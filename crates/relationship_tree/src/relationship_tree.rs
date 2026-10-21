@@ -1256,8 +1256,9 @@ impl RelationshipTree {
     }
 
     /// Reads ahead what opening `path` will show once the pointer has rested on its row;
-    /// leaving the row first reads nothing. A row the pointer left cancels only its own read:
-    /// moving down, the row entered hears the move before the row left does.
+    /// leaving the row first reads nothing, and leaving it after stops what was read ahead for
+    /// it and is still out ([`Exploration::end_prefetch`]). A row the pointer left cancels only
+    /// its own reads: moving down, the row entered hears the move before the row left does.
     fn prefetch(&mut self, path: &graph_store::ExplorePath, hovered: bool, cx: &mut Context<Self>) {
         if !hovered {
             if self
@@ -1267,6 +1268,7 @@ impl RelationshipTree {
             {
                 self.prefetch = None;
             }
+            self.with_exploration(cx, |e, cx| e.end_prefetch(path, cx));
             return;
         }
         let Some(exploration) = self.exploration.clone() else {

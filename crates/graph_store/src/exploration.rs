@@ -286,6 +286,22 @@ pub enum LoadTarget {
 /// How many values of a grouping property one read returns, most common first.
 pub const VALUES_LIMIT: u32 = 100;
 
+/// The most reads one row the pointer rests on reads ahead ([`Exploration::prefetch`]): the
+/// first that opening it needs, in the order its rows show. A Person on the personal graph has
+/// 92 relationships, each a count; the rest are read when the row opens. As many as a
+/// connection keeps on the wire, so a read ahead never waits behind itself.
+pub const PREFETCH_LIMIT: usize = 8;
+
+/// How many counts, neighbour lists, values and labels an exploration holds before it lets go
+/// of those nothing open can reach: rows the pointer rested on and never opened, and what was
+/// read below a subtree closed whole. What is let go is read again at the pin when it opens,
+/// mostly from the session's answers kept.
+const KEPT_READS: usize = 4_096;
+
+/// How many commits a pin carried past are remembered: reads out across that many head moves
+/// that changed nothing they read still stand when they answer.
+const CARRIED_PINS: usize = 16;
+
 /// One row of the flattened exploration, in tree order. The relationship tree renders these;
 /// the canvas derives its nodes, hubs and edges from them.
 #[derive(Debug, Clone, PartialEq)]
@@ -536,6 +552,58 @@ impl ExploreState {
         self.counts.clear();
         self.neighbours.clear();
         self.values.clear();
+    }
+
+    /// How many counts, neighbour lists, values and labels are held.
+    fn held(&self) -> usize {
+        self.counts.len() + self.neighbours.len() + self.values.len() + self.labels.len()
+    }
+
+    /// Lets go of what nothing open can reach, which no flattening shows until it opens: what
+    /// was read ahead for rows that never opened, and what was read below a subtree closed
+    /// whole. Kept: whatever is still being read; each open node's counts and fields; each
+    /// open relationship's or value's neighbours, values and counts; the labels of the root,
+    /// the breadcrumb, the nodes on open paths and the neighbours kept.
+    pub fn retain_reachable(&mut self) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        let mut nodes: HashSet<NodeRef> = HashSet::new();
+        let mut groups: HashSet<GroupKey> = HashSet::new();
+        nodes.insert(root.clone());
+        for path in &self.expanded {
+            nodes.extend(path.nodes().cloned());
+            if path.ends_at_node() {
+                nodes.insert(path.node(&root).clone());
+            } else if let Some(key) = self.group_key(path) {
+                groups.insert(key);
+            }
+        }
+        let base = |key: &GroupKey| GroupKey {
+            within: None,
+            ..key.clone()
+        };
+        self.counts.retain(|key, count| {
+            count.is_loading()
+                || (key.within.is_none() && nodes.contains(&key.node))
+                || groups.contains(&base(key))
+        });
+        self.neighbours.retain(|key, list| {
+            list.status == PageStatus::Loading
+                || groups.contains(key)
+                || (key.within.is_none() && nodes.contains(&key.node))
+        });
+        self.values
+            .retain(|(key, _), values| values.is_loading() || groups.contains(key));
+        let listed: HashSet<&NodeRef> = self
+            .neighbours
+            .values()
+            .flat_map(|list| list.rows.iter().map(|row| &row.node))
+            .collect();
+        let breadcrumb: HashSet<&NodeRef> = self.breadcrumb.iter().collect();
+        self.labels.retain(|node, _| {
+            nodes.contains(node) || listed.contains(node) || breadcrumb.contains(node)
+        });
     }
 
     /// The exploration flattened in tree order.
@@ -1147,6 +1215,14 @@ impl Flattened {
     }
 }
 
+impl Flattened {
+    /// The state, to take an answer that changes nothing the flattening shows (read ahead for
+    /// a row that is closed): the flattening made stays, so taking it walks no tree.
+    fn unseen(&mut self) -> &mut ExploreState {
+        &mut self.state
+    }
+}
+
 impl Deref for Flattened {
     type Target = ExploreState;
     fn deref(&self) -> &ExploreState {
@@ -1174,7 +1250,21 @@ pub struct Exploration {
     /// stays, as the commit does, until Refresh. One that names a type's nodes otherwise (spec
     /// 002, "Node names") reads them again.
     schema: Option<Arc<SchemaModel>>,
-    tasks: HashMap<LoadTarget, Task<()>>,
+    /// The reads out, each with the number it was started under: one that finishes lets go of
+    /// its own entry, not of a read of the same target started since.
+    tasks: HashMap<LoadTarget, (u64, Task<()>)>,
+    next_task: u64,
+    /// The commits the pin was carried past by head moves that changed nothing it read
+    /// ([`Self::compare_head`]), the newest last: a read sent at one of them before the move
+    /// answers there, and stands, since nothing it reads changed in between.
+    carried: Vec<String>,
+    /// What was read ahead for the row the pointer rests on ([`Self::prefetch`]): its path and
+    /// the targets started for it. The pointer moving on stops those still out that nothing
+    /// opened since.
+    ahead: Option<(ExplorePath, Vec<LoadTarget>)>,
+    /// How many counts, neighbour lists, values and labels the state may hold before those
+    /// nothing open can reach are let go ([`ExploreState::retain_reachable`]).
+    prune_at: usize,
     /// What the exploration has read at its pin: a head move that changed none of it moves the
     /// pin without reading again (spec 015).
     scope: ReadScope,
@@ -1222,9 +1312,11 @@ impl Exploration {
             SessionEvent::SchemaChanged => {
                 let now = session.read(cx).schema_model();
                 match (&this.schema, &now) {
+                    // The same text naming some type's nodes otherwise: what is shown is read
+                    // again under the new names, at the same commit.
                     (Some(was), Some(now)) if was.source == now.source && !was.same_as(now) => {
                         this.schema = Some(now.clone());
-                        this.rename(cx);
+                        this.read_again(cx);
                     }
                     // Another text: what was read under the old one is read again under it,
                     // at the head, as Refresh reads it.
@@ -1247,6 +1339,9 @@ impl Exploration {
                     this.root_at(root, cx);
                 }
             }
+            // A new token may see less than the old one did: nothing it read stays shown, and
+            // what is shown is read again under the new one, at the same commit.
+            SessionEvent::CredentialChanged => this.read_again(cx),
             SessionEvent::HeadMoved { branch, .. } if *branch == session.read(cx).branch => {
                 this.compare_head(cx)
             }
@@ -1265,6 +1360,10 @@ impl Exploration {
             generation: 0,
             schema,
             tasks: HashMap::new(),
+            next_task: 0,
+            carried: Vec::new(),
+            ahead: None,
+            prune_at: KEPT_READS,
             scope,
             awaiting_changes: false,
             missing_due: false,
@@ -1288,7 +1387,16 @@ impl Exploration {
         }
         match session.scope_since(&self.scope, &pin, head) {
             ScopeSince::Pending => self.awaiting_changes = true,
-            ScopeSince::Unchanged => self.pin = Some(head.to_owned()),
+            // Reads out at the old pin answer there: the same answer, since nothing they read
+            // changed, so they stand (`pinned_at`).
+            ScopeSince::Unchanged => {
+                self.pin = Some(head.to_owned());
+                self.carried.retain(|commit| *commit != pin);
+                self.carried.push(pin);
+                if self.carried.len() > CARRIED_PINS {
+                    self.carried.remove(0);
+                }
+            }
             ScopeSince::Changed => {
                 self.newer_available = true;
                 self.changed(cx);
@@ -1515,8 +1623,10 @@ impl Exploration {
     }
 
     /// Reads ahead what opening `path` will show, without opening it, so it opens at once
-    /// (spec 006: a pill the pointer rests on). Only once the exploration has its commit, so
-    /// every read stays on it.
+    /// (spec 006: a pill the pointer rests on): the first [`PREFETCH_LIMIT`] reads it needs.
+    /// Only once the exploration has its commit, so every read stays on it. One row is read
+    /// ahead at a time: what was read ahead for another and is still out stops, unless it was
+    /// opened since ([`Self::end_prefetch`]).
     pub fn prefetch(&mut self, path: &ExplorePath, cx: &mut Context<Self>) {
         if self.pin.is_none() {
             return;
@@ -1524,9 +1634,67 @@ impl Exploration {
         let Some(schema) = self.schema(cx) else {
             return;
         };
+        if self.ahead.as_ref().is_some_and(|(ahead, _)| ahead == path) {
+            return;
+        }
+        self.stop_ahead();
         // A target read or being read is in the state already, so it is not among these.
-        for target in self.state.prefetch_targets(&schema, path) {
-            self.start(target, cx);
+        let targets: Vec<LoadTarget> = self
+            .state
+            .prefetch_targets(&schema, path)
+            .into_iter()
+            .take(PREFETCH_LIMIT)
+            .collect();
+        for target in &targets {
+            self.start(target.clone(), cx);
+        }
+        self.ahead = Some((path.clone(), targets));
+    }
+
+    /// The pointer left the row at `path`: what was read ahead for it and is still out stops,
+    /// unless it was opened since, and is read again if it opens later.
+    pub fn end_prefetch(&mut self, path: &ExplorePath, _cx: &mut Context<Self>) {
+        if self.ahead.as_ref().is_some_and(|(ahead, _)| ahead == path) {
+            self.stop_ahead();
+        }
+    }
+
+    /// Stops the reads ahead still out whose answers nothing open shows, and forgets that they
+    /// were asked for. An answer in stays, as one shown does.
+    fn stop_ahead(&mut self) {
+        let Some((_, targets)) = self.ahead.take() else {
+            return;
+        };
+        let Some(schema) = self.schema.clone() else {
+            return;
+        };
+        for target in targets {
+            if self.state.shows(&schema, &target) || self.tasks.remove(&target).is_none() {
+                continue;
+            }
+            // Dropping the read's task stops it: a count left out of its batch, a read
+            // nobody waits for any more.
+            let state = self.state.unseen();
+            match &target {
+                LoadTarget::Root => {}
+                LoadTarget::Count(key) => {
+                    state.counts.remove(key);
+                }
+                LoadTarget::Page(key) => {
+                    if state
+                        .neighbours
+                        .get(key)
+                        .is_some_and(|list| list.rows.is_empty())
+                    {
+                        state.neighbours.remove(key);
+                    } else if let Some(list) = state.neighbours.get_mut(key) {
+                        list.status = PageStatus::Idle;
+                    }
+                }
+                LoadTarget::Values(key, by) => {
+                    state.values.remove(&(key.clone(), by.clone()));
+                }
+            }
         }
     }
 
@@ -1578,11 +1746,13 @@ impl Exploration {
         self.changed(cx);
     }
 
-    /// The schema now names some type's nodes otherwise: what is shown is read again under the
-    /// new names, at the same commit, with every path left open or closed as it was.
-    fn rename(&mut self, cx: &mut Context<Self>) {
+    /// Lets go of everything read and reads what is shown again at the same commit, with every
+    /// path left open or closed as it was: the schema names some type's nodes otherwise, or the
+    /// token changed. Reads still out are dropped, and their answers land nowhere.
+    fn read_again(&mut self, cx: &mut Context<Self>) {
         self.generation += 1;
         self.tasks.clear();
+        self.ahead = None;
         self.state.clear_loaded();
         self.request_missing(cx);
         self.changed(cx);
@@ -1592,6 +1762,8 @@ impl Exploration {
     fn reset_reads(&mut self, cx: &mut Context<Self>) {
         self.generation += 1;
         self.tasks.clear();
+        self.ahead = None;
+        self.carried.clear();
         self.pin = None;
         self.newer_available = false;
         self.schema = self.session.read(cx).schema_model();
@@ -1622,6 +1794,21 @@ impl Exploration {
         }
     }
 
+    /// The state, to take an answer to `target` or mark it asked for: through the flattening
+    /// when the answer can change what is shown, else leaving the flattening as made, so a
+    /// read ahead for a row that is closed walks no tree when it lands.
+    fn state_for(&mut self, target: &LoadTarget) -> &mut ExploreState {
+        let shows = match &self.schema {
+            Some(schema) => self.state.shows(schema, target),
+            None => true,
+        };
+        if shows {
+            &mut self.state
+        } else {
+            self.state.unseen()
+        }
+    }
+
     fn start(&mut self, target: LoadTarget, cx: &mut Context<Self>) {
         // Until the first read returns its commit, nothing else is read, so every read of the
         // exploration sees the same commit: what is asked for meanwhile (a group's search) is
@@ -1635,16 +1822,35 @@ impl Exploration {
         let Some(schema) = self.schema(cx) else {
             return;
         };
+        if target == LoadTarget::Root && self.state.root.is_none() {
+            return;
+        }
+        let page_size = self.page_size(cx);
+        let state = self.state_for(&target);
+        match &target {
+            LoadTarget::Root => state.root_status = Loadable::Loading,
+            LoadTarget::Count(key) => {
+                state.counts.insert(key.clone(), Loadable::Loading);
+            }
+            LoadTarget::Page(key) => {
+                let list = state.neighbours.entry(key.clone()).or_default();
+                list.status = PageStatus::Loading;
+                list.page_size = page_size;
+            }
+            LoadTarget::Values(key, by) => {
+                state
+                    .values
+                    .insert((key.clone(), by.clone()), Loadable::Loading);
+            }
+        }
         let query = match &target {
             LoadTarget::Root => {
-                let Some(root) = self.state.root.clone() else {
+                let Some(root) = &self.state.root else {
                     return;
                 };
-                self.state.root_status = Loadable::Loading;
                 builder::node_label(&schema, &root.type_name, &root.id)
             }
             LoadTarget::Count(key) => {
-                self.state.counts.insert(key.clone(), Loadable::Loading);
                 let snapshot = self.pin.clone();
                 let scope = &self.scope;
                 let count = self.session.update(cx, |session, cx| {
@@ -1661,14 +1867,15 @@ impl Exploration {
                 return;
             }
             LoadTarget::Page(key) => {
-                let page_size = self.page_size(cx);
-                let search = self.state.searches.get(key).cloned();
-                let list = self.state.neighbours.entry(key.clone()).or_default();
-                list.status = PageStatus::Loading;
-                list.page_size = page_size;
+                let search = self.state.searches.get(key).map(String::as_str);
+                let after = self
+                    .state
+                    .neighbours
+                    .get(key)
+                    .and_then(NeighbourList::next_after);
                 let value = key.within.as_ref().map(|within| within.value.value());
                 let narrow = Narrow {
-                    search: search.as_deref(),
+                    search,
                     value: key
                         .within
                         .as_ref()
@@ -1680,15 +1887,12 @@ impl Exploration {
                     &key.node.type_name,
                     &key.group,
                     &key.node.id,
-                    list.next_after().map(builder::After::Neighbour),
+                    after.map(builder::After::Neighbour),
                     narrow,
                     page_size,
                 )
             }
             LoadTarget::Values(key, by) => {
-                self.state
-                    .values
-                    .insert((key.clone(), by.clone()), Loadable::Loading);
                 let values = builder::neighbour_values(
                     &schema,
                     &key.node.type_name,
@@ -1760,6 +1964,7 @@ impl Exploration {
                     .update(cx, |session, cx| session.read(without, commit, cx))
             });
         let key = target.clone();
+        let ticket = self.next_ticket();
         let session = self.session.downgrade();
         let task = cx.spawn(async move |this, cx| {
             let mut result = read.await;
@@ -1795,6 +2000,7 @@ impl Exploration {
                 if this.generation != generation {
                     return;
                 }
+                this.finished(&key, ticket);
                 let unpinned = this.pin.is_none();
                 if !this.apply(&key, result, sent_at.as_deref(), cx) {
                     return;
@@ -1808,7 +2014,25 @@ impl Exploration {
             })
             .ok();
         });
-        self.tasks.insert(target, task);
+        self.tasks.insert(target, (ticket, task));
+    }
+
+    /// A number for a read about to start, which its entry in `tasks` is kept under.
+    fn next_ticket(&mut self) -> u64 {
+        self.next_task += 1;
+        self.next_task
+    }
+
+    /// The read numbered `ticket` for `target` finished: its entry goes, unless a read of the
+    /// same target started since holds it.
+    fn finished(&mut self, target: &LoadTarget, ticket: u64) {
+        if self
+            .tasks
+            .get(target)
+            .is_some_and(|(held, _)| *held == ticket)
+        {
+            self.tasks.remove(target);
+        }
     }
 
     /// Waits for a count the session reads together with the others asked for this turn, read
@@ -1825,17 +2049,19 @@ impl Exploration {
     ) {
         let generation = self.generation;
         let key = target.clone();
+        let ticket = self.next_ticket();
         let task = cx.spawn(async move |this, cx| {
             let count = count.await;
             this.update(cx, |this, cx| {
                 if this.generation != generation {
                     return;
                 }
+                this.finished(&key, ticket);
                 let unpinned = this.pin.is_none();
                 match (&key, count) {
                     (LoadTarget::Count(group), Ok((count, commit))) => {
                         match this.pinned_at(&key, commit.as_deref(), sent_at.as_deref(), cx) {
-                            Pinned::Taken => this.state.apply_count(group.clone(), count),
+                            Pinned::Taken => this.state_for(&key).apply_count(group.clone(), count),
                             Pinned::Again => return,
                             Pinned::Elsewhere(message) => this.apply_failure(&key, message),
                         }
@@ -1852,11 +2078,12 @@ impl Exploration {
             })
             .ok();
         });
-        self.tasks.insert(target, task);
+        self.tasks.insert(target, (ticket, task));
     }
 
     /// Takes the commit an answer to `target` names, read at `sent_at` (the head when `None`):
-    /// the first answer pins the exploration, and every later one must be at the pin.
+    /// the first answer pins the exploration, and every later one must be at the pin, or at a
+    /// commit the pin was carried past since the read was sent ([`Self::carried`]).
     fn pinned_at(
         &mut self,
         target: &LoadTarget,
@@ -1870,6 +2097,12 @@ impl Exploration {
                 Pinned::Taken
             }
             (Some(pin), Some(commit)) if pin != commit => {
+                // Asked before the pin moved on, at a commit it was carried past: nothing the
+                // exploration reads changed since, so this is the pin's answer too.
+                let carried = self.carried.iter().any(|past| past == commit);
+                if carried && sent_at.is_none_or(|sent| sent == commit) {
+                    return Pinned::Taken;
+                }
                 if sent_at.is_none() {
                     self.start(target.clone(), cx);
                     return Pinned::Again;
@@ -1884,8 +2117,18 @@ impl Exploration {
         }
     }
 
-    /// After an answer: reads what it made visible, and redraws when it shows.
+    /// After an answer: reads what it made visible, and redraws when it shows. An answer read
+    /// ahead for something closed shows nothing yet and makes nothing visible: nothing is read
+    /// for it and nothing drawn, and the tree is not walked again, since the answer left the
+    /// flattening as made ([`Self::state_for`]); opening it draws.
     fn loaded(&mut self, key: &LoadTarget, cx: &mut Context<Self>) {
+        self.bound_reads();
+        let shows = self
+            .schema(cx)
+            .is_some_and(|schema| self.state.shows(&schema, key));
+        if !shows {
+            return;
+        }
         if !std::mem::replace(&mut self.missing_due, true) {
             let this = cx.entity().downgrade();
             cx.defer(move |cx| {
@@ -1896,14 +2139,21 @@ impl Exploration {
                 .ok();
             });
         }
-        // An answer read ahead for something closed shows nothing yet: nothing to draw.
-        let shows = self
-            .schema(cx)
-            .is_some_and(|schema| self.state.shows(&schema, key));
-        if shows {
-            cx.emit(ExplorationEvent::Loaded);
-            cx.notify();
+        cx.emit(ExplorationEvent::Loaded);
+        cx.notify();
+    }
+
+    /// Keeps what the state holds bounded: past [`KEPT_READS`] counts, neighbour lists, values
+    /// and labels, those nothing open can reach go ([`ExploreState::retain_reachable`]). What
+    /// stays sets the next bound at twice its size, so a large walk that is all open is not
+    /// gone through again at every answer.
+    fn bound_reads(&mut self) {
+        if self.state.held() <= self.prune_at {
+            return;
         }
+        // Nothing reachable goes, so nothing shown changes: the flattening stays as made.
+        self.state.unseen().retain_reachable();
+        self.prune_at = KEPT_READS.max(2 * self.state.held());
     }
 
     /// Takes the answer to a read of `target` sent at `sent_at` (unpinned when `None`). The
@@ -1933,40 +2183,40 @@ impl Exploration {
                 return true;
             }
         }
+        let page_size = match target {
+            LoadTarget::Page(key) => self
+                .state
+                .neighbours
+                .get(key)
+                .map_or(1, |list| list.page_size.max(1)),
+            _ => 1,
+        };
+        let state = self.state_for(target);
         match target {
-            LoadTarget::Root => self.state.apply_root(&output),
+            LoadTarget::Root => state.apply_root(&output),
             // A count is read with the others asked for this turn, and taken by `spawn_count`.
             LoadTarget::Count(_) => {}
             LoadTarget::Values(key, by) => {
-                self.state
-                    .apply_values(key.clone(), by.clone(), &output, VALUES_LIMIT)
+                state.apply_values(key.clone(), by.clone(), &output, VALUES_LIMIT)
             }
-            LoadTarget::Page(key) => {
-                let page_size = self
-                    .state
-                    .neighbours
-                    .get(key)
-                    .map_or(1, |list| list.page_size.max(1));
-                self.state.apply_page(key.clone(), &output, page_size)
-            }
+            LoadTarget::Page(key) => state.apply_page(key.clone(), &output, page_size),
         }
         true
     }
 
     fn apply_failure(&mut self, target: &LoadTarget, message: String) {
+        let state = self.state_for(target);
         match target {
-            LoadTarget::Root => self.state.root_status = Loadable::Failed(message),
+            LoadTarget::Root => state.root_status = Loadable::Failed(message),
             LoadTarget::Count(key) => {
-                self.state
-                    .counts
-                    .insert(key.clone(), Loadable::Failed(message));
+                state.counts.insert(key.clone(), Loadable::Failed(message));
             }
             LoadTarget::Page(key) => {
-                self.state.neighbours.entry(key.clone()).or_default().status =
+                state.neighbours.entry(key.clone()).or_default().status =
                     PageStatus::Failed(message);
             }
             LoadTarget::Values(key, by) => {
-                self.state
+                state
                     .values
                     .insert((key.clone(), by.clone()), Loadable::Failed(message));
             }
@@ -2853,5 +3103,361 @@ mod tests {
                 false
             )
         );
+    }
+
+    /// A read sent at the pin and still out when another writer's commit, which changed nothing
+    /// the exploration reads, carried the pin to the head answers at the old pin: it stands,
+    /// since nothing it reads changed in between, for a page and a count alike. An answer at a
+    /// commit the pin never was at is still a failure.
+    #[gpui::test]
+    async fn an_answer_at_a_commit_the_pin_was_carried_past_stands(cx: &mut gpui::TestAppContext) {
+        use crate::test_server::{followed_session, node_change};
+        let (session, served) = followed_session(
+            SCHEMA,
+            |_| json!([{ "id": "p1", "label": "Ada", "n": 0 }]),
+            cx,
+        );
+        cx.run_until_parked();
+        let exploration = cx.update(|cx| Exploration::for_session(&session, cx));
+        exploration.update(cx, |exploration, cx| exploration.root_at(person("p1"), cx));
+        cx.run_until_parked();
+        let pin = |cx: &mut gpui::TestAppContext| {
+            exploration.read_with(cx, |exploration, _| exploration.pin().map(str::to_owned))
+        };
+        assert_eq!(pin(cx).as_deref(), Some("c1"));
+
+        // Another writer changes a company: nothing the exploration reads.
+        served
+            .lock()
+            .unwrap()
+            .commit("c2", vec![node_change("Company", "k9")]);
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        assert_eq!(pin(cx).as_deref(), Some("c2"), "carried to the head");
+
+        let schema = schema();
+        let knows = group(&schema, "Person", "Knows", Direction::Outgoing);
+        let key = GroupKey::new(person("p1"), knows);
+        let at = |commit: &str| ReadOutput {
+            graph_commit_id: Some(commit.into()),
+            ..output(&["id", "label"], json!([{ "id": "p2", "label": "Bo" }]))
+        };
+        let page = LoadTarget::Page(key.clone());
+        let list = |cx: &mut gpui::TestAppContext| {
+            exploration.read_with(cx, |exploration, _| {
+                let list = &exploration.state().neighbours[&key];
+                (list.status.clone(), list.rows.len())
+            })
+        };
+        exploration.update(cx, |exploration, cx| {
+            assert!(exploration.apply(&page, Ok(at("c1")), Some("c1"), cx));
+        });
+        assert_eq!(
+            list(cx),
+            (PageStatus::Idle, 1),
+            "the old pin's answer stands"
+        );
+        exploration.update(cx, |exploration, cx| {
+            exploration.state.neighbours.remove(&key);
+            exploration.apply(&page, Ok(at("c9")), Some("c1"), cx);
+        });
+        assert!(
+            matches!(list(cx), (PageStatus::Failed(_), 0)),
+            "a commit the pin never was at"
+        );
+
+        let count = LoadTarget::Count(key.clone());
+        exploration.update(cx, |exploration, cx| {
+            let answer = Task::ready(Ok((5, Some("c1".to_owned()))));
+            exploration.spawn_count(count, answer, Some("c1".into()), cx)
+        });
+        cx.run_until_parked();
+        let counted = exploration.read_with(cx, |exploration, _| {
+            exploration.state().counts[&key].clone()
+        });
+        assert_eq!(counted, Loadable::Loaded(5));
+        assert_eq!(pin(cx).as_deref(), Some("c2"));
+    }
+
+    /// A new token may see less than the old one: what the exploration read under the old one
+    /// goes at once, and is read again under the new one at the same commit.
+    #[gpui::test]
+    async fn a_new_token_reads_what_the_exploration_shows_again(cx: &mut gpui::TestAppContext) {
+        use futures::AsyncReadExt as _;
+        use gpui::AppContext as _;
+        use http_client::http::Response;
+        use http_client::{AsyncBody, FakeHttpClient};
+
+        use crate::connection::{Connection, ServerEntry, ServerSource};
+
+        // Each node read: the token it went with and the commit it was pinned to.
+        type Sent = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+        let sent: Sent = Arc::default();
+        let log = sent.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let token = request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            let log = log.clone();
+            async move {
+                let mut bytes = Vec::new();
+                request.into_body().read_to_end(&mut bytes).await.ok();
+                let body = if path.ends_with("/schema") {
+                    json!({ "schema_source": SCHEMA })
+                } else if path.ends_with("/query") {
+                    let asked: Value = serde_json::from_slice(&bytes).unwrap();
+                    let name = asked["name"].as_str().unwrap_or_default().to_owned();
+                    let snapshot = asked["snapshot"].as_str().map(str::to_owned);
+                    if name == "studio_node" {
+                        log.lock().unwrap().push((token.clone(), snapshot));
+                    }
+                    // The new token may not see Ada.
+                    let rows = match name.as_str() {
+                        "studio_node" if token == "Bearer old" => {
+                            json!([{ "id": "ada", "label": "Ada" }])
+                        }
+                        "studio_page_degrees" => json!([{ "id": "ada", "n": 0 }]),
+                        _ => json!([]),
+                    };
+                    json!({ "query_name": name, "target": { "branch": "main" }, "row_count": 0,
+                        "columns": [], "rows": rows, "graph_commit_id": "c1" })
+                } else {
+                    json!({ "branches": ["main"] })
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("old".into()), http).unwrap());
+        let session = cx
+            .new(|cx| GraphSession::new(connection.clone(), "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        let exploration = cx.update(|cx| Exploration::for_session(&session, cx));
+        exploration.update(cx, |exploration, cx| exploration.root_at(person("ada"), cx));
+        cx.run_until_parked();
+        let shown = |cx: &mut gpui::TestAppContext| {
+            exploration.read_with(cx, |exploration, _| {
+                let state = exploration.state();
+                (
+                    state.root_status.clone(),
+                    state.label(&person("ada")).map(str::to_owned),
+                )
+            })
+        };
+        assert_eq!(shown(cx), (Loadable::Loaded(()), Some("Ada".into())));
+        assert_eq!(
+            std::mem::take(&mut *sent.lock().unwrap()),
+            vec![("Bearer old".to_owned(), None)]
+        );
+
+        connection.update(cx, |connection, cx| {
+            connection.set_token(Some("new".into()), cx)
+        });
+        let (status, label) = shown(cx);
+        assert_eq!(label, None, "the old token's label is gone at once");
+        assert!(!matches!(status, Loadable::Loaded(())));
+        cx.run_until_parked();
+        // At the pin, which is the head: sent as a read of the branch whose commit is checked.
+        let again: Vec<String> = std::mem::take(&mut *sent.lock().unwrap())
+            .into_iter()
+            .map(|(token, _)| token)
+            .collect();
+        assert_eq!(again, ["Bearer new"], "read again under the new token");
+        let (status, label) = shown(cx);
+        assert!(matches!(status, Loadable::Failed(_)), "{status:?}");
+        assert_eq!(label, None);
+        let pin = exploration.read_with(cx, |exploration, _| exploration.pin().map(str::to_owned));
+        assert_eq!(pin.as_deref(), Some("c1"));
+    }
+
+    /// A row the pointer rests on reads ahead at most `PREFETCH_LIMIT` reads; the pointer
+    /// moving on before they answer stops them and sends none, and those answered stay. Reads
+    /// that finished let go of their tasks, and an answer for a row that is closed leaves the
+    /// tree's flattening as it was made.
+    #[gpui::test]
+    async fn what_is_read_ahead_stops_when_the_pointer_moves_on(cx: &mut gpui::TestAppContext) {
+        use futures::AsyncReadExt as _;
+        use gpui::AppContext as _;
+        use http_client::http::Response;
+        use http_client::{AsyncBody, FakeHttpClient};
+
+        use crate::connection::{Connection, ServerEntry, ServerSource};
+
+        let mut many = String::from("node Person {\n  slug: String @key\n  name: String\n}\n");
+        for edge in 0..10 {
+            many.push_str(&format!("edge E{edge}: Person -> Person\n"));
+        }
+        let text = many.clone();
+        // Reads about p2 never answer, as a slow server's would not before the pointer moves on.
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let text = text.clone();
+            async move {
+                let mut bytes = Vec::new();
+                request.into_body().read_to_end(&mut bytes).await.ok();
+                let body = if path.ends_with("/schema") {
+                    json!({ "schema_source": text })
+                } else if path.ends_with("/query") {
+                    let asked: Value = serde_json::from_slice(&bytes).unwrap();
+                    if asked["params"].to_string().contains("p2") {
+                        futures::future::pending::<()>().await;
+                    }
+                    json!({ "query_name": asked["name"], "target": { "branch": "main" },
+                        "row_count": 1, "columns": [],
+                        "rows": [{ "id": "p1", "label": "Ada", "n": 0 }],
+                        "graph_commit_id": "c1" })
+                } else {
+                    json!({ "branches": ["main"] })
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        let exploration = cx.update(|cx| Exploration::for_session(&session, cx));
+        exploration.update(cx, |exploration, cx| exploration.root_at(person("p1"), cx));
+        cx.run_until_parked();
+        let schema = exploration.read_with(cx, |exploration, cx| exploration.schema(cx).unwrap());
+        let e0 = group(&schema, "Person", "E0", Direction::Outgoing);
+        let under_e0 = |id: &str| ExplorePath::root().child_group(&e0).child_node(&person(id));
+        let ahead_of = |exploration: &Exploration, id: &str| {
+            exploration
+                .state()
+                .counts
+                .iter()
+                .filter(|(key, _)| key.node == person(id))
+                .map(|(_, count)| count.clone())
+                .collect::<Vec<_>>()
+        };
+        let out = |cx: &mut gpui::TestAppContext| {
+            session.read_with(cx, |session, _| session.reads_in_flight)
+        };
+        assert_eq!(out(cx), 0);
+
+        // Twenty relationships to count; the first eight are read ahead.
+        exploration.update(cx, |exploration, cx| {
+            exploration.prefetch(&under_e0("p2"), cx)
+        });
+        cx.run_until_parked();
+        exploration.read_with(cx, |exploration, _| {
+            assert_eq!(
+                ahead_of(exploration, "p2"),
+                vec![Loadable::Loading; PREFETCH_LIMIT]
+            );
+        });
+        assert_eq!(out(cx), PREFETCH_LIMIT, "one read per relationship, out");
+
+        // The pointer moves on: they stop, and nothing says they were asked for.
+        exploration.update(cx, |exploration, cx| {
+            exploration.end_prefetch(&under_e0("p2"), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(out(cx), 0, "stopped");
+        exploration.read_with(cx, |exploration, _| {
+            assert!(ahead_of(exploration, "p2").is_empty());
+            assert!(exploration.tasks.is_empty());
+        });
+
+        // Answered, they stay; finished reads let go of their tasks; and the answers, for a row
+        // that is closed, leave the flattening as it was made.
+        let made = exploration.read_with(cx, |exploration, cx| exploration.entries(cx));
+        exploration.update(cx, |exploration, cx| {
+            exploration.prefetch(&under_e0("p3"), cx)
+        });
+        cx.run_until_parked();
+        exploration.update(cx, |exploration, cx| {
+            assert_eq!(
+                ahead_of(exploration, "p3"),
+                vec![Loadable::Loaded(0); PREFETCH_LIMIT]
+            );
+            assert!(exploration.tasks.is_empty(), "finished reads let go");
+            assert!(
+                Arc::ptr_eq(&made, &exploration.entries(cx)),
+                "a closed row's answers leave the flattening as made"
+            );
+            exploration.end_prefetch(&under_e0("p3"), cx);
+            assert_eq!(
+                ahead_of(exploration, "p3").len(),
+                PREFETCH_LIMIT,
+                "answers stay"
+            );
+        });
+
+        // Another row read ahead in its place stops the first's reads still out.
+        exploration.update(cx, |exploration, cx| {
+            exploration.prefetch(&under_e0("p2"), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(out(cx), PREFETCH_LIMIT);
+        exploration.update(cx, |exploration, cx| {
+            exploration.prefetch(&under_e0("p4"), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(out(cx), 0);
+        exploration.read_with(cx, |exploration, _| {
+            assert!(ahead_of(exploration, "p2").is_empty());
+            assert_eq!(ahead_of(exploration, "p4").len(), PREFETCH_LIMIT);
+        });
+    }
+
+    /// Past its bound, the state lets go of what nothing open reaches and keeps the rest.
+    #[test]
+    fn what_nothing_open_reaches_is_let_go() {
+        let schema = schema();
+        let knows = group(&schema, "Person", "Knows", Direction::Outgoing);
+        let works_at = group(&schema, "Person", "WorksAt", Direction::Outgoing);
+        let mut state = loaded_root(&schema);
+        let open = ExplorePath::root().child_group(&knows);
+        state.expand(&open);
+        let key = |id: &str, group: &RelationshipGroup| GroupKey::new(person(id), group.clone());
+        for (id, group) in [("ada", &knows), ("ada", &works_at), ("far", &knows)] {
+            state.apply_count(key(id, group), 1);
+        }
+        state.counts.insert(key("near", &knows), Loadable::Loading);
+        let page = output(&["id", "label"], json!([{ "id": "bob", "label": "Bob" }]));
+        state.apply_page(key("ada", &knows), &page, 50);
+        let elsewhere = output(&["id", "label"], json!([{ "id": "zed", "label": "Zed" }]));
+        state.apply_page(key("far", &knows), &elsewhere, 50);
+        state.labels.insert(person("far"), Some("Far".into()));
+
+        state.retain_reachable();
+        let mut counted: Vec<_> = state.counts.keys().map(|k| k.node.id.clone()).collect();
+        counted.sort();
+        assert_eq!(
+            counted,
+            ["ada", "ada", "near"],
+            "the root's and the one being read"
+        );
+        assert!(state.neighbours.contains_key(&key("ada", &knows)));
+        assert!(!state.neighbours.contains_key(&key("far", &knows)));
+        assert_eq!(state.label(&person("bob")), Some("Bob"));
+        assert!(!state.labels.contains_key(&person("zed")));
+        assert!(!state.labels.contains_key(&person("far")));
+        assert!(state.labels.contains_key(&person("ada")), "the root's");
     }
 }

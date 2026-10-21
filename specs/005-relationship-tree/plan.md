@@ -105,10 +105,26 @@ on the canvas. Typing filters the visible rows.
   selects scrolls into what shows.
 - Each expansion loads lazily: an inline spinner row, or an error row with Retry.
 - Reads that finish together are shown in one go: `ExplorationEvent::Loaded` is gathered for up
-  to 8 ms before the rows are rebuilt, and an answer for a closed row sends nothing. Opening,
-  closing and re-rooting still rebuild at once (`Changed`).
+  to 8 ms before the rows are rebuilt, and an answer for a closed row sends nothing, reads
+  nothing more and leaves the flattening as it was made, so it walks no tree (since
+  2026-10-21). Opening, closing and re-rooting still rebuild at once (`Changed`).
 - A closed row the pointer rests on for 120 ms reads ahead what it opens to, as the canvas's
-  pills do (spec 006), so it usually opens with its rows already read.
+  pills do (spec 006), so it usually opens with its rows already read: the first 8 reads it
+  needs (`PREFETCH_LIMIT`, one connection's reads on the wire), in the order its rows show.
+  One row is read ahead at a time: the pointer leaving it, or resting on another, stops what
+  is still out unless the row was opened since, and that is read again if it opens later
+  (since 2026-10-21; before, a Person's 92 counts went out for every row rested on and ran to
+  the end).
+- What the exploration holds stays bounded: a finished read lets go of its task, and past
+  4,096 counts, neighbour lists, values and labels, those no open path reaches (rows read
+  ahead and never opened, what was below a subtree closed whole) are let go, to be read again
+  at the pin, mostly from the session's answers kept (since 2026-10-21).
+- The pin moves past another writer's commit that changed nothing the tree reads (spec 015);
+  a read still out at the old pin answers there and stands, since nothing it reads changed in
+  between. An answer at a commit the pin never was at is still a failure (since 2026-10-21).
+- A new token (`omnigraph login`, or one typed in) may see less than the old: everything the
+  tree read is let go at once and read again under the new token at the same commit, paths
+  left open or closed as they were (since 2026-10-21).
 
 ## Decisions
 
@@ -131,6 +147,9 @@ on the canvas. Typing filters the visible rows.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | A read out when the pin moved past a commit that changed nothing it reads stands | `graph_store` `an_answer_at_a_commit_the_pin_was_carried_past_stands` (root at c1; another writer changes a Company at c2, so the pin moves to c2; a page and a count answered at c1, sent at c1; a page answered at c9, sent at c1) | The c1 page shows its neighbour and the c1 count 5, with the pin at c2; the c9 answer fails. Before, `pinned_at` refused every answer not at the current pin, so a slow group expanded before another writer's unrelated commit showed "The server answered at commit c1, not at c2" until Retry |
+| 2026-10-21 | A new token reads what the tree shows again | `graph_store` `a_new_token_reads_what_the_exploration_shows_again` (a server answering the root by token: the old one sees Ada, the new one nothing; `Connection::set_token`) | At once the label Ada is gone and the root is not loaded; then one node read goes under the new token and the root reads "No Person with key ada at this commit.", the pin still c1. Before, the exploration had no arm for `SessionEvent::CredentialChanged`: what the old token read stayed beside what the new one read |
+| 2026-10-21 | Reads ahead are bounded and stop when the pointer moves on | `graph_store` `what_is_read_ahead_stops_when_the_pointer_moves_on` (20 relationships; a server that never answers reads about p2), `what_nothing_open_reaches_is_let_go`; `relationship_tree` calls `Exploration::end_prefetch` when the pointer leaves a row | Resting on p2: 8 counts Loading and 8 reads out; leaving: 0 out, no count kept, no task. p3's 8 answered counts stay after leaving, its tasks gone, the flattening the same `Arc`; resting on p4 stops p2's still out. The unreachable counts, lists and labels go and the root's, an open group's and one being read stay. Before, all 20 went out, ran on, kept their tasks, and each answer re-flattened the tree |
 | 2026-10-21 | ⌘R reads the tree again | `relationship_tree` `cmd_r_reads_the_tree_again` (another writer changes the root at c2, the tree offers newer data, then `studio::Refresh` is dispatched with the tree focused) | The rows are read again and the offer goes. Before, nothing in the tree handled `Refresh`: ⌘R reloaded the session at the workspace and "Newer data · Refresh" stayed |
 | 2026-10-21 | One count reader | `GraphSession::degree`, used only by tests, removed; the tests read through `degree_at`, which the tree's `degree_in` wraps | The `graph_store` count tests pass on `degree_at`, one of them now also checking that each count names the commit it was asked at |
 | 2026-10-21 | A relationship count is held to the exploration's pin too | `graph_store` `every_read_of_an_exploration_is_at_its_roots_commit`, extended: `spawn_count` given a count of 9 at c3, sent unpinned, then sent at the pin c2, then with no pin; `GraphSession::degree_at` returns each count with the commit its read answered at (`ReadOutput.graph_commit_id`, or the commit asked for) | Unpinned and answered at c3: read again at c2 and shown as 0, its answer there; sent at c2 and answered at c3: a failure that names both commits; with no pin (the root's read failed): c3 becomes the pin and 9 shows. Before, `spawn_count` applied any count it was given, so after a failed root read counts read at the head could stand beside pages pinned at another commit |
