@@ -115,15 +115,6 @@ pub enum GraphStartupFailure {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SchemaOutput {
     pub schema_source: String,
-    #[serde(default)]
-    pub system_columns: Option<SystemColumnsOutput>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct SystemColumnsOutput {
-    pub id: String,
-    pub src: String,
-    pub dst: String,
 }
 
 /// `GET /graphs/{id}/snapshot?branch=`.
@@ -581,6 +572,16 @@ pub struct DiffOutput {
     pub next_page_token: Option<String>,
 }
 
+/// `GET /graphs/{id}/commits/{commit_id}/changes` (one page, `CommitChangesOutput`): a commit's
+/// entity changes against its first parent, with the commit as their cause.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommitChanges {
+    pub cause: ChangeCauseOutput,
+    pub changes: Vec<EntityChangeOutput>,
+    #[serde(default)]
+    pub next_page_token: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChangeBlockOutput {
     pub cause: ChangeCauseOutput,
@@ -841,8 +842,7 @@ mod contract_tests {
                 "failure",
             ],
         ),
-        ("SchemaOutput", &["schema_source", "system_columns"]),
-        ("SystemColumnsOutput", &["id", "src", "dst"]),
+        ("SchemaOutput", &["schema_source"]),
         (
             "SnapshotOutput",
             &[
@@ -1039,7 +1039,7 @@ mod contract_tests {
                 "next_page_token",
             ],
         ),
-        // The client's `CommitChanges`.
+        // Read as `CommitChanges`.
         (
             "CommitChangesOutput",
             &["cause", "changes", "next_page_token"],

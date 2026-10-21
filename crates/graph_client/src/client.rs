@@ -18,7 +18,7 @@ use url::Url;
 use crate::api::{
     AccessOutput, BlobWriteOutput, BranchCreateOutput, BranchCreateRequest, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeFeedOutput, ChangeOutput, ChangeRequest,
-    CommitListOutput, DiffOutput, ErrorOutput, GraphListResponse, HealthOutput,
+    CommitChanges, CommitListOutput, DiffOutput, ErrorOutput, GraphListResponse, HealthOutput,
     InvokeStoredQueryRequest, MergeBaseOutput, QueriesCatalogOutput, QueryRequest, ReadOutput,
     ReadinessOutput, SchemaOutput, SnapshotOutput,
 };
@@ -44,10 +44,12 @@ pub const READ_CONCURRENCY: usize = 8;
 /// Why a read failed.
 #[derive(Debug, Clone)]
 pub enum ReadError {
-    /// The request did not complete: connection refused, timeout, TLS, DNS.
+    /// The request did not complete: connection refused, timeout, TLS, DNS; or something
+    /// between Studio and the server (a proxy, a gateway) answered it with an error that lacks
+    /// the contract header, which says nothing of the server or the graph.
     Transport(String),
-    /// The server answered without the contract header, or with a contract Studio does not
-    /// speak.
+    /// The server answered a success without the contract header, or answered naming a
+    /// contract Studio does not speak.
     ContractMismatch { served: Option<String> },
     /// The server refused the read.
     Refused(ApiErrorSummary),
@@ -413,9 +415,13 @@ impl GraphClient {
     }
 
     /// Counts a response's 403 to a request on a graph (`graphs/{id}/…` under the root) when
-    /// the server sent it (it carries the contract header), against the graph its path names.
+    /// the server sent it (it carries the contract Studio speaks), against the graph its path
+    /// names.
     fn note_refusal(&self, url: &Url, status: StatusCode, headers: &HeaderMap) {
-        if status != StatusCode::FORBIDDEN || !headers.contains_key(CONTRACT_HEADER) {
+        let contract = headers
+            .get(CONTRACT_HEADER)
+            .and_then(|value| value.to_str().ok());
+        if status != StatusCode::FORBIDDEN || !speaks_contract(contract) {
             return;
         }
         let below = url.path().strip_prefix(self.base.path()).unwrap_or("");
@@ -651,15 +657,14 @@ impl GraphClient {
         let url = self.url(segments, query);
         let limit = BodyLimit::First(cap.saturating_add(1));
         let raw = self.fetch_reading(method, url, body, &[], limit).await?;
-        if raw.status.is_success() {
-            check_contract(&raw)?;
-            if raw.body.len() > cap {
-                return Err(ReadError::TooLarge { limit: cap });
-            }
-            serde_json::from_slice(&raw.body).map_err(|error| ReadError::Decode(error.to_string()))
-        } else {
-            Err(ReadError::Refused(summary(raw.status, &raw.body)))
+        if !raw.status.is_success() {
+            return Err(refusal(&raw));
         }
+        check_contract(&raw)?;
+        if raw.body.len() > cap {
+            return Err(ReadError::TooLarge { limit: cap });
+        }
+        serde_json::from_slice(&raw.body).map_err(|error| ReadError::Decode(error.to_string()))
     }
 
     fn blob_url(&self, graph: &str, cell: &BlobCell, at: BlobAt<'_>) -> Url {
@@ -720,7 +725,7 @@ impl GraphClient {
                 check_contract(&raw)?;
                 Ok(BlobMeta::Null)
             }
-            _ => Err(ReadError::Refused(summary(raw.status, &raw.body))),
+            _ => Err(refusal(&raw)),
         }
     }
 
@@ -776,16 +781,19 @@ impl GraphClient {
                 body.truncate(len);
                 Ok(body)
             }
-            301 | 302 | 303 | 307 | 308 => Err(ReadError::Refused(ApiErrorSummary {
-                status: raw.status.as_u16(),
-                message: "The value is a reference to an object outside the graph; Studio does \
-                          not fetch it."
-                    .into(),
-                code: None,
-                diagnostic: None,
-                change_diff_refusal: None,
-            })),
-            _ => Err(ReadError::Refused(summary(raw.status, &raw.body))),
+            301 | 302 | 303 | 307 | 308 => {
+                check_contract(&raw)?;
+                Err(ReadError::Refused(ApiErrorSummary {
+                    status: raw.status.as_u16(),
+                    message: "The value is a reference to an object outside the graph; Studio \
+                              does not fetch it."
+                        .into(),
+                    code: None,
+                    diagnostic: None,
+                    change_diff_refusal: None,
+                }))
+            }
+            _ => Err(refusal(&raw)),
         }
     }
 
@@ -918,7 +926,8 @@ impl GraphClient {
         })
     }
 
-    /// `GET /healthz`. Public; used to discover the server's contract.
+    /// `GET /healthz`. Public; used to discover the server's contract, so a success is returned
+    /// with whatever contract it names, for the caller to judge.
     pub async fn health(&self) -> Result<ServerHealth, ReadError> {
         let url = self.url(&["healthz"], &[]);
         let raw = self
@@ -926,7 +935,7 @@ impl GraphClient {
             .await
             .map_err(ReadError::Transport)?;
         if !raw.status.is_success() {
-            return Err(ReadError::Refused(summary(raw.status, &raw.body)));
+            return Err(refusal(&raw));
         }
         let health =
             serde_json::from_slice(&raw.body).map_err(|e| ReadError::Decode(e.to_string()))?;
@@ -936,13 +945,18 @@ impl GraphClient {
         })
     }
 
-    /// `GET /readyz`. Public. A 503 still carries a readiness body.
+    /// `GET /readyz`. Public. A 503 still carries a readiness body, and is the server's only
+    /// with the contract header, as a 200 is.
     pub async fn readiness(&self) -> Result<ReadinessOutput, ReadError> {
         let url = self.url(&["readyz"], &[]);
         let raw = self
             .send(Method::GET, url, None, &[], HEALTH_TIMEOUT)
             .await
             .map_err(ReadError::Transport)?;
+        if !raw.status.is_success() && raw.status != StatusCode::SERVICE_UNAVAILABLE {
+            return Err(refusal(&raw));
+        }
+        check_contract(&raw)?;
         serde_json::from_slice(&raw.body).map_err(|e| ReadError::Decode(e.to_string()))
     }
 
@@ -1180,8 +1194,8 @@ impl GraphClient {
         let raw = self
             .fetch(Method::POST, url, Some(json(&request)), &[])
             .await?;
+        check_contract(&raw)?;
         if raw.status.is_success() {
-            check_contract(&raw)?;
             let output: BranchMergeOutput = serde_json::from_slice(&raw.body)
                 .map_err(|error| ReadError::Decode(error.to_string()))?;
             return Ok(MergePreview::Merges(output.outcome));
@@ -1190,10 +1204,9 @@ impl GraphClient {
             && let Ok(error) = serde_json::from_slice::<ErrorOutput>(&raw.body)
             && let Some(conflicts) = error.merge_conflicts.filter(|c| !c.is_empty())
         {
-            check_contract(&raw)?;
             return Ok(MergePreview::Conflicts(conflicts));
         }
-        Err(ReadError::Refused(summary(raw.status, &raw.body)))
+        Err(refusal(&raw))
     }
 
     /// One page of a branch's change feed, from `at`.
@@ -1311,26 +1324,35 @@ pub enum MergePreview {
     Conflicts(Vec<crate::api::MergeConflictOutput>),
 }
 
-/// `GET /commits/{id}/changes`: one page of a commit's entity changes.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct CommitChanges {
-    pub cause: crate::api::ChangeCauseOutput,
-    pub changes: Vec<crate::api::EntityChangeOutput>,
-    #[serde(default)]
-    pub next_page_token: Option<String>,
-}
-
 fn json<T: Serialize>(value: &T) -> Vec<u8> {
     serde_json::to_vec(value).expect("request types serialize")
 }
 
-/// A successful read must carry a contract Studio speaks.
+/// Whether a read's answer is the server's: it carries the contract Studio speaks. OmniGraph
+/// stamps the header on every response it sends, errors included, as [`judge_write`] relies on
+/// too. A success without it is a server that does not say which contract it speaks. An error
+/// without it came from something between Studio and the server (a proxy, a gateway): it says
+/// nothing of the server or the graph, so it is no refusal, and the read fails as one that did
+/// not reach the server. An answer naming another contract is a server Studio cannot read.
 fn check_contract(raw: &RawResponse) -> Result<(), ReadError> {
     match raw.contract.as_deref() {
         served if speaks_contract(served) => Ok(()),
+        None if !raw.status.is_success() => Err(ReadError::Transport(format!(
+            "something between Studio and the server answered {}",
+            raw.status
+        ))),
         served => Err(ReadError::ContractMismatch {
             served: served.map(str::to_owned),
         }),
+    }
+}
+
+/// An answer that is not a success, as a read's error: the server's refusal only when the
+/// server sent it ([`check_contract`]).
+fn refusal(raw: &RawResponse) -> ReadError {
+    match check_contract(raw) {
+        Ok(()) => ReadError::Refused(summary(raw.status, &raw.body)),
+        Err(error) => error,
     }
 }
 
@@ -1564,18 +1586,20 @@ mod tests {
     /// A 403 on a graph's route counts as a refusal of that graph on every clone, read or
     /// write, from the gateway too, by the id its path names, escaped or not; one on another
     /// graph does not count for it. One on the server's own routes (listing and discovering
-    /// graphs, which most tokens may not), or one without the contract header, does not count.
-    /// Neither moves the credential count.
+    /// graphs, which most tokens may not), or one without the contract Studio speaks, does not
+    /// count. Neither moves the credential count.
     #[test]
     fn a_refusal_on_a_graph_is_counted_for_that_graph_alone() {
         let held = GraphClient::new(
             "http://127.0.0.1:8787/og",
             Some("t".into()),
             FakeHttpClient::create(|request| {
-                let contract = !request.uri().path().ends_with("/plain/schema");
+                let path = request.uri().path().to_owned();
                 async move {
                     let mut builder = Response::builder().status(403);
-                    if contract {
+                    if path.ends_with("/older/schema") {
+                        builder = builder.header(CONTRACT_HEADER, "0.13");
+                    } else if !path.ends_with("/plain/schema") {
                         builder = builder.header(CONTRACT_HEADER, CONTRACT);
                     }
                     Ok(builder
@@ -1589,11 +1613,12 @@ mod tests {
         block_on(held.graphs()).ok();
         block_on(held.discover_graphs()).ok();
         block_on(held.schema("plain")).ok();
-        for graph in ["plain", "discovery", "knowledge"] {
+        block_on(held.schema("older")).ok();
+        for graph in ["plain", "older", "discovery", "knowledge"] {
             assert_eq!(
                 held.refusals(graph),
                 0,
-                "the server's own routes, and a 403 from elsewhere"
+                "the server's own routes, a 403 from elsewhere and one in another contract"
             );
         }
         block_on(held.schema("discovery")).ok();
@@ -2165,7 +2190,8 @@ mod tests {
     }
 
     /// A Blob cell is null, or a reference, only by the server's word: a 404 or a redirect
-    /// without the contract header comes from something in between.
+    /// without the contract header comes from something in between, and the read fails as one
+    /// that did not reach the server.
     #[test]
     fn a_blob_cell_is_null_only_by_the_servers_answer() {
         let cell = BlobCell {
@@ -2182,10 +2208,7 @@ mod tests {
             ))
         };
         assert_eq!(head(Some(CONTRACT)).unwrap(), BlobMeta::Null);
-        assert!(matches!(
-            head(None),
-            Err(ReadError::ContractMismatch { served: None })
-        ));
+        assert!(matches!(head(None), Err(ReadError::Transport(_))));
         let redirect = FakeHttpClient::create(|_| async {
             Ok(Response::builder()
                 .status(302)
@@ -2195,7 +2218,7 @@ mod tests {
         });
         assert!(matches!(
             block_on(client(redirect).blob_head("g", &cell, BlobAt::Branch("main"))),
-            Err(ReadError::ContractMismatch { served: None })
+            Err(ReadError::Transport(_))
         ));
     }
 
@@ -2211,6 +2234,123 @@ mod tests {
             client(respond(200, Some(CONTRACT), r#"{"branches":["main"]}"#)).branches("g"),
         );
         assert_eq!(result.unwrap().branches, vec!["main"]);
+    }
+
+    /// How a read ended, its answer dropped.
+    fn ended<T>(result: Result<T, ReadError>) -> Result<(), ReadError> {
+        result.map(|_| ())
+    }
+
+    /// Every read the client makes, sent once to `http`: its name and how it ended.
+    fn every_read(http: Arc<dyn HttpClient>) -> Vec<(&'static str, Result<(), ReadError>)> {
+        let at = client(http);
+        let graph = "g";
+        let cell = cell("d1");
+        let query = QueryRequest {
+            query: "query q() {}".into(),
+            ..QueryRequest::default()
+        };
+        let stored = InvokeStoredQueryRequest::default();
+        let (main, commit) = (BlobAt::Branch("main"), BlobAt::Snapshot("c1"));
+        block_on(async {
+            vec![
+                ("health", ended(at.health().await)),
+                ("readiness", ended(at.readiness().await)),
+                ("graphs", ended(at.graphs().await)),
+                ("discover_graphs", ended(at.discover_graphs().await)),
+                ("schema", ended(at.schema(graph).await)),
+                ("snapshot", ended(at.snapshot(graph, "main").await)),
+                ("query", ended(at.query(graph, &query).await)),
+                ("stored_queries", ended(at.stored_queries(graph).await)),
+                (
+                    "invoke_stored_read",
+                    ended(at.invoke_stored_read(graph, "find", &stored).await),
+                ),
+                ("access", ended(at.access(graph, Some("main"), None).await)),
+                ("branches", ended(at.branches(graph).await)),
+                (
+                    "commit_page",
+                    ended(at.commit_page(graph, "main", 10, None).await),
+                ),
+                ("commit", ended(at.commit(graph, "c1").await)),
+                (
+                    "commit_changes",
+                    ended(at.commit_changes(graph, "c1", None, 10).await),
+                ),
+                ("diff", ended(at.diff(graph, "c1", "c2", None, 10).await)),
+                (
+                    "merge_base",
+                    ended(at.merge_base(graph, "feature", "main").await),
+                ),
+                (
+                    "merge_preview",
+                    ended(at.merge_preview(graph, "feature", "main").await),
+                ),
+                (
+                    "changes",
+                    ended(
+                        at.changes(graph, "main", FeedAt::Start("now"), &[], 10)
+                            .await,
+                    ),
+                ),
+                ("blob_head", ended(at.blob_head(graph, &cell, main).await)),
+                (
+                    "blob_bytes",
+                    ended(at.blob_bytes(graph, &cell, commit, 0..10).await),
+                ),
+            ]
+        })
+    }
+
+    /// An error answer is the server's refusal only when it carries the contract Studio speaks,
+    /// on every read. One without the header, a gateway's 404 or 502, came from something
+    /// between Studio and the server, and the read fails as one that did not reach the server:
+    /// a gateway's 404 on a commit is not the server saying it does not serve the commit, and
+    /// its 502 is not an answer that clears a graph's unavailable mark. One naming another
+    /// contract is a server Studio cannot read.
+    #[test]
+    fn an_error_is_the_servers_refusal_only_with_its_contract_header() {
+        for status in [404, 502] {
+            for (read, ended) in every_read(respond(status, None, r#"{"error":"not here"}"#)) {
+                match ended {
+                    Err(ReadError::Transport(reason)) => {
+                        assert!(reason.contains(&status.to_string()), "{read}: {reason}")
+                    }
+                    other => panic!("{read}, answered {status} without the header: {other:?}"),
+                }
+            }
+        }
+        let denied = r#"{"error":"denied","code":"forbidden"}"#;
+        for (read, ended) in every_read(respond(403, Some(CONTRACT), denied)) {
+            assert!(
+                matches!(&ended, Err(ReadError::Refused(refusal))
+                    if refusal.status == 403 && refusal.message == "denied"),
+                "{read}: {ended:?}"
+            );
+        }
+        for (read, ended) in every_read(respond(404, Some("0.13"), r#"{"error":"not found"}"#)) {
+            assert!(
+                matches!(&ended, Err(ReadError::ContractMismatch { served: Some(served) })
+                    if served == "0.13"),
+                "{read}: {ended:?}"
+            );
+        }
+
+        // The server's own 404 on a commit is its refusal.
+        let not_found = r#"{"error":"commit not found","code":"not_found"}"#;
+        let commit = block_on(client(respond(404, Some(CONTRACT), not_found)).commit("g", "c9"));
+        assert!(
+            matches!(&commit, Err(ReadError::Refused(refusal))
+                if refusal.status == 404 && refusal.code == Some(crate::api::ErrorCode::NotFound)),
+            "{commit:?}"
+        );
+        let gateway =
+            block_on(client(respond(502, None, "<html>bad gateway</html>")).commit("g", "c9"));
+        assert_eq!(
+            gateway.unwrap_err().to_string(),
+            "Could not reach the server: something between Studio and the server answered 502 \
+             Bad Gateway"
+        );
     }
 
     /// Answers 429 (`Retry-After: 0`) `limited` times, then 200; counts the requests.
