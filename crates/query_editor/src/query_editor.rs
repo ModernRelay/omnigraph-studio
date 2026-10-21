@@ -243,10 +243,16 @@ pub fn init(cx: &mut App) {
                 queries_panel::QUERIES_PANEL,
                 "Queries",
                 IconName::FileCode,
-                panel.into(),
+                panel.clone().into(),
                 cx,
             );
             workspace.set_panel_actions(queries_panel::QUERIES_PANEL, actions.into(), cx);
+            // Shown from its button or its key, the panel takes the keyboard: ↑ ↓ and ↵.
+            workspace.set_panel_focus(
+                queries_panel::QUERIES_PANEL,
+                move |cx| Some(gpui::Focusable::focus_handle(panel.read(cx), cx)),
+                cx,
+            );
         }
         workspace.register_action(|workspace, action: &OpenQueryFile, window, cx| {
             match &action.path {

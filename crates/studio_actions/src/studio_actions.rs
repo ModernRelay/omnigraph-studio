@@ -507,6 +507,22 @@ pub mod query {
     );
 }
 
+pub mod queries {
+    use gpui::actions;
+
+    actions!(
+        studio_queries,
+        [
+            /// Select the next query in the Queries panel.
+            SelectNext,
+            /// Select the previous query in the Queries panel.
+            SelectPrevious,
+            /// Open the query selected in the Queries panel.
+            OpenSelected,
+        ]
+    );
+}
+
 pub mod history {
     use gpui::actions;
 

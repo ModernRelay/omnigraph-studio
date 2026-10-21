@@ -41,6 +41,9 @@ Run against the sample graph (200 people, 25 companies, 40 projects):
 script/dev-server    # serves knowledge and notes on 127.0.0.1:8787, token dev-token
 ```
 
+It stops, saying which, when either binary speaks another contract: the CLI by its
+`version --json`, the started server by the contract header its `/healthz` answers with.
+
 ```bash
 OMNIGRAPH_STUDIO_SERVER=http://127.0.0.1:8787 OMNIGRAPH_STUDIO_TOKEN=dev-token \
   OMNIGRAPH_STUDIO_GRAPH=knowledge cargo run

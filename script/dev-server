@@ -8,7 +8,8 @@
 #
 # Needs an OmniGraph that speaks HTTP contract 0.14 (`omnigraph` and `omnigraph-server`; until 0.14
 # is released, the edge build `edge-20261020-7fd9cc9` or later, named by OMNIGRAPH_BIN and
-# OMNIGRAPH_SERVER_BIN when not on PATH).
+# OMNIGRAPH_SERVER_BIN when not on PATH). Both are checked: the CLI's `version --json`, and the
+# contract header of the started server's /healthz.
 # Data lives in dev/.data; 0.14 stamps it format 16 on its first write, which 0.13 cannot open.
 set -euo pipefail
 
@@ -67,6 +68,17 @@ for _ in $(seq 1 60); do
   if curl -fsS "http://$BIND/readyz" > /dev/null 2>&1; then break; fi
   sleep 0.5
 done
+
+# The CLI's contract says nothing of the server's: a stale OMNIGRAPH_SERVER_BIN starts, and Studio
+# would refuse it only once it connects. Ask the server itself, as Studio does, by the contract
+# header its /healthz answers with.
+served=$(curl -fsS -o /dev/null -D - "http://$BIND/healthz" 2> /dev/null \
+  | tr -d '\r' | awk -F': *' 'tolower($1) == "omnigraph-http-api" { print $2 }' || true)
+if [[ "$served" != 0.14 ]]; then
+  if [[ -n "$served" ]]; then answer="contract $served"; else answer="no contract"; fi
+  echo "dev-server needs an omnigraph-server that speaks HTTP contract 0.14 (edge-20261020-7fd9cc9 or later); $SERVER answers $answer at http://$BIND/healthz (set OMNIGRAPH_SERVER_BIN)" >&2
+  exit 1
+fi
 
 if [[ $fresh == 1 ]]; then
   [[ -f "$ROOT/dev/seed.jsonl" ]] || python3 "$ROOT/script/dev-seed.py" > "$ROOT/dev/seed.jsonl"

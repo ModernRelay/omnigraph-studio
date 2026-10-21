@@ -56,8 +56,13 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   path so it opens once, and shows the changed dot while its text differs from the file; its
   draft and path come back after a restart. The left dock's Queries panel lists the folder,
   newest first; New query, Open a file… and Show the folder are icon buttons in its title
-  line. The palette's Queries scope lists saved files no tab has open, and the stored queries
-  with their aliases, which ↵ opens (spec 002).
+  line. Its rows take the keyboard as Studio's other lists do: shown from its button or key,
+  the panel has it; ↑ and ↓ move among the rows that open a query (saved files, stored queries,
+  aliases), passing over headers and notes and stopping at either end; ↵ opens the one selected
+  as a click does (`studio_queries::SelectNext`, `SelectPrevious`, `OpenSelected`, bound in the
+  `QueriesPanel` context). The selection keeps to its query as rows come and go and shows
+  while the panel has the keyboard. The palette's Queries scope lists saved files no tab has
+  open, and the stored queries with their aliases, which ↵ opens (spec 002).
 - **Stored queries:** the queries a server runs by name for the graph (declared in
   `cluster.yaml`, applied with `omnigraph cluster apply`; `GET /graphs/{id}/queries` lists them
   with typed parameters and never their text). The session reads the catalog with the graph (a
@@ -249,6 +254,7 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 | 2026-10-20 | Plan names | `engine/explain.rs` (`logical_initial`, `logical`, `physical`, `datafusion`, `plan`), `omnigraph-planner/src/physical.rs` and `engine/operators/hydrate.rs` at `edge-20261020-7fd9cc9`; `query_editor` `plans_become_an_indented_list_under_tree_headers`; `gq_language` `logical_and_physical_operators_find_their_clauses`, `datafusion_operators_find_their_clauses` | `logical_initial` heads "Initial logical plan". `Hydrate` was right: it is DataFusion's `HydrateExec` (the `Exec` is dropped before matching); `HydrateColumns` and `HydrateExec` light the `return`. `HydrateByAddress` is planned only for diffs and merges (`optimizer.rs`, `LogicalNode::Join` and `MergeClassify`), never for a query or a load, so nothing in the editor's plans needs it |
 | 2026-10-20 | F32 parameters | `json_value_to_literal_typed` (`omnigraph-compiler/src/query_input.rs`) takes any finite number for F32, but the v2 binding of every declared parameter (`engine/typed_value.rs`, `validate_params` → `typed_scalar`) refuses one infinite as a Float32, and its test `direct_parameter_values_are_checked_even_without_a_consumer` holds an F32 of `f64::MAX` refused | Studio's refusal of `1e39` for F32 is the engine's; the test comment now says which step refuses it |
 | 2026-10-20 | Saved queries follow the graph's key, not its server's name | `graph_store` `named_keys` tests `saved_queries_move_to_the_graphs_key_without_writing_over_one` (neither folder, the name's only, both), `a_graph_opening_takes_its_saved_queries_along` (a `GraphSession` made for `dev` at `http://127.0.0.1:8787`), `a_name_resolves_only_to_a_known_server`; `studio_settings` `query_folders_are_safe_names_per_graph`; every caller of the removed `GraphSession::settings_key` (Queries panel, ⌘S, ⌘⇧S, the palette's Queries scope) now on `overrides_key` | With neither folder nothing is made; the name's alone is renamed whole; with both, `a.gq` moved, `b.gq` kept the key's text ("new b") and stayed in the old folder with `notes.txt`. Opening the graph moved `people.gq` to `queries/http_~~127.0.0.1_8787~moved-queries`. Not yet seen in the running app on a renamed CLI target |
+| 2026-10-20 | The Queries panel's rows are reached by keys | `query_editor` test `queries_panel::tests::the_rows_are_selected_and_opened_by_keys` (a saved file and two stored queries served with the contract header: ↓ to the file, ↵, ↓ past the Stored header, ↓↓ stopping at the last, ↑ ↵; a file saved above keeps the selection on its query); `studio` `keymaps` test (each new action bound on macOS, Linux and Windows) | Pass: ↵ dispatched `OpenQueryFile` with the file's path, then `OpenStoredQuery` for `people_titled`; the pattern is the relationship tree's (actions in `studio_actions`, bindings in the keymaps, the panel's focus given by `set_panel_focus`) |
 | 2026-10-20 | Run reuses the check | `query_editor` `a_run_reuses_the_check_of_the_same_text` | A held check of the same text and schema answers Run and Confirm; text changed since is checked again |
 
 

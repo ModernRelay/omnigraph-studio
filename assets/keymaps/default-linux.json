@@ -264,6 +264,14 @@
     }
   },
   {
+    "context": "QueriesPanel",
+    "bindings": {
+      "up": "studio_queries::SelectPrevious",
+      "down": "studio_queries::SelectNext",
+      "enter": "studio_queries::OpenSelected"
+    }
+  },
+  {
     "context": "Ontology",
     "bindings": {
       "escape": "studio_ontology::Back",
