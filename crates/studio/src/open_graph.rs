@@ -82,8 +82,8 @@ impl OpenGraphModal {
         let connections = registry.read(cx).connections.clone();
         // A reload of the operator's files can add, drop or replace servers: the dialog lists
         // and follows what the registry holds now.
-        let observe = cx.observe(&registry, |this, registry, cx| {
-            this.follow(registry.read(cx).connections.clone(), cx)
+        let observe = cx.observe_in(&registry, window, |this, registry, window, cx| {
+            this.follow(registry.read(cx).connections.clone(), window, cx)
         });
         Self::build(workspace, connections, vec![observe], window, cx)
     }
@@ -104,7 +104,8 @@ impl OpenGraphModal {
         let replacement_token = input("New token", window, cx);
         replacement_token.update(cx, |editor, cx| editor.set_masked(true, cx));
         // An error is about what was typed: typing again clears it. Typing in a field puts the
-        // keyboard there, so ↵ uses what was typed.
+        // keyboard there, so ↵ uses what was typed. A field the dialog clears while the
+        // keyboard is elsewhere was not typed in.
         for (editor, place) in [
             (&graph_id, Some(Place::GraphId)),
             (&new_url, None),
@@ -114,8 +115,10 @@ impl OpenGraphModal {
             subscriptions.push(cx.subscribe_in(
                 editor,
                 window,
-                move |this, _, event: &EditorEvent, _, cx| {
-                    if let EditorEvent::BufferEdited = event {
+                move |this, editor, event: &EditorEvent, window, cx| {
+                    if let EditorEvent::BufferEdited = event
+                        && editor.focus_handle(cx).is_focused(window)
+                    {
                         this.error = None;
                         if place.is_some() {
                             this.cursor = place.clone();
@@ -148,7 +151,7 @@ impl OpenGraphModal {
             error: None,
             _subscriptions: subscriptions,
         };
-        this.follow(connections, cx);
+        this.follow(connections, window, cx);
         this
     }
 
@@ -156,7 +159,12 @@ impl OpenGraphModal {
     /// checked while the dialog shows it; one the registry dropped or replaced (a reload of the
     /// operator's files makes a new connection for a changed address) is not any more. A
     /// selection the registry no longer holds moves to one it does.
-    fn follow(&mut self, connections: Vec<Entity<Connection>>, cx: &mut Context<Self>) {
+    fn follow(
+        &mut self,
+        connections: Vec<Entity<Connection>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let listed = |id: EntityId| connections.iter().any(|c| c.entity_id() == id);
         self.followed.retain(|(id, ..)| listed(*id));
         for connection in &connections {
@@ -173,7 +181,7 @@ impl OpenGraphModal {
             .as_ref()
             .is_some_and(|selected| !connections.contains(selected))
         {
-            self.selected = first_choice(&connections, cx);
+            self.choose(first_choice(&connections, cx), window, cx);
             if let Some(connection) = &self.selected {
                 connection.update(cx, |c, cx| c.connect_if_idle(cx));
             }
@@ -252,7 +260,7 @@ impl OpenGraphModal {
                     .cloned()
                 {
                     connection.update(cx, |c, cx| c.connect_if_idle(cx));
-                    self.selected = Some(connection);
+                    self.choose(Some(connection), window, cx);
                     self.error = None;
                 }
                 window.focus(&self.focus_handle, cx);
@@ -276,7 +284,7 @@ impl OpenGraphModal {
         else {
             return;
         };
-        self.select(connection.clone(), cx);
+        self.select(connection.clone(), window, cx);
         let c = connection.read(cx);
         let next = match c.graph_ids().into_iter().next() {
             Some(graph) => Some(Place::Graph(graph)),
@@ -323,7 +331,12 @@ impl OpenGraphModal {
         cx.notify();
     }
 
-    fn select(&mut self, connection: Entity<Connection>, cx: &mut Context<Self>) {
+    fn select(
+        &mut self,
+        connection: Entity<Connection>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if matches!(
             connection.read(cx).state,
             ConnectionState::Idle | ConnectionState::Unreachable(_)
@@ -331,10 +344,36 @@ impl OpenGraphModal {
             connection.update(cx, |c, cx| c.connect(cx));
         }
         self.cursor = Some(Place::Server(connection.entity_id()));
-        self.selected = Some(connection);
+        self.choose(Some(connection), window, cx);
         self.adding = false;
         self.error = None;
         cx.notify();
+    }
+
+    /// Makes `connection` the server chosen, by a click, the keyboard or the registry dropping
+    /// the one chosen. A new token typed for another server is that server's alone: the field
+    /// and its error are cleared, so Update token never sends it to this server's address nor
+    /// saves it under this server's keychain entry.
+    fn choose(
+        &mut self,
+        connection: Option<Entity<Connection>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected == connection {
+            return;
+        }
+        self.selected = connection;
+        self.error = None;
+        let field = self.replacement_token.clone();
+        if field.read(cx).text(cx).is_empty() {
+            return;
+        }
+        // The keyboard leaves the field it was in, which shows another server's token now.
+        if field.focus_handle(cx).is_focused(window) {
+            window.focus(&self.focus_handle, cx);
+        }
+        field.update(cx, |editor, cx| editor.set_text("", window, cx));
     }
 
     fn open(&mut self, graph_id: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -414,15 +453,15 @@ impl OpenGraphModal {
             // it is selected, followed and connected once, as it was.
             Ok(connection) if listed.contains(&connection.entity_id()) => {
                 let name = connection.read(cx).server.name.clone();
-                self.select(connection, cx);
+                self.select(connection, window, cx);
                 self.error = Some(format!("{name} has that address already.").into());
                 cx.notify();
             }
             Ok(connection) => {
                 // Followed now, before the registry's notice reaches the dialog.
-                self.follow(registry.read(cx).connections.clone(), cx);
+                self.follow(registry.read(cx).connections.clone(), window, cx);
                 connection.update(cx, |c, cx| c.connect(cx));
-                self.select(connection, cx);
+                self.select(connection, window, cx);
                 // A second server is typed fresh, not added again from the first one's fields.
                 for editor in [&self.new_name, &self.new_url, &self.new_token] {
                     editor.update(cx, |editor, cx| editor.set_text("", window, cx));
@@ -493,8 +532,8 @@ impl OpenGraphModal {
                                         .truncate(),
                                     ),
                             )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.select(connection.clone(), cx)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.select(connection.clone(), window, cx)
                             }))
                     }),
             )
@@ -893,6 +932,77 @@ mod tests {
         assert!(dismissed.get(), "↵ on a graph opens it");
     }
 
+    /// A new token typed for one refused server is gone once another is chosen, by a click, by
+    /// the keyboard or by the registry dropping the first: Update token then asks for one
+    /// rather than sending the first server's to the second's address.
+    #[gpui::test]
+    fn a_token_typed_for_one_server_is_cleared_when_another_is_chosen(cx: &mut TestAppContext) {
+        let alpha = server(&["one"], cx);
+        let beta = server(&["two"], cx);
+        for connection in [&alpha, &beta] {
+            connection.update(cx, |connection, _| {
+                connection.state = ConnectionState::Unauthorized
+            });
+        }
+        let (modal, cx) = dialog(vec![alpha.clone(), beta.clone()], cx);
+        let field = modal.read_with(cx, |modal, _| modal.replacement_token.clone());
+        let typed = |cx: &mut VisualTestContext| field.read_with(cx, |field, cx| field.text(cx));
+        let type_token = |token: &str, cx: &mut VisualTestContext| {
+            modal.update_in(cx, |modal, window, cx| {
+                modal.move_to(Place::Token, window, cx)
+            });
+            cx.simulate_input(token);
+            assert_eq!(typed(cx), token);
+        };
+        let selected =
+            |cx: &mut VisualTestContext| modal.read_with(cx, |modal, _| modal.selected.clone());
+
+        // Typed for alpha, then beta clicked.
+        type_token("alpha-secret", cx);
+        modal.update_in(cx, |modal, window, cx| {
+            modal.select(beta.clone(), window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(selected(cx), Some(beta.clone()));
+        assert_eq!(typed(cx), "", "the click clears it");
+        modal.update_in(cx, |modal, window, cx| modal.update_token(window, cx));
+        assert_eq!(
+            modal.read_with(cx, |modal, _| modal.error.clone()),
+            Some("Enter the new token.".into()),
+            "nothing is sent"
+        );
+        assert!(!cx.update(|window, cx| field.focus_handle(cx).is_focused(window)));
+
+        // Typed for beta, then ↑ to alpha.
+        type_token("beta-secret", cx);
+        cx.dispatch_action(menu::SelectPrevious);
+        cx.dispatch_action(menu::SelectPrevious);
+        cx.run_until_parked();
+        assert_eq!(selected(cx), Some(alpha.clone()));
+        assert_eq!(typed(cx), "", "the keyboard clears it");
+        assert_eq!(
+            modal.read_with(cx, |modal, _| modal.cursor.clone()),
+            Some(Place::Server(alpha.entity_id())),
+            "and stays on the server"
+        );
+
+        // Typed for alpha, which the registry then drops.
+        type_token("alpha-again", cx);
+        modal.update_in(cx, |modal, window, cx| {
+            modal.follow(vec![beta.clone()], window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(selected(cx), Some(beta.clone()));
+        assert_eq!(typed(cx), "", "a server dropped takes its token along");
+
+        // The same server chosen again keeps what was typed for it.
+        type_token("beta-kept", cx);
+        modal.update_in(cx, |modal, window, cx| {
+            modal.select(beta.clone(), window, cx)
+        });
+        assert_eq!(typed(cx), "beta-kept");
+    }
+
     /// A reload that replaces a server (a new address in the CLI config) is followed: the new
     /// connection's state changes reach the dialog, the old one's no longer do, and the choice
     /// moves off the server that left.
@@ -912,8 +1022,8 @@ mod tests {
             let drawn = drawn.clone();
             cx.observe(&modal, move |_, _| drawn.set(drawn.get() + 1))
         });
-        modal.update(cx, |modal, cx| {
-            modal.follow(vec![alpha.clone(), replacement.clone()], cx)
+        modal.update_in(cx, |modal, window, cx| {
+            modal.follow(vec![alpha.clone(), replacement.clone()], window, cx)
         });
         cx.run_until_parked();
         assert_eq!(

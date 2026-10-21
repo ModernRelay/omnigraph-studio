@@ -51,9 +51,12 @@ dialog by keyboard), X (capabilities from the served document).
 
 1. Every server the CLI's targets name. Tokens are resolved exactly as the CLI does; Studio
    never writes the CLI's files. It reads them again when
-   `config.yaml` or `credentials` changes (their modification time and size, checked every
-   2 s off the main thread): a server added there joins the list, one removed leaves it (a
-   window open on it keeps its connection), one at a new address is a new connection, a
+   `config.yaml` or `credentials` changes (their modification time, size and permissions,
+   checked every 2 s off the main thread, so a `chmod 600` on `credentials` is seen at the next
+   check): a server added there joins the list, one removed leaves it (a window open on it keeps
+   its connection), one at a new address is a new connection, a target renamed on the same
+   endpoint is the same connection, renamed in place, which the windows open on it keep and a
+   later `omnigraph login` reaches (servers are matched by address, since 2026-10-21), a
    target's graph is added, and a token changed there (`omnigraph login`) replaces the
    connection's, which a connection in use checks at once. Every session on the connection
    then forgets every answer its read memo kept with the old one, which may have seen more, and
@@ -99,16 +102,22 @@ dialog by keyboard), X (capabilities from the served document).
    is shown on the server that target lands on, and under the target's `default_graph` when it
    names no graph.
 2. Servers added in Studio (URL, optional token). Tokens go to the OS keychain through GPUI's
-   credentials API; the server list goes to Studio's settings. A token typed while the
+   credentials API; the server list goes to `servers.json` in the data directory. One that
+   cannot be read or parsed is set aside as `servers.json.unreadable-<seconds>` and named in a
+   toast ("Servers at start: Studio's saved servers could not be read (…)"), and one that
+   cannot be set aside is never saved over (since 2026-10-21). A token typed while the
    keychain is still being read at start stands when the keychain answers after it.
    An address is made a server root before it is used (`graph_client::server_root`): trimmed,
    without a trailing slash, with `http://` added for a loopback host (`localhost`, `127.*`,
    `[::1]`) and `https://` for any other when no scheme is given; anything but an `http(s)`
    URL with a host, or one holding a user name or password, is refused with the reason. The
-   same rule applies to addresses from the CLI config, the environment and a saved list, so
-   an entry saved before it (`localhost:8080`) loads as `http://localhost:8080`, its token
-   copied to the new address. `GraphClient::new` refuses an unusable root rather than
-   building URLs on it.
+   same rule applies to addresses from the CLI config and the environment. Studio's saved list
+   holds each address as `add_server` checked it, scheme included, and is read as written:
+   nothing converts an entry saved without a scheme (`localhost:8080`), which the toast of the
+   servers' problems at start names with its reason (Corrections, 2026-10-18). Those toasts
+   read "Servers at start: …", a prefix true of a server not added and of a saved list not read
+   alike (since 2026-10-21; before, "A server could not be added: …" headed both).
+   `GraphClient::new` refuses an unusable root rather than building URLs on it.
 3. Graph ids for a server come from, in order: `GET /graphs` when allowed; else
    `GET /graphs/discovery`, which names the graphs an identity credential (managed or OIDC)
    may know of, with no state; its targets' `default_graph`s; graph ids the person typed
@@ -118,8 +127,9 @@ dialog by keyboard), X (capabilities from the served document).
 ### Connecting
 
 1. `HEAD /healthz` with a 5 s bound. Read the contract header.
-2. Compare with the contracts `graph_client` speaks (only `0.13` today). Mismatch: state
-   `contract mismatch`, with the server's version and "Studio speaks 0.13".
+2. Compare with the contracts `graph_client` speaks (only `0.14` today, `CONTRACT`). Mismatch:
+   state `contract mismatch`, which reads "Server speaks 0.13; Studio speaks 0.14" for a 0.13
+   server.
 3. Capabilities: every route Studio uses is served by its minimum server (0.14, or the edge
    build before it), so connecting reads no capability set. A surface that comes to use a newer
    route reads `GET /openapi.json` and asks which operation ids exist, never the version string
@@ -131,7 +141,9 @@ dialog by keyboard), X (capabilities from the served document).
 5. Re-check health every 30 s and on wake from sleep while something shows the server: a
    window showing one of its graphs (a parked graph does not count), or the Open dialog listing
    it (`Connection::watch`); back off to 2 min after failures. A check that comes while nothing
-   shows it is skipped and the checks stop; the next watch checks at once.
+   shows it is skipped and the checks stop; the next watch checks at once. A graph list that
+   failed is read again when something next watches the server and on a graph's Refresh
+   (`Connection::list_graphs_again`, since 2026-10-21).
 
 ### The Open dialog
 
@@ -143,7 +155,11 @@ id field, wrapping around (constitution VIII). Moving to a server chooses it and
 graphs, connecting it if it never was; one that could not be reached is tried again with ↵
 or Retry, not at every key that passes it. ↵ on a server goes to its first graph (to the id
 field when a ready server lists none), ↵ on a graph opens it, and ↵ in a field uses what was
-typed. While a server is added, Tab moves through that form's fields. The dialog lists the
+typed. A new token typed for a server that refused its token is that server's alone: choosing
+another, by a click, by the keyboard or by the registry dropping the one chosen, clears the field
+and its error, so Update token never sends it to another address nor saves it under another
+server's keychain entry (since 2026-10-21; before, one field served every server and kept what
+was typed). While a server is added, Tab moves through that form's fields. The dialog lists the
 registry's servers as they are now: a reload of the CLI's files that adds, drops or replaces
 one (a new address is a new connection) is followed, so the replacement's state shows and the
 dropped one's no longer reaches the dialog; a choice the registry no longer holds moves to one
@@ -154,7 +170,7 @@ it does.
 | State | Chip | What the person can do |
 |---|---|---|
 | connecting | grey, "Connecting…" | wait; cancel |
-| ready | green, "server · 0.13" | everything the token allows |
+| ready | green, "contract 0.14" | everything the token allows |
 | contract mismatch | amber | open in the CLI; nothing else |
 | unauthorized (401) | red | update token |
 | unreachable | red, last error | retry; requests in flight are marked unknown, never resent |
@@ -164,9 +180,14 @@ it does.
 
 - Built on Zed's `http_client::HttpClient` (Apache-2.0): `reqwest_client` in the app, the fake
   client in tests.
-- Every request sets `Authorization: Bearer`, `omnigraph-http-api: 0.13`, and a bounded
+- Every request sets `Authorization: Bearer`, `omnigraph-http-api: 0.14`, and a bounded
   timeout. Every response is checked for the contract header; a write response without it is an
-  **unknown** outcome.
+  **unknown** outcome. A read's error without it came from something between Studio and the
+  server (a proxy, a gateway) and is no refusal: the read fails as one that did not reach the
+  server (`ReadError::Transport`), so a gateway's 404 or 502 neither says the server lacks what
+  was asked nor marks or clears a graph's availability. An answer naming another contract is a
+  contract mismatch (since 2026-10-21; before, a read took any error status for the server's
+  refusal).
 - 429 honours `Retry-After` for reads only. Writes are never retried (constitution III).
 - Error bodies are parsed into the typed `ErrorOutput` (code, diagnostic, merge conflicts,
   precondition failure, resource limit, …) and surfaced as such.
@@ -176,9 +197,10 @@ it does.
   (0.13 refuses past its read ingress cap, 64 by default, with "read ingress count cap 64
   exceeded"), and a view that counts every relationship of a node at once would otherwise be
   refused for some of them. A read waiting out a 429 does so without its slot.
-- A read at a commit is answered once per session: the answer is kept (256 reads, 2,048 Blob
-  cells, least recently used out first) and an identical read under way is shared, since a
-  commit never changes. Failures are not kept, and reads at the branch head always go out. A
+- A read at a commit is answered once per session: the answer is kept (up to 4,096 answered
+  reads and 2,048 Blob cells, least recently used out first) and an identical read under way is
+  shared, since a commit never changes. Failures are not kept, and reads at the branch head
+  always go out. A
   new token forgets every answer kept, and a read still out when it changed keeps nothing: the
   new token may see less, and its refusals are shown (constitution IV). The type counts, the
   stored-query catalog and the branch list are read again under it; the schema, the heads and
@@ -194,9 +216,11 @@ it does.
   commit before. A head move emits `HeadMoved`; a move from a head already seen that is not
   Studio's own is another writer's commit and emits `Committed`, so head commits and counts are
   read again as after Studio's own. A changed branch list emits `BranchesChanged`, so a branch
-  made or deleted outside Studio appears; an unchanged one says nothing. No poll goes out while
-  no window is active, while the graph is unavailable, or while its window parked it to show
-  another graph; shown again after a poll came meanwhile, it asks at once.
+  made or deleted outside Studio appears; an unchanged one says nothing. Branch lists are
+  taken in the order they were asked for: one answering after a newer one was taken is ignored
+  (since 2026-10-21). No poll goes out while no window is active, while the graph is
+  unavailable, or while its window parked it to show another graph; shown again after a poll
+  came meanwhile, it asks at once.
 - Each branch's newest commit is read once (a page of one) and shared by the views that show
   it (the history's tags, the branches panel); a commit Studio makes on a branch drops that
   branch's, reading the branch list again drops those of the branches that came or went (its
@@ -231,10 +255,16 @@ it does.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | A read takes an error for the server's only with the contract header | `graph_client` at `abe09ad`: `an_error_is_the_servers_refusal_only_with_its_contract_header` (all 20 reads: a 404 and a 502 without the header, a 403 with it, a 404 naming 0.13), `a_blob_cell_is_null_only_by_the_servers_answer`, `a_refusal_on_a_graph_is_counted_for_that_graph_alone` (a 403 naming 0.13); `check_contract` and `refusal` in `client.rs` | Without the header every read fails as `Transport` naming the status; with it, `Refused`; naming 0.13, `ContractMismatch` |
+| 2026-10-21 | The contract the plan names is the one Studio speaks | `graph_client::CONTRACT` (`0.14`) and `ConnectionState::label` (`contract 0.14`, "Server speaks …; Studio speaks 0.14") | The request header, the comparison and the ready chip said 0.13; corrected. The facts about OmniGraph `v0.13.0` above and the older rows stay as checked then |
+| 2026-10-21 | The saved list, a renamed target, a `chmod`, a failed graph list and the branch lists' order | `graph_store` at `43ad4f3`: `an_unreadable_server_list_is_set_aside_and_said`, `a_renamed_cli_target_keeps_its_connection`, `reads_servers_with_their_tokens_and_stamps_the_files` (a permissions change alone changes the stamp), `a_graph_list_that_failed_is_read_again_when_next_shown`, `an_older_branch_list_landing_last_does_not_replace_a_newer_one`; `studio_workspace` `a_start_notice_says_only_what_happened` | Written here from that commit and its tests, read against `registry.rs`, `cli_config.rs` and `connection.rs`. The saved list's notice reached the toast as "A server could not be added: Studio's saved servers could not be read …"; it reads "Servers at start: …" now, as every start problem does |
+| 2026-10-21 | A token typed for one refused server never reaches another | `studio` `a_token_typed_for_one_server_is_cleared_when_another_is_chosen` (two servers that refused their tokens: a token typed for the first, then the second clicked; one typed for the second, then ↑↑; one typed for the first, then the registry's list without it; one typed and its own server clicked again) | Each change of server left the field empty, its error gone and the keyboard off the field; Update token then said "Enter the new token." and sent nothing; the same server clicked again kept what was typed. Before, `select`, `move_to` and `follow` changed `selected` and left the one shared field as it was, so Update token sent the first server's token to the second's address and saved it under the second's keychain entry |
+| 2026-10-21 | The read memo keeps up to 4,096 answered reads | `graph_store/src/session.rs` `PINNED_READS` (4,096, with `PINNED_READ_BYTES`) and `PINNED_BLOBS` (2,048), read at `a073bf1` | The plan said 256 reads; corrected to the constant |
+| 2026-10-21 | No conversion of saved addresses remains | `graph_store/src/registry.rs` `ConnectionRegistry::load` (a saved server is added at its saved address; `add_connection` refuses an unusable root into the start errors); `6f69def` removed the conversion | The plan still said an entry saved without a scheme loaded with `http://` and its token copied; that text is removed (Corrections) |
 | 2026-10-21 | A parked graph reads nothing for a new token until it is shown | `graph_store` `a_new_token_reads_access_and_every_answer_again`, extended: the session parked (`set_shown(false)`), the token replaced, then shown again | Parked: no request at all (no `/access`, `/snapshot`, `/queries` or `/branches`), Person's count gone and the branch list and catalog loading. Shown: each of the three read once and `/access` once, the new token's answer allowing change, Person 7 again. Before, `sync_access` → `read_again_for_credential` read all four for every session on the connection, parked or shown |
 | 2026-10-21 | A new token reads the counts, the stored-query catalog and the branch list again | `graph_store` `a_new_token_reads_access_and_every_answer_again`, extended: the fake answers `/snapshot` (Person: 7), `/queries` and `/branches`, and lists what is asked; `GraphSession::read_again_for_credential` from `sync_access`; at `7fd9cc9` `server_branch_list`, `server_schema_get` (a read with no branch) and `server_list_queries` (a read on main) in `omnigraph-server/src/handlers.rs` | Before, `forget_reads` cleared the read memo only: the old token's counts, catalog and branch list stayed shown. Now, right after the token changes, `count_of(Person)` is none and the branch list and catalog are loading; then each of `/snapshot`, `/queries` and `/branches` is asked once under the new token, and Person shows 7 again. The schema, the heads and the change logs stay, as `docs/architecture.md` says |
 | 2026-10-21 | A new token reads what it may do at once and forgets what the old one read | `graph_store` test `a_new_token_reads_access_and_every_answer_again` (a server answering `/access` by the bearer token; the session opened with a read-only token whose access read is held); `graph_client` `a_replaced_token_reaches_every_clone` (only a token that differs counts as a credential change); `access` `a_forgotten_answer_is_read_again`. The same session test against the earlier code, by reading: `Connection::set_token` moved the client's count and nothing subscribed to it, and `Access::landed` compared only its own generation | The write-capable token's access read went at once, with no write, and allowed changing main; the read-only answer released after it landed nowhere; a read at commit c1 kept under the old token was asked again under the new; the narrower token's own answer refused change. A 403 on a write read access again (one read) and kept the answers. Before: the table kept "Your credential may not change main" until a branch move or a write, the held answer landed, and the memo answered without asking |
-| 2026-10-21 | Only a 403 on a graph says its policy may have changed | `graph_client` test `a_refusal_on_a_graph_is_counted_and_one_on_the_server_is_not` (a 403 from `GET /graphs`, `/graphs/discovery`, and one without the contract header; then a read, a write and a forwarded request on a graph, one named `discovery` among them) | The server's own routes counted nothing, the graph's three; neither moved the credential count. Before, the connect probe's `/graphs` refusal, which a static token always gets, forgot every access answer at each connect |
+| 2026-10-21 | Only a 403 on a graph says its policy may have changed | `graph_client` test `a_refusal_on_a_graph_is_counted_for_that_graph_alone` (a 403 from `GET /graphs`, `/graphs/discovery`, and one without the contract header; then a read, a write and a forwarded request on a graph, one named `discovery` among them) | The server's own routes counted nothing, the graph's three; neither moved the credential count. Before, the connect probe's `/graphs` refusal, which a static token always gets, forgot every access answer at each connect |
 | 2026-10-21 | An address is one connection | `graph_store` tests `targets_on_one_endpoint_are_one_server` (a file as `omnigraph target import` writes it, with `defaults.target: default`, an anonymous target on the same endpoint, and two targets on another endpoint, the anonymous one first in the file), `cli_servers_follow_the_cli_files` (a server added in Studio at an address two CLI targets then name, one of them moved there) | Three servers: the imported one (named like its owner, both default graphs, its token), the other endpoint's as its first target with its default graph, and the plain one; the anonymous target beside `default` and the keyed one after the first were named in the toast with the target Studio connects as and why, their aliases on no server. The Studio server stayed the address's one connection, both CLI targets named, the moved one's old connection gone. Before, the anonymous target was a second connection to the same address |
 | 2026-10-21 | A token typed while the keychain is read stands | `graph_store` test `a_connect_waits_for_its_token_and_a_cancel_stays` (the keychain's answer given after a token was set) | Nothing sent with the keychain's token; before, `token_read` replaced the typed token unconditionally |
 | 2026-10-21 | Health is checked only while something shows the server, and a parked graph polls nothing | `graph_store` tests `health_is_checked_only_while_the_server_is_watched` (simulated clock), `the_head_watch_sees_other_writers_commits_while_a_window_is_active` (parked, two polls and an activation, then shown); `studio_workspace` `a_graph_reopened_behind_opens_its_tabs_when_first_shown` (a graph added behind and one shown, then switched) | No check while nothing watched, through three intervals; a watch checked at once and then at each interval; dropped, none. Parked, no head probe or branch list at the polls or on activation; shown, one probe at once that saw the newer head. Behind and switched-from graphs were not shown, the shown one was. Before, every server connected once was checked every 30 s for the rest of the run, and every parked graph polled its heads and branches |
@@ -271,3 +301,9 @@ it does.
 - 2026-10-12 · The client followed redirects: reqwest's default follows up to ten, and nothing
   overrode it. Every request now sets `RedirectPolicy::NoFollow`, so a Blob's external
   reference (302 with its URI) is reported and never fetched.
+
+- 2026-10-18 · The conversion of server addresses saved without a scheme (`localhost:8080`
+  loaded as `http://localhost:8080`, its keychain token copied to the new address) was removed
+  (`6f69def`): every release saves an address as `add_server` checked it. This plan described
+  it until 2026-10-21. Graph data filed under a server's name is not converted either (spec
+  002, 2026-10-21).
