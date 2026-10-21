@@ -13,10 +13,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::channel::{mpsc, oneshot};
 use futures::{AsyncReadExt as _, AsyncWriteExt as _};
+use graph_client::api::CommitKind;
 use graph_client::{
     AsyncBody, CONTRACT, CONTRACT_HEADER, ForwardRequest, GraphClient, HeaderMap, Method,
     StatusCode, WriteOutcome,
 };
+use serde::Deserialize as _;
 use serde_json::{Value, json};
 use smol::net::{TcpListener, TcpStream};
 
@@ -84,9 +86,11 @@ pub enum Seen {
     },
     /// The server held the write as a commit no branch shows (a stored mutation written `as
     /// commit` or `as unattached branch`, whose text the gateway never sees): it went through,
-    /// and the agent's branch did not move.
+    /// and the agent's branch did not move. `kind` says what the commit is: a proposal
+    /// (`Unpublished`), a snapshot (`Unattached`), or one this build does not know (`Other`).
     Unpublished {
         commit: String,
+        kind: CommitKind,
     },
     Refused(String),
     Unknown(String),
@@ -474,10 +478,11 @@ async fn read_write_answer(
 fn seen_committed(json: &Value) -> Seen {
     let commit = json.get("commit").filter(|commit| !commit.is_null());
     if let Some(commit) = commit
-        && !is_published(commit)
+        && let Some(kind) = held_kind(commit)
     {
         return Seen::Unpublished {
             commit: id_of(commit).unwrap_or_default(),
+            kind,
         };
     }
     Seen::Committed {
@@ -495,14 +500,22 @@ fn id_of(json: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Whether a write's commit is one of a branch's history: an unpublished commit (`kind:
-/// unpublished`) or an unattached snapshot (`kind: unattached`) is readable by its id and shown
-/// by no branch. A kind this build does not know is read by `published`, and a commit that
-/// says neither as published, as Studio's own writes read it.
-fn is_published(commit: &Value) -> bool {
-    match commit.get("kind").and_then(Value::as_str) {
-        Some("unpublished" | "unattached") => false,
-        _ => commit.get("published").and_then(Value::as_bool) != Some(false),
+/// The kind of a write's commit when no branch shows it, `None` when it is one of a branch's
+/// history. The commit's `kind` decides, as it does for Studio's own writes: a proposal
+/// (`unpublished`) or a snapshot (`unattached`) is readable by its id and shown by no branch. A
+/// kind this build does not know is held as that unknown kind when the commit says `published:
+/// false`, and is on the branch otherwise; a commit with no kind is a proposal when it says
+/// `published: false`, as the server reads a receipt written before commits had kinds.
+fn held_kind(commit: &Value) -> Option<CommitKind> {
+    let says_held = commit.get("published").and_then(Value::as_bool) == Some(false);
+    let kind = commit
+        .get("kind")
+        .map(|kind| CommitKind::deserialize(kind).unwrap_or(CommitKind::Other));
+    match kind {
+        Some(CommitKind::Published) => None,
+        Some(kind @ (CommitKind::Unpublished | CommitKind::Unattached)) => Some(kind),
+        Some(CommitKind::Other) => says_held.then_some(CommitKind::Other),
+        None => says_held.then_some(CommitKind::Unpublished),
     }
 }
 
@@ -1169,10 +1182,25 @@ mod tests {
             answer(r#"{"uri":"u","from":"main","name":"b","commit":null}"#),
             committed(None, 0, 0, false)
         );
-        for commit in [
-            r#"{"graph_commit_id":"c3","kind":"unpublished","published":false}"#,
-            r#"{"graph_commit_id":"c3","kind":"unattached","published":false}"#,
-            r#"{"graph_commit_id":"c3","published":false}"#,
+        // A commit no branch shows carries its kind: a proposal, a snapshot, one of a kind this
+        // build does not know, and, with no kind, a proposal as the server reads one.
+        for (commit, kind) in [
+            (
+                r#"{"graph_commit_id":"c3","kind":"unpublished","published":false}"#,
+                CommitKind::Unpublished,
+            ),
+            (
+                r#"{"graph_commit_id":"c3","kind":"unattached","published":false}"#,
+                CommitKind::Unattached,
+            ),
+            (
+                r#"{"graph_commit_id":"c3","kind":"pending","published":false}"#,
+                CommitKind::Other,
+            ),
+            (
+                r#"{"graph_commit_id":"c3","published":false}"#,
+                CommitKind::Unpublished,
+            ),
         ] {
             assert_eq!(
                 answer(&format!(
@@ -1180,8 +1208,24 @@ mod tests {
                         "commit":{commit}}}"#
                 )),
                 super::Seen::Unpublished {
-                    commit: "c3".into()
+                    commit: "c3".into(),
+                    kind,
                 },
+                "{commit}"
+            );
+        }
+        // The kind decides over `published`, and a kind this build does not know, not said to
+        // be held, is on the branch.
+        for commit in [
+            r#"{"graph_commit_id":"c4","kind":"published","published":false}"#,
+            r#"{"graph_commit_id":"c4","kind":"pending"}"#,
+        ] {
+            assert_eq!(
+                answer(&format!(
+                    r#"{{"branch":"b","query_name":"m","affected_nodes":1,"affected_edges":0,
+                        "commit":{commit}}}"#
+                )),
+                committed(Some("c4"), 1, 0, false),
                 "{commit}"
             );
         }

@@ -20,6 +20,7 @@ use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, FollowMode,
     ListAlignment, ListState, Render, SharedString, Subscription, Task, WeakEntity, Window, list,
 };
+use graph_client::api::CommitKind;
 use graph_store::{GraphSession, OutcomeKind};
 use serde_json::{Map, Value};
 use studio_actions::agent::{Allow, AllowAlways, ClearQueue, Reject, Restart, Send, SendNow, Stop};
@@ -64,15 +65,16 @@ fn hand_over(decide: oneshot::Sender<Option<OnOutcome>>, approval: Option<OnOutc
     }
 }
 
-/// A gateway write's outcome, as Studio's activity records it.
+/// A gateway write's outcome, as Studio's activity records it: by its commit's kind, as Studio's
+/// own writes are ([`OutcomeKind::written`]). A commit on the agent's branch is committed there;
+/// one written `as commit` or `as unattached branch` is held, with its commit, and moves no
+/// branch; one of a kind this build does not know leaves whether a branch moved unknown.
 fn outcome_kind(seen: &Seen) -> OutcomeKind {
     match seen {
-        Seen::Committed { commit, .. } => OutcomeKind::Committed {
-            commit: commit.clone(),
-        },
-        // It went through, and no branch has its commit: recorded as a write that moved no
-        // branch's head, as one that made no commit is.
-        Seen::Unpublished { .. } => OutcomeKind::Committed { commit: None },
+        Seen::Committed { commit, .. } => {
+            OutcomeKind::written(commit.clone().map(|commit| (commit, CommitKind::Published)))
+        }
+        Seen::Unpublished { commit, kind } => OutcomeKind::written(Some((commit.clone(), *kind))),
         Seen::Refused(message) => OutcomeKind::Refused {
             message: message.clone(),
         },
@@ -204,9 +206,12 @@ enum WriteState {
     Rejected,
     /// A write that made no commit of its own went through, such as creating a branch.
     Done(String),
-    /// The server held the write as this commit, which no branch shows: the agent's branch did
-    /// not move.
-    Unpublished(String),
+    /// The server held the write as this commit, of this kind, which no branch shows: the
+    /// agent's branch did not move.
+    Unpublished {
+        commit: String,
+        kind: CommitKind,
+    },
 }
 
 /// The card of a write the agent's CLI sends through the gateway (spec 013): what it does, the
@@ -468,9 +473,10 @@ fn hash_entry(entry: &Entry, hasher: &mut impl std::hash::Hasher) {
                     6u8.hash(hasher);
                     label.hash(hasher);
                 }
-                WriteState::Unpublished(commit) => {
+                WriteState::Unpublished { commit, kind } => {
                     7u8.hash(hasher);
                     commit.hash(hasher);
+                    std::mem::discriminant(kind).hash(hasher);
                 }
             }
         }
@@ -2049,7 +2055,10 @@ impl AgentPanel {
             } else {
                 "Done".into()
             }),
-            Seen::Unpublished { commit } => WriteState::Unpublished(commit.clone()),
+            Seen::Unpublished { commit, kind } => WriteState::Unpublished {
+                commit: commit.clone(),
+                kind: *kind,
+            },
             Seen::Refused(message) => WriteState::Refused(message.clone()),
             Seen::Unknown(_) => WriteState::Unknown,
         };
@@ -2946,6 +2955,36 @@ fn shows_query(entry: &Entry) -> bool {
     args.by_ref().any(|arg| arg == "-e") && args.next().is_some()
 }
 
+/// Whether the query call at `index` has its text on the write card the gateway made for it,
+/// which holds the query, its parameters, its branch and its outcome; the call's line alone then
+/// says what ran, so the text shows once. It has when a write card after it in its turn carries
+/// the same text, before a later call of that text, which owns the cards after it; and while a
+/// `mutate` call runs, since its card is on its way or waits for the person's answer. A call
+/// that ended with no such card (its CLI failed before sending it) shows its own text.
+fn query_on_card(entries: &[Entry], index: usize) -> bool {
+    let Some(entry @ Entry::Tool { status, .. }) = entries.get(index) else {
+        return false;
+    };
+    let Some((command, text, _)) = shown_query(entry) else {
+        return false;
+    };
+    let text = text.trim();
+    let running = matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress);
+    for later in entries.get(index + 1..).unwrap_or_default() {
+        match later {
+            Entry::User(_) => break,
+            Entry::Write(card) if card.query.trim() == text => return true,
+            Entry::Tool { .. }
+                if shown_query(later).is_some_and(|(_, again, _)| again.trim() == text) =>
+            {
+                break;
+            }
+            _ => {}
+        }
+    }
+    running && command == "mutate"
+}
+
 /// Whether an entry folds into a run's summary line: thoughts, and tool calls other than the
 /// queries shown with their text.
 fn is_folded_step(entry: &Entry) -> bool {
@@ -3414,6 +3453,7 @@ impl AgentPanel {
             Block::Entry { index, .. } => index..index + 1,
             Block::Query { index, .. } => {
                 self.folded_queries.contains(&index).hash(&mut hasher);
+                query_on_card(&self.entries, index).hash(&mut hasher);
                 index..index + 1
             }
             Block::Activity { start, end, .. } => {
@@ -3620,7 +3660,9 @@ impl AgentPanel {
     }
 
     /// A query the agent ran, as Delta shows an edit: "Query people" over the query in a code
-    /// card with the editor's colours, and its parameters under it. The line folds the card.
+    /// card with the editor's colours, and its parameters under it. The line folds the card. A
+    /// write whose text its write card shows ([`query_on_card`]) is the line alone: "Mutate
+    /// retitle", with no code or arguments to fold.
     fn render_query_call(
         &self,
         index: usize,
@@ -3644,12 +3686,13 @@ impl AgentPanel {
         } = &*card;
         let running = matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress);
         let failed = matches!(status, ToolCallStatus::Failed);
-        let folded = self.folded_queries.contains(&index);
+        let on_card = query_on_card(&self.entries, index);
+        let folded = on_card || self.folded_queries.contains(&index);
         let header = h_flex()
             .id(("query-call", index))
             .gap(px(ds::space::XS))
             .items_center()
-            .cursor_pointer()
+            .when(!on_card, |header| header.cursor_pointer())
             .child(studio_ui::ds::text::muted(if running {
                 "Running".to_owned()
             } else {
@@ -3668,23 +3711,26 @@ impl AgentPanel {
             .when(failed, |row| {
                 row.child(studio_ui::ds::text::error("· failed"))
             })
-            .child(if running {
-                studio_ui::ds::spinner().into_any_element()
-            } else {
-                studio_ui::ds::icon::meta(if folded {
-                    IconName::ChevronRight
+            .map(|row| {
+                if running {
+                    row.child(studio_ui::ds::spinner())
+                } else if on_card {
+                    row
                 } else {
-                    IconName::ChevronDown
-                })
-                .into_any_element()
-            })
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if !this.folded_queries.remove(&index) {
-                    this.folded_queries.insert(index);
+                    row.child(studio_ui::ds::icon::meta(if folded {
+                        IconName::ChevronRight
+                    } else {
+                        IconName::ChevronDown
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.folded_queries.remove(&index) {
+                            this.folded_queries.insert(index);
+                        }
+                        this.folds += 1;
+                        cx.notify();
+                    }))
                 }
-                this.folds += 1;
-                cx.notify();
-            }));
+            });
         let params = params.clone();
         let card = ds::code_block_highlighted(text.clone(), highlights.iter().cloned(), cx);
         gutter_row(
@@ -4031,16 +4077,28 @@ impl AgentPanel {
                     WriteState::Done(label) => {
                         (Some(IconName::Check), Color::Success, label.clone(), None)
                     }
-                    WriteState::Unpublished(commit) => (
+                    WriteState::Unpublished { commit, kind } => (
                         Some(IconName::Warning),
                         Color::Warning,
                         "Not on the branch".into(),
-                        Some(format!(
-                            "The server held this write as commit {commit}, which no branch \
-                             shows, so {} did not change. Publishing it is yours, outside \
-                             Studio.",
-                            card.branch
-                        )),
+                        Some(match kind {
+                            CommitKind::Unattached => format!(
+                                "The server saved this write as snapshot {commit}, which no \
+                                 branch shows and which never publishes, so {} did not change.",
+                                card.branch
+                            ),
+                            CommitKind::Unpublished => format!(
+                                "The server held this write as commit {commit}, which no \
+                                 branch shows, so {} did not change. Publishing it is yours, \
+                                 outside Studio.",
+                                card.branch
+                            ),
+                            _ => format!(
+                                "The server held this write as commit {commit}, which no \
+                                 branch shows, so {} did not change.",
+                                card.branch
+                            ),
+                        }),
                     ),
                     _ => (Some(IconName::Close), Color::Muted, "Rejected".into(), None),
                 };
@@ -4458,6 +4516,72 @@ mod tests {
         );
     }
 
+    /// A write's text shows once, on its write card: a `mutate` call whose card carries its text
+    /// is its line alone, as is one still running, whose card is on its way or waits for the
+    /// person to allow it (the card shows the text it asks about). A call that ended with no
+    /// card, a read, and a call whose card is past the person's next message or belongs to a
+    /// later call of the same text show their own text.
+    #[test]
+    fn a_write_shows_its_query_once_on_its_card() {
+        let text = "query retitle() { update Person set { title: \"T\" } }";
+        let call = |command: &str, status| Entry::Tool {
+            id: "t".into(),
+            title: String::new(),
+            status,
+            input: Some(serde_json::json!({
+                "args": [command, "-e", text, "--branch", "agent/x"]
+            })),
+            studio: Some(StudioTool::Run),
+            output: None,
+        };
+        let card = |state| {
+            Entry::Write(WriteCard {
+                summary: "Mutation".into(),
+                query: format!("{text}\n"),
+                params: None,
+                branch: "agent/x".into(),
+                creates_from: None,
+                state,
+            })
+        };
+        let waiting = || WriteState::Waiting(oneshot::channel().0);
+        let done = || WriteState::Committed {
+            commit: "c2".into(),
+            nodes: 1,
+            edges: 0,
+        };
+        use ToolCallStatus::{Completed, Failed, InProgress};
+        // Running, before its card arrives and while the card waits for Allow.
+        assert!(query_on_card(&[call("mutate", InProgress)], 0));
+        assert!(query_on_card(
+            &[call("mutate", InProgress), card(waiting())],
+            0
+        ));
+        // Ended, its card showing the outcome; text compared without the trailing line.
+        assert!(query_on_card(&[call("mutate", Completed), card(done())], 0));
+        // Ended with no card: the CLI failed before it sent anything.
+        assert!(!query_on_card(&[call("mutate", Failed)], 0));
+        // A read has no card, running or not.
+        assert!(!query_on_card(&[call("query", InProgress)], 0));
+        // A card past the next message is another turn's.
+        assert!(!query_on_card(
+            &[
+                call("mutate", Failed),
+                Entry::User("again".into()),
+                card(done())
+            ],
+            0
+        ));
+        // A later call of the same text owns the cards after it.
+        let retried = [
+            call("mutate", Failed),
+            call("mutate", Completed),
+            card(done()),
+        ];
+        assert!(!query_on_card(&retried, 0));
+        assert!(query_on_card(&retried, 1));
+    }
+
     /// A query's rows come from its result as `omnigraph_run` answers it or as the CLI prints
     /// it: the columns in the CLI's order, the first rows, how many came back and where they
     /// were read. A failed run, other output and no rows give no card.
@@ -4582,6 +4706,53 @@ mod tests {
             *seen.lock().unwrap(),
             Some(Seen::Refused(crate::gateway::NOT_SENT.into()))
         );
+    }
+
+    /// An agent's write is logged as Studio's own writes are, by its commit's kind: one written
+    /// `as commit` is held as a proposal and one written `as unattached branch` as a snapshot,
+    /// each with its commit and no branch moved; one on the agent's branch is committed there.
+    #[test]
+    fn an_agents_held_write_is_logged_as_held() {
+        use graph_store::HeldAs;
+        let held = |kind| {
+            outcome_kind(&Seen::Unpublished {
+                commit: "c3".into(),
+                kind,
+            })
+        };
+        assert_eq!(
+            held(CommitKind::Unpublished),
+            OutcomeKind::Held {
+                commit: "c3".into(),
+                held: HeldAs::Proposal,
+            }
+        );
+        assert_eq!(
+            held(CommitKind::Unattached),
+            OutcomeKind::Held {
+                commit: "c3".into(),
+                held: HeldAs::Snapshot,
+            }
+        );
+        assert!(
+            matches!(held(CommitKind::Other), OutcomeKind::Unknown { reason } if reason.contains("c3")),
+            "a kind Studio does not know leaves the branch's move unknown"
+        );
+        let committed = |commit: Option<&str>| {
+            outcome_kind(&Seen::Committed {
+                commit: commit.map(str::to_owned),
+                nodes: 1,
+                edges: 0,
+                branch_created: false,
+            })
+        };
+        assert_eq!(
+            committed(Some("c2")),
+            OutcomeKind::Committed {
+                commit: Some("c2".into())
+            }
+        );
+        assert_eq!(committed(None), OutcomeKind::Committed { commit: None });
     }
 
     #[test]

@@ -300,6 +300,8 @@ commit, Not on the branch for one the server held as a commit no branch shows (`
 success whose body cannot be read is too, as Studio's own writes judge it. A load given `from`
 is tagged new only when its answer says it created the branch. A committed write is logged in the
 session (the workspace's "Agent CLI: … committed" notice) and the agent branch banner counts it.
+A write the server held as a proposal or a snapshot is logged as held, with its commit, by the
+commit's kind, as Studio's own writes are (since 2026-10-21; before, as committed).
 
 - **Sandbox** (default): writes to the agent branch go through at once.
 - **Ask before writes** (Settings → Agent, `agent.ask_before_writes`): each write waits on its
@@ -411,7 +413,9 @@ same write would split the cards and the rules.
   failed while Studio still holds it might write again, so `omnigraph_run` answers before
   Codex's limit with a run number to wait on.
 - The thread shows an `omnigraph_run` call with an inline query as a query card titled by its
-  subcommand ("Query", "Mutate"), and other calls as tool rows ("Run omnigraph").
+  subcommand ("Query", "Mutate"), and other calls as tool rows ("Run omnigraph"). A write whose
+  card shows its text is the title line alone ("Mutate retitle"), so the query shows once, on
+  the card with its branch and outcome (since 2026-10-21).
 
 ## Decisions
 
