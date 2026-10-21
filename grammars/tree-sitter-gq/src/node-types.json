@@ -381,6 +381,10 @@
         {
           "type": "dry_run",
           "named": true
+        },
+        {
+          "type": "from_commit",
+          "named": true
         }
       ]
     }
@@ -740,6 +744,21 @@
         },
         {
           "type": "query_declaration",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "from_commit",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "string",
           "named": true
         }
       ]

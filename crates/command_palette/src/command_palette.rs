@@ -1151,7 +1151,7 @@ mod tests {
                 Ok(Response::builder()
                     .status(200)
                     // `graph_client::CONTRACT_HEADER`.
-                    .header("omnigraph-http-api", "0.13")
+                    .header("omnigraph-http-api", "0.14")
                     .body(AsyncBody::from(body.to_string()))
                     .unwrap())
             }

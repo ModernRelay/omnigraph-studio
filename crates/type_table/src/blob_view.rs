@@ -1292,7 +1292,10 @@ mod tests {
         let http = FakeHttpClient::create(move |request| {
             let seen = seen.clone();
             async move {
-                let ok = || Response::builder().header(graph_client::CONTRACT_HEADER, "0.13");
+                let ok = || {
+                    Response::builder()
+                        .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                };
                 let response = if !request.uri().path().ends_with("/blob") {
                     ok().status(404).body(AsyncBody::empty())
                 } else if request.method() == Method::HEAD {

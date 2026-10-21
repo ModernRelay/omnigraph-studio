@@ -6,9 +6,9 @@
 #   script/dev-server            # first run applies the cluster and loads dev/seed.jsonl
 #   script/dev-server --reset    # start again from an empty graph
 #
-# Needs OmniGraph 0.14 with CLI targets (`omnigraph` and `omnigraph-server`; until it is released,
-# the edge build `edge-20261020-b692610` or later, named by OMNIGRAPH_BIN and OMNIGRAPH_SERVER_BIN
-# when not on PATH).
+# Needs an OmniGraph that speaks HTTP contract 0.14 (`omnigraph` and `omnigraph-server`; until 0.14
+# is released, the edge build `edge-20261020-7fd9cc9` or later, named by OMNIGRAPH_BIN and
+# OMNIGRAPH_SERVER_BIN when not on PATH).
 # Data lives in dev/.data; 0.14 stamps it format 16 on its first write, which 0.13 cannot open.
 set -euo pipefail
 
@@ -27,9 +27,9 @@ fi
 # line into a closed pipe, which `pipefail` turns into a failed start.
 version=$("$CLI" version)
 version=${version%%$'\n'*}
-targets=$("$CLI" version --json | python3 -c 'import json,sys; print(json.load(sys.stdin).get("protocols", {}).get("target", ""))')
-if [[ "$version" != "omnigraph 0.14."* || "$targets" != 1 ]]; then
-  echo "dev-server needs OmniGraph 0.14 with CLI targets (edge-20261020-b692610 or later); found: $version (set OMNIGRAPH_BIN and OMNIGRAPH_SERVER_BIN)" >&2
+contract=$("$CLI" version --json | python3 -c 'import json,sys; print(json.load(sys.stdin).get("http_contract", ""))')
+if [[ "$contract" != 0.14 ]]; then
+  echo "dev-server needs an OmniGraph that speaks HTTP contract 0.14 (edge-20261020-7fd9cc9 or later); found: $version (set OMNIGRAPH_BIN and OMNIGRAPH_SERVER_BIN)" >&2
   exit 1
 fi
 

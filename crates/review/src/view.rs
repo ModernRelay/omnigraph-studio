@@ -3857,7 +3857,7 @@ pub(crate) mod tests {
                 (
                     200,
                     json!({ "branch": "feature", "query_name": "q", "affected_nodes": affected, "affected_edges": 0,
-                        "commit": { "graph_commit_id": format!("r{}", n + 1), "graph_manifest_version": 3, "created_at": 0, "parent_commit_id": parent } }),
+                        "commit": { "graph_commit_id": format!("r{}", n + 1), "graph_manifest_version": 3, "kind": "published", "created_at": 0, "parent_commit_id": parent } }),
                 )
             },
             cx,
@@ -3876,7 +3876,7 @@ pub(crate) mod tests {
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) {
         let writes = std::sync::atomic::AtomicUsize::new(0);
-        let commit = |id: &str, parent: Option<&str>| json!({ "graph_commit_id": id, "graph_manifest_version": 1, "created_at": 0, "parent_commit_id": parent, "actor_id": "act-dev" });
+        let commit = |id: &str, parent: Option<&str>| json!({ "graph_commit_id": id, "graph_manifest_version": 1, "kind": "published", "created_at": 0, "parent_commit_id": parent, "actor_id": "act-dev" });
         let person = |id: &str, op: &str| json!({ "kind": "node", "type": { "id": "Person", "name": "Person" }, "id": id, "op": op, "before": { "properties": { "slug": id } }, "after": { "properties": { "slug": id, "name": "x" } } });
         let block = |id: &str, parent: &str, change: Value| json!({ "cause": { "graph_commit_id": id, "parent_commit_id": parent, "authored_branch": "feature", "authored_at": 0, "actor_id": "act-dev" }, "changes": [change] });
         let base_id = if merged_in { "m2" } else { "m1" };
@@ -3909,7 +3909,7 @@ pub(crate) mod tests {
                 if path.contains("/mutate") {
                     write(writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
                 } else if path.ends_with("/branches/merge") {
-                    let merge = json!({ "graph_commit_id": "m3", "graph_manifest_version": 4, "created_at": 0, "parent_commit_id": "m2", "merged_parent_commit_id": took });
+                    let merge = json!({ "graph_commit_id": "m3", "graph_manifest_version": 4, "kind": "published", "created_at": 0, "parent_commit_id": "m2", "merged_parent_commit_id": took });
                     let mut answer = json!({ "source": "feature", "target": "main", "outcome": "merged", "commit": merge });
                     if sent.contains("\"delete_branch\":true") {
                         answer["branch_deleted"] = json!(true);
@@ -4004,7 +4004,7 @@ pub(crate) mod tests {
                 let (status, body) = answer(&path, &query, &sent);
                 Ok(Response::builder()
                     .status(status)
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                     .body(AsyncBody::from(body.to_string()))
                     .unwrap())
             }
@@ -4124,7 +4124,7 @@ pub(crate) mod tests {
     async fn a_merge_is_confirmed_after_more_of_the_source_was_merged(
         cx: &mut gpui::TestAppContext,
     ) {
-        let commit = |id: &str, merged: Option<&str>| json!({ "graph_commit_id": id, "graph_manifest_version": 1, "created_at": 0, "merged_parent_commit_id": merged });
+        let commit = |id: &str, merged: Option<&str>| json!({ "graph_commit_id": id, "graph_manifest_version": 1, "kind": "published", "created_at": 0, "merged_parent_commit_id": merged });
         // main merged f2 (as m3), then f3 (as m4).
         let base = json!({ "merge_base": commit("f3", None), "source": "feature", "source_commit_id": "f3", "target": "main", "target_commit_id": "m4" });
         let main = json!({ "commits": [commit("m4", Some("f3")), commit("m3", Some("f2")), commit("m1", None)] });

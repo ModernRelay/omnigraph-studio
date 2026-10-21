@@ -408,7 +408,7 @@ mod tests {
             parent_commit_id: parent.map(Into::into),
             merged_parent_commit_id: None,
             actor_id: None,
-            kind: Default::default(),
+            kind: graph_client::api::CommitKind::Published,
         }
     }
 

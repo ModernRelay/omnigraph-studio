@@ -34,11 +34,14 @@ const HEAD_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
 /// The most a write's answer may take before the gateway stops reading it for the card.
 const MAX_WRITE_ANSWER: usize = 8 * 1024 * 1024;
 /// Request headers passed on to the server; the gateway sets the token and contract itself.
+/// `omnigraph-if-actor` (the CLI's `--as`) can only narrow a request: the server refuses it
+/// unless it names the person's actor.
 const FORWARDED_HEADERS: &[&str] = &[
     "accept",
     "content-type",
     "if-match",
     "if-none-match",
+    "omnigraph-if-actor",
     "omnigraph-if-graph-commit",
     "range",
 ];
@@ -846,6 +849,33 @@ mod tests {
 
     const AGENT: &str = "agent/20261013-101500";
 
+    /// A request's conditions reach the server, its actor assertion among them; its own token
+    /// and every other header stay behind.
+    #[test]
+    fn a_forwarded_request_keeps_its_conditions_and_drops_its_credentials() {
+        let request = Request {
+            method: "POST".into(),
+            target: "/graphs/knowledge/mutate".into(),
+            headers: [
+                ("authorization", "Bearer agent-token"),
+                ("omnigraph-if-actor", "act-person"),
+                ("omnigraph-if-graph-commit", "c1"),
+                ("cookie", "x"),
+            ]
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .into(),
+            body: b"{}".to_vec(),
+        };
+        assert_eq!(
+            forward_request(&request, None).headers,
+            [
+                ("omnigraph-if-actor", "act-person"),
+                ("omnigraph-if-graph-commit", "c1")
+            ]
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        );
+    }
+
     /// What the fake server saw: method, URL, its authorization and contract headers, body.
     type Seen = Arc<Mutex<Vec<(String, String, String, String, String)>>>;
 
@@ -877,7 +907,7 @@ mod tests {
                     .push((method, uri, auth, contract, body));
                 Ok(Response::builder()
                     .status(200)
-                    .header(CONTRACT_HEADER, "0.13")
+                    .header(CONTRACT_HEADER, CONTRACT)
                     .header("content-type", "application/json")
                     .body(AsyncBody::from(answer))
                     .unwrap())
@@ -968,7 +998,7 @@ mod tests {
                     }
                     Ok(Response::builder()
                         .status(200)
-                        .header(CONTRACT_HEADER, "0.13")
+                        .header(CONTRACT_HEADER, CONTRACT)
                         .header("content-type", "application/json")
                         .body(AsyncBody::from(
                             r#"{"branch":"agent/20261013-101500","query_name":"m","affected_nodes":1,"affected_edges":0,"commit":{"graph_commit_id":"c9"}}"#,
@@ -987,7 +1017,7 @@ mod tests {
                 r#"{"query":"query m() { … }","name":"m","branch":"agent/20261013-101500"}"#;
             let _cli = smol::spawn(call(
                 port,
-                post("/graphs/knowledge/mutate", &token, Some("0.13"), write),
+                post("/graphs/knowledge/mutate", &token, Some(CONTRACT), write),
             ));
             let Some(GatewayEvent::Write { decide, .. }) = events.next().await else {
                 panic!("no write event")
@@ -1022,7 +1052,7 @@ mod tests {
     fn a_writes_success_answer_says_what_it_did() {
         let answer = |body: &str| {
             let mut headers = HeaderMap::new();
-            headers.append(CONTRACT_HEADER, "0.13".parse().unwrap());
+            headers.append(CONTRACT_HEADER, CONTRACT.parse().unwrap());
             let response = graph_client::ForwardResponse {
                 status: StatusCode::OK,
                 headers,
@@ -1142,16 +1172,19 @@ mod tests {
             )
             .await;
             assert_eq!(status, 200);
-            assert!(head.contains("omnigraph-http-api: 0.13"), "{head}");
+            assert!(
+                head.contains(&format!("{CONTRACT_HEADER}: {CONTRACT}")),
+                "{head}"
+            );
 
             // A wrong token, and a CLI that sends no contract.
             let (status, head, body) = call(
                 port,
-                post("/graphs/knowledge/query", "nope", Some("0.13"), "{}"),
+                post("/graphs/knowledge/query", "nope", Some(CONTRACT), "{}"),
             )
             .await;
             assert_eq!(status, 401);
-            assert!(head.contains("omnigraph-http-api: 0.13"));
+            assert!(head.contains(&format!("{CONTRACT_HEADER}: {CONTRACT}")));
             assert!(body.contains("\"code\":\"unauthorized\""), "{body}");
             // Its body is never waited for: one that says it is large, and never comes, is
             // answered at once.
@@ -1175,7 +1208,7 @@ mod tests {
                 post(
                     "/graphs/knowledge/query",
                     &token,
-                    Some("0.13"),
+                    Some(CONTRACT),
                     r#"{"query":"q","branch":"main"}"#,
                 ),
             )
@@ -1190,7 +1223,7 @@ mod tests {
                     ("POST", "http://127.0.0.1:8787/graphs/knowledge/query")
                 );
                 assert_eq!(auth, "Bearer person-token");
-                assert_eq!(contract, "0.13");
+                assert_eq!(contract, CONTRACT);
                 assert_eq!(body, r#"{"query":"q","branch":"main"}"#);
             }
 
@@ -1200,7 +1233,7 @@ mod tests {
                 post(
                     "/graphs/knowledge/mutate",
                     &token,
-                    Some("0.13"),
+                    Some(CONTRACT),
                     r#"{"query":"q","branch":"main"}"#,
                 ),
             )
@@ -1217,7 +1250,7 @@ mod tests {
             ] {
                 let answer = futures::FutureExt::fuse(call(
                     port,
-                    post(target, &token, Some("0.13"), "{}\n"),
+                    post(target, &token, Some(CONTRACT), "{}\n"),
                 ));
                 let write = futures::FutureExt::fuse(events.next());
                 futures::pin_mut!(answer, write);
@@ -1235,7 +1268,7 @@ mod tests {
                 r#"{"query":"query m() { … }","name":"m","branch":"agent/20261013-101500"}"#;
             let rejected = smol::spawn(call(
                 port,
-                post("/graphs/knowledge/mutate", &token, Some("0.13"), write),
+                post("/graphs/knowledge/mutate", &token, Some(CONTRACT), write),
             ));
             let Some(GatewayEvent::Write {
                 decide,
@@ -1255,7 +1288,7 @@ mod tests {
             // Allowed, it is sent once and its outcome reported.
             let allowed = smol::spawn(call(
                 port,
-                post("/graphs/knowledge/mutate", &token, Some("0.13"), write),
+                post("/graphs/knowledge/mutate", &token, Some(CONTRACT), write),
             ));
             let Some(GatewayEvent::Write { decide, id, .. }) = events.next().await else {
                 panic!("no write event")
@@ -1270,7 +1303,7 @@ mod tests {
                 .unwrap();
             let (status, head, body) = allowed.await;
             assert_eq!(status, 200);
-            assert!(head.contains("omnigraph-http-api: 0.13"));
+            assert!(head.contains(&format!("{CONTRACT_HEADER}: {CONTRACT}")));
             assert!(body.contains("\"graph_commit_id\":\"c9\""), "{body}");
             let Some(GatewayEvent::Finished {
                 id: finished,
@@ -1298,7 +1331,9 @@ mod tests {
                 .await
                 .unwrap();
             hung_up
-                .write_all(post("/graphs/knowledge/mutate", &token, Some("0.13"), write).as_bytes())
+                .write_all(
+                    post("/graphs/knowledge/mutate", &token, Some(CONTRACT), write).as_bytes(),
+                )
                 .await
                 .unwrap();
             let Some(GatewayEvent::Write { decide, id, .. }) = events.next().await else {
@@ -1318,7 +1353,7 @@ mod tests {
             // A chunked body is read whole before the rules see it.
             let chunked = format!(
                 "POST /graphs/knowledge/query HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {token}\r\n\
-                 {CONTRACT_HEADER}: 0.13\r\ncontent-type: application/json\r\n\
+                 {CONTRACT_HEADER}: {CONTRACT}\r\ncontent-type: application/json\r\n\
                  transfer-encoding: chunked\r\n\r\n5\r\n{{\"a\":\r\n2\r\n1}}\r\n0\r\n\r\n"
             );
             let (status, _, _) = call(port, chunked).await;
@@ -1328,7 +1363,7 @@ mod tests {
             // A chunk size near the largest number is refused, not added to.
             let huge = format!(
                 "POST /graphs/knowledge/query HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {token}\r\n\
-                 {CONTRACT_HEADER}: 0.13\r\ncontent-type: application/json\r\n\
+                 {CONTRACT_HEADER}: {CONTRACT}\r\ncontent-type: application/json\r\n\
                  transfer-encoding: chunked\r\n\r\n1\r\n{{\r\n{:x}\r\n",
                 usize::MAX
             );

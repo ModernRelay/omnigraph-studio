@@ -455,7 +455,7 @@ pub fn no_cli_text(contract: &str, found: &[(PathBuf, CliFacts)]) -> String {
     }
     text.push_str(&format!(
         ". Install an omnigraph that speaks {contract} with CLI targets (OmniGraph \
-         edge-20261020-b692610 or later), or set `agent.omnigraph_cli` to one."
+         edge-20261020-7fd9cc9 or later), or set `agent.omnigraph_cli` to one."
     ));
     text
 }
@@ -1223,11 +1223,11 @@ mod tests {
         // Speaks the contract but has no targets, so it would refuse the home's config.
         let untargeted = fake(
             "omnigraph-0.14",
-            r#"[ "$1 $2" = "version --json" ] && { echo '{"version":"0.14.0","http_contract":"0.13"}'; exit 0; }; exit 2"#,
+            r#"[ "$1 $2" = "version --json" ] && { echo '{"version":"0.14.0","http_contract":"0.14"}'; exit 0; }; exit 2"#,
         );
         let current = fake(
             "omnigraph-targets",
-            r#"[ "$1 $2" = "version --json" ] && { echo '{"version":"0.14.0-edge+b692610","http_contract":"0.13","protocols":{"target":1,"credential":1}}'; exit 0; }; exit 2"#,
+            r#"[ "$1 $2" = "version --json" ] && { echo '{"version":"0.14.0-edge+7fd9cc9","http_contract":"0.14","protocols":{"target":1,"credential":1}}'; exit 0; }; exit 2"#,
         );
         // A wrapper that hangs: a match before it is chosen without waiting for it.
         let hung = fake("omnigraph-hung", "sleep 30");
@@ -1246,13 +1246,14 @@ mod tests {
         )
         .unwrap();
         let wrapper = || std::fs::read_to_string(&home.command).unwrap();
-        let choose =
-            |candidates: Vec<PathBuf>| smol::block_on(choose_cli(&home, candidates, "0.13"));
+        let choose = |candidates: Vec<PathBuf>| {
+            smol::block_on(choose_cli(&home, candidates, graph_client::CONTRACT))
+        };
 
         match choose(vec![old.clone(), untargeted.clone(), current.clone()]) {
             CliChoice::Chosen { cli, version } => {
                 assert_eq!(cli, current);
-                assert_eq!(version.as_deref(), Some("0.14.0-edge+b692610"));
+                assert_eq!(version.as_deref(), Some("0.14.0-edge+7fd9cc9"));
             }
             other => panic!("{other:?}"),
         }
@@ -1301,7 +1302,7 @@ mod tests {
 
         match choose(vec![old.clone(), untargeted.clone(), other.clone()]) {
             CliChoice::NoMatch { found } => {
-                let text = no_cli_text("0.13", &found);
+                let text = no_cli_text(graph_client::CONTRACT, &found);
                 assert!(text.contains("older than 0.14"), "{text}");
                 assert!(text.contains("0.14.0, which has no CLI targets"), "{text}");
                 assert!(text.contains("0.15.0, which speaks 0.15"), "{text}");
@@ -1507,10 +1508,10 @@ mod tests {
         };
         let (text, failed) = smol::block_on(run(&home, &cwd, plan()));
         assert!(failed && text.contains("not chosen"), "{text}");
-        home.refuse("No omnigraph CLI here speaks 0.13").unwrap();
+        home.refuse("No omnigraph CLI here speaks 0.14").unwrap();
         let (text, failed) = smol::block_on(run(&home, &cwd, plan()));
         assert!(
-            failed && text == "No omnigraph CLI here speaks 0.13",
+            failed && text == "No omnigraph CLI here speaks 0.14",
             "{text}"
         );
 

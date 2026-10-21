@@ -1994,7 +1994,7 @@ mod tests {
 
     fn commit(id: &str, at: i64, parent: Option<&str>, merged: Option<&str>) -> Value {
         json!({
-            "graph_commit_id": id, "graph_manifest_version": at, "created_at": at,
+            "graph_commit_id": id, "graph_manifest_version": at, "kind": "published", "created_at": at,
             "parent_commit_id": parent, "merged_parent_commit_id": merged,
         })
     }
@@ -2042,7 +2042,7 @@ mod tests {
                 };
                 Ok(Response::builder()
                     .status(status)
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                     .body(AsyncBody::from(body.to_string()))
                     .unwrap())
             }
@@ -2747,7 +2747,7 @@ mod tests {
             parent_commit_id: None,
             merged_parent_commit_id: None,
             actor_id: Some("act-Dev".into()),
-            kind: Default::default(),
+            kind: graph_client::api::CommitKind::Published,
         };
         let text = CommitText::of(&commit);
         assert!(text.matches("hb1.01m4r"));

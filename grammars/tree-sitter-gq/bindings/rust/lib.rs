@@ -69,6 +69,8 @@ query child($base: String) as unattached branch on $base {
     const EVERY_STATEMENT: &str = r#"
 show all;
 branch create feature from main;
+branch create fix from commit "01J";
+branch create twin from commit;
 branch delete "old";
 branch merge dry into main
 branch merge feature into main as commit
@@ -108,7 +110,9 @@ explain query q() { match { $p: Person } return { $p.name } }
         let tree = parse(EVERY_STATEMENT);
         let sexp = tree.root_node().to_sexp();
         assert!(!tree.root_node().has_error(), "{sexp}");
-        assert_eq!(sexp.matches("(branch_statement").count(), 9, "{sexp}");
+        assert_eq!(sexp.matches("(branch_statement").count(), 11, "{sexp}");
+        // `from commit "<id>"` starts at a commit; a bare `commit` is a branch of that name.
+        assert_eq!(sexp.matches("(from_commit").count(), 1, "{sexp}");
         assert_eq!(sexp.matches("(commit_statement").count(), 2, "{sexp}");
         assert_eq!(sexp.matches("(load_statement").count(), 2, "{sexp}");
         assert_eq!(sexp.matches("(explain_statement").count(), 2, "{sexp}");

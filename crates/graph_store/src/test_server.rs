@@ -142,7 +142,7 @@ pub fn followed_session(
             if path.ends_with("/schema") && served.schema_fails {
                 return Ok(Response::builder()
                     .status(500)
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                     .body(AsyncBody::from(
                         r#"{"error":"the schema could not be read"}"#,
                     ))
@@ -159,7 +159,7 @@ pub fn followed_session(
                 {
                     return Ok(Response::builder()
                         .status(400)
-                        .header(graph_client::CONTRACT_HEADER, "0.13")
+                        .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                         .body(AsyncBody::from(
                             r#"{"error":"unknown node type","code":"bad_request"}"#,
                         ))
@@ -183,7 +183,7 @@ pub fn followed_session(
             };
             Ok(Response::builder()
                 .status(200)
-                .header(graph_client::CONTRACT_HEADER, "0.13")
+                .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                 .body(AsyncBody::from(body.to_string()))
                 .unwrap())
         }

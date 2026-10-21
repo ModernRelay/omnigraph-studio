@@ -2,10 +2,9 @@
 
 Status: open · 2026-10-11, updated 2026-10-20. Landed on OmniGraph main: E6, E7, E8, E23 and E24
 by 2026-10-15, then E10, E15 (as the access route), E21 and E22 by 2026-10-20 (see "On OmniGraph
-main, 2026-10-20"). Studio's oldest supported server is 0.14, the edge build
-`edge-20261018-0a62bb7` until 0.14 is released (`edge-20261017-d883c49` from 2026-10-17, `911a885`,
-until 2026-10-20), whose HTTP contract header
-is still `0.13` (constitution X). When a change is picked up it becomes an OmniGraph RFC and issue
+main, 2026-10-20"). Studio's oldest supported server is the edge build `edge-20261020-7fd9cc9`,
+the first that speaks HTTP contract 0.14, until 0.14 is released (`edge-20261018-0a62bb7`, then
+`edge-20261017-d883c49`, before; both speak `0.13`, which Studio now refuses) (constitution X). When a change is picked up it becomes an OmniGraph RFC and issue
 in `ModernRelay/omnigraph`, follows that repository's invariants and test ownership, and Studio
 adopts it once its minimum server serves it, or before then only when a server's OpenAPI
 document advertises it.
@@ -124,11 +123,12 @@ change is additive; the CLI's is not.
   - Lance 13 (#1072): storage format 16 is unchanged; nothing for Studio.
 - Still open: E1 to E5 (#980; the launcher's RFC and its stack, #1017, are under way), E9 (#1012
   not merged), E11, E12, E13, E14, E16 to E20 (#978), E25 to E28.
-- To adopt: E10, E15, E21, `full_text_index_required`, `executed` and `pipelines` are on main but
-  not in `edge-20261017-d883c49`, so Studio adopts them with its next minimum-server bump (an edge
-  build at or after `4ba904d3`), or before it only where a server's OpenAPI document advertises
-  them. The CLI change cannot wait for that bump: the agent's CLI and the person's are whatever
-  is installed, so specs 003 and 013 read both operator-file formats.
+- Adopted with the minimum-server bump to `edge-20261020-7fd9cc9` (2026-10-20), which also
+  moved the HTTP contract to 0.14 and added `Omnigraph-If-Actor` (#1074): E10, E15, E21,
+  `full_text_index_required`, `executed` and `pipelines` are on every server Studio supports.
+  Studio pages history by E10; E15 and E21 are next. The CLI change could not wait for the bump:
+  the agent's CLI and the person's are whatever is installed, so specs 003 and 013 read both
+  operator-file formats.
 
 ## The changes
 

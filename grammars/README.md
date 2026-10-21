@@ -4,9 +4,8 @@ Tree-sitter grammars for OmniGraph's languages, used by the query editor for hig
 folding and outline (spec 007):
 
 - `tree-sitter-gq`: queries, mutations and statements (`.gq`) at OmniGraph
-  `edge-20261018-0a62bb7`, the `omnigraph-compiler` tag Studio pins (its `query.pest` is
-  unchanged from `edge-20261017-d883c49`, where the corpus below was checked). Built: the query editor's
-  buffer parses with it (`query_editor::syntax`).
+  `edge-20261020-7fd9cc9`, the `omnigraph-compiler` tag Studio pins, where the corpus below was
+  checked. Built: the query editor's buffer parses with it (`query_editor::syntax`).
 - `tree-sitter-pg`: schemas (`.pg`) at OmniGraph v0.13.0. Built: the read-only schema view
   parses with it (`query_editor::schema_view`).
 
@@ -39,8 +38,8 @@ These grammars live here until OmniGraph takes ownership of them together with a
   keywords. Check a grammar change against OmniGraph's logic-test corpus too: extract the
   `--- query` and `--- mutate` steps of `crates/omnigraph-gqt/cases/**/*.gqt` at the pinned tag
   (leaving out steps whose next `--- expect` is an error) and run `tree-sitter parse --quiet
-  --stat` over them; at `edge-20261017-d883c49` all 2,028 parse without an error node, as do the
-  repository's fixture queries (`crates/omnigraph/tests/fixtures/*.gq` at the tag).
+  --stat` over them with the repository's fixture queries (`crates/omnigraph/tests/fixtures/*.gq`
+  at the tag); at `edge-20261020-7fd9cc9` all 1,636 parse without an error node.
 
 ## tree-sitter-pg
 

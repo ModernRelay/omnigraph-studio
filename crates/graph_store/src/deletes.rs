@@ -344,7 +344,7 @@ mod tests {
                 };
                 Ok(Response::builder()
                     .status(200)
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                     .body(AsyncBody::from(body.to_string()))
                     .unwrap())
             }
@@ -412,7 +412,7 @@ mod tests {
                 };
                 Ok(Response::builder()
                     .status(200)
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                     .body(AsyncBody::from(body.to_string()))
                     .unwrap())
             }

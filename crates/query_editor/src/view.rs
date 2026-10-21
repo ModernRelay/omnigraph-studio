@@ -3010,9 +3010,7 @@ impl QueryEditor {
                                     },
                                 ))
                             }))
-                            .children(
-                                fix.map(|fix| ds::text::muted(format!("Fix: {fix}"))),
-                            ),
+                            .children(fix.map(|fix| ds::text::muted(format!("Fix: {fix}")))),
                     ),
             )
             .into_any_element()
@@ -3342,7 +3340,7 @@ mod tests {
             let http = FakeHttpClient::create(|_| async move {
                 Ok(Response::builder()
                     .status(200)
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                     .body(AsyncBody::from(r#"{"branches":["main"]}"#))
                     .unwrap())
             });

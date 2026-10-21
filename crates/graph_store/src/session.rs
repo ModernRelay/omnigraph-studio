@@ -3190,7 +3190,14 @@ impl GraphSession {
         cx.emit(SessionEvent::ActivityChanged);
         let work = cx.spawn(async move |this, cx| {
             let outcome = client
-                .create_branch(&graph, &BranchCreateRequest { name, from })
+                .create_branch(
+                    &graph,
+                    &BranchCreateRequest {
+                        name,
+                        from,
+                        from_commit: None,
+                    },
+                )
                 .await;
             let kind = outcome_kind(&outcome, |_| None);
             this.update(cx, |this, cx| {
@@ -3408,7 +3415,7 @@ mod tests {
                 };
                 Ok(Response::builder()
                     .status(status)
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                     .body(AsyncBody::from(body))
                     .unwrap())
             }
@@ -3458,7 +3465,7 @@ mod tests {
             async move {
                 Ok(Response::builder()
                     .status(200)
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                     .body(AsyncBody::from(body))
                     .unwrap())
             }
@@ -3483,7 +3490,7 @@ mod tests {
             "query_name": "merge",
             "affected_nodes": 0,
             "affected_edges": 0,
-            "commit": { "graph_commit_id": "r9", "graph_manifest_version": 9, "created_at": 0 },
+            "commit": { "graph_commit_id": "r9", "graph_manifest_version": 9, "kind": "published", "created_at": 0 },
             "branches": ["main", "release"],
         });
         let session = listing_session(body.to_string(), "main", cx);
@@ -3591,7 +3598,7 @@ mod tests {
                 };
                 Ok(Response::builder()
                     .status(status)
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                     .body(AsyncBody::from(body.to_string()))
                     .unwrap())
             }
@@ -3856,7 +3863,7 @@ mod tests {
                 };
                 Ok(Response::builder()
                     .status(200)
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                     .body(AsyncBody::from(body))
                     .unwrap())
             }
@@ -3970,7 +3977,7 @@ mod tests {
                 };
                 Ok(Response::builder()
                     .status(200)
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                     .body(AsyncBody::from(body))
                     .unwrap())
             }
@@ -4098,7 +4105,7 @@ mod tests {
                 };
                 Ok(Response::builder()
                     .status(200)
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                     .body(AsyncBody::from(body.to_string()))
                     .unwrap())
             }
@@ -4209,7 +4216,7 @@ mod tests {
                 };
                 Ok(Response::builder()
                     .status(200)
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                     .body(AsyncBody::from(body.to_string()))
                     .unwrap())
             }
@@ -4279,13 +4286,13 @@ mod tests {
                     asked.lock().unwrap().push(branch);
                     serde_json::json!({ "query_name": "studio_head", "target": { "branch": "main" }, "row_count": 0, "rows": [], "graph_commit_id": head })
                 } else if path.ends_with("/mutate") {
-                    serde_json::json!({ "branch": "main", "query_name": "m", "affected_nodes": 1, "affected_edges": 0, "commit": { "graph_commit_id": "c9", "graph_branch": "main", "graph_manifest_version": 9, "created_at": 9, "parent_commit_id": "c2" } })
+                    serde_json::json!({ "branch": "main", "query_name": "m", "affected_nodes": 1, "affected_edges": 0, "commit": { "graph_commit_id": "c9", "graph_branch": "main", "graph_manifest_version": 9, "kind": "published", "created_at": 9, "parent_commit_id": "c2" } })
                 } else {
                     serde_json::json!({ "branches": *branch_list.lock().unwrap() })
                 };
                 Ok(Response::builder()
                     .status(200)
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                     .body(AsyncBody::from(body.to_string()))
                     .unwrap())
             }
@@ -4446,7 +4453,7 @@ mod tests {
                     } else {
                         (
                             200,
-                            serde_json::json!({ "branch": "main", "query_name": "add", "affected_nodes": 1, "affected_edges": 0, "commit": { "graph_commit_id": "c5", "graph_branch": "main", "graph_manifest_version": 5, "created_at": 5, "parent_commit_id": "c4" } }),
+                            serde_json::json!({ "branch": "main", "query_name": "add", "affected_nodes": 1, "affected_edges": 0, "commit": { "graph_commit_id": "c5", "graph_branch": "main", "graph_manifest_version": 5, "kind": "published", "created_at": 5, "parent_commit_id": "c4" } }),
                         )
                     }
                 } else {
@@ -4454,7 +4461,7 @@ mod tests {
                 };
                 Ok(Response::builder()
                     .status(status)
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                     .body(AsyncBody::from(body.to_string()))
                     .unwrap())
             }
@@ -4538,13 +4545,13 @@ mod tests {
             async move {
                 let body = if path.ends_with("/commits") {
                     seen.lock().unwrap().push(query);
-                    r#"{"commits":[{"graph_commit_id":"c2","created_at":2,"graph_manifest_version":2,"published":true},{"graph_commit_id":"c1","created_at":1,"graph_manifest_version":1,"published":true}]}"#
+                    r#"{"commits":[{"graph_commit_id":"c2","created_at":2,"graph_manifest_version":2,"kind":"published"},{"graph_commit_id":"c1","created_at":1,"graph_manifest_version":1,"kind":"published"}]}"#
                 } else {
                     r#"{"branches":["main","feature"]}"#
                 };
                 Ok(Response::builder()
                     .status(200)
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                     .body(AsyncBody::from(body))
                     .unwrap())
             }
@@ -4620,15 +4627,15 @@ mod tests {
             async move {
                 let body = if path.ends_with("/commits") {
                     seen.lock().unwrap().push(query);
-                    r#"{"commits":[{"graph_commit_id":"c1","created_at":1,"graph_manifest_version":1,"published":true}]}"#
+                    r#"{"commits":[{"graph_commit_id":"c1","created_at":1,"graph_manifest_version":1,"kind":"published"}]}"#
                 } else if path.ends_with("/mutate") {
-                    r#"{"branch":"main","query_name":"m","affected_nodes":1,"affected_edges":0,"commit":{"graph_commit_id":"c2","graph_branch":"main","graph_manifest_version":2,"created_at":2,"parent_commit_id":"c1"}}"#
+                    r#"{"branch":"main","query_name":"m","affected_nodes":1,"affected_edges":0,"commit":{"graph_commit_id":"c2","graph_branch":"main","graph_manifest_version":2,"kind":"published","created_at":2,"parent_commit_id":"c1"}}"#
                 } else {
                     r#"{"branches":["main","feature"]}"#
                 };
                 Ok(Response::builder()
                     .status(200)
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                     .body(AsyncBody::from(body))
                     .unwrap())
             }
@@ -4771,7 +4778,7 @@ mod tests {
                 }
                 Ok(Response::builder()
                     .status(200)
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                     .body(AsyncBody::from(r#"{"branches":["main"]}"#))
                     .unwrap())
             }
@@ -4839,7 +4846,7 @@ mod tests {
                 let status = if path.ends_with("/mutate") { 400 } else { 200 };
                 Ok(Response::builder()
                     .status(status)
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                     .body(AsyncBody::from(body))
                     .unwrap())
             }
@@ -4998,7 +5005,7 @@ mod tests {
                 };
                 Ok(Response::builder()
                     .status(200)
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                     .body(AsyncBody::from(body))
                     .unwrap())
             }

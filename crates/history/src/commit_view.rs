@@ -783,7 +783,7 @@ mod tests {
                 };
                 Ok(Response::builder()
                     .status(status)
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                     .body(AsyncBody::from(body.to_string()))
                     .unwrap())
             }
@@ -854,7 +854,7 @@ mod tests {
                 };
                 Ok(Response::builder()
                     .status(status)
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                     .body(AsyncBody::from(body.to_string()))
                     .unwrap())
             }
@@ -930,7 +930,7 @@ mod tests {
                 let body = json!({ "cause": cause, "changes": [] });
                 Ok(Response::builder()
                     .status(if changes { 200 } else { 404 })
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                     .body(AsyncBody::from(body.to_string()))
                     .unwrap())
             }

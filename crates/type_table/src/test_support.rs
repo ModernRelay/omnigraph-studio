@@ -24,7 +24,7 @@ pub(crate) fn committed(commit: &str, parent: &str) -> Value {
         "affected_edges": 0,
         "commit": {
             "graph_commit_id": commit,
-            "graph_manifest_version": 2,
+            "graph_manifest_version": 2, "kind": "published",
             "created_at": 0,
             "parent_commit_id": parent,
         },
@@ -475,7 +475,7 @@ impl Blobs {
                 *published += 1;
                 let commit = json!({
                     "graph_commit_id": format!("c{}", *published + 1),
-                    "graph_manifest_version": 2,
+                    "graph_manifest_version": 2, "kind": "published",
                     "created_at": 0,
                     "parent_commit_id": format!("c{}", *published),
                 });
@@ -566,7 +566,7 @@ fn serve_blobs(
                 }
                 let mut response = Response::builder()
                     .status(status)
-                    .header(graph_client::CONTRACT_HEADER, "0.13");
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT);
                 for (name, value) in headers {
                     response = response.header(name, value);
                 }
@@ -605,7 +605,7 @@ fn serve_blobs(
                 if let Some(message) = rows.get("refuse").and_then(Value::as_str) {
                     return Ok(Response::builder()
                         .status(400)
-                        .header(graph_client::CONTRACT_HEADER, "0.13")
+                        .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                         .body(AsyncBody::from(
                             json!({ "error": message, "code": "bad_request" }).to_string(),
                         ))
@@ -644,7 +644,7 @@ fn serve_blobs(
             };
             Ok(Response::builder()
                 .status(status)
-                .header(graph_client::CONTRACT_HEADER, "0.13")
+                .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                 .body(AsyncBody::from(body.to_string()))
                 .unwrap())
         }

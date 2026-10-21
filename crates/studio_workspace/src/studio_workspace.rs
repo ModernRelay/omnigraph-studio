@@ -4680,7 +4680,7 @@ pub fn connection_color(state: &ConnectionState) -> Color {
     match state {
         ConnectionState::Ready => Color::Success,
         ConnectionState::Connecting | ConnectionState::Idle => Color::Muted,
-        ConnectionState::ContractMismatch { .. } | ConnectionState::TooOld { .. } => Color::Warning,
+        ConnectionState::ContractMismatch { .. } => Color::Warning,
         ConnectionState::Unauthorized | ConnectionState::Unreachable(_) => Color::Error,
     }
 }

@@ -768,7 +768,7 @@ mod tests {
             studio_theme::init_test(cx);
             editor::init(cx);
         });
-        let commit = |id: &str| json!({ "graph_commit_id": id, "graph_manifest_version": 1, "created_at": 0 });
+        let commit = |id: &str| json!({ "graph_commit_id": id, "graph_manifest_version": 1, "kind": "published", "created_at": 0 });
         let late_reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let late = late_reads.clone();
         let (session, asked) = fake_server(

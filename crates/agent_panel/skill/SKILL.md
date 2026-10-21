@@ -4,8 +4,8 @@ description: Read and change this OmniGraph graph from OmniGraph Studio with the
 license: GPL-3.0-or-later; GUIDE.md and references/ are MIT (see LICENSE)
 metadata:
   author: OmniGraph Studio
-  guide-version: "0.14.0-edge+b692610"
-  http-contract: "0.13"
+  guide-version: "0.14.0-edge+7fd9cc9"
+  http-contract: "0.14"
 ---
 
 # OmniGraph in Studio

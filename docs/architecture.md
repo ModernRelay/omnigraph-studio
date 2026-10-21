@@ -77,7 +77,7 @@ a 412 reopens the draft.
 │               ├──────────────────────────────────────────┤                   │
 │               │ History                               ×  │                   │
 ├───────────────┴──────────────────────────────────────────┴───────────────────┤
-│ ◧ │ ▦ ≡ ⎘ ⑂ ✦ │ ● env · 0.13 · 31 ms │ graph / ⑂ main │ facts …    ⌨ 41 MB │ ▦ ◷ ⚡ │ ⓘ │
+│ ◧ │ ▦ ≡ ⎘ ⑂ ✦ │ ● env · 0.14 · 31 ms │ graph / ⑂ main │ facts …    ⌨ 41 MB │ ▦ ◷ ⚡ │ ⓘ │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -115,7 +115,7 @@ a 412 reopens the draft.
 - `#[gpui::test]` for views and entities, against `graph_client` driven by Zed's
   `FakeHttpClient` with recorded responses.
 - `graph_client` and `gq_language` have plain unit tests; they do not depend on GPUI.
-- `crates/graph_client/openapi/omnigraph-0.14.0-edge.json` (OmniGraph `edge-20261018-0a62bb7`)
+- `crates/graph_client/openapi/omnigraph-0.14.0-edge.json` (OmniGraph `edge-20261020-7fd9cc9`)
   is the contract; a test checks every DTO and route against it.
 - macOS screenshot tests for the main views, once the views exist.
 

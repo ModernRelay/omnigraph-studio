@@ -2,7 +2,7 @@
 //! settings prefix and the byte range of each declaration), so the editor can run the
 //! declaration under the cursor.
 //!
-//! Lexical only. It follows the terminals of `query.pest` at OmniGraph `edge-20261018-0a62bb7`
+//! Lexical only. It follows the terminals of `query.pest` at OmniGraph `edge-20261020-7fd9cc9`
 //! (line and block comments, strings with escapes, `$variables`, `@meta` fields, `@Catalogue`
 //! types, identifiers, numbers) and never type-checks; `check` is the authority on what a source
 //! means.

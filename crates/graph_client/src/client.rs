@@ -176,24 +176,6 @@ impl ServerHealth {
     pub fn contract_supported(&self) -> bool {
         speaks_contract(self.contract.as_deref())
     }
-
-    /// Whether the server is OmniGraph [`MIN_SERVER_VERSION`] or later, by the version
-    /// `/healthz` names. Its contract header did not change at 0.14, so the version is what
-    /// tells a 0.13 server apart; one Studio cannot read is not supported.
-    pub fn version_supported(&self) -> bool {
-        server_version(&self.health.version).is_some_and(|version| version >= MIN_SERVER_VERSION)
-    }
-}
-
-/// The oldest OmniGraph server Studio supports, as (major, minor): 0.14, the first with the
-/// graph diff and its branch review, merge-base and merge dry run.
-pub const MIN_SERVER_VERSION: (u64, u64) = (0, 14);
-
-/// A server version's major and minor numbers: `0.14.0`, and an edge build such as
-/// `0.14.0-edge+d883c49`, are both (0, 14).
-fn server_version(version: &str) -> Option<(u64, u64)> {
-    let mut parts = version.trim().split(['.', '-', '+']);
-    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
 struct RawResponse {
@@ -1494,7 +1476,7 @@ mod tests {
                 };
                 Ok(Response::builder()
                     .status(200)
-                    .header(CONTRACT_HEADER, "0.13")
+                    .header(CONTRACT_HEADER, CONTRACT)
                     .body(AsyncBody::from(answer))
                     .unwrap())
             }
@@ -1580,7 +1562,7 @@ mod tests {
                 log.lock().unwrap().push((method, uri, headers, body));
                 Ok(Response::builder()
                     .status(201)
-                    .header(CONTRACT_HEADER, "0.13")
+                    .header(CONTRACT_HEADER, CONTRACT)
                     .body(AsyncBody::from("{\"ok\":true}"))
                     .unwrap())
             }
@@ -1610,7 +1592,7 @@ mod tests {
             vec![
                 ("authorization".into(), "Bearer t".into()),
                 ("content-type".into(), "application/x-ndjson".into()),
-                ("omnigraph-http-api".into(), "0.13".into()),
+                ("omnigraph-http-api".into(), CONTRACT.into()),
             ]
         );
         assert_eq!(sent, "{}\n");
@@ -1638,7 +1620,7 @@ mod tests {
 
     #[test]
     fn a_committed_write_needs_the_contract_header() {
-        let outcome = block_on(client(respond(200, Some("0.13"), CHANGE)).mutate(
+        let outcome = block_on(client(respond(200, Some(CONTRACT), CHANGE)).mutate(
             "g",
             &ChangeRequest::default(),
             None,
@@ -1656,7 +1638,7 @@ mod tests {
     #[test]
     fn a_refusal_carries_the_servers_reason() {
         let body = r#"{"error":"graph commit moved","code":"conflict","precondition_failure":{"expected":"a","actual":"b"}}"#;
-        let outcome = block_on(client(respond(412, Some("0.13"), body)).mutate(
+        let outcome = block_on(client(respond(412, Some(CONTRACT), body)).mutate(
             "g",
             &ChangeRequest::default(),
             Some("a"),
@@ -1689,7 +1671,7 @@ mod tests {
     fn a_merge_preview_reads_the_outcome_or_the_conflicts() {
         let merges = r#"{"source":"feature","target":"main","outcome":"fast_forward","commit":null,"dry_run":true}"#;
         let preview = block_on(
-            client(respond(200, Some("0.13"), merges)).merge_preview("g", "feature", "main"),
+            client(respond(200, Some(CONTRACT), merges)).merge_preview("g", "feature", "main"),
         );
         assert!(matches!(
             preview,
@@ -1699,7 +1681,7 @@ mod tests {
         ));
         let conflicts = r#"{"error":"merge conflicts","code":"conflict","merge_conflicts":[{"entity_kind":"node","type_name":"Person","kind":"divergent_update","message":"changed on both","entity_id":"p1"}]}"#;
         let preview = block_on(
-            client(respond(409, Some("0.13"), conflicts)).merge_preview("g", "feature", "main"),
+            client(respond(409, Some(CONTRACT), conflicts)).merge_preview("g", "feature", "main"),
         );
         match preview {
             Ok(MergePreview::Conflicts(conflicts)) => {
@@ -1708,7 +1690,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         let refused = block_on(
-            client(respond(403, Some("0.13"), r#"{"error":"denied"}"#))
+            client(respond(403, Some(CONTRACT), r#"{"error":"denied"}"#))
                 .merge_preview("g", "feature", "main"),
         );
         assert!(matches!(refused, Err(ReadError::Refused(summary)) if summary.status == 403));
@@ -1717,7 +1699,7 @@ mod tests {
     #[test]
     fn a_server_error_on_a_write_is_unknown() {
         let outcome = block_on(
-            client(respond(500, Some("0.13"), r#"{"error":"boom"}"#)).mutate(
+            client(respond(500, Some(CONTRACT), r#"{"error":"boom"}"#)).mutate(
                 "g",
                 &ChangeRequest::default(),
                 None,
@@ -1729,13 +1711,14 @@ mod tests {
     #[test]
     fn a_read_checks_the_contract() {
         let result =
-            block_on(client(respond(200, Some("0.14"), r#"{"branches":[]}"#)).branches("g"));
+            block_on(client(respond(200, Some("0.13"), r#"{"branches":[]}"#)).branches("g"));
         assert!(matches!(
             result,
             Err(ReadError::ContractMismatch { served: Some(_) })
         ));
-        let result =
-            block_on(client(respond(200, Some("0.13"), r#"{"branches":["main"]}"#)).branches("g"));
+        let result = block_on(
+            client(respond(200, Some(CONTRACT), r#"{"branches":["main"]}"#)).branches("g"),
+        );
         assert_eq!(result.unwrap().branches, vec!["main"]);
     }
 
@@ -1749,7 +1732,7 @@ mod tests {
         let http = FakeHttpClient::create(move |_request| {
             let n = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             async move {
-                let builder = Response::builder().header(CONTRACT_HEADER, "0.13");
+                let builder = Response::builder().header(CONTRACT_HEADER, CONTRACT);
                 let response = if n < limited {
                     builder
                         .status(429)
@@ -1794,7 +1777,7 @@ mod tests {
                 now.fetch_sub(1, Ordering::SeqCst);
                 Ok(Response::builder()
                     .status(200)
-                    .header(CONTRACT_HEADER, "0.13")
+                    .header(CONTRACT_HEADER, CONTRACT)
                     .body(AsyncBody::from(r#"{"branches":["main"]}"#))
                     .unwrap())
             }
@@ -1825,7 +1808,7 @@ mod tests {
 
     #[test]
     fn paths_and_queries_are_encoded() {
-        let client = client(respond(200, Some("0.13"), "{}"));
+        let client = client(respond(200, Some(CONTRACT), "{}"));
         let url = client.url(
             &["graphs", "g", "branches", "feature/x y"],
             &[("branch", "a&b")],
@@ -1834,16 +1817,6 @@ mod tests {
             url.as_str(),
             "http://127.0.0.1:8787/graphs/g/branches/feature%2Fx%20y?branch=a%26b"
         );
-    }
-
-    #[test]
-    fn a_server_version_is_its_major_and_minor() {
-        assert_eq!(server_version("0.14.0"), Some((0, 14)));
-        assert_eq!(server_version("0.14.0-edge+d883c49"), Some((0, 14)));
-        assert_eq!(server_version("1.2"), Some((1, 2)));
-        assert_eq!(server_version("edge"), None);
-        assert!(server_version("0.13.0").unwrap() < MIN_SERVER_VERSION);
-        assert!(server_version("0.15.1").unwrap() > MIN_SERVER_VERSION);
     }
 
     #[test]
@@ -1927,7 +1900,7 @@ mod tests {
                 log.lock()
                     .unwrap()
                     .push(format!("{} {range} {:?}", request.method(), follows));
-                let ok = || Response::builder().header(CONTRACT_HEADER, "0.13");
+                let ok = || Response::builder().header(CONTRACT_HEADER, CONTRACT);
                 let response = if url.contains("id=bytes") {
                     if request.method() == Method::HEAD {
                         ok().status(200)
@@ -2025,7 +1998,7 @@ mod tests {
             async move {
                 Ok(Response::builder()
                     .status(200)
-                    .header(CONTRACT_HEADER, "0.13")
+                    .header(CONTRACT_HEADER, CONTRACT)
                     .body(AsyncBody::from_reader(Endless(counted)))
                     .unwrap())
             }
@@ -2110,7 +2083,7 @@ mod tests {
                     .push((method, query, types, if_match, bytes));
                 Ok(Response::builder()
                     .status(status)
-                    .header(CONTRACT_HEADER, "0.13")
+                    .header(CONTRACT_HEADER, CONTRACT)
                     .body(AsyncBody::from(body))
                     .unwrap())
             }
@@ -2210,7 +2183,7 @@ mod tests {
         ));
         // Too large for the server is its refusal: nothing was stored.
         assert!(matches!(
-            put(respond(413, Some("0.13"), r#"{"error":"Blob put exceeds 1048576 bytes"}"#)),
+            put(respond(413, Some(CONTRACT), r#"{"error":"Blob put exceeds 1048576 bytes"}"#)),
             WriteOutcome::Refused(error) if error.status == 413
         ));
     }

@@ -223,7 +223,7 @@ it is.
    bounded to 5 s: `omnigraph version --json` reports `http_contract` (OmniGraph #987, E23) and
    `protocols.target` (#1090). An older release, or one that does not answer, fits nothing; its
    `--version` only names it in the notice. The first that speaks Studio's contract and target
-   protocol 1 goes in the wrapper (edge `edge-20261020-b692610` is the first), so a slow or
+   protocol 1 goes in the wrapper (edge `edge-20261020-7fd9cc9` is the first), so a slow or
    unavailable server never decides which CLI a conversation gets.
 3. If none fits, the wrapper runs nothing and prints why, so `omnigraph_run` and the agent's
    shell refuse rather than run a CLI the server would refuse. A notice in the thread names the
@@ -236,8 +236,12 @@ it is.
 
 The gateway answers `GET`/`HEAD /healthz` itself with one contract header, before the token
 check, as the CLI probes with no token. Every other request needs the session token (else 401)
-and exactly one `omnigraph-http-api: 0.13` (else 400 `api_contract_mismatch`, naming the CLI to
-use). Request bodies are read whole, at most 64 MiB (413 above, before anything is sent). A
+and exactly one `omnigraph-http-api: 0.14` (else 400 `api_contract_mismatch`, naming the CLI to
+use). Of the request's headers only `accept`, `content-type`, `if-match`, `if-none-match`,
+`omnigraph-if-actor`, `omnigraph-if-graph-commit` and `range` are passed on; the gateway sets the
+token and contract itself. `omnigraph-if-actor` is the CLI's `--as`, which can only narrow a
+request: the server refuses it unless it names the person's actor. Request bodies are read
+whole, at most 64 MiB (413 above, before anything is sent). A
 target holding a `#`, or a query parameter given twice, is refused (400) before the rules
 read it: forwarding drops a `#` and all that follows it, so the rules would judge a query the
 server never sees, and a repeated key could be judged by one value and read as another.
@@ -248,7 +252,7 @@ server never sees, and a repeated key could be judged by one value and read as a
 | `POST /mutate`, `/mutate/if-graph-commit` | Only when `branch` is the agent branch. `branch: null` (branch and commit statements) is refused, and so is a declaration written `as commit` or `as unattached branch`, read from its head with `gq_language`'s lexer: it moves no branch |
 | `POST /load/ndjson`, `/load` | Only when `branch` is the agent branch; `from`, when given, must be the base (it creates the branch when the branch is missing; the answer's `branch_created` says whether it did) |
 | `PUT`/`DELETE /blob` | Only when `branch` is the agent branch |
-| `POST /branches` | Only `{name: <agent branch>, from: <base>}` |
+| `POST /branches` | Only `{name: <agent branch>, from: <base>}`; one with `from_commit` is refused, since a branch started at a commit holds what that commit held |
 | `DELETE /branches/{name}` | Only the agent branch |
 | `POST /branches/merge` | Only into the agent branch, and never with `delete_branch: true` or `as_commit`. A `dry_run` is a read, on any graph, as the other reads are |
 | `POST /queries/{name}` | On the agent branch, a write; elsewhere forwarded with `expect_mutation: false`. Its text is not in the request and the catalog (`GET /queries`) says only whether it writes, so one held as an unpublished commit is known from its answer alone |

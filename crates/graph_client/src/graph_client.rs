@@ -5,8 +5,8 @@
 //!
 //! Built on Zed's `http_client::HttpClient` (Apache-2.0): the app passes `reqwest_client`,
 //! tests pass Zed's fake client. The contract is `openapi/omnigraph-0.14.0-edge.json`, copied
-//! from OmniGraph at `edge-20261018-0a62bb7` (`0.14.0-edge+0a62bb7`, MIT), the oldest server
-//! Studio supports. Its contract header is still `0.13`.
+//! from OmniGraph at `edge-20261020-7fd9cc9` (`0.14.0-edge+7fd9cc9`, MIT), the first build that
+//! speaks contract `0.14` and the oldest server Studio supports.
 
 pub mod api;
 mod client;
@@ -14,8 +14,8 @@ mod client;
 pub use api::ErrorOutput;
 pub use client::{
     ApiErrorSummary, BlobAt, BlobCell, BlobMeta, CommitChanges, FeedAt, ForwardRequest,
-    ForwardResponse, GraphClient, HistoricalGap, MIN_SERVER_VERSION, MergePreview, PropertyThen,
-    ReadError, ServerHealth, judge_write, server_root,
+    ForwardResponse, GraphClient, HistoricalGap, MergePreview, PropertyThen, ReadError,
+    ServerHealth, judge_write, server_root,
 };
 pub use http_client::{
     AsyncBody,
@@ -23,12 +23,13 @@ pub use http_client::{
 };
 
 /// Header every protected request sends and every response echoes
-/// (`omnigraph-api-types` `HTTP_API_CONTRACT_HEADER` at OmniGraph v0.13.0).
+/// (`omnigraph-api-types` `HTTP_API_CONTRACT_HEADER`).
 pub const CONTRACT_HEADER: &str = "omnigraph-http-api";
 
-/// The contract this client speaks: `HTTP_API_CONTRACT`, unchanged from OmniGraph 0.13 to
-/// 0.14.
-pub const CONTRACT: &str = "0.13";
+/// The contract this client speaks: `HTTP_API_CONTRACT`. A server refuses a request that does
+/// not send exactly this value, and an earlier 0.14 build, which still speaks `0.13`, is told
+/// apart by its header alone.
+pub const CONTRACT: &str = "0.14";
 
 /// Whether a response's contract header names the contract Studio speaks.
 pub fn speaks_contract(served: Option<&str>) -> bool {

@@ -146,10 +146,10 @@ through its own CLI. CI caches `~/.cargo/git` and `target/` keyed on `Cargo.lock
 - Auto-update, until there is a first signed release.
 - Engine change E19 (publish `omnigraph-compiler` to crates.io again), [spec 012](../012-omnigraph-engine-changes/plan.md). Until then the
   compiler is a git dependency on the tag of Studio's oldest supported server,
-  `edge-20261018-0a62bb7` since 2026-10-20 (`edge-20261017-d883c49` before). It moves with that
-  server, so the query editor checks text by the rules the server it targets applies: `T27`,
-  `T59` and exact `@range` bounds came with this bump; `from commit` in `branch create` arrives
-  with a bump to a build at or after OmniGraph main `b8e82abf` (spec 012). Schemas the server
+  `edge-20261020-7fd9cc9` since 2026-10-20 (`edge-20261018-0a62bb7` and `edge-20261017-d883c49`
+  before). It moves with that server, so the query editor checks text by the rules the server it
+  targets applies: `T27`, `T59` and exact `@range` bounds came with the bump to `0a62bb7`, and
+  `from commit "<id>"` in `branch create` (GQ 2.3) with this one. Schemas the server
   holds are read with its compatibility parser for accepted contracts, so a graph admitted
   before a rule tightened still opens.
 

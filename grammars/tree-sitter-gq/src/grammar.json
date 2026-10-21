@@ -249,8 +249,26 @@
                           "value": "from"
                         },
                         {
-                          "type": "SYMBOL",
-                          "name": "_branch_name"
+                          "type": "CHOICE",
+                          "members": [
+                            {
+                              "type": "SYMBOL",
+                              "name": "from_commit"
+                            },
+                            {
+                              "type": "ALIAS",
+                              "content": {
+                                "type": "STRING",
+                                "value": "commit"
+                              },
+                              "named": true,
+                              "value": "branch_name"
+                            },
+                            {
+                              "type": "SYMBOL",
+                              "name": "_branch_name"
+                            }
+                          ]
                         }
                       ]
                     },
@@ -500,6 +518,19 @@
           },
           "named": true,
           "value": "branch_name"
+        }
+      ]
+    },
+    "from_commit": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "commit"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "string"
         }
       ]
     },

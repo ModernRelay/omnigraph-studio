@@ -4576,7 +4576,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.56.0",
+ "windows-core 0.57.0",
 ]
 
 [[package]]
@@ -6963,7 +6963,7 @@ dependencies = [
 [[package]]
 name = "omnigraph-compiler"
 version = "0.14.0"
-source = "git+https://github.com/ModernRelay/omnigraph?tag=edge-20261018-0a62bb7#0a62bb7b2aa5b99b012f413807c216277f7f9596"
+source = "git+https://github.com/ModernRelay/omnigraph?tag=edge-20261020-7fd9cc9#7fd9cc9037c634e2f3284f1ede55a85a6f7b28e8"
 dependencies = [
  "ahash",
  "arrow-array",

@@ -78,8 +78,7 @@ pub enum GraphAvailability {
     Transitioning,
     Blocked,
     Stopping,
-    /// A value a newer server sends that this build does not know: Studio accepts any server
-    /// from 0.14 on, so an answer still decodes.
+    /// A value a later build speaking contract 0.14 may send, so an answer still decodes.
     #[serde(other)]
     Other,
 }
@@ -92,8 +91,7 @@ pub enum GraphAvailabilityAction {
     WaitForTransition,
     ApplyCorrectionOrRestart,
     WaitForRestart,
-    /// A value a newer server sends that this build does not know: Studio accepts any server
-    /// from 0.14 on, so an answer still decodes.
+    /// A value a later build speaking contract 0.14 may send, so an answer still decodes.
     #[serde(other)]
     Other,
 }
@@ -106,8 +104,7 @@ pub enum GraphStartupFailure {
     InvalidExternalBlobPolicy,
     OpenFailed,
     InvalidStoredQueries,
-    /// A value a newer server sends that this build does not know: Studio accepts any server
-    /// from 0.14 on, so an answer still decodes.
+    /// A value a later build speaking contract 0.14 may send, so an answer still decodes.
     #[serde(other)]
     Other,
 }
@@ -313,21 +310,101 @@ pub struct BranchListOutput {
     pub branches: Vec<String>,
 }
 
-/// `POST /graphs/{id}/branches`.
+/// `POST /graphs/{id}/branches`: the new branch starts at `from`'s head, or at the published
+/// commit `from_commit` names; never both.
 #[derive(Debug, Clone, Serialize)]
 pub struct BranchCreateRequest {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BranchCreateOutput {
     pub uri: String,
+    /// The branch the new one started from; for a commit start, the branch that wrote it.
     pub from: String,
     pub name: String,
+    /// The commit the new branch starts at.
+    pub from_commit_id: String,
     #[serde(default)]
     pub actor_id: Option<String>,
+}
+
+/// A branch create refused at the commit `from_commit` named (409, or 410 for
+/// `not_retained`); nothing was created.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BranchStartRefusalOutput {
+    pub reason: BranchStartRefusalReason,
+    pub graph_commit_id: String,
+    /// For `branch_deleted`, the branch that wrote the commit.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// For `not_retained`, the type whose stored version cleanup reclaimed.
+    #[serde(default)]
+    pub type_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchStartRefusalReason {
+    /// Cleanup reclaimed a version the commit names.
+    NotRetained,
+    /// The schema changed since the commit.
+    SchemaChanged,
+    /// The commit predates the graph's storage format.
+    EarlierStorageFormat,
+    /// The branch that wrote the commit was deleted.
+    BranchDeleted,
+    UnpublishedCommit,
+    UnattachedSnapshot,
+    Unknown,
+    /// A value a later build speaking contract 0.14 may send, so an answer still decodes.
+    #[serde(other)]
+    Other,
+}
+
+// ---- access ----
+
+/// `GET /graphs/{id}/access`: what the caller's own credential may do on one graph, by its
+/// installed policy.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AccessOutput {
+    pub graph_id: String,
+    /// The actor the credential resolves to; none on a server without authentication.
+    #[serde(default)]
+    pub actor: Option<String>,
+    /// Actions allowed with no branch named: the graph-scoped ones, and those a single rule
+    /// allows on every branch. An action allowed on every branch only by two rules together
+    /// is missing here; `actions` for a branch has it.
+    pub graph_wide: Vec<AccessAction>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub target_branch: Option<String>,
+    /// With `branch`, the actions allowed on it (with `target_branch`, also `branch_create`
+    /// and `branch_merge` from it into that one). Empty without `branch`.
+    pub actions: Vec<AccessAction>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessAction {
+    Read,
+    Export,
+    Change,
+    SchemaApply,
+    BranchCreate,
+    BranchDelete,
+    BranchMerge,
+    CommitPublish,
+    CommitDrop,
+    InvokeQuery,
+    /// A value a later build speaking contract 0.14 may send, so an answer still decodes.
+    #[serde(other)]
+    Other,
 }
 
 /// `POST /graphs/{id}/branches/merge`.
@@ -375,8 +452,7 @@ pub enum BranchMergeOutcome {
     AlreadyUpToDate,
     FastForward,
     Merged,
-    /// A value a newer server sends that this build does not know: Studio accepts any server
-    /// from 0.14 on, so an answer still decodes.
+    /// A value a later build speaking contract 0.14 may send, so an answer still decodes.
     #[serde(other)]
     Other,
 }
@@ -409,24 +485,20 @@ pub struct CommitOutput {
     pub merged_parent_commit_id: Option<String>,
     #[serde(default)]
     pub actor_id: Option<String>,
-    /// Always sent by 0.14; a commit of a branch's history is `published`.
-    #[serde(default)]
     pub kind: CommitKind,
 }
 
 /// Which kind of commit a commit is (`CommitKindOutput`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommitKind {
     /// A commit of a branch's history.
-    #[default]
     Published,
     /// A proposal written `as commit`, awaiting `commit publish`.
     Unpublished,
     /// An unattached snapshot, written `as unattached branch`, which never publishes.
     Unattached,
-    /// A value a newer server sends that this build does not know: Studio accepts any server
-    /// from 0.14 on, so an answer still decodes.
+    /// A value a later build speaking contract 0.14 may send, so an answer still decodes.
     #[serde(other)]
     Other,
 }
@@ -558,8 +630,7 @@ pub struct BlobSelectorOutput {
 pub enum BlobWriteState {
     Managed,
     Null,
-    /// A value a newer server sends that this build does not know: Studio accepts any server
-    /// from 0.14 on, so an answer still decodes.
+    /// A value a later build speaking contract 0.14 may send, so an answer still decodes.
     #[serde(other)]
     Other,
 }
@@ -590,6 +661,9 @@ pub struct ErrorOutput {
     /// was read.
     #[serde(default)]
     pub blob_precondition_failure: Option<BlobPreconditionFailureOutput>,
+    /// Set when a branch could not start at the commit `from_commit` named.
+    #[serde(default)]
+    pub branch_start_refusal: Option<BranchStartRefusalOutput>,
     #[serde(default)]
     pub diagnostic: Option<Value>,
     #[serde(flatten)]
@@ -612,8 +686,9 @@ pub enum ErrorCode {
     Internal,
     /// `commit publish` of an unattached snapshot, which never publishes.
     UnattachedCannotPublish,
-    /// A value a newer server sends that this build does not know: Studio accepts any server
-    /// from 0.14 on, so an answer still decodes.
+    /// The credential resolves to another actor than `Omnigraph-If-Actor` named (412).
+    ActorMismatch,
+    /// A value a later build speaking contract 0.14 may send, so an answer still decodes.
     #[serde(other)]
     Other,
 }
@@ -638,8 +713,7 @@ pub enum MergeConflictKind {
     UniqueViolation,
     CardinalityViolation,
     ValueConstraintViolation,
-    /// A value a newer server sends that this build does not know: Studio accepts any server
-    /// from 0.14 on, so an answer still decodes.
+    /// A value a later build speaking contract 0.14 may send, so an answer still decodes.
     #[serde(other)]
     Other,
 }
@@ -761,8 +835,26 @@ mod contract_tests {
             ],
         ),
         ("BranchListOutput", &["branches"]),
-        ("BranchCreateRequest", &["name", "from"]),
-        ("BranchCreateOutput", &["uri", "from", "name", "actor_id"]),
+        ("BranchCreateRequest", &["name", "from", "from_commit"]),
+        (
+            "BranchCreateOutput",
+            &["uri", "from", "name", "from_commit_id", "actor_id"],
+        ),
+        (
+            "BranchStartRefusalOutput",
+            &["reason", "graph_commit_id", "branch", "type_name"],
+        ),
+        (
+            "AccessOutput",
+            &[
+                "graph_id",
+                "actor",
+                "graph_wide",
+                "branch",
+                "target_branch",
+                "actions",
+            ],
+        ),
         ("BranchMergeRequest", &["source", "target", "delete_branch"]),
         (
             "BranchMergeOutput",
@@ -833,6 +925,7 @@ mod contract_tests {
                 "merge_conflicts",
                 "precondition_failure",
                 "blob_precondition_failure",
+                "branch_start_refusal",
                 "diagnostic",
             ],
         ),
@@ -892,6 +985,34 @@ mod contract_tests {
                 "graph_unavailable",
                 "internal",
                 "unattached_cannot_publish",
+                "actor_mismatch",
+            ],
+        ),
+        (
+            "BranchStartRefusalReason",
+            &[
+                "not_retained",
+                "schema_changed",
+                "earlier_storage_format",
+                "branch_deleted",
+                "unpublished_commit",
+                "unattached_snapshot",
+                "unknown",
+            ],
+        ),
+        (
+            "AccessAction",
+            &[
+                "read",
+                "export",
+                "change",
+                "schema_apply",
+                "branch_create",
+                "branch_delete",
+                "branch_merge",
+                "commit_publish",
+                "commit_drop",
+                "invoke_query",
             ],
         ),
         (

@@ -28,11 +28,12 @@ Requirements:
 - macOS: the Command Line Tools (GPUI compiles its Metal shaders when Studio starts); full
   Xcode to compile them into a release build (`script/bundle-mac`). Linux: the Wayland, X11 and
   Vulkan development packages listed in `.github/workflows/ci.yml`.
-- An OmniGraph 0.14 server or later; Studio refuses an older one. Its query checks follow
-  `edge-20261018-0a62bb7`, and commit lists page from that build on. For the sample graph, the
-  `omnigraph` and `omnigraph-server` binaries of an edge build whose CLI reads target files,
-  `edge-20261020-b692610` or later (`VERSION=edge-20261020-b692610` with OmniGraph's
-  `scripts/install.sh`), on `PATH` or named by `OMNIGRAPH_BIN` and `OMNIGRAPH_SERVER_BIN`.
+- An OmniGraph server that speaks HTTP contract 0.14: the edge build `edge-20261020-7fd9cc9`
+  or later. Studio refuses a server that speaks another contract, OmniGraph 0.13 and the
+  earlier 0.14 edge builds included, and its query checks follow that build. For the sample
+  graph, the `omnigraph` and `omnigraph-server` binaries of that build or later
+  (`VERSION=edge-20261020-7fd9cc9` with OmniGraph's `scripts/install.sh`), on `PATH` or named by
+  `OMNIGRAPH_BIN` and `OMNIGRAPH_SERVER_BIN`.
 
 Run against the sample graph (200 people, 25 companies, 40 projects):
 
@@ -98,9 +99,9 @@ Studio is a client of the OmniGraph HTTP API and nothing else. These rules are i
 `.specify/memory/constitution.md` and each feature plan records how it follows them.
 
 - **HTTP only.** No access to graph storage and no engine crate except `omnigraph-compiler`,
-  which is linked for parsing and type checking. Every request sends `omnigraph-http-api: 0.13`
-  (unchanged in 0.14), and a response without the header is treated as having an unknown effect.
-  A server older than 0.14, by the version its `/healthz` names, is refused.
+  which is linked for parsing and type checking. Every request sends `omnigraph-http-api: 0.14`,
+  a server that answers with another contract is refused, and a response without the header is
+  treated as having an unknown effect.
 - **One commit per view.** A view records the `graph_commit_id` of its first read and passes it
   as `snapshot` on every later read. When the branch head moves, the view shows "Newer data ·
   Refresh" and keeps its data until refreshed.
@@ -172,7 +173,7 @@ what is deferred, and a dated validation log of the checks behind each claim.
 
 ## Status
 
-Built against OmniGraph 0.14 (`edge-20261018-0a62bb7`); macOS is the primary platform, and Linux and Windows build and
+Built against OmniGraph 0.14 (`edge-20261020-7fd9cc9`, HTTP contract 0.14); macOS is the primary platform, and Linux and Windows build and
 test in CI. Not implemented:
 
 - Signed and notarized releases, a Windows installer, auto-update.

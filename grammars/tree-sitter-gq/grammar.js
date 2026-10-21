@@ -1,5 +1,5 @@
 /**
- * Tree-sitter grammar for OmniGraph queries (`.gq`), GQ at OmniGraph `edge-20261018-0a62bb7`.
+ * Tree-sitter grammar for OmniGraph queries (`.gq`), GQ at OmniGraph `edge-20261020-7fd9cc9`.
  *
  * Written from `crates/omnigraph-compiler/src/query/query.pest` at that tag. It is for
  * highlighting, folding and outline in Studio's query editor: it accepts what the pest grammar
@@ -65,7 +65,14 @@ module.exports = grammar({
       seq(
         'branch',
         choice(
-          seq('create', $._branch_name, optional(seq('from', $._branch_name))),
+          seq(
+            'create',
+            $._branch_name,
+            // A bare `commit`, with no quoted id after it, is a branch of that name.
+            optional(
+              seq('from', choice($.from_commit, alias('commit', $.branch_name), $._branch_name)),
+            ),
+          ),
           seq('delete', $._branch_name),
           seq(
             'merge',
@@ -90,6 +97,9 @@ module.exports = grammar({
     // A side is a branch or a quoted commit id. `dry` and `as` are names here: the clause
     // words are keywords only where the clause may start.
     _branch_name: ($) => choice(alias($.identifier, $.branch_name), alias($.string, $.branch_name)),
+
+    // `from commit "<id>"`: the new branch starts at that graph commit.
+    from_commit: ($) => seq('commit', $.string),
 
     dry_run: (_) => seq('dry', 'run'),
 
