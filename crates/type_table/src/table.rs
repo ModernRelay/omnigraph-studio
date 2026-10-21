@@ -30,6 +30,7 @@ use graph_client::{BlobCell, BlobMeta, HistoricalGap, PropertyThen, ReadError};
 use graph_store::scope::{ReadScope, ScopeSince};
 use graph_store::{DraftEntry, DraftKey, GraphSession, Loadable, SessionEvent};
 use serde_json::Value;
+use studio_actions::blob::{ChooseFile, ClearValue};
 use studio_actions::table::{
     AddFilter, Cancel, ClearFilters, ConfirmEdit, CopyCell, DeleteRow, EditCell, ExploreRow,
     FilterBySelection, InsertRow, MoveDown, MoveLeft, MoveRight, MoveUp, OpenRowPage, PeekRow,
@@ -6533,16 +6534,62 @@ impl TypeTable {
         }
     }
 
-    /// Stores the file at `path` in row `row_id`'s Blob `property` on the table's branch, bound
-    /// to the value the cell shows at the table's commit. After a conflict, a file dropped
-    /// again is bound to what the cell held at the head then, which the cell's notice named.
-    /// The cell shows a dot while it is out; its commit moves the table there as a cell edit's
-    /// does.
+    /// The Blob cell under the cursor, as (row id, property), in a node table: what Choose File
+    /// and Clear act on.
+    fn blob_under_cursor(&self) -> Option<(String, String)> {
+        let cursor = self.cursor?;
+        let property = self.columns.get(cursor.col)?.property()?;
+        (self.kind == TableKind::Node && property.kind == ScalarKind::Blob)
+            .then(|| self.rows.get(cursor.row))
+            .flatten()
+            .map(|row| (row.id.clone(), property.name.clone()))
+    }
+
+    /// Choose File…: the system's picker, then the file chosen stored in the Blob cell under the
+    /// cursor.
+    fn on_choose_blob_file(&mut self, _: &ChooseFile, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((row_id, property)) = self.blob_under_cursor() else {
+            return;
+        };
+        let chosen = blob_write::choose_file(cx);
+        cx.spawn(async move |this, cx| {
+            if let Some(path) = chosen.await {
+                this.update(cx, |this, cx| {
+                    this.upload_blob(&row_id, &property, path, cx)
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Clear: the Blob cell under the cursor set to null, bound to the value it shows.
+    fn on_clear_blob(&mut self, _: &ClearValue, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some((row_id, property)) = self.blob_under_cursor() {
+            self.write_blob(&row_id, &property, BlobChange::Clear, cx);
+        }
+    }
+
+    /// Stores the file at `path` in row `row_id`'s Blob `property` on the table's branch.
     pub(crate) fn upload_blob(
         &mut self,
         row_id: &str,
         property: &str,
         path: std::path::PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        self.write_blob(row_id, property, BlobChange::Upload(path), cx);
+    }
+
+    /// Sends `change` to row `row_id`'s Blob `property` on the table's branch, bound to the value
+    /// the cell shows at the table's commit. After a conflict, a change made again is bound to
+    /// what the cell held at the head then, which the cell's notice named. The cell shows a dot
+    /// while it is out; its commit moves the table there as a cell edit's does.
+    fn write_blob(
+        &mut self,
+        row_id: &str,
+        property: &str,
+        change: BlobChange,
         cx: &mut Context<Self>,
     ) {
         let key = (row_id.to_owned(), property.to_owned());
@@ -6554,13 +6601,6 @@ impl TypeTable {
             notice: Notice::new(Tone::Invalid, reason),
             again: None,
         };
-        if let Some(reason) =
-            blob_write::write_refusal(self.schema.as_deref(), &cell, self.at_commit.as_deref())
-        {
-            self.blob_edits.insert(key, refused(reason));
-            cx.notify();
-            return;
-        }
         let over = match self.blob_edits.get(&key) {
             Some(BlobEdit::Failed {
                 again: Some((_, now)),
@@ -6568,6 +6608,21 @@ impl TypeTable {
             }) => Some(now.clone()),
             _ => None,
         };
+        let (schema, pinned) = (self.schema.as_deref(), self.at_commit.as_deref());
+        let refusal = match &change {
+            BlobChange::Clear if over.is_none() => blob_write::clear_refusal(
+                schema,
+                &cell,
+                pinned,
+                self.blobs.get(&key).and_then(Loadable::loaded),
+            ),
+            _ => blob_write::write_refusal(schema, &cell, pinned),
+        };
+        if let Some(reason) = refusal {
+            self.blob_edits.insert(key, refused(reason));
+            cx.notify();
+            return;
+        }
         let shown = over
             .clone()
             .or_else(|| self.blobs.get(&key).and_then(Loadable::loaded).cloned());
@@ -6585,8 +6640,20 @@ impl TypeTable {
         } else {
             self.paging.pinned.clone()
         };
-        let change = BlobChange::Upload(path.clone());
-        let write = blob_write::upload(&self.session, &self.branch, cell, shown, read_at, path, cx);
+        let write = match &change {
+            BlobChange::Upload(path) => blob_write::upload(
+                &self.session,
+                &self.branch,
+                cell,
+                shown,
+                read_at,
+                path.clone(),
+                cx,
+            ),
+            BlobChange::Clear => {
+                blob_write::clear(&self.session, &self.branch, cell, shown, read_at, cx)
+            }
+        };
         self.blob_edits
             .insert(key.clone(), BlobEdit::Saving(change.clone()));
         self.saves_in_flight += 1;
@@ -7187,18 +7254,25 @@ impl TypeTable {
                 }
                 keys
             }
-            (false, TableKind::Node) => vec![
-                key("Edit", &EditCell),
-                key("Peek", &PeekRow),
-                key("Open page", &OpenRowPage),
-                key("Explore", &ExploreRow),
-                key("Copy", &CopyCell),
-                key("Filter by this value", &FilterBySelection),
-                key("New row", &InsertRow),
-                key("Delete row", &DeleteRow),
-                key("Save drafts", &SaveDrafts),
-                key("Refresh", &RefreshTable),
-            ],
+            (false, TableKind::Node) => {
+                let mut keys = vec![
+                    key("Edit", &EditCell),
+                    key("Peek", &PeekRow),
+                    key("Open page", &OpenRowPage),
+                    key("Explore", &ExploreRow),
+                    key("Copy", &CopyCell),
+                    key("Filter by this value", &FilterBySelection),
+                    key("New row", &InsertRow),
+                    key("Delete row", &DeleteRow),
+                    key("Save drafts", &SaveDrafts),
+                    key("Refresh", &RefreshTable),
+                ];
+                if self.blob_under_cursor().is_some() {
+                    keys.insert(1, key("Choose file", &ChooseFile));
+                    keys.insert(2, key("Clear value", &ClearValue));
+                }
+                keys
+            }
             (false, TableKind::Edge) => vec![
                 key("Peek", &PeekRow),
                 key("Copy", &CopyCell),
@@ -7298,6 +7372,14 @@ impl Render for TypeTable {
                 this.filter_by_selection(window, cx)
             }))
             .on_action(cx.listener(|this, _: &ClearFilters, _, cx| this.clear_filters(cx)))
+            .when(
+                self.at_commit.is_none() && self.blob_under_cursor().is_some(),
+                |table| {
+                    table
+                        .on_action(cx.listener(Self::on_choose_blob_file))
+                        .on_action(cx.listener(Self::on_clear_blob))
+                },
+            )
             .child(toolbar)
             .children(filter_bar)
             .children(bulk_bar)
@@ -9329,6 +9411,70 @@ mod tests {
                     etag: Some(stored.1.clone())
                 })
             );
+        });
+    }
+
+    /// Clear is a key on the Blob cell under the cursor, and only there: it sets the cell to
+    /// null bound to the ETag the cell read, and the status bar offers it with Choose File.
+    #[gpui::test]
+    async fn the_blob_cell_under_the_cursor_is_cleared_by_its_key(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+            cx.bind_keys([gpui::KeyBinding::new(
+                "ctrl-cmd-backspace",
+                ClearValue,
+                Some("TypeTable && !editing"),
+            )]);
+        });
+        let schema = PEOPLE.replace("  name: String\n", "  name: String\n  doc: Blob?\n");
+        let (session, blobs) = crate::test_support::session_with_blobs(&schema, cx);
+        let read = blobs.set("Person/p1/doc", b"old");
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(BLOB_READ_AFTER);
+        cx.run_until_parked();
+        // The keys a cell takes are the table's actions as it draws there.
+        let at = |table: &mut TypeTable,
+                  column: &str,
+                  window: &mut Window,
+                  cx: &mut Context<TypeTable>| {
+            let col = table.column_index(column).unwrap();
+            table.set_cursor(Cursor { row: 0, col }, cx);
+            window.focus(&table.focus_handle, cx);
+            cx.notify();
+        };
+        table.update_in(cx, |table, window, cx| at(table, "name", window, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-cmd-backspace");
+        cx.run_until_parked();
+        assert!(blobs.writes.lock().unwrap().is_empty(), "not a Blob cell");
+
+        table.update_in(cx, |table, window, cx| {
+            at(table, "doc", window, cx);
+            let keys = table.status_parts(cx).keys;
+            let labels: Vec<&str> = keys.iter().map(|key| &*key.label).collect();
+            assert_eq!(labels[1..3], ["Choose file", "Clear value"]);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-cmd-backspace");
+        cx.run_until_parked();
+        let writes = blobs.writes.lock().unwrap().clone();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].method, "DELETE");
+        assert_eq!(writes[0].if_match.as_deref(), Some(read.as_str()));
+        table.read_with(cx, |table, _| {
+            let key = ("p1".to_owned(), "doc".to_owned());
+            assert_eq!(table.blobs[&key], Loadable::Loaded(BlobMeta::Null));
         });
     }
 

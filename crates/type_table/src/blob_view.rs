@@ -17,6 +17,7 @@ use gpui::{
 use graph_client::{BlobCell, BlobMeta};
 use graph_store::{GraphSession, Loadable};
 use serde_json::json;
+use studio_actions::blob::{ChooseFile, ClearValue};
 use studio_actions::canvas::{ActualSize, FitToWindow, ZoomIn, ZoomOut};
 use studio_ui::ds;
 use studio_workspace::{Item, ItemEvent, ItemStatus, KeyHint, SavedItem};
@@ -1249,8 +1250,11 @@ impl Render for BlobView {
             Loadable::Loaded(Content::Text(..) | Content::Bytes(_)) => "BlobText",
             _ => "BlobView",
         };
-        // A file dropped from the file manager anywhere on the tab is stored in the value.
+        // A file dropped from the file manager anywhere on the tab is stored in the value. Choose
+        // File and Clear are actions only while the value can take them, so the palette offers
+        // them only then.
         let droppable = self.write_refusal(cx).is_none() && !self.saving();
+        let clearable = self.clear_refusal(cx).is_none() && !self.saving();
         let drop_bg = studio_ui::ds::surface::drop_target(cx);
         div()
             .key_context(context)
@@ -1259,6 +1263,12 @@ impl Render for BlobView {
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::actual_size))
             .on_action(cx.listener(Self::fit))
+            .when(droppable, |tab| {
+                tab.on_action(cx.listener(|this, _: &ChooseFile, _, cx| this.choose_file(cx)))
+            })
+            .when(clearable, |tab| {
+                tab.on_action(cx.listener(|this, _: &ClearValue, _, cx| this.clear(cx)))
+            })
             .size_full()
             .bg(studio_ui::ds::surface::document(cx))
             .when(droppable, |tab| {

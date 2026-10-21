@@ -179,15 +179,15 @@ pub(crate) fn clear_refusal(
     }
 }
 
-/// What a Choose File button's tooltip says: where the file goes, and the CLI command that does
-/// the same.
+/// What a Choose File button's tooltip says: where the file goes, its key, and the CLI command
+/// that does the same.
 pub(crate) fn upload_tooltip(cell: &BlobCell, branch: &str, cx: &mut App) -> gpui::AnyView {
     ui::Tooltip::with_meta(
         format!(
             "Choose File… to store in {} on {branch}, or drop one here",
             cell.property
         ),
-        None,
+        Some(&studio_actions::blob::ChooseFile),
         format!(
             "omnigraph blob put node {} {} {} --file <file> --branch {branch}",
             cell.type_name, cell.id, cell.property
@@ -203,7 +203,7 @@ pub(crate) fn clear_tooltip(cell: &BlobCell, branch: &str, cx: &mut App) -> gpui
             "Clear {} on {branch}: it holds no value then",
             cell.property
         ),
-        None,
+        Some(&studio_actions::blob::ClearValue),
         format!(
             "omnigraph blob clear node {} {} {} --branch {branch}",
             cell.type_name, cell.id, cell.property

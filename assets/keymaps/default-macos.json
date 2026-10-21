@@ -66,6 +66,13 @@
     }
   },
   {
+    "context": "BlobView || BlobText",
+    "bindings": {
+      "cmd-alt-u": "studio_blob::ChooseFile",
+      "ctrl-cmd-backspace": "studio_blob::ClearValue"
+    }
+  },
+  {
     "context": "NodeField > Editor",
     "bindings": {
       "enter": "studio_node::SaveField",
@@ -181,7 +188,9 @@
       "g": "studio_table::ExploreRow",
       "cmd-c": "studio_table::CopyCell",
       "cmd-backspace": "studio_table::DeleteRow",
-      "cmd-alt-f": "studio_table::FilterBySelection"
+      "cmd-alt-f": "studio_table::FilterBySelection",
+      "cmd-alt-u": "studio_blob::ChooseFile",
+      "ctrl-cmd-backspace": "studio_blob::ClearValue"
     }
   },
   {

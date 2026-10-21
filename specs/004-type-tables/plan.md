@@ -79,8 +79,11 @@ stay put), IX (paged, virtualized).
   system's picker, and a file dropped from the file manager does the same, on the Blob tab
   (its status bar, the whole tab as the drop target, and "Choose File…" in an empty value's
   state), on a peek's slot (an open-folder icon and a ×, the slot the drop target) and on a
-  table's Blob cell (a drop alone; the peek beside it has the buttons). "Clear" sets a nullable
-  value to null. The file is read off the main thread and refused over 32 MiB before anything
+  table's Blob cell (a drop, and the keys). "Clear" sets a nullable value to null. Both are
+  actions, `studio_blob::ChooseFile` (⌘⌥U; Ctrl-Alt-U elsewhere) and `studio_blob::ClearValue`
+  (⌃⌘⌫; Ctrl-Alt-Shift-Backspace elsewhere), on the Blob tab while its value can take them and
+  on the table's Blob cell under the cursor, whose status bar then lists both; the buttons'
+  tooltips name the keys. The file is read off the main thread and refused over 32 MiB before anything
   is sent. The write goes to the branch the view shows, once, bound to the value shown as read
   at the view's commit: a managed value by its ETag, which names the type's table version, so
   it is read again at the view's commit when the view moved since (its own writes move it); a

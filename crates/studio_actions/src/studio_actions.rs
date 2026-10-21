@@ -390,6 +390,21 @@ pub mod table {
     );
 }
 
+pub mod blob {
+    use gpui::actions;
+
+    actions!(
+        studio_blob,
+        [
+            /// Choose a file to store in the Blob value: the tab's, or the table cell's under the
+            /// cursor.
+            ChooseFile,
+            /// Clear the Blob value, so it holds none.
+            ClearValue,
+        ]
+    );
+}
+
 pub mod node {
     use gpui::actions;
 
