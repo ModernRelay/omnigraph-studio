@@ -99,9 +99,9 @@ title bar; Ragnor's choice over a Zed-style title bar) over one status bar acros
 - The status bar (30 px, `ds::size::STATUS_BAR`: Zed's 22 px buttons with 4 px around them)
   reads, after the sidebar toggle and the left dock's buttons: the
   server chip (state and round trip; the graph switcher), the graph chip and the branch menu,
-  then the few facts the open tab adds (`Item::footer`: a query's rows and time, a Blob's size;
+  then the few facts the open tab adds (`Item::status`: a query's rows and time, a Blob's size;
   not what the tab shows itself, such as a table's row count or a schema's counts); at the
-  right, what is running, a keyboard button whose menu lists the tab's keys (`ItemFooter::keys`,
+  right, what is running, a keyboard button whose menu lists the tab's keys (`ItemStatus::keys`,
   Zed's context menu: each entry runs its action, its binding read in the tab's context),
   Studio's memory and CPU, then the bottom and right docks' buttons. Key hints are not spelled
   out in the bar, and a tab's controls belong in the tab. Groups are split
@@ -413,7 +413,7 @@ than styling one-off elements.
   state, opening the graph switcher), where the open tab reads and writes (graph / branch with
   the branch menu), then the tab's own facts; at the end what is running, the tab's controls,
   memory and CPU, and the bottom and right docks' panel buttons. A tab supplies its part through
-  `Item::footer` (`ItemFooter { start, end }`): the table its loaded count, read commit and key
+  `Item::status` (`ItemStatus { start, end, keys }`): the table its loaded count, read commit and key
   hints; the agent its restart, agent pill and send. A pane's header holds its Back and Forward
   and its tabs.
   - The connection's state reads with the server's round trip, from the last health check
