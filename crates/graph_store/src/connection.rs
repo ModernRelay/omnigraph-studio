@@ -115,6 +115,8 @@ pub struct Connection {
     /// asks for none accepts. `None` once a token is set.
     pub token_unread: Option<String>,
     _task: Option<Task<()>>,
+    /// The graph list read again after it could not be read ([`Connection::list_graphs_again`]).
+    _listing: Option<Task<()>>,
     /// The next health re-check (spec 003).
     _health_check: Option<Task<()>>,
     /// The token is still being read (from the keychain): a connect waits for it, rather than
@@ -163,6 +165,7 @@ impl Connection {
             token_unsaved: None,
             token_unread: None,
             _task: None,
+            _listing: None,
             _health_check: None,
             token_pending: false,
             tokens_set: 0,
@@ -291,6 +294,7 @@ impl Connection {
         let watch = ConnectionWatch {
             _alive: self.watchers.clone(),
         };
+        self.list_graphs_again(cx);
         if std::mem::take(&mut self.check_missed)
             && !matches!(
                 self.state,
@@ -320,9 +324,42 @@ impl Connection {
         }
     }
 
+    /// Reads the server's graph list again when the last read of it failed and the server
+    /// is ready: when something comes to show the server (a window showing one of its graphs,
+    /// the Open dialog listing it, [`Connection::watch`]) and on a graph's Refresh. A health
+    /// check sees only the server, so a list that failed once stayed failed until Studio
+    /// connected again. A list read, or refused, stays as it is.
+    pub fn list_graphs_again(&mut self, cx: &mut Context<Self>) {
+        if self.state != ConnectionState::Ready
+            || !matches!(self.graphs, GraphListing::Failed(_))
+            || self._listing.is_some()
+        {
+            return;
+        }
+        let client = self.client.clone();
+        self._listing = Some(cx.spawn(async move |this, cx| {
+            let listed = cx
+                .background_executor()
+                .spawn(async move { list_graphs(&client).await })
+                .await;
+            this.update(cx, |this, cx| {
+                this._listing = None;
+                match listed {
+                    Ok(graphs) => this.graphs = graphs,
+                    Err(state) => this.state = state,
+                }
+                cx.emit(ConnectionEvent::StateChanged);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     /// Checks health and contract, then reads the graph list.
     pub fn connect(&mut self, cx: &mut Context<Self>) {
         self.state = ConnectionState::Connecting;
+        // The probe reads the list itself.
+        self._listing = None;
         // The probe schedules the next check when it ends.
         self._health_check = None;
         cx.emit(ConnectionEvent::StateChanged);
@@ -467,15 +504,29 @@ async fn probe(client: &GraphClient) -> Probe {
         let health = client.health().await;
         (health, started.elapsed())
     };
-    let ((health, latency), graphs) = futures::join!(timed_health, client.graphs());
+    let ((health, latency), graphs) = futures::join!(timed_health, list_graphs(client));
     let health = match served(health) {
         Ok(health) => health,
         Err(state) => return Probe::Failed(state),
     };
     let graphs = match graphs {
+        Ok(graphs) => graphs,
+        Err(state) => return Probe::Failed(state),
+    };
+    Probe::Ready {
+        health: health.health,
+        latency,
+        graphs,
+    }
+}
+
+/// What the server says about its graphs, or the state a refused token leaves the
+/// connection in.
+async fn list_graphs(client: &GraphClient) -> Result<GraphListing, ConnectionState> {
+    Ok(match client.graphs().await {
         Ok(list) => GraphListing::Listed(list.graphs),
         Err(ReadError::Refused(summary)) if summary.status == 401 => {
-            return Probe::Failed(ConnectionState::Unauthorized);
+            return Err(ConnectionState::Unauthorized);
         }
         // A credential that may not list the server's graphs may still discover its own.
         Err(ReadError::Refused(summary)) if summary.status == 403 => {
@@ -491,12 +542,7 @@ async fn probe(client: &GraphClient) -> Probe {
             }
         }
         Err(error) => GraphListing::Failed(error.to_string()),
-    };
-    Probe::Ready {
-        health: health.health,
-        latency,
-        graphs,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -779,6 +825,80 @@ mod tests {
             });
         }
         assert_eq!(listed.load(std::sync::atomic::Ordering::SeqCst), asked);
+    }
+
+    /// A graph list that could not be read is read again when something next shows the server,
+    /// not left failed for as long as its health checks pass; one read is not read again.
+    #[gpui::test]
+    async fn a_graph_list_that_failed_is_read_again_when_next_shown(cx: &mut TestAppContext) {
+        let lists = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = lists.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let listed = if path.ends_with("/graphs") {
+                Some(counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+            } else {
+                None
+            };
+            async move {
+                let (status, body) = match listed {
+                    None => (
+                        200,
+                        r#"{"status":"ok","version":"0.14.0","internal_schema_version":16}"#,
+                    ),
+                    Some(0) => (500, r#"{"error":"the cluster is reloading"}"#),
+                    Some(_) => (
+                        200,
+                        r#"{"graphs":[{"graph_id":"knowledge","uri":"s3://g/knowledge","state":"ready","read_available":true,"write_available":true,"action":"none"}]}"#,
+                    ),
+                };
+                Ok(Response::builder()
+                    .status(status)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Studio,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let _shown = connection.update(cx, |connection, cx| {
+            connection.connect(cx);
+            connection.watch(cx)
+        });
+        cx.run_until_parked();
+        let listing = |cx: &mut TestAppContext| {
+            connection.read_with(cx, |connection, _| {
+                (connection.state.clone(), connection.graph_ids())
+            })
+        };
+        assert_eq!(listing(cx), (ConnectionState::Ready, Vec::<String>::new()));
+        for _ in 0..2 {
+            cx.executor().advance_clock(DEFAULT_CHECK_INTERVAL);
+            cx.run_until_parked();
+        }
+        let failed = connection.read_with(cx, |connection, _| connection.graphs.clone());
+        assert!(matches!(failed, GraphListing::Failed(_)), "{failed:?}");
+        assert_eq!(lists.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let _again = connection.update(cx, |connection, cx| connection.watch(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            listing(cx),
+            (ConnectionState::Ready, vec!["knowledge".to_owned()])
+        );
+        let _third = connection.update(cx, |connection, cx| connection.watch(cx));
+        connection.update(cx, |connection, cx| connection.list_graphs_again(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            lists.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "read once more"
+        );
     }
 
     /// Health is checked only while something shows the server: a check that comes while

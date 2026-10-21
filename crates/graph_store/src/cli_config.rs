@@ -10,7 +10,7 @@
 //! `credentials` when that section's `endpoint` covers the target's. A token is sent only to the
 //! server it is keyed to: the untargeted `OMNIGRAPH_BEARER_TOKEN` goes to none, as the CLI
 //! dropped it (OmniGraph #1030). Studio never writes these files; it reads them again when they
-//! change ([`stamp`]).
+//! change ([`stamp`]), their permissions included.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -187,9 +187,15 @@ pub fn read_operator(dir: Option<&Path>) -> OperatorFiles {
     }
 }
 
-/// When `config.yaml` and `credentials` in `dir` were last written, and their sizes: a stamp
-/// that differs from the last one means the files are read again.
-pub fn stamp(dir: Option<&Path>) -> Vec<Option<(SystemTime, u64)>> {
+/// What a file's stamp holds: when it was last written, its size, and its permissions.
+pub type FileStamp = (SystemTime, u64, u32);
+
+/// When `config.yaml` and `credentials` in `dir` were last written, their sizes and their
+/// permissions: a stamp that differs from the last one means the files are read again. A
+/// change of permissions writes nothing, so it moves neither time nor size, yet it decides
+/// whether `credentials`' tokens are taken (a file others may read is refused): a
+/// `chmod 600` that makes them usable is seen at the next check, not at the next start.
+pub fn stamp(dir: Option<&Path>) -> Vec<Option<FileStamp>> {
     let Some(dir) = dir else {
         return Vec::new();
     };
@@ -197,9 +203,25 @@ pub fn stamp(dir: Option<&Path>) -> Vec<Option<(SystemTime, u64)>> {
         .iter()
         .map(|file| {
             let metadata = std::fs::metadata(dir.join(file)).ok()?;
-            Some((metadata.modified().ok()?, metadata.len()))
+            Some((
+                metadata.modified().ok()?,
+                metadata.len(),
+                permission_bits(&metadata.permissions()),
+            ))
         })
         .collect()
+}
+
+/// A file's permissions as a number: its mode on Unix, else whether it is read-only.
+fn permission_bits(permissions: &std::fs::Permissions) -> u32 {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::PermissionsExt::mode(permissions)
+    }
+    #[cfg(not(unix))]
+    {
+        u32::from(permissions.readonly())
+    }
 }
 
 /// The servers and the aliases in a CLI target file.
@@ -611,11 +633,22 @@ mod tests {
             Some("two")
         );
 
-        // Open permissions refuse the token, once, not the servers.
+        // Open permissions refuse the token, once, not the servers. A change of permissions
+        // alone changes the stamp, so it is read again without a restart, either way.
+        let written = stamp(Some(&dir));
         std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let opened = stamp(Some(&dir));
+        assert_ne!(opened, written);
         let files = read_operator(Some(&dir));
         assert_eq!(files.servers.unwrap()[0].1, None);
         assert_eq!(files.errors.len(), 1, "{:?}", files.errors);
+        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_ne!(stamp(Some(&dir)), opened, "a chmod 600 is seen");
+        assert_eq!(
+            read_operator(Some(&dir)).servers.unwrap()[0].1.as_deref(),
+            Some("two")
+        );
+        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         std::fs::write(dir.join("config.yaml"), "targets: [unclosed\n").unwrap();
         let files = read_operator(Some(&dir));

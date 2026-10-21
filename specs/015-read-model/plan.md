@@ -283,7 +283,16 @@ A first cut of parts 1 and 4, ahead of the shared cache:
   or peek opened from a table at the session's known head reads nothing for the node; a page's
   relationship counts answer each node's count. Counts are kept per node, commit and schema
   epoch (16,384 of them), so a peek, the tree and the canvas share the table's, and a count
-  carries to a later commit that changed no edge of its group at the node.
+  carries to a later commit that changed no edge of its group at the node. Node answers a page
+  gave are kept apart from the answers read, 1,024 within 16 MB, with their own commits to
+  carry from, so scrolling a table never pushes out an answer that took seconds to read (since
+  2026-10-21; before, about twenty pages of a table filled the 4,096 places and evicted a
+  node page's relationship groups).
+- A read at the branch head's commit is sent as a read of the branch (part 3, target
+  choice). Refused there, it is sent again pinned only when the branch is gone (404); any
+  other refusal is the read's own, which the commit would answer alike. On `/query` a 409 is a
+  full-text index to rebuild, which no read clears (the 0.14 edge contract), so it is shown,
+  not sent twice (since 2026-10-21).
 - Review reads its fork and head from `branches/merge-base` and folds the feed after the base,
   instead of reading both branches' whole commit lists (each about 1.6 s on the personal graph,
   and 3m47s once right after a restart); its commits come from the feed blocks' causes. A
@@ -388,6 +397,8 @@ commit can be cleaned up; measure first).
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | Seeds never push out an answer that was read | `graph_store` `seeded_answers_never_push_out_an_answer_that_was_read` (an answer read at c1, then 5,120 node answers seeded at c1 through `GraphSession::seed`); `a_page_read_at_a_commit_answers_its_nodes` still passing with the seed forgotten from its own memo | The read answer is still held; 1,024 seeds are kept, and at most 1,024 seed commit families. Before, seeds went into the 4,096-entry `pinned_reads` and the read answer went first |
+| 2026-10-21 | A branch read refused for its own reason is not sent again pinned | `graph_store` `a_branch_read_refused_is_sent_pinned_only_when_the_branch_is_gone` (the head at c1; the branch read answered 409, then 404); `openapi/omnigraph-0.14.0-edge.json`, `POST /graphs/{graph_id}/query` responses (409: `full_text_index_rebuild_required` or `full_text_index_required`, "neither is cleared by retrying"; no 404 listed, the server's `not_found` for a branch it does not know) | 409: one branch read and the refusal returned; 404: the branch read, then one pinned read, answered. Before, a 409 was sent again pinned and refused again |
 | 2026-10-21 | The memo weighs an answer as decoding it allocates | `graph_store` `an_answer_is_weighed_as_decoding_it_allocates`, a counting allocator around the system's, on the measuring thread only (debug build, Apple M5 Pro, 48 GB): 2,000 node rows of 8 properties (346,900 bytes of JSON) and 50 rows of 20,000 characters (1,001,758 bytes) decoded as a `ReadOutput` | Node rows: 4,869,438 bytes allocated (14.0 times the text), weighed 4,901,677 (0.7% over); the weight before was 1,274,060 (26%), so the 64 MiB budget held about 250 MB. Long text: 1,041,100 allocated, weighed 1,042,139. Each string is counted at its length, each array at its slots, and each object at its entries and hash index as `IndexMap` grows them (`object_room`) |
 | 2026-10-21 | A new token forgets every answer kept | `graph_store` `a_new_token_reads_access_and_every_answer_again` | A read at c1 kept under one token was sent again under the next; a 403 alone kept it |
 | 2026-10-18 | The same reads on 0.14 | After the hosted graph moved to `0.14.0-edge+d883c49`: node by id at the branch 0.65–0.87 s, pinned to the head 1.51–1.62 s, pinned 200 back 1.34–1.56 s; a Person's 92 groups read once each (first 51 neighbours), 8 at a time | 74.5 s wall, median 1.25 s, p90 3.3 s; `spokenBy` (about 18k edges into a 208k-row table) took 61.2 s, `bookmarked` 20.8 s, `artifactFromPerson` 16.5 s; 51 groups had neighbours, 18 more than 50. The hub groups are the far-table scan of omnigraph#1051 (evidence added there); the pinned surcharge is omnigraph#1052 (0.14 numbers added there) |

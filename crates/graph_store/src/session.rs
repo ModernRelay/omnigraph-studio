@@ -220,6 +220,13 @@ const PINNED_READS: usize = 4_096;
 const PINNED_READ_BYTES: usize = 64 * 1024 * 1024;
 const PINNED_BLOBS: usize = 2_048;
 
+/// How many node answers a page's rows give ([`Seeds`]) a session keeps, apart from the reads
+/// it sent: a table page seeds one per row, so scrolling twenty pages would otherwise push out
+/// relationship groups that took seconds to read. A seed costs nothing to make again: the
+/// page holding it is read again, or the node alone.
+const SEEDED_READS: usize = 1_024;
+const SEEDED_READ_BYTES: usize = 16 * 1024 * 1024;
+
 /// How many branches' newest commits a session keeps.
 const HEAD_COMMITS: usize = 64;
 /// Pages of commits' changes kept, and what they may weigh together.
@@ -594,6 +601,9 @@ pub struct GraphSession {
     recheck_after: Duration,
     /// Answers to reads pinned to a commit, and those under way (they never change).
     pinned_reads: ReadMemo<PinnedRead, ReadOutput>,
+    /// Node answers a page's rows gave at its commit ([`Self::seed`]), kept within their own
+    /// bound ([`SEEDED_READS`]) so they never push out an answer that was read.
+    seeded_reads: Memo<PinnedRead, ReadOutput, ()>,
     /// Numbers the reads the memos keep under way (`Pending`).
     next_ticket: u64,
     pinned_blobs: ReadMemo<(BlobCell, String, u64), BlobMeta>,
@@ -605,6 +615,9 @@ pub struct GraphSession {
     /// rather than going through every answer kept. Entries the memo let go are skipped and
     /// dropped as they are met.
     pinned_commits: HashMap<(String, String, u64), Vec<String>>,
+    /// The commits a page's rows gave each node answer at, as `pinned_commits` for the
+    /// answers read, within the seeds' own bound.
+    seeded_commits: HashMap<(String, String, u64), Vec<String>>,
     degree_commits: HashMap<(String, RelationshipGroup, String, u64), Vec<String>>,
     /// Which schema the session reads under: a new number each time the schema's text changes,
     /// the first one included. A read at an old commit uses the current schema, so the same
@@ -706,6 +719,16 @@ pub struct GraphSession {
     /// Whether a window shows the graph ([`Self::set_shown`]): a parked one asks after no head
     /// and no branch list, and holds no watch on its server.
     shown: bool,
+    /// The first reads were sent: the schema, the branch list, the type counts, the
+    /// stored-query catalog and what the credential may do. A session opened behind the graph
+    /// its window shows ([`Self::parked`]) sends them when it is first shown.
+    opened: bool,
+    /// The wait after a 503 ended while the graph was parked: it is asked again when shown.
+    recheck_owed: bool,
+    /// Numbers the branch-list reads as they are sent, and the newest whose list was taken: a
+    /// list asked for before one already taken answers for an older moment, and is not taken.
+    branch_lists_sent: u64,
+    branch_list_taken: u64,
     /// A new token came while the graph was parked: its counts, catalog and branch list are
     /// read under it when shown again ([`Self::read_again_for_credential`]).
     credential_owed: bool,
@@ -717,7 +740,22 @@ pub struct GraphSession {
 impl EventEmitter<SessionEvent> for GraphSession {}
 
 impl GraphSession {
+    /// A session on `graph_id` that a window shows: it reads the graph at once.
     pub fn new(
+        connection: Entity<Connection>,
+        graph_id: String,
+        branch: String,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut session = Self::parked(connection, graph_id, branch, cx);
+        session.set_shown(true, cx);
+        session
+    }
+
+    /// A session on `graph_id` opened behind the graph its window shows, as a start reopens
+    /// a window's graphs: it sends nothing, not even its first reads, until it is first shown
+    /// ([`Self::set_shown`]).
+    pub fn parked(
         connection: Entity<Connection>,
         graph_id: String,
         branch: String,
@@ -739,10 +777,12 @@ impl GraphSession {
             unavailable: None,
             recheck_after: RECHECK_FIRST,
             pinned_reads: Memo::weighed(PINNED_READS, PINNED_READ_BYTES, read_bytes),
+            seeded_reads: Memo::weighed(SEEDED_READS, SEEDED_READ_BYTES, read_bytes),
             next_ticket: 0,
             pinned_blobs: Memo::new(PINNED_BLOBS),
             degree_counts: Memo::new(DEGREE_COUNTS),
             pinned_commits: HashMap::new(),
+            seeded_commits: HashMap::new(),
             degree_commits: HashMap::new(),
             schema_epoch: 0,
             schema_text: None,
@@ -789,7 +829,11 @@ impl GraphSession {
             access: Access::default(),
             credential: 0,
             _connection_events: None,
-            shown: true,
+            shown: false,
+            opened: false,
+            recheck_owed: false,
+            branch_lists_sent: 0,
+            branch_list_taken: 0,
             credential_owed: false,
             access_owed: false,
             _connection_watch: None,
@@ -803,13 +847,13 @@ impl GraphSession {
                 }
             },
         ));
-        session._connection_watch = Some(session.connection.update(cx, |c, cx| c.watch(cx)));
         session.labels = session.chosen_labels(cx);
         session._settings = Some(
             cx.observe_global::<studio_settings::StudioSettings>(|this, cx| {
                 this.labels_changed(cx)
             }),
         );
+        // The polls stop asking while the graph is parked, and say a poll came.
         session._head_poll = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(HEAD_POLL).await;
@@ -827,9 +871,6 @@ impl GraphSession {
                 }
             }
         }));
-        session.reload(cx);
-        let branch = AccessScope::branch(&session.branch);
-        session.read_access(branch, cx);
         session
     }
 
@@ -938,9 +979,11 @@ impl GraphSession {
     /// and a log only carries an answer forward, from those read since with the new token.
     fn forget_reads(&mut self) {
         self.pinned_reads.clear();
+        self.seeded_reads.clear();
         self.pinned_blobs.clear();
         self.degree_counts.clear();
         self.pinned_commits.clear();
+        self.seeded_commits.clear();
         self.degree_commits.clear();
         self.head_commits.clear();
         self.commit_change_pages.clear();
@@ -958,6 +1001,10 @@ impl GraphSession {
     /// lets go of the old token's answers and the reads still out under it, and reads under the
     /// new one when shown again.
     fn read_again_for_credential(&mut self, cx: &mut Context<Self>) {
+        // Nothing was read yet: the first show reads it all under the token it then has.
+        if !self.opened {
+            return;
+        }
         self.counts_reading = false;
         self.counts_again = false;
         // Not kept while it is read: it is the old token's.
@@ -1013,7 +1060,9 @@ impl GraphSession {
     }
 
     /// Notes what a read says about the graph's availability: a 503 marks it unavailable and
-    /// asks again later, with a growing wait; any answer clears the mark.
+    /// asks again later, with a growing wait, while a window shows it (a parked graph asks
+    /// when shown again); any answer clears the mark, and a shown graph then asks after its
+    /// heads, which it stopped asking after meanwhile.
     fn note_read<T>(&mut self, result: &Result<T, ReadError>, cx: &mut Context<Self>) {
         match result {
             Err(ReadError::Refused(error)) if error.status == 503 => {
@@ -1026,7 +1075,11 @@ impl GraphSession {
                         cx.background_executor().timer(wait).await;
                         this.update(cx, |this, cx| {
                             this._recheck = None;
-                            this.reload(cx);
+                            if this.shown {
+                                this.recheck_available(cx);
+                            } else {
+                                this.recheck_owed = true;
+                            }
                         })
                         .ok();
                     }));
@@ -1040,24 +1093,55 @@ impl GraphSession {
                 if self.unavailable.take().is_some() {
                     self.recheck_after = RECHECK_FIRST;
                     self._recheck = None;
+                    self.recheck_owed = false;
                     cx.emit(SessionEvent::AvailabilityChanged);
+                    if self.shown {
+                        self.check_heads(cx);
+                    }
                 }
             }
         }
     }
 
-    /// Reloads the schema, the branch list, the type counts and the stored queries.
+    /// Asks a graph that answered 503 again, refreshing what is held rather than letting it
+    /// go: the schema, the branch list, the type counts and the stored-query catalog held stay
+    /// shown while they are read, and stay if the graph still cannot answer; what was never
+    /// read is read.
+    fn recheck_available(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.schema, Loadable::Loaded(_)) {
+            self.recheck_schema(None, cx);
+        } else {
+            self.reload_schema(cx);
+        }
+        self.read_branches(None, cx);
+        self.refresh_counts(cx);
+        self.read_stored_queries(true, cx);
+    }
+
+    /// Reloads the schema, the branch list, the type counts and the stored queries, and reads
+    /// the server's graph list again if it could not be read before.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.reload_schema(cx);
         self.reload_branches(cx);
         self.reload_counts(cx);
         self.reload_stored_queries(cx);
+        self.connection
+            .update(cx, |connection, cx| connection.list_graphs_again(cx));
     }
 
     /// Reads the graph's stored-query catalog. A graph without stored queries answers an empty
     /// one; a 404 is a graph the server no longer serves, and shows as a failure.
     pub fn reload_stored_queries(&mut self, cx: &mut Context<Self>) {
-        self.stored_queries = Loadable::Loading;
+        self.read_stored_queries(false, cx);
+    }
+
+    /// [`Self::reload_stored_queries`], keeping the catalog held while it is read, and when the
+    /// read fails, with `keep_held`.
+    fn read_stored_queries(&mut self, keep_held: bool, cx: &mut Context<Self>) {
+        let keep_held = keep_held && matches!(self.stored_queries, Loadable::Loaded(_));
+        if !keep_held {
+            self.stored_queries = Loadable::Loading;
+        }
         let client = self.client(cx);
         let graph = self.graph_id.clone();
         let read = cx.background_spawn(async move { client.stored_queries(&graph).await });
@@ -1066,6 +1150,8 @@ impl GraphSession {
             this.update(cx, |this, cx| this.note_read(&read, cx)).ok();
             let result = match read {
                 Ok(output) => Loadable::Loaded(Arc::new(output.queries)),
+                // The catalog held is still the graph's: a failed read says nothing of it.
+                Err(_) if keep_held => return,
                 Err(error) => Loadable::Failed(error.to_string()),
             };
             this.update(cx, |this, cx| {
@@ -1265,12 +1351,14 @@ impl GraphSession {
         self.schema_epoch += 1;
         self.schema_text = Some(model.source.clone());
         self.pinned_reads.clear();
+        self.seeded_reads.clear();
         self.pinned_blobs.clear();
         // A change names its type as the schema does now.
         self.commit_change_pages.clear();
         self.whole_commit_pages.clear();
         self.degree_counts.clear();
         self.pinned_commits.clear();
+        self.seeded_commits.clear();
         self.degree_commits.clear();
         // Each log starts again at its branch's head, so the next move is read; the schema was
         // just read, so no move before it is left to compare.
@@ -1372,11 +1460,12 @@ impl GraphSession {
         if !matches!(self.branches, Loadable::Loaded(_)) {
             self.branches = Loadable::Loading;
         }
-        // A poll's list asked for before this would land as the newer one.
+        // A poll's list asked for before this answers for an older moment: it is not needed.
         self.branch_recheck = None;
         let client = self.client(cx);
         let graph = self.graph_id.clone();
         let moves = self.branch_moves;
+        let sent = self.next_branch_list();
         let read = cx.background_spawn(async move { client.branches(&graph).await });
         self._branches_task = Some(cx.spawn(async move |this, cx| {
             let read = read.await;
@@ -1385,19 +1474,15 @@ impl GraphSession {
                 Ok(output) => Loadable::Loaded(branch_order(output.branches)),
                 Err(error) => Loadable::Failed(error.to_string()),
             };
-            // A name the server lists again was made again since it was deleted.
-            if let Loadable::Loaded(branches) = &result {
-                let listed: HashSet<&String> = branches.iter().collect();
-                this.update(cx, |this, _| {
-                    this.gone_branches.retain(|branch| !listed.contains(branch))
-                })
-                .ok();
-            }
             this.update(cx, |this, cx| {
                 if let Some(changed) = &changed {
                     this.forget_branch(changed);
                 }
                 let result = match result {
+                    // Asked for before a list already taken (a poll's, sent while this one was
+                    // out and answered first): the newer stays, and nothing is dropped for a
+                    // branch only it holds, nor kept for one it lacks.
+                    Loadable::Loaded(_) if sent < this.branch_list_taken => return,
                     Loadable::Loaded(branches) => branches,
                     // The list held is still the graph's.
                     _ if matches!(this.branches, Loadable::Loaded(_)) => return,
@@ -1408,6 +1493,9 @@ impl GraphSession {
                         return;
                     }
                 };
+                this.branch_list_taken = sent;
+                // A name the server lists again was made again since it was deleted.
+                this.gone_branches.retain(|branch| !result.contains(branch));
                 // The first list changes nothing read before it: lists asked for meanwhile
                 // (main's, as the window opens) stay, rather than being read twice.
                 if this.branches_read {
@@ -1563,6 +1651,12 @@ impl GraphSession {
         }
         self.branch = branch;
         self.branch_moves += 1;
+        // Not yet shown: the first show reads the graph on this branch.
+        if !self.opened {
+            cx.emit(SessionEvent::BranchChanged);
+            cx.notify();
+            return;
+        }
         self.reload_counts(cx);
         cx.emit(SessionEvent::BranchChanged);
         cx.notify();
@@ -1709,8 +1803,12 @@ impl GraphSession {
             .any(|watched| watched == branch);
         self.head_watches
             .push((branch.to_owned(), Rc::downgrade(&alive)));
-        if new && self.unavailable.is_none() && !self.head_reads.contains_key(branch) {
+        // A parked graph asks after no head: shown, it asks after every watched one.
+        if new && self.shown && self.unavailable.is_none() && !self.head_reads.contains_key(branch)
+        {
             self.read_head(branch.to_owned(), cx);
+        } else if new && !self.shown {
+            self.head_check_missed = true;
         }
         HeadWatch { _alive: alive }
     }
@@ -2053,9 +2151,10 @@ impl GraphSession {
 
     /// Whether a window shows the graph. A graph its window parked (another graph shown in its
     /// place) asks after no head and no branch list, stops holding its server's health checks
-    /// ([`Connection::watch`]), and reads nothing again for a new token or a 403; shown again,
-    /// it reads what those owe, and asks after its heads at once when a poll came meanwhile, as
-    /// a window's activation does. A session starts shown.
+    /// ([`Connection::watch`]), and reads nothing again for a new token, a 403 or a 503; shown
+    /// again, it reads what those owe, and asks after its heads at once when a poll came
+    /// meanwhile, as a window's activation does. A session opened behind ([`Self::parked`])
+    /// sends its first reads when first shown; one made with [`Self::new`] is shown already.
     pub fn set_shown(&mut self, shown: bool, cx: &mut Context<Self>) {
         if self.shown == shown {
             return;
@@ -2066,6 +2165,19 @@ impl GraphSession {
             return;
         }
         self._connection_watch = Some(self.connection.update(cx, |c, cx| c.watch(cx)));
+        if !std::mem::replace(&mut self.opened, true) {
+            // The first reads cover whatever a token, a refusal or a poll owed meanwhile, and
+            // the schema's answer asks after the heads.
+            self.credential_owed = false;
+            self.access_owed = false;
+            self.recheck_owed = false;
+            self.head_check_missed = false;
+            self.credential = self.client(cx).credential_changes();
+            self.reload(cx);
+            let branch = AccessScope::branch(&self.branch);
+            self.read_access(branch, cx);
+            return;
+        }
         // A new token, or a 403 on the graph, while parked: what the graph shows, and what the
         // credential may do, are read now.
         if std::mem::take(&mut self.credential_owed) {
@@ -2073,6 +2185,10 @@ impl GraphSession {
         }
         if std::mem::take(&mut self.access_owed) {
             self.access_changed(cx);
+        }
+        // The graph answered 503, and its wait ended while parked.
+        if std::mem::take(&mut self.recheck_owed) {
+            self.recheck_available(cx);
         }
         if cx.active_window().is_some() && std::mem::take(&mut self.head_check_missed) {
             self.check_heads(cx);
@@ -2096,8 +2212,13 @@ impl GraphSession {
     }
 
     /// Reads each watched branch's head with a read that returns no rows, unless one is under
-    /// way, and the branch list. Heads of branches no longer watched are forgotten.
+    /// way, and the branch list. Heads of branches no longer watched are forgotten. A parked
+    /// graph asks nothing: it asks when shown again.
     pub fn check_heads(&mut self, cx: &mut Context<Self>) {
+        if !self.shown {
+            self.head_check_missed = true;
+            return;
+        }
         self.head_watches
             .retain(|(_, alive)| alive.strong_count() > 0);
         let watched = self.watched_branches();
@@ -2197,6 +2318,13 @@ impl GraphSession {
         self.head_reads.insert(key, read);
     }
 
+    /// A number for a branch-list read about to be sent: the lists are taken in the order
+    /// they were asked for, whatever order they answer in.
+    fn next_branch_list(&mut self) -> u64 {
+        self.branch_lists_sent += 1;
+        self.branch_lists_sent
+    }
+
     /// Reads the branch list again once it has been read, so a branch made or deleted elsewhere
     /// (the CLI, an agent, another window) appears; an unchanged list changes nothing.
     fn recheck_branches(&mut self, cx: &mut Context<Self>) {
@@ -2206,6 +2334,7 @@ impl GraphSession {
         let client = self.client(cx);
         let graph = self.graph_id.clone();
         let moves = self.branch_moves;
+        let sent = self.next_branch_list();
         let read = cx.background_spawn(async move { client.branches(&graph).await });
         self.branch_recheck = Some(cx.spawn(async move |this, cx| {
             let read = read.await;
@@ -2215,6 +2344,11 @@ impl GraphSession {
                 let Ok(output) = read else {
                     return;
                 };
+                // A list read again since, and taken, is newer.
+                if sent < this.branch_list_taken {
+                    return;
+                }
+                this.branch_list_taken = sent;
                 let branches = branch_order(output.branches);
                 if this.branches.loaded() != Some(&branches) {
                     this.forget_branches_changed(&branches, cx);
@@ -2320,9 +2454,9 @@ impl GraphSession {
         match seeds {
             Seeds::Nodes { .. } => {
                 for (key, answer) in nodes {
-                    if !self.pinned_reads.holds(&key) {
-                        self.kept_at(&key);
-                        self.pinned_reads.insert(key, answer);
+                    if !self.pinned_reads.holds(&key) && !self.seeded_reads.holds(&key) {
+                        self.seeded_at(&key);
+                        self.seeded_reads.insert(key, answer);
                     }
                 }
             }
@@ -2404,24 +2538,32 @@ impl GraphSession {
             return None;
         }
         let family = (key.query.clone(), key.params.clone(), key.schema);
-        let kept = self.pinned_commits.get_mut(&family)?;
-        let reads = &self.pinned_reads;
+        let (reads, seeded) = (&self.pinned_reads, &self.seeded_reads);
+        let log = self.change_logs.get(&self.branch);
         let at = |commit: &str| PinnedRead {
             commit: commit.to_owned(),
             ..key.clone()
         };
-        let mut output = carry_back(
-            self.change_logs.get(&self.branch),
-            &key.commit,
-            kept,
-            |commit| reads.peek(&at(commit)).is_some(),
-            |start, since| {
-                reads
-                    .peek(&at(start))
-                    .filter(|output| answer_unchanged(since, depends, &output.rows))
-                    .cloned()
-            },
-        )?;
+        let answer = |commit: &str| {
+            let at = at(commit);
+            reads.peek(&at).or_else(|| seeded.peek(&at))
+        };
+        // The commits it was read at, then those a page's rows gave it at.
+        let mut output = [&mut self.pinned_commits, &mut self.seeded_commits]
+            .into_iter()
+            .find_map(|families| {
+                carry_back(
+                    log,
+                    &key.commit,
+                    families.get_mut(&family)?,
+                    |commit| answer(commit).is_some(),
+                    |start, since| {
+                        answer(start)
+                            .filter(|output| answer_unchanged(since, depends, &output.rows))
+                            .cloned()
+                    },
+                )
+            })?;
         output.graph_commit_id = Some(key.commit.clone());
         output.target.branch = None;
         output.target.snapshot = Some(key.commit.clone());
@@ -2431,6 +2573,12 @@ impl GraphSession {
     /// The memo key of `query` read at `commit`, under the session's schema.
     fn pinned_key(&self, query: &BuiltQuery, commit: &str) -> PinnedRead {
         PinnedRead::of(query, commit, self.schema_epoch)
+    }
+
+    /// Notes that a page's row gave the answer for `key`, so a miss at another commit finds it.
+    fn seeded_at(&mut self, key: &PinnedRead) {
+        let family = (key.query.clone(), key.params.clone(), key.schema);
+        remember(&mut self.seeded_commits, family, &key.commit, SEEDED_READS);
     }
 
     /// Notes that an answer for `key` is kept, so a miss at another commit finds it.
@@ -2462,6 +2610,12 @@ impl GraphSession {
             return self.seeding(query.seeds.clone(), read, cx);
         };
         let key = self.pinned_key(query, &commit);
+        // A page's row answered it at this commit.
+        if !self.pinned_reads.holds(&key)
+            && let Some(Held::Done(output)) = self.seeded_reads.get(&key)
+        {
+            return self.seeding(query.seeds.clone(), Task::ready(Ok(output)), cx);
+        }
         // Neither an answer nor a read someone still waits for: carried from an earlier
         // commit when nothing it depends on changed since.
         let none = match self.pinned_reads.held(&key) {
@@ -2679,11 +2833,11 @@ impl GraphSession {
                     output.target.snapshot = Some(commit);
                     return Ok(output);
                 }
-                // The branch moved past the commit, or went: read at the commit itself.
-                Ok(_)
-                | Err(ReadError::Refused(ApiErrorSummary {
-                    status: 404 | 409, ..
-                })) => {}
+                // The branch moved past the commit, or went (a branch the server does not
+                // know is not found): read at the commit itself. Any other refusal is the
+                // read's own, which the commit would answer alike: on this route a 409 is a
+                // full-text index to rebuild, which no read clears.
+                Ok(_) | Err(ReadError::Refused(ApiErrorSummary { status: 404, .. })) => {}
                 Err(error) => return Err(error),
             }
             let pinned = this.update(cx, |this, cx| this.read_request(request, cx));
@@ -3721,7 +3875,7 @@ fn branch_order(mut branches: Vec<String>) -> Vec<String> {
     branches
 }
 
-/// Opens a session on a graph.
+/// Opens a session on a graph a window shows.
 pub fn open_session(
     connection: Entity<Connection>,
     graph_id: String,
@@ -3730,6 +3884,18 @@ pub fn open_session(
 ) -> Entity<GraphSession> {
     connection.update(cx, |connection, _| connection.remember_graph(&graph_id));
     cx.new(|cx| GraphSession::new(connection, graph_id, branch, cx))
+}
+
+/// Opens a session on a graph its window opens behind the one it shows: it reads nothing until
+/// first shown ([`GraphSession::parked`]).
+pub fn open_session_behind(
+    connection: Entity<Connection>,
+    graph_id: String,
+    branch: String,
+    cx: &mut App,
+) -> Entity<GraphSession> {
+    connection.update(cx, |connection, _| connection.remember_graph(&graph_id));
+    cx.new(|cx| GraphSession::parked(connection, graph_id, branch, cx))
 }
 
 #[cfg(test)]
@@ -4987,6 +5153,392 @@ mod tests {
             Some(vec!["main".to_owned(), "made".to_owned()]),
             "the newer list stays"
         );
+    }
+
+    /// A poll's branch list sent while a reload's was out, and answered first, is the newer:
+    /// the reload's, landing after it, is not taken, so a branch only the poll's lists keeps
+    /// its drafts.
+    #[gpui::test]
+    async fn an_older_branch_list_landing_last_does_not_replace_a_newer_one(
+        cx: &mut TestAppContext,
+    ) {
+        let lists = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (gate_tx, gate_rx) = futures::channel::oneshot::channel::<()>();
+        let gate = Arc::new(std::sync::Mutex::new(Some(gate_rx)));
+        let (count, held) = (lists.clone(), gate.clone());
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let (count, held) = (count.clone(), held.clone());
+            async move {
+                let body = if path.ends_with("/schema") {
+                    serde_json::json!({ "schema_source": "node Person {\n  slug: String @key\n}\n" })
+                } else if path.ends_with("/query") {
+                    serde_json::json!({ "query_name": "studio_head", "target": { "branch": "main" }, "row_count": 0, "rows": [], "graph_commit_id": "c1" })
+                } else if path.ends_with("/branches") {
+                    // The first list; the reload's, held, from before a branch was made; the
+                    // poll's, after.
+                    match count.fetch_add(1, Ordering::SeqCst) {
+                        0 => serde_json::json!({ "branches": ["main"] }),
+                        1 => {
+                            let gate = held.lock().unwrap().take().unwrap();
+                            gate.await.ok();
+                            serde_json::json!({ "branches": ["main"] })
+                        }
+                        _ => serde_json::json!({ "branches": ["main", "made"] }),
+                    }
+                } else {
+                    serde_json::json!({})
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        let listed = |cx: &mut TestAppContext| {
+            session.read_with(cx, |session, _| session.branches.loaded().cloned())
+        };
+        assert_eq!(listed(cx), Some(vec!["main".to_owned()]));
+
+        session.update(cx, |session, cx| session.reload_branches(cx));
+        cx.run_until_parked();
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        let both = Some(vec!["main".to_owned(), "made".to_owned()]);
+        assert_eq!(listed(cx), both, "the poll's");
+        let key = DraftKey {
+            type_name: "Person".into(),
+            id: "p1".into(),
+            property: "slug".into(),
+        };
+        let entry = DraftEntry {
+            old: serde_json::json!("p1"),
+            text: "p2".into(),
+        };
+        session.update(cx, |session, cx| {
+            session.set_draft_on("made", key.clone(), entry, cx)
+        });
+
+        gate_tx.send(()).ok();
+        cx.run_until_parked();
+        assert_eq!(listed(cx), both, "the newer list stays");
+        assert_eq!(
+            session.read_with(cx, |session, _| session.drafts_on("made").count()),
+            1,
+            "its branch's drafts stay"
+        );
+    }
+
+    /// A read at the head's commit goes to the branch; refused there because the branch is
+    /// gone (404), it is sent again pinned to the commit. Any other refusal is the read's own,
+    /// which the commit would answer alike: a 409 on this route is a full-text index to
+    /// rebuild, and it is not sent again.
+    #[gpui::test]
+    async fn a_branch_read_refused_is_sent_pinned_only_when_the_branch_is_gone(
+        cx: &mut TestAppContext,
+    ) {
+        use futures::AsyncReadExt as _;
+        let refusal = Arc::new(std::sync::Mutex::new(409u16));
+        let sent: Arc<std::sync::Mutex<Vec<bool>>> = Arc::default();
+        let (status_seen, sent_seen) = (refusal.clone(), sent.clone());
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let (refusal, sent) = (status_seen.clone(), sent_seen.clone());
+            async move {
+                let (status, body) = if path.ends_with("/query") {
+                    let mut bytes = Vec::new();
+                    request.into_body().read_to_end(&mut bytes).await.ok();
+                    let asked: Value = serde_json::from_slice(&bytes).unwrap();
+                    let pinned = asked["snapshot"].is_string();
+                    sent.lock().unwrap().push(pinned);
+                    if pinned {
+                        let answer = serde_json::json!({ "query_name": "q",
+                            "target": { "snapshot": "c1" }, "row_count": 0, "columns": [],
+                            "rows": [], "graph_commit_id": "c1" });
+                        (200, answer.to_string())
+                    } else {
+                        let status = *refusal.lock().unwrap();
+                        let answer = serde_json::json!({ "error": "refused",
+                            "code": if status == 404 { "not_found" } else { "conflict" } });
+                        (status, answer.to_string())
+                    }
+                } else {
+                    (200, r#"{"branches":["main"]}"#.to_owned())
+                };
+                Ok(Response::builder()
+                    .status(status)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        session.update(cx, |session, _| {
+            session.heads.insert("main".into(), "c1".into());
+        });
+        let query = |n: i64| BuiltQuery {
+            name: "q".into(),
+            text: "query q($n: I64) { match { $p: Person } return { count($p) as n } }".into(),
+            params: [("n".to_owned(), Value::from(n))].into_iter().collect(),
+            ..Default::default()
+        };
+
+        sent.lock().unwrap().clear();
+        let read = session.update(cx, |session, cx| {
+            session.read(&query(1), Some("c1".into()), cx)
+        });
+        let refused = read.await;
+        assert!(
+            matches!(&refused, Err(ReadError::Refused(refusal)) if refusal.status == 409),
+            "{refused:?}"
+        );
+        assert_eq!(*sent.lock().unwrap(), vec![false], "not sent again");
+
+        *refusal.lock().unwrap() = 404;
+        sent.lock().unwrap().clear();
+        let read = session.update(cx, |session, cx| {
+            session.read(&query(2), Some("c1".into()), cx)
+        });
+        assert!(read.await.is_ok());
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![false, true],
+            "the branch is gone: read at the commit"
+        );
+    }
+
+    /// The node answers a page's rows give are kept within a bound of their own: however many
+    /// pages are scrolled, an answer that was read stays.
+    #[gpui::test]
+    async fn seeded_answers_never_push_out_an_answer_that_was_read(cx: &mut TestAppContext) {
+        use crate::test_server::followed_session;
+        use serde_json::json;
+
+        let (session, _) = followed_session(
+            "node Person {\n  slug: String @key\n}\n",
+            |_| json!([{ "n": 3 }]),
+            cx,
+        );
+        cx.run_until_parked();
+        let group = BuiltQuery {
+            name: "g".into(),
+            text: "query g() { match { $p: Person } return { count($p) as n } }".into(),
+            ..Default::default()
+        };
+        let read = session.update(cx, |session, cx| {
+            session.read(&group, Some("c1".into()), cx)
+        });
+        let page = read.await.unwrap();
+        session.update(cx, |session, _| {
+            let read_key = session.pinned_key(&group, "c1");
+            assert!(session.pinned_reads.holds(&read_key));
+            // Five memos' worth of node answers from scrolled pages.
+            let nodes: Vec<(PinnedRead, ReadOutput)> = (0..PINNED_READS + SEEDED_READS)
+                .map(|n| {
+                    let node = BuiltQuery {
+                        name: "studio_node".into(),
+                        text: format!("query studio_node() {{ match {{ $n: Person }} return {{ $n }} limit {n} }}"),
+                        ..Default::default()
+                    };
+                    (session.pinned_key(&node, "c1"), page.clone())
+                })
+                .collect();
+            let seeds = Seeds::Nodes {
+                type_name: "Person".into(),
+            };
+            let (epoch, credential) = (session.schema_epoch, session.credential);
+            session.seed(&seeds, &page, nodes, epoch, credential);
+            assert!(session.pinned_reads.holds(&read_key), "the read stays");
+            assert_eq!(session.seeded_reads.len(), SEEDED_READS);
+            assert!(session.seeded_commits.len() <= SEEDED_READS);
+        });
+    }
+
+    /// A graph opened behind the one its window shows sends nothing, not its first reads nor
+    /// a head probe or branch list at the polls, and holds no watch on its server; its first
+    /// show reads the graph, and the schema's answer asks after the head.
+    #[gpui::test]
+    async fn a_graph_opened_behind_asks_nothing_until_first_shown(cx: &mut TestAppContext) {
+        let (session, connection, asked, _) = parked_graph(cx);
+        cx.run_until_parked();
+        cx.add_empty_window()
+            .update(|window, _| window.activate_window());
+        cx.executor().advance_clock(HEAD_POLL);
+        cx.run_until_parked();
+        let _watch = session.update(cx, |session, cx| {
+            session.check_heads(cx);
+            session.window_activated(cx);
+            session.watch_head("feature", cx)
+        });
+        cx.run_until_parked();
+        assert!(asked.lock().unwrap().is_empty(), "{:?}", asked.lock());
+        assert!(!connection.read_with(cx, |connection, _| connection.watched()));
+
+        session.update(cx, |session, cx| session.set_shown(true, cx));
+        cx.run_until_parked();
+        let sent = std::mem::take(&mut *asked.lock().unwrap());
+        let times = |read: &str| sent.iter().filter(|sent| *sent == read).count();
+        for read in ["schema", "snapshot", "queries", "access"] {
+            assert_eq!(times(read), 1, "{read}: {sent:?}");
+        }
+        assert!(times("branches") >= 1, "{sent:?}");
+        assert_eq!(
+            times("studio_head"),
+            2,
+            "main and the watched branch: {sent:?}"
+        );
+        assert!(connection.read_with(cx, |connection, _| connection.watched()));
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.count_of(EntityKind::Node, "Person"), Some(7));
+            assert_eq!(session.head("main"), Some("c1"));
+        });
+    }
+
+    /// The wait after a 503 ending while the graph is parked sends nothing; shown again, the
+    /// graph is asked again, and what it holds (counts, the catalog, the branch list) stays
+    /// shown while it is, and when the graph still answers 503.
+    #[gpui::test]
+    async fn a_503_recheck_waits_for_the_graph_to_show_and_keeps_what_it_holds(
+        cx: &mut TestAppContext,
+    ) {
+        let (session, _, asked, failing) = parked_graph(cx);
+        session.update(cx, |session, cx| session.set_shown(true, cx));
+        cx.run_until_parked();
+        let held = |cx: &mut TestAppContext| {
+            session.read_with(cx, |session, _| {
+                (
+                    session.count_of(EntityKind::Node, "Person"),
+                    matches!(session.stored_queries, Loadable::Loaded(_)),
+                    matches!(session.branches, Loadable::Loaded(_)),
+                    session.unavailable.is_some(),
+                )
+            })
+        };
+        assert_eq!(held(cx), (Some(7), true, true, false));
+
+        failing.store(true, Ordering::SeqCst);
+        let query = BuiltQuery {
+            name: "q".into(),
+            text: "query q() { match { $p: Person } return { count($p) as n } }".into(),
+            ..Default::default()
+        };
+        let read = session.update(cx, |session, cx| session.read(&query, None, cx));
+        assert!(read.await.is_err());
+        assert_eq!(held(cx), (Some(7), true, true, true));
+        session.update(cx, |session, cx| session.set_shown(false, cx));
+        asked.lock().unwrap().clear();
+        cx.executor().advance_clock(RECHECK_FIRST);
+        cx.run_until_parked();
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "parked: {:?}",
+            asked.lock()
+        );
+
+        session.update(cx, |session, cx| session.set_shown(true, cx));
+        cx.run_until_parked();
+        let sent = std::mem::take(&mut *asked.lock().unwrap());
+        for read in ["schema", "branches", "snapshot", "queries"] {
+            assert!(sent.iter().any(|sent| sent == read), "{read}: {sent:?}");
+        }
+        assert_eq!(held(cx), (Some(7), true, true, true), "kept through a 503");
+
+        failing.store(false, Ordering::SeqCst);
+        cx.executor().advance_clock(RECHECK_FIRST * 2);
+        cx.run_until_parked();
+        assert_eq!(held(cx), (Some(7), true, true, false), "answered again");
+    }
+
+    /// A graph opened behind its window's shown one ([`GraphSession::parked`]) on a server that
+    /// names each request it is sent (the last part of its path, or the query's name) and
+    /// answers 503 to all of them while `failing` holds.
+    #[allow(clippy::type_complexity)]
+    fn parked_graph(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<GraphSession>,
+        Entity<Connection>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        Arc<AtomicBool>,
+    ) {
+        use futures::AsyncReadExt as _;
+        use serde_json::json;
+        let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let failing = Arc::new(AtomicBool::new(false));
+        let (log, down) = (asked.clone(), failing.clone());
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let (log, down) = (log.clone(), down.clone());
+            async move {
+                let mut bytes = Vec::new();
+                request.into_body().read_to_end(&mut bytes).await.ok();
+                let asked: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                let read = match asked["name"].as_str() {
+                    Some(name) => name.to_owned(),
+                    None => path.rsplit('/').next().unwrap_or_default().to_owned(),
+                };
+                log.lock().unwrap().push(read.clone());
+                let (status, body) = if down.load(Ordering::SeqCst) {
+                    (
+                        503,
+                        json!({ "error": "graph knowledge is loading", "code": "graph_unavailable" }),
+                    )
+                } else {
+                    let body = match read.as_str() {
+                        "schema" => {
+                            json!({ "schema_source": "node Person {\n  slug: String @key\n}\n" })
+                        }
+                        "snapshot" => json!({ "graph_branch": "main", "graph_manifest_version": 3,
+                            "internal_schema_version": 16, "datasets": [{ "entity_kind": "node",
+                            "type_name": "Person", "dataset_path": "nodes/1",
+                            "published_dataset_version": 2, "entity_count": 7 }] }),
+                        "queries" => json!({ "queries": [] }),
+                        "access" => json!({ "graph_id": "knowledge", "actor": "act-ada",
+                            "graph_wide": ["read"], "branch": "main", "actions": ["read"] }),
+                        "branches" => json!({ "branches": ["main", "feature"] }),
+                        name => json!({ "query_name": name, "target": { "branch": "main" },
+                            "row_count": 0, "columns": [], "rows": [], "graph_commit_id": "c1" }),
+                    };
+                    (200, body)
+                };
+                Ok(Response::builder()
+                    .status(status)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session = cx.new(|cx| {
+            GraphSession::parked(connection.clone(), "knowledge".into(), "main".into(), cx)
+        });
+        (session, connection, asked, failing)
     }
 
     #[gpui::test]
@@ -6670,7 +7222,7 @@ mod tests {
         // The node's answer goes; the page, read again from what was kept, files nothing.
         session.update(cx, |session, _| {
             let key = session.pinned_key(&node, "c1");
-            session.pinned_reads.forget(&key);
+            session.seeded_reads.forget(&key);
         });
         read(&page, cx).await.unwrap();
         read(&node, cx).await.unwrap();

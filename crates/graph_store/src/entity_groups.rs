@@ -109,10 +109,12 @@ pub struct RelationshipEntry {
     pub replaces: Option<(usize, String)>,
 }
 
-/// The lines a card draws ([`EntityGroups::lines`]): the first few, how many there are, and the
-/// added, changed and removed among all of them; mirrors count on their own card.
+/// The relationship lines a review card draws for one entity ([`EntityGroups::lines`]): the
+/// first few, how many there are, and the added, changed and removed among all of them;
+/// mirrors count on their own card. Not `change_cards::CardLines`, which counts how many lines
+/// each card shows.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CardLines {
+pub struct RelationshipLines {
     pub entries: Vec<RelationshipEntry>,
     pub total: usize,
     pub added: usize,
@@ -506,15 +508,15 @@ impl EntityGroups {
         schema: Option<&SchemaModel>,
         names: &NodeNames,
         take: usize,
-    ) -> CardLines {
+    ) -> RelationshipLines {
         let group = &self.groups[ix];
         let counts = self.counts.get(ix).copied().unwrap_or_default();
-        let mut lines = CardLines {
+        let mut lines = RelationshipLines {
             total: counts.total,
             added: counts.added,
             changed: counts.changed,
             removed: counts.removed,
-            ..CardLines::default()
+            ..RelationshipLines::default()
         };
         let other_name = |relationship: &GroupRelationship| {
             relationship

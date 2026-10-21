@@ -1,15 +1,15 @@
 //! Every server Studio knows: from the CLI config, added in Studio, or from the environment.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
-use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Global, Task};
+use gpui::{App, AppContext as _, Context, Entity, Global, Task};
 use http_client::HttpClient;
 use serde::{Deserialize, Serialize};
 
-use crate::cli_config::{self, CliAlias, OperatorFiles};
+use crate::cli_config::{self, CliAlias, CliServer, OperatorFiles};
 use crate::connection::{Connection, ServerEntry, ServerSource};
 
 /// The keychain user name Studio stores server tokens under.
@@ -34,11 +34,6 @@ struct SavedServer {
     graphs: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RegistryEvent {
-    ServersChanged,
-}
-
 pub struct ConnectionRegistry {
     pub connections: Vec<Entity<Connection>>,
     /// Servers named in the environment or saved by Studio that could not be added at start.
@@ -47,10 +42,10 @@ pub struct ConnectionRegistry {
     /// Where the CLI's files are (`$OMNIGRAPH_HOME`, else `~/.omnigraph`), and their stamp
     /// when last read.
     operator_dir: Option<PathBuf>,
-    operator_stamp: Vec<Option<(SystemTime, u64)>>,
-    /// The token each CLI server took from the CLI's files when they were last read. Only a
-    /// token changed there replaces the connection's, so one typed into Studio for this run
-    /// stays until then.
+    operator_stamp: Vec<Option<cli_config::FileStamp>>,
+    /// The token each CLI server took from the CLI's files when they were last read, by its
+    /// address. Only a token changed there replaces the connection's, so one typed into Studio
+    /// for this run stays until then.
     cli_tokens: HashMap<String, Option<String>>,
     /// What the CLI's files could not give when last read.
     cli_errors: Vec<String>,
@@ -59,10 +54,11 @@ pub struct ConnectionRegistry {
     /// Servers saved by Studio and not connected this run, since another connection has their
     /// address (the environment's): they stay in the saved list.
     kept_saved: Vec<SavedServer>,
+    /// The saved list may be written: `false` when `servers.json` could not be read and could
+    /// not be set aside either, so no save this run writes over what it holds.
+    saving: bool,
     _watch: Option<Task<()>>,
 }
-
-impl EventEmitter<RegistryEvent> for ConnectionRegistry {}
 
 struct GlobalRegistry(Entity<ConnectionRegistry>);
 
@@ -75,11 +71,63 @@ fn saved_path() -> PathBuf {
     data_dir().join("servers.json")
 }
 
-fn load_saved() -> SavedServers {
-    std::fs::read_to_string(saved_path())
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+/// Studio's saved servers as read at start, whether the list may be written over, and what
+/// the person is told once when the file could not be used.
+struct LoadedServers {
+    saved: SavedServers,
+    saving: bool,
+    notice: Option<String>,
+}
+
+/// The servers saved at `path`. A file that cannot be read or parsed is set aside beside
+/// itself before anything replaces it, as the workspace's files are, so the next save keeps
+/// what it held: every server added in Studio, whose tokens the keychain still holds. One
+/// that cannot be set aside is never written over. Either way the person is told, once.
+fn load_saved_at(path: &Path) -> LoadedServers {
+    let read = std::fs::read_to_string(path).map_err(|error| (error.kind(), error.to_string()));
+    let reason = match read {
+        Ok(text) => match serde_json::from_str(&text) {
+            Ok(saved) => {
+                return LoadedServers {
+                    saved,
+                    saving: true,
+                    notice: None,
+                };
+            }
+            Err(error) => error.to_string(),
+        },
+        Err((std::io::ErrorKind::NotFound, _)) => {
+            return LoadedServers {
+                saved: SavedServers::default(),
+                saving: true,
+                notice: None,
+            };
+        }
+        Err((_, error)) => error,
+    };
+    let (saving, notice) = match studio_settings::set_aside(path) {
+        Some(aside) => (
+            true,
+            format!(
+                "Studio's saved servers could not be read ({reason}), so it starts without them; \
+                 the file is kept as {}",
+                aside.display()
+            ),
+        ),
+        None => (
+            false,
+            format!(
+                "Studio's saved servers could not be read ({reason}) or moved aside, so it starts \
+                 without them and saves no server over {} this run",
+                path.display()
+            ),
+        ),
+    };
+    LoadedServers {
+        saved: SavedServers::default(),
+        saving,
+        notice: Some(notice),
+    }
 }
 
 impl ConnectionRegistry {
@@ -101,7 +149,13 @@ impl ConnectionRegistry {
     fn load(http: Arc<dyn HttpClient>, cx: &mut Context<Self>) -> Self {
         let operator_dir = cli_config::operator_dir();
         let mut this = Self::empty(http, operator_dir.clone());
-        let saved = load_saved();
+        let LoadedServers {
+            saved,
+            saving,
+            notice,
+        } = load_saved_at(&saved_path());
+        this.saving = saving;
+        this.start_errors.extend(notice);
 
         if let Ok(url) = std::env::var("OMNIGRAPH_STUDIO_SERVER") {
             let url = graph_client::server_root(&url).unwrap_or(url);
@@ -194,6 +248,7 @@ impl ConnectionRegistry {
             cli_errors: Vec::new(),
             aliases: Vec::new(),
             kept_saved: Vec::new(),
+            saving: true,
             _watch: None,
         }
     }
@@ -248,7 +303,6 @@ impl ConnectionRegistry {
                         this.operator_stamp = stamp;
                         if this.apply_operator_files(files, &SavedServers::default(), cx) {
                             this.save(cx);
-                            cx.emit(RegistryEvent::ServersChanged);
                             cx.notify();
                         }
                     })
@@ -261,12 +315,15 @@ impl ConnectionRegistry {
     }
 
     /// Brings the CLI's servers in line with what its files say, and says whether anything
-    /// changed. A new server is added, with the graphs Studio remembered for it (`saved`); one
-    /// no longer named leaves the list (a window open on it keeps its connection); one at a new
-    /// address is a new connection; a token changed in the files replaces the connection's; a
-    /// profile's graph is added. Files that could not be read change no server. What they could
-    /// not give, a server they name that cannot be added included, is a change only when it
-    /// differs from what was kept.
+    /// changed. An address is one server (spec 003), so a CLI server is its address: a target
+    /// renamed on the same endpoint renames the connection in place, which the windows open on
+    /// it keep, and a token changed in the files later reaches it. A new address is a new
+    /// connection, with the graphs Studio remembered for it (`saved`, by address, else by
+    /// name) or for the name at the address it left; an address no longer named leaves the
+    /// list (a window open on it keeps its connection); a token changed in the files replaces
+    /// the connection's; a profile's graph is added. Files that could not be read change no
+    /// server. What they could not give, a server they name that cannot be added included, is
+    /// a change only when it differs from what was kept.
     fn apply_operator_files(
         &mut self,
         files: OperatorFiles,
@@ -286,28 +343,61 @@ impl ConnectionRegistry {
             self.aliases = aliases;
             changed = true;
         }
-        let named: Vec<String> = servers
-            .iter()
-            .map(|(server, _)| server.name.clone())
+        let servers: Vec<(CliServer, Option<String>, String)> = servers
+            .into_iter()
+            .map(|(server, token)| {
+                let url = graph_client::server_root(&server.url).unwrap_or(server.url.clone());
+                (server, token, url)
+            })
             .collect();
-        let before = self.connections.len();
+        let named: Vec<&String> = servers.iter().map(|(_, _, url)| url).collect();
+        // The CLI connections at addresses the files no longer name leave; a target that moved
+        // takes the graphs remembered for its name to its new address.
+        let mut left: Vec<ServerEntry> = Vec::new();
         self.connections.retain(|connection| {
             let server = &connection.read(cx).server;
-            server.source != ServerSource::Cli || named.contains(&server.name)
+            let stays = server.source != ServerSource::Cli || named.contains(&&server.url);
+            if !stays {
+                left.push(server.clone());
+            }
+            stays
         });
-        changed |= self.connections.len() != before;
-        self.cli_tokens.retain(|name, _| named.contains(name));
-        for (server, token) in servers {
-            let url = graph_client::server_root(&server.url).unwrap_or(server.url);
-            let existing = self.connections.iter().position(|connection| {
+        changed |= !left.is_empty();
+        self.cli_tokens.retain(|url, _| named.contains(&url));
+        // Each address the files land a server on, and the target it was taken as.
+        let mut taken: Vec<(String, String)> = Vec::new();
+        for (server, token, url) in servers {
+            // An address Studio reaches already as a server of its own (added in Studio, or the
+            // environment's) is that connection: a second would open its graphs twice, and the
+            // graph keys, window restore and links would each find either.
+            let other = self.connections.iter().find_map(|connection| {
                 let entry = &connection.read(cx).server;
-                entry.source == ServerSource::Cli && entry.name == server.name
+                (entry.url == url && entry.source != ServerSource::Cli).then(|| entry.name.clone())
             });
-            if let Some(ix) = existing
-                && self.connections[ix].read(cx).server.url == url
-            {
-                let connection = self.connections[ix].clone();
-                connection.update(cx, |connection, _| {
+            let first = taken
+                .iter()
+                .find(|(at, _)| *at == url)
+                .map(|(_, name)| name.clone());
+            if let Some(other) = other.or(first) {
+                errors.push(format!(
+                    "CLI target '{}' is at {url}, which Studio connects to already as \
+                     '{other}'; Studio keeps one connection per address",
+                    server.name
+                ));
+                continue;
+            }
+            taken.push((url.clone(), server.name.clone()));
+            let existing = self.connections.iter().find(|connection| {
+                let entry = &connection.read(cx).server;
+                entry.source == ServerSource::Cli && entry.url == url
+            });
+            if let Some(connection) = existing.cloned() {
+                connection.update(cx, |connection, cx| {
+                    if connection.server.name != server.name {
+                        connection.server.name = server.name.clone();
+                        changed = true;
+                        cx.notify();
+                    }
                     for graph in &server.graphs {
                         if !connection.server.known_graphs.contains(graph) {
                             connection.remember_graph(graph);
@@ -315,46 +405,27 @@ impl ConnectionRegistry {
                         }
                     }
                 });
-                if self.cli_tokens.get(&server.name) != Some(&token) {
-                    self.cli_tokens.insert(server.name.clone(), token.clone());
+                if self.cli_tokens.get(&url) != Some(&token) {
+                    self.cli_tokens.insert(url, token.clone());
                     connection.update(cx, |connection, cx| connection.set_token(token, cx));
                     changed = true;
                 }
                 continue;
             }
-            // An address Studio reaches already as a server of its own (added in Studio, or the
-            // environment's) is that connection: a second would open its graphs twice, and the
-            // graph keys, window restore and links would each find either. The CLI server's
-            // connection at its old address, if any, goes.
-            let other = self.connections.iter().find_map(|connection| {
-                let entry = &connection.read(cx).server;
-                (entry.url == url && entry.source != ServerSource::Cli).then(|| entry.name.clone())
-            });
-            if let Some(other) = other {
-                errors.push(format!(
-                    "CLI target '{}' is at {url}, which Studio connects to already as \
-                     '{other}'; Studio keeps one connection per address",
-                    server.name
-                ));
-                if let Some(ix) = existing {
-                    self.connections.remove(ix);
-                    changed = true;
-                }
-                self.cli_tokens.remove(&server.name);
-                continue;
-            }
-            // New, or at another address: a connection of its own. The graphs remembered for
-            // the name come along.
+            // New: a connection of its own, with the graphs remembered for it.
             let mut graphs = server.graphs.clone();
-            let remembered = match existing {
-                Some(ix) => self.connections[ix].read(cx).server.known_graphs.clone(),
-                None => saved
-                    .servers
-                    .iter()
-                    .find(|saved| saved.source == "cli" && saved.name == server.name)
-                    .map(|saved| saved.graphs.clone())
-                    .unwrap_or_default(),
-            };
+            let remembered = left
+                .iter()
+                .find(|entry| entry.name == server.name)
+                .map(|entry| entry.known_graphs.clone())
+                .or_else(|| {
+                    let saved_cli = || saved.servers.iter().filter(|saved| saved.source == "cli");
+                    saved_cli()
+                        .find(|saved| saved.url == url)
+                        .or_else(|| saved_cli().find(|saved| saved.name == server.name))
+                        .map(|saved| saved.graphs.clone())
+                })
+                .unwrap_or_default();
             for graph in remembered {
                 if !graphs.contains(&graph) {
                     graphs.push(graph);
@@ -362,18 +433,14 @@ impl ConnectionRegistry {
             }
             let entry = ServerEntry {
                 name: server.name.clone(),
-                url,
+                url: url.clone(),
                 source: ServerSource::Cli,
                 known_graphs: graphs,
             };
             match Connection::new(entry, token.clone(), self.http.clone()) {
                 Ok(connection) => {
-                    let connection = cx.new(|_| connection);
-                    match existing {
-                        Some(ix) => self.connections[ix] = connection,
-                        None => self.connections.push(connection),
-                    }
-                    self.cli_tokens.insert(server.name, token);
+                    self.connections.push(cx.new(|_| connection));
+                    self.cli_tokens.insert(url, token);
                     changed = true;
                 }
                 Err(error) => errors.push(error.to_string()),
@@ -440,7 +507,6 @@ impl ConnectionRegistry {
             Self::save_token(&connection, &url, token, cx);
         }
         self.save(cx);
-        cx.emit(RegistryEvent::ServersChanged);
         cx.notify();
         Ok(connection)
     }
@@ -479,8 +545,12 @@ impl ConnectionRegistry {
     }
 
     /// Writes Studio-added servers and remembered graph ids to the data directory, those not
-    /// connected this run among them.
+    /// connected this run among them; nothing over a file that could not be read and stayed
+    /// where it was.
     pub fn save(&self, cx: &App) {
+        if !self.saving {
+            return;
+        }
         let servers = self
             .connections
             .iter()
@@ -527,7 +597,6 @@ mod tests {
     use http_client::{AsyncBody, FakeHttpClient};
 
     use super::*;
-    use crate::cli_config::CliServer;
 
     fn files(servers: &[(&str, &str, Option<&str>)]) -> OperatorFiles {
         OperatorFiles {
@@ -744,5 +813,119 @@ mod tests {
             assert_eq!(names, ["mine"]);
             assert!(registry.aliases_for("c", "other").is_empty());
         });
+    }
+
+    /// A CLI target renamed on the same endpoint is the same server: its connection, which
+    /// open windows hold, takes the new name, and a token `omnigraph login` writes later
+    /// reaches it. A target moved to a new address takes the graphs remembered for its name.
+    #[gpui::test]
+    async fn a_renamed_cli_target_keeps_its_connection(cx: &mut TestAppContext) {
+        let sent: Arc<Mutex<Vec<String>>> = Arc::default();
+        let seen = sent.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let authorization = request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            seen.lock().unwrap().push(authorization);
+            async move {
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(r#"{"status":"ok","version":"0.14.0"}"#))
+                    .unwrap())
+            }
+        });
+        let registry = cx.new(|_| ConnectionRegistry::empty(http, None));
+        let apply = |cx: &mut TestAppContext, files: OperatorFiles| {
+            registry.update(cx, |registry, cx| {
+                registry.apply_operator_files(files, &SavedServers::default(), cx)
+            })
+        };
+        let at_a = |cx: &mut TestAppContext| {
+            registry.read_with(cx, |registry, cx| {
+                registry
+                    .connections
+                    .iter()
+                    .filter(|connection| connection.read(cx).server.url == "http://a.test")
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+        };
+        apply(cx, files(&[("old", "http://a.test", Some("one"))]));
+        let open = at_a(cx).pop().unwrap();
+        open.update(cx, |connection, _| connection.remember_graph("knowledge"));
+
+        assert!(apply(cx, files(&[("new", "http://a.test", Some("one"))])));
+        assert_eq!(at_a(cx), vec![open.clone()], "one connection, the one held");
+        open.read_with(cx, |connection, _| {
+            assert_eq!(connection.server.name, "new");
+            assert_eq!(connection.server.known_graphs, ["knowledge"]);
+        });
+        assert!(!apply(cx, files(&[("new", "http://a.test", Some("one"))])));
+
+        // `omnigraph login` under the new name reaches the connection the windows hold.
+        assert!(apply(cx, files(&[("new", "http://a.test", Some("two"))])));
+        let client = open.read_with(cx, |connection, _| connection.client().clone());
+        let health = cx
+            .background_executor
+            .spawn(async move { client.health().await });
+        cx.run_until_parked();
+        drop(health);
+        assert_eq!(sent.lock().unwrap().pop().as_deref(), Some("Bearer two"));
+
+        // Moved to another address, it is a new connection with the graphs it had.
+        assert!(apply(cx, files(&[("new", "http://b.test", Some("two"))])));
+        assert!(at_a(cx).is_empty());
+        let moved = registry.read_with(cx, |registry, cx| registry.find("new", cx).unwrap());
+        moved.read_with(cx, |connection, _| {
+            assert_eq!(connection.server.url, "http://b.test");
+            assert_eq!(connection.server.known_graphs, ["knowledge"]);
+        });
+    }
+
+    /// A `servers.json` that cannot be parsed is set aside before anything replaces it, and the
+    /// person is told where it went; a missing one is an empty list, said nothing of.
+    #[test]
+    fn an_unreadable_server_list_is_set_aside_and_said() {
+        let dir = std::env::temp_dir().join(format!("studio-servers-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("servers.json");
+
+        let missing = load_saved_at(&path);
+        assert!(missing.saving && missing.notice.is_none());
+        assert!(missing.saved.servers.is_empty());
+
+        std::fs::write(
+            &path,
+            r#"{"servers":[{"name":"mine","url":"http://a.test","source":"studio"}]}"#,
+        )
+        .unwrap();
+        let read = load_saved_at(&path);
+        assert_eq!(read.saved.servers.len(), 1);
+        assert!(read.saving && read.notice.is_none());
+
+        std::fs::write(&path, r#"{"servers":[{"name":"mine","#).unwrap();
+        let broken = load_saved_at(&path);
+        assert!(broken.saved.servers.is_empty());
+        assert!(broken.saving, "set aside, so a save loses nothing");
+        let notice = broken.notice.expect("the person is told");
+        assert!(!path.exists());
+        let aside: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(aside.len(), 1);
+        assert!(notice.contains(&aside[0].display().to_string()), "{notice}");
+        assert_eq!(
+            std::fs::read_to_string(&aside[0]).unwrap(),
+            r#"{"servers":[{"name":"mine","#,
+            "kept as it was"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

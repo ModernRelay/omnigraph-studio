@@ -15,7 +15,7 @@ use gpui::{
     App, AppContext as _, Context, Entity, Focusable as _, Window, WindowBounds, WindowOptions, px,
     size,
 };
-use graph_store::{ConnectionRegistry, open_session};
+use graph_store::{ConnectionRegistry, open_session, open_session_behind};
 use studio_actions::workspace::{NewWindow, OpenGraph, OpenLink, OpenSettings, Quit, RevealLog};
 use studio_workspace::{SavedWindow, ToastKind, Workspace};
 
@@ -284,12 +284,15 @@ fn reopen_window(
             continue;
         };
         connection.update(cx, |connection, cx| connection.connect_if_idle(cx));
-        let session = open_session(connection, graph.graph.clone(), graph.branch.clone(), cx);
+        let (graph_id, branch) = (graph.graph.clone(), graph.branch.clone());
         if index == saved.session.shown {
+            let session = open_session(connection, graph_id, branch, cx);
             workspace.update(cx, |workspace, cx| {
                 workspace.set_session(session, window, cx)
             });
         } else {
+            // Parked: it sends nothing, its first reads included, until it is first shown.
+            let session = open_session_behind(connection, graph_id, branch, cx);
             last = Some(session.entity_id());
             workspace.update(cx, |workspace, cx| {
                 workspace.add_session_behind(session, cx)

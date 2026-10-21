@@ -1,10 +1,10 @@
 //! Relationship counts asked for one node at a time, read for many at once. The tree, the
-//! canvas and the peek each ask how many neighbours a node has through a relationship; when an
-//! exploration expands several nodes, reloads after Refresh, or comes back after a restart,
-//! that is one `builder::degree` read per node and relationship. Counts asked for in the same
-//! turn of the app for one node type, relationship and commit go out together as
-//! `builder::page_degrees` reads of at most [`DEGREE_BATCH`] nodes, sorted, so the same batch
-//! asked again at a commit is answered by the session's memo.
+//! canvas and the peek each ask how many neighbours a node has through a relationship, many
+//! together when an exploration expands several nodes, reloads after Refresh, or comes back
+//! after a restart. Counts asked for in the same turn of the app for one node type,
+//! relationship and commit go out together as `builder::page_degrees` reads of at most
+//! [`DEGREE_BATCH`] nodes, sorted, so the same batch asked again at a commit is answered by the
+//! session's memo; one node's count is a batch of one.
 
 use std::collections::{BTreeMap, HashMap};
 

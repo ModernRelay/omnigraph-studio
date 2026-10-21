@@ -35,16 +35,17 @@ pub use connection::{
     ServerSource,
 };
 pub use entity_groups::{
-    CardLines, EntityGroup, EntityGroups, GroupRelationship, GroupRun, GroupSection, NodeNames,
-    RelationshipEntry, entity_name, relationship_words,
+    EntityGroup, EntityGroups, GroupRelationship, GroupRun, GroupSection, NodeNames,
+    RelationshipEntry, RelationshipLines, entity_name, relationship_words,
 };
 pub use exploration::*;
 pub use fixes::{RevertUnavailable, revert_query};
 pub use graph_client::api::{AccessAction, EntityKind};
-pub use registry::{ConnectionRegistry, RegistryEvent, data_dir};
+pub use registry::{ConnectionRegistry, data_dir};
 pub use session::{
     BranchStart, DraftEntry, DraftKey, ExternalWrite, FollowUp, GraphSession, HeadWatch, HeldAs,
     Loadable, OutcomeEntry, OutcomeKind, ServerState, SessionEvent, open_session,
+    open_session_behind,
 };
 
 /// Sets up the HTTP client and loads every known server. Call once at startup.
