@@ -588,9 +588,20 @@ pub struct DiffOutput {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CommitChanges {
     pub cause: ChangeCauseOutput,
-    pub changes: Vec<EntityChangeOutput>,
+    /// Shared, as `ReadOutput.rows` is: a page kept for its commit is handed to every reader
+    /// that asks again, and a copy is made only by one that takes the changes for its own
+    /// (`Arc::unwrap_or_clone`).
+    #[serde(deserialize_with = "shared_changes")]
+    pub changes: Arc<Vec<EntityChangeOutput>>,
     #[serde(default)]
     pub next_page_token: Option<String>,
+}
+
+/// A page's changes read once and shared.
+fn shared_changes<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Arc<Vec<EntityChangeOutput>>, D::Error> {
+    Vec::deserialize(deserializer).map(Arc::new)
 }
 
 #[derive(Debug, Clone, Deserialize)]

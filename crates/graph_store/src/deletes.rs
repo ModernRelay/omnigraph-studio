@@ -255,9 +255,18 @@ pub fn undo_query(
                     studio_ui::group_digits(UNDO_CAP)
                 ));
             }
-            for change in page.changes {
-                fold.add(&page.cause, change);
-            }
+            // The page is shared with the session's memo: its changes are copied for the fold
+            // off the main thread.
+            let (cause, changes) = (page.cause, page.changes);
+            fold = cx
+                .background_executor()
+                .spawn(async move {
+                    for change in Arc::unwrap_or_clone(changes) {
+                        fold.add(&cause, change);
+                    }
+                    fold
+                })
+                .await;
             match page.next_page_token {
                 Some(token) => page_token = Some(token),
                 None => break,

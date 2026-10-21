@@ -6289,9 +6289,9 @@ mod tests {
     }
 
     /// A page of a commit's changes is read once, for every view that asks: a commit never
-    /// changes.
+    /// changes. Every view is handed the one page read, not a copy of its changes.
     #[gpui::test]
-    async fn a_commits_changes_are_read_once(cx: &mut TestAppContext) {
+    async fn a_commits_changes_are_read_once_and_shared(cx: &mut TestAppContext) {
         let pages = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = pages.clone();
         let http = FakeHttpClient::create(move |request| {
@@ -6299,7 +6299,7 @@ mod tests {
             async move {
                 let body = if request.uri().path().ends_with("/changes") {
                     counted.fetch_add(1, Ordering::SeqCst);
-                    r#"{"cause":{"graph_commit_id":"c1","authored_branch":"main","authored_at":1},"changes":[]}"#
+                    r#"{"cause":{"graph_commit_id":"c1","authored_branch":"main","authored_at":1},"changes":[{"kind":"node","type":{"id":"t1","name":"Person"},"id":"p1","op":"update","before":{"properties":{"name":"Ada"}},"after":{"properties":{"name":"Grace"}}}]}"#
                 } else {
                     r#"{"branches":["main"]}"#
                 };
@@ -6327,18 +6327,27 @@ mod tests {
                 session.commit_changes("c1", None, 500, cx),
             )
         });
-        assert!(panel.await.is_ok() && tab.await.is_ok());
+        let (panel, tab) = (panel.await.unwrap(), tab.await.unwrap());
         let again = session.update(cx, |session, cx| {
             session.commit_changes("c1", None, 500, cx)
         });
-        assert!(again.await.is_ok());
+        let again = again.await.unwrap();
         // The page came back whole: a larger ask (the commit view beside a History row) takes
         // it too.
         let larger = session.update(cx, |session, cx| {
             session.commit_changes("c1", None, 5_000, cx)
         });
-        assert!(larger.await.is_ok());
+        let larger = larger.await.unwrap();
         assert_eq!(pages.load(Ordering::SeqCst) - at_start, 1);
+        assert_eq!(panel.changes.len(), 1);
+        // The read shared while under way, the answer kept, and the whole page answering a
+        // larger ask all hold the changes decoded once.
+        for (asked, page) in [("tab", &tab), ("again", &again), ("larger", &larger)] {
+            assert!(
+                Arc::ptr_eq(&panel.changes, &page.changes),
+                "{asked} holds a copy"
+            );
+        }
     }
 
     /// A branch Studio deleted takes its unsaved values with it, and so does one deleted

@@ -1459,9 +1459,10 @@ impl HistoryView {
                 let folded = cx
                     .background_spawn(async move {
                         let mut fold = graph_store::ChangeFold::new();
+                        // Shared with the session's memo: copied here, off the main thread.
                         fold.add_block(graph_client::api::ChangeBlockOutput {
                             cause: page.cause,
-                            changes: page.changes,
+                            changes: Arc::unwrap_or_clone(page.changes),
                         });
                         fold.finish()
                             .counts()

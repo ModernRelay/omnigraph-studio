@@ -297,15 +297,17 @@ impl CommitView {
                 });
                 match read.await {
                     Ok(page) => {
-                        let block = graph_client::api::ChangeBlockOutput {
-                            cause: page.cause.clone(),
-                            changes: page.changes,
-                        };
+                        let (block_cause, changes) = (page.cause.clone(), page.changes);
                         cause = Some(page.cause);
                         fold = cx
                             .background_executor()
                             .spawn(async move {
-                                fold.add_block(block);
+                                // Shared with the session's memo: copied here, off the main
+                                // thread.
+                                fold.add_block(graph_client::api::ChangeBlockOutput {
+                                    cause: block_cause,
+                                    changes: Arc::unwrap_or_clone(changes),
+                                });
                                 fold
                             })
                             .await;

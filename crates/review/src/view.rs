@@ -3409,10 +3409,18 @@ async fn read_commit_review(
                     })
                     .await
                     .map_err(|e| e.to_string())?;
-                let block = ChangeBlockOutput {
-                    cause: page.cause,
-                    changes: page.changes,
-                };
+                // The page is shared with the session's memo: its changes are copied for the
+                // fold off the main thread.
+                let (cause, changes) = (page.cause, page.changes);
+                let block = cx
+                    .background_executor()
+                    .spawn(async move {
+                        ChangeBlockOutput {
+                            cause,
+                            changes: Arc::unwrap_or_clone(changes),
+                        }
+                    })
+                    .await;
                 Ok((block, page.next_page_token))
             },
         ),
