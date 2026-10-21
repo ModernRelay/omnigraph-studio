@@ -1498,7 +1498,9 @@ impl GraphCanvas {
         let node = self.scene.nodes[index].clone();
         let pinned = pin_key(&node.id).is_some_and(|key| self.pinned.contains_key(&key));
         let exploring = self.mode() == Mode::Explore;
-        let schema = self.session.read(cx).schema_model();
+        // The schema the rows shown were read under, which can be older than the session's
+        // until Refresh, so the grouping choices match the rows.
+        let schema = self.exploration.read(cx).schema(cx);
         let grouping = match &node.kind {
             SceneKind::Hub { key, .. } => self.exploration.read(cx).grouping(&key.group).cloned(),
             _ => None,
