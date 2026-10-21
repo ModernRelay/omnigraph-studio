@@ -577,6 +577,26 @@ pub mod canvas {
     );
 }
 
+pub mod ontology {
+    use gpui::actions;
+
+    actions!(
+        studio_ontology,
+        [
+            /// Back to the type in focus before, or to the domains.
+            Back,
+            /// Show the domains.
+            ShowDomains,
+            /// Point at the next type, or the next relationship of the type in focus.
+            SelectNext,
+            /// Point at the previous type, or the previous relationship of the type in focus.
+            SelectPrevious,
+            /// Bring the type pointed at into focus.
+            Open,
+        ]
+    );
+}
+
 pub mod agent {
     use gpui::{Action, actions};
     use schemars::JsonSchema;

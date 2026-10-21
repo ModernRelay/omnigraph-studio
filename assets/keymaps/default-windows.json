@@ -264,6 +264,15 @@
     }
   },
   {
+    "context": "Ontology",
+    "bindings": {
+      "escape": "studio_ontology::Back",
+      "up": "studio_ontology::SelectPrevious",
+      "down": "studio_ontology::SelectNext",
+      "enter": "studio_ontology::Open"
+    }
+  },
+  {
     "context": "Canvas",
     "bindings": {
       "0": "studio_canvas::FitToWindow",

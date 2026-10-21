@@ -69,25 +69,39 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
     types" (`domains.rs`). Each domain is a card titled by its most related type ("Account and
     17 more"), listing its types with their counts, its footer naming the domains it has most
     relationships with. Cards stand in as many columns as the page holds, each card in the
-    column with least in it. Pointing at a type lights the types it is related to, in every
-    card. Deterministic: a function of the schema alone. Twelve types or fewer are one group.
-  - **A type in focus** (a click on any type): its card in the middle, with its count, its
-    domain, how many relationships reach it and leave it, what the schema says it is (its
-    `@description`, else its `@instruction`; `NodeType::about`), its properties, and Open
-    table, Browse rows and Schema. The relationships that reach it stand on the left, those it
-    reaches on the right (one to itself once, on the right), each a row of the type at the
-    other end and the relationship's name, cut before the type's; past eight a side is
-    grouped by domain, the shared types first. Each row's dashed line runs to an upright
+    column with least in it; the page's width is read as it is laid out, and a new one draws
+    the page again once that frame is done. Pointing at a type selects it and dims the types
+    it is not related to, in every card. Deterministic: a function of the schema alone.
+    Twelve types or fewer are one group.
+  - **A type in focus** (a click on any type): its card in the middle, with its count, what
+    the schema says it is (its `@description`, else its `@instruction`; `NodeType::about`;
+    five lines, the rest behind More), its properties (an enumeration's values below its
+    name, on as many lines as they need), and Open table, Browse rows and Schema; its domain
+    is in the header's path. The relationships that reach it stand on the left, those it
+    reaches on the right (one to itself once, on the right), each side titled with how many
+    it holds, each a row of the type at the other end and the relationship's name: the type
+    takes up to half the row and the name the rest, each cut past that with both whole in
+    the row's tooltip. Past eight a side is grouped by domain, the shared types first. The
+    sides are as wide as the page allows between 240 and 440 px; a page narrower than the
+    three columns (952 px) shows the card, then each side below it, full width up to 640 px,
+    without lines, on the page's edge. Each row's dashed line runs to an upright
     between the side and the card, each end in a ring, as the canvas draws its lines; the
     row pointed at draws its line stronger and shows the relationship's own description. A
-    click on a row brings that type into focus; ← and Esc go back through the types shown,
-    Domains to the domains. The tab reads "Ontology · Type" and comes back with its type in
-    focus (`{"focus": "Type"}`).
+    click on a row brings that type into focus; the back button and Esc
+    (`studio_ontology::Back`) go back through the types shown, Domains (and the palette's
+    `studio_ontology::ShowDomains`) to the domains. A type the schema no longer has (dropped,
+    or renamed by another writer: the page takes another writer's schema at once, as the
+    types list does) leaves the focus and the way back. The tab reads "Ontology · Type" and
+    comes back with its type in focus (`{"focus": "Type"}`).
+  - **Keys** (context `Ontology`): ↑ and ↓ (`SelectPrevious`, `SelectNext`) point at the
+    types in the order the page lists them, or at the type in focus's lines, the side
+    reaching it first, as the pointer does; ↵ (`Open`) brings the type pointed at into focus.
   - **A small schema** (12 types or fewer, 24 relationships or fewer) is drawn whole as a map:
-    each type a card in columns (`layered.rs`), each relationship a dashed right-angle line
-    between their sides, named on its own upright, a type's relationships to itself as
-    brackets over its card; pointing at a type draws its lines stronger, a click brings it
-    into focus.
+    each type a card in columns (`layered.rs`), as wide as its name and count need between
+    140 and 280 px, each relationship a dashed right-angle line between their sides, named on
+    its own upright, a type's relationships to itself as brackets over its card; a line meets
+    a card's side as near its other end as the side allows, so a line level with it runs
+    straight. Pointing at a type draws its lines stronger, a click brings it into focus.
 - **Opened chips** (2026-10-19). A node's chip shows 32 characters of its name, then "…"
   (`CHIP_LABEL_CHARS`); layout always measures that, so opening a chip never moves another.
   Pointing at a cut chip for a moment opens it: its whole name, wrapped at 320 px at zoom 1
@@ -156,6 +170,8 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-20 | Nothing on the ontology page is cut off at any width | `layered` `a_line_meets_a_chip_level_with_its_other_end_where_it_can` and the existing route soundness tests; `ontology` tests; workspace clippy `-D warnings`; design tokens and layers; offscreen snapshots on a third scratch server whose 101 types carry made-up properties and descriptions shaped like a personal graph's (enumerations of up to 20 values, descriptions of up to 600 characters), at 1440 and 1100 px wide, light and dark, a row pointed at; the dev graph's map | Before: at 1100 px the focus view's fixed 1,084 px of columns ran off both edges, cutting the type names on each side, and enumerations ran out of the card. After: at 1440 px the sides take 330 px each; at 1100 px the card stands above the two sides, nothing cut; enumeration values wrap under their property; a 600-character description shows five lines and More; the side titles read "Reach it 14" and "It reaches 10"; the dev map's Contributes line runs straight into Person, where it stepped 5 px |
+| 2026-10-20 | The ontology page is keyed, packs its columns on first draw and drops a type the schema lost | `ontology` `the_keys_walk_the_types_and_their_lines`; `studio` `keymaps` (every action bound or palette-only); workspace clippy `-D warnings`; offscreen snapshots on the 101-type scratch schema: open, ↓↓↓, ↓↓↵, ↓↓↵ Esc | Four columns on the first render, before any pointer; ↓↓↓ selected the third shared type and dimmed the types it is not related to; ↓↓↵ brought the second into focus; Esc returned to the domains |
 | 2026-10-20 | A large ontology reads as domains and one type at a time; a small one as a named map | `graph_canvas` `domains::tests` (cliques around a hub group apart and the hub is shared, every type has one place, a small schema is one group), `ontology::tests` (each relationship once on its side of a type in focus; past twelve types no map), `layered::tests`; `gq_language` `a_type_says_what_it_is`; workspace clippy `-D warnings`; offscreen snapshots on a scratch server holding a 101-type, 555-relationship schema with the structure of a personal graph and made-up names, and on `script/dev-server` | Four shared types and nine domains of 4 to 18 types in four columns; pointing at a type lit the 16 types it is related to; a shared type in focus listed 77 relationships reaching it and 12 it reaches, grouped by domain, long names cut before the type's; the dev graph drawn as three cards with Owns, Contributes, WorksAt and the Knows loop named |
 | 2026-10-20 | The canvas's lines are dashed as interfaces.dev's borders, at right angles, drawn once where they share a stretch | `paint` tests (`lines_turn_at_right_angles`, `lines_along_one_stretch_share_their_dashes`, `overlapping_lines_are_drawn_once_in_their_strongest_tone`); a 1 px dashed border in a local page captured at 2x in the browser pane; offscreen snapshot of Donald Dijkstra's walk | Chrome: 6 device pixels on, 4 off; Studio: 3 px on, 2 off, crisp on the pixel grid; Donald's four relationship pills hang from one upright each side, rings at every end, the top left reading "From Donald Dijkstra · 1 node" |
 | 2026-10-20 | Chips carry interfaces.dev's shadow | Offscreen 2x ontology snapshots on `script/dev-server` (light, pointed, dark) against the site's `x-height` chip at 2x | Out from the top edge, the site reads 240, 238, 239, 246 and Studio 242, 236, 236, 245; from the bottom 234, 231, 235, 245 and 236, 226, 228, 240 (a chip sits at a fractional position, so its ring spreads over three pixels); pointed, the bottom reads 230, 217, 219; dark, the 8 % white ring alone. Before, a chip showed no ring and a broad, soft shadow |
@@ -228,6 +244,15 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   types that name recognisable parts of it (money, work, learning and events, health,
   automation, commerce, investments, equity); grouping three levels deep merged them into
   groups of 23 and 32, so it stops at two.
+- **Ontology cut off (2026-10-20).** The focus view's columns were fixed (300, 72, 340, 72 and
+  300 px) and centred, so on a page narrower than their 1,084 px (a smaller window, or a
+  panel open beside it) both sides ran off the page's edges and their type names were cut
+  (Ragnor: "the ontology nodes are cut off"); an enumeration's values ran out of the card
+  on one line, and a relationship's name had 40 % of a 300 px row. The sides now take the
+  page's width between two bounds and the view stacks below them, enumerations wrap under
+  their property, and type and name share a row half and half. The page's width is read for
+  every view, not only the domains. The map's cards were 180 px whatever their names and
+  could cut one; they are sized to it now.
 - **Canvas lines (2026-10-20).** The explorer's and a query result's lines are dashed 3 on 2
   off, as Chrome draws a 1 px dashed border (measured at 2x: 6 device pixels on, 4 off), and
   turn at right angles: out of a node's side, turning 18 px beyond it (within the narrower of

@@ -285,7 +285,6 @@ pub(crate) struct GraphCanvas {
     /// Set for a canvas of query results; such a canvas never shows the exploration.
     results: Option<(usize, Arc<ResultsData>)>,
     focus_handle: FocusHandle,
-    mode: Mode,
     scene: Arc<Scene>,
     positions: Arc<Vec<Vec2>>,
     /// Half of each node's chip width at zoom 1, as measured for the layout.
@@ -369,7 +368,7 @@ impl Item for GraphCanvas {
     /// The icons of the Graph panel's rows: the canvas is a walk from a node, a query's result
     /// nodes are a map.
     fn tab_icon(&self, _cx: &App) -> Option<IconName> {
-        Some(match self.mode {
+        Some(match self.mode() {
             Mode::Explore => IconName::Crosshair,
             Mode::Results => IconName::GitGraph,
         })
@@ -384,7 +383,7 @@ impl Item for GraphCanvas {
 
     /// The walk from a node is what `OpenCanvas` opens; a query's result nodes are not.
     fn opened_by(&self, action: &dyn gpui::Action, _cx: &App) -> bool {
-        self.mode == Mode::Explore && action.as_any().is::<OpenCanvas>()
+        self.mode() == Mode::Explore && action.as_any().is::<OpenCanvas>()
     }
 
     /// The exploration canvas comes back after a restart; a results canvas is transient.
@@ -405,6 +404,16 @@ impl GraphCanvas {
     fn draws_exploration(&self) -> bool {
         self.results.is_none()
     }
+
+    /// What the canvas draws: a query's result nodes when it was opened with them (whether or
+    /// not they are laid out yet), else the walk from a node.
+    fn mode(&self) -> Mode {
+        if self.results.is_some() {
+            Mode::Results
+        } else {
+            Mode::Explore
+        }
+    }
 }
 
 impl GraphCanvas {
@@ -413,7 +422,7 @@ impl GraphCanvas {
     }
 
     /// The canvas, of `results` when given: built with them, so it lays out only them, not
-    /// the ontology first.
+    /// the exploration first.
     fn build(
         session: Entity<GraphSession>,
         results: Option<(usize, Arc<ResultsData>)>,
@@ -422,8 +431,8 @@ impl GraphCanvas {
         let exploration = Exploration::for_session(&session, cx);
         let subscriptions = vec![
             cx.subscribe(&exploration, |this, _, event, cx| match event {
-                // The ontology and a results canvas draw none of the exploration: only the
-                // tab's mark for newer data and the caption follow it, and nothing is laid out.
+                // A results canvas draws none of the exploration: only the tab's mark for newer
+                // data and the caption follow it, and nothing is laid out.
                 ExplorationEvent::Changed | ExplorationEvent::Loaded
                     if !this.draws_exploration() =>
                 {
@@ -449,7 +458,7 @@ impl GraphCanvas {
                         }));
                     }
                 }
-                // The ontology and a results canvas keep their own selection.
+                // A results canvas keeps its own selection.
                 ExplorationEvent::SelectionChanged => {
                     if this.draws_exploration() {
                         this.follow_selection(cx);
@@ -468,7 +477,6 @@ impl GraphCanvas {
             exploration,
             results,
             focus_handle: cx.focus_handle(),
-            mode: Mode::Explore,
             scene: Arc::default(),
             positions: Arc::default(),
             half_widths: Arc::default(),
@@ -603,7 +611,6 @@ impl GraphCanvas {
             self.fit_pending = true;
             self.layout_key = Some(key);
         }
-        self.mode = Mode::Explore;
         self.layout_generation += 1;
         // Chips being dragged are laid out from where they are now, so what opens on
         // them meanwhile grows from there.
@@ -719,7 +726,6 @@ impl GraphCanvas {
             self.fit_pending = true;
         }
         self.layout_key = Some((Mode::Results, None));
-        self.mode = Mode::Results;
         self.layout_generation += 1;
         self.lay_out(scene, widths, move || layout::explore_positions(&nodes), cx);
     }
@@ -891,7 +897,7 @@ impl GraphCanvas {
         let height = f32::from(viewport.size.height).max(1.);
         let zoom = ((width - 80.) / (max.x - min.x).max(1.))
             .min((height - 120.) / (max.y - min.y).max(1.))
-            // A fit never zooms the ontology past 1.1.
+            // A fit never zooms a small walk past 1.1.
             .clamp(0.05, 1.1);
         self.zoom = zoom;
         self.fit_zoom = zoom;
@@ -1491,7 +1497,7 @@ impl GraphCanvas {
         let this = cx.entity().downgrade();
         let node = self.scene.nodes[index].clone();
         let pinned = pin_key(&node.id).is_some_and(|key| self.pinned.contains_key(&key));
-        let exploring = self.mode == Mode::Explore;
+        let exploring = self.mode() == Mode::Explore;
         let schema = self.session.read(cx).schema_model();
         let grouping = match &node.kind {
             SceneKind::Hub { key, .. } => self.exploration.read(cx).grouping(&key.group).cloned(),
@@ -1684,7 +1690,7 @@ impl GraphCanvas {
         let any_pinned = marked
             .iter()
             .any(|id| pin_key(id).is_some_and(|key| self.pinned.contains_key(&key)));
-        let exploring = self.mode == Mode::Explore;
+        let exploring = self.mode() == Mode::Explore;
         ContextMenu::build(window, cx, move |menu, _, _| {
             let ids = marked.clone();
             menu.header(format!("{count} selected"))
@@ -2075,7 +2081,7 @@ impl GraphCanvas {
                     }),
             )
             .child(studio_ui::ds::text::muted(
-                "or press G on a row in any table, or click a type in the ontology to pick one",
+                "or press G on a row in any table",
             ))
             .into_any_element()
     }
@@ -2108,7 +2114,7 @@ impl GraphCanvas {
         let exploration = self.exploration.read(cx);
         let state = exploration.state();
         let newer = exploration.newer_available();
-        let summary = match self.mode {
+        let summary = match self.mode() {
             Mode::Results => {
                 let count = self.scene.nodes.len();
                 let noun = if count == 1 { "node" } else { "nodes" };
@@ -2134,7 +2140,7 @@ impl GraphCanvas {
                 format!("From {root} · {nodes} {noun}")
             }
         };
-        let root_error = match (&state.root_status, self.mode) {
+        let root_error = match (&state.root_status, self.mode()) {
             (Loadable::Failed(message), Mode::Explore) => Some(message.clone()),
             _ => None,
         };
@@ -2144,7 +2150,7 @@ impl GraphCanvas {
         // floating controls (what is drawn, search and zoom) read as one family, each
         // concentric around what it holds.
         let panel = |id: &'static str| studio_ui::ds::float_bar(id, cx);
-        let mode = self.mode;
+        let mode = self.mode();
         v_flex()
             .absolute()
             .top(px(space::MD))
@@ -2406,12 +2412,12 @@ impl Render for GraphCanvas {
                     .into_any_element(),
             ),
             Loadable::Loaded(_)
-                if self.mode == Mode::Explore && self.exploration.read(cx).root().is_none() =>
+                if self.mode() == Mode::Explore && self.exploration.read(cx).root().is_none() =>
             {
                 Some(self.render_explore_start(cx))
             }
             Loadable::Loaded(_) if self.scene.nodes.is_empty() => Some(
-                match self.mode {
+                match self.mode() {
                     Mode::Explore => studio_ui::ds::loading_state("Laying out…"),
                     Mode::Results => {
                         studio_ui::ds::empty_state(IconName::Hash, "No nodes in the result")

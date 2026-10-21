@@ -255,31 +255,22 @@ pub(crate) fn paint(
         .collect();
 
     // Each line as right-angle pieces, with its tone: out of the node it hangs from, turning
-    // near it, so a column of neighbours shares one upright.
+    // near it, so a column of neighbours shares one upright. A scene has no edge from a node to
+    // itself (a node is drawn once, and a result's row joins distinct nodes).
     let mut drawn: Vec<(usize, Vec<Point<Pixels>>, Tone)> = Vec::new();
-    let mut loop_rank: HashMap<usize, usize> = HashMap::new();
     for (index, edge) in scene.edges.iter().enumerate() {
         let tone = line_tone(scene, edge.from, edge.to, hovered, selected);
-        let points = if edge.from == edge.to {
-            let rank = loop_rank.entry(edge.from).or_default();
-            *rank += 1;
-            if mark_only(edge.from) {
-                continue;
-            }
-            loop_points(screen[edge.from], reach[edge.from], scale, *rank - 1)
+        let from_is_parent = scene.nodes[edge.from].parent != Some(edge.to);
+        let (parent, child) = if from_is_parent {
+            (edge.from, edge.to)
         } else {
-            let from_is_parent = scene.nodes[edge.from].parent != Some(edge.to);
-            let (parent, child) = if from_is_parent {
-                (edge.from, edge.to)
-            } else {
-                (edge.to, edge.from)
-            };
-            elbow(
-                (screen[parent], reach[parent]),
-                (screen[child], reach[child]),
-                ELBOW * zoom,
-            )
+            (edge.to, edge.from)
         };
+        let points = elbow(
+            (screen[parent], reach[parent]),
+            (screen[child], reach[child]),
+            ELBOW * zoom,
+        );
         if !crosses(&points, bounds, 40.) {
             continue;
         }
@@ -287,12 +278,11 @@ pub(crate) fn paint(
     }
     window.paint_layer(bounds, |window| {
         paint_runs(&drawn, bounds, lines.origin, palette.text, window);
-        // Each line end's ring, once where ends meet, in its strongest tone; none at a mark,
-        // nor at a loop's feet, which rings would crowd.
+        // Each line end's ring, once where ends meet, in its strongest tone; none at a mark.
         let mut rings: BTreeMap<(i64, i64), (Point<Pixels>, u16)> = BTreeMap::new();
         for (index, points, tone) in &drawn {
             let edge = &scene.edges[*index];
-            if edge.from == edge.to || points.len() < 2 {
+            if points.len() < 2 {
                 continue;
             }
             // Drawn from the node a line hangs from to the other.

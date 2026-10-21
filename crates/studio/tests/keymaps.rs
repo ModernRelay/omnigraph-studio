@@ -30,7 +30,7 @@ const KEYMAPS: [(&str, &str); 3] = [
 
 /// The actions without a default key, as in Zed: rare, or destructive enough that a key would
 /// be reached by accident. Each is in the command palette, and most in a menu as well.
-const PALETTE_ONLY: [&str; 16] = [
+const PALETTE_ONLY: [&str; 17] = [
     "studio::RevealLog",
     "studio::OpenDesignSystem",
     "studio::SplitLeft",
@@ -47,6 +47,7 @@ const PALETTE_ONLY: [&str; 16] = [
     "studio_agent::ClearQueue",
     "studio_agent::Restart",
     "studio_agent::ShowConversations",
+    "studio_ontology::ShowDomains",
 ];
 
 /// The platform's command modifier, as keymaps write it.

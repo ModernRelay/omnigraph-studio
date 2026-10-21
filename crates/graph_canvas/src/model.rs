@@ -55,9 +55,6 @@ pub struct SceneNode {
 pub struct SceneEdge {
     pub from: usize,
     pub to: usize,
-    pub color_key: String,
-    /// Drawn with an arrowhead and a label (the schema view and single-target fields).
-    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -147,8 +144,6 @@ pub fn results_scene(
         .map(|(from, to)| SceneEdge {
             from: *from,
             to: *to,
-            color_key: scene_nodes[*to].color_key.clone(),
-            label: None,
         })
         .collect();
     let capped = (capped > 0).then(|| {
@@ -426,7 +421,7 @@ pub fn explore_scene(
         .filter(|ix| matches!(scene.nodes[*ix].kind, SceneKind::Hub { open: true, .. }))
         .collect();
     let mut drawn_from: HashMap<usize, u64> = HashMap::new();
-    for edge in scene.edges.iter().filter(|edge| edge.label.is_none()) {
+    for edge in &scene.edges {
         *drawn_from.entry(edge.from).or_default() += 1;
     }
     for hub in hubs {
@@ -507,21 +502,10 @@ fn hub_limit(hub: &SceneNode, limits: &HashMap<GroupKey, usize>) -> usize {
     }
 }
 
-/// An unlabelled edge, in the color of the relationship: the hub's, whichever end it is.
+/// An edge, once.
 fn push_edge(scene: &mut Scene, lines: &mut HashSet<(usize, usize)>, from: usize, to: usize) {
-    let hub_end = if matches!(scene.nodes[to].kind, SceneKind::Hub { .. }) {
-        to
-    } else {
-        from
-    };
-    let color_key = scene.nodes[hub_end].color_key.clone();
     if lines.insert((from, to)) {
-        scene.edges.push(SceneEdge {
-            from,
-            to,
-            color_key,
-            label: None,
-        });
+        scene.edges.push(SceneEdge { from, to });
     }
 }
 

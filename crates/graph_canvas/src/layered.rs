@@ -214,8 +214,9 @@ pub fn layered(half_widths: &[f32], links: &[Link]) -> Layered {
                 .total_cmp(&y[segments[t].b])
                 .then(segments[s].link.cmp(&segments[t].link))
         });
-        for (k, offset) in port_offsets(out.len()).into_iter().enumerate() {
-            port_start[out[k]] = y[e] + offset;
+        let toward: Vec<f32> = out.iter().map(|&s| y[segments[s].b]).collect();
+        for (k, at) in ports(y[e], &toward).into_iter().enumerate() {
+            port_start[out[k]] = at;
         }
         let mut into = arriving[e].clone();
         into.sort_by(|&s, &t| {
@@ -223,8 +224,9 @@ pub fn layered(half_widths: &[f32], links: &[Link]) -> Layered {
                 .total_cmp(&y[segments[t].a])
                 .then(segments[s].link.cmp(&segments[t].link))
         });
-        for (k, offset) in port_offsets(into.len()).into_iter().enumerate() {
-            port_end[into[k]] = y[e] + offset;
+        let toward: Vec<f32> = into.iter().map(|&s| y[segments[s].a]).collect();
+        for (k, at) in ports(y[e], &toward).into_iter().enumerate() {
+            port_end[into[k]] = at;
         }
     }
 
@@ -825,15 +827,36 @@ fn order_tracks(uprights: &[Upright]) -> Vec<usize> {
     order
 }
 
-/// Where `count` named lines meet one side of a chip, around its middle.
-fn port_offsets(count: usize) -> Vec<f32> {
-    if count < 2 {
-        return vec![0.; count];
+/// Where named lines meet one side of a chip whose middle is at `centre`, in the order of
+/// `toward`, where their other ends are: each as near its other end as the side allows, within
+/// [`PORT_SPREAD`] of the middle, and [`PORT_STEP`] apart or as far as the side has room for, so
+/// a line whose other end is level with the side runs straight into it rather than stepping.
+fn ports(centre: f32, toward: &[f32]) -> Vec<f32> {
+    let count = toward.len();
+    let step = match count {
+        0 | 1 => 0.,
+        _ => PORT_STEP.min(2. * PORT_SPREAD / (count - 1) as f32),
+    };
+    let mut at: Vec<f32> = toward
+        .iter()
+        .map(|y| (y - centre).clamp(-PORT_SPREAD, PORT_SPREAD))
+        .collect();
+    // Apart going down, then back within the side going up, then within it going down; the
+    // steps fit in the side, so the last pass moves nothing out of it.
+    for k in 1..count {
+        at[k] = at[k].max(at[k - 1] + step);
     }
-    let step = PORT_STEP.min(2. * PORT_SPREAD / (count - 1) as f32);
-    (0..count)
-        .map(|k| (k as f32 - (count - 1) as f32 / 2.) * step)
-        .collect()
+    for k in (0..count).rev() {
+        let below = at.get(k + 1).map_or(PORT_SPREAD, |next| next - step);
+        at[k] = at[k].min(below);
+    }
+    for k in 0..count {
+        let above = k
+            .checked_sub(1)
+            .map_or(-PORT_SPREAD, |prev| at[prev] + step);
+        at[k] = at[k].max(above);
+    }
+    at.into_iter().map(|offset| centre + offset).collect()
 }
 
 /// A route without repeated points or straight-through bends.
@@ -1002,6 +1025,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A line meets a chip's side as near its other end as the side allows, so one whose other
+    /// end is level with the side runs straight; crowded ports keep their order, apart and on
+    /// the side.
+    #[test]
+    fn a_line_meets_a_chip_level_with_its_other_end_where_it_can() {
+        assert_eq!(ports(100., &[60., 108.]), vec![90., 108.]);
+        assert_eq!(ports(0., &[3.]), vec![3.]);
+        let crowded = ports(0., &[0.; 5]);
+        assert!(crowded.windows(2).all(|w| w[1] - w[0] >= 5. - 0.01));
+        assert!(crowded.iter().all(|p| p.abs() <= PORT_SPREAD + 0.01));
     }
 
     #[test]
