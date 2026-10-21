@@ -4,7 +4,7 @@ use std::ops::Range;
 use std::time::Duration;
 
 use gpui::{Context, Entity, Render, Subscription, Task, WeakEntity, Window, uniform_list};
-use graph_store::{GraphSession, OutcomeEntry, OutcomeKind, SessionEvent};
+use graph_store::{GraphSession, HeldAs, OutcomeEntry, OutcomeKind, SessionEvent};
 use studio_workspace::{Workspace, WorkspaceEvent};
 use ui::prelude::*;
 
@@ -133,54 +133,103 @@ impl Render for ActivityLog {
     }
 }
 
-/// One write in the feed, after the reference frames: a status dot, what was written
-/// (underlined), where it went, and when; refusals and unknown outcomes keep their reason in a
-/// tooltip.
-fn activity_row(index: usize, entry: &OutcomeEntry) -> studio_ui::ds::ActivityRow {
-    let (status, verb, tooltip) = match &entry.outcome {
-        OutcomeKind::Committed { commit } => (
-            studio_ui::ds::Status::Done,
-            "committed",
-            commit
+/// What one write's row says of its outcome: the verb, the commit it names in the line (a held
+/// one's, which is on no branch), the branch it went to with its preposition, or none when it is
+/// on no branch, and the tooltip.
+#[derive(Debug, PartialEq)]
+struct Said {
+    status: studio_ui::ds::Status,
+    verb: &'static str,
+    commit: Option<String>,
+    place: Option<(&'static str, String)>,
+    tooltip: Option<String>,
+}
+
+/// What a write's outcome is said to be (constitution III): committed to its branch only when
+/// a commit moved it; a proposal held as its commit, which publishes to the branch it was made
+/// for; a snapshot saved as its commit, on no branch; refused or unknown with their reason.
+fn said(entry: &OutcomeEntry) -> Said {
+    let branch = entry.branch.clone();
+    match &entry.outcome {
+        OutcomeKind::Committed { commit } => Said {
+            status: studio_ui::ds::Status::Done,
+            verb: "committed",
+            commit: None,
+            place: Some(("to", branch)),
+            tooltip: commit
                 .as_deref()
                 .filter(|id| !id.is_empty())
                 .map(|id| format!("Commit {id}")),
-        ),
-        OutcomeKind::Refused { message } => (
-            studio_ui::ds::Status::Failed,
-            "was refused",
-            Some(format!("Nothing was written: {message}")),
-        ),
-        OutcomeKind::Unknown { reason } => (
-            studio_ui::ds::Status::Running,
-            "has an unknown outcome",
-            Some(format!("{reason}. Check History before trying again.")),
-        ),
-    };
+        },
+        OutcomeKind::Held {
+            commit,
+            held: HeldAs::Proposal,
+        } => Said {
+            status: studio_ui::ds::Status::Done,
+            verb: "was held as commit",
+            commit: Some(studio_ui::short_commit_id(commit)),
+            place: Some(("to publish to", branch.clone())),
+            tooltip: Some(format!(
+                "Commit {commit}, on no branch: {branch} did not change. `commit publish \
+                 \"{commit}\"` puts it there; `commit drop \"{commit}\"` drops it."
+            )),
+        },
+        OutcomeKind::Held {
+            commit,
+            held: HeldAs::Snapshot,
+        } => Said {
+            status: studio_ui::ds::Status::Done,
+            verb: "was saved as snapshot",
+            commit: Some(studio_ui::short_commit_id(commit)),
+            place: None,
+            tooltip: Some(format!(
+                "Snapshot {commit}, on no branch: no branch changed. Read it by its id; it never \
+                 publishes."
+            )),
+        },
+        OutcomeKind::Refused { message } => Said {
+            status: studio_ui::ds::Status::Failed,
+            verb: "was refused",
+            commit: None,
+            place: Some(("on", branch)),
+            tooltip: Some(format!("Nothing was written: {message}")),
+        },
+        OutcomeKind::Unknown { reason } => Said {
+            status: studio_ui::ds::Status::Running,
+            verb: "has an unknown outcome",
+            commit: None,
+            place: Some(("on", branch)),
+            tooltip: Some(format!("{reason}. Check History before trying again.")),
+        },
+    }
+}
+
+/// One write in the feed, after the reference frames: a status dot, what was written, the
+/// commit a held write is (underlined), where it went, and when; the tooltip has the commit in
+/// full, or a refusal's or an unknown outcome's reason.
+fn activity_row(index: usize, entry: &OutcomeEntry) -> studio_ui::ds::ActivityRow {
+    let said = said(entry);
     // As every other time in Studio reads.
     let at = entry
         .at
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_micros() as i64);
     let when = studio_ui::relative_time(at, studio_ui::now_micros());
-    let row = studio_ui::ds::ActivityRow::new(
+    let mut row = studio_ui::ds::ActivityRow::new(
         ("activity", index),
         IconName::Pencil,
         entry.description.clone(),
-        verb,
+        said.verb,
         when,
     )
-    .status(status)
-    .place(
-        if matches!(entry.outcome, OutcomeKind::Committed { .. }) {
-            "to"
-        } else {
-            "on"
-        },
-        IconName::GitBranch,
-        entry.branch.clone(),
-    );
-    match tooltip {
+    .status(said.status);
+    if let Some(commit) = said.commit {
+        row = row.object(commit);
+    }
+    if let Some((preposition, branch)) = said.place {
+        row = row.place(preposition, IconName::GitBranch, branch);
+    }
+    match said.tooltip {
         Some(tooltip) => row.tooltip(tooltip),
         None => row,
     }
@@ -192,6 +241,52 @@ mod tests {
     use graph_store::OutcomeKind;
 
     use super::*;
+
+    /// A write held off every branch says what it is, with its commit, and never that it was
+    /// committed to the branch it was sent to: a proposal is held to publish to it, a snapshot
+    /// is on no branch. A committed write goes to its branch.
+    #[test]
+    fn a_held_write_says_it_is_on_no_branch() {
+        let entry = |outcome: OutcomeKind| OutcomeEntry {
+            at: std::time::SystemTime::UNIX_EPOCH,
+            branch: "main".into(),
+            description: "add".into(),
+            outcome,
+            follow_up: None,
+        };
+        let proposal = said(&entry(OutcomeKind::Held {
+            commit: "01JPROPOSALAA".into(),
+            held: HeldAs::Proposal,
+        }));
+        assert_eq!(proposal.verb, "was held as commit");
+        assert_eq!(proposal.commit.as_deref(), Some("OPOSALAA"), "its short id");
+        assert_eq!(
+            proposal.place,
+            Some(("to publish to", "main".to_owned())),
+            "named as the branch it publishes to, not one it changed"
+        );
+        let tooltip = proposal.tooltip.unwrap();
+        assert!(tooltip.contains("on no branch"), "{tooltip}");
+        assert!(
+            tooltip.contains("commit publish \"01JPROPOSALAA\""),
+            "{tooltip}"
+        );
+
+        let snapshot = said(&entry(OutcomeKind::Held {
+            commit: "01JSNAPSHOTAA".into(),
+            held: HeldAs::Snapshot,
+        }));
+        assert_eq!(snapshot.verb, "was saved as snapshot");
+        assert_eq!(snapshot.commit.as_deref(), Some("APSHOTAA"));
+        assert_eq!(snapshot.place, None, "on no branch");
+
+        let committed = said(&entry(OutcomeKind::Committed {
+            commit: Some("c2".into()),
+        }));
+        assert_eq!(committed.verb, "committed");
+        assert_eq!(committed.place, Some(("to", "main".to_owned())));
+        assert_eq!(committed.commit, None);
+    }
 
     /// The log draws again when a write's outcome is logged, and not when a read starts or
     /// ends: every read the window sends raises the same event.

@@ -41,10 +41,15 @@ from Zed with notices).
   held off every branch names what it is in the branch's place ("Unpublished, on no branch
   until published to main", "Unattached snapshot, on no branch"), and a commit still being read
   names no branch until its kind is known (since 2026-10-21). The graph's first commit has no
-  parent, so the server cannot compare it (a 409, `parentless_commit`): its changes are never
-  asked for, its row reads "first commit" in the changes column, and its detail says it is the
-  graph's first commit; a commit opened in its own tab waits for its own read before asking
-  for changes, since it may be that one.
+  parent, so the server cannot compare it (a 409, `parentless_commit`): listed, its changes
+  are never asked for, its row reads "first commit" in the changes column, and its detail says
+  it is the graph's first commit. History opens the commits it lists in their own tabs with
+  the commit as listed (a click in the panel, a double click, ↵, the row menu's "Open in a
+  tab"), which is not read again. A commit named by its id alone (a restored tab, a toast's
+  "View commit", a parent link) asks for its changes beside its own read, not after it, and
+  the server's `parentless_commit` refusal shows it as the first (since 2026-10-21; before, it
+  waited for its own read, a round trip more on every commit tab). A commit tab's "Load more
+  changes", and "Try again" after a read of them failed, is ⌘⌥N (`LoadMoreChanges`).
 - Search by id prefix or actor with an i/N counter; ↵ and ⇧↵ step through the matches, and
   typing in the field never moves the selection.
 - Any commit can open a type table or query editor pinned to it (read-only chip): the commit
@@ -59,7 +64,11 @@ from Zed with notices).
   answers for the head the first page resolved (`head_commit_id`), so the pages stay one
   history while the branch moves. A commit landing on the branch reads the first page again:
   when it reaches the head the pages were read from, the new commits go on top and the pages
-  read stay, else it replaces them. A server that pages no history answers the whole list,
+  read stay, else it replaces them. The rows being read stay where they are: a list scrolled
+  down scrolls by the rows that came above its top row (merged-in commits read since
+  included), and one at its top shows the new commits there (since 2026-10-21). The toolbar's
+  counts are grouped ("12,480 commits so far · 1,200 merged in"), and ⌘R reads the history
+  again as its refresh button does, which shows the key. A server that pages no history answers the whole list,
   read as one page. When a later page fails, the list's last row says why and offers Try
   again, which reads the listing from its first page when the server refused the page's
   continuation. Search finds the commits read so far, and a page read finds them again.
@@ -72,9 +81,9 @@ from Zed with notices).
   (`NewBranchHere`) does the same for the selected commit in the list, the panel and a
   commit's tab. Each dispatches `CreateBranchAt`, which opens spec 008's new-branch dialog
   started at that commit. A proposal or an unattached snapshot (`kind` other than
-  `published`) offers none of them, and the key is not available there. A commit opened in
-  its own tab reads itself by id once (`GET /commits/{id}`) for its kind and branch; one
-  listed beside History is not read again.
+  `published`) offers none of them, and the key is not available there. A commit named by its
+  id alone reads itself by id once (`GET /commits/{id}`) for its kind and branch; one History
+  lists, beside it or in its own tab, is not read again.
 
 Other branches' tags come from each branch's newest commit, read alone (a page of one) and
 kept by the session until a commit lands on that branch (spec 003), for up to 20 branches; a
@@ -126,10 +135,18 @@ away are dropped.
 | 2026-10-20 | A deleted branch's commits by id | OmniGraph `GraphCoordinator::resolve_commit` at `0a62bb7` (source read) | `GET /commits/{id}` serves them once they have moved into the graph's `__history`; its latest commits, still buffered in the branch's retired `__manifest`, answer 404 and draw as stubs |
 | 2026-10-20 | "New branch here" is offered only at a published commit | `history` tests `new_branch_here_is_offered_only_at_a_published_commit` (the selected row's key and the row menu, over published, unpublished and unattached commits) and `a_branch_starts_here_only_at_a_published_commit` (a commit's own tab reads its kind; a listed one is not read), against the `Served` fake and a fake sending the contract header | Pass: only the published commit makes the key available, shows the menu entry and starts `CreateBranchAt` |
 | 2026-10-21 | A held commit's view names what it is, not main | `history` `a_branch_starts_here_only_at_a_published_commit`, extended: own tabs of a published, an unpublished and an unattached commit, each read by id, and `branch_fact` for a commit still being read and for one that could not be read | Before (found in the running app on the edge server, after a write `as commit`), the meta line showed "main", the cause's `authored_branch`. Now: published, "main"; unpublished, "Unpublished, on no branch until published to main"; unattached, "Unattached snapshot, on no branch"; still being read, no branch; unreadable, the cause's branch. Not yet seen in the running app |
+| 2026-10-21 | A commit tab makes no read wait for another | `history` `a_commit_named_by_its_id_reads_its_changes_at_once` (the commit by id held 5 s of the test clock, its changes answered at once; the first commit `c0` refused with `change_diff_refusal.reason: parentless_commit`, as `omnigraph-server` `commit_changes_parentless_commit_is_typed_409` at `7fd9cc9` answers), `a_listed_commit_opens_its_tab_without_reading_itself` (in a workspace's window: no `/commits/c7`, one `/commits/c7/changes`), `a_branch_starts_here_only_at_a_published_commit` (the first commit listed asks nothing, in its own tab once); `graph_client` `a_refused_commit_comparison_names_its_reason` | Before, `load_more` waited for `GET /commits/{id}`, so every History click (each opens a tab), toast "View commit", parent link and restored tab made two reads in turn, and `OpenCommit` dropped the commit History held. Now c9's changes are in while its own read is out, c0 shows "The graph's first commit" from the refusal while its own read is out, and a listed commit is not read again. Not yet seen in the running app |
+| 2026-10-21 | The rows being read stay where they are when a commit lands | `history` `a_commit_landing_on_the_branch_keeps_the_pages_read`, extended: scrolled to row 50 (m399 at the top), m450 lands; then at the top, m451 lands | Before, `take` put the new rows on top with no scroll adjustment, moving m399 down a row under the reader. Now the offset moves by the row that came above, m399 stays at the top of the rows shown (row 51); at the top, m451 shows there |
+| 2026-10-21 | ⌘R refreshes History, and a commit tab's Load more has a key | `history` `merged_in_commits_are_read_by_their_ids` (⌘R dispatched as `studio::Refresh` with the view focused: the first page and the missing merged parent read again); `studio` `keymaps` (`studio_history::LoadMoreChanges` bound on every platform, ⌘⌥N / Ctrl+Alt+N in `CommitView`) | Before, nothing in History handled `Refresh`, so ⌘R went to the workspace and "Newer data" stayed; the refresh button showed no key, and Load more and Try again had no action |
+| 2026-10-21 | The toolbar's counts are grouped | `history` `the_summary_groups_its_counts` | "12,480 commits so far · 1,200 merged in"; before, "12480 commits" |
 | 2026-10-21 | The graph's first commit is named, and its changes never asked for | `history` `the_first_commits_changes_are_never_asked_for` (a three-commit chain, row counts read for every row) and `a_branch_starts_here_only_at_a_published_commit` (the first commit listed and in its own tab) | Before (found in the running app on the edge server), each History open sent `/commits/{root}/changes` and the server answered 409; the row showed nothing and the detail an error. Now no `/commits/m0/changes` is sent, the row reads "first commit", and both views are in their `First` state: "The graph's first commit", with no read. Not yet seen in the running app |
 
 ## Corrections
 
+- 2026-10-21: a commit opened in its own tab without its listing no longer waits for its own
+  read before asking for its changes, which the row "The graph's first commit is named" below
+  had it do: it asks for both at once, and the server's `parentless_commit` refusal names the
+  graph's first commit (Design).
 - 2026-10-12: lanes are a fresh implementation of the idea in Zed's `GraphData::add_commits`, not a
   fork: each row records the lines through it, ending at its commit and leaving it, so every
   row of the virtualized list draws itself with a `canvas`. The property tests are Studio's own.

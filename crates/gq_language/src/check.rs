@@ -148,18 +148,29 @@ pub fn statement_publication(source: &str) -> Publication {
     }
 }
 
-/// Where the declaration `name` in `source` puts what it writes, read from its parse alone, for
-/// a source checked against no schema yet; [`QueryInfo::publication`] says the same once it is.
-/// [`Publication::Branch`] for text that does not parse or holds no such declaration.
-pub fn declared_publication(source: &str, name: &str) -> Publication {
+/// What the declaration `name` in `source` does with what it writes, read from its parse alone:
+/// where its result goes, and what it destroys that Studio cannot put back.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeclaredWrite {
+    pub publication: Publication,
+    pub destroys: Option<Destroys>,
+}
+
+/// [`DeclaredWrite`] for the declaration `name` in `source`, for a source checked against no
+/// schema yet: neither needs the schema, so a destructive write waits for its name typed
+/// whether the schema is loaded or not. [`QueryInfo::publication`] and [`QueryInfo::destroys`]
+/// say the same once it is checked. Text that does not parse, or holds no such declaration,
+/// publishes on its branch and destroys nothing; the server refuses it before it writes.
+pub fn declared_write(source: &str, name: &str) -> DeclaredWrite {
     match parse_query_diagnostic(source).map(|file| file.body) {
-        Ok(FileBody::Queries(decls)) => decls
-            .iter()
-            .find(|decl| decl.name == name)
-            .map_or(Publication::Branch, |decl| {
-                Publication::of(&decl.write_mode)
-            }),
-        _ => Publication::Branch,
+        Ok(FileBody::Queries(decls)) => decls.iter().find(|decl| decl.name == name).map_or_else(
+            DeclaredWrite::default,
+            |decl| DeclaredWrite {
+                publication: Publication::of(&decl.write_mode),
+                destroys: deletes(decl),
+            },
+        ),
+        _ => DeclaredWrite::default(),
     }
 }
 
@@ -452,11 +463,15 @@ mod tests {
         ] {
             let checked = check(&dev(), source);
             assert_eq!(checked.queries[0].publication, publication, "{source}");
-            assert_eq!(declared_publication(source, "q"), publication, "{source}");
+            assert_eq!(
+                declared_write(source, "q").publication,
+                publication,
+                "{source}"
+            );
         }
         assert_eq!(
-            declared_publication("query q() as commit { insert Person { slug: \"a\" } }", "r"),
-            Publication::Branch,
+            declared_write("query q() as commit { insert Person { slug: \"a\" } }", "r"),
+            DeclaredWrite::default(),
             "no such declaration"
         );
         for (source, publication) in [
@@ -513,15 +528,26 @@ mod tests {
             "query purge($s: String) {\n  delete Person where slug = $s\n  delete Company where slug = $s\n  delete Person where name = $s\n}",
         );
         assert!(deletes.diagnostics.is_empty(), "{:?}", deletes.diagnostics);
-        assert_eq!(
-            deletes.queries[0].destroys,
-            Some(Destroys::Rows(vec!["Person".into(), "Company".into()]))
-        );
+        let rows = Some(Destroys::Rows(vec!["Person".into(), "Company".into()]));
+        assert_eq!(deletes.queries[0].destroys, rows);
+        // Read from the parse alone, as for a source no schema has checked yet: the same.
+        let purge = "query purge($s: String) {\n  delete Person where slug = $s\n  delete Company where slug = $s\n  delete Person where name = $s\n}";
+        assert_eq!(declared_write(purge, "purge").destroys, rows);
         let proposed = check(
             &dev(),
             "query purge($s: String) as commit {\n  delete Person where slug = $s\n}",
         );
         assert_eq!(proposed.queries[0].destroys, None);
+        assert_eq!(
+            declared_write(
+                "query purge($s: String) as commit {\n  delete Person where slug = $s\n}",
+                "purge"
+            ),
+            DeclaredWrite {
+                publication: Publication::Held,
+                destroys: None
+            }
+        );
         let insert = check(
             &dev(),
             "query add($s: String) {\n  insert Company { slug: $s, name: $s }\n}",

@@ -35,6 +35,7 @@ use studio_actions::tree::{
     ClearFilter, Collapse, CollapseAll, Expand, ExpandAll, OpenPage, OpenSelected, OpenTable,
     PeekSelected, RerootHere, SelectNext, SelectPrevious, ShowOnCanvas, ToggleEmptyGroups,
 };
+use studio_actions::workspace::Refresh;
 use studio_ui::ds::space;
 use studio_ui::menu::ContextMenu;
 use studio_ui::type_swatch;
@@ -1209,9 +1210,17 @@ impl RelationshipTree {
                     d.child(
                         studio_ui::ds::row_button("newer", "Newer data · Refresh")
                             .style(ButtonStyle::Tinted(ui::TintColor::Accent))
-                            .tooltip(Tooltip::text(
-                                "The branch moved since this tree was read. Refresh reads it again.",
-                            ))
+                            .tooltip({
+                                let focus = self.focus_handle.clone();
+                                move |_, cx| {
+                                    Tooltip::for_action_in(
+                                        "The branch moved since this tree was read. Refresh reads it again.",
+                                        &Refresh,
+                                        &focus,
+                                        cx,
+                                    )
+                                }
+                            })
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.with_exploration(cx, |e, cx| e.refresh(cx));
                             })),
@@ -1382,6 +1391,12 @@ impl Render for RelationshipTree {
             .on_action(cx.listener(Self::open_table))
             .on_action(cx.listener(Self::open_page))
             .on_action(cx.listener(Self::toggle_empty_groups))
+            // ⌘R reads the tree again at the branch head, as its Newer data button does, and
+            // goes on to the workspace, which reads the graph's schema, branches and counts.
+            .on_action(cx.listener(|this, _: &Refresh, _, cx| {
+                this.with_exploration(cx, |exploration, cx| exploration.refresh(cx));
+                cx.propagate();
+            }))
             .on_key_down(cx.listener(Self::key_down));
 
         let has_root = self
@@ -1606,6 +1621,64 @@ mod tests {
                     .child(self.tree.clone()),
             )
         }
+    }
+
+    /// ⌘R where the tree has the keyboard reads it again at the branch head, as its "Newer
+    /// data · Refresh" does, and takes the offer down.
+    #[gpui::test]
+    async fn cmd_r_reads_the_tree_again(cx: &mut gpui::TestAppContext) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        cx.update(studio_theme::init_test);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted = reads.clone();
+        let (session, served) = followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\n",
+            move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                serde_json::json!([{ "id": "p1", "label": "Ada", "n": 0 }])
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        let shown = session.clone();
+        let (dock, cx) = cx.add_window_view(move |window, cx| {
+            let workspace = cx.new(|cx| Workspace::new(window, cx));
+            let tree =
+                cx.new(|cx| RelationshipTree::new(&workspace, Some(shown.clone()), window, cx));
+            Dock {
+                tree,
+                _workspace: workspace,
+            }
+        });
+        let exploration = cx.update(|_, cx| Exploration::for_session(&session, cx));
+        exploration.update(cx, |exploration, cx| {
+            exploration.root_at(NodeRef::new("Person", "p1"), cx)
+        });
+        let settle = |cx: &mut gpui::VisualTestContext| {
+            for _ in 0..3 {
+                cx.run_until_parked();
+                cx.executor()
+                    .advance_clock(std::time::Duration::from_millis(10));
+            }
+            cx.run_until_parked();
+        };
+        settle(cx);
+        // Another writer changes the root: the tree offers the newer data.
+        served.lock().unwrap().commit(
+            "c2",
+            vec![graph_store::test_server::node_change("Person", "p1")],
+        );
+        session.update(cx, |session, cx| session.check_heads(cx));
+        settle(cx);
+        assert!(exploration.read_with(cx, |exploration, _| exploration.newer_available()));
+        let before = reads.load(Ordering::SeqCst);
+        let tree = dock.read_with(cx, |dock, _| dock.tree.clone());
+        cx.update(|window, cx| window.focus(&tree.focus_handle(cx), cx));
+        cx.dispatch_action(Refresh);
+        settle(cx);
+        assert!(reads.load(Ordering::SeqCst) > before, "read again");
+        assert!(!exploration.read_with(cx, |exploration, _| exploration.newer_available()));
     }
 
     /// The rows take what the tree's dock leaves below its header, not the window's height, so

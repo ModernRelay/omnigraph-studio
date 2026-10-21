@@ -28,14 +28,17 @@ pub fn init(cx: &mut App) {
         let handle = cx.entity().downgrade();
         let session = workspace.session().cloned();
         let list = cx.new(|cx| BranchList::new(handle, session, window, cx));
+        let view: gpui::AnyView = list.into();
         workspace.add_panel(
             PanelPosition::Left,
             "branches",
             "Branches",
             IconName::GitBranch,
-            list.into(),
+            view.clone(),
             cx,
         );
+        // The list draws only the rows in view, sized from whichever dock it is in.
+        workspace.set_panel_scrolls_itself(&view, cx);
         branches::register(workspace);
     })
     .detach();

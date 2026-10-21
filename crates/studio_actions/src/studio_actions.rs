@@ -540,6 +540,8 @@ pub mod history {
             PreviousMatch,
             /// Start a new branch at the selected commit.
             NewBranchHere,
+            /// Read the commit's next changes, or try again a read of them that failed.
+            LoadMoreChanges,
         ]
     );
 }

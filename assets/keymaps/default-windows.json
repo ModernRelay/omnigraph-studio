@@ -380,7 +380,8 @@
   {
     "context": "CommitView",
     "bindings": {
-      "b": "studio_history::NewBranchHere"
+      "b": "studio_history::NewBranchHere",
+      "ctrl-alt-n": "studio_history::LoadMoreChanges"
     }
   },
   {

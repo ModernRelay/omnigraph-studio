@@ -27,6 +27,7 @@ use serde_json::Value;
 use studio_actions::review::{
     AcceptAndNext, EditChange, Merge, NextChange, PreviousChange, RevertAndNext,
 };
+use studio_actions::workspace::Refresh;
 use studio_ui::ds::{radii, space};
 use studio_ui::menu::ContextMenu;
 use studio_ui::{ChangeCard, change_counts, group_digits, short_commit_id, type_swatch};
@@ -1738,7 +1739,10 @@ impl ReviewView {
         })
         .on_click(cx.listener(|this, _, _, cx| this.merge(cx)));
         let refresh = studio_ui::ds::toolbar_icon_button("refresh", IconName::RotateCw)
-            .tooltip(Tooltip::text("Read the branch and its target again"))
+            .tooltip(refresh_tooltip(
+                "Read the branch and its target again",
+                &self.focus_handle,
+            ))
             .on_click(cx.listener(|this, _, _, cx| this.reload(cx)));
 
         let (sentence, detail) = match (&self.load, &self.data) {
@@ -1851,6 +1855,10 @@ impl ReviewView {
                     )
                     .action_slot(
                         studio_ui::ds::button("refresh-own", "Refresh")
+                            .tooltip(refresh_tooltip(
+                                "Read the review again at the branch's head",
+                                &self.focus_handle,
+                            ))
                             .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
                     )
                     .into_any_element(),
@@ -1865,6 +1873,10 @@ impl ReviewView {
                     )))
                     .action_slot(
                         studio_ui::ds::button("refresh-newer", "Refresh")
+                            .tooltip(refresh_tooltip(
+                                "Read the review again at the branch's head",
+                                &self.focus_handle,
+                            ))
                             .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
                     )
                     .into_any_element(),
@@ -2030,6 +2042,10 @@ impl ReviewView {
                 ),
                 Some(
                     studio_ui::ds::button("refresh-moved", "Refresh")
+                        .tooltip(refresh_tooltip(
+                            "Read the review again at the branch's head",
+                            &self.focus_handle,
+                        ))
                         .on_click(cx.listener(|this, _, _, cx| this.reload(cx)))
                         .into_any_element(),
                 ),
@@ -3296,9 +3312,24 @@ impl Render for ReviewView {
             .when(self.merge_refusal(cx).is_none(), |view| {
                 view.on_action(cx.listener(|this, _: &Merge, _, cx| this.merge(cx)))
             })
+            // ⌘R reads the review again, as its Refresh buttons do, and goes on to the
+            // workspace, which reads the graph's schema, branches and counts again.
+            .on_action(cx.listener(|this, _: &Refresh, _, cx| {
+                this.reload(cx);
+                cx.propagate();
+            }))
             .child(header)
             .child(body)
     }
+}
+
+/// A Refresh button's tooltip, which shows the key that does the same in the review.
+fn refresh_tooltip(
+    title: &'static str,
+    focus: &FocusHandle,
+) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + use<> {
+    let focus = focus.clone();
+    move |_, cx| Tooltip::for_action_in(title, &Refresh, &focus, cx)
 }
 
 /// Opens the review of `branch` against `target`. A merge starts there, from a head the person
@@ -3900,8 +3931,8 @@ pub(crate) mod tests {
     }
 
     /// A review read while another writer changed the schema is newer once it is in, as is
-    /// one read at a head behind the one the session saw; neither sends a dry run for the
-    /// head its cards show.
+    /// one read at a head behind the one the session saw, read again with ⌘R; neither sends a
+    /// dry run for the head its cards show.
     #[gpui::test]
     async fn a_review_read_behind_the_schema_or_the_head_is_newer(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
@@ -3949,8 +3980,14 @@ pub(crate) mod tests {
         });
         cx.run_until_parked();
         asked.lock().unwrap().clear();
-        view.update(cx, |view, cx| view.reload(cx));
+        // ⌘R, where the review has the keyboard, is its Refresh.
+        cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+        cx.dispatch_action(Refresh);
         cx.run_until_parked();
+        assert!(
+            !asked.lock().unwrap().is_empty(),
+            "the review was read again"
+        );
         view.read_with(cx, |view, _| {
             assert_eq!(view.bound_head.as_deref(), Some("f2"));
             assert_newer(view);

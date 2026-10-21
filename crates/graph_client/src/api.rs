@@ -387,6 +387,31 @@ pub enum BranchStartRefusalReason {
     Other,
 }
 
+/// A commit's changes the server cannot compare with its parent's (409); nothing was read. It
+/// is an error's `change_diff_refusal`, read from [`ErrorOutput::other`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ChangeDiffRefusalOutput {
+    pub reason: ChangeDiffRefusalReason,
+    pub graph_commit_id: String,
+    /// For `schema_boundary`, the type at the boundary.
+    #[serde(default)]
+    pub type_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeDiffRefusalReason {
+    /// The commit has no first parent: the graph's first commit.
+    ParentlessCommit,
+    /// The commit and its parent are on either side of a schema change the server cannot
+    /// compare across.
+    SchemaBoundary,
+    Unknown,
+    /// A value a later build speaking contract 0.14 may send, so an answer still decodes.
+    #[serde(other)]
+    Other,
+}
+
 // ---- access ----
 
 /// `GET /graphs/{id}/access`: what the caller's own credential may do on one graph, by its
@@ -883,6 +908,10 @@ mod contract_tests {
             &["reason", "graph_commit_id", "branch", "type_name"],
         ),
         (
+            "ChangeDiffRefusalOutput",
+            &["reason", "graph_commit_id", "type_name"],
+        ),
+        (
             "AccessOutput",
             &[
                 "graph_id",
@@ -1062,6 +1091,10 @@ mod contract_tests {
                 "unattached_cannot_publish",
                 "actor_mismatch",
             ],
+        ),
+        (
+            "ChangeDiffRefusalReason",
+            &["parentless_commit", "schema_boundary", "unknown"],
         ),
         (
             "BranchStartRefusalReason",

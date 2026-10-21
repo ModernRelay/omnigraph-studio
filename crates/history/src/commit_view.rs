@@ -12,18 +12,18 @@ use gpui::{
 };
 use gq_language::SchemaModel;
 use graph_client::ReadError;
-use graph_client::api::{ChangeCauseOutput, CommitKind, CommitOutput};
+use graph_client::api::{ChangeCauseOutput, ChangeDiffRefusalReason, CommitKind, CommitOutput};
 use graph_store::{
     ChangeFold, EntityGroups, FoldedChanges, GraphSession, GroupRun, GroupSection, NodeNames,
     SessionEvent, TypeCounts,
 };
 use studio_actions::graph::{CreateBranchAt, OpenCommit, OpenQueryAt, OpenType};
-use studio_actions::history::NewBranchHere;
+use studio_actions::history::{LoadMoreChanges, NewBranchHere};
 use studio_ui::menu::ContextMenu;
 use studio_ui::{now_micros, relative_time, short_commit_id, utc_date_time};
-use studio_workspace::{Item, ItemEvent, SavedItem};
+use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
 use ui::prelude::*;
-use ui::{PopoverMenu, Tooltip};
+use ui::{KeyBinding, PopoverMenu, Tooltip};
 
 /// Changes read before asking the person to load more (constitution IX).
 const CAP: usize = 5_000;
@@ -208,10 +208,11 @@ impl CommitView {
         &self.commit_id
     }
 
-    /// Reads the commit itself when the view came without it: its kind says whether a branch
-    /// can start at it and where it is, and its parent whether it has changes to read, which
-    /// wait for it. One that cannot be read leaves the header to the changes' cause, and
-    /// offers no branch.
+    /// Reads the commit itself when the view came without it (a tab restored, a toast's or a
+    /// parent link's), beside its changes, which do not wait for it: its kind says whether a
+    /// branch can start at it and where it is. One found to be the graph's first stops a read
+    /// of its changes still out, which the server would refuse. One that cannot be read leaves
+    /// the header to the changes' cause, and offers no branch.
     fn read_commit(&mut self, cx: &mut Context<Self>) {
         if self.commit.is_some() || self._commit_task.is_some() {
             return;
@@ -228,10 +229,8 @@ impl CommitView {
                 if let Ok(commit) = read {
                     this.commit = Some(commit);
                 }
-                // Its changes waited for it: the first commit has none to ask for.
-                if !this.settle_if_first() {
-                    this.load_more(cx);
-                }
+                // The first commit has no changes to read.
+                this.settle_if_first();
                 cx.notify();
             })
             .ok();
@@ -262,10 +261,18 @@ impl CommitView {
         branch_start(self.commit.as_ref()?)
     }
 
-    /// Reads the next pages of changes, up to [`CAP`] more. The graph's first commit has none
-    /// to read, and a commit still being read is waited for, since it may be that one.
+    /// Whether the list's last row offers to read more changes ("Load more changes", or "Try
+    /// again" after a read of them failed), with no read under way.
+    fn offers_more(&self) -> bool {
+        self.next_page_token.is_some() && !matches!(self.state, State::Loading)
+    }
+
+    /// Reads the next pages of changes, up to [`CAP`] more. The graph's first commit, known by
+    /// the commit as listed, has none to read; one not known yet is asked for its changes at
+    /// once, and the server's refusal of a commit without a parent (`parentless_commit`) shows
+    /// it as the first, so no read waits for another.
     fn load_more(&mut self, cx: &mut Context<Self>) {
-        if self.settle_if_first() || self.commit_pending {
+        if self.settle_if_first() {
             return;
         }
         // One read at a time: the one under way holds the fold.
@@ -307,7 +314,9 @@ impl CommitView {
                             break Ok(());
                         }
                     }
-                    Err(error) => break Err(describe(&error)),
+                    // The graph's first commit: it has no parent to compare with.
+                    Err(error) if is_parentless(&error) => break Err(None),
+                    Err(error) => break Err(Some(describe(&error))),
                 }
             };
             let read_any = fold.raw_changes() > start;
@@ -327,13 +336,21 @@ impl CommitView {
                 .await;
             this.update(cx, |this, cx| {
                 this.fold = fold;
-                // A failure after changes were shown keeps them, and those read since.
                 let result = match result {
-                    Err(message) if read_any || !this.rows.is_empty() => {
+                    Err(None) => {
+                        this.next_page_token = None;
+                        this.more_error = None;
+                        this.state = State::First;
+                        cx.notify();
+                        return;
+                    }
+                    // A failure after changes were shown keeps them, and those read since.
+                    Err(Some(message)) if read_any || !this.rows.is_empty() => {
                         this.more_error = Some(message.into());
                         Ok(())
                     }
-                    result => result,
+                    Err(Some(message)) => Err(message),
+                    Ok(()) => Ok(()),
                 };
                 match result {
                     Ok(()) => {
@@ -772,6 +789,11 @@ impl CommitView {
                     )
                     .style(ButtonStyle::Subtle)
                     .disabled(matches!(self.state, State::Loading))
+                    .key_binding(KeyBinding::for_action_in(
+                        &LoadMoreChanges,
+                        &self.focus_handle,
+                        cx,
+                    ))
                     .on_click(cx.listener(|this, _, _, cx| this.load_more(cx))),
                 )
                 .children(self.more_error.clone().map(|error| {
@@ -838,15 +860,61 @@ pub(crate) fn new_branch_at(commit_id: &str, window: &mut Window, cx: &mut App) 
     );
 }
 
+/// Opens commit `id`'s own tab in `workspace`, or brings it forward. `listed` is the commit as
+/// History listed it, which the tab keeps, so it reads only the commit's changes; a tab without
+/// it reads the commit by its id beside them.
+pub(crate) fn open_in(
+    workspace: &mut Workspace,
+    session: Entity<GraphSession>,
+    id: String,
+    listed: Option<CommitOutput>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    workspace.open_item::<CommitView>(commit_key(&id), window, cx, |_, cx| {
+        CommitView::new(session, id, listed, cx)
+    });
+}
+
+/// Opens a listed commit's own tab with the commit as listed ([`open_in`]). A list drawn
+/// outside a workspace's window has no workspace to open it in, and dispatches [`OpenCommit`],
+/// which reads the commit by its id.
+pub(crate) fn open_listed(
+    session: &Entity<GraphSession>,
+    commit: &CommitOutput,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let id = commit.graph_commit_id.clone();
+    let Some(workspace) = studio_workspace::workspace_for(window) else {
+        window.dispatch_action(Box::new(OpenCommit { commit_id: id }), cx);
+        return;
+    };
+    let (session, listed) = (session.clone(), commit.clone());
+    workspace.update(cx, |workspace, cx| {
+        open_in(workspace, session, id, Some(listed), window, cx)
+    });
+}
+
 /// The CLI command that starts a branch at `commit_id`.
 pub(crate) fn branch_here_cli(commit_id: &str) -> String {
     format!("omnigraph branch create <name> --from-commit {commit_id}")
 }
 
+/// Whether the server refused a commit's changes because the commit has no parent: the
+/// graph's first commit.
+fn is_parentless(error: &ReadError) -> bool {
+    matches!(
+        error,
+        ReadError::Refused(summary)
+            if summary.change_diff_refusal == Some(ChangeDiffRefusalReason::ParentlessCommit)
+    )
+}
+
 fn describe(error: &ReadError) -> String {
     match error {
         ReadError::Refused(summary) if summary.status == 409 => format!(
-            "This commit cannot be compared with a parent (the first commit, or a schema change): {}",
+            "This commit cannot be compared with its parent (a schema change between them): {}",
             summary.message
         ),
         ReadError::Refused(summary) if summary.status == 410 => {
@@ -901,6 +969,11 @@ impl Render for CommitView {
                         new_branch_at(commit, window, cx)
                     }
                 }))
+            })
+            // As the list's last row offers: more changes to read, or a read of them to try
+            // again, while none is under way.
+            .when(self.offers_more(), |view| {
+                view.on_action(cx.listener(|this, _: &LoadMoreChanges, _, cx| this.load_more(cx)))
             })
             .child(header)
             .child(body)
@@ -1090,6 +1163,12 @@ mod tests {
             async move {
                 let cause = |id: &str| json!({ "graph_commit_id": id, "parent_commit_id": "c0", "authored_branch": "main", "authored_at": 0 });
                 let (status, body) = match path.rsplit_once("/commits/") {
+                    // As OmniGraph refuses the graph's first commit's changes.
+                    Some((_, "c0/changes")) => (
+                        409,
+                        json!({ "error": "commit 'c0' has no first parent; bootstrap from an exact baseline", "code": "conflict",
+                                "change_diff_refusal": { "reason": "parentless_commit", "graph_commit_id": "c0" } }),
+                    ),
                     Some((_, rest)) if rest.ends_with("/changes") => {
                         let id = rest.trim_end_matches("/changes");
                         (200, json!({ "cause": cause(id), "changes": [] }))
@@ -1187,28 +1266,165 @@ mod tests {
             "a listed commit was read again"
         );
 
-        // The graph's first commit, listed or in its own tab: the server cannot compare it with
-        // a parent, so its changes are never asked for, and it says what it is.
+        // The graph's first commit, listed or in its own tab, says what it is. Listed, it has
+        // no parent, so its changes are never asked for; in its own tab they are asked for
+        // beside its own read, once, and the server's refusal shows it as the first.
         let first: CommitOutput = serde_json::from_value(
             json!({ "graph_commit_id": "c0", "graph_manifest_version": 1, "kind": "published", "created_at": 0 }),
         )
         .unwrap();
+        let first_changes = || {
+            asked
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|path| path.ends_with("/commits/c0/changes"))
+                .count()
+        };
         let listed = cx.new(|cx| CommitView::new(session.clone(), "c0".into(), Some(first), cx));
+        cx.run_until_parked();
+        assert_eq!(
+            first_changes(),
+            0,
+            "the listed first commit's changes were asked for"
+        );
         let own = cx.new(|cx| CommitView::new(session.clone(), "c0".into(), None, cx));
         cx.run_until_parked();
+        assert_eq!(first_changes(), 1);
         for view in [listed, own] {
             view.read_with(cx, |view, _| {
                 assert!(matches!(view.state, State::First));
                 assert_eq!(view.branch_here(), Some("c0"), "a branch can start there");
             });
         }
-        assert!(
-            !asked
-                .lock()
-                .unwrap()
+    }
+
+    /// A session on a server that answers a commit by its id only after `held` of the test
+    /// clock, every commit's changes at once (the graph's first commit, `c0`, refused for having
+    /// no parent, as OmniGraph refuses it), and notes every path asked for.
+    fn held_commit_session(
+        held: Duration,
+        cx: &mut TestAppContext,
+    ) -> (Entity<GraphSession>, Arc<std::sync::Mutex<Vec<String>>>) {
+        cx.update(studio_theme::init_test);
+        let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = asked.clone();
+        let executor = cx.executor();
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            seen.lock().unwrap().push(path.clone());
+            let executor = executor.clone();
+            async move {
+                let cause = |id: &str| json!({ "graph_commit_id": id, "parent_commit_id": "c8", "authored_branch": "main", "authored_at": 0 });
+                let insert = json!({ "kind": "node", "type": { "id": "Person", "name": "Person" }, "id": "p1", "op": "insert", "before": null, "after": { "properties": { "slug": "p1" } } });
+                let (status, body) = match path.rsplit_once("/commits/") {
+                    Some((_, "c0/changes")) => (
+                        409,
+                        json!({ "error": "commit 'c0' has no first parent; bootstrap from an exact baseline", "code": "conflict",
+                                "change_diff_refusal": { "reason": "parentless_commit", "graph_commit_id": "c0" } }),
+                    ),
+                    Some((_, rest)) if rest.ends_with("/changes") => {
+                        let id = rest.trim_end_matches("/changes");
+                        (200, json!({ "cause": cause(id), "changes": [insert] }))
+                    }
+                    Some((_, id)) => {
+                        executor.timer(held).await;
+                        let parent = (id != "c0").then_some("c8");
+                        (
+                            200,
+                            json!({ "graph_commit_id": id, "graph_manifest_version": 1, "kind": "published", "created_at": 0, "parent_commit_id": parent }),
+                        )
+                    }
+                    None => (404, json!({ "error": "not here" })),
+                };
+                Ok(Response::builder()
+                    .status(status)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        (session, asked)
+    }
+
+    /// A commit named by its id alone (a restored tab, a toast's "View commit", a parent link)
+    /// asks for its changes at once, beside its own read, rather than one after the other. The
+    /// graph's first commit, refused its changes for having no parent, shows as the first while
+    /// its own read is still out, and is asked for them once.
+    #[gpui::test]
+    async fn a_commit_named_by_its_id_reads_its_changes_at_once(cx: &mut TestAppContext) {
+        let held = Duration::from_secs(5);
+        let (session, asked) = held_commit_session(held, cx);
+        let view = cx.new(|cx| CommitView::new(session.clone(), "c9".into(), None, cx));
+        let first = cx.new(|cx| CommitView::new(session.clone(), "c0".into(), None, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.commit_pending, "its own read is still out");
+            assert!(
+                matches!(view.state, State::Ready),
+                "its changes did not wait"
+            );
+            assert_eq!(view.folded.changes.len(), 1);
+        });
+        first.read_with(cx, |view, _| {
+            assert!(view.commit_pending);
+            assert!(matches!(view.state, State::First));
+        });
+        cx.executor().advance_clock(held);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.commit_pending);
+            assert_eq!(view.branch_here(), Some("c9"));
+            assert!(matches!(view.state, State::Ready));
+        });
+        first.read_with(cx, |view, _| assert!(matches!(view.state, State::First)));
+        let asked = asked.lock().unwrap();
+        let times = |end: &str| asked.iter().filter(|path| path.ends_with(end)).count();
+        assert_eq!(times("/commits/c0/changes"), 1);
+        assert_eq!(times("/commits/c9/changes"), 1);
+    }
+
+    /// A commit History lists opens in its own tab with the commit as listed: the tab reads its
+    /// changes, and not the commit again.
+    #[gpui::test]
+    async fn a_listed_commit_opens_its_tab_without_reading_itself(cx: &mut TestAppContext) {
+        let (session, asked) = held_commit_session(Duration::from_secs(5), cx);
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let listed: CommitOutput = serde_json::from_value(
+            json!({ "graph_commit_id": "c7", "graph_manifest_version": 1, "kind": "published", "created_at": 0, "parent_commit_id": "c6" }),
+        )
+        .unwrap();
+        cx.update(|window, cx| open_listed(&session, &listed, window, cx));
+        cx.run_until_parked();
+        let tab = workspace
+            .read_with(cx, |workspace, _| {
+                workspace
+                    .active_item()
+                    .and_then(|item| item.to_any().downcast::<CommitView>().ok())
+            })
+            .expect("the commit's tab");
+        tab.read_with(cx, |view, _| {
+            assert!(!view.commit_pending, "the commit was not read again");
+            assert_eq!(view.branch_here(), Some("c7"));
+            assert!(matches!(view.state, State::Ready));
+        });
+        let asked = asked.lock().unwrap();
+        assert!(!asked.iter().any(|path| path.ends_with("/commits/c7")));
+        assert_eq!(
+            asked
                 .iter()
-                .any(|path| path.ends_with("/commits/c0/changes")),
-            "the first commit's changes were asked for"
+                .filter(|path| path.ends_with("/commits/c7/changes"))
+                .count(),
+            1
         );
     }
 

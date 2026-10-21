@@ -5,11 +5,12 @@
 //! [`DETAIL_LIMIT`] branches.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use editor::{Editor, EditorEvent};
 use gpui::{
-    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render, SharedString,
-    Subscription, Task, WeakEntity, Window,
+    AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render,
+    SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, uniform_list,
 };
 use graph_client::WriteOutcome;
 use graph_client::api::{BranchStartRefusalOutput, BranchStartRefusalReason, CommitOutput};
@@ -44,6 +45,11 @@ pub struct BranchList {
     workspace: WeakEntity<Workspace>,
     session: Option<Entity<GraphSession>>,
     details: HashMap<String, BranchDetail>,
+    /// The list's scroll: it draws only the rows in view.
+    scroll: UniformListScrollHandle,
+    /// How many rows the list has built, for the test that it builds only those in view.
+    #[cfg(test)]
+    rows_drawn: usize,
     _details_task: Option<Task<()>>,
     _workspace_subscription: Option<Subscription>,
     _session_subscription: Option<Subscription>,
@@ -62,6 +68,9 @@ impl BranchList {
             workspace: workspace.clone(),
             session: None,
             details: HashMap::new(),
+            scroll: UniformListScrollHandle::new(),
+            #[cfg(test)]
+            rows_drawn: 0,
             _details_task: None,
             _workspace_subscription: None,
             _session_subscription: None,
@@ -279,52 +288,87 @@ impl BranchList {
     }
 }
 
+impl BranchList {
+    /// The "New branch…" row, after the branches.
+    fn render_new_branch(current: &str) -> studio_ui::ds::SidebarRow {
+        let current = current.to_owned();
+        studio_ui::ds::SidebarRow::new("new-branch", "New branch…")
+            .muted(true)
+            .icon(IconName::Plus)
+            .tooltip_fn(move |_, cx| {
+                Tooltip::with_meta(
+                    format!("New branch from {current}"),
+                    Some(&CreateBranch),
+                    format!("omnigraph branch create <name> --from {current}"),
+                    cx,
+                )
+            })
+            .on_click(|_, window, cx| window.dispatch_action(Box::new(CreateBranch), cx))
+    }
+
+    /// The rows in `range` of the list: the branches it reaches, each with its right-click menu
+    /// (built only when it opens), then "New branch…" after the last.
+    fn render_rows(&mut self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        #[cfg(test)]
+        {
+            self.rows_drawn += range.len();
+        }
+        let Some(session) = self.session.as_ref() else {
+            return Vec::new();
+        };
+        let session = session.read(cx);
+        let Some(branches) = session.branches.loaded() else {
+            return Vec::new();
+        };
+        let current = session.branch.as_str();
+        range
+            .map(|index| match branches.get(index) {
+                Some(branch) => self
+                    .render_branch(index, branch.clone(), *branch == current)
+                    .into_any_element(),
+                None => Self::render_new_branch(current).into_any_element(),
+            })
+            .collect()
+    }
+}
+
 impl Render for BranchList {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(session) = self.session.clone() else {
             return v_flex().into_any_element();
         };
         let s = session.read(cx);
-        let current = s.branch.clone();
-        let state = match &s.branches {
-            graph_store::Loadable::Loaded(branches) => Ok(branches.clone()),
-            graph_store::Loadable::Failed(error) => Err(Some(error.clone())),
-            _ => Err(None),
+        let rows = s.branches.loaded().map(|branches| branches.len() + 1);
+        let failed = match &s.branches {
+            graph_store::Loadable::Failed(error) => Some(error.clone()),
+            _ => None,
         };
-        let new_button = studio_ui::ds::SidebarRow::new("new-branch", "New branch…")
-            .muted(true)
-            .icon(IconName::Plus)
-            .tooltip_fn({
-                let current = current.clone();
-                move |_, cx| {
-                    Tooltip::with_meta(
-                        format!("New branch from {current}"),
-                        Some(&CreateBranch),
-                        format!("omnigraph branch create <name> --from {current}"),
-                        cx,
-                    )
-                }
-            })
-            .on_click(|_, window, cx| window.dispatch_action(Box::new(CreateBranch), cx));
-        let mut list = v_flex();
-        match state {
-            Ok(branches) => {
-                for (index, branch) in branches.into_iter().enumerate() {
-                    let is_current = branch == current;
-                    list = list.child(self.render_branch(index, branch, is_current));
-                }
-            }
-            Err(Some(error)) => {
-                list = list.child(div().px(px(ds::space::MD)).child(
-                    studio_ui::ds::text::error_note(format!("Branches could not be read: {error}")),
-                ))
-            }
-            Err(None) => list = list.child(studio_ui::ds::sidebar_note("Reading branches…")),
+        let current = s.branch.clone();
+        // Every branch is a row of a list that draws only the rows in view, as a graph can have
+        // thousands; "New branch…" is the row after the last.
+        if let Some(rows) = rows {
+            return uniform_list(
+                "branch-rows",
+                rows,
+                cx.processor(|this, range: Range<usize>, _window, cx| this.render_rows(range, cx)),
+            )
+            .track_scroll(&self.scroll)
+            .size_full()
+            .pb(px(ds::space::MD))
+            .into_any_element();
         }
+        let note = match failed {
+            Some(error) => div()
+                .px(px(ds::space::MD))
+                .child(studio_ui::ds::text::error_note(format!(
+                    "Branches could not be read: {error}"
+                ))),
+            None => studio_ui::ds::sidebar_note("Reading branches…"),
+        };
         v_flex()
             .w_full()
-            .child(list)
-            .child(new_button)
+            .child(note)
+            .child(Self::render_new_branch(&current))
             .into_any_element()
     }
 }
@@ -962,6 +1006,47 @@ mod tests {
 
     use super::*;
     use crate::view::tests::fake_server;
+
+    /// The sidebar's branches are a list that builds only the rows in view, however many
+    /// branches the graph has: of 2,000, a dock of 320 pt builds a screenful, not every row and
+    /// its menu at every frame.
+    #[gpui::test]
+    async fn the_branch_list_builds_only_the_rows_in_view(cx: &mut gpui::TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let names: Vec<String> = std::iter::once("main".to_owned())
+            .chain((1..2_000).map(|i| format!("feature-{i:04}")))
+            .collect();
+        let (session, _) = fake_server(
+            move |path, _, _| {
+                if path.ends_with("/branches") {
+                    (200, json!({ "branches": names }))
+                } else {
+                    (404, json!({ "error": "not here" }))
+                }
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        struct Dock(Entity<BranchList>);
+        impl Render for Dock {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(260.)).h(px(320.)).child(self.0.clone())
+            }
+        }
+        let (dock, cx) = cx.add_window_view(|window, cx| {
+            Dock(cx.new(|cx| BranchList::new(WeakEntity::new_invalid(), Some(session), window, cx)))
+        });
+        cx.run_until_parked();
+        let list = dock.read_with(cx, |dock, _| dock.0.clone());
+        list.update(cx, |list, cx| {
+            list.rows_drawn = 0;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let drawn = list.read_with(cx, |list, _| list.rows_drawn);
+        assert!(drawn > 0, "the rows in view are drawn");
+        assert!(drawn < 100, "{drawn} rows built of 2,001");
+    }
 
     /// A merged branch is deleted with ↵; one with commits only it holds waits for its name.
     #[gpui::test]

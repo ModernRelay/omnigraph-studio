@@ -1768,12 +1768,12 @@ impl QueryEditor {
         };
         let (columns, destroys, publication) = match info {
             Some(info) => (Some(info.columns), info.destroys, info.publication),
-            // Unchecked (no schema yet): where it publishes is in its parse alone.
-            None => (
-                None,
-                None,
-                gq_language::check::declared_publication(&text, &declaration.name),
-            ),
+            // Unchecked (no schema yet): where it publishes and what it destroys are in its
+            // parse alone, so a destructive write still waits for its name typed.
+            None => {
+                let declared = gq_language::check::declared_write(&text, &declaration.name);
+                (None, declared.destroys, declared.publication)
+            }
         };
         Ok(Prepared {
             text,
@@ -4614,7 +4614,9 @@ mod tests {
         }
 
         /// A destructive statement names what it destroys and goes only with that name typed:
-        /// ↵ with other words in the field sends nothing.
+        /// ↵ with other words in the field sends nothing. A `delete` written in the tab waits
+        /// for its type's name too, also before the schema is read (this server serves none):
+        /// what it destroys is in its parse alone.
         #[gpui::test]
         async fn a_destructive_write_waits_for_its_name(cx: &mut TestAppContext) {
             init(cx);
@@ -4658,6 +4660,35 @@ mod tests {
                 field.update(cx, |field, cx| field.set_text("feature", window, cx));
                 editor.confirm_write(&menu::Confirm, window, cx);
                 assert!(editor.writing, "sent with its name typed");
+            });
+            cx.run_until_parked();
+            assert_eq!(mutations(), 1);
+
+            // A declaration that deletes, checked against no schema: its type's name is typed.
+            editor.update_in(cx, |editor, window, cx| {
+                assert!(editor.schema(cx).is_none(), "no schema was read");
+                editor.set_text(
+                    "query purge() {\n  delete Person where slug = \"a\"\n}",
+                    window,
+                    cx,
+                );
+                editor.cursor = 0;
+                editor.run(&Run, window, cx);
+                let typed = editor
+                    .pending_write
+                    .as_ref()
+                    .and_then(|pending| pending.typed.as_ref())
+                    .expect("typed to confirm");
+                assert_eq!(typed.phrase, "Person");
+                assert!(
+                    typed
+                        .what
+                        .starts_with("Deletes what its `where` matches of Person"),
+                    "{}",
+                    typed.what
+                );
+                editor.confirm_write(&menu::Confirm, window, cx);
+                assert!(!editor.writing, "nothing was sent");
             });
             cx.run_until_parked();
             assert_eq!(mutations(), 1);

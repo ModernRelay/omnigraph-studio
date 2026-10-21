@@ -57,7 +57,7 @@ on the canvas. Typing filters the visible rows.
   and cached for it. Counts asked for in the same turn (several nodes expanded at once, a
   refresh, a restored exploration) go out together: one `builder::page_degrees` read per node
   type and relationship for up to 100 nodes, sorted by id (`graph_store::degrees`,
-  `GraphSession::degree`), so a node's peek and the tree share the read at the commit. GQ has
+  `GraphSession::degree_in`), so a node's peek and the tree share the read at the commit. GQ has
   no single query that counts several relationship groups. Sketch of one count:
 
   ```
@@ -92,7 +92,8 @@ on the canvas. Typing filters the visible rows.
   read and flattened under one schema too, the one its reads were made under: another writer's
   schema offers Refresh as a head move does, and the groups stay as read (a dropped
   relationship's still there, an added one not yet) until Refresh takes the new schema at the
-  head (since 2026-10-20).
+  head (since 2026-10-20). ⌘R where the tree has the keyboard is that Refresh, whose tooltip
+  shows the key, and goes on to the workspace's reload of the graph (since 2026-10-21).
 
 ### Rendering and state
 
@@ -130,6 +131,8 @@ on the canvas. Typing filters the visible rows.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | ⌘R reads the tree again | `relationship_tree` `cmd_r_reads_the_tree_again` (another writer changes the root at c2, the tree offers newer data, then `studio::Refresh` is dispatched with the tree focused) | The rows are read again and the offer goes. Before, nothing in the tree handled `Refresh`: ⌘R reloaded the session at the workspace and "Newer data · Refresh" stayed |
+| 2026-10-21 | One count reader | `GraphSession::degree`, used only by tests, removed; the tests read through `degree_at`, which the tree's `degree_in` wraps | The `graph_store` count tests pass on `degree_at`, one of them now also checking that each count names the commit it was asked at |
 | 2026-10-21 | A relationship count is held to the exploration's pin too | `graph_store` `every_read_of_an_exploration_is_at_its_roots_commit`, extended: `spawn_count` given a count of 9 at c3, sent unpinned, then sent at the pin c2, then with no pin; `GraphSession::degree_at` returns each count with the commit its read answered at (`ReadOutput.graph_commit_id`, or the commit asked for) | Unpinned and answered at c3: read again at c2 and shown as 0, its answer there; sent at c2 and answered at c3: a failure that names both commits; with no pin (the root's read failed): c3 becomes the pin and 9 shows. Before, `spawn_count` applied any count it was given, so after a failed root read counts read at the head could stand beside pages pinned at another commit |
 | 2026-10-21 | Every read of an exploration is at the commit its root pinned | `graph_store` `every_read_of_an_exploration_is_at_its_roots_commit` (a fake holding the root read while a group is searched, then moving the head to c2 before releasing it; `Exploration::apply` given an answer at c3 sent unpinned, then pinned); the same test against the earlier code, by reading: `search_group` called `start(Page)` with no pin while the root was out | Nothing but the root read went out while it was out; after it, the pin was c2 and every count and neighbour read went at c2. The unpinned answer at c3 was read again at the pin (the session's kept answer, so nothing was sent) and its neighbour not shown; the pinned one at c3 failed. Before, the search's page was read at the head beside the root, so a commit between them showed two commits at once |
 | 2026-10-11 | Tree primitives exist in Zed `ui` | `git ls-tree -r v1.23.2 crates/ui/src/components` | `tree_view_item.rs`, `indent_guides.rs`, `sticky_items.rs` |

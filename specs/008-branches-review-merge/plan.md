@@ -37,7 +37,10 @@ place), X (designed on 0.13; the better routes are deferred).
 ### Branches
 
 - Sidebar list with current branch marked; ⌘⇧B switch; create from the current branch or a
-  commit. Fork point and last commit derived from `GET /commits?branch=`.
+  commit. Fork point and last commit derived from `GET /commits?branch=`. The list draws only
+  the rows in view, "New branch…" the row after the last, and builds a row's menu when it
+  opens, so a graph of thousands of branches costs a frame a screenful of rows (since
+  2026-10-21; before, every branch's row and menu were built at every frame).
 - Built (start at a commit, E21, 2026-10-20): History's "New branch here…" (spec 009)
   dispatches `CreateBranchAt`, which opens the same new-branch dialog started at that commit:
   "New branch at <short id>", then who made it and when, read by its id as the dialog opens
@@ -96,7 +99,8 @@ place), X (designed on 0.13; the better routes are deferred).
   card; the card turns hollow but stays, and says how many are not reviewed when some are).
   Each relationship line has its own Revert, shown on hover. Keys: J/K between cards, ↵ edit,
   ⌘Y accept the card and go to the next, ⌥⌘Z revert the selected change (the card's own, or
-  the relationship line clicked) and go to the next.
+  the relationship line clicked) and go to the next, ⌘R read the review again as its refresh
+  button and every banner's Refresh do, each of which shows the key (since 2026-10-21).
 - Edit (a node that is added or changed): a form of its editable properties filled with what
   the branch holds; Save writes only the fields that changed, each bound to that value, as one
   mutation on the reviewed branch bound to the reviewed head. After a fix the card's other
@@ -189,6 +193,8 @@ place), X (designed on 0.13; the better routes are deferred).
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | ⌘R reads the review again | `review` `a_review_read_behind_the_schema_or_the_head_is_newer`, its second Refresh dispatched as `studio::Refresh` with the review focused | The review was read again (requests sent, the head bound as before, "Newer data" as the fake still serves f2). Before, nothing in the review handled `Refresh`: ⌘R reloaded the session at the workspace and the review's "Newer data · Refresh" stayed; its buttons showed no key |
+| 2026-10-21 | The branch list draws only the rows in view | `review` `the_branch_list_builds_only_the_rows_in_view` (2,000 branches, a 320 pt dock, rows counted as built) | Fewer than 100 rows built of 2,001, more than none. Before, `BranchList::render` cloned the list and built a row and its right-click menu for every branch each frame |
 | 2026-10-21 | A review short of the fork lists the branch's own commits and names the history that stopped it | `review` `a_fork_past_the_history_read_is_said_and_no_history_is_read_whole`, extended: fixtures name `graph_branch` as the server records it (`feature`, `dev`, none for main); a branch that moved 300 commits past the reviewed head; a branch forked from `dev`, whose 10,000 commits are past its pages; `graph_branch` at `7fd9cc9`: `GraphNamespacePublisher` and `GraphHeadExpectation` normalize main to `None`, `LineageIntent.branch` is the writing branch, `GET /commits?branch=` lists the first-parent chain (`commit_list_page`, `first_parent_page`) | Before, a branch main was merged into listed `["f2","fm","f1","m0"]`, main's m0 as the branch's, and every capped review said "More than 10,000 commits since the fork". Now `["f2","fm","f1"]` with "The fork is past the newest 10,000 commits of main's history: … the 3 commits made on feature."; the moved branch says "More than 9,700 commits" (9,900 since its fork, not 10,000); the `dev` fork lists `["f1","f0"]` and "The fork is more than 10,000 commits down feature's history: …". A fork reached is unchanged: its commits since it still include a parent branch's |
 | 2026-10-21 | A merge whose deletion was refused is logged as such | `graph_store` `a_merge_whose_deletion_was_refused_says_the_branch_stays` (a merge with deletion answered `branch_deleted: false` and `branch_delete_error_details`, then one answered `true`) | "Merge feature into main; feature was not deleted: feature is protected", the session still on feature; then "Merge feature into main and delete feature", the session on main. Before, both read "…and delete feature", the activity log and the toast saying a branch that stayed was deleted |
 | 2026-10-21 | Every write runs through one runner | `graph_store` `GraphSession::run_write` (count, send once, run to the outcome, log, follow-up) in place of six copies in `send_write`, `invoke_stored_write`, `send_blob_write`, `create_branch`, `delete_branch` and `merge`; the session, review, history, type table and query editor tests | All pass unchanged |

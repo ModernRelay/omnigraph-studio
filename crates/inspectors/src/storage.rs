@@ -91,6 +91,11 @@ impl Item for StorageInspector {
     }
 }
 
+/// A table's row count as its Rows column shows it: grouped, as Studio writes every count.
+fn rows_text(count: i64) -> String {
+    studio_ui::group_count(count)
+}
+
 /// A snapshot's datasets, nodes first, each kind by type name, as the table lists them.
 fn tables_in_order(mut snapshot: SnapshotOutput) -> SnapshotOutput {
     snapshot.datasets.sort_by(|a, b| {
@@ -107,6 +112,9 @@ impl StorageInspector {
         // health, readiness and graphs are the same on every branch, and stay.
         let subscription = cx.subscribe(&session, |this: &mut Self, _, event, cx| match event {
             SessionEvent::BranchChanged => this.reload_snapshot(true, cx),
+            // A new token may see less than the one the server's state was read with: none of
+            // that shows while it is read again under the new one.
+            SessionEvent::CredentialChanged => this.reload(cx),
             // A commit, Studio's or another writer's, moves the tables' versions and rows: the
             // storage shown stays, and the tab offers the newer.
             SessionEvent::HeadMoved { branch, head } if *branch == this.branch => {
@@ -397,7 +405,7 @@ impl StorageInspector {
                         )
                         .child(div().w(px(col::ROWS)).flex_none().child(CopyableValue::new(
                             ("rows", ix),
-                            Some(dataset.entity_count.to_string()),
+                            Some(rows_text(dataset.entity_count)),
                         )))
                         .child(
                             div()
@@ -709,5 +717,46 @@ mod tests {
             inspector.read_with(cx, |inspector, _| inspector.branch.clone()),
             "feature"
         );
+    }
+
+    /// A new token on the connection reads the server's state again under it, showing none of
+    /// the old token's meanwhile: it may see less.
+    #[gpui::test]
+    async fn a_new_token_reads_the_storage_again(cx: &mut TestAppContext) {
+        let (session, _) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n}\n",
+            |_| json!([]),
+            cx,
+        );
+        cx.run_until_parked();
+        let inspector = cx.new(|cx| StorageInspector::new(session.clone(), cx));
+        cx.run_until_parked();
+        let reads = |cx: &mut TestAppContext| {
+            inspector.read_with(cx, |inspector, _| inspector.snapshot_reads)
+        };
+        assert_eq!(reads(cx), 1);
+        let connection = session.read_with(cx, |session, _| session.connection.clone());
+        connection.update(cx, |connection, cx| {
+            connection.set_token(Some("another".into()), cx)
+        });
+        inspector.read_with(cx, |inspector, _| {
+            assert!(
+                inspector.graphs.is_loading(),
+                "the old token's graphs do not show"
+            );
+            assert!(inspector.snapshot.is_loading());
+        });
+        cx.run_until_parked();
+        assert_eq!(reads(cx), 2, "read again under the new token");
+        inspector.read_with(cx, |inspector, _| {
+            assert!(!inspector.graphs.is_loading());
+        });
+    }
+
+    /// A table's row count is grouped as every count Studio writes.
+    #[test]
+    fn row_counts_are_grouped() {
+        assert_eq!(rows_text(12_480), "12,480");
+        assert_eq!(rows_text(7), "7");
     }
 }

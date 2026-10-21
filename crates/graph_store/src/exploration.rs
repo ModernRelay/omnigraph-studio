@@ -7,7 +7,7 @@
 //! commit, or another writer's), the pin moves to the head if nothing the exploration shows
 //! changed in between (spec 015); otherwise [`Exploration::newer_available`] is raised and
 //! nothing changes until [`Exploration::refresh`]. Counts come from the session's batched counts
-//! ([`GraphSession::degree`]): every count asked for in one turn (several nodes expanded,
+//! ([`GraphSession::degree_in`]): every count asked for in one turn (several nodes expanded,
 //! a refresh) is one `builder::page_degrees` read per node type and relationship group (engine
 //! change E16 would replace them); neighbours come in keyset
 //! pages from `builder::neighbours`, as many as the graph's `tree_page_size` setting. A

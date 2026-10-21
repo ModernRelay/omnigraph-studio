@@ -34,15 +34,31 @@ if [[ "$contract" != 0.14 ]]; then
   exit 1
 fi
 
-fresh=0
+# Something already answering at the address would be asked in this server's place, and this
+# server would exit, unable to bind it. Asked before anything is written, so a first run on a
+# busy address leaves no cluster behind.
+if curl -s -o /dev/null --max-time 2 "http://$BIND/healthz"; then
+  echo "dev-server: something already answers at http://$BIND; stop it, or set STUDIO_DEV_BIND to another address" >&2
+  exit 1
+fi
+
+# The seeds are loaded once, after the first apply. The marker stands from the apply until both
+# loads are done, so a run that stops between them (the address taken meanwhile, a load that
+# failed) seeds at the next run instead of serving empty graphs for good. A data directory
+# from before the marker existed is taken as seeded.
+pending="$DATA/.seed-pending"
 if [[ ! -d "$DATA/__cluster" ]]; then
-  fresh=1
   mkdir -p "$DATA"
+  touch "$pending"
   cp "$ROOT"/dev/cluster/*.yaml "$ROOT"/dev/cluster/*.pg "$DATA"/
   (cd "$DATA" && "$CLI" cluster apply --config . --target . > /dev/null)
   # A direct apply keeps the cluster lock; nothing else uses this directory, so release it.
   lock=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["lock_id"])' "$DATA/__cluster/lock.json")
   (cd "$DATA" && "$CLI" cluster force-unlock "$lock" --target . > /dev/null)
+fi
+fresh=0
+if [[ -f "$pending" ]]; then
+  fresh=1
 fi
 
 # A server stopped without shutting down (killed, or its shell closed) leaves its lock behind.
@@ -53,13 +69,6 @@ if [[ -f "$DATA/__cluster/lock.json" ]]; then
     (cd "$DATA" && "$CLI" cluster force-unlock "$lock" --target . > /dev/null)
     echo "Released the lock of a stopped server (pid $pid)." >&2
   fi
-fi
-
-# Something already answering at the address would be asked in this server's place, and this
-# server would exit, unable to bind it.
-if curl -s -o /dev/null --max-time 2 "http://$BIND/healthz"; then
-  echo "dev-server: something already answers at http://$BIND; stop it, or set STUDIO_DEV_BIND to another address" >&2
-  exit 1
 fi
 
 OMNIGRAPH_SERVER_BEARER_TOKENS_JSON="{\"act-dev\":\"$TOKEN\"}" \
@@ -107,6 +116,7 @@ if [[ $fresh == 1 ]]; then
     --data "$ROOT/dev/seed.jsonl" --mode overwrite --yes > /dev/null
   OMNIGRAPH_HOME=$home OMNIGRAPH_TOKEN_DEV=$TOKEN "$CLI" load --target dev --graph notes \
     --data "$ROOT/dev/notes-seed.jsonl" --mode overwrite --yes > /dev/null
+  rm -f "$pending"
   echo "Loaded dev/seed.jsonl into knowledge and dev/notes-seed.jsonl into notes."
 fi
 

@@ -16,15 +16,15 @@ use gpui::{
 use graph_client::ReadError;
 use graph_client::api::{CommitListOutput, CommitOutput};
 use graph_store::{GraphSession, HeadWatch, SessionEvent};
-use studio_actions::graph::OpenCommit;
 use studio_actions::history::{NewBranchHere, NextMatch, PreviousMatch};
+use studio_actions::workspace::Refresh;
 use studio_ui::menu::ContextMenu;
 use studio_ui::{change_counts, group_digits, now_micros, relative_time, short_commit_id};
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 use ui::{Tooltip, right_click_menu};
 
-use crate::commit_view::{CommitCounts, CommitView, branch_start, new_branch_at};
+use crate::commit_view::{CommitCounts, CommitView, branch_start, new_branch_at, open_listed};
 use crate::lanes::{Graph, GraphCommit, assign_lanes};
 use crate::merged::{Absent, Drawn, HistoryRead, branch_heads};
 
@@ -908,12 +908,14 @@ impl HistoryView {
         this.update(cx, |this, cx| this.take(arranged, cx)).ok();
     }
 
-    /// Shows a layout of what was read, keeping the commit selected.
+    /// Shows a layout of what was read, keeping the commit selected and the rows being read
+    /// where they are ([`Self::keep_place`]).
     fn take(&mut self, arranged: Arranged, cx: &mut Context<Self>) {
         let previous = self
             .selected
             .and_then(|ix| self.commits.get(ix))
             .map(|c| c.graph_commit_id.clone());
+        let place = self.reading_at();
         self.read = arranged.read;
         self.commits = arranged.commits;
         self.commit_texts = arranged.commit_texts;
@@ -923,6 +925,7 @@ impl HistoryView {
         self.state = State::Ready;
         // The drawn rows' counts were found in the list before.
         self.count_rows = None;
+        self.keep_place(place);
         let keep =
             previous.and_then(|id| self.commits.iter().position(|c| c.graph_commit_id == id));
         match keep {
@@ -935,6 +938,36 @@ impl HistoryView {
         self.match_commits(cx);
         self.match_at = self.match_at_selection();
         cx.notify();
+    }
+
+    /// The commit at the top of the rows shown, by its id, and its row, when the list is
+    /// scrolled from its top: the row being read. At the top, `None`.
+    fn reading_at(&self) -> Option<(String, usize)> {
+        let offset = -f32::from(self.scroll.0.borrow().base_handle.offset().y);
+        if offset <= 0. {
+            return None;
+        }
+        let row = (offset / ROW_HEIGHT).floor() as usize;
+        Some((self.commits.get(row)?.graph_commit_id.clone(), row))
+    }
+
+    /// Keeps the rows being read where they are (constitution V): when rows came or went above
+    /// the commit at the top of those shown, the list scrolls by as many, so that commit stays
+    /// at the top. A list at its top shows the newest commits there.
+    fn keep_place(&mut self, place: Option<(String, usize)>) {
+        let Some((id, was)) = place else {
+            return;
+        };
+        let Some(now) = self.commits.iter().position(|c| c.graph_commit_id == id) else {
+            return;
+        };
+        if now == was {
+            return;
+        }
+        let handle = self.scroll.0.borrow().base_handle.clone();
+        let offset = handle.offset();
+        let moved = (now as f32 - was as f32) * ROW_HEIGHT;
+        handle.set_offset(point(offset.x, offset.y - px(moved)));
     }
 
     /// Where the selection sits among the matches: its own place when it is one, else the
@@ -1196,14 +1229,10 @@ impl HistoryView {
         }
     }
 
+    /// ↵ opens the selected commit's own tab, with the commit as listed.
     fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(commit) = self.selected.and_then(|ix| self.commits.get(ix)) {
-            window.dispatch_action(
-                Box::new(OpenCommit {
-                    commit_id: commit.graph_commit_id.clone(),
-                }),
-                cx,
-            );
+            open_listed(&self.session, commit, window, cx);
         }
     }
 
@@ -1396,8 +1425,8 @@ impl HistoryView {
                 let heads = self.heads.get(&id).cloned().unwrap_or_default();
                 let selected = self.selected == Some(ix);
                 let actor = commit.actor_id.clone();
-                let open_id = id.clone();
                 let menu_commit = commit.clone();
+                let menu_session = self.session.clone();
                 let menu_focus = self.focus_handle.clone();
                 let merge = commit.merged_parent_commit_id.is_some();
                 // A row reads: lane, id, where it heads, what it changed, then who and when.
@@ -1503,14 +1532,12 @@ impl HistoryView {
                     .on_click(
                         cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                             this.select(ix, cx);
-                            // The panel has no detail split: a click opens the commit's tab.
-                            if this.compact || event.click_count() == 2 {
-                                window.dispatch_action(
-                                    Box::new(OpenCommit {
-                                        commit_id: open_id.clone(),
-                                    }),
-                                    cx,
-                                );
+                            // The panel has no detail split: a click opens the commit's tab,
+                            // with the commit as listed.
+                            if (this.compact || event.click_count() == 2)
+                                && let Some(commit) = this.commits.get(ix)
+                            {
+                                open_listed(&this.session, commit, window, cx);
                             }
                         }),
                     );
@@ -1519,8 +1546,9 @@ impl HistoryView {
                         .trigger(move |_, _, _| row_element)
                         .menu(move |window, cx| {
                             let (commit, focus) = (menu_commit.clone(), menu_focus.clone());
+                            let session = menu_session.clone();
                             ContextMenu::build(window, cx, move |menu, _, _| {
-                                commit_menu(menu.context(focus), &commit)
+                                commit_menu(menu.context(focus), &session, &commit)
                             })
                         })
                         .into_any_element(),
@@ -1628,22 +1656,22 @@ impl HistoryView {
     }
 }
 
-/// A commit row's menu. "New branch here" shows the key that starts a branch at the selected
-/// commit, and starts one at this row's; it is offered only at a published commit.
-fn commit_menu(menu: ContextMenu, commit: &CommitOutput) -> ContextMenu {
+/// A commit row's menu. "Open in a tab" opens the commit as listed; "New branch here" shows the
+/// key that starts a branch at the selected commit, and starts one at this row's; it is offered
+/// only at a published commit.
+fn commit_menu(
+    menu: ContextMenu,
+    session: &Entity<GraphSession>,
+    commit: &CommitOutput,
+) -> ContextMenu {
     let copy_id = commit.graph_commit_id.clone();
-    let open_id = copy_id.clone();
+    let (session, listed) = (session.clone(), commit.clone());
     let branch_at = branch_start(commit).map(str::to_owned);
     menu.entry("Copy commit id", None, move |_, cx| {
         cx.write_to_clipboard(ClipboardItem::new_string(copy_id.clone()))
     })
     .entry("Open in a tab", None, move |window, cx| {
-        window.dispatch_action(
-            Box::new(OpenCommit {
-                commit_id: open_id.clone(),
-            }),
-            cx,
-        )
+        open_listed(&session, &listed, window, cx)
     })
     .when_some(branch_at, |menu, commit| {
         menu.separator().entry(
@@ -1652,6 +1680,24 @@ fn commit_menu(menu: ContextMenu, commit: &CommitOutput) -> ContextMenu {
             move |window, cx| new_branch_at(&commit, window, cx),
         )
     })
+}
+
+/// The toolbar's one fact about the commits read: how many, "so far" while the listing goes on
+/// below them, and how many of them were merged in, each count grouped as Studio writes every
+/// count.
+fn summary(count: usize, merged: usize, complete: bool) -> String {
+    let mut summary = format!(
+        "{} commit{}",
+        group_digits(count),
+        if count == 1 { "" } else { "s" }
+    );
+    if !complete {
+        summary.push_str(" so far");
+    }
+    if merged > 0 {
+        summary.push_str(&format!(" · {} merged in", group_digits(merged)));
+    }
+    summary
 }
 
 /// What the search finds a commit by, lowercase, made once with the list rather than at each
@@ -1819,18 +1865,11 @@ impl Render for HistoryView {
             .w(px(if self.compact { 200. } else { 240. }))
             .children(counter.map(studio_ui::ds::text::meta));
         let summary = match self.state {
-            State::Ready => {
-                // Of the commits read: the listing may go on below them.
-                let merged = count.saturating_sub(self.read.own.len());
-                let mut summary = format!("{count} commit{}", if count == 1 { "" } else { "s" });
-                if !self.read.complete {
-                    summary.push_str(" so far");
-                }
-                if merged > 0 {
-                    summary.push_str(&format!(" · {merged} merged in"));
-                }
-                summary
-            }
+            State::Ready => summary(
+                count,
+                count.saturating_sub(self.read.own.len()),
+                self.read.complete,
+            ),
             State::Loading => "Reading…".into(),
             State::Failed(_) => String::new(),
         };
@@ -1848,7 +1887,7 @@ impl Render for HistoryView {
             .child(
                 studio_ui::ds::toolbar_icon_button("refresh-history", IconName::RotateCw)
                     .icon_color(Color::Muted)
-                    .tooltip(Tooltip::text("Read the history again"))
+                    .tooltip(|_, cx| Tooltip::for_action("Read the history again", &Refresh, cx))
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             );
         let body = match &self.state {
@@ -1897,6 +1936,12 @@ impl Render for HistoryView {
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::confirm))
+            // ⌘R reads the history again, and goes on to the workspace, which reads the graph's
+            // schema, branches and counts again.
+            .on_action(cx.listener(|this, _: &Refresh, _, cx| {
+                this.refresh(cx);
+                cx.propagate();
+            }))
             .on_action(cx.listener(|this, _: &NextMatch, _, cx| this.step_match(true, cx)))
             .on_action(cx.listener(|this, _: &PreviousMatch, _, cx| this.step_match(false, cx)))
             .when(self.branch_here().is_some(), |view| {
@@ -2164,6 +2209,16 @@ mod tests {
             .collect()
     }
 
+    /// The toolbar's counts are grouped as every count Studio writes.
+    #[test]
+    fn the_summary_groups_its_counts() {
+        assert_eq!(summary(1, 0, true), "1 commit");
+        assert_eq!(
+            summary(12_480, 1_200, false),
+            "12,480 commits so far · 1,200 merged in"
+        );
+    }
+
     /// History lays out its branch's newest page, and reads the next when the rows drawn come
     /// within a screen of the end, continuing the listing the first page resolved; once the
     /// listing ends, nothing more is read. No listing is ever read whole.
@@ -2255,7 +2310,8 @@ mod tests {
 
     /// A commit landing on the branch reads its first page again: the commits above the head
     /// the pages were read from go on top of them, and the next page still continues their
-    /// listing.
+    /// listing. The rows being read stay where they are: the list scrolls by the rows that came
+    /// above them, unless it is at its top, where the new ones show.
     #[gpui::test]
     async fn a_commit_landing_on_the_branch_keeps_the_pages_read(cx: &mut TestAppContext) {
         let (session, served) = serve(
@@ -2268,6 +2324,26 @@ mod tests {
         let (view, cx) = open(&session, cx);
         view.update(cx, |view, cx| view.want_more(&(170..200), cx));
         cx.run_until_parked();
+        // Read from row 50 down, m399 at the top of the rows shown.
+        let scrolled_to = |view: &Entity<HistoryView>, rows: f32, cx: &mut VisualTestContext| {
+            view.update(cx, |view, _| {
+                let mut scroll = view.scroll.0.borrow_mut();
+                scroll.deferred_scroll_to_item = None;
+                scroll
+                    .base_handle
+                    .set_offset(point(px(0.), px(-rows * ROW_HEIGHT)));
+            })
+        };
+        let top_row = |view: &Entity<HistoryView>, cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, _| {
+                -f32::from(view.scroll.0.borrow().base_handle.offset().y) / ROW_HEIGHT
+            })
+        };
+        scrolled_to(&view, 50., cx);
+        assert_eq!(
+            view.read_with(cx, |view, _| view.reading_at()),
+            Some(("m399".to_owned(), 50))
+        );
         // Another writer commits; Studio hears of it at the next head read.
         session
             .update(cx, |session, cx| session.head_now("main", cx))
@@ -2286,11 +2362,33 @@ mod tests {
             assert_eq!(view.commits[0].graph_commit_id, "m450");
             assert_eq!(view.heads.get("m450"), Some(&vec!["main".to_owned()]));
             assert_eq!(view.heads.get("m449"), None);
+            assert_eq!(view.commits[51].graph_commit_id, "m399");
         });
-        view.update(cx, |view, cx| view.want_more(&(380..402), cx));
+        assert_eq!(
+            top_row(&view, cx),
+            51.,
+            "m399 stays at the top of the rows shown"
+        );
+
+        // At the top, the newest commit shows there.
+        scrolled_to(&view, 0., cx);
+        served
+            .lock()
+            .unwrap()
+            .chain_mut("main")
+            .insert(0, commit("m451", 4_520, Some("m450"), None));
+        session
+            .update(cx, |session, cx| session.head_now("main", cx))
+            .await;
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
-            assert_eq!(view.commits.len(), 451);
+            assert_eq!(view.commits[0].graph_commit_id, "m451")
+        });
+        assert_eq!(top_row(&view, cx), 0.);
+        view.update(cx, |view, cx| view.want_more(&(380..403), cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.commits.len(), 452);
             assert!(view.read.complete);
         });
         assert_eq!(
@@ -2299,6 +2397,7 @@ mod tests {
                 "branch=main&limit=200",
                 "branch=main&limit=200&page_token=m449_200",
                 "branch=main&limit=200",
+                "branch=main&limit=200",
                 "branch=main&limit=200&page_token=m449_400",
             ]
         );
@@ -2306,8 +2405,9 @@ mod tests {
 
     /// Commits merged in are read one at a time by their ids, as each names the next, and join
     /// the history in time order with their lanes. A merged parent the server does not have
-    /// stays a stub. A Refresh reads none of those read again, since a commit never changes,
-    /// and asks again for the one the server did not have.
+    /// stays a stub. A Refresh (⌘R, where the history has the keyboard) reads none of those
+    /// read again, since a commit never changes, and asks again for the one the server did not
+    /// have.
     #[gpui::test]
     async fn merged_in_commits_are_read_by_their_ids(cx: &mut TestAppContext) {
         let (session, served) = serve(
@@ -2354,10 +2454,18 @@ mod tests {
             ["b2", "b1", "gone"].map(|id| served.reads_of(id))
         };
         assert_eq!(reads(&served), [1, 1, 1]);
-        view.update(cx, |view, cx| view.refresh(cx));
+        // ⌘R where the history has the keyboard is its Refresh.
+        let listings = served.lock().unwrap().listings().len();
+        cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+        cx.dispatch_action(Refresh);
         cx.run_until_parked();
         view.read_with(cx, |view, _| check(view));
         assert_eq!(reads(&served), [1, 1, 2]);
+        assert_eq!(
+            served.lock().unwrap().listings().len(),
+            listings + 1,
+            "the first page read again"
+        );
     }
 
     /// A merge whose branch goes on below the oldest commit of the pages read is read as far
@@ -2904,7 +3012,7 @@ mod tests {
 
         for (commit, offered) in commits.iter().zip([true, false, false]) {
             let (_, cx) = cx.add_window_view(|window, cx| {
-                ContextMenu::new(window, cx, |menu, _, _| commit_menu(menu, commit))
+                ContextMenu::new(window, cx, |menu, _, _| commit_menu(menu, &session, commit))
             });
             cx.run_until_parked();
             assert_eq!(

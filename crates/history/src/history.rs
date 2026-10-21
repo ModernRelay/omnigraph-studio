@@ -13,7 +13,6 @@ use studio_actions::graph::{OpenCommit, OpenHistory};
 use studio_workspace::{PanelPosition, Workspace};
 use ui::IconName;
 
-use commit_view::{CommitView, commit_key};
 use view::{HistoryView, history_key};
 
 /// Registers this surface with every new workspace.
@@ -37,10 +36,7 @@ pub fn init(cx: &mut App) {
         ) else {
             return;
         };
-        let id = id.to_owned();
-        workspace.open_item::<CommitView>(commit_key(&id), window, cx, |_, cx| {
-            CommitView::new(session, id, None, cx)
-        });
+        commit_view::open_in(workspace, session, id.to_owned(), None, window, cx);
     });
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         if let Some(window) = window {
@@ -66,14 +62,14 @@ pub fn init(cx: &mut App) {
                 HistoryView::new(session, branch, window, cx)
             });
         });
+        // A commit named by its id alone (a toast's, a parent link's): its tab reads it beside
+        // its changes. History opens the commits it lists with the commit as listed.
         workspace.register_action(|workspace, action: &OpenCommit, window, cx| {
             let Some(session) = workspace.session().cloned() else {
                 return;
             };
             let id = action.commit_id.clone();
-            workspace.open_item::<CommitView>(commit_key(&id), window, cx, |_, cx| {
-                CommitView::new(session, id, None, cx)
-            });
+            commit_view::open_in(workspace, session, id, None, window, cx);
         });
     })
     .detach();

@@ -1218,8 +1218,9 @@ impl Workspace {
             return;
         }
         let (kind, label, action): (_, SharedString, Box<dyn Action>) = match &latest.outcome {
-            // No publish, no toast (constitution VII); the surface that wrote explains it.
-            OutcomeKind::Committed { commit: None } => return,
+            // No publish, no toast (constitution VII); the surface that wrote explains it, and
+            // the activity log says where a held commit is.
+            OutcomeKind::Committed { commit: None } | OutcomeKind::Held { .. } => return,
             OutcomeKind::Committed {
                 commit: Some(commit),
             } => {
@@ -3990,6 +3991,23 @@ fn toast_text(entry: &graph_store::OutcomeEntry) -> String {
         OutcomeKind::Committed { .. } => {
             format!("{} · committed to {}", entry.description, entry.branch)
         }
+        OutcomeKind::Held {
+            commit,
+            held: graph_store::HeldAs::Proposal,
+        } => format!(
+            "{} · held as commit {}, on no branch until published to {}",
+            entry.description,
+            studio_ui::short_commit_id(commit),
+            entry.branch
+        ),
+        OutcomeKind::Held {
+            commit,
+            held: graph_store::HeldAs::Snapshot,
+        } => format!(
+            "{} · saved as snapshot {}, on no branch",
+            entry.description,
+            studio_ui::short_commit_id(commit)
+        ),
         OutcomeKind::Refused { message } => format!(
             "{} · refused: {message}. Nothing was written.",
             entry.description

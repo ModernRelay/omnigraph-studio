@@ -474,7 +474,11 @@ and a 97 % fill let the text behind show through.
 - The activity log (bottom dock) keeps every write with its outcome. It draws again when an
   outcome is logged, and once a minute while it lists writes, for the times they read; a read
   starting or ending, which raises the same session event, leaves it as it was (since
-  2026-10-21; before, every session event drew it).
+  2026-10-21; before, every session event drew it). Only a commit that moved its branch reads
+  "committed to ⑂ main"; a write held off every branch (`OutcomeKind::Held`) names its commit
+  and where it is: a proposal "was held as commit OPOSALAA to publish to ⑂ main", a snapshot
+  "was saved as snapshot APSHOTAA", the full id and the `commit publish`/`commit drop` lines
+  in the tooltip; neither toasts, since neither is a publish (since 2026-10-21).
 
 ### Visual language
 
@@ -850,6 +854,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | The activity log says where a held write is | `graph_store` `a_held_write_is_logged_held_and_moves_no_head` (a mutation `as commit`, one `as unattached branch` and a `branch merge … as commit` statement, answered with `unpublished` and `unattached` commits), `a_write_without_a_commit_names_none` (`OutcomeKind::written` by `CommitKind`); `studio` `a_held_write_says_it_is_on_no_branch`; at `7fd9cc9` the server answers such writes with the commit's `kind` (`CommitKindOutput`) | Before, `send_write` passed only a `published` commit, so all three logged `Committed { commit: None }` and read "… committed to ⑂ main" with no commit; the merge's on release. Now each is `Held` with its commit, on the branch it was sent to, no head moves and no `Committed` event; the row reads "was held as commit OPOSALAA to publish to ⑂ main" or "was saved as snapshot APSHOTAA". A commit of a kind this build does not know is an unknown outcome. Not yet seen in the running app |
 | 2026-10-21 | A 403 on one graph leaves another graph's access as read | `graph_client` `a_refusal_on_a_graph_is_counted_for_that_graph_alone` (`GraphClient::refusals(graph)`, by the id in `graphs/{id}/…`, escaped or not: `a_path_segment_reads_its_escapes`); `graph_store` `access_is_read_per_branch_and_again_after_a_refusal`, extended with a `notes` session on the same connection | Before, the client counted 403s for the whole server, so a refusal on `knowledge` made the `notes` session forget its answer and read `/access` again, and an answer in flight landed nowhere. Now `knowledge` reads its access again after its 403, and `notes`, asked again, asks nothing and still allows reading |
 | 2026-10-21 | Parking a graph lets go of its server's watch | `graph_store` `the_head_watch_sees_other_writers_commits_while_a_window_is_active`, extended (`Connection::watched`) | Watched while shown; parked, no watch; shown again, watched again |
 | 2026-10-21 | What builds before 2026-10-20 filed under a server's name is not read (decided: no conversion code) | `graph_store::named_keys` deleted with its callers (`GraphSession::new`'s move, `agent_panel` `AgentSessions::global`'s `move_named_graphs`) and `SessionEvent::SavedQueriesMoved` with the Queries panel's arm for it; their tests `a_name_resolves_only_to_a_known_server`, `settings_kept_under_a_servers_name_move_to_its_address_once`, `saved_queries_move_to_the_graphs_key_without_writing_over_one`, `a_graph_opening_takes_its_saved_queries_along` and `conversations_filed_by_server_name_move_to_the_graphs_key` deleted; no source names `named_keys`, `move_named` or `SavedQueriesMoved` | Supersedes the 2026-10-20 row on one key per graph: settings under `graphs."<server name>/<graph id>"`, query folders `<server>~<graph>` and conversations filed by a server's name stay where they are, unread; Studio writes only under `<server url>/<graph id>` |

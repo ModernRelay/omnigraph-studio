@@ -65,6 +65,8 @@ pub struct ApiErrorSummary {
     pub code: Option<crate::api::ErrorCode>,
     /// The server's diagnostic for a refused query: where in the text, and what (spec 007).
     pub diagnostic: Option<Value>,
+    /// Why a commit's changes could not be compared with its parent's (a 409).
+    pub change_diff_refusal: Option<crate::api::ChangeDiffRefusalReason>,
 }
 
 /// What a read at a commit was refused for because the commit predates the current schema: a
@@ -780,6 +782,7 @@ impl GraphClient {
                     .into(),
                 code: None,
                 diagnostic: None,
+                change_diff_refusal: None,
             })),
             _ => Err(ReadError::Refused(summary(raw.status, &raw.body))),
         }
@@ -1337,6 +1340,14 @@ fn summary(status: StatusCode, body: &[u8]) -> ApiErrorSummary {
             message: error.error,
             code: error.code,
             diagnostic: error.diagnostic,
+            change_diff_refusal: error
+                .other
+                .get("change_diff_refusal")
+                .cloned()
+                .and_then(|refusal| {
+                    serde_json::from_value::<crate::api::ChangeDiffRefusalOutput>(refusal).ok()
+                })
+                .map(|refusal| refusal.reason),
         },
         Err(_) => ApiErrorSummary {
             status: status.as_u16(),
@@ -1346,6 +1357,7 @@ fn summary(status: StatusCode, body: &[u8]) -> ApiErrorSummary {
                 .to_owned(),
             code: None,
             diagnostic: None,
+            change_diff_refusal: None,
         },
     }
 }
@@ -2023,6 +2035,34 @@ mod tests {
         );
     }
 
+    /// A commit's changes refused because it has no parent say so by the refusal's reason, as
+    /// the server answers for the graph's first commit (`change_diff_refusal`); a schema boundary
+    /// says its own, and another refusal none.
+    #[test]
+    fn a_refused_commit_comparison_names_its_reason() {
+        use crate::api::ChangeDiffRefusalReason;
+        let refused = |body: &'static str| {
+            let client = client(respond(409, Some(CONTRACT), body));
+            match block_on(client.commit_changes("g", "c0", None, 10)) {
+                Err(ReadError::Refused(summary)) => summary.change_diff_refusal,
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            refused(
+                r#"{"error":"commit 'c0' has no first parent; bootstrap from an exact baseline","code":"conflict","change_diff_refusal":{"reason":"parentless_commit","graph_commit_id":"c0"}}"#
+            ),
+            Some(ChangeDiffRefusalReason::ParentlessCommit)
+        );
+        assert_eq!(
+            refused(
+                r#"{"error":"schema boundary","change_diff_refusal":{"reason":"schema_boundary","graph_commit_id":"c0","type_name":"Person"}}"#
+            ),
+            Some(ChangeDiffRefusalReason::SchemaBoundary)
+        );
+        assert_eq!(refused(r#"{"error":"conflict"}"#), None);
+    }
+
     /// A merge preview reads what a merge would do, or the conflicts that would stop it; any
     /// other answer is a refused read, never a merge outcome.
     #[test]
@@ -2260,6 +2300,7 @@ mod tests {
                 message: message.into(),
                 code: None,
                 diagnostic: None,
+                change_diff_refusal: None,
             }
             .historical_gap()
         };

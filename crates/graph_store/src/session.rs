@@ -59,9 +59,64 @@ impl<T> Loadable<T> {
 /// How one write ended, kept for the activity log (constitution III).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutcomeKind {
-    Committed { commit: Option<String> },
-    Refused { message: String },
-    Unknown { reason: String },
+    /// The write landed on its branch: `commit` is the branch's head now, or none when it
+    /// published no commit (a branch created or deleted, a merge already up to date, a
+    /// mutation that matched nothing).
+    Committed {
+        commit: Option<String>,
+    },
+    /// The write landed as `commit`, which no branch's head moved to: a proposal or a snapshot,
+    /// as `held` says. The outcome's branch is the one the write was sent to, which did not
+    /// change.
+    Held {
+        commit: String,
+        held: HeldAs,
+    },
+    Refused {
+        message: String,
+    },
+    Unknown {
+        reason: String,
+    },
+}
+
+/// What a write that moved no branch made of its result ([`OutcomeKind::Held`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldAs {
+    /// A proposal, written `as commit` (a mutation or a merge): on no branch until `commit
+    /// publish` puts it on the branch it was made for; `commit drop` drops it.
+    Proposal,
+    /// An unattached snapshot, written `as unattached branch`: read by its id, never published.
+    Snapshot,
+}
+
+impl OutcomeKind {
+    /// How a write that went through ended, by the kind of the commit its answer names (`None`
+    /// when it made none): a published commit moved its branch's head, a proposal or a snapshot
+    /// moved none, and of a kind this build does not know, whether a branch moved is unknown.
+    pub fn written(commit: Option<(String, CommitKind)>) -> Self {
+        match commit {
+            None => OutcomeKind::Committed { commit: None },
+            Some((commit, _)) if commit.is_empty() => OutcomeKind::Committed { commit: None },
+            Some((commit, CommitKind::Published)) => OutcomeKind::Committed {
+                commit: Some(commit),
+            },
+            Some((commit, CommitKind::Unpublished)) => OutcomeKind::Held {
+                commit,
+                held: HeldAs::Proposal,
+            },
+            Some((commit, CommitKind::Unattached)) => OutcomeKind::Held {
+                commit,
+                held: HeldAs::Snapshot,
+            },
+            Some((commit, CommitKind::Other)) => OutcomeKind::Unknown {
+                reason: format!(
+                    "The server wrote commit {commit}, of a kind Studio does not know, so whether \
+                     a branch moved is not known"
+                ),
+            },
+        }
+    }
 }
 
 /// A write [`GraphSession::external_write`] counts while it runs. It can travel to the task that
@@ -152,6 +207,10 @@ pub enum SessionEvent {
     },
     /// What the credential may do was read, or is to be read again ([`GraphSession::allows`]).
     AccessChanged,
+    /// The connection's token changed, and the session reads under the new one: a view that
+    /// shows what it read of the server itself (the storage inspector) reads it again, since
+    /// the new token may see less. A parked graph says so when shown again.
+    CredentialChanged,
 }
 
 /// How many answers to reads pinned to a commit, and Blob cells at a commit, a session keeps. A
@@ -647,6 +706,11 @@ pub struct GraphSession {
     /// Whether a window shows the graph ([`Self::set_shown`]): a parked one asks after no head
     /// and no branch list, and holds no watch on its server.
     shown: bool,
+    /// A new token came while the graph was parked: its counts, catalog and branch list are
+    /// read under it when shown again ([`Self::read_again_for_credential`]).
+    credential_owed: bool,
+    /// What the credential may do was forgotten while parked: it is read when shown again.
+    access_owed: bool,
     _connection_watch: Option<ConnectionWatch>,
 }
 
@@ -726,6 +790,8 @@ impl GraphSession {
             credential: 0,
             _connection_events: None,
             shown: true,
+            credential_owed: false,
+            access_owed: false,
             _connection_watch: None,
         };
         session.credential = session.client(cx).credential_changes();
@@ -824,8 +890,8 @@ impl GraphSession {
     /// ([`Self::forget_reads`]) and what the session shows of the graph is read again
     /// ([`Self::read_again_for_credential`]); after a new token or a 403 on the graph what the
     /// credential may do is forgotten too, and the session's branch is read again; views that
-    /// show what it allows hear [`SessionEvent::AccessChanged`] and ask for theirs. Whether
-    /// anything was forgotten.
+    /// show what it allows hear [`SessionEvent::AccessChanged`] and ask for theirs. A parked
+    /// graph forgets at once and reads when shown again. Whether anything was forgotten.
     fn sync_access(&mut self, cx: &mut Context<Self>) -> bool {
         let client = self.client(cx);
         let credential = client.credential_changes();
@@ -842,11 +908,22 @@ impl GraphSession {
         {
             return false;
         }
+        // A parked graph asks the server nothing; shown again, it reads what it may do.
+        if self.shown {
+            self.access_changed(cx);
+        } else {
+            self.access_owed = true;
+        }
+        true
+    }
+
+    /// What the credential may do was forgotten: views that show it hear so and ask for theirs,
+    /// and the session's branch is read again.
+    fn access_changed(&mut self, cx: &mut Context<Self>) {
         cx.emit(SessionEvent::AccessChanged);
         cx.notify();
         let branch = AccessScope::branch(&self.branch);
         self.read_access(branch, cx);
-        true
     }
 
     /// Forgets every answer kept, and the reads under way with them, which then keep nothing
@@ -873,19 +950,38 @@ impl GraphSession {
     /// Reads again, under a new token, what the session shows of the graph as the old one was
     /// answered it: the type counts, the stored-query catalog and the branch list. The new
     /// token's policy may refuse it what the old one read, so none of it shows meanwhile: each
-    /// is being read, and views hear it. A branch the new token's list does not hold is left,
-    /// as any branch the list no longer holds is; drafts on it stay.
+    /// is being read, and views hear it, and [`SessionEvent::CredentialChanged`] tells views
+    /// that read the server themselves. A branch the new token's list does not hold is left, as
+    /// any branch the list no longer holds is; drafts on it stay.
+    ///
+    /// A parked graph (one no window shows, [`Self::set_shown`]) asks the server nothing: it
+    /// lets go of the old token's answers and the reads still out under it, and reads under the
+    /// new one when shown again.
     fn read_again_for_credential(&mut self, cx: &mut Context<Self>) {
         self.counts_reading = false;
         self.counts_again = false;
-        self.reload_counts(cx);
-        self.reload_stored_queries(cx);
         // Not kept while it is read: it is the old token's.
         self.branches = Loadable::Loading;
-        self.read_branches(None, cx);
+        if self.shown {
+            self.reload_counts(cx);
+            self.reload_stored_queries(cx);
+            self.read_branches(None, cx);
+        } else {
+            self.datasets = Loadable::Loading;
+            self.dataset_counts.clear();
+            self.stored_queries = Loadable::Loading;
+            self._datasets_task = None;
+            self._stored_queries_task = None;
+            self._branches_task = None;
+            self.branch_recheck = None;
+            self.credential_owed = true;
+        }
         cx.emit(SessionEvent::CountsChanged);
         cx.emit(SessionEvent::StoredQueriesChanged);
         cx.emit(SessionEvent::BranchesChanged);
+        if self.shown {
+            cx.emit(SessionEvent::CredentialChanged);
+        }
         cx.notify();
     }
 
@@ -1041,7 +1137,7 @@ impl GraphSession {
         };
         self.run_write(
             send,
-            published,
+            |output: &ChangeOutput| output.commit.as_ref(),
             move |_, _, _| WriteLog::new(branch, description),
             |_, _, _| {},
             cx,
@@ -1956,9 +2052,10 @@ impl GraphSession {
     }
 
     /// Whether a window shows the graph. A graph its window parked (another graph shown in its
-    /// place) asks after no head and no branch list, and stops holding its server's health
-    /// checks ([`Connection::watch`]); shown again, it asks at once when a poll came meanwhile,
-    /// as a window's activation does. A session starts shown.
+    /// place) asks after no head and no branch list, stops holding its server's health checks
+    /// ([`Connection::watch`]), and reads nothing again for a new token or a 403; shown again,
+    /// it reads what those owe, and asks after its heads at once when a poll came meanwhile, as
+    /// a window's activation does. A session starts shown.
     pub fn set_shown(&mut self, shown: bool, cx: &mut Context<Self>) {
         if self.shown == shown {
             return;
@@ -1969,6 +2066,14 @@ impl GraphSession {
             return;
         }
         self._connection_watch = Some(self.connection.update(cx, |c, cx| c.watch(cx)));
+        // A new token, or a 403 on the graph, while parked: what the graph shows, and what the
+        // credential may do, are read now.
+        if std::mem::take(&mut self.credential_owed) {
+            self.read_again_for_credential(cx);
+        }
+        if std::mem::take(&mut self.access_owed) {
+            self.access_changed(cx);
+        }
         if cx.active_window().is_some() && std::mem::take(&mut self.head_check_missed) {
             self.check_heads(cx);
         }
@@ -2953,25 +3058,13 @@ impl GraphSession {
     }
 
     /// How many neighbours `id` has through `group`, at `snapshot` (the branch head when
-    /// `None`). Counts asked for in the same turn for one node type, relationship and commit
-    /// are read together, as `builder::page_degrees` reads of up to a hundred nodes in id
-    /// order (`crate::degrees`); an asker that stops waiting is left out, and a read nobody
-    /// waits for any more is stopped.
-    pub fn degree(
-        &mut self,
-        type_name: &str,
-        group: &RelationshipGroup,
-        id: &str,
-        snapshot: Option<String>,
-        cx: &mut Context<Self>,
-    ) -> Task<Result<u64, String>> {
-        let read = self.degree_at(type_name, group, id, snapshot, cx);
-        cx.background_spawn(async move { read.await.map(|(n, _)| n) })
-    }
-
-    /// [`Self::degree`], with the commit the count holds at: the one asked for, or the one the
-    /// read answered at, for a count asked for at the head. A view pinned by its first answer
-    /// compares it with its pin, as it does every other answer.
+    /// `None`), with the commit the count holds at: the one asked for, or the one the read
+    /// answered at, for a count asked for at the head. A view pinned by its first answer
+    /// compares it with its pin, as it does every other answer. Counts asked for in the same
+    /// turn for one node type, relationship and commit are read together, as
+    /// `builder::page_degrees` reads of up to a hundred nodes in id order (`crate::degrees`);
+    /// an asker that stops waiting is left out, and a read nobody waits for any more is
+    /// stopped. Views ask through [`Self::degree_in`], which notes what the count depends on.
     pub(crate) fn degree_at(
         &mut self,
         type_name: &str,
@@ -3253,7 +3346,7 @@ impl GraphSession {
         let send = async move { client.mutate(&graph, &request, if_commit.as_deref()).await };
         self.run_write(
             send,
-            published,
+            |output: &ChangeOutput| output.commit.as_ref(),
             move |_, outcome, _| {
                 let branch = match outcome {
                     WriteOutcome::Committed(output) if statement && !output.branch.is_empty() => {
@@ -3299,7 +3392,10 @@ impl GraphSession {
                 reason: "Studio stopped before the server answered.".into(),
             });
             this.update(cx, |this, cx| {
-                let went_through = matches!(outcome, OutcomeKind::Committed { .. });
+                let went_through = matches!(
+                    outcome,
+                    OutcomeKind::Committed { .. } | OutcomeKind::Held { .. }
+                );
                 let made = (creates_branch && went_through).then(|| branch.clone());
                 this.finish_write(branch, description, outcome, None, None, cx);
                 if let Some(made) = made {
@@ -3535,9 +3631,9 @@ impl GraphSession {
     /// counted in [`Self::writes_in_flight`] while out, sent once and never again, and run to
     /// its outcome whoever still waits for it ([`Self::to_outcome`]). When it ends, `log` names
     /// the branch it went to and says what it did, from its answer, after doing what must come
-    /// before the outcome is logged; the outcome is logged with the commit `commit` finds in
-    /// the answer, which becomes its branch's head; then `after` does the write's own
-    /// follow-up.
+    /// before the outcome is logged; the outcome is logged by the commit `commit` finds in the
+    /// answer ([`OutcomeKind::written`]): a published one becomes its branch's head, a proposal
+    /// or a snapshot is logged as held; then `after` does the write's own follow-up.
     fn run_write<T: 'static>(
         &mut self,
         send: impl Future<Output = WriteOutcome<T>> + 'static,
@@ -3550,9 +3646,7 @@ impl GraphSession {
         cx.emit(SessionEvent::ActivityChanged);
         let work = cx.spawn(async move |this, cx| {
             let outcome = send.await;
-            let kind = outcome_kind(&outcome, |value| {
-                commit(value).map(|c| c.graph_commit_id.clone())
-            });
+            let kind = outcome_kind(&outcome, commit);
             let parent = parent_of(&outcome, commit);
             this.update(cx, |this, cx| {
                 let WriteLog {
@@ -3588,17 +3682,18 @@ impl WriteLog {
     }
 }
 
-/// How a write ended, with the commit it published. A write that published none (a branch
-/// created or deleted, a merge already up to date, a mutation that matched nothing) is
-/// `Committed { commit: None }`: it moves no head and shows no commit.
+/// How a write ended, by the commit its answer names, which `commit` finds
+/// ([`OutcomeKind::written`]). A write that made none (a branch created or deleted, a merge
+/// already up to date, a mutation that matched nothing) is `Committed { commit: None }`: it
+/// moves no head and shows no commit.
 fn outcome_kind<T>(
     outcome: &WriteOutcome<T>,
-    commit: impl Fn(&T) -> Option<String>,
+    commit: impl Fn(&T) -> Option<&CommitOutput>,
 ) -> OutcomeKind {
     match outcome {
-        WriteOutcome::Committed(value) => OutcomeKind::Committed {
-            commit: commit(value).filter(|commit| !commit.is_empty()),
-        },
+        WriteOutcome::Committed(value) => OutcomeKind::written(
+            commit(value).map(|commit| (commit.graph_commit_id.clone(), commit.kind)),
+        ),
         WriteOutcome::Refused(error) => OutcomeKind::Refused {
             message: error.body.error.clone(),
         },
@@ -3608,16 +3703,8 @@ fn outcome_kind<T>(
     }
 }
 
-/// The parent of the commit a write's answer names.
-/// The commit a mutation's answer names when it moved its branch's head: a proposal
-/// (`as commit`) or a snapshot (`as unattached branch`) is a commit no branch's head moved to.
-fn published(output: &ChangeOutput) -> Option<&CommitOutput> {
-    output
-        .commit
-        .as_ref()
-        .filter(|commit| commit.kind == CommitKind::Published)
-}
-
+/// The parent of the commit a write's answer names, which `commit` finds: the head below it
+/// when it is published.
 fn parent_of<T>(
     outcome: &WriteOutcome<T>,
     commit: impl Fn(&T) -> Option<&CommitOutput>,
@@ -3668,20 +3755,42 @@ mod tests {
     }
 
     /// A write that published no commit (a branch created or deleted, a merge already up to
-    /// date) is done without one: it moves no head and offers no commit to view.
+    /// date) is done without one: it moves no head and offers no commit to view. One whose
+    /// commit is a proposal or a snapshot is held, with its commit; one of a kind this build does
+    /// not know has an unknown outcome, since whether a branch moved is not known.
     #[test]
     fn a_write_without_a_commit_names_none() {
-        assert!(matches!(
-            outcome_kind(&WriteOutcome::Committed(()), |_| None),
+        let written = |commit: Option<(&str, CommitKind)>| {
+            OutcomeKind::written(commit.map(|(id, kind)| (id.to_owned(), kind)))
+        };
+        assert_eq!(written(None), OutcomeKind::Committed { commit: None });
+        assert_eq!(
+            written(Some(("", CommitKind::Published))),
             OutcomeKind::Committed { commit: None }
-        ));
+        );
+        assert_eq!(
+            written(Some(("c2", CommitKind::Published))),
+            OutcomeKind::Committed {
+                commit: Some("c2".into())
+            }
+        );
+        assert_eq!(
+            written(Some(("p1", CommitKind::Unpublished))),
+            OutcomeKind::Held {
+                commit: "p1".into(),
+                held: HeldAs::Proposal
+            }
+        );
+        assert_eq!(
+            written(Some(("s1", CommitKind::Unattached))),
+            OutcomeKind::Held {
+                commit: "s1".into(),
+                held: HeldAs::Snapshot
+            }
+        );
         assert!(matches!(
-            outcome_kind(&WriteOutcome::Committed(()), |_| Some(String::new())),
-            OutcomeKind::Committed { commit: None }
-        ));
-        assert!(matches!(
-            outcome_kind(&WriteOutcome::Committed(()), |_| Some("c2".into())),
-            OutcomeKind::Committed { commit: Some(commit) } if commit == "c2"
+            written(Some(("o1", CommitKind::Other))),
+            OutcomeKind::Unknown { reason } if reason.contains("o1")
         ));
     }
 
@@ -3871,6 +3980,98 @@ mod tests {
             assert_eq!(session.head("release"), Some("r9"));
             assert_ne!(session.head("main"), Some("r9"), "main did not move");
         });
+    }
+
+    /// A write held off every branch is logged as held, with its commit, and moves no head: a
+    /// mutation `as commit` is a proposal, one `as unattached branch` a snapshot, and a merge
+    /// statement `as commit` a proposal for its target. None of them reads as committed to the
+    /// branch it was sent to.
+    #[gpui::test]
+    async fn a_held_write_is_logged_held_and_moves_no_head(cx: &mut TestAppContext) {
+        let held = |branch: &str, id: &str, kind: &str| {
+            let answer = serde_json::json!({
+                "branch": branch,
+                "query_name": "q",
+                "affected_nodes": 1,
+                "affected_edges": 0,
+                "commit": { "graph_commit_id": id, "graph_manifest_version": 10_415_222_161_995_537_841_u64,
+                            "kind": kind, "created_at": 0, "parent_commit_id": "m1" },
+            });
+            (200, answer)
+        };
+        let session = answering_session(
+            vec![
+                held("main", "p1", "unpublished"),
+                held("main", "s1", "unattached"),
+                held("release", "p2", "unpublished"),
+            ],
+            "main",
+            cx,
+        );
+        cx.run_until_parked();
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let committed = heard.clone();
+        cx.update(|cx| {
+            cx.subscribe(&session, move |_, event: &SessionEvent, _| {
+                if let SessionEvent::Committed { branch } = event {
+                    committed.lock().unwrap().push(branch.clone());
+                }
+            })
+            .detach()
+        });
+        for (query, branch) in [
+            (
+                "query add() as commit { insert Person { slug: \"a\" } }",
+                Some("main"),
+            ),
+            (
+                "query snap() as unattached branch { insert Person { slug: \"b\" } }",
+                Some("main"),
+            ),
+            ("branch merge feature into release as commit", None),
+        ] {
+            let write = session.update(cx, |session, cx| {
+                let request = ChangeRequest {
+                    query: query.into(),
+                    name: None,
+                    params: None,
+                    branch: branch.map(str::to_owned),
+                };
+                session.write_request(request, None, "Write".into(), cx)
+            });
+            write.await;
+            cx.run_until_parked();
+        }
+        session.read_with(cx, |session, _| {
+            let logged: Vec<(&str, &OutcomeKind)> = session
+                .outcomes
+                .iter()
+                .map(|entry| (entry.branch.as_str(), &entry.outcome))
+                .collect();
+            let proposal = |commit: &str| OutcomeKind::Held {
+                commit: commit.into(),
+                held: HeldAs::Proposal,
+            };
+            let snapshot = OutcomeKind::Held {
+                commit: "s1".into(),
+                held: HeldAs::Snapshot,
+            };
+            assert_eq!(
+                logged,
+                [
+                    ("main", &proposal("p1")),
+                    ("main", &snapshot),
+                    ("release", &proposal("p2")),
+                ]
+            );
+            for (branch, commit) in [("main", "p1"), ("main", "s1"), ("release", "p2")] {
+                assert_ne!(session.head(branch), Some(commit), "{branch} moved");
+            }
+        });
+        assert!(
+            heard.lock().unwrap().is_empty(),
+            "no branch heard of a commit"
+        );
     }
 
     /// A merge asked to delete its branch is logged as what happened: deleted with it, or
@@ -4663,7 +4864,7 @@ mod tests {
             let group = group(edge, other);
             session.update(cx, |session, cx| {
                 ids.iter()
-                    .map(|id| session.degree("Person", &group, id, Some("c1".into()), cx))
+                    .map(|id| session.degree_at("Person", &group, id, Some("c1".into()), cx))
                     .collect::<Vec<_>>()
             })
         };
@@ -4673,7 +4874,9 @@ mod tests {
         let works = ask(cx, "WorksAt", "Company", &["p-1", "p-3"]);
         let mut counts = Vec::new();
         for count in knows.into_iter().chain(works) {
-            counts.push(count.await.unwrap());
+            let (count, at) = count.await.unwrap();
+            assert_eq!(at.as_deref(), Some("c1"), "held at the commit asked for");
+            counts.push(count);
         }
         assert_eq!(counts, vec![3, 1, 0, 1, 3], "a node without a row has none");
         let mut sent = reads.lock().unwrap().clone();
@@ -4702,7 +4905,7 @@ mod tests {
         // A count asked for at the head of a branch the session leaves in the same turn is not
         // read at the new branch's head.
         let at_head = session.update(cx, |session, cx| {
-            let count = session.degree("Person", &group("Knows", "Person"), "p-1", None, cx);
+            let count = session.degree_at("Person", &group("Knows", "Person"), "p-1", None, cx);
             session.set_branch("fix".into(), cx);
             count
         });
@@ -5761,7 +5964,7 @@ mod tests {
     /// and no answer kept from the old token is given again, since the new one may see less:
     /// the type counts, the stored-query catalog and the branch list are read again, and none
     /// of the old token's shows meanwhile. A 403 alone reads what the credential may do again
-    /// and keeps the answers.
+    /// and keeps the answers. A parked graph forgets at once and reads only when shown again.
     #[gpui::test]
     async fn a_new_token_reads_access_and_every_answer_again(cx: &mut TestAppContext) {
         use futures::AsyncReadExt as _;
@@ -5942,6 +6145,38 @@ mod tests {
         );
         assert_eq!(change(cx), Allowed::No);
         assert_eq!(read_at_c1(cx), 0, "kept through a 403");
+
+        // A graph its window parked asks the server nothing for a new token: the old token's
+        // answers go at once, and the new token's are read when the graph is shown again.
+        session.update(cx, |session, cx| session.set_shown(false, cx));
+        cx.run_until_parked();
+        shown.lock().unwrap().clear();
+        accesses.store(0, Ordering::SeqCst);
+        connection.update(cx, |connection, cx| {
+            connection.set_token(Some("rw".into()), cx)
+        });
+        cx.run_until_parked();
+        assert!(
+            shown.lock().unwrap().is_empty(),
+            "a parked graph read {:?}",
+            shown.lock().unwrap()
+        );
+        assert_eq!(accesses.load(Ordering::SeqCst), 0, "nor what it may do");
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.count_of(EntityKind::Node, "Person"), None);
+            assert!(session.branches.is_loading());
+            assert!(session.stored_queries.is_loading());
+        });
+        session.update(cx, |session, cx| session.set_shown(true, cx));
+        cx.run_until_parked();
+        let mut asked_again = shown.lock().unwrap().clone();
+        asked_again.sort();
+        assert_eq!(asked_again, ["/branches", "/queries", "/snapshot"]);
+        assert_eq!(accesses.load(Ordering::SeqCst), 1);
+        assert_eq!(change(cx), Allowed::Yes, "the new token's own answer");
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.count_of(EntityKind::Node, "Person"), Some(7));
+        });
     }
 
     /// A branch starts at a branch's head or at a commit, and its request names the one, never
@@ -6634,10 +6869,10 @@ mod tests {
         read.await.unwrap();
         let count = |cx: &mut TestAppContext, id: &str, commit: &str| {
             let read = session.update(cx, |session, cx| {
-                session.degree("Person", &group, id, Some(commit.into()), cx)
+                session.degree_at("Person", &group, id, Some(commit.into()), cx)
             });
             cx.run_until_parked();
-            read
+            async move { read.await.map(|(count, _)| count) }
         };
         assert_eq!(count(cx, "p1", "c1").await, Ok(3));
         assert_eq!(count(cx, "p2", "c1").await, Ok(0), "no row is none");
