@@ -56,6 +56,9 @@ pub struct ConnectionRegistry {
     cli_errors: Vec<String>,
     /// The CLI config's aliases, as last read.
     aliases: Vec<CliAlias>,
+    /// Servers saved by Studio and not connected this run, since another connection has their
+    /// address (the environment's): they stay in the saved list.
+    kept_saved: Vec<SavedServer>,
     _watch: Option<Task<()>>,
 }
 
@@ -119,16 +122,24 @@ impl ConnectionRegistry {
             }
         }
 
-        this.operator_stamp = cli_config::stamp(operator_dir.as_deref());
-        this.apply_operator_files(
-            cli_config::read_operator(operator_dir.as_deref()),
-            &saved,
-            cx,
-        );
-        this.watch_operator_files(cx);
-
-        // Each address was saved as `add_server` checked it, scheme included.
-        for saved in saved.servers.into_iter().filter(|s| s.source == "studio") {
+        // Studio's own servers before the CLI's: an address is one connection (spec 003), and
+        // one added here keeps it when a CLI target comes to name it too. Each address was
+        // saved as `add_server` checked it, scheme included.
+        for saved in saved
+            .servers
+            .iter()
+            .filter(|s| s.source == "studio")
+            .cloned()
+        {
+            if let Some(other) = this.connected_at(&saved.url, cx) {
+                this.start_errors.push(format!(
+                    "{}: Studio connects to {} already as '{other}', and keeps one connection \
+                     per address; the server stays saved",
+                    saved.name, saved.url
+                ));
+                this.kept_saved.push(saved);
+                continue;
+            }
             let read = cx.read_credentials(&saved.url);
             let entry = ServerEntry {
                 name: saved.name,
@@ -146,14 +157,30 @@ impl ConnectionRegistry {
                     continue;
                 }
             };
-            connection.update(cx, |connection, _| connection.await_token());
+            let wait = connection.update(cx, |connection, _| connection.await_token());
             cx.spawn(async move |_, cx| {
                 let read = read.await;
-                connection.update(cx, |connection, cx| connection.token_read(read, cx));
+                connection.update(cx, |connection, cx| connection.token_read(wait, read, cx));
             })
             .detach();
         }
+
+        this.operator_stamp = cli_config::stamp(operator_dir.as_deref());
+        this.apply_operator_files(
+            cli_config::read_operator(operator_dir.as_deref()),
+            &saved,
+            cx,
+        );
+        this.watch_operator_files(cx);
         this
+    }
+
+    /// The name of the connection at `url`, when there is one.
+    fn connected_at(&self, url: &str, cx: &App) -> Option<String> {
+        self.connections.iter().find_map(|connection| {
+            let server = &connection.read(cx).server;
+            (server.url == url).then(|| server.name.clone())
+        })
     }
 
     fn empty(http: Arc<dyn HttpClient>, operator_dir: Option<PathBuf>) -> Self {
@@ -166,6 +193,7 @@ impl ConnectionRegistry {
             cli_tokens: HashMap::new(),
             cli_errors: Vec::new(),
             aliases: Vec::new(),
+            kept_saved: Vec::new(),
             _watch: None,
         }
     }
@@ -292,6 +320,27 @@ impl ConnectionRegistry {
                     connection.update(cx, |connection, cx| connection.set_token(token, cx));
                     changed = true;
                 }
+                continue;
+            }
+            // An address Studio reaches already as a server of its own (added in Studio, or the
+            // environment's) is that connection: a second would open its graphs twice, and the
+            // graph keys, window restore and links would each find either. The CLI server's
+            // connection at its old address, if any, goes.
+            let other = self.connections.iter().find_map(|connection| {
+                let entry = &connection.read(cx).server;
+                (entry.url == url && entry.source != ServerSource::Cli).then(|| entry.name.clone())
+            });
+            if let Some(other) = other {
+                errors.push(format!(
+                    "CLI target '{}' is at {url}, which Studio connects to already as \
+                     '{other}'; Studio keeps one connection per address",
+                    server.name
+                ));
+                if let Some(ix) = existing {
+                    self.connections.remove(ix);
+                    changed = true;
+                }
+                self.cli_tokens.remove(&server.name);
                 continue;
             }
             // New, or at another address: a connection of its own. The graphs remembered for
@@ -429,7 +478,8 @@ impl ConnectionRegistry {
         .detach();
     }
 
-    /// Writes Studio-added servers and remembered graph ids to the data directory.
+    /// Writes Studio-added servers and remembered graph ids to the data directory, those not
+    /// connected this run among them.
     pub fn save(&self, cx: &App) {
         let servers = self
             .connections
@@ -448,6 +498,7 @@ impl ConnectionRegistry {
                     graphs: server.known_graphs.clone(),
                 })
             })
+            .chain(self.kept_saved.iter().cloned())
             .collect();
         let saved = SavedServers { servers };
         if let Ok(text) = serde_json::to_string_pretty(&saved) {
@@ -501,7 +552,8 @@ mod tests {
     /// The CLI's servers follow its files without a restart: a token changed there reaches the
     /// same connection, a token typed into Studio stays until the files change theirs, a new
     /// address is a new connection, servers come and go, and files that cannot be read keep
-    /// every server and say why.
+    /// every server and say why. An address is one connection: a CLI target at the address of
+    /// a server added in Studio is said, not connected.
     #[gpui::test]
     async fn cli_servers_follow_the_cli_files(cx: &mut TestAppContext) {
         let sent: Arc<Mutex<Vec<String>>> = Arc::default();
@@ -633,6 +685,43 @@ mod tests {
         assert!(find(cx, "bad").is_none());
         registry.read_with(cx, |registry, _| assert_eq!(registry.cli_errors().len(), 1));
         assert!(!apply(cx, with_bad()), "nothing else changed");
+
+        // A server added in Studio keeps its address: a CLI target naming it later is not a
+        // second connection, and is said; one whose CLI server moved there drops its old one.
+        let mine = registry.update(cx, |registry, cx| {
+            registry
+                .add_server("mine".into(), "http://d.test".into(), None, Vec::new(), cx)
+                .unwrap()
+        });
+        let at_d = |cx: &mut TestAppContext| {
+            registry.read_with(cx, |registry, cx| {
+                registry
+                    .connections
+                    .iter()
+                    .filter(|connection| connection.read(cx).server.url == "http://d.test")
+                    .count()
+            })
+        };
+        assert!(apply(
+            cx,
+            files(&[
+                ("a", "http://d.test", Some("two")),
+                ("c", "http://c.test", None),
+                ("d", "http://d.test/", None),
+            ])
+        ));
+        assert_eq!(at_d(cx), 1);
+        assert!(find(cx, "a").is_none() && find(cx, "d").is_none());
+        assert_eq!(find(cx, "mine"), Some(mine));
+        registry.read_with(cx, |registry, _| {
+            let said: Vec<_> = registry
+                .cli_errors()
+                .iter()
+                .filter(|error| error.contains("one connection per address"))
+                .collect();
+            assert_eq!(said.len(), 2, "{:?}", registry.cli_errors());
+            assert!(said.iter().all(|error| error.contains("'mine'")));
+        });
 
         // Aliases are found by server and graph; one that names no graph is under none.
         let alias = |name: &str, graph: Option<&str>| CliAlias {

@@ -55,8 +55,10 @@ dialog by keyboard), X (capabilities from the served document).
    2 s off the main thread): a server added there joins the list, one removed leaves it (a
    window open on it keeps its connection), one at a new address is a new connection, a
    target's graph is added, and a token changed there (`omnigraph login`) replaces the
-   connection's, which a connection in use checks at once. A token typed into Studio for a
-   CLI server lasts until the files change that server's token. Files that cannot be read
+   connection's, which a connection in use checks at once. Every session on the connection
+   then reads what the new token may do at once, and forgets every answer it kept with the old
+   one, which may have seen more (spec 002, "What the credential may do"). A token typed into
+   Studio for a CLI server lasts until the files change that server's token. Files that cannot be read
    keep every server as it was and are named in a toast that stays until dismissed, as a
    settings file's are. A token from `OMNIGRAPH_TOKEN_<OWNER>` is the one Studio started with,
    as for the CLI. The untargeted `OMNIGRAPH_BEARER_TOKEN` is sent to no server: a token goes
@@ -64,10 +66,19 @@ dialog by keyboard), X (capabilities from the served document).
    Studio reads `target_config_version: 1` only: every `server` target, and every `managed`
    cluster target with an `endpoint`, lands on a server, its `default_graph` a known graph of
    that server; a `direct` target opens storage, which Studio does not, and is not listed.
-   Targets with one endpoint (as `graph_client::server_root` writes it) and one credential
-   owner, or both anonymous, are one server, as an imported file makes them: it is labelled
-   with the target named like the owner (an imported server's old name), else the first by
-   name, and knows every target's default graph. A server target's token is `OMNIGRAPH_TOKEN_<OWNER>` for
+   An address is one server (decided 2026-10-21): every graph's key is its server's address
+   and its id, so a second connection to one address would open its graphs twice, and window
+   restore, links and toasts would each find either. Of the targets on one endpoint (as
+   `graph_client::server_root` writes it), Studio connects as the CLI's `defaults.target` when
+   it is one of them, else as the first in the file. The targets with its credential (one
+   owner, or both anonymous) are that server too, as an imported file makes them: it is
+   labelled with the target named like the owner (an imported server's old name), else with
+   the one it connects as, and knows each of their default graphs. A target on the endpoint
+   with another credential is named in the toast with why (`CLI target 'open' is not listed:
+   Studio keeps one connection per address, and reaches … as 'default' (the CLI's default
+   target), whose credential differs`), and its aliases land on no server. A CLI target at the
+   address of a server added in Studio is named the same way and not connected; Studio's own
+   servers load before the CLI's, so the one added first keeps the address. A server target's token is `OMNIGRAPH_TOKEN_<OWNER>` for
    its credential owner, else `[<owner>] token = …` in `credentials` when that section's
    `endpoint` covers the target's (the same scheme, host and port, the scheme's default filled
    in, and a path that starts with every segment of the endpoint's), as the CLI checks before
@@ -84,7 +95,8 @@ dialog by keyboard), X (capabilities from the served document).
    is shown on the server that target lands on, and under the target's `default_graph` when it
    names no graph.
 2. Servers added in Studio (URL, optional token). Tokens go to the OS keychain through GPUI's
-   credentials API; the server list goes to Studio's settings.
+   credentials API; the server list goes to Studio's settings. A token typed while the
+   keychain is still being read at start stands when the keychain answers after it.
    An address is made a server root before it is used (`graph_client::server_root`): trimmed,
    without a trailing slash, with `http://` added for a loopback host (`localhost`, `127.*`,
    `[::1]`) and `https://` for any other when no scheme is given; anything but an `http(s)`
@@ -112,8 +124,10 @@ dialog by keyboard), X (capabilities from the served document).
 4. `GET /readyz` for serving state; `GET /graphs` when allowed, for per-graph state
    (`ready`, `loading`, `transitioning`, `blocked`, `stopping`) and `read_available` /
    `write_available`.
-5. Re-check health every 30 s while a window is open and on wake from sleep; back off to 2 min
-   after failures.
+5. Re-check health every 30 s and on wake from sleep while something shows the server: a
+   window showing one of its graphs (a parked graph does not count), or the Open dialog listing
+   it (`Connection::watch`); back off to 2 min after failures. A check that comes while nothing
+   shows it is skipped and the checks stop; the next watch checks at once.
 
 ### The Open dialog
 
@@ -160,7 +174,9 @@ it does.
   refused for some of them. A read waiting out a 429 does so without its slot.
 - A read at a commit is answered once per session: the answer is kept (256 reads, 2,048 Blob
   cells, least recently used out first) and an identical read under way is shared, since a
-  commit never changes. Failures are not kept, and reads at the branch head always go out.
+  commit never changes. Failures are not kept, and reads at the branch head always go out. A
+  new token forgets every answer kept, and a read still out when it changed keeps nothing: the
+  new token may see less, and its refusals are shown (constitution IV).
 - A session watches branch heads for the views pinned to them: its own branch always, and any
   branch a view holds a `HeadWatch` for (a review's). Every `HEAD_POLL` (30 s) while a Studio
   window is active, and when a window becomes active after a poll came while none was, it reads
@@ -169,17 +185,19 @@ it does.
   way per branch, and reads the branch list again. Studio's own commits set the head without
   asking and drop any head read still under way for that branch, whose answer could name the
   commit before. A head move emits `HeadMoved`; a move from a head already seen that is not
-  Studio's own is another writer's commit and emits `Committed`, so commit lists and counts are
+  Studio's own is another writer's commit and emits `Committed`, so head commits and counts are
   read again as after Studio's own. A changed branch list emits `BranchesChanged`, so a branch
   made or deleted outside Studio appears; an unchanged one says nothing. No poll goes out while
-  no window is active or while the graph is unavailable.
-- Each branch's commit list is read once and shared by the views that show it (the history,
-  the branches panel, every query tab's snapshot picker); a commit Studio makes on a branch
-  drops that branch's list, reading the branch list again drops them all (its first read, as
-  the window opens, keeps what was asked for meanwhile), and Refresh reads its branch again. A
-  write used to set off one full commit list per branch in each of those views, one after
-  another. Review and merge checks read their branches' heads themselves, since they decide on
-  the live head.
+  no window is active, while the graph is unavailable, or while its window parked it to show
+  another graph; shown again after a poll came meanwhile, it asks at once.
+- Each branch's newest commit is read once (a page of one) and shared by the views that show
+  it (the history's tags, the branches panel); a commit Studio makes on a branch drops that
+  branch's, reading the branch list again drops those of the branches that came or went (its
+  first read, as the window opens, keeps what was asked for meanwhile), and Refresh reads its
+  branch again. A write used to set off one full commit list per branch in each of those views,
+  one after another. Since 2026-10-20 nothing reads a branch's whole commit list: views read
+  pages (specs 008, 009). Review and merge checks read their branches' heads themselves, since
+  they decide on the live head.
 - The footer's "N queries running" and "Writing…" count requests actually in flight. A read
   whose caller stops waiting (a search superseded by the next keystroke, a closed tab) is
   stopped and counted out. A write runs to its outcome whoever still waits for it, and the
@@ -206,6 +224,12 @@ it does.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | A new token reads what it may do at once and forgets what the old one read | `graph_store` test `a_new_token_reads_access_and_every_answer_again` (a server answering `/access` by the bearer token; the session opened with a read-only token whose access read is held); `graph_client` `a_replaced_token_reaches_every_clone` (only a token that differs counts as a credential change); `access` `a_forgotten_answer_is_read_again`. The same session test against the earlier code, by reading: `Connection::set_token` moved the client's count and nothing subscribed to it, and `Access::landed` compared only its own generation | The write-capable token's access read went at once, with no write, and allowed changing main; the read-only answer released after it landed nowhere; a read at commit c1 kept under the old token was asked again under the new; the narrower token's own answer refused change. A 403 on a write read access again (one read) and kept the answers. Before: the table kept "Your credential may not change main" until a branch move or a write, the held answer landed, and the memo answered without asking |
+| 2026-10-21 | Only a 403 on a graph says its policy may have changed | `graph_client` test `a_refusal_on_a_graph_is_counted_and_one_on_the_server_is_not` (a 403 from `GET /graphs`, `/graphs/discovery`, and one without the contract header; then a read, a write and a forwarded request on a graph, one named `discovery` among them) | The server's own routes counted nothing, the graph's three; neither moved the credential count. Before, the connect probe's `/graphs` refusal, which a static token always gets, forgot every access answer at each connect |
+| 2026-10-21 | An address is one connection | `graph_store` tests `targets_on_one_endpoint_are_one_server` (a file as `omnigraph target import` writes it, with `defaults.target: default`, an anonymous target on the same endpoint, and two targets on another endpoint, the anonymous one first in the file), `cli_servers_follow_the_cli_files` (a server added in Studio at an address two CLI targets then name, one of them moved there) | Three servers: the imported one (named like its owner, both default graphs, its token), the other endpoint's as its first target with its default graph, and the plain one; the anonymous target beside `default` and the keyed one after the first were named in the toast with the target Studio connects as and why, their aliases on no server. The Studio server stayed the address's one connection, both CLI targets named, the moved one's old connection gone. Before, the anonymous target was a second connection to the same address |
+| 2026-10-21 | A token typed while the keychain is read stands | `graph_store` test `a_connect_waits_for_its_token_and_a_cancel_stays` (the keychain's answer given after a token was set) | Nothing sent with the keychain's token; before, `token_read` replaced the typed token unconditionally |
+| 2026-10-21 | Health is checked only while something shows the server, and a parked graph polls nothing | `graph_store` tests `health_is_checked_only_while_the_server_is_watched` (simulated clock), `the_head_watch_sees_other_writers_commits_while_a_window_is_active` (parked, two polls and an activation, then shown); `studio_workspace` `a_graph_reopened_behind_opens_its_tabs_when_first_shown` (a graph added behind and one shown, then switched) | No check while nothing watched, through three intervals; a watch checked at once and then at each interval; dropped, none. Parked, no head probe or branch list at the polls or on activation; shown, one probe at once that saw the newer head. Behind and switched-from graphs were not shown, the shown one was. Before, every server connected once was checked every 30 s for the rest of the run, and every parked graph polled its heads and branches |
+| 2026-10-21 | Every route the client calls is in the contract | `graph_client` test `every_route_the_client_calls_is_in_the_contract` (29 calls, every public read and write, conditional writes both ways, against `openapi/omnigraph-0.14.0-edge.json`'s paths, a `{…}` matching one segment); `api` `object_types_match_the_contract`, `enum_types_match_the_contract` with `BranchMergeRequest.dry_run`, `InvokeStoredQueryRequest`, `QueriesCatalogOutput`, `QueryCatalogEntry`, `ParamDescriptor`, `ParamKind`, `DiffOutput` and the client's `CommitChanges` (`CommitChangesOutput`) added | All pass. `docs/architecture.md` had claimed a route test that did not exist |
 | 2026-10-20 | The Open dialog is reached by keyboard and follows the registry | `studio` tests `the_keyboard_chooses_a_server_and_opens_its_graph` (two servers waiting for a token, so nothing is sent; the select actions dispatched as the keymap sends them) and `a_server_the_registry_replaces_is_followed` (the second server replaced by a new connection); the second against the earlier rule, which subscribed to the servers present when the dialog opened; Zed `v1.23.2` `assets/keymaps/default-macos.json` (up, down, tab and shift-tab to `menu::SelectNext`/`SelectPrevious` with no context) and `crates/editor/src/navigation.rs`, `editor.rs` (`move_up`, `move_down`, `tab` and `backtab` propagate in a single-line editor) | ↓ chose the second server, then its first graph; ↑↑ the first server, ↵ its graph, ↓ the id field with focus in it, ↓ the first server again; ↵ on a graph opened it. After the replacement the choice moved to the first server, the replaced connection's change drew nothing and the replacement's drew once; the earlier rule drew for the replaced one. The registry itself is not built in a test, so its observer is checked by reading only |
 | 2026-10-17 | `script/dev-server` runs on any CLI that speaks contract 0.13 | `git show v0.13.0:crates/omnigraph-cli/src/main.rs` (`Command::Version`); `omnigraph version` from a 0.14.0 main build; the script's check against stub CLIs under bash 5 and macOS's bash 3.2; the script itself with 0.14.0 on port 8798 and a scratch `STUDIO_DEV_DATA` | 0.13.0 prints two lines and no contract; 0.14.0 adds `http-contract 0.13`. 0.13.x and 0.14.0 accepted; 0.12.0 and a CLI printing `http-contract 0.14` refused with the version and contract found. On 0.14.0 the cluster applied, both seeds loaded and `GET /graphs` listed `knowledge` and `notes` ready. Before, the script refused 0.14.0 by its version alone |
 | 2026-10-12 | A server added as `localhost:8080` no longer crashes Studio | crash report: `GraphClient::url` panicked on `path_segments_mut().expect(..)` from the health probe, since `Url::parse("localhost:8080")` reads `localhost` as the scheme and cannot be a base; `graph_client` tests `a_server_address_gets_a_scheme_and_a_bare_word_is_refused`, `a_client_refuses_a_root_that_cannot_take_a_path` | The address becomes `http://localhost:8080`; a root without an http(s) host, or with credentials, is refused with its reason |

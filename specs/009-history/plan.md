@@ -77,8 +77,13 @@ it names, as far back as the oldest commit of the pages read: at most 200 in one
 once, the rows drawn first. A walk follows each page read and starts again while a drawn row
 names one not read; a read that failed is asked again 5 s later, while its row is drawn. That
 route checks `read` on no branch, so it refuses (403) a token whose read grant names branches:
-History then reads up to 20 other branches' whole lists once, until the next load or Refresh. A
-merged parent not read yet, or not had, draws as a stub.
+History then reads the newest 1,000 commits of up to 20 other branches, one page each (the
+server's most), once until the next load or Refresh, and never a listing whole. A merged
+parent not read yet, not had, or in none of those pages draws as a stub, and the merge mark's
+tooltip says which: the server does not serve it (a deleted branch's latest commits, history
+cleaned up); it is not among the newest 1,000 commits of any branch read and the credential may
+not read a commit by its id; its read failed and is asked again while the row shows; it is
+being read; or it is older than the commits read so far.
 A row's change count is read once scrolling has paused for 120 ms, and reads for rows scrolled
 away are dropped.
 
@@ -110,6 +115,7 @@ away are dropped.
 | 2026-10-12 | Change counts on rows | offscreen snapshot of a scratch branch with two edits on top of main | `~3` and `~1` on the edits, `+500 + more` on the seed load, none on the first commit |
 | 2026-10-12 | Search matches by id prefix or actor | `history` test `search_finds_commits_by_id_prefix_or_actor` | An id matches only by prefix; actors match anywhere, case-blind |
 | 2026-10-20 | History reads a page at a time, merged-in commits by id | `history` tests `history_reads_its_branch_a_page_at_a_time`, `an_old_server_answers_the_whole_history_as_one_page`, `a_commit_landing_on_the_branch_keeps_the_pages_read`, `try_again_after_a_refused_page_starts_from_the_first`, `merged_in_commits_are_read_by_their_ids`, `a_merged_branch_is_read_as_far_as_the_pages_read`, `a_long_merged_branch_is_read_as_its_rows_are_drawn`, `merged_reads_go_to_the_rows_drawn_first`, `a_failed_merged_read_is_asked_again_after_a_while`, `a_token_refused_commits_by_id_reads_merges_from_the_listings`, `tags_sit_at_each_branchs_newest_commit`, `a_commit_to_another_branch_moves_its_tag_alone`, `a_search_finds_matches_a_later_page_brings`, against a fake server that pages as #1013 does | Pass; no listing is read whole but a 0.14 server's that pages none, and the other branches' after a 403 by id |
+| 2026-10-20 | A token refused commits by id reads one page of each other branch, and a stub says why it is one | `history` tests `a_token_refused_commits_by_id_reads_merges_from_the_listings` (a third branch of 1,102 commits whose `z1`, merged into main, lies below its newest 1,000), `merged_in_commits_are_read_by_their_ids` (a merged parent the server answers 404 for); `history::merged` tests `listed_commits_answer_a_merged_chain_at_once`, `a_merge_from_a_commit_the_server_does_not_have_stays_a_stub` (`Absent::NotListed`, `Absent::NotHad`); against the `Served` fake paging as `edge-20261020-7fd9cc9` does and sending the contract header | Pass: each other branch is read as `branch=<name>&limit=1000`, once per load and again after Refresh; every listing names a `limit`; `z1` draws as a stub whose tooltip reads "The merged commit is not among the newest 1,000 commits of any branch read, and this credential may not read a commit by its id."; the 404 one "The server does not serve the merged commit, as for a deleted branch's latest commits and history cleaned up." |
 | 2026-10-20 | A deleted branch's commits by id | OmniGraph `GraphCoordinator::resolve_commit` at `0a62bb7` (source read) | `GET /commits/{id}` serves them once they have moved into the graph's `__history`; its latest commits, still buffered in the branch's retired `__manifest`, answer 404 and draw as stubs |
 | 2026-10-20 | "New branch here" is offered only at a published commit | `history` tests `new_branch_here_is_offered_only_at_a_published_commit` (the selected row's key and the row menu, over published, unpublished and unattached commits) and `a_branch_starts_here_only_at_a_published_commit` (a commit's own tab reads its kind; a listed one is not read), against the `Served` fake and a fake sending the contract header | Pass: only the published commit makes the key available, shows the menu entry and starts `CreateBranchAt` |
 
@@ -126,3 +132,6 @@ away are dropped.
   it reads only for a token refused commits by id (Design). A merge from a deleted branch draws
   as a lane once its commits are in the graph's `__history`; its latest commits, still buffered
   in the branch's retired `__manifest`, answer 404 and draw as a stub.
+- 2026-10-20: for a token refused commits by id, History read the other branches' whole
+  listings, every commit since each began. It reads the newest page of each (1,000 commits),
+  and the stubs say why the commits merged are not drawn (Design).

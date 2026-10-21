@@ -1613,6 +1613,15 @@ impl Exploration {
     }
 
     fn start(&mut self, target: LoadTarget, cx: &mut Context<Self>) {
+        // Until the first read returns its commit, nothing else is read, so every read of the
+        // exploration sees the same commit: what is asked for meanwhile (a group's search) is
+        // read at that commit once the root's answer pins it, as missing.
+        if target != LoadTarget::Root
+            && self.pin.is_none()
+            && self.state.root_status == Loadable::Loading
+        {
+            return;
+        }
         let Some(schema) = self.schema(cx) else {
             return;
         };
@@ -1718,6 +1727,7 @@ impl Exploration {
         cx: &mut Context<Self>,
     ) {
         let snapshot = self.pin.clone();
+        let sent_at = snapshot.clone();
         let generation = self.generation;
         let scope = &self.scope;
         let read = self.session.update(cx, |session, cx| {
@@ -1776,7 +1786,9 @@ impl Exploration {
                     return;
                 }
                 let unpinned = this.pin.is_none();
-                this.apply(&key, result);
+                if !this.apply(&key, result, sent_at.as_deref(), cx) {
+                    return;
+                }
                 this.loaded(&key, cx);
                 // The first answer pins the exploration: a head seen move while it was out is
                 // compared now, which it could not be before.
@@ -1840,16 +1852,43 @@ impl Exploration {
         }
     }
 
-    fn apply(&mut self, target: &LoadTarget, result: Result<ReadOutput, ReadError>) {
+    /// Takes the answer to a read of `target` sent at `sent_at` (unpinned when `None`). The
+    /// first answer pins the exploration, and every later one must be at the pin: one read at
+    /// the head before the pin was taken, and answered at another commit, is read again at the
+    /// pin; one read at the pin that names another commit is a failure. Whether it was taken
+    /// (`false` when it is read again).
+    fn apply(
+        &mut self,
+        target: &LoadTarget,
+        result: Result<ReadOutput, ReadError>,
+        sent_at: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let output = match result {
             Ok(output) => output,
             Err(error) => {
                 self.apply_failure(target, error.to_string());
-                return;
+                return true;
             }
         };
-        if self.pin.is_none() {
-            self.pin = output.graph_commit_id.clone();
+        match (&self.pin, &output.graph_commit_id) {
+            (None, commit) => self.pin = commit.clone(),
+            (Some(pin), Some(commit)) if pin != commit => {
+                if sent_at.is_none() {
+                    self.start(target.clone(), cx);
+                    return false;
+                }
+                self.apply_failure(
+                    target,
+                    format!(
+                        "The server answered at commit {}, not at {}, which the exploration shows.",
+                        studio_ui::short_commit_id(commit),
+                        studio_ui::short_commit_id(pin)
+                    ),
+                );
+                return true;
+            }
+            _ => {}
         }
         match target {
             LoadTarget::Root => self.state.apply_root(&output),
@@ -1868,6 +1907,7 @@ impl Exploration {
                 self.state.apply_page(key.clone(), &output, page_size)
             }
         }
+        true
     }
 
     fn apply_failure(&mut self, target: &LoadTarget, message: String) {
@@ -2463,6 +2503,137 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(status(cx), Loadable::Loaded(()));
+    }
+
+    /// Every read of an exploration is at the commit its root's answer pinned: a group searched
+    /// while the root is out waits for that answer, though another writer commits meanwhile,
+    /// and an answer at another commit is never shown with the pinned ones: read at the head
+    /// before the pin was taken, it is read again at the pin; read at the pin, it fails.
+    #[gpui::test]
+    async fn every_read_of_an_exploration_is_at_its_roots_commit(cx: &mut gpui::TestAppContext) {
+        use futures::AsyncReadExt as _;
+        use gpui::AppContext as _;
+        use http_client::http::Response;
+        use http_client::{AsyncBody, FakeHttpClient};
+
+        use crate::connection::{Connection, ServerEntry, ServerSource};
+
+        type Sent = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+        // The branch head another writer moves, the root read held until released, and each
+        // read sent but the head probe: its name and its commit.
+        let head = Arc::new(std::sync::Mutex::new("c1".to_owned()));
+        let (release, held) = futures::channel::oneshot::channel::<()>();
+        let held = Arc::new(std::sync::Mutex::new(Some(held)));
+        let sent: Sent = Arc::default();
+        let (at, gate, log) = (head.clone(), held.clone(), sent.clone());
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let (at, gate, log) = (at.clone(), gate.clone(), log.clone());
+            async move {
+                let mut bytes = Vec::new();
+                request.into_body().read_to_end(&mut bytes).await.ok();
+                let body = if path.ends_with("/schema") {
+                    json!({ "schema_source": SCHEMA })
+                } else if path.ends_with("/query") {
+                    let asked: Value = serde_json::from_slice(&bytes).unwrap();
+                    let name = asked["name"].as_str().unwrap_or_default().to_owned();
+                    let snapshot = asked["snapshot"].as_str().map(str::to_owned);
+                    if name != "studio_head" {
+                        log.lock().unwrap().push((name.clone(), snapshot.clone()));
+                    }
+                    let wait = gate.lock().unwrap().take_if(|_| name == "studio_node");
+                    if let Some(wait) = wait {
+                        wait.await.ok();
+                    }
+                    let commit = snapshot.unwrap_or_else(|| at.lock().unwrap().clone());
+                    let rows = if name == "studio_node" {
+                        json!([{ "id": "ada", "label": "Ada" }])
+                    } else {
+                        json!([])
+                    };
+                    json!({ "query_name": name, "target": { "branch": "main" }, "row_count": 0,
+                        "columns": [], "rows": rows, "graph_commit_id": commit })
+                } else {
+                    json!({ "branches": ["main"] })
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        let schema = schema();
+        let knows = group(&schema, "Person", "Knows", Direction::Outgoing);
+        let key = GroupKey::new(person("ada"), knows.clone());
+        let exploration = cx.update(|cx| Exploration::for_session(&session, cx));
+        exploration.update(cx, |exploration, cx| {
+            exploration.root_at(person("ada"), cx);
+            exploration.expand(&ExplorePath::root().child_group(&knows), cx);
+            exploration.search_group(&key, "b", cx);
+        });
+        cx.run_until_parked();
+        let taken = || std::mem::take(&mut *sent.lock().unwrap());
+        assert_eq!(
+            taken(),
+            vec![("studio_node".to_owned(), None)],
+            "nothing else while the root is out"
+        );
+
+        *head.lock().unwrap() = "c2".into();
+        release.send(()).ok();
+        cx.run_until_parked();
+        let pin = exploration.read_with(cx, |exploration, _| exploration.pin().map(str::to_owned));
+        assert_eq!(pin.as_deref(), Some("c2"), "the root's answer");
+        let after = taken();
+        assert!(
+            after.iter().any(|(name, _)| name == "studio_neighbours"),
+            "{after:?}"
+        );
+        assert!(
+            after
+                .iter()
+                .all(|(_, commit)| commit.as_deref() == Some("c2")),
+            "{after:?}"
+        );
+
+        // An answer at another commit, naming a neighbour the pin's does not: read at the head
+        // before the pin, it is read again at the pin (whose answer the session kept, so
+        // nothing is sent); read at the pin, it fails. Neither shows the neighbour.
+        let elsewhere = || ReadOutput {
+            graph_commit_id: Some("c3".into()),
+            ..output(&["id", "label"], json!([{ "id": "zed", "label": "Zed" }]))
+        };
+        let page = LoadTarget::Page(key.clone());
+        let list = |cx: &mut gpui::TestAppContext| {
+            exploration.read_with(cx, |exploration, _| {
+                let list = &exploration.state().neighbours[&key];
+                (list.status.clone(), list.rows.len())
+            })
+        };
+        let taken_now = exploration.update(cx, |exploration, cx| {
+            exploration.apply(&page, Ok(elsewhere()), None, cx)
+        });
+        assert!(!taken_now);
+        assert_eq!(list(cx), (PageStatus::Loading, 0), "read again");
+        cx.run_until_parked();
+        assert_eq!(list(cx), (PageStatus::Idle, 0), "at the pin");
+        assert!(taken().is_empty());
+        let taken_now = exploration.update(cx, |exploration, cx| {
+            exploration.apply(&page, Ok(elsewhere()), Some("c2"), cx)
+        });
+        assert!(taken_now);
+        assert!(matches!(list(cx), (PageStatus::Failed(_), 0)));
     }
 
     /// Paths opened or closed together are one change: views draw them once, not once a path.

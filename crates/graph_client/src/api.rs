@@ -883,7 +883,10 @@ mod contract_tests {
                 "actions",
             ],
         ),
-        ("BranchMergeRequest", &["source", "target", "delete_branch"]),
+        (
+            "BranchMergeRequest",
+            &["source", "target", "delete_branch", "dry_run"],
+        ),
         (
             "BranchMergeOutput",
             &[
@@ -962,6 +965,40 @@ mod contract_tests {
             &["entity_kind", "type_name", "kind", "message", "entity_id"],
         ),
         ("PreconditionFailureOutput", &["expected", "actual"]),
+        (
+            "InvokeStoredQueryRequest",
+            &["params", "branch", "snapshot", "expect_mutation"],
+        ),
+        ("QueriesCatalogOutput", &["queries"]),
+        (
+            "QueryCatalogEntry",
+            &[
+                "name",
+                "tool_name",
+                "description",
+                "instruction",
+                "mutation",
+                "params",
+            ],
+        ),
+        (
+            "ParamDescriptor",
+            &["name", "kind", "item_kind", "vector_dim", "nullable"],
+        ),
+        (
+            "DiffOutput",
+            &[
+                "from_commit_id",
+                "to_commit_id",
+                "changes",
+                "next_page_token",
+            ],
+        ),
+        // The client's `CommitChanges`.
+        (
+            "CommitChangesOutput",
+            &["cause", "changes", "next_page_token"],
+        ),
     ];
 
     /// (schema name, the variants our enum declares, in serde's spelling).
@@ -1046,6 +1083,13 @@ mod contract_tests {
         (
             "CommitKindOutput",
             &["published", "unpublished", "unattached"],
+        ),
+        (
+            "ParamKind",
+            &[
+                "string", "bool", "int", "bigint", "float", "date", "datetime", "blob", "vector",
+                "list",
+            ],
         ),
         (
             "MergeConflictKindOutput",

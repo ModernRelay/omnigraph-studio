@@ -28,11 +28,12 @@ use gpui::App;
 
 pub use access::{AccessScope, Allowed};
 pub use changes::{
-    ChangeFold, FoldedChange, FoldedChanges, NetChange, PropertyDiff, REVIEW_CHANGE_CAP,
-    TypeCounts, commits_since, contains_merge_of, fork_point, summary_sentence,
+    ChangeFold, FoldedChange, FoldedChanges, ForkSearch, NetChange, PropertyDiff,
+    REVIEW_CHANGE_CAP, TypeCounts, contains_merge_of, summary_sentence,
 };
 pub use connection::{
-    Connection, ConnectionEvent, ConnectionState, GraphListing, ServerEntry, ServerSource,
+    Connection, ConnectionEvent, ConnectionState, ConnectionWatch, GraphListing, ServerEntry,
+    ServerSource,
 };
 pub use entity_groups::{
     CardLines, EntityGroup, EntityGroups, GroupRelationship, GroupRun, GroupSection, NodeNames,
@@ -43,8 +44,8 @@ pub use fixes::{RevertUnavailable, revert_query};
 pub use graph_client::api::{AccessAction, EntityKind};
 pub use registry::{ConnectionRegistry, RegistryEvent, data_dir};
 pub use session::{
-    BranchStart, CommitList, DraftEntry, DraftKey, ExternalWrite, FollowUp, GraphSession,
-    HeadWatch, Loadable, OutcomeEntry, OutcomeKind, ServerState, SessionEvent, open_session,
+    BranchStart, DraftEntry, DraftKey, ExternalWrite, FollowUp, GraphSession, HeadWatch, Loadable,
+    OutcomeEntry, OutcomeKind, ServerState, SessionEvent, open_session,
 };
 
 /// Sets up the HTTP client and loads every known server. Call once at startup.

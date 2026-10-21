@@ -3,8 +3,9 @@
 //! Studio reads `$OMNIGRAPH_HOME` (else `~/.omnigraph`) the way the CLI does
 //! (`crates/omnigraph-cli/src/operator.rs` and `targets.rs`): `config.yaml` is
 //! `target_config_version: 1` with `targets`. Each `server` target, and each `managed` cluster
-//! target with an `endpoint`, lands on a server; targets on one endpoint with one credential are
-//! one server, since the CLI makes a target of every profile. A server target's token is
+//! target with an `endpoint`, lands on a server; an address is one server, which targets on it
+//! with one credential share, since the CLI makes a target of every profile, and one with
+//! another credential is said and left out. A server target's token is
 //! `OMNIGRAPH_TOKEN_<OWNER>` for its credential owner, else `[<owner>] token = …` in
 //! `credentials` when that section's `endpoint` covers the target's. A token is sent only to the
 //! server it is keyed to: the untargeted `OMNIGRAPH_BEARER_TOKEN` goes to none, as the CLI
@@ -19,8 +20,8 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliServer {
-    /// The name of the target named like the server's credential owner, else of the first of
-    /// its targets by name.
+    /// The name of the target named like the server's credential owner, else of the target
+    /// Studio connects as: the CLI's default target, else the first on the address in the file.
     pub name: String,
     pub url: String,
     /// Its targets' `default_graph`s.
@@ -48,9 +49,15 @@ pub struct CliAlias {
 /// `config.yaml`, `target_config_version: 1`.
 #[derive(Debug, Default, Deserialize)]
 struct TargetsConfig {
-    /// Read one by one: a target Studio cannot read is said and left out, not the whole file.
+    /// Read one by one, in the file's order: a target Studio cannot read is said and left out,
+    /// not the whole file, and of targets on one address the first may be the one Studio
+    /// connects as.
     #[serde(default)]
-    targets: BTreeMap<String, serde_norway::Value>,
+    targets: serde_norway::Mapping,
+    /// Read for its `target` alone: the CLI's default, which Studio connects as among the
+    /// targets on its address.
+    #[serde(default)]
+    defaults: Option<serde_norway::Value>,
     /// Read one by one too: an alias Studio cannot read is left out.
     #[serde(default)]
     aliases: BTreeMap<String, serde_norway::Value>,
@@ -233,13 +240,28 @@ fn load_operator_from(path: &Path) -> Result<Operator, String> {
 /// The servers the targets land on, and the aliases with their servers and graphs. A `direct`
 /// target opens storage, which Studio does not, so it is not listed; a target Studio cannot
 /// open is said.
+///
+/// An address is one server, as every graph's key is its server's address and its id: of the
+/// targets on one endpoint, the CLI's default target is the one Studio connects as when it is
+/// among them, else the first in the file. Those with its credential (one owner, or both
+/// anonymous) land on that server too, as the targets `omnigraph target import` makes of one
+/// server's profiles do, with their default graphs; one with another credential is said and
+/// left out, since its token would go to the same address beside the first.
 fn targets_operator(config: TargetsConfig) -> Operator {
-    // Each server with the root its targets share.
-    let mut servers: Vec<(String, CliServer, TokenSource)> = Vec::new();
-    // Each target listed: the server it lands on, and its default graph.
-    let mut landed: BTreeMap<String, (usize, Option<String>)> = BTreeMap::new();
+    let default_target = config
+        .defaults
+        .as_ref()
+        .and_then(|defaults| defaults.get("target"))
+        .and_then(serde_norway::Value::as_str)
+        .map(str::to_owned);
     let mut errors = Vec::new();
-    for (name, value) in config.targets {
+    // Each target Studio can open, in file order.
+    let mut readable: Vec<Landing> = Vec::new();
+    for (key, value) in config.targets {
+        let Some(name) = key.as_str().map(str::to_owned) else {
+            errors.push("a CLI target's name is not text".to_owned());
+            continue;
+        };
         let target: TargetConfig = match serde_norway::from_value(value) {
             Ok(target) => target,
             Err(error) => {
@@ -278,54 +300,96 @@ fn targets_operator(config: TargetsConfig) -> Operator {
             continue;
         }
         let root = graph_client::server_root(&endpoint).unwrap_or_else(|_| endpoint.clone());
-        let owner_named = source == TokenSource::Owner(name.clone());
-        let index = match servers
+        readable.push(Landing {
+            name,
+            root,
+            endpoint,
+            source,
+            default_graph: target.default_graph,
+        });
+    }
+
+    let mut servers: Vec<(CliServer, TokenSource)> = Vec::new();
+    // Each target listed: the server it lands on, and its default graph.
+    let mut landed: BTreeMap<String, (usize, Option<String>)> = BTreeMap::new();
+    let mut roots: Vec<&str> = Vec::new();
+    for landing in &readable {
+        if !roots.contains(&landing.root.as_str()) {
+            roots.push(&landing.root);
+        }
+    }
+    for root in roots {
+        let on_root: Vec<&Landing> = readable.iter().filter(|t| t.root == root).collect();
+        let chosen = on_root
             .iter()
-            .position(|(at, _, other)| *at == root && *other == source)
-        {
-            Some(index) => {
-                let (_, server, _) = &mut servers[index];
-                if owner_named {
-                    server.name = name.clone();
-                    server.url = endpoint;
-                }
-                if let Some(graph) = &target.default_graph
-                    && !server.graphs.contains(graph)
-                {
-                    server.graphs.push(graph.clone());
-                }
-                index
-            }
-            None => {
-                let server = CliServer {
-                    name: name.clone(),
-                    url: endpoint,
-                    graphs: target.default_graph.iter().cloned().collect(),
-                };
-                servers.push((root, server, source));
-                servers.len() - 1
-            }
+            .find(|t| default_target.as_deref() == Some(t.name.as_str()));
+        let why = if chosen.is_some() {
+            "the CLI's default target"
+        } else {
+            "the first target on it in the file"
         };
-        landed.insert(name, (index, target.default_graph));
+        let first = chosen.copied().unwrap_or(on_root[0]);
+        let (alike, other): (Vec<&Landing>, Vec<&Landing>) =
+            on_root.into_iter().partition(|t| t.source == first.source);
+        // Named like the credential owner, as an imported server's own target is, else as
+        // the target Studio connects as.
+        let named = alike
+            .iter()
+            .find(|t| t.source == TokenSource::Owner(t.name.clone()))
+            .copied()
+            .unwrap_or(first);
+        let mut graphs: Vec<String> = Vec::new();
+        for graph in alike.iter().filter_map(|t| t.default_graph.as_ref()) {
+            if !graphs.contains(graph) {
+                graphs.push(graph.clone());
+            }
+        }
+        let index = servers.len();
+        servers.push((
+            CliServer {
+                name: named.name.clone(),
+                url: named.endpoint.clone(),
+                graphs,
+            },
+            first.source.clone(),
+        ));
+        for target in alike {
+            landed.insert(target.name.clone(), (index, target.default_graph.clone()));
+        }
+        for skipped in other {
+            errors.push(format!(
+                "CLI target '{}' is not listed: Studio keeps one connection per address, and \
+                 reaches {root} as '{}' ({why}), whose credential differs",
+                skipped.name, first.name
+            ));
+        }
     }
     let aliases = read_aliases(config.aliases)
         .into_iter()
         .map(|mut alias| {
             if let Some((index, default_graph)) = landed.get(&alias.server) {
-                alias.server = servers[*index].1.name.clone();
+                alias.server = servers[*index].0.name.clone();
                 alias.graph = alias.graph.or_else(|| default_graph.clone());
             }
             alias
         })
         .collect();
     Operator {
-        servers: servers
-            .into_iter()
-            .map(|(_, server, source)| (server, source))
-            .collect(),
+        servers,
         aliases,
         errors,
     }
+}
+
+/// A target Studio can open, as `targets_operator` reads it.
+struct Landing {
+    name: String,
+    /// Its endpoint as a server root ([`graph_client::server_root`]), which targets on one
+    /// address share.
+    root: String,
+    endpoint: String,
+    source: TokenSource,
+    default_graph: Option<String>,
 }
 
 /// The aliases Studio can read, sorted by name, each naming its target.
@@ -579,7 +643,10 @@ mod tests {
 
     /// `omnigraph target import` makes a target of every server and of every profile, so one
     /// server's targets differ only in their default graph: they are one server, named like the
-    /// credential owner, with every default graph, and an alias on any of them lands there.
+    /// credential owner, with every default graph, and an alias on any of them lands there. An
+    /// address is one server: a target on it with another credential is said and left out,
+    /// Studio connecting as the CLI's default target when it is there, else as the first on the
+    /// address in the file.
     #[cfg(unix)]
     #[test]
     fn targets_on_one_endpoint_are_one_server() {
@@ -596,10 +663,14 @@ mod tests {
              \x20 studio-test-other:\n    kind: server\n    endpoint: https://other.test\n    credential: studio-test-other\n\
              \x20 work:\n    kind: server\n    endpoint: http://127.0.0.1:8791\n    credential: studio-test-dev\n    default_graph: notes\n\
              \x20 open:\n    kind: server\n    endpoint: http://127.0.0.1:8791\n    auth: anonymous\n\
+             \x20 zz-public:\n    kind: server\n    endpoint: https://shared.test\n    auth: anonymous\n    default_graph: docs\n\
+             \x20 aa-keyed:\n    kind: server\n    endpoint: https://shared.test/\n    credential: studio-test-other\n\
              defaults:\n  target: default\n\
              aliases:\n\
              \x20 people:\n    target: studio-test-dev\n    graph: knowledge\n    query: who_is\n\
              \x20 notes:\n    target: work\n    query: recent\n\
+             \x20 public:\n    target: zz-public\n    query: find\n\
+             \x20 hidden:\n    target: open\n    query: find\n\
              \x20 lost:\n    target: nowhere\n    query: q\n",
         )
         .unwrap();
@@ -612,18 +683,39 @@ mod tests {
         std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         let files = read_operator(Some(&dir));
-        assert!(files.errors.is_empty(), "{:?}", files.errors);
+        // The anonymous target beside the default one is not a second connection to its
+        // address, nor the keyed one after the anonymous target first in the file.
+        assert_eq!(files.errors.len(), 2, "{:?}", files.errors);
+        assert!(
+            files.errors[0].contains("'open' is not listed"),
+            "{:?}",
+            files.errors
+        );
+        assert!(
+            files.errors[0].contains("as 'default' (the CLI's default target)"),
+            "{:?}",
+            files.errors
+        );
+        assert!(
+            files.errors[1].contains("'aa-keyed' is not listed"),
+            "{:?}",
+            files.errors
+        );
+        assert!(
+            files.errors[1].contains("as 'zz-public' (the first target on it in the file)"),
+            "{:?}",
+            files.errors
+        );
+        assert!(files.errors.iter().all(|e| !e.contains("dev-token")));
         let listed: Vec<_> = files
             .servers
             .unwrap()
             .into_iter()
             .map(|(server, token)| (server.name, server.url, server.graphs, token))
             .collect();
-        // The anonymous target on the same address is a server of its own: it sends no token.
         assert_eq!(
             listed,
             vec![
-                ("open".into(), "http://127.0.0.1:8791".into(), vec![], None),
                 (
                     "studio-test-dev".into(),
                     "http://127.0.0.1:8791/".into(),
@@ -634,6 +726,12 @@ mod tests {
                     "studio-test-other".into(),
                     "https://other.test".into(),
                     vec![],
+                    None
+                ),
+                (
+                    "zz-public".into(),
+                    "https://shared.test".into(),
+                    vec!["docs".to_owned()],
                     None
                 ),
             ]
@@ -649,12 +747,15 @@ mod tests {
                 )
             })
             .collect();
+        // An alias on a target left out keeps its name and lands on no server.
         assert_eq!(
             aliases,
             vec![
+                ("hidden", "open", None),
                 ("lost", "nowhere", None),
                 ("notes", "studio-test-dev", Some("notes")),
                 ("people", "studio-test-dev", Some("knowledge")),
+                ("public", "zz-public", Some("docs")),
             ]
         );
         std::fs::remove_dir_all(dir).ok();

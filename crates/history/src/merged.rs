@@ -16,8 +16,9 @@
 //! branch's own commits read would sort below them, so it is held back, its parents unread,
 //! until the page that reaches its time is read. Once their merged-in commits are read, the rows
 //! drawn are the newest of the whole history, and a page read adds rows below them. A merged
-//! parent not read yet, or one the server does not have (a deleted branch's commit, cleaned
-//! up), draws as a stub.
+//! parent not read yet, one the server does not have (a deleted branch's commit, cleaned up),
+//! or, for a token refused commits by id, one the other branches' pages read do not hold,
+//! draws as a stub, which says which ([`Absent`]).
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -35,9 +36,18 @@ pub struct HistoryRead {
     /// Merged-in commits read by id. A commit never changes, so they are kept when the first
     /// page is read again, for as long as a commit read reaches them.
     merged: HashMap<String, CommitOutput>,
-    /// Merged-in commits the server does not have: drawn as stubs, and not asked for again
-    /// while a commit read names them.
-    missing: HashSet<String>,
+    /// Merged-in commits not had, and why: drawn as stubs, and not asked for again while a
+    /// commit read names them.
+    missing: HashMap<String, Absent>,
+}
+
+/// Why a merged-in commit History asked for is not drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Absent {
+    /// The server does not have it: a deleted branch's latest commits, or history cleaned up.
+    NotHad,
+    /// The other branches' pages read for a token refused commits by id do not hold it.
+    NotListed,
 }
 
 /// What History draws from what it has read ([`HistoryRead::draw`]).
@@ -93,12 +103,12 @@ impl HistoryRead {
             Some(commit) => {
                 // An answer for another id leaves the one asked for unread for good.
                 if commit.graph_commit_id != id {
-                    self.missing.insert(id);
+                    self.missing.insert(id, Absent::NotHad);
                 }
                 self.merged.insert(commit.graph_commit_id.clone(), commit);
             }
             None => {
-                self.missing.insert(id);
+                self.missing.insert(id, Absent::NotHad);
             }
         }
     }
@@ -120,10 +130,19 @@ impl HistoryRead {
                 return;
             }
             for id in wanted {
-                let commit = listed.get(&id).cloned();
-                self.merged_read(id, commit);
+                match listed.get(&id) {
+                    Some(commit) => self.merged_read(id, Some(commit.clone())),
+                    None => {
+                        self.missing.insert(id, Absent::NotListed);
+                    }
+                }
             }
         }
+    }
+
+    /// Why merged-in commit `id` is not drawn, when it was asked for and not had.
+    pub fn absent(&self, id: &str) -> Option<Absent> {
+        self.missing.get(id).copied()
     }
 
     /// Whether `commit`, merged in, sorts among the rows read: one below the oldest own commit
@@ -153,7 +172,7 @@ impl HistoryRead {
             .collect();
         let mut extra: Vec<&CommitOutput> = Vec::new();
         let mut reached: HashSet<String> = HashSet::new();
-        let mut named_missing: HashSet<String> = HashSet::new();
+        let mut named_missing: HashMap<String, Absent> = HashMap::new();
         let mut unread: HashSet<&str> = HashSet::new();
         while let Some(id) = stack.pop() {
             if !seen.insert(id) {
@@ -169,12 +188,14 @@ impl HistoryRead {
                         stack.extend(commit.parent_commit_id.as_deref());
                     }
                 }
-                None if self.missing.contains(id) => {
-                    named_missing.insert(id.to_owned());
-                }
-                None => {
-                    unread.insert(id);
-                }
+                None => match self.missing.get(id) {
+                    Some(absent) => {
+                        named_missing.insert(id.to_owned(), *absent);
+                    }
+                    None => {
+                        unread.insert(id);
+                    }
+                },
             }
         }
         let mut commits: Vec<CommitOutput> = self.own.clone();
@@ -305,6 +326,7 @@ mod tests {
         let drawn = read.draw();
         assert_eq!(drawn.commits.len(), 2);
         assert!(drawn.wanted.is_empty(), "asked for again");
+        assert_eq!(read.absent("gone"), Some(Absent::NotHad));
     }
 
     /// A merged-in commit older than the oldest own commit read waits for the page that
@@ -403,6 +425,8 @@ mod tests {
         assert_eq!(ids(&drawn), ["m4", "b3", "m3", "b2", "m2"]);
         assert!(drawn.wanted.is_empty());
         assert_eq!(read.merged_held(), 3, "b1 is kept, held back");
+        assert_eq!(read.absent("gone"), Some(Absent::NotListed), "says why");
+        assert_eq!(read.absent("b3"), None);
     }
 
     #[test]

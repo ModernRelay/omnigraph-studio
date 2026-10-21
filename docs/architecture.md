@@ -49,8 +49,8 @@ view (layer 5) ──reads──▶ entity in graph_store ──calls──▶ g
 
 | Entity | Holds | Notes |
 |---|---|---|
-| `Connection` | server URL, token, contract and version check, health and latency, the graph list, state (`connecting`, `ready`, `contract-mismatch`, `unauthorized`, `unreachable`) | One per server; the status-bar chip renders it |
-| `GraphSession` | graph id, branch, schema, branch list, type counts, the heads it watches, the read memo, drafts and the outcome log | One per open graph in a window; its views share it. Each view holds its own snapshot pin |
+| `Connection` | server URL, token, contract and version check, health and latency, the graph list, state (`connecting`, `ready`, `contract-mismatch`, `unauthorized`, `unreachable`) | One per server address; the status-bar chip renders it. Health is checked while a window shows one of its graphs or the Open dialog lists it (`Connection::watch`) |
+| `GraphSession` | graph id, branch, schema, branch list, type counts, the heads it watches, the read memo, what the credential may do, drafts and the outcome log | One per open graph in a window; its views share it. Each view holds its own snapshot pin. A new token on its connection reads what it may do again and forgets every answer kept with the old one |
 | `SchemaModel` | the `.pg` source from `GET /schema`, compiled with `omnigraph-compiler` into node, edge and property shapes | One per session, rebuilt when the schema is read again (Refresh, or another writer's schema seen at a head move) |
 | `Exploration` | the set of expanded paths (node → relationship group → node …) | Shared by the relationship tree and the canvas |
 | Drafts (`GraphSession::drafts`) | unsaved property values by branch, each with the value it was read at (spec 014) | A branch's wait while another is shown; a save is one mutation bound to the values read |
@@ -60,9 +60,9 @@ view (layer 5) ──reads──▶ entity in graph_store ──calls──▶ g
 
 A view's first read returns `graph_commit_id`. Later reads in that view pass it as `snapshot`.
 The `GraphSession` watches branch heads for every view: every 30 s while a Studio window is
-active, and at once when a window becomes active after a missed poll, it reads each watched
-branch's head with a query that returns no rows (`limit 0`; its answer names the head commit),
-and it reads the branch list. Studio's own commits set the head without asking. A view whose
+active and shows the graph, and at once when a window becomes active after a missed poll (or
+shows the graph again after parking it), it reads each watched branch's head with a query that
+returns no rows (`limit 0`; its answer names the head commit), and it reads the branch list. Studio's own commits set the head without asking. A view whose
 pin is not the head shows "Newer data · Refresh" and changes nothing until the person
 refreshes (constitution II, V). Writes use `POST /mutate/if-graph-commit` with the pinned id;
 a 412 reopens the draft.
@@ -116,7 +116,10 @@ a 412 reopens the draft.
   `FakeHttpClient` with recorded responses.
 - `graph_client` and `gq_language` have plain unit tests; they do not depend on GPUI.
 - `crates/graph_client/openapi/omnigraph-0.14.0-edge.json` (OmniGraph `edge-20261020-7fd9cc9`)
-  is the contract; a test checks every DTO and route against it.
+  is the contract: `graph_client`'s contract tests check every DTO's fields and every enum's
+  variants against its schemas, and `every_route_the_client_calls_is_in_the_contract` makes
+  each of the client's calls once and checks that its method and path are one of the
+  document's routes.
 - macOS screenshot tests for the main views, once the views exist.
 
 ## Connecting to graphs today

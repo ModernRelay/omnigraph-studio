@@ -1,11 +1,11 @@
-//! Change folding shared by review and history (spec 008, 009): the fork point of a branch, the
+//! Change folding shared by review and history (spec 008, 009): the fork of a branch, the
 //! per-entity fold of change-feed entries (first before, last after), per-type counts and the
 //! summary sentence. Pure functions; no GPUI.
 //!
 //! Review folds the branch's change feed after the merge base (E7). When the feed refuses the
 //! base as a start, because the target was merged into the branch, review folds the net diff
-//! from the merge base instead, and finds the branch's commits since its fork by walking both
-//! branches' `GET /commits`.
+//! from the merge base instead, and finds the branch's commits since its fork from both
+//! branches' `GET /commits`, read a page at a time ([`ForkSearch`]).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -19,26 +19,71 @@ use serde_json::Value;
 /// The most changes a review folds before it says "Partial" (spec 008).
 pub const REVIEW_CHANGE_CAP: usize = 20_000;
 
-/// The newest commit of `branch` that `target` already contains. Both lists are newest first,
-/// as `GET /commits?branch=` returns them. `None` when the histories share nothing.
+/// Where a branch forked from its target, found while both histories are read a page at a
+/// time, newest first, as `GET /commits?branch=` lists them: the newest commit of the branch's
+/// first-parent chain that the target's history holds, or a commit known to be in it
+/// ([`Self::hold`], the merge base the server names).
 ///
-/// A target's list holds only its own first-parent chain: a merged branch's commits appear
+/// A target's listing holds only its own first-parent chain: a merged branch's commits appear
 /// there as some commit's `merged_parent_commit_id` (a fast-forward too publishes a new commit
-/// with the branch head as merged parent). A branch list is a first-parent chain, so once one
-/// of its commits is in the target, every older one is.
-pub fn fork_point<'a>(
-    branch: &'a [CommitOutput],
-    target: &[CommitOutput],
-) -> Option<&'a CommitOutput> {
-    let reachable: HashSet<&str> = target
-        .iter()
-        .flat_map(|c| {
-            std::iter::once(c.graph_commit_id.as_str()).chain(c.merged_parent_commit_id.as_deref())
-        })
-        .collect();
-    branch
-        .iter()
-        .find(|commit| reachable.contains(commit.graph_commit_id.as_str()))
+/// with the branch head as merged parent), so a merged parent counts as held. A branch's chain
+/// is a first-parent chain, so once one of its commits is in the target, every older one is.
+/// The search keeps each side's ids as they are read, so a page costs only the commits on it.
+#[derive(Debug, Default)]
+pub struct ForkSearch {
+    /// The branch's chain as far as it was read, newest first.
+    chain: Vec<CommitOutput>,
+    /// Each commit of `chain` by its place there.
+    places: HashMap<String, usize>,
+    /// The commits the target's pages list, the merged parents they name, and those held.
+    held: HashSet<String>,
+    /// The place in `chain` of its newest commit `held` holds.
+    fork: Option<usize>,
+}
+
+impl ForkSearch {
+    /// Takes the branch's next page, below the commits taken before.
+    pub fn branch_page(&mut self, page: impl IntoIterator<Item = CommitOutput>) {
+        for commit in page {
+            let at = self.chain.len();
+            if self.fork.is_none() && self.held.contains(&commit.graph_commit_id) {
+                self.fork = Some(at);
+            }
+            self.places
+                .entry(commit.graph_commit_id.clone())
+                .or_insert(at);
+            self.chain.push(commit);
+        }
+    }
+
+    /// Takes the target's next page.
+    pub fn target_page(&mut self, page: &[CommitOutput]) {
+        for commit in page {
+            self.hold(&commit.graph_commit_id);
+            if let Some(merged) = &commit.merged_parent_commit_id {
+                self.hold(merged);
+            }
+        }
+    }
+
+    /// Takes `id` as a commit the target's history holds.
+    pub fn hold(&mut self, id: &str) {
+        if let Some(&at) = self.places.get(id) {
+            self.fork = Some(self.fork.map_or(at, |fork| fork.min(at)));
+        }
+        self.held.insert(id.to_owned());
+    }
+
+    /// The fork, once the pages read reach it.
+    pub fn fork(&self) -> Option<&CommitOutput> {
+        self.fork.map(|at| &self.chain[at])
+    }
+
+    /// The branch's commits newer than the fork, newest first: every commit read until the
+    /// pages reach it.
+    pub fn since(&self) -> &[CommitOutput] {
+        &self.chain[..self.fork.unwrap_or(self.chain.len())]
+    }
 }
 
 /// Whether `target`'s history shows `head` merged: listed itself, or the merged parent of one
@@ -47,20 +92,6 @@ pub fn contains_merge_of(target: &[CommitOutput], head: &str) -> bool {
     target
         .iter()
         .any(|c| c.graph_commit_id == head || c.merged_parent_commit_id.as_deref() == Some(head))
-}
-
-/// The commits of `branch` newer than `fork`, newest first. Every commit when `fork` is `None`.
-pub fn commits_since<'a>(branch: &'a [CommitOutput], fork: Option<&str>) -> &'a [CommitOutput] {
-    match fork {
-        Some(fork) => {
-            let end = branch
-                .iter()
-                .position(|c| c.graph_commit_id == fork)
-                .unwrap_or(branch.len());
-            &branch[..end]
-        }
-        None => branch,
-    }
 }
 
 /// What an entity's folded change amounts to. The order is the display order: changes to
@@ -366,10 +397,13 @@ fn plural(count: usize, one: &str, many: &str) -> String {
 
 /// The review header's sentence: "17 entities and 22 relationships changed in 3 commits by
 /// act-dev".
+///
+/// `commits` is `None` when the commits are not all known (a history read only so far): the
+/// sentence then names neither a count nor who made them.
 pub fn summary_sentence(
     entities: usize,
     relationships: usize,
-    commits: usize,
+    commits: Option<usize>,
     actors: &[String],
 ) -> String {
     let what = match (entities, relationships) {
@@ -381,6 +415,9 @@ pub fn summary_sentence(
             plural(e, "entity", "entities"),
             plural(r, "relationship", "relationships")
         ),
+    };
+    let Some(commits) = commits else {
+        return format!("{what} changed");
     };
     let mut sentence = format!("{what} changed in {}", plural(commits, "commit", "commits"));
     match actors {
@@ -450,6 +487,29 @@ mod tests {
         }
     }
 
+    /// The fork of a branch from the commit lists read in pages of `page`: each side's ids are
+    /// kept as its pages arrive, the two read in turn.
+    fn fork_of(branch: &[CommitOutput], target: &[CommitOutput], page: usize) -> ForkSearch {
+        let mut search = ForkSearch::default();
+        let (mut branch, mut target) = (branch.chunks(page), target.chunks(page));
+        loop {
+            let (b, t) = (branch.next(), target.next());
+            if b.is_none() && t.is_none() {
+                return search;
+            }
+            if let Some(b) = b {
+                search.branch_page(b.iter().cloned());
+            }
+            if let Some(t) = t {
+                search.target_page(t);
+            }
+        }
+    }
+
+    fn ids(commits: &[CommitOutput]) -> Vec<&str> {
+        commits.iter().map(|c| c.graph_commit_id.as_str()).collect()
+    }
+
     #[test]
     fn the_fork_is_the_newest_branch_commit_in_the_target() {
         let main = vec![
@@ -463,20 +523,54 @@ mod tests {
             commit("m2", Some("m1")),
             commit("m1", None),
         ];
-        let fork = fork_point(&branch, &main).unwrap();
-        assert_eq!(fork.graph_commit_id, "m2");
-        let since = commits_since(&branch, Some("m2"));
-        assert_eq!(since.len(), 2);
-        assert_eq!(since[0].graph_commit_id, "b2");
+        for page in [1, 2, 10] {
+            let search = fork_of(&branch, &main, page);
+            assert_eq!(
+                search.fork().unwrap().graph_commit_id,
+                "m2",
+                "pages of {page}"
+            );
+            assert_eq!(ids(search.since()), ["b2", "b1"]);
+        }
 
         // A branch with no commits of its own forks at its head.
         let fresh = vec![commit("m2", Some("m1")), commit("m1", None)];
-        assert_eq!(fork_point(&fresh, &main).unwrap().graph_commit_id, "m2");
-        assert!(commits_since(&fresh, Some("m2")).is_empty());
+        let search = fork_of(&fresh, &main, 1);
+        assert_eq!(search.fork().unwrap().graph_commit_id, "m2");
+        assert!(search.since().is_empty());
 
-        // Unrelated histories share nothing.
-        assert!(fork_point(&[commit("x", None)], &main).is_none());
-        assert_eq!(commits_since(&branch, None).len(), 4);
+        // Unrelated histories share nothing: every commit read is the branch's.
+        let search = fork_of(&[commit("x", None)], &main, 1);
+        assert!(search.fork().is_none());
+        assert_eq!(ids(search.since()), ["x"]);
+
+        // Before the target's pages reach it, the fork is not known.
+        let mut search = ForkSearch::default();
+        search.branch_page(branch.clone());
+        search.target_page(&main[..1]);
+        assert!(search.fork().is_none());
+        assert_eq!(search.since().len(), 4);
+        search.target_page(&main[1..]);
+        assert_eq!(search.fork().unwrap().graph_commit_id, "m2");
+    }
+
+    /// A commit known to be in the target, the merge base, is the fork once the branch's chain
+    /// reaches it, with no page of the target read.
+    #[test]
+    fn a_held_merge_base_is_the_fork_the_chain_reaches() {
+        let branch = [
+            commit("b2", Some("b1")),
+            commit("b1", Some("m2")),
+            commit("m2", Some("m1")),
+            commit("m1", None),
+        ];
+        let mut search = ForkSearch::default();
+        search.hold("m2");
+        search.branch_page(branch[..2].iter().cloned());
+        assert!(search.fork().is_none(), "not reached yet");
+        search.branch_page(branch[2..].iter().cloned());
+        assert_eq!(search.fork().unwrap().graph_commit_id, "m2");
+        assert_eq!(ids(search.since()), ["b2", "b1"]);
     }
 
     #[test]
@@ -492,11 +586,32 @@ mod tests {
             commit("b1", Some("m1")),
             commit("m1", None),
         ];
-        assert_eq!(fork_point(&branch, &main).unwrap().graph_commit_id, "b2");
-        assert_eq!(commits_since(&branch, Some("b2")).len(), 1);
+        for page in [1, 3] {
+            let search = fork_of(&branch, &main, page);
+            assert_eq!(search.fork().unwrap().graph_commit_id, "b2");
+            assert_eq!(ids(search.since()), ["b3"]);
+        }
         assert!(contains_merge_of(&main, "b2"));
         assert!(contains_merge_of(&main, "m2"));
         assert!(!contains_merge_of(&main, "b3"));
+    }
+
+    /// The target merged into the branch: the merge commit and the branch's commits before it
+    /// are the branch's own, down to where it began.
+    #[test]
+    fn a_branch_the_target_was_merged_into_forks_where_it_began() {
+        let main = vec![commit("m2", Some("m1")), commit("m1", None)];
+        let mut merge = commit("fm", Some("f1"));
+        merge.merged_parent_commit_id = Some("m2".into());
+        let branch = vec![
+            commit("f2", Some("fm")),
+            merge,
+            commit("f1", Some("m1")),
+            commit("m1", None),
+        ];
+        let search = fork_of(&branch, &main, 1);
+        assert_eq!(search.fork().unwrap().graph_commit_id, "m1");
+        assert_eq!(ids(search.since()), ["f2", "fm", "f1"]);
     }
 
     #[test]
@@ -509,7 +624,10 @@ mod tests {
             commit("m1", None),
         ];
         let branch = vec![commit("b1", Some("m1")), commit("m1", None)];
-        assert_eq!(fork_point(&branch, &main).unwrap().graph_commit_id, "b1");
+        assert_eq!(
+            fork_of(&branch, &main, 1).fork().unwrap().graph_commit_id,
+            "b1"
+        );
     }
 
     #[test]
@@ -821,29 +939,34 @@ mod tests {
     fn the_summary_reads_as_a_sentence() {
         let dev = vec!["act-dev".to_owned()];
         assert_eq!(
-            summary_sentence(17, 22, 3, &dev),
+            summary_sentence(17, 22, Some(3), &dev),
             "17 entities and 22 relationships changed in 3 commits by act-dev"
         );
         assert_eq!(
-            summary_sentence(1, 0, 1, &dev),
+            summary_sentence(1, 0, Some(1), &dev),
             "1 entity changed in 1 commit by act-dev"
         );
         assert_eq!(
-            summary_sentence(0, 2, 1, &["a".into(), "b".into()]),
+            summary_sentence(0, 2, Some(1), &["a".into(), "b".into()]),
             "2 relationships changed in 1 commit by a and b"
         );
         assert_eq!(
-            summary_sentence(3, 0, 4, &["a".into(), "b".into(), "c".into()]),
+            summary_sentence(3, 0, Some(4), &["a".into(), "b".into(), "c".into()]),
             "3 entities changed in 4 commits by 3 people"
         );
-        assert_eq!(summary_sentence(0, 0, 2, &dev), "Nothing changed");
+        assert_eq!(summary_sentence(0, 0, Some(2), &dev), "Nothing changed");
         assert_eq!(
-            summary_sentence(2, 0, 2, &[]),
+            summary_sentence(2, 0, Some(2), &[]),
             "2 entities changed in 2 commits"
         );
         assert_eq!(
-            summary_sentence(20_000, 0, 3, &dev),
+            summary_sentence(20_000, 0, Some(3), &dev),
             "20,000 entities changed in 3 commits by act-dev"
+        );
+        // A history read only so far names no count, and nobody.
+        assert_eq!(
+            summary_sentence(17, 22, None, &dev),
+            "17 entities and 22 relationships changed"
         );
         assert_eq!(plural(999, "commit", "commits"), "999 commits");
         assert_eq!(plural(1_234_567, "commit", "commits"), "1,234,567 commits");

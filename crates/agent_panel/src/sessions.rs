@@ -742,7 +742,8 @@ mod tests {
     /// Conversations a build before filed under a graph's server name are filed under the
     /// graph's key once the index loads, each keeping its working directory, so resuming one
     /// finds the agent's own record of it; a new conversation works in the key's directory. A
-    /// name no server has stays as it is.
+    /// name no server has stays as it is, and so does one two servers share, either of which
+    /// could have filed it.
     #[gpui::test]
     fn conversations_filed_by_server_name_move_to_the_graphs_key(cx: &mut gpui::TestAppContext) {
         let dir = std::env::temp_dir().join(format!("studio-agent-named-{}", std::process::id()));
@@ -753,10 +754,15 @@ mod tests {
         store.update(cx, |store, cx| {
             store.upsert(record("old", "dev/crm", "claude", 5), cx);
             store.upsert(record("gone", "gone/crm", "claude", 1), cx);
+            store.upsert(record("shared", "local/crm", "claude", 2), cx);
         });
         studio_settings::writes_done();
 
-        let servers = vec![("dev".to_owned(), "http://127.0.0.1:8787".to_owned())];
+        let servers = vec![
+            ("dev".to_owned(), "http://127.0.0.1:8787".to_owned()),
+            ("local".to_owned(), "http://127.0.0.1:8790".to_owned()),
+            ("local".to_owned(), "http://127.0.0.1:9000".to_owned()),
+        ];
         let key = "http://127.0.0.1:8787/crm";
         let mut loaded = AgentSessions::load(path.clone());
         loaded.move_named_graphs(&servers);
@@ -779,6 +785,11 @@ mod tests {
             loaded.get("gone").unwrap().graph,
             "gone/crm",
             "no server has the name"
+        );
+        assert_eq!(
+            loaded.get("shared").unwrap().graph,
+            "local/crm",
+            "two servers have the name"
         );
 
         // Saved under the key, so the next load finds it there.

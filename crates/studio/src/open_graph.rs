@@ -8,7 +8,8 @@ use gpui::{
     SharedString, Subscription, WeakEntity, Window,
 };
 use graph_store::{
-    Connection, ConnectionEvent, ConnectionRegistry, ConnectionState, GraphListing, ServerSource,
+    Connection, ConnectionEvent, ConnectionRegistry, ConnectionState, ConnectionWatch,
+    GraphListing, ServerSource,
 };
 use studio_ui::ds::{self, MenuRow, size, space};
 use studio_workspace::ModalView;
@@ -32,8 +33,9 @@ pub struct OpenGraphModal {
     focus_handle: FocusHandle,
     /// The servers listed, as the registry last held them.
     connections: Vec<Entity<Connection>>,
-    /// A subscription to each listed server's state, by the server's entity.
-    followed: Vec<(EntityId, Subscription)>,
+    /// A subscription to each listed server's state, by the server's entity, and a watch that
+    /// keeps its health checked while the dialog shows it ([`Connection::watch`]).
+    followed: Vec<(EntityId, Subscription, ConnectionWatch)>,
     selected: Option<Entity<Connection>>,
     /// The row or field ↑, ↓ and Tab moved to, which ↵ runs.
     cursor: Option<Place>,
@@ -150,19 +152,20 @@ impl OpenGraphModal {
         this
     }
 
-    /// Lists `connections`, the registry's servers now. Each one's state is followed; one the
-    /// registry dropped or replaced (a reload of the operator's files makes a new connection
-    /// for a changed address) is not any more. A selection the registry no longer holds moves
-    /// to one it does.
+    /// Lists `connections`, the registry's servers now. Each one's state is followed, its health
+    /// checked while the dialog shows it; one the registry dropped or replaced (a reload of the
+    /// operator's files makes a new connection for a changed address) is not any more. A
+    /// selection the registry no longer holds moves to one it does.
     fn follow(&mut self, connections: Vec<Entity<Connection>>, cx: &mut Context<Self>) {
         let listed = |id: EntityId| connections.iter().any(|c| c.entity_id() == id);
-        self.followed.retain(|(id, _)| listed(*id));
+        self.followed.retain(|(id, ..)| listed(*id));
         for connection in &connections {
             let id = connection.entity_id();
-            if !self.followed.iter().any(|(followed, _)| *followed == id) {
+            if !self.followed.iter().any(|(followed, ..)| *followed == id) {
                 let subscription =
                     cx.subscribe(connection, |_, _, _: &ConnectionEvent, cx| cx.notify());
-                self.followed.push((id, subscription));
+                let watch = connection.update(cx, |connection, cx| connection.watch(cx));
+                self.followed.push((id, subscription, watch));
             }
         }
         if self

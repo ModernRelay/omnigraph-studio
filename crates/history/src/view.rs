@@ -19,14 +19,14 @@ use graph_store::{GraphSession, HeadWatch, SessionEvent};
 use studio_actions::graph::OpenCommit;
 use studio_actions::history::{NewBranchHere, NextMatch, PreviousMatch};
 use studio_ui::menu::ContextMenu;
-use studio_ui::{change_counts, now_micros, relative_time, short_commit_id};
+use studio_ui::{change_counts, group_digits, now_micros, relative_time, short_commit_id};
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 use ui::{Tooltip, right_click_menu};
 
 use crate::commit_view::{CommitCounts, CommitView, branch_start, new_branch_at};
 use crate::lanes::{Graph, GraphCommit, assign_lanes};
-use crate::merged::{Drawn, HistoryRead, branch_heads};
+use crate::merged::{Absent, Drawn, HistoryRead, branch_heads};
 
 /// Commits read per page of the branch's history. A row is `ds::size::ROW` tall, so one page
 /// fills several screens of the tab and the first shows after one read; a page costs the server
@@ -53,8 +53,13 @@ const MERGED_RETRY_AFTER: Duration = Duration::from_secs(5);
 const COUNTS_AFTER: Duration = Duration::from_millis(120);
 /// How long typing in the search pauses before the commits are matched.
 const SEARCH_DELAY: Duration = Duration::from_millis(80);
-/// Other branches whose heads History reads for their tags.
+/// Other branches whose heads History reads for their tags, and whose listings it reads for
+/// merged-in commits when the server refuses this token commits by id.
 const OTHER_BRANCHES: usize = 20;
+/// Commits read of each other branch's listing for a token the server refuses commits by id:
+/// one page each, the server's most (`limit` is 1 to 1,000). A merged-in commit none of those
+/// pages holds draws as a stub that says so, rather than the listings being read whole.
+const LISTED_PAGE: u32 = 1_000;
 
 const ROW_HEIGHT: f32 = studio_ui::ds::size::ROW;
 /// The short commit id's column, and the time's, so ids and times line up down the list.
@@ -186,8 +191,8 @@ pub struct HistoryView {
     _merged_retry: Option<Task<()>>,
     /// Whether merged-in commits are read by id. The server checks that route against a read
     /// grant on every branch, so it refuses (403) a token whose grant names branches; merged-in
-    /// commits then come from the other branches' whole listings, which it checks branch by
-    /// branch, read once into `listed`, until the next load or Refresh.
+    /// commits then come from the other branches' listings, which it checks branch by branch,
+    /// a page of [`LISTED_PAGE`] each, read once into `listed`, until the next load or Refresh.
     by_id: bool,
     listed: Option<Arc<HashMap<String, CommitOutput>>>,
     /// The commits drawn, newest first: the branch's own and those merged in.
@@ -825,8 +830,10 @@ impl HistoryView {
     }
 
     /// Answers the merged-in commits wanted from the other branches' listings, for a token the
-    /// server refuses commits by id: up to [`OTHER_BRANCHES`] live branches' whole lists, read
-    /// once into `listed`, then laid out once. A commit no list holds draws as a stub.
+    /// server refuses commits by id: the newest [`LISTED_PAGE`] commits of up to
+    /// [`OTHER_BRANCHES`] live branches, one page each, read once into `listed`, then laid out
+    /// once. A commit none of those pages holds draws as a stub, saying so
+    /// ([`Absent::NotListed`]).
     async fn read_listed(this: &WeakEntity<Self>, cx: &mut AsyncApp) {
         let Ok(held) = this.update(cx, |this, _| this.listed.clone()) else {
             return;
@@ -850,8 +857,9 @@ impl HistoryView {
                         names
                             .into_iter()
                             .map(|name| {
-                                this.session
-                                    .update(cx, |session, cx| session.commits(&name, false, cx))
+                                this.session.update(cx, |session, cx| {
+                                    session.commit_page(&name, LISTED_PAGE, None, cx)
+                                })
                             })
                             .collect::<Vec<_>>(),
                     )
@@ -860,11 +868,11 @@ impl HistoryView {
                     // once it is in.
                     return;
                 };
-                // As a branch whose list could not be read holds none of them.
+                // As a branch whose page could not be read holds none of them.
                 let mut lists = Vec::with_capacity(reads.len());
                 for read in reads {
-                    if let Ok(list) = read.await {
-                        lists.push(list);
+                    if let Ok(page) = read.await {
+                        lists.push(page.commits);
                     }
                 }
                 let listed = cx
@@ -1368,11 +1376,13 @@ impl HistoryView {
                         .map(|l| (l.lane, color(l.color)))
                         .collect(),
                     merge: commit.merged_parent_commit_id.is_some(),
-                    // A merged parent not drawn: not read yet, or one the server does not have
-                    // (a deleted branch's commit).
-                    stub: commit.merged_parent_commit_id.is_some()
-                        && !row.outgoing.iter().any(|l| l.lane != row.lane),
+                    stub: self.is_stub(ix),
                 };
+                let unnamed = commit
+                    .merged_parent_commit_id
+                    .as_deref()
+                    .filter(|_| lines.stub)
+                    .map(|merged| self.why_not_drawn(merged));
                 let branch = commit
                     .graph_branch
                     .clone()
@@ -1445,10 +1455,20 @@ impl HistoryView {
                                     .map(|name| studio_ui::ds::tag(name.clone(), cx)),
                             )
                             .when(merge, |d| {
+                                let title = format!("Merged into {branch}");
                                 d.child(
                                     div()
                                         .id(("merge", ix))
-                                        .tooltip(Tooltip::text(format!("Merged into {branch}")))
+                                        // A stub says why its merged commits are not drawn.
+                                        .tooltip(move |_, cx| match &unnamed {
+                                            Some(why) => Tooltip::with_meta(
+                                                title.clone(),
+                                                None,
+                                                why.clone(),
+                                                cx,
+                                            ),
+                                            None => Tooltip::simple(title.clone(), cx),
+                                        })
                                         .child(studio_ui::ds::icon::meta(IconName::PullRequest)),
                                 )
                             }),
@@ -1535,6 +1555,44 @@ impl HistoryView {
             .child(div().w(px(graph_width)).h_full().flex_none())
             .child(status)
             .into_any_element()
+    }
+
+    /// Whether row `ix` is a merge whose merged parent is not drawn, so its lane ends in a
+    /// stub.
+    fn is_stub(&self, ix: usize) -> bool {
+        let (Some(commit), Some(row)) = (self.commits.get(ix), self.graph.rows.get(ix)) else {
+            return false;
+        };
+        commit.merged_parent_commit_id.is_some() && !row.outgoing.iter().any(|l| l.lane != row.lane)
+    }
+
+    /// Why the commits a merge brought in are not drawn below it, by its merged parent `id`: not
+    /// had, not in the listings read, its read failed, not read yet, or older than the rows read.
+    fn why_not_drawn(&self, id: &str) -> String {
+        match self.read.absent(id) {
+            Some(Absent::NotHad) => {
+                "The server does not serve the merged commit, as for a deleted branch's latest \
+                 commits and history cleaned up."
+                    .into()
+            }
+            Some(Absent::NotListed) => format!(
+                "The merged commit is not among the newest {} commits of any branch read, and \
+                 this credential may not read a commit by its id.",
+                group_digits(LISTED_PAGE as usize)
+            ),
+            None if self.merged_failed.contains_key(id) => {
+                "The merged commit could not be read; it is asked for again while this row shows."
+                    .into()
+            }
+            None if self.wanted.iter().any(|wanted| wanted == id) => {
+                "The merged commits are being read.".into()
+            }
+            None => {
+                "The merged commits are older than the commits read so far, and show as more are \
+                 read."
+                    .into()
+            }
+        }
     }
 
     fn render_list(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2232,7 +2290,15 @@ mod tests {
             let m2 = &view.graph.rows[2];
             assert!(m2.outgoing.iter().all(|line| line.lane == m2.lane));
         };
-        view.read_with(cx, |view, _| check(view));
+        view.read_with(cx, |view, _| {
+            check(view);
+            assert!(view.is_stub(2));
+            assert_eq!(
+                view.why_not_drawn("gone"),
+                "The server does not serve the merged commit, as for a deleted branch's latest \
+                 commits and history cleaned up."
+            );
+        });
         let reads = |served: &Arc<Mutex<Served>>| {
             let served = served.lock().unwrap();
             ["b2", "b1", "gone"].map(|id| served.reads_of(id))
@@ -2325,9 +2391,18 @@ mod tests {
     }
 
     /// A token whose read grant names branches is refused commits by id: merged-in commits then
-    /// come from the other branches' listings, read whole, and one no listing holds is a stub.
+    /// come from the other branches' listings, the newest page of each, never read whole. One
+    /// none of those pages holds is a stub that says so: here `long`'s `z1`, below its newest
+    /// 1,000 commits.
     #[gpui::test]
     async fn a_token_refused_commits_by_id_reads_merges_from_the_listings(cx: &mut TestAppContext) {
+        let mut long = chain("l", LISTED_PAGE as usize + 100);
+        let oldest = long.len() - 1;
+        long[oldest]["parent_commit_id"] = json!("z1");
+        long.extend([
+            commit("z1", 15, Some("m1"), None),
+            commit("m1", 10, None, None),
+        ]);
         let (session, served) = serve(
             Served {
                 branches: vec![
@@ -2335,7 +2410,7 @@ mod tests {
                         "main".into(),
                         vec![
                             commit("m3", 30, Some("m2"), Some("b2")),
-                            commit("m2", 20, Some("m1"), Some("gone")),
+                            commit("m2", 20, Some("m1"), Some("z1")),
                             commit("m1", 10, None, None),
                         ],
                     ),
@@ -2348,6 +2423,7 @@ mod tests {
                             commit("m1", 10, None, None),
                         ],
                     ),
+                    ("long".into(), long),
                 ],
                 refuse_by_id: true,
                 ..Default::default()
@@ -2363,24 +2439,33 @@ mod tests {
                 m2.outgoing.iter().all(|line| line.lane == m2.lane),
                 "a stub"
             );
+            assert!(view.is_stub(2) && !view.is_stub(0));
+            assert_eq!(
+                view.why_not_drawn("z1"),
+                "The merged commit is not among the newest 1,000 commits of any branch read, and \
+                 this credential may not read a commit by its id."
+            );
             assert!(!view.by_id);
         });
-        let whole = |served: &Arc<Mutex<Served>>| {
-            served
-                .lock()
-                .unwrap()
-                .listings()
-                .into_iter()
-                .filter(|listing| *listing == "branch=feature")
-                .count()
+        let pages = |served: &Arc<Mutex<Served>>| {
+            let served = served.lock().unwrap();
+            let listings = served.listings();
+            assert!(
+                listings.iter().all(|listing| listing.contains("&limit=")),
+                "a listing read whole: {listings:?}"
+            );
+            ["feature", "long"].map(|branch| {
+                let page = format!("branch={branch}&limit={LISTED_PAGE}");
+                listings.iter().filter(|listing| **listing == page).count()
+            })
         };
-        assert_eq!(whole(&served), 1);
-        // A Refresh tries by id again, is refused again, and reads the lists again, as it reads
+        assert_eq!(pages(&served), [1, 1]);
+        // A Refresh tries by id again, is refused again, and reads the pages again, as it reads
         // every head again.
         view.update(cx, |view, cx| view.refresh(cx));
         cx.run_until_parked();
         view.read_with(cx, |view, _| assert_eq!(ids(view).len(), 5));
-        assert_eq!(whole(&served), 2);
+        assert_eq!(pages(&served), [2, 2]);
     }
 
     /// A merged-in commit whose read failed is asked for again once a while has passed, while a

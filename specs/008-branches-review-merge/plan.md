@@ -136,7 +136,11 @@ place), X (designed on 0.13; the better routes are deferred).
   entity, and the message. Resolution happens on the source branch with ordinary edits; then
   merge again.
 - After merging, Studio confirms the target's history contains the merge (a verified
-  merge).
+  merge), reading it a page at a time from its head for at most its newest 10,000 commits. A
+  merge not in them is not confirmed: "Not confirmed: the newest 10,000 commits of main's
+  history do not show it, and Studio read no further; open History to check." A lost merge
+  response read the same way stays unknown ("… Studio did not retry; open History before
+  merging again"), never "merge again".
 
 ## Decisions
 
@@ -156,9 +160,14 @@ place), X (designed on 0.13; the better routes are deferred).
     base to the reviewed head instead (both pinned), capped at 20,000 changes either way.
   - E7 merge base: `GET /branches/merge-base` since 0.14 (fork, head, and a merge's
     confirmation). A review of one commit reads the branch's history a page at a time down to
-    the merge base; both whole lists are read only for a branch its target was merged into,
-    whose merge base is off its own chain, or one not reached within 20 pages. A lost merge
-    response reads the target's history a page at a time from its head.
+    the merge base. A branch its target was merged into, whose merge base is off its own
+    chain, finds its commits since the fork from pages of both histories, read in turn: its
+    first-parent chain down to its newest commit the target's pages hold, listed there or as a
+    merged parent (`graph_store::ForkSearch`). No history is read whole: each is read at most
+    20 pages of 500. A fork past them shows the commits read, "More than 10,000 commits since
+    the fork: Studio read no further, and One commit lists only those it read.", and a
+    summary that names no commit count or author ("17 entities changed"). A lost merge
+    response reads the target's history a page at a time from its head, as far.
   - E8 merge preview with no effects: merge on request and show the 409 conflicts until then.
   - E9 branch details: derived from `GET /commits?branch=` until then.
   - E21 a branch from a commit (`from_commit`, OmniGraph #1016): built 2026-10-20 (Design,
@@ -173,6 +182,8 @@ place), X (designed on 0.13; the better routes are deferred).
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | A merge whose deletion was refused is logged as such | `graph_store` `a_merge_whose_deletion_was_refused_says_the_branch_stays` (a merge with deletion answered `branch_deleted: false` and `branch_delete_error_details`, then one answered `true`) | "Merge feature into main; feature was not deleted: feature is protected", the session still on feature; then "Merge feature into main and delete feature", the session on main. Before, both read "…and delete feature", the activity log and the toast saying a branch that stayed was deleted |
+| 2026-10-21 | Every write runs through one runner | `graph_store` `GraphSession::run_write` (count, send once, run to the outcome, log, follow-up) in place of six copies in `send_write`, `invoke_stored_write`, `send_blob_write`, `create_branch`, `delete_branch` and `merge`; the session, review, history, type table and query editor tests | All pass unchanged |
 | 2026-10-11 | Merge outcomes and conflict kinds in 0.13.0 | parsed `openapi.json` at `v0.13.0` | As listed |
 | 2026-10-12 | Edge mutations Studio builds compile on 0.13 | `gq_language` `writes_compile`, `graph_store` `fixes` tests type-check `insert_edge`/`delete_edge` against the 0.13 compiler; `docs/user/mutations/index.md` at `v0.13.0` (`from`/`to` assignments; no edge update; inserts and deletes cannot mix) | Pass |
 | 2026-10-12 | Relationship reverts land on the branch | dev server: branch `review-edges` adds `WorksAt person-000000 → company-00003` and deletes `Knows person-000000 → person-000005`; review restored from a workspace file; ⌥⌘Z on both cards; queries on the branch | Two commits, each bound to the head before it; the `Knows` edge is back, the `WorksAt` edge is gone |
@@ -189,6 +200,7 @@ place), X (designed on 0.13; the better routes are deferred).
 | 2026-10-12 | Merge refuses a moved branch | offscreen snapshot: a second writer committed on `feature-v` after the review was read | "feature-v moved to …"; no merge request sent; main unchanged |
 | 2026-10-18 | Relationships are reviewed with the entity they came with | `graph_store` `entity_groups` tests (home rule, mirrors, self relationships, a type the schema lacks, edge types in words); `review` test `a_search_keeps_the_cards_whose_changes_match_and_headers_count_what_shows` | Each change on exactly one card; mirrors name their card; headers count what shows |
 | 2026-10-18 | Entity cards render | offscreen snapshot against a scratch dev server on edge `0a62bb7`: branch `review-demo` adds Person `person-900000` with `WorksAt` and `Knows`, retitles `person-000001` and adds its `Contributes`, removes `WorksAt person-000000 → company-00002`, adds `Knows person-000155 → person-000005` | Donald Dijkstra's card carries his new `contributes`; Theo Brandt's carries `works at` and `knows`, mirrored on `person-000000`'s card with the removed `works at` struck through; the scratch server and its data were deleted after |
+| 2026-10-20 | No history is read whole: the fork, the commits since it and a merge's confirmation come from bounded pages | `review` tests `a_review_reads_the_merge_base_and_the_feed_after_it` (a branch main was merged into reads one page of each history, `limit=500`), `a_fork_past_the_history_read_is_said_and_no_history_is_read_whole` (a review of one commit on a branch of 10,500 commits since the fork; a branch main was merged into whose fork is past main's newest 10,000), `a_merge_past_the_history_read_is_not_confirmed` (main of 10,501 commits without the merge), `a_merge_is_confirmed_after_more_of_the_source_was_merged`; `graph_store` `ForkSearch` tests (`the_fork_is_the_newest_branch_commit_in_the_target`, `a_held_merge_base_is_the_fork_the_chain_reaches`, `a_branch_the_target_was_merged_into_forks_where_it_began`, `a_branch_merged_into_the_target_forks_at_its_merged_head`, `a_merged_branch_forks_at_its_own_head`), each history read in pages of 1, 2, 3 and 10; against fakes that page `GET /commits` by `limit` and `page_token` as `edge-20261020-7fd9cc9` does (`limit` 1 to 1,000, `crates/graph_client/openapi/omnigraph-0.14.0-edge.json`) and send the contract header | Pass: every listing names a `limit`; past the bound exactly 20 pages of a history are read, none of main's for a fork on the branch's own chain; the note shows and the summary reads "1 entity changed"; the merge reads `NotReached`, "Not confirmed: …" when committed and "The merge outcome is unknown (…): the newest 10,000 commits of main's history do not show it, and Studio read no further. Studio did not retry; open History before merging again." when lost. `GraphSession::commits` and `GraphClient::commits`, the whole-list reads, are gone: nothing else read them |
 | 2026-10-20 | A branch starts at a commit with the commit alone, and each refusal reads in words | `graph_store` test `a_branch_starts_at_a_head_or_at_a_commit_never_both`; `review` test `a_branch_at_a_commit_says_why_it_was_refused_and_is_not_sent_again`, against fakes answering with the contract header as OmniGraph `edge-20261020-7fd9cc9` does (`BranchCreateRequest`, `BranchCreateOutput`, `BranchStartRefusalOutput` in `crates/graph_client/openapi/omnigraph-0.14.0-edge.json`) | Pass: the body names `from_commit` and no `from`; the receipt's commit is the head; every reason's notice shows, an unknown one as the server's message, and each start is sent once |
 
 ## Corrections
@@ -208,6 +220,11 @@ place), X (designed on 0.13; the better routes are deferred).
 - 2026-10-12: a fresh window focuses nothing, so window-level actions never reached the
   workspace's handlers. `review::init` focuses the workspace when nothing is focused; the fix
   belongs in `studio_workspace`.
+- 2026-10-20: the fork of a branch its target was merged into, a fork past 20 pages of the
+  branch's history, and a merge's confirmation past 20 pages of the target's read both whole
+  lists (every commit since each branch began, main's before the fork included). They read
+  bounded pages now and say when the bound stopped them (Deferred, E7); `fork_point` over two
+  whole lists became `graph_store::ForkSearch` over pages.
 - 2026-10-12: the change feed folds first-parent history, so a branch that merged its target in
   showed the merged-in changes too, each with Revert, which would undo the target's own change
   on merge. Since 2026-10-18 such a review folds the net diff from the merge base (E6) and says

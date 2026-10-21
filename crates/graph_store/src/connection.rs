@@ -1,5 +1,6 @@
 //! One OmniGraph server: its client, contract and version check, and graphs (spec 003).
 
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -81,7 +82,21 @@ pub enum GraphListing {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionEvent {
     StateChanged,
+    /// The token was replaced by another: what was read with the old one, and what it was
+    /// allowed to do, is to be read again.
+    CredentialChanged,
 }
+
+/// Held by whatever shows a server (a window's graph, the Open dialog): its health is checked
+/// while one is held ([`Connection::watch`]).
+pub struct ConnectionWatch {
+    _alive: Rc<()>,
+}
+
+/// A read of the token from the keychain, asked for by [`Connection::await_token`]: its answer
+/// counts only while no token was set since ([`Connection::token_read`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenWait(u64);
 
 pub struct Connection {
     pub server: ServerEntry,
@@ -105,6 +120,14 @@ pub struct Connection {
     /// The token is still being read (from the keychain): a connect waits for it, rather than
     /// asking without one and being refused.
     token_pending: bool,
+    /// How many tokens were set: a keychain read asked for before the last one answers too
+    /// late, and the token set since stands.
+    tokens_set: u64,
+    /// One more holder than the watches held ([`ConnectionWatch`]): health is checked only
+    /// while one is.
+    watchers: Rc<()>,
+    /// A health check came while nothing watched the server: the next watch checks at once.
+    check_missed: bool,
 }
 
 /// Health re-check interval after a failure (spec 003).
@@ -142,24 +165,34 @@ impl Connection {
             _task: None,
             _health_check: None,
             token_pending: false,
+            tokens_set: 0,
+            watchers: Rc::new(()),
+            check_missed: false,
         })
     }
 
     /// Notes that the token is being read; [`Connection::token_read`] or
     /// [`Connection::set_token`] ends the wait, and a connect asked for meanwhile goes then.
-    pub fn await_token(&mut self) {
+    /// The read's answer is given back with the returned wait.
+    pub fn await_token(&mut self) -> TokenWait {
         self.token_pending = true;
+        TokenWait(self.tokens_set)
     }
 
-    /// Takes the token read from the OS keychain, which is none when none was saved. One that
-    /// could not be read ends the wait too: Studio connects without a token and keeps why
-    /// ([`Connection::token_unread`]). A server that asks for one answers 401, and a token
-    /// typed in then connects.
+    /// Takes the token read from the OS keychain for `wait`, which is none when none was saved.
+    /// One that could not be read ends the wait too: Studio connects without a token and keeps
+    /// why ([`Connection::token_unread`]). A server that asks for one answers 401, and a token
+    /// typed in then connects. A token set since the read was asked for (typed in while the
+    /// keychain was slow to answer) is newer, and stands.
     pub(crate) fn token_read(
         &mut self,
+        wait: TokenWait,
         read: anyhow::Result<Option<(String, Vec<u8>)>>,
         cx: &mut Context<Self>,
     ) {
+        if wait.0 != self.tokens_set {
+            return;
+        }
         let (token, unread) = match read {
             Ok(None) => (None, None),
             Ok(Some((_, bytes))) => match String::from_utf8(bytes) {
@@ -236,7 +269,10 @@ impl Connection {
         cx: &mut Context<Self>,
     ) {
         self.token_pending = false;
-        self.client.set_token(token);
+        self.tokens_set += 1;
+        if self.client.set_token(token) {
+            cx.emit(ConnectionEvent::CredentialChanged);
+        }
         let unread_changed = unread != self.token_unread;
         self.token_unread = unread;
         if self.state != ConnectionState::Idle {
@@ -247,12 +283,37 @@ impl Connection {
         }
     }
 
+    /// Keeps the server's health checked while the returned watch is held: a window that shows
+    /// one of its graphs holds one, and so does the Open dialog listing it. With none held, a
+    /// check that comes is skipped and the checks stop; the next watch checks at once and
+    /// starts them again.
+    pub fn watch(&mut self, cx: &mut Context<Self>) -> ConnectionWatch {
+        let watch = ConnectionWatch {
+            _alive: self.watchers.clone(),
+        };
+        if std::mem::take(&mut self.check_missed)
+            && !matches!(
+                self.state,
+                ConnectionState::Idle | ConnectionState::Connecting
+            )
+        {
+            self.check_health_after(Duration::ZERO, cx);
+        }
+        watch
+    }
+
+    /// Whether a watch is held ([`Connection::watch`]).
+    pub fn watched(&self) -> bool {
+        Rc::strong_count(&self.watchers) > 1
+    }
+
     /// Stops a connection attempt that is taking too long.
     pub fn cancel(&mut self, cx: &mut Context<Self>) {
         if self.state == ConnectionState::Connecting {
             self._task = None;
             // A check already scheduled would connect again, or mark the server down.
             self._health_check = None;
+            self.check_missed = false;
             self.state = ConnectionState::Idle;
             cx.emit(ConnectionEvent::StateChanged);
             cx.notify();
@@ -309,9 +370,24 @@ impl Connection {
         } else {
             FAILED_CHECK_INTERVAL
         };
+        self.check_health_after(interval, cx);
+    }
+
+    /// Checks `/healthz` after `wait`, unless nothing watches the server by then: that check
+    /// is missed, the checks stop, and the next watch makes it ([`Connection::watch`]).
+    fn check_health_after(&mut self, wait: Duration, cx: &mut Context<Self>) {
         let client = self.client.clone();
         self._health_check = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(interval).await;
+            cx.background_executor().timer(wait).await;
+            let watched = this
+                .update(cx, |this, _| {
+                    this.check_missed = !this.watched();
+                    !this.check_missed
+                })
+                .unwrap_or(false);
+            if !watched {
+                return;
+            }
             // Timed off the main thread, so a busy frame does not count as the server's time.
             let (health, latency) = cx
                 .background_executor()
@@ -513,8 +589,9 @@ mod tests {
     }
 
     /// A connection whose token is still being read waits to connect, sending nothing it
-    /// would be refused; the token's arrival connects it. A cancel stops the check scheduled
-    /// after a failure, which would otherwise connect again.
+    /// would be refused; the token's arrival connects it, and the keychain's answer to that
+    /// read, coming after, is dropped. A cancel stops the check scheduled after a failure,
+    /// which would otherwise connect again.
     #[gpui::test]
     async fn a_connect_waits_for_its_token_and_a_cancel_stays(cx: &mut TestAppContext) {
         let sent = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
@@ -558,9 +635,10 @@ mod tests {
             known_graphs: Vec::new(),
         };
         let connection = cx.new(|_| Connection::new(server, None, http).unwrap());
-        connection.update(cx, |connection, cx| {
-            connection.await_token();
+        let first_read = connection.update(cx, |connection, cx| {
+            let wait = connection.await_token();
             connection.connect(cx);
+            wait
         });
         cx.run_until_parked();
         connection.read_with(cx, |connection, _| {
@@ -583,6 +661,18 @@ mod tests {
                 .iter()
                 .all(|token| token.as_deref() == Some("Bearer t"))
         );
+        // The keychain answering after a token was set: the token set stands, and nothing is
+        // sent again with the keychain's.
+        sent.lock().unwrap().clear();
+        connection.update(cx, |connection, cx| {
+            let saved = ("omnigraph-studio".to_owned(), b"from-keychain".to_vec());
+            connection.token_read(first_read, Ok(Some(saved)), cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "the late answer is dropped"
+        );
 
         // A check is scheduled while ready; connecting and cancelling leave none behind.
         connection.update(cx, |connection, cx| {
@@ -597,9 +687,9 @@ mod tests {
         let read_failed = |cx: &mut TestAppContext| {
             sent.lock().unwrap().clear();
             connection.update(cx, |connection, cx| {
-                connection.await_token();
+                let wait = connection.await_token();
                 connection.connect(cx);
-                connection.token_read(Err(anyhow::anyhow!("the keychain is locked")), cx);
+                connection.token_read(wait, Err(anyhow::anyhow!("the keychain is locked")), cx);
             });
             cx.run_until_parked();
             let sent = sent.lock().unwrap();
@@ -674,7 +764,11 @@ mod tests {
             known_graphs: Vec::new(),
         };
         let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
-        connection.update(cx, |connection, cx| connection.connect(cx));
+        // Shown, so its health is checked.
+        let _watch = connection.update(cx, |connection, cx| {
+            connection.connect(cx);
+            connection.watch(cx)
+        });
         cx.run_until_parked();
         let asked = listed.load(std::sync::atomic::Ordering::SeqCst);
         for _ in 0..3 {
@@ -685,6 +779,68 @@ mod tests {
             });
         }
         assert_eq!(listed.load(std::sync::atomic::Ordering::SeqCst), asked);
+    }
+
+    /// Health is checked only while something shows the server: a check that comes while
+    /// nothing watches is skipped and the checks stop, until a watch checks at once and starts
+    /// them again.
+    #[gpui::test]
+    async fn health_is_checked_only_while_the_server_is_watched(cx: &mut TestAppContext) {
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = checks.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let health = request.uri().path().ends_with("/healthz");
+            if health {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            async move {
+                let body = if health {
+                    r#"{"status":"ok","version":"0.14.0","internal_schema_version":16}"#
+                } else {
+                    r#"{"graphs":[]}"#
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Studio,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let checked = || checks.swap(0, std::sync::atomic::Ordering::SeqCst);
+        let wait = |cx: &mut TestAppContext| {
+            cx.executor().advance_clock(DEFAULT_CHECK_INTERVAL);
+            cx.run_until_parked();
+        };
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        cx.run_until_parked();
+        assert_eq!(checked(), 1, "the connect's own");
+        for _ in 0..3 {
+            wait(cx);
+        }
+        assert_eq!(checked(), 0, "nothing shows the server");
+
+        let watch = connection.update(cx, |connection, cx| connection.watch(cx));
+        cx.run_until_parked();
+        assert_eq!(checked(), 1, "at once");
+        wait(cx);
+        wait(cx);
+        assert_eq!(checked(), 2, "then at each interval");
+
+        drop(watch);
+        wait(cx);
+        wait(cx);
+        assert_eq!(checked(), 0);
+        connection.read_with(cx, |connection, _| {
+            assert!(!connection.watched());
+            assert_eq!(connection.state, ConnectionState::Ready);
+        });
     }
 
     /// A server that speaks contract 0.13 (OmniGraph 0.13, or a 0.14 build before the contract

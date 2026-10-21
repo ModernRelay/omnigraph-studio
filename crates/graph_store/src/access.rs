@@ -53,6 +53,11 @@ impl Allowed {
     }
 }
 
+/// The client's counts an answer is read under: its credential changes and the 403s the server
+/// sent on the graph (`GraphClient::credential_changes`, `GraphClient::refusals`). Either moving
+/// means the answers may no longer hold.
+pub(crate) type Authority = (u64, u64);
+
 /// The answers read so far, and the reads out.
 #[derive(Default)]
 pub(crate) struct Access {
@@ -60,14 +65,14 @@ pub(crate) struct Access {
     asked: HashSet<AccessScope>,
     /// Moves on [`Access::forget`], so a read sent before lands nowhere.
     generation: u64,
-    /// The client's authority count the answers were read under.
-    authority: u64,
+    /// The client's counts the answers were read under.
+    authority: Authority,
 }
 
 impl Access {
-    /// Forgets every answer when the client's authority count moved since they were read (a
-    /// new token, or a 403). Whether it forgot.
-    pub(crate) fn sync(&mut self, authority: u64) -> bool {
+    /// Forgets every answer when the client's counts moved since they were read (a new token,
+    /// or a 403 on the graph). Whether it forgot.
+    pub(crate) fn sync(&mut self, authority: Authority) -> bool {
         if authority == self.authority {
             return false;
         }
@@ -120,8 +125,10 @@ impl Access {
         Some(self.generation)
     }
 
-    /// Lands a read of `scope` sent at `generation`: kept when nothing was forgotten since. A
-    /// failed read is asked again the next time. Returns whether anything changed.
+    /// Lands a read of `scope` sent at `generation`: kept when nothing was forgotten since,
+    /// which the caller makes sure of by syncing first ([`Access::sync`]), so an answer sent
+    /// before a change of the counts lands nowhere. A failed read is asked again the next
+    /// time. Returns whether anything changed.
     pub(crate) fn landed(
         &mut self,
         scope: AccessScope,
@@ -224,7 +231,8 @@ mod tests {
     }
 
     /// Forgetting drops every answer, and a read sent before lands nowhere; a failed read is
-    /// asked again.
+    /// asked again. A new token or a 403 on the graph, either count moving, forgets as well,
+    /// and counts that stand forget nothing.
     #[test]
     fn a_forgotten_answer_is_read_again() {
         let mut access = Access::default();
@@ -239,5 +247,24 @@ mod tests {
             access.wants(&main).is_some(),
             "a failed read is asked again"
         );
+
+        // A new token, then a 403, each while a read is out: it lands nowhere.
+        for moved in [(1, 0), (1, 1)] {
+            let generation = access.wants(&main).unwrap_or(access.generation);
+            assert!(access.sync(moved), "the read out is forgotten");
+            assert!(!access.sync(moved), "counts that stand");
+            assert!(
+                !access.landed(
+                    main.clone(),
+                    generation,
+                    Some(answer(Some("main"), &[], &[]))
+                ),
+                "sent before the move"
+            );
+        }
+        let held = access.wants(&main).unwrap();
+        assert!(access.landed(main.clone(), held, Some(answer(Some("main"), &[], &[]))));
+        assert!(access.sync((1, 2)), "a 403 forgets what was read");
+        assert_eq!(access.allows(AccessAction::Read, &main), Allowed::Unknown);
     }
 }

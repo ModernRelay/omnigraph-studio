@@ -304,9 +304,11 @@ pub struct GraphClient {
     http: Arc<dyn HttpClient>,
     /// Shared by every clone, so the bound holds for the whole connection.
     read_slots: Arc<smol::lock::Semaphore>,
-    /// How often what the credential may do may have changed: a new token, or a 403 from the
-    /// server ([`Self::authority_changes`]). Shared by every clone.
-    authority_changes: Arc<std::sync::atomic::AtomicU64>,
+    /// How often the token was replaced by another ([`Self::credential_changes`]), and how often
+    /// the server refused a request on one of its graphs with 403 ([`Self::refusals`]). Shared
+    /// by every clone.
+    credential_changes: Arc<std::sync::atomic::AtomicU64>,
+    refusals: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl std::fmt::Debug for GraphClient {
@@ -352,35 +354,57 @@ impl GraphClient {
             token: Arc::new(std::sync::RwLock::new(token.map(Into::into))),
             http,
             read_slots: Arc::new(smol::lock::Semaphore::new(READ_CONCURRENCY)),
-            authority_changes: Arc::default(),
+            credential_changes: Arc::default(),
+            refusals: Arc::default(),
         })
     }
 
-    /// A count that moves whenever what this client's credential may do may have changed: the
-    /// token was replaced, or the server refused a request with 403. What was read of the
-    /// credential's actions before it moved is to be read again.
-    pub fn authority_changes(&self) -> u64 {
-        self.authority_changes
+    /// A count that moves whenever the token is replaced by another: everything read with the
+    /// old one, and what it was allowed to do, is to be read again with the new, which may see
+    /// less.
+    pub fn credential_changes(&self) -> u64 {
+        self.credential_changes
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Counts a response's 403 when the server sent it (it carries the contract header).
-    fn note_refusal(&self, status: StatusCode, headers: &HeaderMap) {
-        if status == StatusCode::FORBIDDEN && headers.contains_key(CONTRACT_HEADER) {
-            self.authority_changes
+    /// A count that moves whenever the server refuses a request on one of its graphs with 403:
+    /// the graph's policy may have changed, so what the credential may do there is to be read
+    /// again. A 403 from the server's own routes is not counted: listing or discovering its
+    /// graphs is a server action most tokens may not take, and says nothing about a graph.
+    pub fn refusals(&self) -> u64 {
+        self.refusals.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Counts a response's 403 to a request on a graph (`graphs/{id}/…` under the root) when
+    /// the server sent it (it carries the contract header).
+    fn note_refusal(&self, url: &Url, status: StatusCode, headers: &HeaderMap) {
+        if status != StatusCode::FORBIDDEN || !headers.contains_key(CONTRACT_HEADER) {
+            return;
+        }
+        let below = url.path().strip_prefix(self.base.path()).unwrap_or("");
+        let mut segments = below.split('/');
+        let on_graph = segments.next() == Some("graphs") && segments.nth(1).is_some();
+        if on_graph {
+            self.refusals
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
     /// Replaces the token for this client and every clone of it; requests sent after this use
-    /// it.
-    pub fn set_token(&self, token: Option<String>) {
-        *self
+    /// it. Whether it differs from the token it replaced, which counts as a credential change.
+    pub fn set_token(&self, token: Option<String>) -> bool {
+        let token: Option<Arc<str>> = token.map(Into::into);
+        let mut held = self
             .token
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = token.map(Into::into);
-        self.authority_changes
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *held == token {
+            return false;
+        }
+        *held = token;
+        self.credential_changes
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        true
     }
 
     fn token(&self) -> Option<Arc<str>> {
@@ -472,7 +496,7 @@ impl GraphClient {
             .await
             .map_err(|error| describe_transport(&error))?;
         let status = response.status();
-        self.note_refusal(status, response.headers());
+        self.note_refusal(&url, status, response.headers());
         let contract = response
             .headers()
             .get(CONTRACT_HEADER)
@@ -839,7 +863,7 @@ impl GraphClient {
             .await
             .map_err(|error| describe_transport(&error))?;
         let status = response.status();
-        self.note_refusal(status, response.headers());
+        self.note_refusal(&url, status, response.headers());
         let headers = response.headers().clone();
         Ok(ForwardResponse {
             status,
@@ -997,18 +1021,10 @@ impl GraphClient {
             .await
     }
 
-    pub async fn commits(&self, graph: &str, branch: &str) -> Result<CommitListOutput, ReadError> {
-        self.read(
-            Method::GET,
-            &["graphs", graph, "commits"],
-            &[("branch", branch)],
-            None,
-        )
-        .await
-    }
-
     /// A page of `branch`'s history, newest first: its newest `limit` commits, or from
     /// `page_token` the next ones. The page names the head it resolved and where it goes on.
+    /// The one way Studio reads a history: without `limit` the server answers the whole of it,
+    /// every commit since the graph began, in one body.
     pub async fn commit_page(
         &self,
         graph: &str,
@@ -1497,8 +1513,187 @@ mod tests {
     const CHANGE: &str =
         r#"{"branch":"main","query_name":"u","affected_nodes":1,"affected_edges":0,"commit":null}"#;
 
+    /// A 403 on a graph's route counts as a refusal on every clone, read or write, from the
+    /// gateway too; one on the server's own routes (listing and discovering graphs, which most
+    /// tokens may not), or one without the contract header, does not. Neither moves the
+    /// credential count.
+    #[test]
+    fn a_refusal_on_a_graph_is_counted_and_one_on_the_server_is_not() {
+        let held = GraphClient::new(
+            "http://127.0.0.1:8787/og",
+            Some("t".into()),
+            FakeHttpClient::create(|request| {
+                let contract = !request.uri().path().ends_with("/plain/schema");
+                async move {
+                    let mut builder = Response::builder().status(403);
+                    if contract {
+                        builder = builder.header(CONTRACT_HEADER, CONTRACT);
+                    }
+                    Ok(builder
+                        .body(AsyncBody::from(r#"{"error":"denied"}"#))
+                        .unwrap())
+                }
+            }),
+        )
+        .unwrap();
+        let gateway = held.clone();
+        block_on(held.graphs()).ok();
+        block_on(held.discover_graphs()).ok();
+        block_on(held.schema("plain")).ok();
+        assert_eq!(
+            held.refusals(),
+            0,
+            "the server's own routes, and a 403 from elsewhere"
+        );
+        block_on(held.schema("discovery")).ok();
+        let change = ChangeRequest {
+            query: "query q() {}".into(),
+            name: None,
+            params: None,
+            branch: Some("main".into()),
+        };
+        block_on(held.mutate("knowledge", &change, None));
+        block_on(gateway.forward(ForwardRequest {
+            method: Method::GET,
+            path_and_query: "graphs/knowledge/branches".into(),
+            headers: Vec::new(),
+            body: AsyncBody::empty(),
+        }))
+        .unwrap();
+        assert_eq!(
+            gateway.refusals(),
+            3,
+            "a graph named like a route counts too"
+        );
+        assert_eq!(held.credential_changes(), 0);
+    }
+
+    /// Every route the client calls is one the contract serves, with that method: each public
+    /// call is made once, a conditional write both ways, against a server that records what it
+    /// was sent, and each request's path is matched to the contract's paths, a `{…}` standing for
+    /// one segment. The agent's forwarded requests are the CLI's own and not counted here.
+    #[test]
+    fn every_route_the_client_calls_is_in_the_contract() {
+        let sent: Arc<std::sync::Mutex<Vec<(String, String)>>> = Arc::default();
+        let log = sent.clone();
+        let http = FakeHttpClient::create(move |request| {
+            log.lock().unwrap().push((
+                request.method().as_str().to_ascii_lowercase(),
+                request.uri().path().to_owned(),
+            ));
+            async move {
+                Ok(Response::builder()
+                    .status(200)
+                    .header(CONTRACT_HEADER, CONTRACT)
+                    .body(AsyncBody::from("{}"))
+                    .unwrap())
+            }
+        });
+        let at = client(http);
+        let graph = "knowledge";
+        let cell = BlobCell {
+            edge: false,
+            type_name: "Person".into(),
+            id: "p1".into(),
+            property: "photo".into(),
+        };
+        let query = QueryRequest {
+            query: "query q() {}".into(),
+            name: None,
+            params: None,
+            branch: Some("main".into()),
+            snapshot: None,
+        };
+        let change = ChangeRequest {
+            query: "query m() {}".into(),
+            name: None,
+            params: None,
+            branch: Some("main".into()),
+        };
+        let stored = InvokeStoredQueryRequest {
+            params: None,
+            branch: Some("main".into()),
+            snapshot: None,
+            expect_mutation: None,
+        };
+        let create = BranchCreateRequest {
+            name: "feature".into(),
+            from: Some("main".into()),
+            from_commit: None,
+        };
+        let merge = BranchMergeRequest {
+            source: "feature".into(),
+            target: Some("main".into()),
+            delete_branch: true,
+            dry_run: false,
+        };
+        block_on(async {
+            at.health().await.ok();
+            at.readiness().await.ok();
+            at.graphs().await.ok();
+            at.discover_graphs().await.ok();
+            at.schema(graph).await.ok();
+            at.snapshot(graph, "main").await.ok();
+            at.query(graph, &query).await.ok();
+            at.stored_queries(graph).await.ok();
+            at.invoke_stored_read(graph, "find", &stored).await.ok();
+            let _ = at.invoke_stored_write(graph, "find", &stored, None).await;
+            let _ = at
+                .invoke_stored_write(graph, "find", &stored, Some("c1"))
+                .await;
+            at.access(graph, Some("main"), Some("feature")).await.ok();
+            at.branches(graph).await.ok();
+            at.commit_page(graph, "main", 1, Some("t")).await.ok();
+            at.commit(graph, "c1").await.ok();
+            at.commit_changes(graph, "c1", None, 10).await.ok();
+            at.diff(graph, "c1", "c2", None, 10).await.ok();
+            at.merge_base(graph, "feature", "main").await.ok();
+            at.merge_preview(graph, "feature", "main").await.ok();
+            at.changes(graph, "main", FeedAt::Start("now"), &[], 10)
+                .await
+                .ok();
+            let _ = at.mutate(graph, &change, None).await;
+            let _ = at.mutate(graph, &change, Some("c1")).await;
+            let _ = at.create_branch(graph, &create).await;
+            let _ = at.delete_branch(graph, "feature").await;
+            let _ = at.merge(graph, &merge).await;
+            at.blob_head(graph, &cell, BlobAt::Branch("main"))
+                .await
+                .ok();
+            at.blob_bytes(graph, &cell, BlobAt::Snapshot("c1"), 0..10)
+                .await
+                .ok();
+            let _ = at.blob_put(graph, "main", &cell, None, vec![1]).await;
+            let _ = at.blob_clear(graph, "main", &cell, None).await;
+        });
+
+        let contract: Value =
+            serde_json::from_str(include_str!("../openapi/omnigraph-0.14.0-edge.json")).unwrap();
+        let paths = contract["paths"].as_object().expect("paths");
+        let same_route = |template: &str, path: &str| {
+            let (template, path) = (template.split('/'), path.split('/'));
+            template.clone().count() == path.clone().count()
+                && template
+                    .zip(path)
+                    .all(|(part, segment)| part.starts_with('{') || part == segment)
+        };
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 29, "one request per call: {sent:?}");
+        for (method, path) in sent.iter() {
+            assert!(
+                paths
+                    .iter()
+                    .any(|(template, operations)| same_route(template, path)
+                        && operations.get(method).is_some()),
+                "{} {path} is not a route of the contract",
+                method.to_uppercase()
+            );
+        }
+    }
+
     /// A token replaced on the client reaches every clone, as the one a running agent's gateway
-    /// holds: its next forwarded request and its next read send the new token.
+    /// holds: its next forwarded request and its next read send the new token. Only a token that
+    /// differs from the one held counts as a credential change.
     #[test]
     fn a_replaced_token_reaches_every_clone() {
         let sent: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
@@ -1522,7 +1717,10 @@ mod tests {
         });
         let held = client(http);
         let gateway = held.clone();
-        held.set_token(Some("new".into()));
+        assert!(!held.set_token(Some("t".into())), "the token held");
+        assert_eq!(gateway.credential_changes(), 0);
+        assert!(held.set_token(Some("new".into())));
+        assert_eq!(gateway.credential_changes(), 1);
         block_on(gateway.forward(ForwardRequest {
             method: Method::GET,
             path_and_query: "graphs".into(),

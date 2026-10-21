@@ -20,8 +20,8 @@ use graph_client::{ReadError, WriteOutcome};
 use graph_store::fixes::revert_deletes;
 use graph_store::{
     AccessAction, AccessScope, ChangeFold, EntityGroup, EntityGroups, FoldedChange, FoldedChanges,
-    GraphSession, GroupRun, GroupSection, HeadWatch, NodeNames, REVIEW_CHANGE_CAP, SessionEvent,
-    TypeCounts, commits_since, contains_merge_of, fork_point, revert_query, summary_sentence,
+    ForkSearch, GraphSession, GroupRun, GroupSection, HeadWatch, NodeNames, REVIEW_CHANGE_CAP,
+    SessionEvent, TypeCounts, contains_merge_of, revert_query, summary_sentence,
 };
 use serde_json::Value;
 use studio_actions::review::{
@@ -44,12 +44,16 @@ const SEARCH_DELAY: Duration = Duration::from_millis(80);
 /// after the last change returned, so fewer, larger pages cost fewer reads; the server's byte
 /// budget still bounds what one page holds.
 const FEED_PAGE: usize = 8_192;
-/// Commits asked for per page of a branch's history when its commits since the fork are read
-/// ([`commits_since_fork`]); a page costs only the commits it returns. The server's most is
+/// Commits asked for per page of a history: a branch's and its target's when the branch's
+/// commits since the fork are read ([`commits_since_fork`]), a target's when a merge is looked
+/// for in it ([`merge_shown`]). A page costs only the commits it returns; the server's most is
 /// 1,000.
 const FORK_PAGE: u32 = 500;
-/// Pages of a branch's history read for its fork before both whole lists are read instead.
+/// Pages of one history read, at most. Past them the fork, or a merge, is not looked for
+/// further: the review shows what was read and says so.
 const FORK_PAGES: usize = 20;
+/// The most commits of one history a review reads.
+const FORK_BOUND: usize = FORK_PAGE as usize * FORK_PAGES;
 
 #[derive(Debug, Clone, PartialEq)]
 enum FixState {
@@ -89,19 +93,13 @@ enum Check {
     /// The history is being read.
     Reading,
     Shown,
+    /// The target's history, read to its end, does not show it.
     NotShown,
+    /// The newest [`FORK_BOUND`] commits of the target's history do not show it, and the
+    /// history goes on: Studio read no further, so it cannot tell.
+    NotReached,
     /// The history could not be read, or the source head was not known: Studio cannot tell.
     Unread,
-}
-
-impl Check {
-    fn of(shown: Option<bool>) -> Self {
-        match shown {
-            Some(true) => Check::Shown,
-            Some(false) => Check::NotShown,
-            None => Check::Unread,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -192,6 +190,9 @@ struct ReviewData {
     /// The target was merged into the branch since it forked: `fork` is that merge's base, and
     /// the changes are the net ones since it, without the target's own.
     merged_in: bool,
+    /// The fork lies past the commits read, [`FORK_BOUND`] of a history: `commits` are those
+    /// read, so their count and authors are not all known.
+    commits_capped: bool,
 }
 
 /// A fix asked for on a card: sent once the fixes before it are back.
@@ -1414,10 +1415,14 @@ impl ReviewView {
         let mut actors: Vec<String> = in_scope.iter().filter_map(|c| c.actor_id.clone()).collect();
         actors.sort();
         actors.dedup();
+        // The commits read short of the fork are not all of them: their count and authors are
+        // not said. One commit chosen is that one.
+        let commits = (self.scope.is_some() || !data.commits_capped)
+            .then(|| in_scope.len().max(usize::from(self.scope.is_some())));
         summary_sentence(
             data.folded.entity_count(),
             data.folded.relationship_count(),
-            in_scope.len().max(usize::from(self.scope.is_some())),
+            commits,
             &actors,
         )
     }
@@ -1623,7 +1628,7 @@ impl ReviewView {
                     MergeState::Merged {
                         outcome,
                         commit,
-                        verified: Check::of(verified),
+                        verified,
                         beyond_review,
                         deleted,
                     }
@@ -1644,10 +1649,7 @@ impl ReviewView {
                     // Settle by reading history, never by merging again (constitution III).
                     let landed =
                         merge_landed(&session, &branch, &target, bound.as_deref(), cx).await;
-                    MergeState::Unknown {
-                        reason,
-                        landed: Check::of(landed),
-                    }
+                    MergeState::Unknown { reason, landed }
                 }
             };
             this.update(cx, |this, cx| {
@@ -1818,6 +1820,13 @@ impl ReviewView {
             banners.push(
                 studio_ui::ds::banner(Severity::Warning)
                     .child(studio_ui::ds::text::body(text))
+                    .into_any_element(),
+            );
+        }
+        if let Some(note) = self.data.as_ref().and_then(capped_commits_note) {
+            banners.push(
+                studio_ui::ds::banner(Severity::Info)
+                    .child(studio_ui::ds::text::body(note))
                     .into_any_element(),
             );
         }
@@ -2052,18 +2061,7 @@ impl ReviewView {
                         format!("Merged {} into {}.", self.branch, self.target)
                     }
                 };
-                let check = match verified {
-                    Check::Reading => format!(" Checking {}'s history…", self.target),
-                    Check::Shown => format!(" Confirmed in {}'s history.", self.target),
-                    Check::NotShown => format!(
-                        " Not found in {}'s history yet; open History to check.",
-                        self.target
-                    ),
-                    Check::Unread => format!(
-                        " {}'s history could not be read to confirm it; open History to check.",
-                        self.target
-                    ),
-                };
+                let check = merged_check_words(*verified, &self.target);
                 let beyond = if *beyond_review {
                     format!(
                         " The merge took a commit of {} made after the review was read; open \
@@ -2080,8 +2078,10 @@ impl ReviewView {
                 };
                 let beyond = format!("{beyond}{deletion}");
                 (
-                    if matches!(verified, Check::NotShown | Check::Unread)
-                        || *beyond_review
+                    if matches!(
+                        verified,
+                        Check::NotShown | Check::NotReached | Check::Unread
+                    ) || *beyond_review
                         || matches!(deleted, Some(Err(_)))
                     {
                         Severity::Warning
@@ -2120,24 +2120,7 @@ impl ReviewView {
             ),
             MergeState::Unknown { reason, landed } => (
                 Severity::Warning,
-                match landed {
-                    Check::Reading => format!(
-                        "The merge outcome is unknown ({reason}). Studio did not retry; reading {}'s history…",
-                        self.target
-                    ),
-                    Check::Shown => format!(
-                        "The merge response was lost ({reason}), but {}'s history shows the merge landed.",
-                        self.target
-                    ),
-                    Check::NotShown => format!(
-                        "The merge response was lost ({reason}) and {}'s history does not show it. Studio did not retry; merge again when ready.",
-                        self.target
-                    ),
-                    Check::Unread => format!(
-                        "The merge outcome is unknown ({reason}), and {}'s history could not be read to tell. Studio did not retry; open History before merging again.",
-                        self.target
-                    ),
-                },
+                unknown_merge_words(reason, *landed, &self.target),
                 None,
             ),
         };
@@ -2487,6 +2470,58 @@ impl ReviewView {
     }
 }
 
+/// What the merge banner says the target's history showed of a merge that committed.
+fn merged_check_words(verified: Check, target: &str) -> String {
+    match verified {
+        Check::Reading => format!(" Checking {target}'s history…"),
+        Check::Shown => format!(" Confirmed in {target}'s history."),
+        Check::NotShown => format!(" Not found in {target}'s history yet; open History to check."),
+        Check::NotReached => format!(
+            " Not confirmed: the newest {} commits of {target}'s history do not show it, and \
+             Studio read no further; open History to check.",
+            group_digits(FORK_BOUND)
+        ),
+        Check::Unread => {
+            format!(" {target}'s history could not be read to confirm it; open History to check.")
+        }
+    }
+}
+
+/// What the merge banner says of a merge whose response was lost, by what the target's history
+/// showed of it (constitution III: unknown until history says otherwise, and never sent again).
+fn unknown_merge_words(reason: &str, landed: Check, target: &str) -> String {
+    match landed {
+        Check::Reading => format!(
+            "The merge outcome is unknown ({reason}). Studio did not retry; reading {target}'s history…"
+        ),
+        Check::Shown => format!(
+            "The merge response was lost ({reason}), but {target}'s history shows the merge landed."
+        ),
+        Check::NotShown => format!(
+            "The merge response was lost ({reason}) and {target}'s history does not show it. Studio did not retry; merge again when ready."
+        ),
+        Check::NotReached => format!(
+            "The merge outcome is unknown ({reason}): the newest {} commits of {target}'s history do not show it, and Studio read no further. Studio did not retry; open History before merging again.",
+            group_digits(FORK_BOUND)
+        ),
+        Check::Unread => format!(
+            "The merge outcome is unknown ({reason}), and {target}'s history could not be read to tell. Studio did not retry; open History before merging again."
+        ),
+    }
+}
+
+/// What a review says when the fork lies past the history it read: that it read no further,
+/// and that the scope menu's One commit lists only the commits read.
+fn capped_commits_note(data: &ReviewData) -> Option<String> {
+    data.commits_capped.then(|| {
+        format!(
+            "More than {} commits since the fork: Studio read no further, and One commit lists \
+             only those it read.",
+            group_digits(FORK_BOUND)
+        )
+    })
+}
+
 /// What a fix on a change says on its card or line, once one was asked for.
 fn fix_status(fix: &FixState) -> Option<(String, Color)> {
     Some(match fix {
@@ -2588,6 +2623,7 @@ async fn read_review(
                 partial: false,
                 moved_while_reading: false,
                 merged_in: false,
+                commits_capped: false,
             });
         }
         let start = format!("after:{fork}");
@@ -2674,6 +2710,7 @@ impl Fed {
             partial: self.partial,
             moved_while_reading: self.moved_while_reading,
             merged_in: false,
+            commits_capped: false,
         }
     }
 }
@@ -2821,103 +2858,135 @@ async fn fold_pages(
     }
 }
 
-/// The branch's commits since it forked from `target`, newest first, with the fork and the
-/// head.
+/// A branch's history read a page of [`FORK_PAGE`] at a time, newest first, for at most
+/// [`FORK_PAGES`] pages. Later pages continue the listing the first resolved, so they answer
+/// for that head while the branch moves on.
+struct Pages<'a> {
+    branch: &'a str,
+    token: Option<String>,
+    read: usize,
+    /// The listing has no page after the last read.
+    done: bool,
+}
+
+impl<'a> Pages<'a> {
+    fn new(branch: &'a str) -> Self {
+        Self {
+            branch,
+            token: None,
+            read: 0,
+            done: false,
+        }
+    }
+
+    /// Whether another page may be read: the listing goes on, and the bound is not reached.
+    fn more(&self) -> bool {
+        !self.done && self.read < FORK_PAGES
+    }
+
+    async fn next(
+        &mut self,
+        session: &Entity<GraphSession>,
+        cx: &mut AsyncApp,
+    ) -> Result<Vec<CommitOutput>, ReadError> {
+        let (branch, token) = (self.branch, self.token.take());
+        let page = session
+            .update(cx, |session, cx| {
+                session.commit_page(branch, FORK_PAGE, token, cx)
+            })
+            .await?;
+        self.read += 1;
+        // A page with no commits ends the listing: a token after nothing would only ask for
+        // nothing again.
+        self.token = page.next_page_token.filter(|_| !page.commits.is_empty());
+        self.done = self.token.is_none();
+        Ok(page.commits)
+    }
+}
+
+/// A branch's commits since it forked from its target, as far as the histories read reach.
+struct Since {
+    fork: Option<String>,
+    head: String,
+    /// Newest first.
+    commits: Vec<ReviewCommit>,
+    /// The target was merged into the branch since it forked: the merge base is off the
+    /// branch's own chain.
+    merged_in: bool,
+    /// The fork lies past the commits read: `commits` are those read, and `fork` the merge
+    /// base.
+    capped: bool,
+}
+
+/// The branch's commits since it forked from `target`, newest first, with the fork, read a page
+/// at a time ([`Pages`], [`ForkSearch`]).
 ///
-/// The fork is the merge base the server names, and the branch's history is read a page at a
-/// time down to it: a page costs only the commits it returns, where the two branches' whole
-/// lists cost every commit either holds. A merge base off the branch's own chain (the target
-/// was merged into the branch: a commit there names it as its merged parent), or one not
-/// reached within [`FORK_PAGES`], is found from both whole lists instead.
+/// The branch's first-parent chain is read from the reviewed `head` down to the merge base the
+/// server names (`base`). A branch the target was merged into (`merged_in`, or a commit of its
+/// chain naming `base` as its merged parent) has its merge base off its chain: its fork is the
+/// newest commit of its chain that the target's history holds, so the target's history is read
+/// too, a page after each of the branch's. So is it for a chain that ends without reaching
+/// `base`. A fork not reached within [`FORK_PAGES`] pages of each history leaves the commits
+/// read, `capped`, with `base` for the fork: the review says so rather than reading on.
 async fn commits_since_fork(
     session: &Entity<GraphSession>,
     branch: &str,
     target: &str,
+    base: &str,
+    head: &str,
+    mut merged_in: bool,
     cx: &mut AsyncApp,
-) -> Result<(Option<String>, Option<String>, Vec<ReviewCommit>), String> {
-    let base = session
-        .update(cx, |session, cx| session.merge_base(branch, target, cx))
-        .await
-        .map_err(|e| e.to_string())?;
-    let fork = base.merge_base.graph_commit_id;
-    let mut chain: Vec<CommitOutput> = Vec::new();
-    let mut token = None;
-    let mut reached = false;
-    'pages: for _ in 0..FORK_PAGES {
-        let page = session
-            .update(cx, |session, cx| {
-                session.commit_page(branch, FORK_PAGE, token.take(), cx)
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-        for commit in page.commits {
-            if commit.graph_commit_id == fork {
-                reached = true;
-                break 'pages;
+) -> Result<Since, String> {
+    let mut search = ForkSearch::default();
+    search.hold(base);
+    let (mut own, mut theirs) = (Pages::new(branch), Pages::new(target));
+    // The listing starts at the branch's head now: commits made after the reviewed head are
+    // not the review's.
+    let mut above_head = true;
+    while search.fork().is_none() {
+        let mut read = false;
+        if own.more() {
+            read = true;
+            let page = own.next(session, cx).await.map_err(|e| e.to_string())?;
+            let mut chain = Vec::with_capacity(page.len());
+            for commit in page {
+                if above_head {
+                    if commit.graph_commit_id != head {
+                        continue;
+                    }
+                    above_head = false;
+                }
+                merged_in |= commit.merged_parent_commit_id.as_deref() == Some(base);
+                chain.push(commit);
             }
-            if commit.merged_parent_commit_id.as_deref() == Some(fork.as_str()) {
-                break 'pages;
-            }
-            chain.push(commit);
+            search.branch_page(chain);
         }
-        match page.next_page_token {
-            Some(next) => token = Some(next),
-            None => break,
+        // The target's history decides the fork only for a merge base off the branch's chain,
+        // or a chain that ended short of it.
+        if search.fork().is_none() && (merged_in || own.done) && theirs.more() {
+            read = true;
+            let page = theirs.next(session, cx).await.map_err(|e| e.to_string())?;
+            search.target_page(&page);
+        }
+        if !read {
+            break;
         }
     }
-    if !reached {
-        return commits_since_fork_by_lists(session, branch, target, None, cx).await;
-    }
-    let head = chain
-        .first()
-        .map(|c| c.graph_commit_id.clone())
-        .unwrap_or_else(|| fork.clone());
-    let since = chain.iter().map(ReviewCommit::from).collect();
-    Ok((Some(fork), Some(head), since))
-}
-
-/// [`commits_since_fork`] from both branches' whole lists, the session's: the fork is the
-/// branch's newest commit the target's list reaches.
-async fn commits_since_fork_by_lists(
-    session: &Entity<GraphSession>,
-    branch: &str,
-    target: &str,
-    head: Option<&str>,
-    cx: &mut AsyncApp,
-) -> Result<(Option<String>, Option<String>, Vec<ReviewCommit>), String> {
-    // The lists the session keeps, which a commit Studio sees drops: the branch's read again
-    // only when it does not reach the reviewed head (or no head says which commit is the
-    // head), and the target's as kept, since commits it gained after the fork do not move it.
-    let read = |branch: &str, fresh: bool, cx: &mut AsyncApp| {
-        session.update(cx, |session, cx| session.commits(branch, fresh, cx))
+    // Both histories read to their ends and sharing nothing is an answer; anything less is
+    // the bound.
+    let capped = search.fork().is_none() && !(own.done && theirs.done);
+    let fork = match search.fork() {
+        Some(fork) => Some(fork.graph_commit_id.clone()),
+        None if capped => Some(base.to_owned()),
+        None => None,
     };
-    let mut branch_commits = read(branch, head.is_none(), cx)
-        .await
-        .map_err(|e| e.to_string())?;
-    if let Some(head) = head
-        && !branch_commits
-            .iter()
-            .any(|commit| commit.graph_commit_id == head)
-    {
-        branch_commits = read(branch, true, cx).await.map_err(|e| e.to_string())?;
-    }
-    let target_commits = read(target, false, cx).await.map_err(|e| e.to_string())?;
-    // Commits made after the reviewed head are not the review's.
-    let from_head = head
-        .and_then(|head| {
-            branch_commits
-                .iter()
-                .position(|commit| commit.graph_commit_id == head)
-        })
-        .unwrap_or(0);
-    let branch_commits = &branch_commits[from_head..];
-    let fork = fork_point(branch_commits, &target_commits).map(|f| f.graph_commit_id.clone());
-    let head = branch_commits.first().map(|h| h.graph_commit_id.clone());
-    let since = commits_since(branch_commits, fork.as_deref())
-        .iter()
-        .map(ReviewCommit::from)
-        .collect();
-    Ok((fork, head, since))
+    Ok(Since {
+        fork,
+        head: head.to_owned(),
+        commits: search.since().iter().map(ReviewCommit::from).collect(),
+        merged_in,
+        capped,
+    })
 }
 
 /// Reads a branch the target was merged into since it forked: its feed holds that merge's
@@ -2933,10 +3002,7 @@ async fn read_review_since_merge(
     this: WeakEntity<ReviewView>,
     cx: &mut AsyncApp,
 ) -> Result<ReviewData, String> {
-    // The target was merged into the branch, so the merge base is off the branch's own chain,
-    // and the fork is found from both lists.
-    let (_, _, since) =
-        commits_since_fork_by_lists(&session, &branch, &target, Some(&head), cx).await?;
+    let since = commits_since_fork(&session, &branch, &target, &base, &head, true, cx).await?;
     // A range has no single commit: each change is the reviewed head's.
     let cause = ChangeCauseOutput {
         graph_commit_id: head.clone(),
@@ -2966,7 +3032,7 @@ async fn read_review_since_merge(
     .await?;
     let fed = Fed {
         fold,
-        commits: since.into_iter().rev().collect(),
+        commits: since.commits.into_iter().rev().collect(),
         partial,
         moved_while_reading: false,
     };
@@ -2974,6 +3040,7 @@ async fn read_review_since_merge(
         .into_review(&session, Some(base), Some(head), false, cx)
         .await;
     data.merged_in = true;
+    data.commits_capped = since.capped;
     Ok(data)
 }
 
@@ -2987,10 +3054,15 @@ async fn read_commit_review(
     this: WeakEntity<ReviewView>,
     cx: &mut AsyncApp,
 ) -> Result<ReviewData, String> {
-    let (fork, head, since) = commits_since_fork(&session, &branch, &target, cx).await?;
     let Some(commit) = scope else {
         return Err("A review of one commit names the commit.".into());
     };
+    let base = session
+        .update(cx, |session, cx| session.merge_base(&branch, &target, cx))
+        .await
+        .map_err(|e| e.to_string())?;
+    let (base, head) = (base.merge_base.graph_commit_id, base.source_commit_id);
+    let since = commits_since_fork(&session, &branch, &target, &base, &head, false, cx).await?;
     let (fold, partial) = fold_pages(
         &this,
         cx,
@@ -3011,11 +3083,23 @@ async fn read_commit_review(
     .await?;
     let fed = Fed {
         fold,
-        commits: since.into_iter().rev().collect(),
+        commits: since.commits.into_iter().rev().collect(),
         partial,
         moved_while_reading: false,
     };
-    Ok(fed.into_review(&session, fork, head, true, cx).await)
+    // A branch the target was merged into is reviewed since that merge's base, as a review of
+    // all its commits is.
+    let fork = if since.merged_in {
+        Some(base)
+    } else {
+        since.fork
+    };
+    let mut data = fed
+        .into_review(&session, fork, Some(since.head), true, cx)
+        .await;
+    data.merged_in = since.merged_in;
+    data.commits_capped = since.capped;
+    Ok(data)
 }
 
 /// After a lost merge response: whether the target holds the source head.
@@ -3025,15 +3109,20 @@ async fn merge_landed(
     target: &str,
     source_head: Option<&str>,
     cx: &mut AsyncApp,
-) -> Option<bool> {
-    source_head?;
+) -> Check {
+    if source_head.is_none() {
+        return Check::Unread;
+    }
     merge_shown(session, source, target, None, source_head, cx).await
 }
 
 /// Whether the target shows the merge of `source_head` (or the merge commit `commit`). The source
 /// head being the merge base of the two proves it with one read: merged, fast-forwarded, or
 /// already there. When the merge base has moved past it (more of the source was merged since),
-/// the target's history is read: the merge commit, or a commit carrying the source head.
+/// the target's history is read from its head, where a merge just made is, a page at a time
+/// for at most [`FORK_PAGES`] pages: the merge commit, or a commit carrying the source head. A
+/// merge not in them is not confirmed ([`Check::NotReached`]), rather than looked for in the
+/// rest of the history.
 async fn merge_shown(
     session: &Entity<GraphSession>,
     source: &str,
@@ -3041,7 +3130,7 @@ async fn merge_shown(
     commit: Option<&str>,
     source_head: Option<&str>,
     cx: &mut AsyncApp,
-) -> Option<bool> {
+) -> Check {
     // The source head being the merge base, or the target at the merge commit, proves it. So
     // does the source's head now being the merge base: the merge took a newer head than the
     // one asked about, and that one's history with it.
@@ -3051,31 +3140,26 @@ async fn merge_shown(
             || commit == Some(base.target_commit_id.as_str())
             || (source_head.is_some() && base.source_commit_id == base.merge_base.graph_commit_id))
     {
-        return Some(true);
+        return Check::Shown;
     }
     let shows = |list: &[CommitOutput]| {
         commit.is_some_and(|c| list.iter().any(|t| t.graph_commit_id == c))
             || source_head.is_some_and(|head| contains_merge_of(list, head))
     };
-    // The target's history a page at a time from its head, where a merge just made is: a page
-    // costs only the commits it returns. Past [`FORK_PAGES`] pages, the whole list says.
-    let mut token = None;
-    for _ in 0..FORK_PAGES {
-        let read = session.update(cx, |session, cx| {
-            session.commit_page(target, FORK_PAGE, token.take(), cx)
-        });
-        let page = read.await.ok()?;
-        if shows(&page.commits) {
-            return Some(true);
-        }
-        match page.next_page_token {
-            Some(next) => token = Some(next),
-            None => return Some(false),
+    let mut pages = Pages::new(target);
+    while pages.more() {
+        let Ok(page) = pages.next(session, cx).await else {
+            return Check::Unread;
+        };
+        if shows(&page) {
+            return Check::Shown;
         }
     }
-    let read = session.update(cx, |session, cx| session.commits(target, true, cx));
-    let list = read.await.ok()?;
-    Some(shows(&list))
+    if pages.done {
+        Check::NotShown
+    } else {
+        Check::NotReached
+    }
 }
 
 impl Render for ReviewView {
@@ -3244,6 +3328,7 @@ pub(crate) mod tests {
             partial: false,
             moved_while_reading: false,
             merged_in: false,
+            commits_capped: false,
         };
         let shown = |query: &str| {
             let matched = search_matches(&data.search, query);
@@ -4128,7 +4213,8 @@ pub(crate) mod tests {
     /// lists; a review of one commit reads the branch's history a page at a time down to the
     /// merge base, and never main's. A branch main was merged into has a feed that refuses the
     /// base as a start, and whose merge block carries main's own changes: the review reads the
-    /// net diff from the base instead, and the lists for the branch's commits.
+    /// net diff from the base instead, and a page of each history for the branch's commits.
+    /// No history is ever asked for whole.
     #[gpui::test]
     async fn a_review_reads_the_merge_base_and_the_feed_after_it(cx: &mut gpui::TestAppContext) {
         let (session, asked) = reviewed_server(false, cx);
@@ -4209,14 +4295,190 @@ pub(crate) mod tests {
                 .any(|request| request.contains("/diff?from=m2&to=f2")),
             "{asked:?}"
         );
-        assert_eq!(
-            asked
-                .iter()
-                .filter(|request| request.contains("/commits"))
-                .count(),
-            2,
-            "both lists: {asked:?}"
+        let lists: Vec<&String> = asked.iter().filter(|r| r.contains("/commits?")).collect();
+        assert_eq!(lists.len(), 2, "a page of each: {asked:?}");
+        assert!(lists[0].contains("branch=feature&limit=500"), "{asked:?}");
+        assert!(lists[1].contains("branch=main&limit=500"), "{asked:?}");
+        assert!(!data.commits_capped);
+    }
+
+    /// A commit as a listing has it: `id`, its parent and merged parent.
+    fn listed(id: &str, parent: Option<&str>, merged: Option<&str>) -> Value {
+        json!({ "graph_commit_id": id, "graph_manifest_version": 1, "kind": "published", "created_at": 0, "parent_commit_id": parent, "merged_parent_commit_id": merged, "actor_id": "act-dev" })
+    }
+
+    /// A chain of `n` commits, newest first, `{prefix}{n-1}` down to `{prefix}0`, whose oldest
+    /// commit's parent is `below`.
+    fn chain_of(prefix: &str, n: usize, below: Option<&str>) -> Vec<Value> {
+        (0..n)
+            .rev()
+            .map(|i| {
+                let parent = match i {
+                    0 => below.map(str::to_owned),
+                    i => Some(format!("{prefix}{}", i - 1)),
+                };
+                listed(&format!("{prefix}{i}"), parent.as_deref(), None)
+            })
+            .collect()
+    }
+
+    /// A page of `chain` as OmniGraph pages a listing: `limit` commits from the place a
+    /// `page_token` names, and a token for the next page while more follow. Without `limit`,
+    /// the whole chain.
+    fn page_of(chain: &[Value], query: &str) -> Value {
+        let pairs: HashMap<&str, &str> = query
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .collect();
+        let Some(limit) = pairs
+            .get("limit")
+            .and_then(|limit| limit.parse::<usize>().ok())
+        else {
+            return json!({ "commits": chain });
+        };
+        let start = pairs
+            .get("page_token")
+            .and_then(|token| token.parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(chain.len());
+        let end = (start + limit).min(chain.len());
+        let next = (end < chain.len()).then(|| end.to_string());
+        json!({ "commits": &chain[start..end], "head_commit_id": chain.first().map(|c| c["graph_commit_id"].clone()), "next_page_token": next })
+    }
+
+    /// A server for `feature` and `main` whose histories page, with `base` their merge base and
+    /// `feature`'s first commit its head. `feature`'s feed refuses the base as a start when
+    /// main was merged into it (`merged_in`); every diff and commit holds one person's change.
+    fn paged_server(
+        feature: Vec<Value>,
+        main: Vec<Value>,
+        base: &str,
+        merged_in: bool,
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<GraphSession>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let head = feature[0]["graph_commit_id"].clone();
+        let merge_base = json!({ "merge_base": listed(base, None, None), "source": "feature", "source_commit_id": head, "target": "main", "target_commit_id": main[0]["graph_commit_id"] });
+        let person = json!({ "kind": "node", "type": { "id": "Person", "name": "Person" }, "id": "p1", "op": "insert", "before": null, "after": { "properties": { "slug": "p1" } } });
+        let refused = format!("start=after%3A{base}");
+        fake_server(
+            move |path, query, _| {
+                if path.ends_with("/branches/merge-base") {
+                    (200, merge_base.clone())
+                } else if path.ends_with("/schema") {
+                    (
+                        200,
+                        json!({ "schema_source": "node Person {\n  slug: String @key\n}\n" }),
+                    )
+                } else if path.ends_with("/commits") && query.contains("branch=feature") {
+                    (200, page_of(&feature, query))
+                } else if path.ends_with("/commits") {
+                    (200, page_of(&main, query))
+                } else if let Some((_, id)) = path
+                    .strip_suffix("/changes")
+                    .and_then(|commit| commit.rsplit_once("/commits/"))
+                {
+                    let cause = json!({ "graph_commit_id": id, "authored_branch": "feature", "authored_at": 0, "actor_id": "act-dev" });
+                    (200, json!({ "cause": cause, "changes": [person] }))
+                } else if path.ends_with("/changes") && merged_in && query.contains(&refused) {
+                    (
+                        400,
+                        json!({ "error": "start commit is not on this branch's first-parent chain", "code": "bad_request" }),
+                    )
+                } else if path.ends_with("/diff") {
+                    (
+                        200,
+                        json!({ "from_commit_id": "x", "to_commit_id": "y", "changes": [person] }),
+                    )
+                } else {
+                    (200, json!({ "branches": ["main", "feature"] }))
+                }
+            },
+            cx,
+        )
+    }
+
+    /// Listings asked for, and none whole: each names a page size.
+    fn listings(asked: &std::sync::Arc<std::sync::Mutex<Vec<String>>>, branch: &str) -> usize {
+        let asked = asked.lock().unwrap();
+        let lists: Vec<&String> = asked.iter().filter(|r| r.contains("/commits?")).collect();
+        assert!(
+            lists.iter().all(|list| list.contains("limit=")),
+            "a history asked for whole: {lists:?}"
         );
+        lists
+            .iter()
+            .filter(|list| list.contains(&format!("branch={branch}&")))
+            .count()
+    }
+
+    /// A fork past the history a review reads is not looked for in the whole lists: the review
+    /// shows the commits it read, says the fork is further back than it read, and names no
+    /// commit count. Past the branch's own pages (a review of one commit on a long branch), the
+    /// merge base the server names is the fork; past main's (a branch main was merged into,
+    /// whose fork is deep in main), the branch's commits read are all shown.
+    #[gpui::test]
+    async fn a_fork_past_the_history_read_is_said_and_no_history_is_read_whole(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        // More of feature's own commits than a review reads: main is not read at all.
+        let feature = chain_of("f", FORK_BOUND + 500, Some("m0"));
+        let (session, asked) = paged_server(feature, chain_of("m", 1, None), "m0", false, cx);
+        let mut async_cx = cx.to_async();
+        let data = read_review(
+            session,
+            "feature".into(),
+            "main".into(),
+            Some("f10499".into()),
+            WeakEntity::new_invalid(),
+            &mut async_cx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(data.commits.len(), FORK_BOUND, "the commits read");
+        assert_eq!(data.commits[0].id, "f10499", "newest first");
+        assert!(data.commits_capped && !data.merged_in);
+        assert_eq!(data.fork.as_deref(), Some("m0"), "the merge base");
+        assert_eq!(
+            capped_commits_note(&data).as_deref(),
+            Some(
+                "More than 10,000 commits since the fork: Studio read no further, and One \
+                 commit lists only those it read."
+            )
+        );
+        assert_eq!(listings(&asked, "feature"), FORK_PAGES);
+        assert_eq!(listings(&asked, "main"), 0);
+
+        // main merged into feature at m10500, feature forked at m0: main's pages end before m0.
+        let feature = vec![
+            listed("f2", Some("fm"), None),
+            listed("fm", Some("f1"), Some("m10500")),
+            listed("f1", Some("m0"), None),
+            listed("m0", None, None),
+        ];
+        let main = chain_of("m", 10_501, None);
+        let (session, asked) = paged_server(feature, main, "m10500", true, cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let data = view.data.as_ref().expect("read");
+            assert!(data.merged_in && data.commits_capped);
+            assert_eq!(data.fork.as_deref(), Some("m10500"));
+            let commits: Vec<&str> = data.commits.iter().map(|c| c.id.as_str()).collect();
+            assert_eq!(commits, ["f2", "fm", "f1", "m0"], "every commit read");
+            assert!(capped_commits_note(data).is_some());
+            assert_eq!(view.summary, "1 entity changed", "no count, nobody");
+        });
+        assert_eq!(listings(&asked, "feature"), 1);
+        assert_eq!(listings(&asked, "main"), FORK_PAGES);
     }
 
     /// A merge is confirmed by its source head being the merge base; when more of the source
@@ -4253,16 +4515,16 @@ pub(crate) mod tests {
                 &mut async_cx
             )
             .await,
-            Some(true)
+            Check::Shown
         );
         assert_eq!(
             merge_landed(&session, "feature", "main", Some("f2"), &mut async_cx).await,
-            Some(true),
+            Check::Shown,
             "f2 was merged, though the merge base is f3 now"
         );
         assert_eq!(
             merge_landed(&session, "feature", "main", Some("f9"), &mut async_cx).await,
-            Some(true),
+            Check::Shown,
             "the source is merged whole, and its heads with it"
         );
 
@@ -4285,7 +4547,7 @@ pub(crate) mod tests {
         let mut async_cx = cx.to_async();
         assert_eq!(
             merge_landed(&session, "feature", "main", Some("f9"), &mut async_cx).await,
-            Some(false)
+            Check::NotShown
         );
 
         // A history that cannot be read tells nothing: not "not found".
@@ -4300,6 +4562,45 @@ pub(crate) mod tests {
             &mut async_cx,
         )
         .await;
-        assert_eq!(Check::of(shown), Check::Unread);
+        assert_eq!(shown, Check::Unread);
+    }
+
+    /// A merge not in the newest pages of the target's history read is not confirmed, and the
+    /// rest of the history is not read for it: a committed merge says so, and a merge whose
+    /// response was lost stays unknown, never "merge again".
+    #[gpui::test]
+    async fn a_merge_past_the_history_read_is_not_confirmed(cx: &mut gpui::TestAppContext) {
+        // The source moved on to f4 since main merged f3; f2's merge is older than main's
+        // newest commits read.
+        let base = json!({ "merge_base": listed("f3", None, None), "source": "feature", "source_commit_id": "f4", "target": "main", "target_commit_id": "m10500" });
+        let main = chain_of("m", FORK_BOUND + 501, None);
+        let (session, asked) = fake_server(
+            move |path, query, _| {
+                if path.ends_with("/branches/merge-base") {
+                    (200, base.clone())
+                } else if path.ends_with("/commits") {
+                    (200, page_of(&main, query))
+                } else {
+                    (200, json!({ "branches": ["main", "feature"] }))
+                }
+            },
+            cx,
+        );
+        let mut async_cx = cx.to_async();
+        let landed = merge_landed(&session, "feature", "main", Some("f2"), &mut async_cx).await;
+        assert_eq!(landed, Check::NotReached);
+        assert_eq!(listings(&asked, "main"), FORK_PAGES);
+        let lost = unknown_merge_words("the connection closed", landed, "main");
+        assert_eq!(
+            lost,
+            "The merge outcome is unknown (the connection closed): the newest 10,000 commits of \
+             main's history do not show it, and Studio read no further. Studio did not retry; \
+             open History before merging again."
+        );
+        assert_eq!(
+            merged_check_words(landed, "main"),
+            " Not confirmed: the newest 10,000 commits of main's history do not show it, and \
+             Studio read no further; open History to check."
+        );
     }
 }

@@ -837,6 +837,8 @@ impl Workspace {
         }
         self.graph_order.push(session.entity_id());
         self.watch_graph(&session, cx);
+        // Parked: it polls nothing until shown.
+        session.update(cx, |session, cx| session.set_shown(false, cx));
         self.parked.push(ParkedGraph {
             session,
             panes: vec![Pane::new(0)],
@@ -850,9 +852,11 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Shows `session`'s graph as the window's.
+    /// Shows `session`'s graph as the window's: it asks after its heads and its server's health
+    /// again, which it stops while parked ([`GraphSession::set_shown`]).
     fn subscribe_session(&mut self, session: Entity<GraphSession>, cx: &mut Context<Self>) {
         self.watch_graph(&session, cx);
+        session.update(cx, |session, cx| session.set_shown(true, cx));
         self.session = Some(session);
     }
 
@@ -916,10 +920,12 @@ impl Workspace {
         }
     }
 
-    /// Takes the shown graph out of the window, saved, leaving no graph shown.
+    /// Takes the shown graph out of the window, saved, leaving no graph shown. Parked, it asks
+    /// after no head and no branch list, and holds no watch on its server's health.
     fn park(&mut self, cx: &mut Context<Self>) -> Option<ParkedGraph> {
         self.save_now(cx);
         let session = self.session.take()?;
+        session.update(cx, |session, cx| session.set_shown(false, cx));
         // The inspector shows the graph's rows, and holds its session.
         self.remove_panel(INSPECTOR_PANEL);
         self.zoomed = None;
@@ -5749,7 +5755,8 @@ mod tests {
             source: graph_store::ServerSource::Environment,
             known_graphs: Vec::new(),
         };
-        // The CLI can give one server two names, each its own connection.
+        // One server under two names, each its own connection: one the registry replaced,
+        // still held by a window, beside the one it holds now.
         let renamed = graph_store::ServerEntry {
             name: "test-admin".into(),
             ..server.clone()
@@ -5798,6 +5805,9 @@ mod tests {
             assert_eq!(found.map(|s| s.entity_id()), Some(behind.entity_id()));
             workspace.add_behind(behind_again.clone(), None, cx);
             assert_eq!(workspace.open_graphs().len(), 2);
+            // A parked graph polls nothing; the shown one does.
+            let shown_now = |cx: &App| (shown.read(cx).is_shown(), behind.read(cx).is_shown());
+            assert_eq!(shown_now(cx), (true, false));
 
             // The shown graph's inspector goes with it, host and all: the host would keep the
             // inspector, and the session it holds polling, after the graph is put away.
@@ -5808,6 +5818,7 @@ mod tests {
             assert!(!workspace.dock_hosts.contains_key(&inspector.entity_id()));
             let pane = workspace.pane(workspace.active_pane).unwrap();
             assert_eq!((pane.items.len(), pane.active), (2, 1));
+            assert_eq!(shown_now(cx), (false, true));
 
             // Shown again after the other graph: its tabs as they were, not opened twice.
             workspace.show_graph(shown.entity_id(), window, cx);

@@ -151,6 +151,25 @@ pub fn statement_destroys(source: &str) -> Option<Destroys> {
     }
 }
 
+/// The branch the statement `source` writes to, read from its parse alone, as the server
+/// resolves it: the branch a `branch create` makes or a `branch delete` deletes, a `branch
+/// merge`'s target (`main` when it names none), and a `load`'s request branch, which is `main`
+/// when the request names none. `None` for a `commit publish` or `commit drop`, whose target
+/// the proposal recorded and only the server's answer names, for statements that write nothing,
+/// for declarations, and for text that does not parse.
+pub fn statement_branch(source: &str) -> Option<String> {
+    match parse_query_diagnostic(source).ok()?.body {
+        FileBody::Branch(BranchStmt::Write(
+            BranchWrite::Create { name, .. } | BranchWrite::Delete { name },
+        )) => Some(name),
+        FileBody::Branch(BranchStmt::Write(BranchWrite::Merge { into, .. })) => {
+            Some(into.unwrap_or_else(|| "main".to_owned()))
+        }
+        FileBody::Load(_) => Some("main".to_owned()),
+        _ => None,
+    }
+}
+
 /// The types a declaration's `delete`s remove rows from, when its result publishes: a write
 /// `as commit` or `as unattached branch` moves no branch, so it deletes nothing there.
 fn deletes(decl: &QueryDecl) -> Option<Destroys> {
@@ -325,6 +344,39 @@ mod tests {
             .map(|c| c.column.as_str())
             .collect();
         assert_eq!(columns, ["who", "n"]);
+    }
+
+    /// What a write destroys that Studio cannot put back: a deleted branch, a dropped commit,
+    /// A statement's branch is the one the server writes: the branch made or deleted, a
+    /// merge's target or main, and main for a load sent without a branch. A commit statement's
+    /// target is only in the server's answer, and a read or a declaration writes no branch.
+    #[test]
+    fn a_statement_names_the_branch_it_writes() {
+        for (source, branch) in [
+            ("branch create feature from main", Some("feature")),
+            ("branch delete feature", Some("feature")),
+            ("branch merge feature into release", Some("release")),
+            ("branch merge feature", Some("main")),
+            (
+                "branch merge feature into release as commit",
+                Some("release"),
+            ),
+            (
+                "load csv \"s3://b/p.csv\" into node:Person mode append header",
+                Some("main"),
+            ),
+            ("commit publish \"01JCOMMIT\"", None),
+            ("commit drop \"01JCOMMIT\"", None),
+            ("branch list", None),
+            ("branch merge feature into release dry run", None),
+            (
+                "query q() { match { $p: Person } return { $p.name } }",
+                None,
+            ),
+            ("branch delete", None),
+        ] {
+            assert_eq!(statement_branch(source).as_deref(), branch, "{source}");
+        }
     }
 
     /// What a write destroys that Studio cannot put back: a deleted branch, a dropped commit,

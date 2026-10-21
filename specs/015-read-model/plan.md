@@ -288,8 +288,9 @@ A first cut of parts 1 and 4, ahead of the shared cache:
   instead of reading both branches' whole commit lists (each about 1.6 s on the personal graph,
   and 3m47s once right after a restart); its commits come from the feed blocks' causes. A
   base off the branch's first-parent history is refused by the feed (`400`, checked on 0.14),
-  and review then reads both lists as before. A merge checks the head and confirms its landing
-  through the merge base too. Review still offers Refresh on every move.
+  and review then reads both histories a page at a time, as far as 20 pages each (spec 008). A
+  merge checks the head and confirms its landing through the merge base too. Review still
+  offers Refresh on every move.
 
 - Every answer kept (pinned reads, Blob cells) is keyed by a schema epoch, a number that
   moves whenever the schema's text changes, the first load included. A read at an old commit
@@ -387,6 +388,8 @@ commit can be cleaned up; measure first).
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | The memo weighs an answer as decoding it allocates | `graph_store` `an_answer_is_weighed_as_decoding_it_allocates`, a counting allocator around the system's, on the measuring thread only (debug build, Apple M5 Pro, 48 GB): 2,000 node rows of 8 properties (346,900 bytes of JSON) and 50 rows of 20,000 characters (1,001,758 bytes) decoded as a `ReadOutput` | Node rows: 4,869,438 bytes allocated (14.0 times the text), weighed 4,901,677 (0.7% over); the weight before was 1,274,060 (26%), so the 64 MiB budget held about 250 MB. Long text: 1,041,100 allocated, weighed 1,042,139. Each string is counted at its length, each array at its slots, and each object at its entries and hash index as `IndexMap` grows them (`object_room`) |
+| 2026-10-21 | A new token forgets every answer kept | `graph_store` `a_new_token_reads_access_and_every_answer_again` | A read at c1 kept under one token was sent again under the next; a 403 alone kept it |
 | 2026-10-18 | The same reads on 0.14 | After the hosted graph moved to `0.14.0-edge+d883c49`: node by id at the branch 0.65–0.87 s, pinned to the head 1.51–1.62 s, pinned 200 back 1.34–1.56 s; a Person's 92 groups read once each (first 51 neighbours), 8 at a time | 74.5 s wall, median 1.25 s, p90 3.3 s; `spokenBy` (about 18k edges into a 208k-row table) took 61.2 s, `bookmarked` 20.8 s, `artifactFromPerson` 16.5 s; 51 groups had neighbours, 18 more than 50. The hub groups are the far-table scan of omnigraph#1051 (evidence added there); the pinned surcharge is omnigraph#1052 (0.14 numbers added there) |
 | 2026-10-18 | One read per group that fits | `type_table` `a_group_that_fits_its_page_is_read_once`: 2 neighbour reads, 1 count read only for the group past the page | Passes |
 | 2026-10-18 | A head read goes to the branch and checks its commit | `graph_store` `a_read_at_the_head_goes_to_the_branch_and_checks_its_commit` | Passes |
