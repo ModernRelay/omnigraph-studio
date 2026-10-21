@@ -180,7 +180,11 @@ impl TypesList {
             Row::Ontology => view_row("view-ontology", "Ontology", IconName::GitGraph)
                 .selected(self.active_shows(&OpenOntology, cx))
                 .tooltip_fn(|_, cx| {
-                    Tooltip::for_action("The types and relationships as a map", &OpenOntology, cx)
+                    Tooltip::for_action(
+                        "The types by domain, and each type's relationships",
+                        &OpenOntology,
+                        cx,
+                    )
                 })
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenOntology), cx))
                 .into_any_element(),
