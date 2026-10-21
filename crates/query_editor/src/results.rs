@@ -685,43 +685,202 @@ impl SourceMap {
             self.start + sent.saturating_sub(self.prefix_len + self.inserted)
         }
     }
+
+    /// A byte range of the text sent, as a range of the editor's text: both ends in the
+    /// settings prefix, or both in the declaration. One that reaches into what the editor
+    /// added (`explain `), or across it, has no place in the editor's text.
+    pub fn editor_range(self, sent: std::ops::Range<usize>) -> Option<std::ops::Range<usize>> {
+        let declaration = self.prefix_len + self.inserted;
+        if sent.end <= self.prefix_len || sent.start >= declaration {
+            Some(self.editor_offset(sent.start)..self.editor_offset(sent.end))
+        } else {
+            None
+        }
+    }
 }
 
-/// A problem the server reported, its position already mapped into the editor's text.
+/// The diagnostics contract of a refused query, `DiagnosticOutput` in the server's contract
+/// 0.14: a stable code (`Q…` parse, `T…` typecheck); where the failure is, as a source position
+/// or, after parsing, the stage and the expression; what was expected or violated; one concrete
+/// fix, absent when `expected` names the decision; and the edits that make it. `graph_client`
+/// keeps it untyped (`ErrorOutput.diagnostic`), so it is read here, field by field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiagnosticOutput {
+    code: String,
+    expected: String,
+    /// `position.byte`: where in the text sent.
+    byte: Option<usize>,
+    stage: Option<String>,
+    expression: Option<String>,
+    fix: Option<String>,
+    suggestion: Option<SuggestionOutput>,
+}
+
+/// Non-overlapping edits against the text sent, and whether they apply as they are
+/// (`applicability` `machine_applicable`) or want a look first (`needs_review`, or a kind a
+/// later server adds).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SuggestionOutput {
+    machine_applicable: bool,
+    edits: Vec<TextEditOutput>,
+}
+
+/// A UTF-8 byte range of the text sent, its end excluded, and what replaces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TextEditOutput {
+    start: usize,
+    end: usize,
+    replacement: String,
+}
+
+impl DiagnosticOutput {
+    /// `None` when a required field (`code`, `expected`, a suggestion's `applicability` and
+    /// `edits`, an edit's `start`, `end` and `replacement`) is missing or of another type.
+    fn read(value: &Value) -> Option<Self> {
+        let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
+        let suggestion = match value.get("suggestion") {
+            None | Some(Value::Null) => None,
+            Some(suggestion) => Some(SuggestionOutput {
+                machine_applicable: suggestion.get("applicability")?.as_str()?
+                    == "machine_applicable",
+                edits: suggestion
+                    .get("edits")?
+                    .as_array()?
+                    .iter()
+                    .map(|edit| {
+                        Some(TextEditOutput {
+                            start: usize::try_from(edit.get("start")?.as_u64()?).ok()?,
+                            end: usize::try_from(edit.get("end")?.as_u64()?).ok()?,
+                            replacement: edit.get("replacement")?.as_str()?.to_owned(),
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            }),
+        };
+        Some(Self {
+            code: text("code")?,
+            expected: text("expected")?,
+            byte: value
+                .get("position")
+                .and_then(|position| position.get("byte"))
+                .and_then(Value::as_u64)
+                .and_then(|byte| usize::try_from(byte).ok()),
+            stage: text("stage"),
+            expression: text("expression"),
+            fix: text("fix"),
+            suggestion,
+        })
+    }
+}
+
+/// A problem the server reported, its position and edits already mapped into the editor's
+/// text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerDiagnostic {
-    pub code: Option<String>,
+    pub code: String,
     pub message: String,
     pub byte: Option<usize>,
     /// The one concrete fix the server names, absent when the message names the decision.
     pub fix: Option<String>,
+    /// The stage that found a problem after parsing (`typecheck`), when the server names one.
+    pub stage: Option<String>,
+    /// The server's suggested edits, in the editor's text as it was sent; empty when it
+    /// suggests none, or when one has no place there.
+    pub edits: Vec<(std::ops::Range<usize>, String)>,
+    /// What the edits do, in words: ``insert `()` ``.
+    pub suggestion: Option<String>,
+    /// The server says to review the edits before running again.
+    pub review: bool,
 }
 
-/// Reads an `ErrorOutput.diagnostic`, the diagnostics contract of a refused query: its code,
-/// where it failed (a source position, or after parsing the stage and the expression), what
-/// was expected and the fix (`{"code":"Q001","position":{"line":1,"column":46,"byte":45},
-/// "expected":"…"}`). A failure with no position names the expression it was found in.
-pub fn server_diagnostic(value: &Value, fallback: &str, map: SourceMap) -> ServerDiagnostic {
-    let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
-    let expected = ["message", "expected", "detail"]
-        .iter()
-        .find_map(|key| text(key))
-        .unwrap_or_else(|| fallback.to_owned());
-    let byte = value
-        .get("position")
-        .and_then(|p| p.get("byte"))
-        .and_then(Value::as_u64)
-        .map(|byte| map.editor_offset(byte as usize));
-    let message = match text("expression").filter(|_| byte.is_none()) {
-        Some(expression) => format!("{expected}, in `{expression}`"),
-        None => expected,
+/// Reads an `ErrorOutput.diagnostic` in the contract's shape ([`DiagnosticOutput`]), `sent`
+/// being the text the request carried, which its position and edits count in: a failure with
+/// no position names the expression it was found in. `None` for a diagnostic in another shape;
+/// the refusal's own message still says what went wrong.
+pub fn server_diagnostic(value: &Value, sent: &str, map: SourceMap) -> Option<ServerDiagnostic> {
+    let diagnostic = DiagnosticOutput::read(value)?;
+    let byte = diagnostic.byte.map(|byte| map.editor_offset(byte));
+    let message = match diagnostic.expression.filter(|_| byte.is_none()) {
+        Some(expression) => format!("{}, in `{expression}`", diagnostic.expected),
+        None => diagnostic.expected,
     };
-    ServerDiagnostic {
-        code: text("code"),
+    let (edits, suggestion, review) = match diagnostic.suggestion {
+        Some(suggestion) => {
+            let in_sent = suggestion.edits.iter().all(|edit| {
+                edit.start <= edit.end
+                    && sent.get(edit.start..edit.end).is_some()
+                    && map.editor_range(edit.start..edit.end).is_some()
+            });
+            let edits: Vec<(std::ops::Range<usize>, String)> = if in_sent {
+                suggestion
+                    .edits
+                    .iter()
+                    .filter_map(|edit| {
+                        Some((
+                            map.editor_range(edit.start..edit.end)?,
+                            edit.replacement.clone(),
+                        ))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let said = in_sent.then(|| edits_in_words(sent, &suggestion.edits));
+            (
+                edits,
+                said.filter(|said| !said.is_empty()),
+                !suggestion.machine_applicable,
+            )
+        }
+        None => (Vec::new(), None, false),
+    };
+    Some(ServerDiagnostic {
+        code: diagnostic.code,
         message,
         byte,
-        fix: text("fix"),
+        fix: diagnostic.fix,
+        stage: diagnostic.stage,
+        edits,
+        suggestion,
+        review,
+    })
+}
+
+/// Suggested edits as a reader takes them: ``insert `()` ``, ``replace `nmae` with `name` ``,
+/// ``delete `,` ``, the first two said and a count of the rest.
+fn edits_in_words(sent: &str, edits: &[TextEditOutput]) -> String {
+    /// The most characters of one side shown.
+    const SHOWN: usize = 40;
+    let shown = |text: &str| -> String {
+        if text.chars().count() > SHOWN {
+            format!("{}…", text.chars().take(SHOWN - 1).collect::<String>())
+        } else {
+            text.to_owned()
+        }
+    };
+    let mut words: Vec<String> = edits
+        .iter()
+        .take(2)
+        .filter_map(|edit| {
+            let old = sent.get(edit.start..edit.end)?;
+            Some(match (old.is_empty(), edit.replacement.is_empty()) {
+                (true, true) => return None,
+                (true, false) => format!("insert `{}`", shown(&edit.replacement)),
+                (false, true) => format!("delete `{}`", shown(old)),
+                (false, false) => {
+                    format!(
+                        "replace `{}` with `{}`",
+                        shown(old),
+                        shown(&edit.replacement)
+                    )
+                }
+            })
+        })
+        .collect();
+    if edits.len() > 2 {
+        words.push(format!("{} more", edits.len() - 2));
     }
+    words.join("; ")
 }
 
 #[cfg(test)]
@@ -1077,22 +1236,27 @@ mod tests {
         assert_eq!(map.editor_offset(3), 3);
         assert_eq!(map.editor_offset(19), 41);
         assert_eq!(map.editor_offset(25), 47);
+        let sent = "set x = 1;\nexplain query b { match { $p: Person } }";
         let diagnostic = server_diagnostic(
-            &json!({"code": "Q001", "position": {"line": 1, "column": 7, "byte": 25}, "expected": "expected return_clause"}),
-            "parse error",
+            &json!({"code": "Q001", "position": {"line": 2, "column": 15, "byte": 25}, "expected": "expected return_clause"}),
+            sent,
             map,
-        );
-        assert_eq!(diagnostic.code.as_deref(), Some("Q001"));
+        )
+        .expect("the contract's shape");
+        assert_eq!(diagnostic.code, "Q001");
         assert_eq!(diagnostic.message, "expected return_clause");
         assert_eq!(diagnostic.byte, Some(47));
         assert_eq!(diagnostic.fix, None);
+        assert!(diagnostic.edits.is_empty() && diagnostic.suggestion.is_none());
 
-        // A failure found after parsing has no position: it names its expression and the fix.
+        // A failure found after parsing has no position: it names its expression, its stage
+        // and the fix.
         let diagnostic = server_diagnostic(
             &json!({"code": "T27", "stage": "typecheck", "expression": "search($p.name, $q)", "expected": "a full-text index on Person.name", "fix": "declare @index(name) on Person"}),
-            "refused",
+            sent,
             map,
-        );
+        )
+        .expect("the contract's shape");
         assert_eq!(diagnostic.byte, None);
         assert_eq!(
             diagnostic.message,
@@ -1102,5 +1266,87 @@ mod tests {
             diagnostic.fix.as_deref(),
             Some("declare @index(name) on Person")
         );
+        assert_eq!(diagnostic.stage.as_deref(), Some("typecheck"));
+    }
+
+    /// The contract 0.14 shape is read, its suggested edits moved into the editor's text; the
+    /// shape before it (`message`, `detail`, no `expected`) is not a diagnostic of this
+    /// contract, and the refusal's own message stands for it.
+    #[test]
+    fn a_suggested_edit_lands_in_the_editors_text() {
+        // The editor holds `// people\n` (10 bytes) and, at 30, `query people { … }`, sent
+        // after that prefix alone.
+        let map = SourceMap {
+            prefix_len: 10,
+            inserted: 0,
+            start: 30,
+        };
+        let sent = "// people\nquery people { match { $p: Person } return { $p.name } }";
+        let at = sent.find(" {").unwrap();
+        let diagnostic = server_diagnostic(
+            &json!({
+                "code": "Q002",
+                "position": {"line": 2, "column": 13, "byte": at},
+                "expected": "a parameter list",
+                "fix": "add `()` after the query's name",
+                "suggestion": {"applicability": "machine_applicable",
+                               "edits": [{"start": at, "end": at, "replacement": "()"}]},
+            }),
+            sent,
+            map,
+        )
+        .unwrap();
+        let editor_at = 30 + at - 10;
+        assert_eq!(diagnostic.edits, [(editor_at..editor_at, "()".to_owned())]);
+        assert_eq!(diagnostic.suggestion.as_deref(), Some("insert `()`"));
+        assert!(!diagnostic.review);
+
+        // A replacement to review, said as one; an edit of the `explain ` Studio added has no
+        // place in the editor, so none of the suggestion is offered.
+        let review = |edits: Value, map: SourceMap| {
+            server_diagnostic(
+                &json!({"code": "T6", "expected": "a property",
+                        "suggestion": {"applicability": "needs_review", "edits": edits}}),
+                "set x = 1;\nexplain query q() { return { $p.nmae } }",
+                map,
+            )
+            .unwrap()
+        };
+        let explained = SourceMap {
+            prefix_len: 11,
+            inserted: 8,
+            start: 40,
+        };
+        let name = "set x = 1;\nexplain query q() { return { $p.nmae } }"
+            .find("nmae")
+            .unwrap();
+        let replaced = review(
+            json!([{"start": name, "end": name + 4, "replacement": "name"}]),
+            explained,
+        );
+        assert!(replaced.review);
+        assert_eq!(
+            replaced.suggestion.as_deref(),
+            Some("replace `nmae` with `name`")
+        );
+        assert_eq!(replaced.edits[0].0.start, 40 + name - 19);
+        let into_explain = review(
+            json!([{"start": 11, "end": 19, "replacement": ""}]),
+            explained,
+        );
+        assert!(into_explain.edits.is_empty() && into_explain.suggestion.is_none());
+        let past_the_end = review(
+            json!([{"start": 500, "end": 501, "replacement": "x"}]),
+            explained,
+        );
+        assert!(past_the_end.edits.is_empty());
+
+        for legacy in [
+            json!({"code": "Q001", "message": "expected return_clause"}),
+            json!({"message": "x", "detail": "y"}),
+            json!({"code": "Q001", "expected": "x", "suggestion": {"edits": []}}),
+        ] {
+            assert_eq!(server_diagnostic(&legacy, sent, map), None, "{legacy}");
+        }
     }
 }

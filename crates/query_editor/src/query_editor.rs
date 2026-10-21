@@ -22,7 +22,7 @@ use serde_json::{Map, Value};
 use studio_actions::graph::{
     NewQuery, NewQueryWithText, OpenQueryAt, OpenQueryFile, OpenSchema, OpenStoredQuery,
 };
-use studio_workspace::{PanelPosition, ToastKind, Workspace};
+use studio_workspace::{ItemEvent, PanelPosition, ToastKind, Workspace};
 use ui::IconName;
 
 use schema_view::SchemaView;
@@ -38,37 +38,55 @@ pub(crate) fn saved_queries_changed(cx: &mut App) {
     cx.default_global::<SavedQueriesChanged>().0 += 1;
 }
 
-/// Opens `path` in a query tab, or the tab already editing it; the draft comes from `text`
-/// when given (a remembered tab), else from the file.
+/// Opens `path` in a query tab, or shows the tab already editing it as it is. A new tab opens
+/// at once, in its place among the others, and reads the file off the main thread, saying it
+/// is reading until the text is in. `draft` is a remembered tab's unsaved text and what it
+/// was typed over (`QueryEditor::file_read` decides between it and the file); without one, a
+/// file that cannot be read closes the tab and says so.
 fn open_file(
     workspace: &mut Workspace,
     path: PathBuf,
-    text: Option<String>,
+    draft: Option<view::Draft>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Option<Entity<QueryEditor>> {
     let session = workspace.session().cloned()?;
-    let on_disk = std::fs::read_to_string(&path).ok();
-    if on_disk.is_none() && text.is_none() {
-        workspace.show_toast(
-            ToastKind::Error,
-            format!("{} could not be read.", path.display()),
-            cx,
-        );
-        return None;
-    }
     let number = view::next_number();
     let key = view::file_key(&path);
-    workspace.open_item(key, window, cx, move |window, cx| {
-        let mut editor = QueryEditor::new(number, session, window, cx);
-        editor.set_text(
-            text.as_deref().or(on_disk.as_deref()).unwrap_or_default(),
-            window,
-            cx,
-        );
-        editor.set_file(path, on_disk, cx);
-        editor
+    let mut opened = false;
+    let tab_path = path.clone();
+    let editor = workspace.open_item(key, window, cx, |window, cx| {
+        opened = true;
+        QueryEditor::reading(number, session, tab_path, draft, window, cx)
+    })?;
+    if !opened {
+        return Some(editor);
+    }
+    let read = {
+        let path = path.clone();
+        cx.background_spawn(async move { std::fs::read_to_string(&path).ok() })
+    };
+    let tab = editor.downgrade();
+    cx.spawn_in(window, async move |workspace, cx| {
+        let on_disk = read.await;
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                let Some(tab) = tab.upgrade() else {
+                    return;
+                };
+                if !tab.update(cx, |tab, cx| tab.file_read(on_disk, window, cx)) {
+                    workspace.show_toast(
+                        ToastKind::Error,
+                        format!("{} could not be read.", path.display()),
+                        cx,
+                    );
+                    tab.update(cx, |_, cx| cx.emit(ItemEvent::Close));
+                }
+            })
+            .ok();
     })
+    .detach();
+    Some(editor)
 }
 
 /// Opens the tab running the stored query `name`, or the one already open (spec 007). `values`
@@ -175,16 +193,24 @@ pub fn init(cx: &mut App) {
         let text = data
             .get("text")
             .and_then(|text| text.as_str())
-            .unwrap_or_default()
-            .to_owned();
+            .map(str::to_owned);
         let at_commit = data
             .get("at_commit")
             .and_then(|commit| commit.as_str())
             .map(str::to_owned);
         let widths = saved_widths(data);
         if let Some(path) = data.get("path").and_then(|path| path.as_str()) {
-            if let Some(editor) = open_file(workspace, PathBuf::from(path), Some(text), window, cx)
-            {
+            // A file tab keeps its text only while it is unsaved, with the hash of the file it
+            // was typed over; a build that kept no hash kept its text always, and whether its
+            // file changed since is not known.
+            let draft = text.map(|text| view::Draft {
+                text,
+                based_on: data
+                    .get("based_on")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            });
+            if let Some(editor) = open_file(workspace, PathBuf::from(path), draft, window, cx) {
                 editor.update(cx, |editor, cx| {
                     editor.set_column_widths(widths);
                     if let Some(commit) = at_commit {
@@ -195,9 +221,10 @@ pub fn init(cx: &mut App) {
             return;
         }
         let number = view::next_number();
+        let text = text.unwrap_or_default();
         workspace.open_item(format!("query:{number}"), window, cx, |window, cx| {
-            let mut editor = QueryEditor::new(number, session, window, cx);
-            editor.set_text(&text, window, cx);
+            // Its text, even emptied, is the tab's: the example does not fill it again.
+            let mut editor = QueryEditor::with_text(number, session, &text, window, cx);
             editor.set_column_widths(widths);
             if let Some(commit) = at_commit {
                 editor.pin_to(commit, cx);
@@ -302,9 +329,7 @@ pub fn init(cx: &mut App) {
             let number = view::next_number();
             let text = action.text.clone();
             workspace.open_item(format!("query:{number}"), window, cx, |window, cx| {
-                let mut editor = QueryEditor::new(number, session, window, cx);
-                editor.set_text(&text, window, cx);
-                editor
+                QueryEditor::with_text(number, session, &text, window, cx)
             });
         });
         workspace.register_action(|workspace, action: &OpenStoredQuery, window, cx| {

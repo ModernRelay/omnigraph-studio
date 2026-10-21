@@ -24,14 +24,30 @@ impl Analysis {
     pub fn new(schema: &SchemaModel, text: String) -> Self {
         let outline = gq_language::outline(&text);
         let checked = gq_language::check(schema, &text);
-        // The whole text's check describes each declaration it parsed. One it did not is
-        // checked on its own, so one broken query leaves the others runnable, and its problems
-        // are that check's: the whole text's stops at its first.
+        // The whole text's check describes the declarations it parsed in the order of the
+        // text, so each is taken by its place: two may share a name, and the name would give
+        // a delete its namesake read's check. One it did not parse is checked on its own, so
+        // one broken query leaves the others runnable, and its problems are that check's: the
+        // whole text's stops at its first. So is one sharing its name, whose problems the
+        // whole text's check names by that name alone.
+        let in_order = checked.queries.len() == outline.declarations.len();
+        let shared = |name: &str| {
+            outline
+                .declarations
+                .iter()
+                .filter(|d| d.name == name)
+                .count()
+                > 1
+        };
         let mut queries = Vec::new();
         let mut own_problems = Vec::new();
         let mut checked_alone: Vec<&gq_language::Declaration> = Vec::new();
-        for declaration in &outline.declarations {
-            if let Some(query) = checked.queries.iter().find(|q| q.name == declaration.name) {
+        for (index, declaration) in outline.declarations.iter().enumerate() {
+            if let Some(query) = checked
+                .queries
+                .get(index)
+                .filter(|q| in_order && q.name == declaration.name && !shared(&q.name))
+            {
                 queries.push(Some(query.clone()));
                 continue;
             }
@@ -76,6 +92,18 @@ impl Analysis {
             })
             .collect();
         problems.extend(own_problems);
+        // A copy keeps its original's name until it is renamed: the run lines, plans and file
+        // names that go by the name would mix the two up.
+        problems.extend(
+            gq_language::duplicate_names(&text, &outline)
+                .into_iter()
+                .map(|diagnostic| {
+                    let range = diagnostic
+                        .byte
+                        .map(|byte| gq_language::problem_range(&text, byte as usize));
+                    (diagnostic, range)
+                }),
+        );
         // In the order of the text; problems with no place last.
         problems.sort_by_key(|(_, range)| range.as_ref().map_or(usize::MAX, |range| range.start));
         Self {
@@ -243,6 +271,36 @@ mod tests {
         assert_eq!(at.len(), 2, "{:?}", analysis.problems);
         assert!(at[0] < text.find("query q").unwrap(), "{at:?}");
         assert_eq!(at[1], text.find("nope").unwrap());
+    }
+
+    /// A read copied and changed to a delete keeps the read's name: each declaration is still
+    /// what its own text says, a type error is underlined in the one that has it, and the copy's
+    /// name is a problem.
+    #[test]
+    fn declarations_that_share_a_name_are_told_apart_by_place() {
+        let schema = SchemaModel::parse(DEV_SCHEMA).unwrap();
+        let text = "query people() { match { $p: Person } return { $p.nope } }\n\n\
+                    query people($slug: String) {\n  delete Person where slug = $slug\n}";
+        let analysis = Analysis::new(&schema, text.to_owned());
+        let read = analysis.queries[0].as_ref().expect("the read is checked");
+        assert!(!read.is_mutation);
+        let delete = analysis.queries[1].as_ref().expect("the delete is checked");
+        assert!(delete.is_mutation, "the delete is not the read");
+        let (_, info) = analysis.query_at(text.find("delete").unwrap()).unwrap();
+        assert!(info.unwrap().is_mutation);
+        let codes: Vec<(&str, usize)> = analysis
+            .problems
+            .iter()
+            .map(|(problem, range)| (problem.code.as_str(), range.as_ref().unwrap().start))
+            .collect();
+        let second = text.rfind("people").unwrap();
+        assert_eq!(codes.len(), 2, "{:?}", analysis.problems);
+        assert_eq!(
+            codes[0].1,
+            text.find("nope").unwrap(),
+            "in the read, not the delete"
+        );
+        assert_eq!(codes[1], (gq_language::check::DUPLICATE_NAME, second));
     }
 
     #[test]

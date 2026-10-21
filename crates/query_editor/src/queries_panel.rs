@@ -531,8 +531,19 @@ impl Render for QueriesActions {
                 button("queries-reveal", IconName::Folder)
                     .tooltip(Tooltip::text("Show this graph's queries folder"))
                     .on_click(move |_, _, cx| {
-                        std::fs::create_dir_all(&folder).ok();
-                        cx.reveal_path(&folder)
+                        // Made off the main thread, then shown.
+                        let folder = folder.clone();
+                        let made = {
+                            let folder = folder.clone();
+                            cx.background_spawn(
+                                async move { std::fs::create_dir_all(&folder).ok() },
+                            )
+                        };
+                        cx.spawn(async move |cx| {
+                            made.await;
+                            cx.update(|cx| cx.reveal_path(&folder));
+                        })
+                        .detach();
                     })
             }))
     }

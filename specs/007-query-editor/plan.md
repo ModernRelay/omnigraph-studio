@@ -54,7 +54,14 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   (`list_company.gq`, then `-2`, …). ⌘⇧S picks any path in the system dialog; ⌘O opens a file
   (or `studio_graph::OpenQueryFile { path }`). A file tab is titled by the file, keyed by its
   path so it opens once, and shows the changed dot while its text differs from the file; its
-  draft and path come back after a restart. The left dock's Queries panel lists the folder,
+  path comes back after a restart, and its draft only while it is unsaved, with a hash of the
+  file's text it was typed over (since 2026-10-21). The file is read off the main thread, the
+  tab saying "Reading people.gq…" until its text is in: a saved tab shows the file as it is
+  then; a draft over the text the file still holds is kept; a draft over a file changed since
+  is kept too, under a bar that says the file changed on disk, and ⌘S writes nothing over it:
+  it moves to the bar, where ↵ saves over the file and "Use the file's text" takes it (⌘Z
+  brings the draft back). ⌘S also finds a file that changed while its tab was open, and a tab
+  with nothing unsaved takes the file's text when its editor takes the keyboard again. The left dock's Queries panel lists the folder,
   newest first; New query, Open a file… and Show the folder are icon buttons in its title
   line. Its rows take the keyboard as Studio's other lists do: shown from its button or key,
   the panel has it; ↑ and ↓ move among the rows that open a query (saved files, stored queries,
@@ -95,7 +102,8 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 ## What landed (2026-10-12)
 
 - `NewQuery` (⌘N) opens "Query 1", "Query 2", …, starting with a read over the schema's first
-  node type (`gq_language::example_read`).
+  node type (`gq_language::example_read`). A tab opened with text, even none (a remembered
+  tab, an empty `.gq` file, a link), keeps it when the schema arrives.
 - Highlighting follows the syntax tree: the editor's buffer has the GQ language
   (`query_editor::syntax`), the tree-sitter grammar in `grammars/tree-sitter-gq` with its
   highlight, bracket, indent and outline queries, so brackets match and auto-close, new lines
@@ -115,8 +123,13 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   restart.
 - After typing pauses (150 ms) the source is checked off the main thread (`analysis.rs`): the
   whole file for problems, each declaration on its own for mutation/read, parameters and result
-  columns, so one broken declaration does not hide its siblings. Problems are underlined and
-  listed under the editor (code, message, fix, line:column; a click moves the cursor there).
+  columns, so one broken declaration does not hide its siblings. Each declaration is matched to
+  the whole check's answer by its place, not its name, and a declaration named like one above
+  it is a problem on its name (`duplicate`, since 2026-10-21), checked on its own so its
+  problems are underlined in it. Problems are underlined and listed under the editor (code,
+  message, fix, line:column; a click moves the cursor there), a row each, four before the
+  list scrolls; the list is a view of its own, drawn again only when its problems, the one
+  gone to or the one ⌘. fixes change.
   A type error the compiler reports without a position is placed on the last name its message
   quotes. F8 and ⇧F8 go to the next and previous problem (in the order of the text, round
   again), lighting its row; ⌘. applies the suggested fix of the problem gone to or under the
@@ -127,7 +140,8 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   when the declarations change): ▶ Run, then that declaration's last outcome ("25 rows · 96
   ms", "Committed · 1 nodes, 0 edges", "Refused", "Outcome unknown · check History"). A line,
   not a gutter glyph: Zed's gutter run indicators belong to its task system, which needs a
-  project.
+  project. A declaration's range excludes its end, so the line above a declaration runs it
+  even when the one before it lacks its `}` and runs on to it.
 - The toolbar's snapshot picker reads "Head of <branch>" or "Read only · <commit>": the head,
   or one of the branch's 15 latest commits (short id, age, actor), read when the picker opens
   and kept until a commit lands on the branch or the branch changes; then read again only
@@ -140,7 +154,9 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 - Completion goes through Zed's `CompletionProvider` with `gq_language::completions`. After `$`
   it offers the parameters and `match` bindings of the declaration under the cursor with their
   types; after `$var.` the properties of that declaration's binding of `$var`; after `$param:`
-  in a signature the parameter types; elsewhere types, relationships and keywords.
+  in a signature the parameter types; elsewhere types, relationships and keywords. Nothing
+  inside a comment or a string, and nothing after a `.` that follows no `$var` (since
+  2026-10-21): Zed's ↵ confirms a shown completion, so a menu there put a type name in prose.
 - ⌘↵ runs the declaration under the cursor (else the last one before it, else the first) as the
   settings prefix plus that declaration, so a broken sibling does not stop it. A read goes to
   `POST /query` on the session branch; the result header shows rows, elapsed time, the branch
@@ -150,7 +166,11 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   up to 32 MB (`graph_client`'s cap on every query and stored read): a longer one shows
   nothing of itself and says "The answer is over 32 MB, the most Studio reads at once. Add a
   `limit` to the query, or return fewer properties". F6 moves the keyboard to the result grid
-  and back; ↑↓←→ move its cell, ⌘C copies the cell and ⌘⇧C the row.
+  and back; ↑↓←→ move its cell, ⌘C copies the cell and ⌘⇧C the row. Rows read at the
+  session branch's head offer "Newer data · Refresh" in the toolbar, and the tab its stale
+  dot, once the branch's head moves past the commit they were read at (constitution II, since
+  2026-10-21); Refresh or ⌘R reads the same read again, and nothing is read by itself. A
+  write's outcome is never run again.
 - A mutation never runs on ⌘↵: a bar names the branch ("Run on main", ↵) and Esc cancels. One
   that moves no branch says so (since 2026-10-21): a declaration `as commit` is held as a
   commit to publish or drop later ("Hold for main"), one `as unattached branch` writes a
@@ -228,6 +248,16 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | Nothing is completed in a comment or a string, or after a dot no `$var` precedes | `gq_language` `nothing_is_offered_in_a_comment_or_a_string`, `a_dot_offers_only_a_variables_fields`, `comments_and_strings_hold_what_is_typed_in_them` (`lex::in_comment_or_string`) | `// see the docs.`, `// group by company`, an open `/*`, an open string and an `@description` string offer nothing; past a closed comment or string `Pe` offers `Person` again; `limit 1.` and `Person.` offer nothing, `$p.` the properties. Before, `.` offered every type and ↵ inserted the first. Not yet seen in the running app |
+| 2026-10-21 | A restored file tab meets its file as it is now | `query_editor` `a_remembered_draft_meets_its_file_as_it_is_now` (a saved tab is remembered without its text and shows the file; a draft over the unchanged file is kept with `based_on`; a draft over a changed file is kept, the bar shows, ⌘S leaves the file as it was and moves to the bar, Save over it writes the draft; no hash and other text shows the bar; an unreadable file keeps the draft; no draft and no file opens nothing), `an_open_file_changed_elsewhere_is_not_written_over` (a clean tab takes the file's text on focus; ⌘S over a file changed since writes nothing and asks) | Before, every file tab saved its text and restore preferred it to the file, so ⌘S wrote an older draft over a newer file. Hash: FNV-1a 64 with the length (`view::content_hash`), stable across builds. Not yet seen in the running app |
+| 2026-10-21 | Run above a declaration runs it after an unclosed one | `gq_language` `a_declaration_starts_where_an_unclosed_one_before_it_ends` (fails with the inclusive end put back: `declaration_at(b.start)` was `a`); `query_editor` `the_run_line_runs_the_declaration_below_it` | `Outline::declaration_at` takes the half-open range; the Run line above `b` reads "Running b on main…" |
+| 2026-10-21 | Declarations sharing a name are told apart by place | `gq_language` `a_second_declaration_of_a_name_is_a_problem` (the compiler accepts the copy); `query_editor` `declarations_that_share_a_name_are_told_apart_by_place`, `a_write_named_like_a_read_asks_before_it_writes` | A read copied and changed to `delete`, its name kept, is checked as a write and waits for "Person" typed; nothing goes to `/query`; its type error is underlined in it, not its namesake; the copy's name is a `duplicate` problem at 2:7. Before, the delete took the read's check and was sent to `/query` |
+| 2026-10-21 | A stored query's values waiting for the catalog are saved | `query_editor` `values_waiting_for_the_catalog_are_saved_with_the_tab` | Values filled before the catalog is read are in the saved `values`; once an input is made, what it holds replaces them. Before, they were saved as `{}` |
+| 2026-10-21 | An emptied tab stays empty | `query_editor` `a_tab_given_no_text_stays_empty_when_the_schema_arrives` (a tab given `""` and an empty `.gq` file before the schema is read; a new query beside them) | The emptied tab and the empty file stay empty, the file's tab not changed; the new query gets the example |
+| 2026-10-21 | A refused query's diagnostic is read in contract 0.14's shape | `DiagnosticOutput` in `crates/graph_client/openapi/omnigraph-0.14.0-edge.json` (`code` and `expected` required; `position`, `stage`, `expression`, `fix`, `suggestion` with `applicability` and `edits`); `graph_client` keeps `ErrorOutput.diagnostic` untyped, so `results::DiagnosticOutput` reads it; `query_editor` `server_positions_map_back_into_the_editor`, `a_suggested_edit_lands_in_the_editors_text`, `a_refused_reads_suggested_edit_applies_to_the_query` | The code and `expected` show as before; the stage is the button's tooltip; a suggestion reads "Suggested edit: insert `()`" with Apply, which lands where it was meant after an edit above it; an edit of the `explain ` Studio added is not offered. The shape before 0.14 (`message`, `detail`) is no diagnostic of this contract, and the refusal's message stands |
+| 2026-10-21 | Typing leaves the problems list | `query_editor` `typing_leaves_the_problems_as_they_were` (a key after the problem and its check that finds the same problem draw the list 0 times; F8 draws it once) | The list is its own cached view (`QueryProblems`, a `uniform_list` of 28 px rows, four before it scrolls); it reads only what the tab holds, never the editor |
+| 2026-10-21 | Rows offer Refresh when their branch moves | `query_editor` `rows_offer_refresh_when_their_branch_moves` (`/query` requests counted) | A head move to the commit read at, or on another branch, offers nothing; one past it sets the stale dot and "Newer data · Refresh" and reads nothing; Refresh reads once more; under a write's outcome a head move and Refresh send nothing. The pattern is the storage inspector's and the type table's (`SessionEvent::HeadMoved`) |
+| 2026-10-21 | File I/O is off the main thread | Read of `query_editor`: opening and restoring read the file in `background_spawn`, the tab "Reading …" until then and closed with a toast when there is nothing to show; ⌘S finds an unused name and writes in one background task; ⌘⇧S and the Queries panel's Show the folder make the folder in the background first | No `std::fs` call is left on the main thread in the crate outside tests |
 | 2026-10-21 | A `delete` waits for its name before the schema is read | `gq_language` `writes_say_what_they_destroy`, extended (`declared_write` of the same purge and of one `as commit`), `a_write_says_where_its_result_goes` (`declared_write(…).publication`); `query_editor` `a_destructive_write_waits_for_its_name`, extended with `query purge() { delete Person where slug = "a" }` on a session whose server serves no schema | Before, `prepare` set `destroys: None` when no schema was loaded, though `deletes` needs only the parse, so the delete was confirmed with ↵ alone. Now it waits for "Person" typed, says "Deletes what its `where` matches of Person from main…", and ↵ with the field empty sends nothing. `declared_publication` became `declared_write`, which says both. Not yet seen in the running app |
 | 2026-10-21 | A write `as commit` lands as held, not unknown | Found in the running app against the edge server (`7fd9cc9`): the commit's `graph_manifest_version` was `10415222161995537841`, a detached `__manifest` version past `i64::MAX`; `omnigraph-api-types` holds it as `u64` (spec 012, E30); `graph_client` `a_detached_manifest_version_decodes`; `query_editor` `a_write_says_what_it_did_from_the_commits_kind_and_the_outcome` with that version | Before, `CommitOutput.graph_manifest_version: i64` refused the answer and the write read "The outcome is unknown" though it landed; as `u64` it decodes, and the tab says "Held as commit …". Not yet seen in the running app |
 | 2026-10-21 | The confirm bar says where a write goes | `gq_language` `a_write_says_where_its_result_goes` (`QueryInfo::publication`, `statement_publication`, `declared_publication` for text checked against no schema yet); `query_editor` `the_confirm_bar_says_where_a_write_goes`, and the as-commit test above | A declaration `as commit`: "add is held as a commit to publish or drop later; main does not change.", button "Hold for main"; `as unattached branch`: a snapshot that never publishes, "Write snapshot"; a merge `as commit`: "Hold as commit"; any other write as before. Before, the bar said "add_held changes data on main." with "Run on main". A stored query's text is the server's, so its bar says it changes data. Not yet seen in the running app |
@@ -270,6 +300,24 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 
 
 ## Corrections
+
+- 2026-10-21 · Completion ran inside comments and strings, and after any `.` offered every
+  type, so ↵ at the end of `// see the docs.` inserted one.
+- 2026-10-21 · A file tab always saved its text, and a restored one showed it over the file,
+  so ⌘S wrote an older draft over a newer file. It keeps its draft only while unsaved, with
+  the hash of what it was typed over, and asks before writing over a file changed since.
+- 2026-10-21 · Run on the line above a declaration ran the one before it when that one lacked
+  its `}`: `declaration_at` took both ends of a range.
+- 2026-10-21 · Declarations were matched to the check by name, so a copy changed to a `delete`
+  was classed as its namesake read and sent to `/query`; duplicate names were no problem.
+- 2026-10-21 · A stored query's tab saved `{}` for values that came before the catalog.
+- 2026-10-21 · A tab restored empty before the schema loaded filled with the example, and an
+  empty `.gq` file's tab showed the changed dot.
+- 2026-10-21 · The server's diagnostic was read as `message`/`detail`, which contract 0.14
+  does not send; its `stage` and `suggestion` were not shown.
+- 2026-10-21 · Files were read, folders made and names probed on the main thread.
+- 2026-10-21 · The problems list was laid out again at every frame of the tab.
+- 2026-10-21 · Query results never offered Refresh when their branch moved (constitution II).
 
 - 2026-10-20 · A write `as commit` or `as unattached branch` showed "Committed to main" with its
   commit, though nothing moved main; `branch create`, `branch delete` and `commit drop`

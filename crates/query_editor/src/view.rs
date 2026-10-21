@@ -34,6 +34,7 @@ use studio_actions::query::{
     ApplyFix, CopyCell, CopyRow, Explain, NextPage, NextProblem, PreviousProblem, Run, Save,
     SaveAs, SelectNextColumn, SelectPreviousColumn, ToggleResultsFocus,
 };
+use studio_actions::workspace::Refresh;
 use studio_ui::ds::{Dotted as _, space};
 use studio_ui::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::{
@@ -176,6 +177,12 @@ struct RowsOutput {
     page_number: usize,
     /// The run that reads the next page, when the server says there is one.
     next: Option<Prepared>,
+    /// The read that made these rows, which Refresh sends again; none for a statement, which
+    /// names its own branches, or a read at a pinned commit, which never moves.
+    rerun: Option<Prepared>,
+    /// The branch moved past the commit these rows were read at (constitution II): the tab
+    /// offers Refresh and never reads again by itself.
+    newer: bool,
 }
 
 /// A read's rows made ready to show: the table, each column's width from its content, which
@@ -288,8 +295,9 @@ impl Failure {
         }
     }
 
-    /// A failed read; a refusal's diagnostic is placed in the editor through `map`.
-    fn from_read(error: &ReadError, map: SourceMap) -> Self {
+    /// A failed read; a refusal's diagnostic is placed in the editor through `map`, from the
+    /// text `sent`, which its position and edits count in.
+    fn from_read(error: &ReadError, map: SourceMap, sent: &str) -> Self {
         let (title, hint) = match error {
             ReadError::Refused(summary) => {
                 let hint = match summary.code {
@@ -334,7 +342,7 @@ impl Failure {
             ReadError::Refused(summary) => summary
                 .diagnostic
                 .as_ref()
-                .map(|d| server_diagnostic(d, &summary.message, map)),
+                .and_then(|d| server_diagnostic(d, sent, map)),
             _ => None,
         };
         Self {
@@ -343,6 +351,63 @@ impl Failure {
             diagnostic,
         }
     }
+}
+
+/// A file tab's unsaved text as a remembered tab brings it back, and a hash of the file's text
+/// it was typed over ([`content_hash`]): `None` when the tab was remembered by a build that
+/// kept no hash, so whether the file changed since is not known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Draft {
+    pub text: String,
+    pub based_on: Option<String>,
+}
+
+/// A file tab whose file is being read off the main thread: the tab shows it is reading, runs
+/// and saves nothing, and keeps what it remembered until the file is in.
+struct Loading {
+    draft: Option<Draft>,
+}
+
+/// The file changed on disk after the draft was typed over it (another editor, a `git pull`):
+/// the draft is kept and the file is not written over until the person says so.
+struct DiskChange {
+    /// The hash of the text the draft was typed over, which a remembered tab keeps.
+    based_on: Option<String>,
+    /// ⌘S was pressed: the bar asks to save over the file or take its text.
+    asked: bool,
+}
+
+/// Where a save goes.
+enum SaveTarget {
+    /// The file `path`, written only while it still holds `expected`, the text Studio last
+    /// read or wrote there; `None` writes whatever it holds (a file chosen in the save dialog,
+    /// or one the person said to save over).
+    File {
+        path: std::path::PathBuf,
+        expected: Option<String>,
+    },
+    /// A new file in `dir`, named after `name`, over none already there.
+    New {
+        dir: std::path::PathBuf,
+        name: String,
+    },
+}
+
+/// What a save did, off the main thread.
+enum Saved {
+    Written(std::path::PathBuf),
+    /// The file no longer holds the text Studio last read or wrote: this is what it holds.
+    Changed(String),
+}
+
+/// A stable hash of a file's text, kept with a remembered draft to tell, after a restart,
+/// whether the file changed since the draft was typed over it: FNV-1a over its bytes, with
+/// their count, so the same text gives the same hash in every build.
+pub fn content_hash(text: &str) -> String {
+    let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    format!("fnv1a64:{hash:016x}:{}", text.len())
 }
 
 /// How many of the branch's latest commits the snapshot picker offers.
@@ -364,6 +429,16 @@ pub struct QueryEditor {
     /// The text differs from `saved_text`: found once per edit, not on every draw of the tab.
     unsaved: bool,
     file_error: Option<String>,
+    /// The file's text is being read: the tab says so until it is in.
+    loading: Option<Loading>,
+    /// The file changed on disk after the draft was typed over it, and `saved_text` is what
+    /// it holds now: the draft stays, and is written over the file only when the person says.
+    disk_change: Option<DiskChange>,
+    /// A read of the file to see whether it changed elsewhere, made when the editor takes the
+    /// keyboard; a save drops it, since it would answer for the text before the save.
+    disk_task: Option<Task<()>>,
+    /// The bar that says the file changed on disk, which ⌘S moves the keyboard to.
+    file_focus: FocusHandle,
     /// The file is being written. A tab writes one at a time, so a second ⌘S neither names
     /// another new file nor lands before the first.
     saving: bool,
@@ -383,9 +458,17 @@ pub struct QueryEditor {
     /// [`ApplyFix`] fixes; a cursor moved off its place lets it go.
     selected_problem: Option<usize>,
     /// The problems list, scrolled to the problem gone to.
-    problems_scroll: ScrollHandle,
+    problems_scroll: UniformListScrollHandle,
+    /// The problem ⌘. fixes as the problems list last showed it: the list is drawn again when
+    /// the cursor moves into another one's place, not at every key.
+    fix_shown: Option<usize>,
+    /// The problems list as a view of its own, drawn again only when what it shows changes.
+    problems: Entity<QueryProblems>,
     /// Where the server's diagnostic shown points in the text, followed through later edits.
     diagnostic_at: Option<Anchor>,
+    /// The server's suggested edits for that diagnostic, anchored in the text as it was run,
+    /// so they land where they were meant after edits elsewhere.
+    diagnostic_edits: Vec<(std::ops::Range<Anchor>, String)>,
     last_runs: HashMap<String, RunNote>,
     /// The branch's latest commits, for the snapshot picker: id, Unix micros, actor. Read when
     /// the picker opens, and kept until a commit lands on the branch.
@@ -400,6 +483,9 @@ pub struct QueryEditor {
     /// Reads run at this commit and writes are refused (spec 009); `None` uses the branch.
     at_commit: Option<String>,
     editor: Entity<Editor>,
+    /// The editor's focus, held so a part drawn on its own (the problems list) names it
+    /// without reading the editor, which would make that part draw again at every key.
+    editor_focus: FocusHandle,
     /// The buffer parses as GQ (`syntax`): colours, brackets, indents and folds follow the
     /// syntax tree. Until then the text is plain.
     parsed: bool,
@@ -472,6 +558,45 @@ impl Render for QueryResults {
     }
 }
 
+/// The problems list under the query, drawn as a view of its own, as the result area is: the
+/// tab draws again at every key, the list only when its problems, the one gone to or the one
+/// ⌘. fixes change ([`QueryEditor::redraw_problems`]). Its rows are a virtualized list.
+struct QueryProblems {
+    query: WeakEntity<QueryEditor>,
+    /// How often the list was drawn, for the test that typing leaves it alone.
+    #[cfg(test)]
+    renders: usize,
+}
+
+impl QueryProblems {
+    /// Made with the tab, not on its first draw (`docs/drawing.md`).
+    fn new(cx: &mut Context<QueryEditor>) -> Entity<Self> {
+        let query = cx.entity().downgrade();
+        cx.new(|_| QueryProblems {
+            query,
+            #[cfg(test)]
+            renders: 0,
+        })
+    }
+}
+
+impl Render for QueryProblems {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        {
+            self.renders += 1;
+        }
+        self.query
+            .update(cx, |query, cx| query.render_problems(cx))
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| gpui::Empty.into_any_element())
+    }
+}
+
+/// How many problem rows show before the list scrolls.
+const PROBLEM_ROWS: usize = 4;
+
 impl EventEmitter<ItemEvent> for QueryEditor {}
 
 impl Focusable for QueryEditor {
@@ -508,6 +633,11 @@ impl Item for QueryEditor {
         self.writing || self.stored.is_none() && self.unsaved
     }
 
+    /// The rows shown were read at a commit the branch has moved past.
+    fn is_stale(&self, _cx: &App) -> bool {
+        matches!(&self.output, Output::Rows(rows) if rows.newer)
+    }
+
     fn tab_icon(&self, _cx: &App) -> Option<IconName> {
         Some(if self.stored.is_some() {
             IconName::Server
@@ -533,15 +663,19 @@ impl Item for QueryEditor {
     }
 
     /// The draft comes back after a restart (spec 007: the text is never cleared). It is
-    /// written to the workspace file, never to a log.
+    /// written to the workspace file, never to a log. A file tab keeps its text only while it
+    /// is unsaved, with the hash of the file's text it was typed over, so a file changed since
+    /// is told from the draft; a saved one comes back as the file is then.
     fn serialize(&self, cx: &App) -> Option<SavedItem> {
         if let Some(stored) = &self.stored {
-            // The values typed come back with the tab, as a query's text does.
-            let values: Map<String, Value> = self
-                .params
-                .iter()
-                .map(|(name, input)| (name.clone(), Value::String(input.read(cx).text(cx))))
-                .collect();
+            // The values typed come back with the tab, as a query's text does, and so do
+            // those that came before the catalog and wait for their inputs.
+            let mut values = stored.pending.clone();
+            values.extend(
+                self.params
+                    .iter()
+                    .map(|(name, input)| (name.clone(), Value::String(input.read(cx).text(cx)))),
+            );
             return Some(SavedItem {
                 kind: "stored_query".into(),
                 data: serde_json::json!({
@@ -553,26 +687,80 @@ impl Item for QueryEditor {
                 }),
             });
         }
+        let mut data = serde_json::json!({
+            "at_commit": self.at_commit,
+            "path": self.path.as_ref().map(|path| path.to_string_lossy().into_owned()),
+            "widths": self.column_widths,
+        });
+        let draft = match (&self.loading, &self.path) {
+            // Still being read: what was remembered, as it was.
+            (Some(loading), _) => loading.draft.clone(),
+            (None, Some(_)) if !self.unsaved => None,
+            (None, Some(_)) => Some(Draft {
+                text: self.editor.read(cx).text(cx),
+                based_on: match &self.disk_change {
+                    Some(change) => change.based_on.clone(),
+                    None => self.saved_text.as_deref().map(content_hash),
+                },
+            }),
+            (None, None) => Some(Draft {
+                text: self.editor.read(cx).text(cx),
+                based_on: None,
+            }),
+        };
+        if let Some(draft) = draft {
+            data["text"] = Value::String(draft.text);
+            if let Some(based_on) = draft.based_on {
+                data["based_on"] = Value::String(based_on);
+            }
+        }
         Some(SavedItem {
             kind: "query".into(),
-            data: serde_json::json!({
-                "text": self.editor.read(cx).text(cx),
-                "at_commit": self.at_commit,
-                "path": self.path.as_ref().map(|path| path.to_string_lossy().into_owned()),
-                "widths": self.column_widths,
-            }),
+            data,
         })
     }
 }
 
 impl QueryEditor {
+    /// A new query, filled with an example read once the schema is in.
     pub fn new(
         number: usize,
         session: Entity<GraphSession>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::build(number, session, None, window, cx)
+        Self::build(number, session, None, None, window, cx)
+    }
+
+    /// A query with `text` given by whoever opens it (a remembered tab, a link, the agent):
+    /// kept as it is, even empty, never replaced by the example.
+    pub fn with_text(
+        number: usize,
+        session: Entity<GraphSession>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(number, session, None, Some(text), window, cx)
+    }
+
+    /// A tab for the file `path`, whose text is being read: it shows it is reading until
+    /// [`Self::file_read`] gives it the text, and keeps `draft`, a remembered tab's unsaved
+    /// text, until then.
+    pub fn reading(
+        number: usize,
+        session: Entity<GraphSession>,
+        path: std::path::PathBuf,
+        draft: Option<Draft>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut this = Self::build(number, session, None, Some(""), window, cx);
+        this.editor
+            .update(cx, |editor, _| editor.set_read_only(true));
+        this.path = Some(path);
+        this.loading = Some(Loading { draft });
+        this
     }
 
     /// A tab for the stored query `entry` (spec 007), with an input for each parameter.
@@ -589,7 +777,7 @@ impl QueryEditor {
             gone: false,
             pending: Map::new(),
         };
-        let mut this = Self::build(number, session, Some(stored), window, cx);
+        let mut this = Self::build(number, session, Some(stored), None, window, cx);
         this.sync_stored_params(window, cx);
         // Opened before the catalog was read, or after the query left it.
         this.catalog_changed(window, cx);
@@ -600,6 +788,7 @@ impl QueryEditor {
         number: usize,
         session: Entity<GraphSession>,
         stored: Option<Stored>,
+        text: Option<&str>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -618,6 +807,7 @@ impl QueryEditor {
             ))));
             editor
         });
+        let editor_focus = editor.focus_handle(cx);
         let subscriptions = vec![
             cx.subscribe_in(
                 &editor,
@@ -628,6 +818,10 @@ impl QueryEditor {
                     _ => {}
                 },
             ),
+            // Coming back to a file tab, its file may have changed elsewhere.
+            cx.on_focus_in(&editor_focus, window, |this, window, cx| {
+                this.check_disk(window, cx)
+            }),
             cx.subscribe_in(
                 &session,
                 window,
@@ -645,6 +839,13 @@ impl QueryEditor {
                         this.pending_write = None;
                         this.commits.clear();
                         this.commits_stale(window, cx);
+                        // Rows of the branch left name it in the footer; Refresh is offered
+                        // only for the session's branch, which Run reads.
+                        if let Output::Rows(rows) = &mut this.output
+                            && std::mem::take(&mut rows.newer)
+                        {
+                            cx.emit(ItemEvent::UpdateTab);
+                        }
                         // A write still to run says which branch it asks before writing to.
                         this.redraw_expected(cx);
                         cx.notify()
@@ -655,6 +856,7 @@ impl QueryEditor {
                     {
                         this.commits_stale(window, cx)
                     }
+                    SessionEvent::HeadMoved { branch, head } => this.head_moved(branch, head, cx),
                     SessionEvent::StoredQueriesChanged => this.catalog_changed(window, cx),
                     _ => {}
                 },
@@ -667,6 +869,10 @@ impl QueryEditor {
             saved_text: None,
             unsaved: false,
             file_error: None,
+            loading: None,
+            disk_change: None,
+            disk_task: None,
+            file_focus: cx.focus_handle(),
             saving: false,
             save_next: None,
             commits: Vec::new(),
@@ -679,11 +885,15 @@ impl QueryEditor {
             run_line_starts: Vec::new(),
             problem_places: Vec::new(),
             selected_problem: None,
-            problems_scroll: ScrollHandle::new(),
+            problems_scroll: UniformListScrollHandle::new(),
+            fix_shown: None,
+            problems: QueryProblems::new(cx),
             diagnostic_at: None,
+            diagnostic_edits: Vec::new(),
             last_runs: HashMap::new(),
             at_commit: None,
             editor,
+            editor_focus,
             parsed: false,
             analysis: None,
             cursor: 0,
@@ -707,7 +917,11 @@ impl QueryEditor {
             _subscriptions: subscriptions,
         };
         this.parse_as_gq(cx);
-        this.set_example(window, cx);
+        match text {
+            // Text given, even empty, is the tab's: the example never replaces it.
+            Some(text) => this.set_text(text, window, cx),
+            None => this.set_example(window, cx),
+        }
         this
     }
 
@@ -920,7 +1134,8 @@ impl QueryEditor {
     }
 
     /// Makes this tab edit `path`, whose text on disk is `saved` (`None` when it could not be
-    /// read, so any text counts as changed).
+    /// read, so any text counts as changed), as [`Self::file_read`] does for a file read.
+    #[cfg(test)]
     pub fn set_file(
         &mut self,
         path: std::path::PathBuf,
@@ -931,6 +1146,135 @@ impl QueryEditor {
         self.saved_text = Some(saved.unwrap_or_default());
         self.sync_unsaved(cx);
         self.file_error = None;
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    /// The file this tab was [`Self::reading`] was read: `disk` is its text, `None` when it
+    /// could not be read. A tab with no draft shows the file; a draft typed over the text the
+    /// file still holds is kept; a draft over a file that changed since is kept too, with the
+    /// bar saying so, and ⌘S asks before writing over the file. Returns false when there is
+    /// nothing to show: no draft, and no file.
+    pub fn file_read(
+        &mut self,
+        disk: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(Loading { draft }) = self.loading.take() else {
+            return true;
+        };
+        self.editor
+            .update(cx, |editor, _| editor.set_read_only(false));
+        match (draft, disk) {
+            (None, None) => return false,
+            (None, Some(disk)) => {
+                self.saved_text = Some(disk.clone());
+                self.set_text(&disk, window, cx);
+            }
+            (Some(draft), None) => {
+                self.saved_text = Some(String::new());
+                self.file_error = Some(
+                    "The file could not be read; the draft is kept, and Save writes it.".into(),
+                );
+                self.set_text(&draft.text, window, cx);
+            }
+            (Some(draft), Some(disk)) => {
+                let unchanged = draft.text == disk
+                    || draft.based_on.as_deref() == Some(content_hash(&disk).as_str());
+                if !unchanged {
+                    self.disk_change = Some(DiskChange {
+                        based_on: draft.based_on,
+                        asked: false,
+                    });
+                }
+                self.saved_text = Some(disk);
+                self.set_text(&draft.text, window, cx);
+            }
+        }
+        self.sync_unsaved(cx);
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+        true
+    }
+
+    /// Reads the file again, off the main thread, to see whether it changed elsewhere since
+    /// Studio last read or wrote it: when the editor takes the keyboard.
+    fn check_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        if self.loading.is_some() || self.saving || self.disk_task.is_some() {
+            return;
+        }
+        let read = cx.background_spawn(async move { std::fs::read_to_string(&path).ok() });
+        self.disk_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let disk = read.await;
+            this.update_in(cx, |this, window, cx| {
+                this.disk_task = None;
+                this.disk_read(disk, window, cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// The file holds `disk` now. A tab with nothing unsaved shows it; one with a draft keeps
+    /// the draft and says the file changed. A file gone says nothing until a save writes it.
+    fn disk_read(&mut self, disk: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(disk), Some(saved)) = (disk, &self.saved_text) else {
+            return;
+        };
+        if disk == *saved || self.saving || self.loading.is_some() {
+            return;
+        }
+        if self.unsaved || self.disk_change.is_some() {
+            if self.disk_change.is_none() {
+                self.disk_change = Some(DiskChange {
+                    based_on: Some(content_hash(saved)),
+                    asked: false,
+                });
+            }
+            self.saved_text = Some(disk);
+            self.sync_unsaved(cx);
+        } else {
+            self.saved_text = Some(disk.clone());
+            self.set_text(&disk, window, cx);
+        }
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    /// The bar's Save over it: the draft is written over the file's newer text.
+    fn save_over(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        if self.saving || self.disk_change.is_none() {
+            return;
+        }
+        self.write_to(
+            SaveTarget::File {
+                path,
+                expected: None,
+            },
+            window,
+            cx,
+        );
+        window.focus(&self.editor_focus, cx);
+    }
+
+    /// The bar's Use the file's text: the draft is replaced by what the file holds now, an
+    /// edit ⌘Z takes back.
+    fn take_disk_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(disk) = self.saved_text.clone() else {
+            return;
+        };
+        if self.disk_change.take().is_none() {
+            return;
+        }
+        self.set_text(&disk, window, cx);
+        self.sync_unsaved(cx);
+        window.focus(&self.editor_focus, cx);
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
     }
@@ -963,8 +1307,9 @@ impl QueryEditor {
     }
 
     fn save_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // A stored query lives on the server; there is no text here to save.
-        if self.stored.is_some() {
+        // A stored query lives on the server; there is no text here to save. A file still
+        // being read has none yet.
+        if self.stored.is_some() || self.loading.is_some() {
             return;
         }
         if self.saving {
@@ -972,8 +1317,19 @@ impl QueryEditor {
             self.save_next.get_or_insert(None);
             return;
         }
-        let path = match &self.path {
-            Some(path) => path.clone(),
+        // The file changed on disk since the draft was typed over it: nothing is written over
+        // it until the person says so, in the bar ⌘S moves the keyboard to.
+        if let Some(change) = &mut self.disk_change {
+            change.asked = true;
+            window.focus(&self.file_focus, cx);
+            cx.notify();
+            return;
+        }
+        let target = match &self.path {
+            Some(path) => SaveTarget::File {
+                path: path.clone(),
+                expected: self.saved_text.clone(),
+            },
             None => {
                 let graph = self.session.read(cx).overrides_key(cx);
                 let name = gq_language::outline(&self.editor.read(cx).text(cx))
@@ -982,10 +1338,13 @@ impl QueryEditor {
                     .map(|d| d.name.clone())
                     .filter(|name| !name.is_empty())
                     .unwrap_or_else(|| format!("query-{}", self.number));
-                unused_path(&studio_settings::queries_dir(&graph), &name)
+                SaveTarget::New {
+                    dir: studio_settings::queries_dir(&graph),
+                    name,
+                }
             }
         };
-        self.write_to(path, window, cx);
+        self.write_to(target, window, cx);
     }
 
     /// ⌘⇧S: writes the query to a file chosen in the system's save dialog.
@@ -995,7 +1354,7 @@ impl QueryEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.stored.is_some() {
+        if self.stored.is_some() || self.loading.is_some() {
             return;
         }
         let graph = self.session.read(cx).overrides_key(cx);
@@ -1004,52 +1363,104 @@ impl QueryEditor {
             .as_ref()
             .and_then(|path| path.parent().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| studio_settings::queries_dir(&graph));
-        std::fs::create_dir_all(&directory).ok();
         let suggested = self
             .path
             .as_ref()
             .and_then(|path| path.file_name())
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "query.gq".to_owned());
-        let chosen = cx.prompt_for_new_path(&directory, Some(&suggested));
+        // The dialog opens in the graph's folder, made off the main thread first.
+        let made = {
+            let directory = directory.clone();
+            cx.background_spawn(async move { std::fs::create_dir_all(&directory).ok() })
+        };
         cx.spawn_in(window, async move |this, cx| {
+            made.await;
+            let Ok(chosen) = this.update(cx, |_, cx| {
+                cx.prompt_for_new_path(&directory, Some(&suggested))
+            }) else {
+                return;
+            };
             let Ok(Ok(Some(path))) = chosen.await else {
                 return;
             };
-            this.update_in(cx, |this, window, cx| this.write_to(path, window, cx))
+            // The dialog asked before replacing a file: whatever it holds is written over.
+            let target = SaveTarget::File {
+                path,
+                expected: None,
+            };
+            this.update_in(cx, |this, window, cx| this.write_to(target, window, cx))
                 .ok();
         })
         .detach();
     }
 
-    fn write_to(&mut self, path: std::path::PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    /// Writes the text to `target` off the main thread, one write at a time. A file that no
+    /// longer holds the text Studio last read or wrote is left as it is, and the bar says it
+    /// changed.
+    fn write_to(&mut self, target: SaveTarget, window: &mut Window, cx: &mut Context<Self>) {
+        if self.loading.is_some() {
+            return;
+        }
         if self.saving {
-            self.save_next = Some(Some(path));
+            match target {
+                SaveTarget::File {
+                    path,
+                    expected: None,
+                } => self.save_next = Some(Some(path)),
+                _ => {
+                    self.save_next.get_or_insert(None);
+                }
+            }
             return;
         }
         self.saving = true;
+        // A read made to see whether the file changed would answer for the text this replaces.
+        self.disk_task = None;
         let text = self.editor.read(cx).text(cx);
         let written = text.clone();
-        let target = path.clone();
         let write = cx.background_spawn(async move {
-            studio_settings::write_atomic(
-                &target,
-                written.as_bytes(),
-                studio_settings::Access::Keep,
-            )
+            let path = match target {
+                SaveTarget::File { path, expected } => {
+                    // A file gone since is written again; one holding other text is not
+                    // written over.
+                    if let Some(expected) = expected
+                        && let Ok(now) = std::fs::read_to_string(&path)
+                        && now != expected
+                    {
+                        return Ok(Saved::Changed(now));
+                    }
+                    path
+                }
+                SaveTarget::New { dir, name } => unused_path(&dir, &name),
+            };
+            studio_settings::write_atomic(&path, written.as_bytes(), studio_settings::Access::Keep)
+                .map(|()| Saved::Written(path))
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = write.await;
             this.update_in(cx, |this, window, cx| {
                 this.saving = false;
                 match result {
-                    Ok(()) => {
+                    Ok(Saved::Written(path)) => {
                         this.path = Some(path);
                         this.saved_text = Some(text);
+                        this.disk_change = None;
                         // Typing while it was written stays unsaved.
                         this.sync_unsaved(cx);
                         this.file_error = None;
                         crate::saved_queries_changed(cx);
+                    }
+                    Ok(Saved::Changed(now)) => {
+                        // Nothing was written: the draft stays, and the bar asks.
+                        this.disk_change = Some(DiskChange {
+                            based_on: this.saved_text.as_deref().map(content_hash),
+                            asked: true,
+                        });
+                        this.saved_text = Some(now);
+                        this.sync_unsaved(cx);
+                        this.save_next = None;
+                        window.focus(&this.file_focus, cx);
                     }
                     Err(error) => {
                         this.file_error = Some(format!("Could not save: {error}"));
@@ -1058,7 +1469,14 @@ impl QueryEditor {
                 cx.emit(ItemEvent::UpdateTab);
                 cx.notify();
                 match this.save_next.take() {
-                    Some(Some(path)) => this.write_to(path, window, cx),
+                    Some(Some(path)) => this.write_to(
+                        SaveTarget::File {
+                            path,
+                            expected: None,
+                        },
+                        window,
+                        cx,
+                    ),
                     Some(None) => this.save_now(window, cx),
                     None => {}
                 }
@@ -1068,8 +1486,10 @@ impl QueryEditor {
         .detach();
     }
 
-    /// Replaces the draft, as when a remembered tab comes back.
+    /// Replaces the draft, as when a remembered tab comes back. Text given is the tab's, even
+    /// empty: the example read never replaces it.
     pub fn set_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.filled_example = true;
         self.editor
             .update(cx, |editor, cx| editor.set_text(text, window, cx));
     }
@@ -1125,7 +1545,7 @@ impl QueryEditor {
     }
 
     fn cursor_moved(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let before = self.current_query().map(|(name, _)| name.to_owned());
+        let before = self.current_place();
         let editor = self.editor.read(cx);
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         self.cursor = editor
@@ -1141,16 +1561,39 @@ impl QueryEditor {
             && !self.problem_holds(index, self.cursor, cx)
         {
             self.selected_problem = None;
+            self.redraw_problems(cx);
             cx.notify();
         }
+        // The problem ⌘. fixes shows the key on its Fix button.
+        self.sync_fix_shown(cx);
         // The toolbar and the status bar name the declaration under the cursor, and before
         // a run the result area shows its columns. Only a new declaration notifies: the tab
         // draws again anyway because its editor changed, and a notify on every key would draw
-        // the rows again too.
-        if self.current_query().map(|(name, _)| name) != before.as_deref() {
+        // the rows again too. Two may share a name, so it is told by its place.
+        if self.current_place() != before {
             self.redraw_expected(cx);
             cx.emit(ItemEvent::UpdateTab);
             cx.notify();
+        }
+    }
+
+    /// The declaration under the cursor as the last check placed it: its name and start.
+    fn current_place(&self) -> Option<(String, usize)> {
+        let (declaration, _) = self.analysis.as_ref()?.query_at(self.cursor)?;
+        Some((declaration.name.clone(), declaration.range.start))
+    }
+
+    /// Draws the problems list again: what it shows changed.
+    fn redraw_problems(&self, cx: &mut Context<Self>) {
+        self.problems.update(cx, |_, cx| cx.notify());
+    }
+
+    /// Notes the problem ⌘. fixes now, and draws the list again when it is another one.
+    fn sync_fix_shown(&mut self, cx: &mut Context<Self>) {
+        let now = self.fix_target(cx);
+        if now != self.fix_shown {
+            self.fix_shown = now;
+            self.redraw_problems(cx);
         }
     }
 
@@ -1256,12 +1699,22 @@ impl QueryEditor {
             }
             places
         });
-        // The problems are this check's: one chosen from the last is another's now.
-        self.selected_problem = None;
+        // The problems are this check's: one chosen from the last is another's now. The list
+        // is drawn again only when they are not the last check's, so typing that leaves them
+        // as they were leaves the list too.
+        let chosen = self.selected_problem.take().is_some();
+        let same_problems = self
+            .analysis
+            .as_ref()
+            .is_some_and(|before| before.problems == analysis.problems);
         let expected_before = self
             .current_query()
             .map(|(name, info)| (name.to_owned(), info.cloned()));
         self.analysis = Some(analysis);
+        if chosen || !same_problems {
+            self.redraw_problems(cx);
+        }
+        self.sync_fix_shown(cx);
         self.drop_undeclared_params();
         self.sync_params(window, cx);
         self.sync_run_lines(cx);
@@ -1627,10 +2080,11 @@ impl QueryEditor {
         self.editor.read(cx).buffer().read(cx).snapshot(cx)
     }
 
-    /// Holds where the diagnostic of the output shown points, anchored in the text the run
-    /// sent (`sent`, else the text now), so a jump to it lands there after any edit.
+    /// Holds where the diagnostic of the output shown points, and its suggested edits,
+    /// anchored in the text the run sent (`sent`, else the text now), so a jump to it lands
+    /// there, and its edits where they were meant, after any edit.
     fn hold_diagnostic(&mut self, sent: Option<&MultiBufferSnapshot>, cx: &App) {
-        let byte = match &self.output {
+        let diagnostic = match &self.output {
             Output::Failed(Failure {
                 diagnostic: Some(diagnostic),
                 ..
@@ -1638,17 +2092,51 @@ impl QueryEditor {
             | Output::Written(WriteResult::Refused {
                 diagnostic: Some(diagnostic),
                 ..
-            }) => diagnostic.byte,
+            }) => Some(diagnostic),
             _ => None,
         };
+        let byte = diagnostic.and_then(|diagnostic| diagnostic.byte);
+        let edits = diagnostic.map_or(&[][..], |diagnostic| diagnostic.edits.as_slice());
         let now = sent.is_none().then(|| self.snapshot(cx));
         let Some(snapshot) = sent.or(now.as_ref()) else {
             return;
         };
-        self.diagnostic_at = byte.map(|byte| {
-            let byte = MultiBufferOffset(byte.min(snapshot.len().0));
-            snapshot.anchor_before(snapshot.clip_offset(byte, Bias::Left))
+        let clip = |byte: usize, bias: Bias| {
+            snapshot.clip_offset(MultiBufferOffset(byte.min(snapshot.len().0)), bias)
+        };
+        self.diagnostic_at = byte.map(|byte| snapshot.anchor_before(clip(byte, Bias::Left)));
+        self.diagnostic_edits = edits
+            .iter()
+            .map(|(range, text)| {
+                let start = snapshot.anchor_after(clip(range.start, Bias::Left));
+                let end = snapshot.anchor_before(clip(range.end, Bias::Right));
+                (start..end, text.clone())
+            })
+            .collect();
+    }
+
+    /// Applies the server's suggested edits, where their anchors are now.
+    fn apply_server_fix(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.diagnostic_edits.is_empty() || self.stored.is_some() {
+            return;
+        }
+        let edits = std::mem::take(&mut self.diagnostic_edits);
+        self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let mut placed: Vec<(std::ops::Range<MultiBufferOffset>, String)> = edits
+                .iter()
+                .map(|(range, text)| {
+                    let start = range.start.to_offset(&snapshot);
+                    let end = range.end.to_offset(&snapshot).max(start);
+                    (start..end, text.clone())
+                })
+                .collect();
+            placed.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+            editor.edit(placed, cx)
         });
+        window.focus(&self.editor_focus, cx);
+        self.redraw_results(cx);
+        cx.notify();
     }
 
     fn offset_of(&self, anchor: &Anchor, cx: &App) -> usize {
@@ -2000,6 +2488,13 @@ impl QueryEditor {
         );
         self.selected = None;
         let schema = self.session.read(cx).schema_model();
+        // The head the session knew when the read went: one it learns while the read is out is
+        // compared with the commit the answer was read at.
+        let head_before = self
+            .session
+            .read(cx)
+            .head(&self.session.read(cx).branch)
+            .map(str::to_owned);
         // Replacing the task cancels an earlier read still in flight.
         self.run_task = Some(cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -2015,6 +2510,7 @@ impl QueryEditor {
                 let sent = prepared.sent.clone();
                 this.show_read(prepared, read_at, answer, elapsed);
                 this.hold_diagnostic(sent.as_ref(), cx);
+                this.rows_against_head(head_before, cx);
                 cx.emit(ItemEvent::UpdateTab);
                 this.run_task = None;
                 this.redraw_results(cx);
@@ -2081,6 +2577,7 @@ impl QueryEditor {
                     .zip(&table.columns)
                     .map(|(width, column)| self.column_widths.get(column).copied().unwrap_or(width))
                     .collect();
+                let to_branch = matches!(sent, ReadAt::Branch(_));
                 // A statement's answer names no branch or snapshot of the tab's; a read's names
                 // where it read, else it read where it was sent.
                 let read_at = match sent {
@@ -2104,6 +2601,10 @@ impl QueryEditor {
                             ..prepared.clone()
                         })
                     });
+                // A read of the branch head is read again by Refresh once the branch moves;
+                // a statement names its own branches, and a commit never moves.
+                let rerun = (to_branch && matches!(read_at, ReadAt::Branch(_)) && !prepared.write)
+                    .then(|| prepared.clone());
                 Output::Rows(Box::new(RowsOutput {
                     label: prepared.label,
                     graph,
@@ -2118,11 +2619,81 @@ impl QueryEditor {
                     page: output.page,
                     page_number: prepared.page,
                     next,
+                    rerun,
+                    newer: false,
                 }))
             }
-            Answer::Refused(error) => Output::Failed(Failure::from_read(&error, prepared.map)),
+            Answer::Refused(error) => {
+                Output::Failed(Failure::from_read(&error, prepared.map, &prepared.text))
+            }
         };
         self.results_scroll.scroll_to_item(0, ScrollStrategy::Top);
+    }
+
+    /// The rows just shown against the head of their branch: a head the session learned while
+    /// the read was out, other than the commit the answer was read at, is a newer one.
+    fn rows_against_head(&mut self, head_before: Option<String>, cx: &mut Context<Self>) {
+        let session_branch = self.session.read(cx).branch.clone();
+        let Output::Rows(rows) = &self.output else {
+            return;
+        };
+        let (ReadAt::Branch(branch), Some(commit)) = (&rows.read_at, &rows.commit) else {
+            return;
+        };
+        let now = self.session.read(cx).head(branch).map(str::to_owned);
+        if *branch == session_branch
+            && let Some(now) = now
+            && Some(&now) != head_before.as_ref()
+        {
+            let (branch, commit) = (branch.clone(), commit.clone());
+            if now != commit {
+                self.head_moved(&branch, &now, cx);
+            }
+        }
+    }
+
+    /// `branch`'s head is now `head`: rows read at the branch at another commit offer Refresh
+    /// (constitution II). Nothing is read again until the person asks, and a write's outcome
+    /// is never run again.
+    fn head_moved(&mut self, branch: &str, head: &str, cx: &mut Context<Self>) {
+        if *branch != self.session.read(cx).branch {
+            return;
+        }
+        let Output::Rows(rows) = &mut self.output else {
+            return;
+        };
+        let read_here = matches!(&rows.read_at, ReadAt::Branch(read) if read == branch);
+        if rows.newer || rows.rerun.is_none() || !read_here || rows.commit.as_deref() == Some(head)
+        {
+            return;
+        }
+        rows.newer = true;
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    /// ⌘R, or Newer data · Refresh: reads the rows shown again at the branch head, as they
+    /// were read, and goes on to the workspace, which reads the graph's schema, branches and
+    /// counts again. A write is never sent again.
+    fn refresh(&mut self, _: &Refresh, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.propagate();
+        self.refresh_rows(cx);
+    }
+
+    fn refresh_rows(&mut self, cx: &mut Context<Self>) {
+        if self.writing {
+            return;
+        }
+        let Some(rerun) = (match &self.output {
+            Output::Rows(rows) => rows.rerun.clone(),
+            _ => None,
+        }) else {
+            return;
+        };
+        self.run_task = None;
+        self.send_read(rerun, cx);
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
     }
 
     /// Reads the next page of a paged result (`branch diff`): the same statement again, from
@@ -2220,6 +2791,7 @@ impl QueryEditor {
             cx,
         );
         let (map, sent) = (prepared.map, prepared.sent.clone());
+        let sent_text = prepared.text.clone();
         let name = prepared.name.clone();
         // Detached, not stored: closing the tab must not cancel a write in flight, and the
         // session logs its outcome either way (constitution III).
@@ -2261,7 +2833,7 @@ impl QueryEditor {
                             .body
                             .diagnostic
                             .as_ref()
-                            .map(|d| server_diagnostic(d, &error.body.error, map)),
+                            .and_then(|d| server_diagnostic(d, &sent_text, map)),
                         message: error.body.error,
                     },
                     WriteOutcome::Unknown { reason } => WriteResult::Unknown { reason },
@@ -2648,6 +3220,24 @@ impl QueryEditor {
                     .clone()
                     .map(|error| studio_ui::ds::text::error(error).single_line().truncate()),
             )
+            // The rows shown were read at a commit the branch has moved past.
+            .when(self.is_stale(cx), |toolbar| {
+                let focus = focus.clone();
+                toolbar.child(
+                    studio_ui::ds::toolbar_button("newer-rows", "Newer data · Refresh")
+                        .style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                        .disabled(busy)
+                        .tooltip(move |_window, cx| {
+                            Tooltip::for_action_in(
+                                "The branch moved since these rows were read; read them again",
+                                &Refresh,
+                                &focus,
+                                cx,
+                            )
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| this.refresh_rows(cx))),
+                )
+            })
             .child(div().flex_1())
             .child(self.render_snapshot_picker(cx))
             // A stored query's plan needs its text, which the server does not send.
@@ -2692,107 +3282,148 @@ impl QueryEditor {
             )
     }
 
-    fn render_problems(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// The height the problems list takes: a row each, up to [`PROBLEM_ROWS`], then it scrolls;
+    /// `None` when there are none to list. Its view is drawn cached, so it is laid out at this
+    /// size rather than measured.
+    fn problems_height(&self) -> Option<f32> {
         if self.stored.is_some() {
             return None;
         }
-        let analysis = self.analysis.clone()?;
-        if analysis.problems.is_empty() {
-            return None;
-        }
-        let (border, hover, selected_bg) = (
-            studio_ui::ds::surface::rule(cx),
+        let count = self.analysis.as_ref()?.problems.len();
+        (count > 0).then(|| {
+            count.min(PROBLEM_ROWS) as f32 * studio_ui::ds::size::ROW + 2. * space::XS + 1.
+        })
+    }
+
+    /// The problems list, drawn by its own view ([`QueryProblems`]). It reads only what the tab
+    /// holds (the check, the problem gone to, the one ⌘. fixes), never the editor, so a key in
+    /// the query leaves it as it was.
+    fn render_problems(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.problems_height()?;
+        let count = self.analysis.as_ref()?.problems.len();
+        Some(
+            v_flex()
+                .size_full()
+                .py(px(space::XS))
+                .border_t_1()
+                .border_color(studio_ui::ds::surface::rule(cx))
+                .child(
+                    uniform_list(
+                        "query-problems",
+                        count,
+                        cx.processor(|this, range, _window, cx| {
+                            this.render_problem_rows(range, cx)
+                        }),
+                    )
+                    .track_scroll(&self.problems_scroll)
+                    .flex_1(),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_problem_rows(
+        &mut self,
+        range: std::ops::Range<usize>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let Some(analysis) = self.analysis.clone() else {
+            return Vec::new();
+        };
+        let (hover, selected_bg) = (
             studio_ui::ds::surface::hover(cx),
             studio_ui::ds::surface::selected_document(cx),
         );
         // The problem ⌘. fixes shows the key on its Fix button.
-        let fixed_by_key = self.fix_target(cx);
-        let editor_focus = self.editor.focus_handle(cx);
-        Some(
-            v_flex()
-                .id("query-problems")
-                .flex_none()
-                // Four problems, then it scrolls.
-                .max_h(px(4. * studio_ui::ds::size::ROW))
-                .overflow_y_scroll()
-                .track_scroll(&self.problems_scroll)
-                .py(px(space::XS))
-                .border_t_1()
-                .border_color(border)
-                .children(
-                    analysis
-                        .problems
-                        .iter()
-                        .enumerate()
-                        .map(|(index, (problem, _))| {
-                            let position = match (problem.line, problem.column) {
-                                (Some(line), Some(column)) => format!("{line}:{column}"),
-                                _ => String::new(),
-                            };
-                            h_flex()
-                                .id(("problem", index))
-                                .px(px(space::MD))
-                                .py(px(space::XXS))
-                                .gap(px(space::MD))
-                                .cursor_pointer()
-                                .hover(move |s| s.bg(hover))
-                                .when(self.selected_problem == Some(index), |row| {
-                                    row.bg(selected_bg)
+        let fixed_by_key = self.fix_shown;
+        let editor_focus = self.editor_focus.clone();
+        range
+            .filter_map(|index| {
+                let (problem, _) = analysis.problems.get(index)?;
+                let position = match (problem.line, problem.column) {
+                    (Some(line), Some(column)) => format!("{line}:{column}"),
+                    _ => String::new(),
+                };
+                let tip = match &problem.fix {
+                    Some(fix) => format!("{} · Fix: {fix}", problem.message),
+                    None => problem.message.clone(),
+                };
+                let row = h_flex()
+                    .id(("problem", index))
+                    .h(px(studio_ui::ds::size::ROW))
+                    .px(px(space::MD))
+                    .gap(px(space::MD))
+                    .items_center()
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover))
+                    .when(self.selected_problem == Some(index), |row| {
+                        row.bg(selected_bg)
+                    })
+                    .tooltip(Tooltip::text(tip))
+                    .child(studio_ui::ds::icon::meta(IconName::XCircle).color(Color::Error))
+                    .child(
+                        div()
+                            .flex_none()
+                            .child(studio_ui::ds::text::meta(problem.code.clone()).single_line()),
+                    )
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .gap(px(space::MD))
+                            .overflow_hidden()
+                            .child(
+                                studio_ui::ds::text::body(problem.message.clone())
+                                    .single_line()
+                                    .truncate(),
+                            )
+                            .children(problem.fix.clone().map(|fix| {
+                                studio_ui::ds::text::muted(format!("Fix: {fix}"))
+                                    .single_line()
+                                    .truncate()
+                            })),
+                    )
+                    .when(!problem.edits.is_empty(), |row| {
+                        let focus = editor_focus.clone();
+                        row.child(
+                            studio_ui::ds::row_button(("apply-fix", index), "Fix")
+                                .style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                                .when(fixed_by_key == Some(index), |button| {
+                                    button.key_binding(KeyBinding::for_action_in(
+                                        &ApplyFix, &focus, cx,
+                                    ))
                                 })
-                                .child(
-                                    studio_ui::ds::icon::meta(IconName::XCircle)
-                                        .color(Color::Error),
-                                )
-                                .child(studio_ui::ds::text::meta(problem.code.clone()))
-                                .child(studio_ui::ds::text::body(problem.message.clone()))
-                                .children(
-                                    problem.fix.clone().map(|fix| {
-                                        studio_ui::ds::text::muted(format!("Fix: {fix}"))
-                                    }),
-                                )
-                                .when(!problem.edits.is_empty(), |row| {
-                                    // The analysis is shared, not copied: the problems are
-                                    // drawn every frame, the text and edits only applied on
-                                    // a click.
-                                    let checked = analysis.clone();
-                                    let focus = editor_focus.clone();
-                                    row.child(
-                                        studio_ui::ds::row_button(("apply-fix", index), "Fix")
-                                            .style(ButtonStyle::Tinted(ui::TintColor::Accent))
-                                            .when(fixed_by_key == Some(index), |button| {
-                                                button.key_binding(KeyBinding::for_action_in(
-                                                    &ApplyFix, &focus, cx,
-                                                ))
-                                            })
-                                            .tooltip(move |_window, cx| {
-                                                Tooltip::for_action_in(
-                                                    "Apply the compiler's suggested edit",
-                                                    &ApplyFix,
-                                                    &focus,
-                                                    cx,
-                                                )
-                                            })
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                if let Some(problem) = checked.problems.get(index) {
-                                                    this.apply_fix(
-                                                        &checked.text,
-                                                        &problem.0.edits,
-                                                        window,
-                                                        cx,
-                                                    )
-                                                }
-                                            })),
+                                .tooltip(move |_window, cx| {
+                                    Tooltip::for_action_in(
+                                        "Apply the compiler's suggested edit",
+                                        &ApplyFix,
+                                        &focus,
+                                        cx,
                                     )
                                 })
-                                .child(div().flex_1())
-                                .child(studio_ui::ds::text::meta(position))
+                                // The check held when clicked: the list is not drawn again for
+                                // a check that found the same problems in edited text.
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.select_problem(index, window, cx)
-                                }))
-                        }),
-                )
-                .into_any_element(),
-        )
+                                    let Some(checked) = this.analysis.clone() else {
+                                        return;
+                                    };
+                                    if let Some((problem, _)) = checked.problems.get(index) {
+                                        this.apply_fix(&checked.text, &problem.edits, window, cx)
+                                    }
+                                })),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex_none()
+                            .child(studio_ui::ds::text::meta(position).single_line()),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.select_problem(index, window, cx)
+                    }));
+                Some(row.into_any_element())
+            })
+            .collect()
     }
 
     /// Goes to problem `index`: it is the one ⌘. fixes, its row is shown in the list and the
@@ -2805,13 +3436,12 @@ impl QueryEditor {
             return;
         }
         self.selected_problem = Some(index);
-        self.problems_scroll.scroll_to_item(index);
+        self.problems_scroll
+            .scroll_to_item(index, ScrollStrategy::Nearest);
+        self.redraw_problems(cx);
         match self.problem_place(index, cx) {
             Some(place) => self.jump_to(place.start, window, cx),
-            None => {
-                let focus = self.editor.focus_handle(cx);
-                window.focus(&focus, cx);
-            }
+            None => window.focus(&self.editor_focus, cx),
         }
         cx.notify();
     }
@@ -3014,6 +3644,73 @@ impl QueryEditor {
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.confirm_write(&menu::Confirm, window, cx)
                                 })),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The bar that says the file changed on disk after the draft was typed over it: the draft
+    /// is kept, and the person saves it over the file (↵ once ⌘S asked) or takes the file's
+    /// text. Nothing is written over the file without it.
+    fn render_disk_change(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use studio_ui::ds::{self, size, space};
+        let change = self.disk_change.as_ref()?;
+        let name = self.path.as_deref().map(file_name).unwrap_or_default();
+        let said = if change.asked {
+            format!(
+                "{name} changed on disk after this draft was made. Save writes the draft over it; \
+                 the file's text is gone then."
+            )
+        } else {
+            format!(
+                "{name} changed on disk after this draft was made. The draft is kept; nothing is \
+                 written over the file until you choose."
+            )
+        };
+        let focus = self.file_focus.clone();
+        Some(
+            h_flex()
+                .key_context("QueryConfirm")
+                .track_focus(&self.file_focus)
+                .on_action(
+                    cx.listener(|this, _: &menu::Confirm, window, cx| this.save_over(window, cx)),
+                )
+                .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
+                    window.focus(&this.editor_focus, cx);
+                    cx.notify();
+                }))
+                .flex_none()
+                .min_h(px(size::STRIP))
+                .px(px(space::EDGE))
+                .gap(px(space::INLINE))
+                .items_center()
+                .bg(ds::surface::warning(cx))
+                .border_b_1()
+                .border_color(ds::surface::warning_border(cx))
+                .child(studio_ui::ds::icon::lead(IconName::Warning).color(Color::Warning))
+                .child(div().flex_1().min_w_0().child(ds::text::body(said)))
+                .child(
+                    h_flex()
+                        .gap(px(space::XS))
+                        .child(
+                            ds::button("take-disk-text", "Use the file's text")
+                                .tooltip(Tooltip::text(
+                                    "Replace the draft with what the file holds now (⌘Z brings \
+                                     the draft back)",
+                                ))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.take_disk_text(window, cx)
+                                })),
+                        )
+                        .child(
+                            ds::button("save-over", "Save over it")
+                                .style(ButtonStyle::Filled)
+                                .disabled(self.saving)
+                                .key_binding(KeyBinding::for_action_in(&menu::Confirm, &focus, cx))
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.save_over(window, cx)),
+                                ),
                         ),
                 )
                 .into_any_element(),
@@ -3616,6 +4313,13 @@ impl QueryEditor {
     ) -> AnyElement {
         use studio_ui::ds::{self, space};
         let fix = diagnostic.as_ref().and_then(|d| d.fix.clone());
+        // The server's suggested edit, said in words, and applied here while the tab holds
+        // the text it was run with: a stored query's is the server's.
+        let suggestion = diagnostic
+            .as_ref()
+            .filter(|_| self.stored.is_none())
+            .and_then(|d| Some((d.suggestion.clone()?, d.review)));
+        let can_apply = !self.diagnostic_edits.is_empty();
         v_flex()
             .flex_1()
             .min_h_0()
@@ -3644,19 +4348,20 @@ impl QueryEditor {
                                 let at = self
                                     .diagnostic_at
                                     .filter(|_| diagnostic.byte.is_some() && self.stored.is_none());
+                                let tip = match (&at, &diagnostic.stage) {
+                                    (Some(_), _) => "Go to where the server found it".to_owned(),
+                                    (None, Some(stage)) => {
+                                        format!("Found at the {stage} stage, after parsing")
+                                    }
+                                    (None, None) => "The server names no place in the text".into(),
+                                };
                                 ds::button(
                                     "server-diagnostic",
-                                    format!(
-                                        "{}{}",
-                                        diagnostic
-                                            .code
-                                            .map(|c| format!("{c} · "))
-                                            .unwrap_or_default(),
-                                        diagnostic.message
-                                    ),
+                                    format!("{} · {}", diagnostic.code, diagnostic.message),
                                 )
                                 .start_icon(Icon::new(IconName::ArrowRight))
                                 .disabled(at.is_none())
+                                .tooltip(Tooltip::text(tip))
                                 .on_click(cx.listener(
                                     move |this, _, window, cx| {
                                         if let Some(at) = at {
@@ -3666,7 +4371,31 @@ impl QueryEditor {
                                     },
                                 ))
                             }))
-                            .children(fix.map(|fix| ds::text::muted(format!("Fix: {fix}")))),
+                            .children(fix.map(|fix| ds::text::muted(format!("Fix: {fix}"))))
+                            .children(suggestion.map(|(said, review)| {
+                                h_flex()
+                                    .gap(px(space::MD))
+                                    .items_center()
+                                    .child(ds::text::muted(format!("Suggested edit: {said}")))
+                                    .child(
+                                        studio_ui::ds::row_button("apply-server-fix", "Apply")
+                                            .style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                                            .disabled(!can_apply)
+                                            .tooltip(Tooltip::text(match (can_apply, review) {
+                                                (false, _) => "Applied; run the query again",
+                                                (true, true) => {
+                                                    "Apply the server's suggested edit; it asks \
+                                                     for a look before you run again"
+                                                }
+                                                (true, false) => {
+                                                    "Apply the server's suggested edit to the query"
+                                                }
+                                            }))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.apply_server_fix(window, cx)
+                                            })),
+                                    )
+                            })),
                     ),
             )
             .into_any_element()
@@ -3680,7 +4409,13 @@ impl Render for QueryEditor {
             crate::syntax::language(crate::syntax::Syntax::Gq, cx);
         }
         let toolbar = self.render_toolbar(cx).into_any_element();
-        let problems = self.render_problems(cx);
+        let disk_change = self.render_disk_change(cx);
+        // Cached, as the results are: a key in the query draws the tab again, and the list
+        // only when its problems change. A cached view is laid out at its style's size.
+        let problems = self.problems_height().map(|height| {
+            AnyView::from(self.problems.clone())
+                .cached(StyleRefinement::default().flex_none().h(px(height)))
+        });
         let params = self.render_params(cx);
         let confirm = self.render_confirm(cx);
         let results = AnyView::from(self.results.clone())
@@ -3695,7 +4430,15 @@ impl Render for QueryEditor {
                     .pt(px(space::XS))
                     .border_b_1()
                     .border_color(studio_ui::ds::surface::rule(cx))
-                    .child(self.editor.clone())
+                    .map(|area| match (&self.loading, &self.path) {
+                        // Its file's text is not in yet: the tab says so, and shows no empty
+                        // editor that reads as an empty file.
+                        (Some(_), Some(path)) => area.child(studio_ui::ds::loading_state(format!(
+                            "Reading {}…",
+                            file_name(path)
+                        ))),
+                        _ => area.child(self.editor.clone()),
+                    })
                     .into_any_element(),
             ),
         };
@@ -3710,8 +4453,10 @@ impl Render for QueryEditor {
             .on_action(cx.listener(Self::next_problem))
             .on_action(cx.listener(Self::previous_problem))
             .on_action(cx.listener(Self::apply_fix_action))
+            .on_action(cx.listener(Self::refresh))
             .size_full()
             .child(toolbar)
+            .children(disk_change)
             .children(source)
             .children(problems)
             .children(params)
@@ -3743,6 +4488,13 @@ fn diff_sides(page: &ReadPageOutput) -> Option<AnyElement> {
 /// The dedupe key of a tab editing `path`, so a file opens once.
 pub fn file_key(path: &std::path::Path) -> String {
     format!("query-file:{}", path.display())
+}
+
+/// A file's name as the tab and its bars say it: `people.gq`.
+fn file_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 /// A parameter's input: one line, its text at the size of the labels beside it.
@@ -4990,6 +5742,506 @@ mod tests {
                     "p.slug",
                     "checked again"
                 );
+            });
+        }
+
+        /// A scratch folder for one test's files.
+        fn scratch(name: &str) -> std::path::PathBuf {
+            let dir =
+                std::env::temp_dir().join(format!("query-editor-{name}-{}", std::process::id()));
+            std::fs::remove_dir_all(&dir).ok();
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        /// A remembered file tab meets its file as it is now. Still being read, it runs and
+        /// saves nothing and keeps what it remembered. A saved one shows the file and is
+        /// remembered without its text; a draft typed over the text the file still holds is
+        /// kept; a draft over a file changed since is kept too, the bar says so, and ⌘S writes
+        /// nothing until the person saves over the file.
+        #[gpui::test]
+        async fn a_remembered_draft_meets_its_file_as_it_is_now(cx: &mut TestAppContext) {
+            init(cx);
+            let session = session(cx);
+            let path = scratch("remembered").join("people.gq");
+            let (a, b, c) = ("query a() {}", "query b() {}", "query c() {}");
+            std::fs::write(&path, a).unwrap();
+            let opened = path.clone();
+            let (editor, cx) = cx.add_window_view(move |window, cx| {
+                QueryEditor::reading(1, session, opened, None, window, cx)
+            });
+            let draft = |text: &str, over: Option<&str>| Draft {
+                text: text.into(),
+                based_on: over.map(content_hash),
+            };
+            let reopen = |editor: &mut QueryEditor, draft: Option<Draft>| {
+                editor.loading = Some(Loading { draft });
+                editor.disk_change = None;
+                editor.file_error = None;
+            };
+            editor.update_in(cx, |editor, window, cx| {
+                assert!(!editor.is_dirty(cx));
+                assert!(editor.serialize(cx).unwrap().data.get("text").is_none());
+                editor.save_now(window, cx);
+                assert!(!editor.saving, "nothing is saved while the file is read");
+                assert!(editor.file_read(Some(a.into()), window, cx));
+                assert_eq!(editor.editor.read(cx).text(cx), a);
+            });
+            cx.run_until_parked();
+            editor.update_in(cx, |editor, window, cx| {
+                assert!(!editor.is_dirty(cx));
+                let saved = editor.serialize(cx).unwrap();
+                assert!(saved.data.get("text").is_none(), "comes back as its file");
+                assert_eq!(saved.data["path"], json!(path.to_string_lossy()));
+
+                // A draft over the text the file still holds is kept, and remembered with it.
+                reopen(editor, Some(draft(b, Some(a))));
+                assert_eq!(
+                    editor.serialize(cx).unwrap().data["text"],
+                    json!(b),
+                    "kept while the file is read"
+                );
+                assert!(editor.file_read(Some(a.into()), window, cx));
+                assert_eq!(editor.editor.read(cx).text(cx), b);
+                assert!(editor.is_dirty(cx) && editor.disk_change.is_none());
+                let saved = editor.serialize(cx).unwrap();
+                assert_eq!(saved.data["text"], json!(b));
+                assert_eq!(saved.data["based_on"], json!(content_hash(a)));
+
+                // The file changed since: the draft stays, and says so.
+                reopen(editor, Some(draft(b, Some(a))));
+                assert!(editor.file_read(Some(c.into()), window, cx));
+                assert_eq!(editor.editor.read(cx).text(cx), b);
+                assert!(
+                    editor
+                        .disk_change
+                        .as_ref()
+                        .is_some_and(|change| !change.asked)
+                );
+                assert_eq!(
+                    editor.serialize(cx).unwrap().data["based_on"],
+                    json!(content_hash(a)),
+                    "still what it was typed over"
+                );
+            });
+            std::fs::write(&path, c).unwrap();
+            editor.update_in(cx, |editor, window, cx| editor.save_now(window, cx));
+            cx.run_until_parked();
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                c,
+                "⌘S wrote nothing"
+            );
+            editor.update_in(cx, |editor, window, cx| {
+                assert!(
+                    editor
+                        .disk_change
+                        .as_ref()
+                        .is_some_and(|change| change.asked)
+                );
+                assert!(editor.file_focus.is_focused(window), "⌘S went to the bar");
+                editor.save_over(window, cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), b, "saved over it");
+            editor.update_in(cx, |editor, window, cx| {
+                assert!(editor.disk_change.is_none() && !editor.is_dirty(cx));
+
+                // Remembered by a build that kept no hash: a draft that is the file is the
+                // file; any other may be older, and says so.
+                reopen(editor, Some(draft(b, None)));
+                assert!(editor.file_read(Some(b.into()), window, cx));
+                assert!(editor.disk_change.is_none());
+                reopen(editor, Some(draft(a, None)));
+                assert!(editor.file_read(Some(b.into()), window, cx));
+                assert!(editor.disk_change.is_some());
+                editor.take_disk_text(window, cx);
+                assert_eq!(editor.editor.read(cx).text(cx), b, "the file's text taken");
+
+                // A file that cannot be read keeps the draft; without one, there is no tab.
+                reopen(editor, Some(draft(a, Some(b))));
+                assert!(editor.file_read(None, window, cx));
+                assert_eq!(editor.editor.read(cx).text(cx), a);
+                assert!(editor.file_error.is_some());
+                reopen(editor, None);
+                assert!(!editor.file_read(None, window, cx));
+            });
+        }
+
+        /// A file changed elsewhere while its tab is open: a tab with nothing unsaved takes
+        /// the file's text when the editor takes the keyboard; one with a draft is not written
+        /// over by ⌘S, which finds the file holds other text, keeps the draft and asks.
+        #[gpui::test]
+        async fn an_open_file_changed_elsewhere_is_not_written_over(cx: &mut TestAppContext) {
+            init(cx);
+            let session = session(cx);
+            let path = scratch("changed").join("people.gq");
+            std::fs::write(&path, "query a() {}").unwrap();
+            let (editor, cx) = cx.add_window_view(|window, cx| {
+                QueryEditor::with_text(1, session, "query a() {}", window, cx)
+            });
+            editor.update(cx, |editor, cx| {
+                editor.set_file(path.clone(), Some("query a() {}".into()), cx)
+            });
+            std::fs::write(&path, "query b() {}").unwrap();
+            editor.update_in(cx, |editor, window, cx| editor.check_disk(window, cx));
+            cx.run_until_parked();
+            editor.update_in(cx, |editor, window, cx| {
+                assert_eq!(editor.editor.read(cx).text(cx), "query b() {}");
+                assert!(!editor.is_dirty(cx));
+                editor.set_text("query c() {}", window, cx);
+            });
+            cx.run_until_parked();
+            std::fs::write(&path, "query d() {}").unwrap();
+            editor.update_in(cx, |editor, window, cx| {
+                assert!(editor.is_dirty(cx));
+                editor.save_now(window, cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "query d() {}");
+            editor.update_in(cx, |editor, window, cx| {
+                assert_eq!(
+                    editor.editor.read(cx).text(cx),
+                    "query c() {}",
+                    "the draft stays"
+                );
+                assert!(
+                    editor
+                        .disk_change
+                        .as_ref()
+                        .is_some_and(|change| change.asked)
+                );
+                assert_eq!(
+                    editor.serialize(cx).unwrap().data["based_on"],
+                    json!(content_hash("query b() {}"))
+                );
+                editor.save_over(window, cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "query c() {}");
+            editor.read_with(cx, |editor, cx| {
+                assert!(editor.disk_change.is_none() && !editor.is_dirty(cx));
+            });
+        }
+
+        /// A tab given text, even none, keeps it when the schema arrives; only a new query is
+        /// filled with the example. An empty file's tab is not changed by it.
+        #[gpui::test]
+        async fn a_tab_given_no_text_stays_empty_when_the_schema_arrives(cx: &mut TestAppContext) {
+            init(cx);
+            let (session, _) = served(cx, vec![schema_route(PEOPLE)]);
+            assert!(
+                session.read_with(cx, |session, _| session.schema_model().is_none()),
+                "the schema is not read yet"
+            );
+            let (fresh_session, file_session) = (session.clone(), session.clone());
+            let (emptied, cx) = cx.add_window_view(move |window, cx| {
+                QueryEditor::with_text(1, session, "", window, cx)
+            });
+            let (fresh, file) = emptied.update_in(cx, |_, window, cx| {
+                let fresh = cx.new(|cx| QueryEditor::new(2, fresh_session, window, cx));
+                let file = cx.new(|cx| {
+                    let mut file =
+                        QueryEditor::reading(3, file_session, "empty.gq".into(), None, window, cx);
+                    file.file_read(Some(String::new()), window, cx);
+                    file
+                });
+                (fresh, file)
+            });
+            cx.run_until_parked();
+            emptied.read_with(cx, |emptied, cx| {
+                assert!(emptied.schema(cx).is_some(), "the schema arrived");
+                assert_eq!(emptied.editor.read(cx).text(cx), "");
+            });
+            fresh.read_with(cx, |fresh, cx| {
+                assert!(
+                    fresh.editor.read(cx).text(cx).contains("query"),
+                    "the example"
+                );
+            });
+            file.read_with(cx, |file, cx| {
+                assert_eq!(file.editor.read(cx).text(cx), "");
+                assert!(!file.is_dirty(cx));
+            });
+        }
+
+        /// Values a remembered stored-query tab brings back before the graph's catalog is
+        /// read wait for their inputs, and are saved with the tab meanwhile; once an input is
+        /// made, what it holds is saved.
+        #[gpui::test]
+        async fn values_waiting_for_the_catalog_are_saved_with_the_tab(cx: &mut TestAppContext) {
+            init(cx);
+            let session = session(cx);
+            let entry = QueryCatalogEntry {
+                name: "people_titled".into(),
+                tool_name: None,
+                description: None,
+                instruction: None,
+                mutation: false,
+                params: Vec::new(),
+            };
+            let (editor, cx) = cx.add_window_view(|window, cx| {
+                QueryEditor::new_stored(1, session, entry, window, cx)
+            });
+            editor.update_in(cx, |editor, window, cx| {
+                let values = json!({"title": "Founder", "limit": 5});
+                editor.fill_params(None, values.as_object().unwrap(), window, cx);
+                assert!(editor.params.is_empty(), "no input before the catalog");
+                let saved = editor.serialize(cx).unwrap();
+                assert_eq!(saved.data["values"], values);
+
+                if let Some(stored) = &mut editor.stored {
+                    stored.entry.params = vec![ParamDescriptor {
+                        name: "title".into(),
+                        ..param(ParamKind::String)
+                    }];
+                }
+                editor.sync_stored_params(window, cx);
+                let input = editor.params["title"].clone();
+                assert_eq!(input.read(cx).text(cx), "Founder");
+                input.update(cx, |input, cx| input.set_text("CEO", window, cx));
+                let saved = editor.serialize(cx).unwrap();
+                assert_eq!(saved.data["values"], json!({"title": "CEO", "limit": 5}));
+            });
+        }
+
+        /// The Run line above a declaration runs that one, though the one before it lacks its
+        /// `}` and runs on to it.
+        #[gpui::test]
+        async fn the_run_line_runs_the_declaration_below_it(cx: &mut TestAppContext) {
+            init(cx);
+            let session = session(cx);
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(1, session, window, cx));
+            let schema = SchemaModel::parse(PEOPLE).unwrap();
+            let text = "query a() {\n  match { $p: Person }\n  return { $p.name }\n\n\
+                        query b() {\n  match { $p: Person }\n  return { $p.slug }\n}\n";
+            editor.update_in(cx, |editor, window, cx| {
+                editor.set_text(text, window, cx);
+                editor.apply_analysis(Arc::new(Analysis::new(&schema, text.into())), window, cx);
+                assert_eq!(editor.run_line_names, ["a", "b"]);
+                editor.run_declaration(1, window, cx);
+                let Output::Running { label } = &editor.output else {
+                    panic!("not running");
+                };
+                assert_eq!(label.as_ref(), "Running b on main…");
+            });
+        }
+
+        /// A read copied and changed to a delete, its name kept, asks before it writes: it is
+        /// checked as itself, not as the read named like it, and nothing goes to `/query`.
+        #[gpui::test]
+        async fn a_write_named_like_a_read_asks_before_it_writes(cx: &mut TestAppContext) {
+            init(cx);
+            let (session, asked) = served(cx, vec![schema_route(PEOPLE)]);
+            cx.run_until_parked();
+            let schema = session.read_with(cx, |session, _| session.schema_model().unwrap());
+            // The session reads the graph's counts through `/query` on its own.
+            let reads = || {
+                asked
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|line| line.ends_with("/query"))
+                    .count()
+            };
+            let before = reads();
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(1, session, window, cx));
+            let text = "query people() { match { $p: Person } return { $p.name } }\n\n\
+                        query people($slug: String) {\n  delete Person where slug = $slug\n}";
+            editor.update_in(cx, |editor, window, cx| {
+                editor.set_text(text, window, cx);
+                editor.cursor = text.find("delete").unwrap();
+                editor.apply_analysis(Arc::new(Analysis::new(&schema, text.into())), window, cx);
+                let input = editor.params["slug"].clone();
+                input.update(cx, |input, cx| input.set_text("a", window, cx));
+                editor.run(&Run, window, cx);
+                let pending = editor.pending_write.as_ref().expect("a write asks first");
+                assert!(pending.prepared.write);
+                assert!(
+                    pending.typed.is_some(),
+                    "a delete waits for its type's name"
+                );
+            });
+            cx.run_until_parked();
+            assert_eq!(reads(), before, "nothing was read");
+        }
+
+        /// Typing, and a check after it that finds the same problems, leave the problems list
+        /// as it was (`docs/drawing.md`); going to a problem draws it.
+        #[gpui::test]
+        async fn typing_leaves_the_problems_as_they_were(cx: &mut TestAppContext) {
+            init(cx);
+            let (session, _) = served(cx, vec![schema_route(PEOPLE)]);
+            cx.run_until_parked();
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(1, session, window, cx));
+            let renders = |cx: &mut gpui::VisualTestContext| {
+                editor.read_with(cx, |editor, cx| editor.problems.read(cx).renders)
+            };
+            let text = "query people { match { $p: Person } return { $p.name } }";
+            editor.update_in(cx, |editor, window, cx| {
+                editor.set_text(text, window, cx);
+                editor.editor.update(cx, |editor, cx| {
+                    editor.change_selections(Default::default(), window, cx, |s| {
+                        let end = MultiBufferOffset(text.len());
+                        s.select_ranges(vec![end..end])
+                    });
+                });
+                window.focus(&editor.editor.focus_handle(cx), cx);
+            });
+            // The first key also switches GPUI to keyboard input, which draws the whole
+            // window once; the keys after it, and their check, are the ones counted.
+            cx.simulate_input(" ");
+            cx.executor().advance_clock(CHECK_DELAY);
+            cx.run_until_parked();
+            let before = renders(cx);
+            assert!(before > 0, "the list is drawn");
+            cx.simulate_input("// x");
+            cx.executor().advance_clock(CHECK_DELAY);
+            cx.run_until_parked();
+            editor.read_with(cx, |editor, _| {
+                let analysis = editor.analysis.as_ref().expect("a check ran");
+                assert!(analysis.text.ends_with("// x"), "of the text typed");
+                assert_eq!(analysis.problems.len(), 1);
+            });
+            assert_eq!(renders(cx), before, "typing or its check drew the problems");
+            editor.update_in(cx, |editor, window, cx| {
+                editor.next_problem(&NextProblem, window, cx)
+            });
+            cx.run_until_parked();
+            assert_eq!(renders(cx), before + 1);
+        }
+
+        /// Rows read at the branch head offer Refresh once the head moves past the commit they
+        /// were read at, and read nothing by themselves; Refresh reads them again. A head
+        /// moving under a write's outcome sends nothing.
+        #[gpui::test]
+        async fn rows_offer_refresh_when_their_branch_moves(cx: &mut TestAppContext) {
+            init(cx);
+            let rows = json!({
+                "query_name": "people", "target": {"branch": "main"}, "row_count": 1,
+                "columns": ["p.name"], "rows": [{"p.name": "Ada"}],
+                "graph_commit_id": "01JHEADAAAAA",
+            });
+            let (session, asked) = served(cx, vec![("/query", rows.to_string())]);
+            cx.run_until_parked();
+            let moved = |head: &str, branch: &str| SessionEvent::HeadMoved {
+                branch: branch.into(),
+                head: head.into(),
+            };
+            let reads = || {
+                asked
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|line| line.ends_with("/query"))
+                    .count()
+            };
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(1, session.clone(), window, cx));
+            editor.update_in(cx, |editor, window, cx| {
+                editor.set_text(
+                    "query people() { match { $p: Person } return { $p.name } }",
+                    window,
+                    cx,
+                );
+                editor.cursor = 0;
+                editor.run(&Run, window, cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(reads(), 1);
+            let newer = |cx: &mut gpui::VisualTestContext| {
+                editor.read_with(cx, |editor, cx| {
+                    let Output::Rows(rows) = &editor.output else {
+                        panic!("no rows");
+                    };
+                    assert_eq!(rows.newer, editor.is_stale(cx));
+                    rows.newer
+                })
+            };
+            assert!(!newer(cx));
+            session.update(cx, |_, cx| cx.emit(moved("01JHEADAAAAA", "main")));
+            session.update(cx, |_, cx| cx.emit(moved("01JOTHERAAAA", "other")));
+            cx.run_until_parked();
+            assert!(!newer(cx), "the commit read at, or another branch");
+            session.update(cx, |_, cx| cx.emit(moved("01JNEXTAAAAA", "main")));
+            cx.run_until_parked();
+            assert!(newer(cx), "the branch moved on");
+            assert_eq!(reads(), 1, "nothing read by itself");
+            editor.update(cx, |editor, cx| editor.refresh_rows(cx));
+            cx.run_until_parked();
+            assert_eq!(reads(), 2);
+            assert!(!newer(cx));
+
+            editor.update(cx, |editor, cx| {
+                editor.replace_output(
+                    Output::Written(WriteResult::Unknown {
+                        reason: "the connection closed".into(),
+                    }),
+                    cx,
+                )
+            });
+            session.update(cx, |_, cx| cx.emit(moved("01JLASTAAAAA", "main")));
+            editor.update(cx, |editor, cx| editor.refresh_rows(cx));
+            cx.run_until_parked();
+            assert_eq!(reads(), 2, "a write is never sent again");
+            editor.read_with(cx, |editor, cx| assert!(!editor.is_stale(cx)));
+        }
+
+        /// A refused read's diagnostic in contract 0.14's shape points into the query, and its
+        /// suggested edit applies where it was meant after an edit above it.
+        #[gpui::test]
+        async fn a_refused_reads_suggested_edit_applies_to_the_query(cx: &mut TestAppContext) {
+            init(cx);
+            let session = session(cx);
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(1, session, window, cx));
+            let text = "query people { match { $p: Person } return { $p.name } }";
+            let at = text.find(" {").unwrap();
+            editor.update_in(cx, |editor, window, cx| {
+                editor.set_text(text, window, cx);
+                editor.cursor = 0;
+                let prepared = editor.prepare(false, cx).unwrap();
+                assert_eq!(prepared.text, text);
+                let refused = ReadError::Refused(graph_client::ApiErrorSummary {
+                    status: 400,
+                    message: "parse error".into(),
+                    code: Some(ErrorCode::BadRequest),
+                    diagnostic: Some(json!({
+                        "code": "Q002", "position": {"line": 1, "column": 13, "byte": at},
+                        "expected": "a parameter list", "fix": "add `()`",
+                        "suggestion": {"applicability": "machine_applicable",
+                                       "edits": [{"start": at, "end": at, "replacement": "()"}]},
+                    })),
+                    change_diff_refusal: None,
+                });
+                let sent = prepared.sent.clone();
+                let at = ReadAt::Branch("main".into());
+                editor.finish_read(prepared, at, Err(refused), Duration::ZERO, None);
+                editor.hold_diagnostic(sent.as_ref(), cx);
+                let Output::Failed(failure) = &editor.output else {
+                    panic!("not refused");
+                };
+                let diagnostic = failure
+                    .diagnostic
+                    .as_ref()
+                    .expect("the server's diagnostic");
+                assert_eq!(diagnostic.code, "Q002");
+                assert_eq!(diagnostic.suggestion.as_deref(), Some("insert `()`"));
+                editor.editor.update(cx, |editor, cx| {
+                    editor.edit(
+                        [(MultiBufferOffset(0)..MultiBufferOffset(0), "// people\n")],
+                        cx,
+                    )
+                });
+                editor.apply_server_fix(window, cx);
+                assert_eq!(
+                    editor.editor.read(cx).text(cx),
+                    "// people\nquery people() { match { $p: Person } return { $p.name } }"
+                );
+                assert!(editor.diagnostic_edits.is_empty(), "applied once");
             });
         }
     }
