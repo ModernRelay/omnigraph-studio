@@ -13,6 +13,7 @@ serde_json = { workspace = true }
 gpui = { workspace = true }
 ui = { workspace = true }
 editor = { workspace = true }
+futures = { workspace = true }
 menu = { workspace = true }
 studio_ui = { workspace = true }
 change_cards = { workspace = true }
@@ -23,7 +24,6 @@ graph_store = { workspace = true }
 gq_language = { workspace = true }
 
 [dev-dependencies]
-futures = { workspace = true }
 gpui = { workspace = true, features = ["test-support"] }
 http_client = { workspace = true }
 studio_theme = { workspace = true, features = ["test-support"] }

@@ -40,7 +40,9 @@ place), X (designed on 0.13; the better routes are deferred).
   commit. Fork point and last commit derived from `GET /commits?branch=`. The list draws only
   the rows in view, "New branch…" the row after the last, and builds a row's menu when it
   opens, so a graph of thousands of branches costs a frame a screenful of rows (since
-  2026-10-21; before, every branch's row and menu were built at every frame).
+  2026-10-21; before, every branch's row and menu were built at every frame). Each branch's
+  head, actor and time are the shown graph's: a switch of graph drops the details and the reads
+  still out for the previous one (since 2026-10-21).
 - Built (start at a commit, E21, 2026-10-20): History's "New branch here…" (spec 009)
   dispatches `CreateBranchAt`, which opens the same new-branch dialog started at that commit:
   "New branch at <short id>", then who made it and when, read by its id as the dialog opens
@@ -64,7 +66,14 @@ place), X (designed on 0.13; the better routes are deferred).
 
 - Opens as a tab "Review <branch> → <target>".
 - Scope selector: since the fork (default), or one commit (its own changes, read from
-  `GET /graphs/{g}/commits/{id}/changes`).
+  `GET /graphs/{g}/commits/{id}/changes`). The menu is a list that draws, and labels, only the
+  commits in view, the keys moving through every row (since 2026-10-21). A scope change at the
+  heads the review was read at, as far as Studio knows (no other writer's commit or schema
+  seen, no fix landed, neither branch seen at another commit), takes the merge base and the
+  commits since the fork it holds and reads only the new scope's changes; otherwise it reads
+  them again, as a Refresh does. The commits since the fork and the changes they do not depend
+  on are read together, and so are a page of each history once both are needed (since
+  2026-10-21).
 - Search: a field narrows the cards to those whose own change or a relationship on them has an
   id, type, relationship end, or before or after value containing the text; J/K move among
   the cards it leaves.
@@ -110,6 +119,10 @@ place), X (designed on 0.13; the better routes are deferred).
   insert cannot supply one). A changed relationship is not reverted here: edges cannot be
   updated, and the delete and insert it needs cannot share one mutation, so it would publish
   twice. Its card says so and points to the query editor.
+- A credential the access route refuses changes on the branch (spec 002) writes nothing from
+  the review: Edit and every Revert are disabled with the refusal as their tooltip, and ↵ and
+  ⌥⌘Z are not registered (since 2026-10-21). A new token reads the review again, its names and
+  dry run included; nothing read with the old one shows meanwhile (since 2026-10-21).
 - Every fix is a write on the branch, bound with `/mutate/if-graph-commit` to the reviewed head
   or to the commit of the fix before it; a 412 says the branch moved and offers Refresh. Fixes
   go one at a time, so a second one asked for quickly is bound to the first's commit, and each
@@ -143,8 +156,18 @@ place), X (designed on 0.13; the better routes are deferred).
   merge), reading it a page at a time from its head for at most its newest 10,000 commits. A
   merge not in them is not confirmed: "Not confirmed: the newest 10,000 commits of main's
   history do not show it, and Studio read no further; open History to check." A lost merge
-  response read the same way stays unknown ("… Studio did not retry; open History before
-  merging again"), never "merge again".
+  response read the same way stays unknown, never "merge again". Merge stays off while that
+  history is read and while what was read cannot tell ("… Studio did not retry, and Merge stays
+  off until main's history settles it: open History to check, or Refresh to read it again."):
+  a second merge would cancel the read and be sent while the first may still land. Refresh
+  reads the history again, never the merge. History read to its end without the merge lets
+  Merge run again, saying the first may still land ("… does not show it yet, but the merge may
+  still land. Studio did not retry; open History to check before merging again."), and a merge
+  it shows ends the review's merging as a committed one does (since 2026-10-21).
+- A fast-forward publishes a new target commit whose merged parent is the branch head, as a
+  merge commit does: the head it took is that merged parent, so one of the reviewed head no
+  longer says it took a commit made after the review (since 2026-10-21; before, every
+  fast-forward said so).
 
 ## Decisions
 
@@ -193,6 +216,13 @@ place), X (designed on 0.13; the better routes are deferred).
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | A lost merge is never sent twice | `review` `a_lost_merge_keeps_merge_off_until_history_settles_it` (a merge answered 504 through a gateway, main's history first unreadable, then readable without the merge) | While the history is read, and while it cannot tell (`Unread`), Merge is off and `merge` sends nothing; a Refresh reads main's history again and no second merge; read to its end without the merge, Merge runs again with "may still land". Before, Merge stayed on under "reading main's history…": a click replaced the merge task, cancelling the read, and sent a second merge |
+| 2026-10-21 | A fast-forward of the reviewed head is not said to take more | `review` `a_merge_of_a_head_newer_than_the_review_says_so`, extended to `fast_forward` answers whose commit's merged parent is f2 (the reviewed head) or f3 | `beyond_review` false for f2, true for f3, as for a merge commit. Before, a fast-forward compared the new target commit's own id with the reviewed head, which never match: every fast-forward warned |
+| 2026-10-21 | A switch of graph shows none of the previous graph's branch details | `review` `a_switch_of_graph_shows_none_of_the_previous_graphs_details` (graph A's head reads out when the list switches to graph B, whose branches are not read yet) | No details until B's branches are read, then B's main at b1 by act-b1. Before, A's read landed after the switch and named A's head, actor and time on B's rows |
+| 2026-10-21 | A credential refused changes reverts and edits nothing | `review` `a_change_the_credential_may_not_make_is_not_offered` (the access route answering `read` and `branch_merge` only) | `RevertAndNext` and `EditChange` not available, `AcceptAndNext` available; `revert`, `revert_line`, `open_edit` send nothing, `save_edit` answers "Your credential may not change feature"; no `/mutate`. Before, the buttons and keys ignored the refusal the access answer held |
+| 2026-10-21 | A new token reads the review again | `review` `a_new_credential_reads_the_review_again` (`SessionEvent::CredentialChanged` on a read review holding a name) | At once the review is reading, its names gone and its dry run unread; then the merge base and the feed are read again. Before, the review ignored the event: the old token's cards and names stayed |
+| 2026-10-21 | The scope menu draws only the commits in view | `review` `the_scope_menu_builds_only_the_commits_in_view` (10,000 commits since the fork), `the_scope_menu_reviews_the_commit_chosen` | Fewer than 100 rows built of 10,000; Select Last, Next, Previous, First reach every row; ↵ reviews the highlighted commit and closes, and the menu opens again on it. Before, a context menu of one entry per commit was built and drawn at every frame |
+| 2026-10-21 | A scope change at the same heads reads no merge base or fork again; the reads it needs overlap | `review` `a_scope_change_at_the_same_heads_reads_no_base_again`; `a_review_reads_the_merge_base_and_the_feed_after_it` (a branch main was merged into) | Choosing f1 reads one page of feature's history beside f1's changes, no merge base; f2 then reads only its changes; "Since the fork" only the feed; the commits are those a fresh read lists; after another writer's commit a scope change reads the merge base again. A branch main was merged into asks for the diff before either history page, and a page of each together. Before, every scope change read the merge base and searched the fork again, the diff waited for that search, and the two histories' pages were read one after the other |
 | 2026-10-21 | ⌘R reads the review again | `review` `a_review_read_behind_the_schema_or_the_head_is_newer`, its second Refresh dispatched as `studio::Refresh` with the review focused | The review was read again (requests sent, the head bound as before, "Newer data" as the fake still serves f2). Before, nothing in the review handled `Refresh`: ⌘R reloaded the session at the workspace and the review's "Newer data · Refresh" stayed; its buttons showed no key |
 | 2026-10-21 | The branch list draws only the rows in view | `review` `the_branch_list_builds_only_the_rows_in_view` (2,000 branches, a 320 pt dock, rows counted as built) | Fewer than 100 rows built of 2,001, more than none. Before, `BranchList::render` cloned the list and built a row and its right-click menu for every branch each frame |
 | 2026-10-21 | A review short of the fork lists the branch's own commits and names the history that stopped it | `review` `a_fork_past_the_history_read_is_said_and_no_history_is_read_whole`, extended: fixtures name `graph_branch` as the server records it (`feature`, `dev`, none for main); a branch that moved 300 commits past the reviewed head; a branch forked from `dev`, whose 10,000 commits are past its pages; `graph_branch` at `7fd9cc9`: `GraphNamespacePublisher` and `GraphHeadExpectation` normalize main to `None`, `LineageIntent.branch` is the writing branch, `GET /commits?branch=` lists the first-parent chain (`commit_list_page`, `first_parent_page`) | Before, a branch main was merged into listed `["f2","fm","f1","m0"]`, main's m0 as the branch's, and every capped review said "More than 10,000 commits since the fork". Now `["f2","fm","f1"]` with "The fork is past the newest 10,000 commits of main's history: … the 3 commits made on feature."; the moved branch says "More than 9,700 commits" (9,900 since its fork, not 10,000); the `dev` fork lists `["f1","f0"]` and "The fork is more than 10,000 commits down feature's history: …". A fork reached is unchanged: its commits since it still include a parent branch's |

@@ -105,7 +105,11 @@ impl BranchList {
             })
         });
         self.session = session;
+        // The details shown and the reads still out are the previous graph's: a read landing
+        // after the switch would name its heads on this graph's rows. This graph's are read
+        // once its branches are.
         self.details.clear();
+        self._details_task = None;
         self.load_details(cx);
         cx.notify();
     }
@@ -1046,6 +1050,65 @@ mod tests {
         let drawn = list.read_with(cx, |list, _| list.rows_drawn);
         assert!(drawn > 0, "the rows in view are drawn");
         assert!(drawn < 100, "{drawn} rows built of 2,001");
+    }
+
+    /// The details shown are the shown graph's own: a switch to another graph while the first
+    /// graph's heads are still being read shows none of them, as the other graph's branches
+    /// are still to be read, and the other graph's heads once they are.
+    #[gpui::test]
+    async fn a_switch_of_graph_shows_none_of_the_previous_graphs_details(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(studio_theme::init_test);
+        // Each graph's main has its own head, by its own actor.
+        let graph = |head: &'static str, listed: std::sync::Arc<std::sync::atomic::AtomicBool>| {
+            move |path: &str, _: &str, _: &str| {
+                if path.ends_with("/branches") {
+                    if listed.load(std::sync::atomic::Ordering::SeqCst) {
+                        (200, json!({ "branches": ["main"] }))
+                    } else {
+                        (500, json!({ "error": "not yet" }))
+                    }
+                } else if path.ends_with("/commits") {
+                    let commit = json!({ "graph_commit_id": head, "graph_manifest_version": 1, "kind": "published", "created_at": 0, "actor_id": format!("act-{head}") });
+                    (200, json!({ "commits": [commit] }))
+                } else {
+                    (404, json!({ "error": "not here" }))
+                }
+            }
+        };
+        let listed = |now: bool| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(now));
+        let (first, _) = fake_server(graph("a1", listed(true)), cx);
+        let second_listed = listed(false);
+        let (second, _) = fake_server(graph("b1", second_listed.clone()), cx);
+        struct Dock(Entity<BranchList>);
+        impl Render for Dock {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(260.)).h(px(320.)).child(self.0.clone())
+            }
+        }
+        let (dock, cx) = cx.add_window_view(|window, cx| {
+            Dock(cx.new(|cx| {
+                let mut list = BranchList::new(WeakEntity::new_invalid(), Some(first), window, cx);
+                // Switched before the first graph's heads are back.
+                list.watch(Some(second.clone()), cx);
+                list
+            }))
+        });
+        cx.run_until_parked();
+        let list = dock.read_with(cx, |dock, _| dock.0.clone());
+        list.read_with(cx, |list, _| {
+            assert!(list.details.is_empty(), "{:?}", list.details)
+        });
+
+        second_listed.store(true, std::sync::atomic::Ordering::SeqCst);
+        second.update(cx, |session, cx| session.reload_branches(cx));
+        cx.run_until_parked();
+        list.read_with(cx, |list, _| {
+            let main = list.details.get("main").expect("read");
+            assert_eq!(main.head, "b1");
+            assert_eq!(main.actor.as_deref(), Some("act-b1"));
+        });
     }
 
     /// A merged branch is deleted with ↵; one with commits only it holds waits for its name.
