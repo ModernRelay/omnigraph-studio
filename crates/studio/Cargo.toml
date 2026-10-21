@@ -74,6 +74,7 @@ harness = false
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+graph_store = { workspace = true, features = ["test-support"] }
 studio_settings = { workspace = true, features = ["test-support"] }
 studio_theme = { workspace = true, features = ["test-support"] }
 gpui_platform = { workspace = true, features = ["test-support", "font-kit", "runtime_shaders"] }

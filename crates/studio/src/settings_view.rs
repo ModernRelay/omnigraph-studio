@@ -38,8 +38,6 @@ pub struct SettingsView {
     scope: Scope,
     /// A field for each text setting, made with the tab.
     text_inputs: Vec<TextInput>,
-    /// The font choices, read from the system when a font setting is first drawn.
-    fonts: Option<Options>,
     /// The settings as values, read again when they change rather than at every frame.
     values: SettingsValues,
     /// The window's graph changing, which the tab follows.
@@ -138,7 +136,10 @@ impl SettingsView {
                 studio_settings::writes_done();
                 async {}
             }),
+            // The font fields offer the system's fonts once they are listed.
+            cx.observe_global::<FontChoices>(|_, cx| cx.notify()),
         ];
+        read_fonts(cx);
         let mut text_inputs = Vec::new();
         for field in studio_settings::fields() {
             if !matches!(field.kind, FieldKind::Text { .. }) {
@@ -175,7 +176,6 @@ impl SettingsView {
             session: None,
             scope: Scope::All,
             text_inputs,
-            fonts: None,
             values: StudioSettings::get(cx).values(),
             _workspace_subscription: None,
             _session_subscription: None,
@@ -509,29 +509,62 @@ fn node_name_dropdown(names: TypeNaming) -> AnyElement {
         .into_any_element()
 }
 
-/// The font choices, read from the system once for every Settings tab.
-struct FontChoices(Options);
+/// The font choices, listed from the system once for every Settings tab: "Default", then every
+/// font by name. `None` while they are listed.
+#[derive(Default)]
+struct FontChoices {
+    options: Option<Options>,
+}
 
 impl Global for FontChoices {}
 
-/// "Default", then every font the system has, by name.
-fn font_options(cx: &mut App) -> Options {
-    if let Some(FontChoices(options)) = cx.try_global::<FontChoices>() {
-        return options.clone();
+/// Lists the system's fonts off the main thread, once, when the first Settings tab opens: the
+/// platform enumerates every face it has, too slow for a frame (Zed's `FontFamilyCache`
+/// prefetches them in the background for the same reason).
+fn read_fonts(cx: &mut App) {
+    if cx.has_global::<FontChoices>() {
+        return;
     }
-    let mut fonts = cx.text_system().all_font_names();
-    fonts.sort();
-    fonts.dedup();
-    let options: Options = std::iter::once(("Default".into(), Value::Null))
+    cx.set_global(FontChoices::default());
+    let text_system = cx.text_system().clone();
+    let listing = cx.background_spawn(async move {
+        let mut fonts = text_system.all_font_names();
+        fonts.sort();
+        fonts.dedup();
+        fonts.retain(|name| !name.starts_with('.'));
+        fonts
+    });
+    cx.spawn(async move |cx| {
+        let fonts = listing.await;
+        let options: Options = std::iter::once(("Default".into(), Value::Null))
+            .chain(
+                fonts
+                    .into_iter()
+                    .map(|name| (name.clone().into(), Value::from(name))),
+            )
+            .collect();
+        cx.update(|cx| {
+            cx.update_global::<FontChoices, _>(|fonts, _| fonts.options = Some(options))
+        });
+    })
+    .detach();
+}
+
+/// The font choices once they are listed.
+fn font_choices(cx: &App) -> Option<Options> {
+    cx.try_global::<FontChoices>()?.options.clone()
+}
+
+/// A font field's choices while the system's fonts are listed: "Default" and the font chosen,
+/// so the field shows its value.
+fn fonts_being_read(current: &Value) -> Options {
+    std::iter::once(("Default".into(), Value::Null))
         .chain(
-            fonts
-                .into_iter()
-                .filter(|name| !name.starts_with('.'))
-                .map(|name| (name.clone().into(), Value::from(name))),
+            current
+                .as_str()
+                .map(|name| (SharedString::from(name.to_owned()), current.clone())),
         )
-        .collect();
-    cx.set_global(FontChoices(options.clone()));
-    options
+        .collect()
 }
 
 /// The agent's presets as a segmented choice, with the command it runs underneath.
@@ -641,11 +674,10 @@ fn control(
                     .collect(),
             )
         }
-        FieldKind::Custom(kind) if kind == "font" => dropdown(
-            target,
-            current,
-            fonts.cloned().unwrap_or_else(|| Rc::from([])),
-        ),
+        FieldKind::Custom(kind) if kind == "font" => {
+            let options = fonts.cloned().unwrap_or_else(|| fonts_being_read(&current));
+            dropdown(target, current, options)
+        }
         FieldKind::Custom(kind) if kind == "agent" => agent_control(target, current, cx),
         FieldKind::Custom(_) | FieldKind::Text { .. } => {
             let shown = match &current {
@@ -726,13 +758,7 @@ impl Render for SettingsView {
                 }
             })
             .collect();
-        let wants_fonts = shown
-            .iter()
-            .any(|field| matches!(&field.kind, FieldKind::Custom(kind) if kind == "font"));
-        if wants_fonts && self.fonts.is_none() {
-            self.fonts = Some(font_options(cx));
-        }
-        let fonts = self.fonts.clone();
+        let fonts = font_choices(cx);
         let values = &self.values;
         let path = studio_settings::settings_path();
         let settings_problems = studio_settings::settings_problems(cx);
@@ -1074,6 +1100,33 @@ mod tests {
         // value they hold.
         cx.run_until_parked();
         assert_eq!(text(cx), "/usr/local/bin/omnigraph");
+    }
+
+    /// The system's fonts are listed off the main thread when a tab opens, once for every tab;
+    /// until they are in, a font field offers the font chosen, so it shows its value.
+    #[gpui::test]
+    fn fonts_are_listed_off_the_main_thread(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            read_fonts(cx);
+            assert!(
+                font_choices(cx).is_none(),
+                "listed in the background, not here"
+            );
+            read_fonts(cx);
+        });
+        cx.run_until_parked();
+        let listed = cx
+            .update(|cx| font_choices(cx))
+            .expect("the fonts are listed");
+        let default = (SharedString::from("Default"), Value::Null);
+        assert_eq!(listed[0], default);
+
+        let chosen = Value::from("Iosevka");
+        assert_eq!(
+            fonts_being_read(&chosen).to_vec(),
+            [default.clone(), (SharedString::from("Iosevka"), chosen)]
+        );
+        assert_eq!(fonts_being_read(&Value::Null).to_vec(), [default]);
     }
 
     /// Typing a field holds when the tab closes is written then: the field hears no loss of

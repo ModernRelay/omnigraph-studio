@@ -1754,6 +1754,7 @@ dependencies = [
  "editor",
  "gpui",
  "gq_language",
+ "graph_client",
  "graph_store",
  "http_client",
  "menu",

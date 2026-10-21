@@ -1,6 +1,8 @@
 //! The "Storage" inspector (spec 010): server health and readiness, every graph's state, and the
 //! session branch's snapshot with its datasets. Every value is copyable; a value the server did
-//! not send reads "Not reported by this server".
+//! not send reads "Not reported by this server". The snapshot shown stays when the branch moves:
+//! the tab offers the newer one (constitution II, V), and reads again on Refresh or on another
+//! branch.
 
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, SharedString,
@@ -11,10 +13,12 @@ use graph_client::api::{
     EntityKind, GraphInfo, GraphListResponse, ReadinessOutput, SnapshotOutput,
 };
 use graph_store::{GraphSession, Loadable, SessionEvent};
+use studio_actions::workspace::Refresh;
 use studio_ui::CopyableValue;
 use studio_ui::ds::{Dotted as _, space};
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
+use ui::{TintColor, Tooltip};
 
 pub const STORAGE_KEY: &str = "inspector:storage";
 
@@ -44,6 +48,11 @@ pub struct StorageInspector {
     /// Counts the reads of the snapshot begun: only the latest one's answer is shown, so an
     /// older read that finishes later does not put back the storage it saw.
     snapshot_reads: u64,
+    /// The branch head the session knew when the snapshot shown was asked for. The snapshot
+    /// route names no commit, so a head move is measured against this.
+    read_at: Option<String>,
+    /// The branch moved since the snapshot shown was asked for.
+    newer: bool,
     _task: Option<Task<()>>,
     _snapshot_task: Option<Task<()>>,
     _subscription: Subscription,
@@ -70,6 +79,10 @@ impl Item for StorageInspector {
         Some(STORAGE_KEY.into())
     }
 
+    fn is_stale(&self, _cx: &App) -> bool {
+        self.newer
+    }
+
     fn serialize(&self, _cx: &App) -> Option<SavedItem> {
         Some(SavedItem {
             kind: "storage".into(),
@@ -94,9 +107,10 @@ impl StorageInspector {
         // health, readiness and graphs are the same on every branch, and stay.
         let subscription = cx.subscribe(&session, |this: &mut Self, _, event, cx| match event {
             SessionEvent::BranchChanged => this.reload_snapshot(true, cx),
-            // A commit moves the tables' versions and rows: read again, the old shown meanwhile.
-            SessionEvent::HeadMoved { branch, .. } if *branch == this.branch => {
-                this.reload_snapshot(false, cx)
+            // A commit, Studio's or another writer's, moves the tables' versions and rows: the
+            // storage shown stays, and the tab offers the newer.
+            SessionEvent::HeadMoved { branch, head } if *branch == this.branch => {
+                this.head_moved(head, cx)
             }
             _ => {}
         });
@@ -109,6 +123,8 @@ impl StorageInspector {
             graphs: Loadable::NotLoaded,
             snapshot: Loadable::NotLoaded,
             snapshot_reads: 0,
+            read_at: None,
+            newer: false,
             _task: None,
             _snapshot_task: None,
             _subscription: subscription,
@@ -125,8 +141,7 @@ impl StorageInspector {
         self.readiness = Loadable::Loading;
         self.graphs = Loadable::Loading;
         self.snapshot = Loadable::Loading;
-        self.snapshot_reads += 1;
-        let snapshot_read = self.snapshot_reads;
+        let snapshot_read = self.begin_snapshot_read(cx);
         let read = self
             .session
             .update(cx, |session, cx| session.server_state(&branch, cx));
@@ -156,8 +171,7 @@ impl StorageInspector {
         if clear {
             self.snapshot = Loadable::Loading;
         }
-        self.snapshot_reads += 1;
-        let snapshot_read = self.snapshot_reads;
+        let snapshot_read = self.begin_snapshot_read(cx);
         let read = self
             .session
             .update(cx, |session, cx| session.branch_snapshot(&branch, cx));
@@ -172,6 +186,33 @@ impl StorageInspector {
             .ok();
         }));
         cx.notify();
+    }
+
+    /// Counts a read of the branch's snapshot begun, at the head the session knows now, and
+    /// takes down the offer of a newer one.
+    fn begin_snapshot_read(&mut self, cx: &mut Context<Self>) -> u64 {
+        self.snapshot_reads += 1;
+        self.read_at = self.session.read(cx).head(&self.branch).map(str::to_owned);
+        if self.newer {
+            self.newer = false;
+            cx.emit(ItemEvent::UpdateTab);
+        }
+        self.snapshot_reads
+    }
+
+    /// The branch's head is now `head`. A head other than the one the snapshot was asked at
+    /// offers the newer; the first head the session learns, while the snapshot was read, is
+    /// taken as the one it was read at.
+    fn head_moved(&mut self, head: &str, cx: &mut Context<Self>) {
+        match &self.read_at {
+            None => self.read_at = Some(head.to_owned()),
+            Some(read_at) if read_at == head || self.newer => {}
+            Some(_) => {
+                self.newer = true;
+                cx.emit(ItemEvent::UpdateTab);
+                cx.notify();
+            }
+        }
     }
 
     fn render_server(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -540,6 +581,12 @@ impl Render for StorageInspector {
         v_flex()
             .key_context("StorageInspector")
             .track_focus(&self.focus_handle)
+            // ⌘R reads the inspector again, and goes on to the workspace, which reads the
+            // graph's schema, branches and counts again.
+            .on_action(cx.listener(|this, _: &Refresh, _, cx| {
+                this.reload(cx);
+                cx.propagate();
+            }))
             .size_full()
             .child(
                 studio_ui::ds::toolbar(cx)
@@ -551,10 +598,27 @@ impl Render for StorageInspector {
                         self.branch
                     )))
                     .when(loading, |d| d.child(studio_ui::ds::text::meta("Reading…")))
+                    .when(self.newer, |d| {
+                        d.child(
+                            studio_ui::ds::toolbar_button(
+                                "newer-storage",
+                                "Newer snapshot · Refresh",
+                            )
+                            .style(ButtonStyle::Tinted(TintColor::Accent))
+                            .tooltip(Tooltip::text(
+                                "The branch moved since its storage was read; read it again",
+                            ))
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.reload_snapshot(false, cx)),
+                            ),
+                        )
+                    })
                     .child(div().flex_1())
                     .child(
                         studio_ui::ds::toolbar_icon_button("refresh-storage", IconName::RotateCw)
-                            .tooltip(ui::Tooltip::text("Read the server's state again"))
+                            .tooltip(|_, cx| {
+                                Tooltip::for_action("Read the server's state again", &Refresh, cx)
+                            })
                             .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
                     ),
             )
@@ -584,11 +648,66 @@ impl Render for StorageInspector {
 
 #[cfg(test)]
 mod tests {
-    use super::words;
+    use gpui::TestAppContext;
+    use serde_json::json;
+
+    use super::*;
 
     #[test]
     fn variants_read_as_words() {
         assert_eq!(words("WaitForStartup"), "wait for startup");
         assert_eq!(words("None"), "none");
+    }
+
+    /// Another writer's commit leaves the storage shown and offers the newer; Refresh reads it
+    /// again, and another branch is read at once.
+    #[gpui::test]
+    async fn a_head_move_offers_the_newer_snapshot_and_reads_it_only_on_refresh(
+        cx: &mut TestAppContext,
+    ) {
+        let (session, served) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n}\n",
+            |_| json!([]),
+            cx,
+        );
+        served.lock().unwrap().branches.push("feature".into());
+        cx.run_until_parked();
+        let inspector = cx.new(|cx| StorageInspector::new(session.clone(), cx));
+        cx.run_until_parked();
+        let state = |cx: &mut TestAppContext| {
+            inspector.read_with(cx, |inspector, cx| {
+                (
+                    inspector.snapshot_reads,
+                    inspector.newer,
+                    inspector.is_stale(cx),
+                )
+            })
+        };
+        assert_eq!(state(cx), (1, false, false));
+
+        served.lock().unwrap().commit("c2", Vec::new());
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        assert_eq!(state(cx), (1, true, true), "the storage shown stays");
+
+        inspector.update(cx, |inspector, cx| inspector.reload_snapshot(false, cx));
+        cx.run_until_parked();
+        assert_eq!(state(cx), (2, false, false));
+        // The head the snapshot was read at, seen again, offers nothing.
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        assert_eq!(state(cx), (2, false, false));
+
+        session.update(cx, |session, cx| session.set_branch("feature".into(), cx));
+        cx.run_until_parked();
+        assert_eq!(
+            state(cx),
+            (3, false, false),
+            "another branch is read at once"
+        );
+        assert_eq!(
+            inspector.read_with(cx, |inspector, _| inspector.branch.clone()),
+            "feature"
+        );
     }
 }

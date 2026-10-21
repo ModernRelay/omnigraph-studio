@@ -12,8 +12,8 @@ without the `omnigraph studio` launcher (deferred).
 
 ## Principles
 
-I (HTTP only; contract header), III (unknown outcomes), IV (Cedar decides), X (capabilities
-from the served document).
+I (HTTP only; contract header), III (unknown outcomes), IV (Cedar decides), VIII (the Open
+dialog by keyboard), X (capabilities from the served document).
 
 ## What exists today (checked)
 
@@ -115,6 +115,22 @@ from the served document).
 5. Re-check health every 30 s while a window is open and on wake from sleep; back off to 2 min
    after failures.
 
+### The Open dialog
+
+Servers on the left, the chosen server's graphs and a graph id field on the right, and a form
+to add a server (⌥⌘O, `studio::OpenGraph`). The keyboard moves with the select actions Zed's
+keymap sends from ↑, ↓, Tab and ⇧Tab, a single-line field passing them on: through the
+servers, the token field when a server refused the token, the chosen server's graphs, then the
+id field, wrapping around (constitution VIII). Moving to a server chooses it and shows its
+graphs, connecting it if it never was; one that could not be reached is tried again with ↵
+or Retry, not at every key that passes it. ↵ on a server goes to its first graph (to the id
+field when a ready server lists none), ↵ on a graph opens it, and ↵ in a field uses what was
+typed. While a server is added, Tab moves through that form's fields. The dialog lists the
+registry's servers as they are now: a reload of the CLI's files that adds, drops or replaces
+one (a new address is a new connection) is followed, so the replacement's state shows and the
+dropped one's no longer reaches the dialog; a choice the registry no longer holds moves to one
+it does.
+
 ### States (status-bar chip)
 
 | State | Chip | What the person can do |
@@ -190,6 +206,7 @@ from the served document).
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-20 | The Open dialog is reached by keyboard and follows the registry | `studio` tests `the_keyboard_chooses_a_server_and_opens_its_graph` (two servers waiting for a token, so nothing is sent; the select actions dispatched as the keymap sends them) and `a_server_the_registry_replaces_is_followed` (the second server replaced by a new connection); the second against the earlier rule, which subscribed to the servers present when the dialog opened; Zed `v1.23.2` `assets/keymaps/default-macos.json` (up, down, tab and shift-tab to `menu::SelectNext`/`SelectPrevious` with no context) and `crates/editor/src/navigation.rs`, `editor.rs` (`move_up`, `move_down`, `tab` and `backtab` propagate in a single-line editor) | ↓ chose the second server, then its first graph; ↑↑ the first server, ↵ its graph, ↓ the id field with focus in it, ↓ the first server again; ↵ on a graph opened it. After the replacement the choice moved to the first server, the replaced connection's change drew nothing and the replacement's drew once; the earlier rule drew for the replaced one. The registry itself is not built in a test, so its observer is checked by reading only |
 | 2026-10-17 | `script/dev-server` runs on any CLI that speaks contract 0.13 | `git show v0.13.0:crates/omnigraph-cli/src/main.rs` (`Command::Version`); `omnigraph version` from a 0.14.0 main build; the script's check against stub CLIs under bash 5 and macOS's bash 3.2; the script itself with 0.14.0 on port 8798 and a scratch `STUDIO_DEV_DATA` | 0.13.0 prints two lines and no contract; 0.14.0 adds `http-contract 0.13`. 0.13.x and 0.14.0 accepted; 0.12.0 and a CLI printing `http-contract 0.14` refused with the version and contract found. On 0.14.0 the cluster applied, both seeds loaded and `GET /graphs` listed `knowledge` and `notes` ready. Before, the script refused 0.14.0 by its version alone |
 | 2026-10-12 | A server added as `localhost:8080` no longer crashes Studio | crash report: `GraphClient::url` panicked on `path_segments_mut().expect(..)` from the health probe, since `Url::parse("localhost:8080")` reads `localhost` as the scheme and cannot be a base; `graph_client` tests `a_server_address_gets_a_scheme_and_a_bare_word_is_refused`, `a_client_refuses_a_root_that_cannot_take_a_path` | The address becomes `http://localhost:8080`; a root without an http(s) host, or with credentials, is refused with its reason |
 | 2026-10-11 | Contract header and value | `git show v0.13.0:crates/omnigraph-api-types/src/lib.rs` | `omnigraph-http-api`, `0.13` |

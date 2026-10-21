@@ -211,20 +211,32 @@ what was last saved at most every 250 ms rather than serializing every tab on ev
   Built: a segmented control under the search field; ⌘1–⌘6 (Alt elsewhere) inside the
   palette. ⌘K opens All, ⌘P Nodes, ⌘⇧B Branches; the key sheet (`?`) has no tabs. Queries
   lists the open query tabs with their first line, then the graph's saved query files that no
-  tab has open (spec 007). Tab
+  tab has open, and the stored queries the graph serves, each followed by the CLI config's
+  aliases for it (spec 007); ↵ opens one as the Queries panel does
+  (`studio_graph::OpenStoredQuery`). An alias whose query the graph does not serve cannot
+  open and is not listed. Tab
   (bound under `CommandPalette > Editor`, so it outranks the editor's) dismisses the palette
   and sends `studio_agent::Ask`; with no agent chosen, the agent tab says the question waits.
   Node search tries the text as typed, lowercase and capitalized, because `contains` is
   exact on 0.13 ("ada" finds "Ada Turing"). GQ has no node alternatives, so a search is one
-  read per node type, five rows each. Typing on is mostly free: when a type's answer came
-  back under five rows and the new text only narrows the old (each spelling of the new text
-  starts with one of the old, `gq_language::builder::search_narrows`), its rows are filtered
-  in the palette by the query's own predicate (`search_matches`); text typed back to after a
-  backspace shows its answer again. The earlier node rows stay, ranked against the new text,
-  until the new answer replaces them. From the keystroke until every type has answered, a
-  turning circle (`ds::spinner`) sits at the end of the search field in All and Nodes, an
-  empty list reads "Searching nodes…" instead of "No node matches", and the footer leaves
-  out its count until something has come back.
+  read per node type, five rows each. A pause reads at most eight types
+  (`TYPES_PER_SEARCH`, as many as a connection has on the wire at once, so the reads go out
+  together rather than 120 of them queueing behind every other view's on a graph of 120
+  types): those a property names first, since a name is what a person types, then those
+  found by id alone, types the counts say are empty last, each in schema order. When types
+  are left, a last row "Search N more types" reads the next eight and keeps the palette open.
+  Each type's rows show as it answers, below the rows already shown, which keep their place
+  whichever type answers first (constitution V); in All they follow the ranked rows instead
+  of being ranked among them, so a node that lands never pushes down the row under the
+  cursor. New text stops the reads for the old. Typing on is mostly free: when a type's
+  answer came back under five rows and the new text only narrows the old (each spelling of
+  the new text starts with one of the old, `gq_language::builder::search_narrows`), its rows
+  are filtered in the palette by the query's own predicate (`search_matches`); text typed
+  back to after a backspace shows its answer again. Earlier node rows the new text's
+  predicate refuses go at once; the others stay until their type answers. From the keystroke
+  until every type read has answered, a turning circle (`ds::spinner`) sits at the end of the
+  search field in All and Nodes, an empty list reads "Searching nodes…" instead of "No node
+  matches", and the footer leaves out its count until something has come back.
 - Opens in one frame with no animation (constitution VII).
 - Landed 2026-10-12: ⌘K and ⌘⇧P (Ctrl elsewhere), bound by the default keymaps, so a person's
   keymap can unbind them. Rows are humanized action names (`studio_graph::OpenType` → "Graph:
@@ -274,7 +286,9 @@ second line shows it (`omnigraph branch create feature-x --from main`).
     `x-control` (`theme`, `font`, `agent`), `x-step` and `x-hidden` give the rest. The tab
     draws a control per kind (segmented choice up to four, a menu above that, a stepper in
     range, a switch, a text field, the theme and font menus, the agent presets) and writes by
-    path, so a new setting is a field and its attributes. A text field writes when Enter is
+    path, so a new setting is a field and its attributes. The font menus list the system's
+    fonts, read off the main thread once when the first Settings tab opens (the platform
+    enumerates every face it has); until they are in, a font field shows the font chosen. A text field writes when Enter is
     pressed or it loses focus, not on every key; empty unsets a setting that may be unset.
     Typing not yet written stays when the values are drawn again (a switch pressed before the
     field hears it lost focus), and the scope switch writes it to the scope it was typed in

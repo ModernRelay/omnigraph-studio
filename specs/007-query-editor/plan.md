@@ -53,7 +53,8 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   path so it opens once, and shows the changed dot while its text differs from the file; its
   draft and path come back after a restart. The left dock's Queries panel lists the folder,
   newest first; New query, Open a file… and Show the folder are icon buttons in its title
-  line. The palette's Queries scope lists saved files no tab has open.
+  line. The palette's Queries scope lists saved files no tab has open, and the stored queries
+  with their aliases, which ↵ opens (spec 002).
 - **Stored queries:** the queries a server runs by name for the graph (declared in
   `cluster.yaml`, applied with `omnigraph cluster apply`; `GET /graphs/{id}/queries` lists them
   with typed parameters and never their text). The session reads the catalog with the graph (a
