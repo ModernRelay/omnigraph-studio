@@ -15,7 +15,7 @@ use gq_language::builder::{Depends, Seeds};
 use gq_language::input::same_value;
 use gq_language::{BuiltQuery, RelationshipGroup, SchemaModel, builder};
 use graph_client::api::{
-    BranchCreateOutput, BranchCreateRequest, BranchMergeOutput, BranchMergeRequest,
+    AccessAction, BranchCreateOutput, BranchCreateRequest, BranchMergeOutput, BranchMergeRequest,
     ChangeFeedOutput, ChangeOutput, ChangeRequest, CommitKind, CommitOutput, DiffOutput,
     EntityKind, GraphListResponse, InvokeStoredQueryRequest, MergeBaseOutput, QueryCatalogEntry,
     QueryRequest, ReadOutput, ReadTargetOutput, ReadinessOutput, SnapshotDatasetOutput,
@@ -27,6 +27,7 @@ use graph_client::{
 };
 use serde_json::Value;
 
+use crate::access::{Access, AccessScope, Allowed};
 use crate::carry::{ChangeLog, ChangesSince, FeedFold, Since, answer_unchanged};
 use crate::connection::Connection;
 use crate::degrees::{DEGREE_BATCH, DegreeBatchKey, DegreeBatches, page_counts};
@@ -149,6 +150,8 @@ pub enum SessionEvent {
     BranchMissing {
         branch: String,
     },
+    /// What the credential may do was read, or is to be read again ([`GraphSession::allows`]).
+    AccessChanged,
 }
 
 /// How many answers to reads pinned to a commit, and Blob cells at a commit, a session keeps. A
@@ -597,6 +600,9 @@ pub struct GraphSession {
     counts_reading: bool,
     counts_again: bool,
     _stored_queries_task: Option<Task<()>>,
+    /// What the credential may do (spec 002), by the branch asked about: read when the session
+    /// opens and moves to a branch, and again after a 403 or a new token.
+    access: Access,
 }
 
 impl EventEmitter<SessionEvent> for GraphSession {}
@@ -672,6 +678,7 @@ impl GraphSession {
             counts_reading: false,
             counts_again: false,
             _stored_queries_task: None,
+            access: Access::default(),
         };
         session.labels = session.chosen_labels(cx);
         session._settings = Some(
@@ -697,7 +704,70 @@ impl GraphSession {
             }
         }));
         session.reload(cx);
+        let branch = AccessScope::branch(&session.branch);
+        session.read_access(branch, cx);
         session
+    }
+
+    /// Whether the credential may take `action` for `scope`, as the access route answered
+    /// (spec 002). Studio offers every action not known to be refused; the server decides.
+    pub fn allows(&self, action: AccessAction, scope: &AccessScope) -> Allowed {
+        self.access.allows(action, scope)
+    }
+
+    /// Whether the credential may take `action` on the session's branch.
+    pub fn allows_here(&self, action: AccessAction) -> Allowed {
+        self.access
+            .allows(action, &AccessScope::branch(&self.branch))
+    }
+
+    /// The actor the credential resolves to, once the access route has answered.
+    pub fn actor(&self) -> Option<&str> {
+        self.access.actor()
+    }
+
+    /// Reads what the credential may do for `scope`, unless that was read or is being read
+    /// since the credential last may have changed; [`SessionEvent::AccessChanged`] says when an
+    /// answer lands. A read that fails is asked again the next time.
+    pub fn read_access(&mut self, scope: AccessScope, cx: &mut Context<Self>) {
+        let client = self.client(cx);
+        if self.access.sync(client.authority_changes()) {
+            cx.emit(SessionEvent::AccessChanged);
+        }
+        let Some(generation) = self.access.wants(&scope) else {
+            return;
+        };
+        let graph = self.graph_id.clone();
+        let (branch, target) = (scope.branch.clone(), scope.target.clone());
+        let read = self.counted_read(
+            async move {
+                client
+                    .access(&graph, branch.as_deref(), target.as_deref())
+                    .await
+            },
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            let answer = read.await.ok();
+            this.update(cx, |this, cx| {
+                if this.access.landed(scope, generation, answer) {
+                    cx.emit(SessionEvent::AccessChanged);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// After a write: a 403 since the access route last answered (the credential, or the
+    /// policy, may have changed) has the session's branch read again.
+    fn recheck_access(&mut self, cx: &mut Context<Self>) {
+        if self.access.sync(self.client(cx).authority_changes()) {
+            cx.emit(SessionEvent::AccessChanged);
+            let branch = AccessScope::branch(&self.branch);
+            self.read_access(branch, cx);
+        }
     }
 
     /// The client every read and write of this session goes through. Views never hold one
@@ -1287,6 +1357,8 @@ impl GraphSession {
         cx.emit(SessionEvent::BranchChanged);
         cx.notify();
         self.check_heads(cx);
+        let branch = AccessScope::branch(&self.branch);
+        self.read_access(branch, cx);
     }
 
     /// The unsaved value of one property on the session's branch.
@@ -3174,6 +3246,7 @@ impl GraphSession {
         if let Some(commit) = commit {
             self.committed(branch, commit, parent, cx);
         }
+        self.recheck_access(cx);
         cx.emit(SessionEvent::ActivityChanged);
         cx.notify();
     }
@@ -5139,6 +5212,95 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(drafts("elsewhere", cx), 0);
         assert_eq!(drafts("kept", cx), 1);
+    }
+
+    /// What the credential may do is read for the session's branch when it opens and moves
+    /// there, once per branch, and again after the server refuses a write with 403.
+    #[gpui::test]
+    async fn access_is_read_per_branch_and_again_after_a_refusal(cx: &mut TestAppContext) {
+        use crate::access::{AccessScope, Allowed};
+        use graph_client::api::AccessAction;
+        use serde_json::json;
+
+        let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let seen = asked.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let query = request.uri().query().unwrap_or_default().to_owned();
+            if path.ends_with("/access") {
+                seen.lock().unwrap().push(query.clone());
+            }
+            let create = request.method().as_str() == "POST" && path.ends_with("/branches");
+            async move {
+                let (status, body) = if path.ends_with("/access") {
+                    // Every branch reads; only fix takes changes.
+                    let fix = query.contains("branch=fix");
+                    let actions = if fix {
+                        json!(["read", "change"])
+                    } else {
+                        json!(["read"])
+                    };
+                    (
+                        200,
+                        json!({ "graph_id": "knowledge", "actor": "act-ada", "graph_wide": ["read"], "actions": actions }),
+                    )
+                } else if create {
+                    (
+                        403,
+                        json!({ "error": "policy denied", "code": "forbidden" }),
+                    )
+                } else {
+                    (200, json!({ "branches": ["main", "fix"] }))
+                };
+                Ok(Response::builder()
+                    .status(status)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        let taken = || std::mem::take(&mut *asked.lock().unwrap());
+        assert_eq!(taken(), ["branch=main"]);
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.allows_here(AccessAction::Change), Allowed::No);
+            assert_eq!(session.allows_here(AccessAction::Read), Allowed::Yes);
+            assert_eq!(session.actor(), Some("act-ada"));
+        });
+
+        session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        cx.run_until_parked();
+        session.update(cx, |session, cx| session.set_branch("main".into(), cx));
+        cx.run_until_parked();
+        assert_eq!(taken(), ["branch=fix"], "main's answer is kept");
+        session.read_with(cx, |session, _| {
+            let fix = AccessScope::branch("fix");
+            assert_eq!(session.allows(AccessAction::Change, &fix), Allowed::Yes);
+        });
+
+        let refused = session.update(cx, |session, cx| {
+            session.create_branch("x".into(), BranchStart::Head("main".into()), cx)
+        });
+        assert!(matches!(refused.await, WriteOutcome::Refused(_)));
+        cx.run_until_parked();
+        assert_eq!(taken(), ["branch=main"], "read again after the 403");
+        session.read_with(cx, |session, _| {
+            let fix = AccessScope::branch("fix");
+            assert_eq!(
+                session.allows(AccessAction::Change, &fix),
+                Allowed::Unknown,
+                "fix's answer was forgotten"
+            );
+        });
     }
 
     /// A branch starts at a branch's head or at a commit, and its request names the one, never

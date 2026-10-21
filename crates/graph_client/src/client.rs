@@ -15,11 +15,11 @@ use serde_json::Value;
 use url::Url;
 
 use crate::api::{
-    BlobWriteOutput, BranchCreateOutput, BranchCreateRequest, BranchListOutput, BranchMergeOutput,
-    BranchMergeRequest, ChangeFeedOutput, ChangeOutput, ChangeRequest, CommitListOutput,
-    DiffOutput, ErrorOutput, GraphListResponse, HealthOutput, InvokeStoredQueryRequest,
-    MergeBaseOutput, QueriesCatalogOutput, QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput,
-    SnapshotOutput,
+    AccessOutput, BlobWriteOutput, BranchCreateOutput, BranchCreateRequest, BranchListOutput,
+    BranchMergeOutput, BranchMergeRequest, ChangeFeedOutput, ChangeOutput, ChangeRequest,
+    CommitListOutput, DiffOutput, ErrorOutput, GraphListResponse, HealthOutput,
+    InvokeStoredQueryRequest, MergeBaseOutput, QueriesCatalogOutput, QueryRequest, ReadOutput,
+    ReadinessOutput, SchemaOutput, SnapshotOutput,
 };
 use crate::{
     ApiError, CONTRACT, CONTRACT_HEADER, IF_GRAPH_COMMIT_HEADER, WriteOutcome, speaks_contract,
@@ -285,6 +285,9 @@ pub struct GraphClient {
     http: Arc<dyn HttpClient>,
     /// Shared by every clone, so the bound holds for the whole connection.
     read_slots: Arc<smol::lock::Semaphore>,
+    /// How often what the credential may do may have changed: a new token, or a 403 from the
+    /// server ([`Self::authority_changes`]). Shared by every clone.
+    authority_changes: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl std::fmt::Debug for GraphClient {
@@ -330,7 +333,24 @@ impl GraphClient {
             token: Arc::new(std::sync::RwLock::new(token.map(Into::into))),
             http,
             read_slots: Arc::new(smol::lock::Semaphore::new(READ_CONCURRENCY)),
+            authority_changes: Arc::default(),
         })
+    }
+
+    /// A count that moves whenever what this client's credential may do may have changed: the
+    /// token was replaced, or the server refused a request with 403. What was read of the
+    /// credential's actions before it moved is to be read again.
+    pub fn authority_changes(&self) -> u64 {
+        self.authority_changes
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Counts a response's 403 when the server sent it (it carries the contract header).
+    fn note_refusal(&self, status: StatusCode, headers: &HeaderMap) {
+        if status == StatusCode::FORBIDDEN && headers.contains_key(CONTRACT_HEADER) {
+            self.authority_changes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     /// Replaces the token for this client and every clone of it; requests sent after this use
@@ -340,6 +360,8 @@ impl GraphClient {
             .token
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = token.map(Into::into);
+        self.authority_changes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn token(&self) -> Option<Arc<str>> {
@@ -431,6 +453,7 @@ impl GraphClient {
             .await
             .map_err(|error| describe_transport(&error))?;
         let status = response.status();
+        self.note_refusal(status, response.headers());
         let contract = response
             .headers()
             .get(CONTRACT_HEADER)
@@ -778,6 +801,7 @@ impl GraphClient {
             .await
             .map_err(|error| describe_transport(&error))?;
         let status = response.status();
+        self.note_refusal(status, response.headers());
         let headers = response.headers().clone();
         Ok(ForwardResponse {
             status,
@@ -903,6 +927,27 @@ impl GraphClient {
             if_commit,
         )
         .await
+    }
+
+    /// `GET /graphs/{id}/access`: what this client's credential may do on the graph, and with
+    /// `branch` on that branch; with `target_branch` as well, also creating it from `branch` and
+    /// merging `branch` into it. A target without a branch is not asked about. The answer names
+    /// actions, never the rules that allow them, and reads no graph data.
+    pub async fn access(
+        &self,
+        graph: &str,
+        branch: Option<&str>,
+        target_branch: Option<&str>,
+    ) -> Result<AccessOutput, ReadError> {
+        let mut query = Vec::new();
+        if let Some(branch) = branch {
+            query.push(("branch", branch));
+            if let Some(target) = target_branch {
+                query.push(("target_branch", target));
+            }
+        }
+        self.read(Method::GET, &["graphs", graph, "access"], &query, None)
+            .await
     }
 
     pub async fn branches(&self, graph: &str) -> Result<BranchListOutput, ReadError> {
@@ -1387,7 +1432,7 @@ mod tests {
     use http_client::{AsyncBody, FakeHttpClient};
 
     use super::*;
-    use crate::api::ParamKind;
+    use crate::api::{AccessAction, ParamKind};
 
     fn respond(
         status: u16,
@@ -1711,6 +1756,46 @@ mod tests {
             ),
         );
         assert!(matches!(outcome, WriteOutcome::Unknown { .. }));
+    }
+
+    /// The access route asks about the branch, and the target only with it, and its answer
+    /// decodes, an action a later build adds included.
+    #[test]
+    fn access_asks_about_a_branch_and_its_target() {
+        let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let seen = asked.clone();
+        let http = FakeHttpClient::create(move |request| {
+            seen.lock().unwrap().push(request.uri().to_string());
+            async move {
+                Ok(Response::builder()
+                    .status(200)
+                    .header(CONTRACT_HEADER, CONTRACT)
+                    .body(AsyncBody::from(
+                        r#"{"graph_id":"g","actor":"act-ada","graph_wide":["read"],"branch":"main","target_branch":"fix","actions":["read","change","branch_create","later"]}"#,
+                    ))
+                    .unwrap())
+            }
+        });
+        let client = client(http);
+        let access = block_on(client.access("g", Some("main"), Some("fix"))).unwrap();
+        assert_eq!(access.actor.as_deref(), Some("act-ada"));
+        assert_eq!(
+            access.actions,
+            [
+                AccessAction::Read,
+                AccessAction::Change,
+                AccessAction::BranchCreate,
+                AccessAction::Other
+            ]
+        );
+        block_on(client.access("g", None, Some("fix"))).unwrap();
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [
+                "http://127.0.0.1:8787/graphs/g/access?branch=main&target_branch=fix",
+                "http://127.0.0.1:8787/graphs/g/access",
+            ]
+        );
     }
 
     /// A Blob cell is null, or a reference, only by the server's word: a 404 or a redirect

@@ -3,6 +3,7 @@
 //!
 //! Layer 3 (`docs/architecture.md`). Plan: `specs/003-connections/plan.md`.
 
+mod access;
 pub mod carry;
 mod changes;
 pub mod cli_config;
@@ -23,6 +24,7 @@ use std::sync::Arc;
 
 use gpui::App;
 
+pub use access::{AccessScope, Allowed};
 pub use changes::{
     ChangeFold, FoldedChange, FoldedChanges, NetChange, PropertyDiff, REVIEW_CHANGE_CAP,
     TypeCounts, commits_since, contains_merge_of, fork_point, summary_sentence,
