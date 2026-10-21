@@ -152,7 +152,7 @@ impl TextEditor {
                 this.state = State::Idle;
                 this.branch = this.session.read(cx).branch.clone();
                 this.read(window, cx);
-            } else if let SessionEvent::BranchChanged = event {
+            } else if let SessionEvent::BranchChanged | SessionEvent::AccessChanged = event {
                 cx.notify();
             }
         });
@@ -322,7 +322,7 @@ impl TextEditor {
         else {
             return;
         };
-        if matches!(self.state, State::Saving) {
+        if matches!(self.state, State::Saving) || self.change_refusal(cx).is_some() {
             return;
         }
         let old = old.clone();
@@ -423,8 +423,15 @@ impl TextEditor {
         self.read(window, cx);
     }
 
+    /// Why the credential may not change the branch saves go to, once the access route said so
+    /// (spec 002): Save is disabled with it and not registered, and the text stays in the tab.
+    fn change_refusal(&self, cx: &App) -> Option<String> {
+        crate::write::change_refusal(&self.session, &self.branch, cx)
+    }
+
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let branch = self.branch.clone();
+        let refused = self.change_refusal(cx);
         // Unsaved text read on a branch the window has left still saves there.
         let elsewhere = (self.session.read(cx).branch != branch)
             .then(|| studio_ui::ds::text::body(format!("Saves to {branch}")).color(Color::Warning));
@@ -499,15 +506,18 @@ impl TextEditor {
                     } else {
                         ButtonStyle::Subtle
                     })
-                    .disabled(!dirty || matches!(self.state, State::Saving))
-                    .key_binding(ui::KeyBinding::for_action_in(
-                        &SaveText,
-                        &self.focus_handle,
-                        cx,
-                    ))
-                    .tooltip(Tooltip::text(format!(
-                        "Write to {branch}, bound to the value it was read at"
-                    )))
+                    .disabled(!dirty || matches!(self.state, State::Saving) || refused.is_some())
+                    // A key that is not registered is not shown.
+                    .when(refused.is_none(), |button| {
+                        button.key_binding(ui::KeyBinding::for_action_in(
+                            &SaveText,
+                            &self.focus_handle,
+                            cx,
+                        ))
+                    })
+                    .tooltip(Tooltip::text(refused.unwrap_or_else(|| {
+                        format!("Write to {branch}, bound to the value it was read at")
+                    })))
                     .on_click(cx.listener(|this, _, window, cx| this.save(&SaveText, window, cx))),
             )
     }
@@ -619,7 +629,9 @@ impl Render for TextEditor {
         v_flex()
             .key_context("TextEditor")
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(Self::save))
+            .when(self.change_refusal(cx).is_none(), |editor| {
+                editor.on_action(cx.listener(Self::save))
+            })
             .size_full()
             .bg(studio_ui::ds::surface::document(cx))
             .child(self.render_toolbar(cx))
@@ -885,6 +897,51 @@ mod tests {
         save(&view, cx);
         view.read_with(cx, |view, cx| {
             assert!(matches!(&view.state, State::Failed(notice) if notice.tone == Tone::Refused));
+            assert_eq!(view.text(cx), "Ada Lovelace");
+            assert!(view.is_dirty(cx));
+        });
+    }
+
+    /// On a branch the access route says the credential may not change, Save is neither
+    /// registered nor sent; the text stays in the tab.
+    #[gpui::test]
+    async fn a_text_on_a_refused_branch_is_not_saved(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, sent, _) = crate::test_support::session_with_access(
+            PEOPLE,
+            crate::test_support::read_only_access(),
+            cx,
+        );
+        cx.run_until_parked();
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            TextEditor::new(
+                session,
+                "Person".into(),
+                "p1".into(),
+                "name".into(),
+                None,
+                Some("Ada Lovelace".into()),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let focus = view.read(cx).focus_handle.clone();
+            window.focus(&focus, cx);
+        });
+        cx.run_until_parked();
+        assert!(!cx.update(|window, cx| window.is_action_available(&SaveText, cx)));
+        save(&view, cx);
+        assert!(sent.lock().unwrap().is_empty(), "nothing was sent");
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.change_refusal(cx).as_deref(),
+                Some("Your credential may not change main")
+            );
             assert_eq!(view.text(cx), "Ada Lovelace");
             assert!(view.is_dirty(cx));
         });

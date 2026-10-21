@@ -19,9 +19,9 @@ use graph_client::api::{
 use graph_client::{ReadError, WriteOutcome};
 use graph_store::fixes::revert_deletes;
 use graph_store::{
-    ChangeFold, EntityGroup, EntityGroups, FoldedChange, FoldedChanges, GraphSession, GroupRun,
-    GroupSection, HeadWatch, NodeNames, REVIEW_CHANGE_CAP, SessionEvent, TypeCounts, commits_since,
-    contains_merge_of, fork_point, revert_query, summary_sentence,
+    AccessAction, AccessScope, ChangeFold, EntityGroup, EntityGroups, FoldedChange, FoldedChanges,
+    GraphSession, GroupRun, GroupSection, HeadWatch, NodeNames, REVIEW_CHANGE_CAP, SessionEvent,
+    TypeCounts, commits_since, contains_merge_of, fork_point, revert_query, summary_sentence,
 };
 use serde_json::Value;
 use studio_actions::review::{
@@ -481,9 +481,22 @@ impl ReviewView {
                 }
                 SessionEvent::SchemaChanged => this.schema_changed(cx),
                 SessionEvent::SchemaMoved => this.schema_moved(cx),
+                // Merge, and deleting the branch with it, follow what the credential may do. An
+                // answer dropped (a 403, a new token) is read again; one held asks nothing.
+                SessionEvent::AccessChanged => {
+                    let scope = AccessScope::branch_into(&this.branch, &this.target);
+                    this.session
+                        .update(cx, |session, cx| session.read_access(scope, cx));
+                    cx.notify();
+                }
                 _ => {}
             });
         let head_watch = session.update(cx, |session, cx| session.watch_head(&branch, cx));
+        // What the credential may do with the branch and its target, merging included: read
+        // once per credential, so a review opened again asks nothing.
+        session.update(cx, |session, cx| {
+            session.read_access(AccessScope::branch_into(&branch, &target), cx)
+        });
         let target_watch = session.update(cx, |session, cx| session.watch_head(&target, cx));
         let mut view = Self {
             session,
@@ -800,7 +813,9 @@ impl ReviewView {
             .data
             .as_ref()
             .is_some_and(|data| !data.folded.changes.is_empty());
-        if self.scope.is_none() && changed {
+        // A merge the credential may not make is not previewed: the dry run asks the server
+        // what that merge would do.
+        if self.scope.is_none() && changed && self.merge_refusal(cx).is_none() {
             self.read_preview(cx);
         } else {
             self.preview = Preview::Unread;
@@ -1474,15 +1489,33 @@ impl ReviewView {
             && self.scope.is_none()
     }
 
-    /// Whether the merge deletes the branch: as the checkbox says, and never `main`.
-    fn delete_after_merge(&self) -> bool {
-        self.delete_branch && self.branch != "main"
+    /// Whether the merge deletes the branch: as the checkbox says, never `main`, and not when
+    /// the credential may not delete it.
+    fn delete_after_merge(&self, cx: &App) -> bool {
+        self.delete_branch && self.branch != "main" && self.delete_refusal(cx).is_none()
+    }
+
+    /// Why the credential may not merge the branch into the target, once the access route said
+    /// so (spec 002): Merge is disabled with it and its key not registered.
+    fn merge_refusal(&self, cx: &App) -> Option<String> {
+        self.session.read(cx).refusal(
+            AccessAction::BranchMerge,
+            &AccessScope::branch_into(&self.branch, &self.target),
+        )
+    }
+
+    /// Why the credential may not delete the branch, from the same answer as the merge's.
+    fn delete_refusal(&self, cx: &App) -> Option<String> {
+        self.session.read(cx).refusal(
+            AccessAction::BranchDelete,
+            &AccessScope::branch_into(&self.branch, &self.target),
+        )
     }
 
     /// Merges the branch into the target after checking the branch still sits at the head this
     /// review holds. The outcome is shown, then confirmed against the target's history.
     pub fn merge(&mut self, cx: &mut Context<Self>) {
-        if !self.mergeable() {
+        if !self.mergeable() || self.merge_refusal(cx).is_some() {
             return;
         }
         self.merge = MergeState::Checking;
@@ -1520,7 +1553,7 @@ impl ReviewView {
             let Ok(task) = this.update(cx, |this, cx| {
                 this.merge = MergeState::Merging;
                 cx.notify();
-                let delete = this.delete_after_merge();
+                let delete = this.delete_after_merge(cx);
                 session.update(cx, |s, cx| {
                     s.merge(branch.clone(), target.clone(), delete, cx)
                 })
@@ -1666,27 +1699,34 @@ impl ReviewView {
         let border = studio_ui::ds::surface::rule(cx);
         let focus = self.focus_handle.clone();
         let mergeable = self.mergeable();
+        let merge_refused = self.merge_refusal(cx);
+        let delete_refused = self.delete_refusal(cx);
         let merge_button = studio_ui::ds::toolbar_button(
             "merge",
             format!("Merge {} into {}", self.branch, self.target),
         )
         .style(ButtonStyle::Filled)
         .start_icon(Icon::new(IconName::GitBranch))
-        .key_binding(KeyBinding::for_action_in(&Merge, &focus, cx))
-        .disabled(!mergeable)
+        // A key the credential may not use is not shown, as it is not registered.
+        .when(merge_refused.is_none(), |button| {
+            button.key_binding(KeyBinding::for_action_in(&Merge, &focus, cx))
+        })
+        .disabled(!mergeable || merge_refused.is_some())
         .tooltip({
             let cli = format!(
                 "omnigraph branch merge {} --into {}{}",
                 self.branch,
                 self.target,
-                if self.delete_after_merge() {
+                if self.delete_after_merge(cx) {
                     " --delete-branch"
                 } else {
                     ""
                 }
             );
             // A disabled Merge says why (constitution VI).
-            let title = if self.scope.is_some() {
+            let title = if let Some(reason) = merge_refused.clone() {
+                reason
+            } else if self.scope.is_some() {
                 format!("Review all of {}'s commits to merge it", self.branch)
             } else {
                 "Merge after checking the branch has not moved".to_owned()
@@ -1900,15 +1940,20 @@ impl ReviewView {
                     .child(div().flex_1())
                     .child(refresh)
                     .when(self.branch != "main", |row| {
+                        // A branch the credential may not delete stays, unchecked, saying why.
+                        let deletable = mergeable && delete_refused.is_none();
                         row.child(
                             studio_ui::ds::checkbox(
                                 "delete-after-merge",
-                                self.delete_branch,
+                                self.delete_branch && delete_refused.is_none(),
                                 format!("Delete {}", self.branch),
-                                !mergeable,
+                                !deletable,
                                 cx,
                             )
-                            .when(mergeable, |checkbox| {
+                            .when_some(delete_refused, |checkbox, reason| {
+                                checkbox.tooltip(Tooltip::text(reason))
+                            })
+                            .when(deletable, |checkbox| {
                                 checkbox.on_click(cx.listener(|this, _, _, cx| {
                                     this.delete_branch = !this.delete_branch;
                                     cx.notify();
@@ -3085,7 +3130,10 @@ impl Render for ReviewView {
                     this.open_edit(ix, window, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &Merge, _, cx| this.merge(cx)))
+            // Merge is registered only while the credential may merge (constitution VIII).
+            .when(self.merge_refusal(cx).is_none(), |view| {
+                view.on_action(cx.listener(|this, _: &Merge, _, cx| this.merge(cx)))
+            })
             .child(header)
             .child(body)
     }
@@ -3547,6 +3595,42 @@ pub(crate) mod tests {
         }
     }
 
+    /// A merge the access route says the credential may not make is not offered: Merge is
+    /// disabled and its key not registered, the branch is not deleted with it, and neither the
+    /// dry run nor the merge is sent. The review asked about the branch and its target once.
+    #[gpui::test]
+    async fn a_merge_the_credential_may_not_make_is_not_offered(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        // Changes on every branch, and nothing else of a branch's.
+        let access = json!({ "graph_id": "knowledge", "actor": "act-dev", "graph_wide": ["read"], "actions": ["read", "change"] });
+        let (session, asked) =
+            review_server_with(Some(access), false, None, "f2", |_| (500, json!({})), cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+        cx.run_until_parked();
+        assert!(!cx.update(|window, cx| window.is_action_available(&Merge, cx)));
+        view.update(cx, |view, cx| {
+            assert!(view.mergeable(), "the whole review is on screen");
+            assert_eq!(
+                view.merge_refusal(cx).as_deref(),
+                Some("Your credential may not merge feature into main")
+            );
+            assert!(!view.delete_after_merge(cx));
+            view.merge(cx);
+        });
+        cx.run_until_parked();
+        let asked = asked.lock().unwrap();
+        let reads = |route: &str| asked.iter().filter(|r| r.contains(route)).count();
+        assert_eq!(reads("/access?branch=feature&target_branch=main"), 1);
+        assert_eq!(reads("/branches/merge?"), 0, "{asked:?}");
+    }
+
     /// A revert or an edit binds one statement to every value it read: the server's answer
     /// that it matched nothing (a value changed since) leaves the card unfixed and unreviewed,
     /// though a commit came back and the head the next fix binds to moved to it.
@@ -3875,6 +3959,22 @@ pub(crate) mod tests {
         Entity<GraphSession>,
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) {
+        review_server_with(None, merged_in, feed, took, write, cx)
+    }
+
+    /// As [`review_server`], the access route answering `access` for every branch; without it,
+    /// it answers nothing Studio can read, so what the credential may do stays unknown.
+    fn review_server_with(
+        access: Option<Value>,
+        merged_in: bool,
+        feed: Option<Value>,
+        took: &'static str,
+        write: impl Fn(usize) -> (u16, Value) + Send + Sync + 'static,
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<GraphSession>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
         let writes = std::sync::atomic::AtomicUsize::new(0);
         let commit = |id: &str, parent: Option<&str>| json!({ "graph_commit_id": id, "graph_manifest_version": 1, "kind": "published", "created_at": 0, "parent_commit_id": parent, "actor_id": "act-dev" });
         let person = |id: &str, op: &str| json!({ "kind": "node", "type": { "id": "Person", "name": "Person" }, "id": id, "op": op, "before": { "properties": { "slug": id } }, "after": { "properties": { "slug": id, "name": "x" } } });
@@ -3906,7 +4006,9 @@ pub(crate) mod tests {
         let main = json!({ "commits": [commit("m2", Some("m1")), commit("m1", None)] });
         fake_server(
             move |path, query, sent| {
-                if path.contains("/mutate") {
+                if let Some(access) = access.as_ref().filter(|_| path.ends_with("/access")) {
+                    (200, access.clone())
+                } else if path.contains("/mutate") {
                     write(writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
                 } else if path.ends_with("/branches/merge") {
                     let merge = json!({ "graph_commit_id": "m3", "graph_manifest_version": 4, "kind": "published", "created_at": 0, "parent_commit_id": "m2", "merged_parent_commit_id": took });

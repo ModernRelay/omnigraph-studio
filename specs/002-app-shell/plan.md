@@ -170,9 +170,11 @@ what was last saved at most every 250 ms rather than serializing every tab on ev
   `connecting…`, `contract mismatch`, `unauthorized`, `unreachable`, with the contract and the
   round trip), the graph and the branch menu, which switches branch for the window. Right: what
   is running ("2 queries running", "Writing (1)…"), memory and CPU, the other docks' buttons.
-- Not built: the actor in the status bar; a `write · <branch>` chip whenever the active item can
-  write, and a read-only chip when the actor cannot write or the item is pinned to an older
-  commit.
+- What the credential may do (E15, below): "read only" follows the branch's name when the
+  access route refuses `change` there, its tooltip naming what the credential lacks; the actor
+  the credential resolves to is in the connection chip's tooltip ("… · as act-ada · Switch
+  graph"), not a chip of its own, so the bar stays as it was.
+- Not built: a `write · <branch>` chip whenever the active item can write.
 
 ### Actions and keys
 
@@ -257,8 +259,45 @@ what was last saved at most every 250 ms rather than serializing every tab on ev
 
 Every button's tooltip shows the action name and binding (Zed's `Tooltip::for_action`). A
 disabled control's tooltip gives the first blocking reason ("Read-only: pinned to commit
-01JA…", "Your token cannot write to main"). Where a CLI command does the same, the tooltip's
+01JA…", "Your credential may not change main"). Where a CLI command does the same, the tooltip's
 second line shows it (`omnigraph branch create feature-x --from main`).
+
+### What the credential may do (E15)
+
+Built 2026-10-20 on `GET /graphs/{id}/access` (OmniGraph #1073, E15). The session reads it for
+its branch when the graph opens and when the branch changes, and again after a 403 or a new
+token, which the client counts; a branch's menu reads it for that branch as it opens, and a
+review for its branch and target (`AccessScope::branch_into`) as it opens. Each is read once
+until the credential may have changed, and views draw again when an answer lands
+(`SessionEvent::AccessChanged`). Studio offers every action not known to be refused
+(`Allowed::offered`): before an answer lands, or when none can be read, everything is offered.
+The server stays the authority: a 403 still shows as a denial, and the draft stays.
+
+An action the answer refuses stays in view, disabled, and says what the credential lacks
+("Your credential may not change fix", `GraphSession::refusal`): in its tooltip, or in its
+label for a menu entry, which has no tooltip ("Delete (your credential may not delete fix)").
+Its action is not registered, so the palette and the keyboard button's list leave it out
+(constitution VIII); a workspace action is registered with a condition
+(`Workspace::register_action_when`).
+
+- `change` on the branch a view shows: a table's Edit (a click on a value peeks it instead),
+  New row, Delete row, the bulk set, Save drafts, and a Blob cell's Choose File, Clear and
+  drop, with "Read only" in its toolbar; a node's peek and page (fields do not open, an enum's
+  menu and a switch show as values, a relationship's + and × and Save are disabled, Blob slots
+  take no file); a text editor's Save; a Blob tab's Choose File and Clear. A cell edit still
+  open when a refusal lands is kept as the cell's draft by ↵ or Tab, and nothing is sent. ↵
+  stays registered in a table, since it also confirms the filter being written.
+- `branch_delete`: a branch's Delete in the Branches panel, the palette's Delete branch for
+  the window's branch, and a review's "Delete <branch>", which is then unchecked and the merge
+  sent without it.
+- `branch_merge`: a review's Merge (the button and ⌘⇧↵); its dry run is not asked for. The
+  branch menu's "Merge into main…" opens the review, and is disabled only once a review has
+  read the answer for that branch and target.
+- Not gated: a branch's creation (New branch…, History's "New branch here…"). The answer judges
+  a create only with its target, the new branch's name, typed in the dialog, so it stays
+  offered and the server decides. Studio has no control that publishes or drops a commit (R2).
+  A mutation run from the query editor and a review's Revert and Edit are not gated yet; the
+  server refuses them, shown as a denial.
 
 ### Settings (`studio_settings`)
 
@@ -704,15 +743,9 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
   of that kind is refused with a note until OmniGraph has `omnigraph studio`.
 - Engine changes, [spec 012](../012-omnigraph-engine-changes/plan.md):
   - E9 branch details: the branch menu derives head and fork from `GET /commits?branch=` until then.
-  - E15 what may I do: landed as `GET /graphs/{id}/access` (OmniGraph #1073), adopted with the
-    next minimum-server bump. Studio then reads it when a graph opens, when the branch changes
-    and at a 403 (the credential may have changed), for the graph and the window's branch (and
-    the merge target in a review); every action the answer does not allow (edit, insert,
-    delete, Blob writes, branch create, delete and merge, commit publish and drop) stays visible
-    but disabled, its tooltip naming the action the credential lacks, and the status bar's
-    branch says "read only" when `change` is not allowed there. The server stays the authority:
-    a 403 still shows as a denial and the draft stays. Until then every action stays visible;
-    a 403 is shown as a denial and the draft stays.
+  - E15 what may I do (`GET /graphs/{id}/access`, OmniGraph #1073): built 2026-10-20 (Design,
+    What the credential may do). Branch creation stays offered: the answer judges it only with
+    the new branch's name.
 
 ## Validation log
 

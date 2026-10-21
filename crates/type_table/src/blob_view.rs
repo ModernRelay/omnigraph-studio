@@ -12,10 +12,10 @@ use gpui::{
     App, AppContext as _, Bounds, Context, Entity, EventEmitter, ExternalPaths, FocusHandle,
     Focusable, ImageFormat, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
     ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled,
-    SvgRenderer, Task, Window, canvas, checkerboard, div, img, point,
+    Subscription, SvgRenderer, Task, Window, canvas, checkerboard, div, img, point,
 };
 use graph_client::{BlobCell, BlobMeta};
-use graph_store::{GraphSession, Loadable};
+use graph_store::{GraphSession, Loadable, SessionEvent};
 use serde_json::json;
 use studio_actions::blob::{ChooseFile, ClearValue};
 use studio_actions::canvas::{ActualSize, FitToWindow, ZoomIn, ZoomOut};
@@ -117,6 +117,9 @@ pub struct BlobView {
     /// nothing until they are shown.
     _load: Option<Task<()>>,
     _export: Option<Task<()>>,
+    /// Draws the tab again when what the credential may do is read: Choose File and Clear
+    /// follow it.
+    _access: Subscription,
 }
 
 impl BlobView {
@@ -130,6 +133,11 @@ impl BlobView {
         cx.on_release(|this: &mut Self, cx| this.release_images(cx))
             .detach();
         let branch = session.read(cx).branch.clone();
+        let access = cx.subscribe(&session, |_, _, event: &SessionEvent, cx| {
+            if let SessionEvent::AccessChanged = event {
+                cx.notify();
+            }
+        });
         Self {
             session,
             cell,
@@ -150,6 +158,7 @@ impl BlobView {
             focus_handle: cx.focus_handle(),
             _load: None,
             _export: None,
+            _access: access,
         }
     }
 
@@ -449,16 +458,24 @@ impl BlobView {
     /// Why the value cannot take a file here, or `None` when it can.
     fn write_refusal(&self, cx: &App) -> Option<String> {
         let schema = self.session.read(cx).schema_model();
-        blob_write::write_refusal(schema.as_deref(), &self.cell, self.snapshot.as_deref())
+        let denied = crate::write::change_refusal(&self.session, &self.branch, cx);
+        blob_write::write_refusal(
+            schema.as_deref(),
+            &self.cell,
+            self.snapshot.as_deref(),
+            denied.as_deref(),
+        )
     }
 
     /// Why the value cannot be cleared here, or `None` when it can.
     fn clear_refusal(&self, cx: &App) -> Option<String> {
         let schema = self.session.read(cx).schema_model();
+        let denied = crate::write::change_refusal(&self.session, &self.branch, cx);
         blob_write::clear_refusal(
             schema.as_deref(),
             &self.cell,
             self.snapshot.as_deref(),
+            denied.as_deref(),
             self.meta.as_ref(),
         )
     }
@@ -1421,19 +1438,55 @@ mod tests {
         });
     }
 
-    /// A tab opened at a commit stores no file and clears nothing, and says why.
+    /// A tab opened at a commit, or on a branch the access route says the credential may not
+    /// change, stores no file and clears nothing, and says why; on the branch, Choose File and
+    /// Clear are not registered either.
     #[gpui::test]
-    async fn a_tab_at_a_commit_writes_nothing(cx: &mut gpui::TestAppContext) {
+    async fn a_tab_at_a_commit_or_on_a_refused_branch_writes_nothing(
+        cx: &mut gpui::TestAppContext,
+    ) {
         cx.update(studio_theme::init_test);
         let (session, blobs) = crate::test_support::session_with_blobs(DOCS, cx);
         blobs.set("Person/p1/doc", b"old");
-        let (view, cx) = cx.add_window_view(|window, cx| {
+        let (view, held_cx) = cx.add_window_view(|window, cx| {
             BlobView::new(session, doc(), Some("c1".into()), window, cx)
         });
-        cx.run_until_parked();
+        held_cx.run_until_parked();
         let file = crate::test_support::upload_file("tab.txt", b"tab", None);
-        view.update(cx, |view, cx| {
+        view.update(held_cx, |view, cx| {
             assert!(view.write_refusal(cx).is_some() && view.clear_refusal(cx).is_some());
+            view.upload(file, cx);
+        });
+        held_cx.run_until_parked();
+        assert!(blobs.writes.lock().unwrap().is_empty());
+        view.read_with(held_cx, |view, _| {
+            assert!(matches!(
+                &view.edit,
+                Some(BlobEdit::Failed { notice, .. }) if notice.message.starts_with("Read-only")
+            ));
+        });
+
+        let (session, _, blobs) = crate::test_support::session_with_access(
+            DOCS,
+            crate::test_support::read_only_access(),
+            cx,
+        );
+        blobs.set("Person/p1/doc", b"old");
+        let (view, cx) =
+            cx.add_window_view(|window, cx| BlobView::new(session, doc(), None, window, cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+        cx.run_until_parked();
+        let refused = "Your credential may not change main";
+        let offered = cx.update(|window, cx| {
+            window.is_action_available(&ChooseFile, cx)
+                || window.is_action_available(&ClearValue, cx)
+        });
+        assert!(!offered);
+        let file = crate::test_support::upload_file("branch.txt", b"branch", None);
+        view.update(cx, |view, cx| {
+            assert_eq!(view.write_refusal(cx).as_deref(), Some(refused));
+            assert_eq!(view.clear_refusal(cx).as_deref(), Some(refused));
             view.upload(file, cx);
         });
         cx.run_until_parked();
@@ -1441,7 +1494,7 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert!(matches!(
                 &view.edit,
-                Some(BlobEdit::Failed { notice, .. }) if notice.message.starts_with("Read-only")
+                Some(BlobEdit::Failed { notice, .. }) if notice.message == refused
             ));
         });
     }

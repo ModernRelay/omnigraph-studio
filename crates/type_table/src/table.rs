@@ -698,6 +698,8 @@ impl TypeTable {
     ) {
         match event {
             SessionEvent::SchemaChanged => self.load_schema(cx),
+            // What the credential may do was read: the controls that write follow it.
+            SessionEvent::AccessChanged if self.at_commit.is_none() => cx.notify(),
             // Another writer changed the schema: what the table shows was read under the old
             // one, and stays until Refresh takes the new one.
             SessionEvent::SchemaMoved if !self.newer => {
@@ -1188,6 +1190,9 @@ impl TypeTable {
     /// Sets the chosen property on every selected row in one mutation, each row bound to the
     /// value it shows (spec 004, bulk set). Rows already holding the value are left out.
     fn submit_bulk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.change_refusal(cx).is_some() {
+            return;
+        }
         let (Some(property), Some(schema)) = (
             self.bulk
                 .property
@@ -1372,6 +1377,7 @@ impl TypeTable {
         let border = studio_ui::ds::surface::rule(cx);
         let count = self.selection.len();
         let read_only = self.kind == TableKind::Edge || self.at_commit.is_some();
+        let refused = self.change_refusal(cx);
         let editable: Vec<String> = self
             .columns
             .iter()
@@ -1395,6 +1401,14 @@ impl TypeTable {
             );
         if read_only {
             bar = bar.child(studio_ui::ds::text::muted(self.read_only_label()));
+        } else if let Some(reason) = refused {
+            // The set stays in view, disabled, saying what the credential lacks.
+            bar = bar.child(
+                studio_ui::ds::button("bulk-property-button", "Set a property ▾")
+                    .style(ButtonStyle::Outlined)
+                    .disabled(true)
+                    .tooltip(Tooltip::text(reason)),
+            );
         } else {
             bar = bar
                 .child(
@@ -3646,7 +3660,10 @@ impl TypeTable {
         let Some(column) = self.columns.get(cursor.col) else {
             return;
         };
-        if !column.editable(self.kind) || self.at_commit.is_some() {
+        if !column.editable(self.kind)
+            || self.at_commit.is_some()
+            || self.change_refusal(cx).is_some()
+        {
             self.show_peek(cursor.row, false, cx);
             return;
         }
@@ -3784,6 +3801,12 @@ impl TypeTable {
                 Some(index) => self.pick_suggestion(index, window, cx),
                 None => self.apply_filter_draft(window, cx),
             }
+            return;
+        }
+        // An edit open when the access route refused the branch (its save's 403 reopened it):
+        // it is kept as the cell's draft and nothing is sent.
+        if self.editing.is_some() && self.change_refusal(cx).is_some() {
+            self.stage_edit(window, cx);
             return;
         }
         let Some(editing) = self.editing.as_ref() else {
@@ -4203,7 +4226,11 @@ impl TypeTable {
     /// the row shows, so one commit. A draft that does not parse opens instead, and nothing is
     /// sent.
     fn save_drafts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.drafts.saving || self.kind != TableKind::Node || self.at_commit.is_some() {
+        if self.drafts.saving
+            || self.kind != TableKind::Node
+            || self.at_commit.is_some()
+            || self.change_refusal(cx).is_some()
+        {
             return;
         }
         if self.editing.is_some() && !self.stage_edit(window, cx) {
@@ -4685,6 +4712,7 @@ impl TypeTable {
         }
         let saving = self.drafts.saving;
         let focus = self.focus_handle.clone();
+        let refused = self.change_refusal(cx);
         let save_tooltip = format!(
             "One commit to {}; each draft is bound to the value it was typed over",
             self.branch
@@ -4730,8 +4758,15 @@ impl TypeTable {
                 .child(
                     studio_ui::ds::bar_button("drafts-save", "Save as one commit")
                         .style(ButtonStyle::Tinted(TintColor::Accent))
-                        .tooltip(move |_, cx| {
-                            Tooltip::for_action_in(save_tooltip.clone(), &SaveDrafts, &focus, cx)
+                        .disabled(refused.is_some())
+                        .tooltip(move |_, cx| match &refused {
+                            Some(reason) => Tooltip::simple(reason.clone(), cx),
+                            None => Tooltip::for_action_in(
+                                save_tooltip.clone(),
+                                &SaveDrafts,
+                                &focus,
+                                cx,
+                            ),
                         })
                         .on_click(cx.listener(|this, _, window, cx| this.save_drafts(window, cx))),
                 )
@@ -4980,7 +5015,7 @@ impl TypeTable {
     }
 
     fn on_insert(&mut self, _: &InsertRow, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(reason) = self.pinned_reason() {
+        if let Some(reason) = self.write_refusal(cx) {
             self.toast(ToastKind::Info, &reason, cx);
             return;
         }
@@ -5007,7 +5042,7 @@ impl TypeTable {
     }
 
     fn on_delete(&mut self, _: &DeleteRow, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(reason) = self.pinned_reason() {
+        if let Some(reason) = self.write_refusal(cx) {
             self.toast(ToastKind::Info, &reason, cx);
             return;
         }
@@ -5096,6 +5131,21 @@ impl TypeTable {
                 studio_ui::short_commit_id(commit)
             )
         })
+    }
+
+    /// Why the credential may not change the branch the table shows, once the access route
+    /// said so (spec 002): every control that writes is disabled with it, and its action is
+    /// not registered. A table at a commit has its own reason.
+    fn change_refusal(&self, cx: &App) -> Option<String> {
+        if self.at_commit.is_some() {
+            return None;
+        }
+        write::change_refusal(&self.session, &self.branch, cx)
+    }
+
+    /// Why nothing can be written here: the commit the table reads, else the credential.
+    fn write_refusal(&self, cx: &App) -> Option<String> {
+        self.pinned_reason().or_else(|| self.change_refusal(cx))
     }
 
     fn filterable(&self) -> impl Iterator<Item = &Property> {
@@ -5483,7 +5533,9 @@ impl TypeTable {
         };
         let read_only = self.kind == TableKind::Edge || self.at_commit.is_some();
         let pinned = self.at_commit.is_some();
-        let target_tooltip = if let Some(reason) = self.pinned_reason() {
+        let refused = self.change_refusal(cx);
+        let target_tooltip = if let Some(reason) = self.pinned_reason().or_else(|| refused.clone())
+        {
             reason
         } else if read_only {
             format!(
@@ -5508,8 +5560,8 @@ impl TypeTable {
                     .child(studio_ui::ds::text::muted(count)),
             )
             // Where edits go is the branch the status bar names; the table says only when it
-            // cannot edit.
-            .when(read_only, |d| {
+            // cannot edit, the credential's refusal included.
+            .when(read_only || refused.is_some(), |d| {
                 d.child(
                     div()
                         .id("write-target")
@@ -5521,6 +5573,9 @@ impl TypeTable {
                                 cx,
                             )
                             .into_any_element(),
+                            None if refused.is_some() => {
+                                studio_ui::ds::text::meta("Read only").into_any_element()
+                            }
                             None => {
                                 studio_ui::ds::text::meta(self.read_only_label()).into_any_element()
                             }
@@ -5556,13 +5611,11 @@ impl TypeTable {
                         studio_ui::ds::toolbar_button("insert-row", "Row")
                             .style(ButtonStyle::Subtle)
                             .start_icon(Icon::new(IconName::Plus))
-                            .disabled(pinned)
-                            .tooltip(move |_, cx| {
-                                if pinned {
-                                    Tooltip::simple("Read-only at an older commit", cx)
-                                } else {
-                                    Tooltip::for_action("Add a row", &InsertRow, cx)
-                                }
+                            .disabled(pinned || refused.is_some())
+                            .tooltip(move |_, cx| match &refused {
+                                _ if pinned => Tooltip::simple("Read-only at an older commit", cx),
+                                Some(reason) => Tooltip::simple(reason.clone(), cx),
+                                None => Tooltip::for_action("Add a row", &InsertRow, cx),
                             })
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.on_insert(&InsertRow, window, cx)
@@ -6499,13 +6552,14 @@ impl TypeTable {
     }
 
     /// Whether a file dropped on row `row_id`'s Blob `property` is stored there: a node table at
-    /// the head, with no write of the cell out.
-    fn takes_blob_drop(&self, row_id: &str, property: &str) -> bool {
+    /// the head of a branch the credential may change, with no write of the cell out.
+    fn takes_blob_drop(&self, row_id: &str, property: &str, cx: &App) -> bool {
         // Asked for each Blob cell drawn, so it checks cheaply what `blob_write::write_refusal`
         // checks: the column is a Blob property of the schema already. A write that refusal
         // would stop says why when it is sent.
         self.kind == TableKind::Node
             && self.at_commit.is_none()
+            && self.change_refusal(cx).is_none()
             && (self.blob_edits.is_empty()
                 || !self
                     .blob_edits
@@ -6612,14 +6666,16 @@ impl TypeTable {
             _ => None,
         };
         let (schema, pinned) = (self.schema.as_deref(), self.at_commit.as_deref());
+        let denied = self.change_refusal(cx);
         let refusal = match &change {
             BlobChange::Clear if over.is_none() => blob_write::clear_refusal(
                 schema,
                 &cell,
                 pinned,
+                denied.as_deref(),
                 self.blobs.get(&key).and_then(Loadable::loaded),
             ),
-            _ => blob_write::write_refusal(schema, &cell, pinned),
+            _ => blob_write::write_refusal(schema, &cell, pinned, denied.as_deref()),
         };
         if let Some(reason) = refusal {
             self.blob_edits.insert(key, refused(reason));
@@ -7120,7 +7176,8 @@ impl TypeTable {
             ),
             None => (dot, tooltip),
         };
-        if let Some(property) = blob.filter(|property| self.takes_blob_drop(&row.id, property)) {
+        if let Some(property) = blob.filter(|property| self.takes_blob_drop(&row.id, property, cx))
+        {
             let (row_id, drop_bg) = (row.id.clone(), studio_ui::ds::surface::drop_target(cx));
             cell = cell
                 .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_bg))
@@ -7243,7 +7300,10 @@ impl TypeTable {
         let focus = self.focus_handle.clone();
         let key =
             |label: &str, action: &dyn gpui::Action| KeyHint::new(label.to_owned(), action, &focus);
-        let keys = match (self.editing.is_some(), self.kind) {
+        // The keys of actions the credential may not take on the branch are not listed, as
+        // they are not registered.
+        let refused = self.change_refusal(cx).is_some();
+        let mut keys = match (self.editing.is_some(), self.kind) {
             (true, _) => vec![
                 key("Save", &ConfirmEdit),
                 key("Keep as draft", &StageEdit),
@@ -7284,12 +7344,29 @@ impl TypeTable {
                 key("Refresh", &RefreshTable),
             ],
         };
+        if refused {
+            keys.retain(|hint| !writes(hint.action.as_ref()));
+        }
         ItemStatus {
             start,
             end: Vec::new(),
             keys,
         }
     }
+}
+
+/// Whether a table key writes to the branch, so goes when the credential may not change it.
+fn writes(action: &dyn gpui::Action) -> bool {
+    let writing: [&dyn gpui::Action; 7] = [
+        &EditCell,
+        &ConfirmEdit,
+        &SaveDrafts,
+        &InsertRow,
+        &DeleteRow,
+        &ChooseFile,
+        &ClearValue,
+    ];
+    writing.iter().any(|key| key.partial_eq(action))
 }
 
 fn filter_placeholder(op: FilterOp) -> &'static str {
@@ -7336,6 +7413,7 @@ impl Render for TypeTable {
         let filter_bar = self.render_filter_bar(window, cx);
         let bulk_bar = self.render_bulk_bar(cx);
         let drafts_bar = self.render_drafts_bar(cx);
+        let writable = self.change_refusal(cx).is_none();
         let grid = self.grid.clone();
         v_flex()
             .key_context(context)
@@ -7352,21 +7430,32 @@ impl Render for TypeTable {
             .on_action(
                 cx.listener(|this, _: &menu::SelectPrevious, window, cx| this.tab(-1, window, cx)),
             )
-            .on_action(cx.listener(Self::on_edit))
+            // ↵ also confirms the filter being written, so it is always registered; an edit it
+            // would save on a refused branch is kept as a draft instead.
             .on_action(
                 cx.listener(|this, _: &ConfirmEdit, window, cx| this.confirm_edit(window, cx)),
             )
             .on_action(cx.listener(|this, _: &StageEdit, window, cx| {
                 this.stage_edit(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &SaveDrafts, window, cx| this.save_drafts(window, cx)))
+            // What the credential may not take on the branch is not registered, so the palette
+            // and the keys offer only what it may (constitution VIII).
+            .when(writable, |table| {
+                table
+                    .on_action(cx.listener(Self::on_edit))
+                    .on_action(
+                        cx.listener(|this, _: &SaveDrafts, window, cx| {
+                            this.save_drafts(window, cx)
+                        }),
+                    )
+                    .on_action(cx.listener(Self::on_insert))
+                    .on_action(cx.listener(Self::on_delete))
+            })
             .on_action(cx.listener(Self::on_cancel))
             .on_action(cx.listener(Self::on_peek))
             .on_action(cx.listener(Self::on_open_row_page))
             .on_action(cx.listener(Self::on_explore))
             .on_action(cx.listener(|this, _: &RefreshTable, window, cx| this.refresh(window, cx)))
-            .on_action(cx.listener(Self::on_insert))
-            .on_action(cx.listener(Self::on_delete))
             .on_action(cx.listener(Self::on_copy))
             .on_action(
                 cx.listener(|this, _: &AddFilter, window, cx| this.open_filter_draft(window, cx)),
@@ -7376,7 +7465,7 @@ impl Render for TypeTable {
             }))
             .on_action(cx.listener(|this, _: &ClearFilters, _, cx| this.clear_filters(cx)))
             .when(
-                self.at_commit.is_none() && self.blob_under_cursor().is_some(),
+                self.at_commit.is_none() && writable && self.blob_under_cursor().is_some(),
                 |table| {
                     table
                         .on_action(cx.listener(Self::on_choose_blob_file))
@@ -9373,7 +9462,7 @@ mod tests {
         let (held, held_cx) = open(&session, Some("c1"), cx);
         let file = crate::test_support::upload_file("held.txt", b"held", None);
         held.update(held_cx, |table, cx| {
-            assert!(!table.takes_blob_drop("p1", "doc"));
+            assert!(!table.takes_blob_drop("p1", "doc", cx));
             table.upload_blob("p1", "doc", file, cx);
         });
         held_cx.run_until_parked();
@@ -9387,7 +9476,7 @@ mod tests {
 
         let (table, cx) = open(&session, None, cx);
         table.update(cx, |table, cx| {
-            assert!(table.takes_blob_drop("p1", "doc"));
+            assert!(table.takes_blob_drop("p1", "doc", cx));
             table.drop_blob_files("p1", "doc", &["a.txt".into(), "b.txt".into()], cx);
         });
         assert!(blobs.writes.lock().unwrap().is_empty());
@@ -9455,10 +9544,10 @@ mod tests {
 
         session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
         cx.run_until_parked();
-        table.read_with(cx, |table, _| {
+        table.read_with(cx, |table, cx| {
             assert_eq!(table.branch, "fix");
             assert!(table.blob_edits.is_empty(), "not shown on fix");
-            assert!(table.takes_blob_drop("p1", "doc"));
+            assert!(table.takes_blob_drop("p1", "doc", cx));
         });
         open.send(()).ok();
         cx.run_until_parked();
@@ -9532,6 +9621,146 @@ mod tests {
         table.read_with(cx, |table, _| {
             let key = ("p1".to_owned(), "doc".to_owned());
             assert_eq!(table.blobs[&key], Loadable::Loaded(BlobMeta::Null));
+        });
+    }
+
+    /// On a branch the access route says the credential may not change, the table offers no
+    /// write: Edit, New row, Delete row, Save drafts, Choose File and Clear are neither
+    /// registered nor listed as keys; a click on a value peeks it, and a draft's save and a
+    /// file stored send nothing, the file saying why and the draft staying. While what the
+    /// credential may do is not known, every one is offered.
+    #[gpui::test]
+    async fn a_branch_the_credential_may_not_change_offers_no_writes(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let schema = PEOPLE.replace("  name: String\n", "  name: String\n  doc: Blob?\n");
+        /// The table, drawn with its Blob cells read, the keyboard on the first row's Blob cell.
+        fn open(
+            session: Entity<GraphSession>,
+            cx: &mut TestAppContext,
+        ) -> (Entity<TypeTable>, &mut VisualTestContext) {
+            let (table, cx) = cx.add_window_view(|window, cx| {
+                TypeTable::new(
+                    WeakEntity::new_invalid(),
+                    session,
+                    "Person".into(),
+                    None,
+                    window,
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+            cx.executor().advance_clock(BLOB_READ_AFTER);
+            cx.run_until_parked();
+            table.update_in(cx, |table, window, cx| {
+                let col = table.column_index("doc").unwrap();
+                table.set_cursor(Cursor { row: 0, col }, cx);
+                window.focus(&table.focus_handle, cx);
+                cx.notify();
+            });
+            cx.run_until_parked();
+            (table, cx)
+        }
+        /// Which writes the table offers where the keyboard is, and the keys it lists.
+        fn offered(
+            table: &Entity<TypeTable>,
+            cx: &mut VisualTestContext,
+        ) -> (Vec<bool>, Vec<String>) {
+            let writes: [&dyn gpui::Action; 6] = [
+                &EditCell,
+                &InsertRow,
+                &DeleteRow,
+                &SaveDrafts,
+                &ChooseFile,
+                &ClearValue,
+            ];
+            let available = cx.update(|window, cx| {
+                writes
+                    .iter()
+                    .map(|action| window.is_action_available(*action, cx))
+                    .collect()
+            });
+            let keys = table.update(cx, |table, cx| {
+                let keys = table.status_parts(cx).keys;
+                keys.iter().map(|key| key.label.to_string()).collect()
+            });
+            (available, keys)
+        }
+
+        let (unknown, _) = crate::test_support::session_with_blobs(&schema, cx);
+        let (table, unknown_cx) = open(unknown, cx);
+        let (available, keys) = offered(&table, unknown_cx);
+        assert_eq!(available, [true; 6], "offered while not known: {keys:?}");
+        assert!(keys.iter().any(|key| key == "New row"), "{keys:?}");
+
+        let (session, sent, blobs) = crate::test_support::session_with_access(
+            &schema,
+            crate::test_support::read_only_access(),
+            cx,
+        );
+        blobs.set("Person/p1/doc", b"old");
+        let (table, cx) = open(session.clone(), cx);
+        session.read_with(cx, |session, _| {
+            assert_eq!(
+                session.allows_here(graph_store::AccessAction::Change),
+                graph_store::Allowed::No
+            );
+        });
+        let (available, keys) = offered(&table, cx);
+        assert_eq!(available, [false; 6]);
+        assert_eq!(
+            keys,
+            [
+                "Peek",
+                "Open page",
+                "Explore",
+                "Copy",
+                "Filter by this value",
+                "Refresh"
+            ]
+        );
+        let refused = "Your credential may not change main";
+        table.update_in(cx, |table, window, cx| {
+            assert_eq!(table.change_refusal(cx).as_deref(), Some(refused));
+            let col = table.column_index("name").unwrap();
+            table.start_edit(Cursor { row: 0, col }, window, cx);
+            assert!(table.editing.is_none(), "peeked, not edited");
+        });
+        session.update(cx, |session, cx| {
+            let key = DraftKey {
+                type_name: "Person".into(),
+                id: "p1".into(),
+                property: "name".into(),
+            };
+            let draft = graph_store::DraftEntry {
+                old: "Ada".into(),
+                text: "Ada King".into(),
+            };
+            session.set_draft(key, draft, cx);
+        });
+        cx.run_until_parked();
+        let file = crate::test_support::upload_file("refused.txt", b"new", None);
+        table.update_in(cx, |table, window, cx| {
+            table.save_drafts(window, cx);
+            assert!(!table.takes_blob_drop("p1", "doc", cx));
+            table.upload_blob("p1", "doc", file, cx);
+        });
+        cx.run_until_parked();
+        assert!(sent.lock().unwrap().is_empty(), "nothing was sent");
+        assert!(blobs.writes.lock().unwrap().is_empty());
+        table.read_with(cx, |table, _| {
+            let doc = ("p1".to_owned(), "doc".to_owned());
+            assert!(matches!(
+                &table.blob_edits[&doc],
+                BlobEdit::Failed { notice, .. } if notice.message == refused
+            ));
+            let name = ("p1".to_owned(), "name".to_owned());
+            assert!(
+                matches!(table.cells.get(&name), Some(CellState::Draft { .. })),
+                "the draft stays"
+            );
         });
     }
 

@@ -24,7 +24,10 @@ use gpui::{
     ScrollHandle, SharedString, Stateful, Subscription, Task, WeakEntity, Window,
     WindowControlArea, WindowHandle, deferred, div, point,
 };
-use graph_store::{ConnectionRegistry, ConnectionState, GraphSession, OutcomeKind, SessionEvent};
+use graph_store::{
+    AccessAction, AccessScope, ConnectionRegistry, ConnectionState, GraphSession, OutcomeKind,
+    SessionEvent,
+};
 use studio_actions::graph::{OpenCommit, OpenHistory};
 use studio_actions::workspace::{
     ActivateItem, ActivateLastItem, ActivateNextGraph, ActivateNextItem, ActivateNextPane,
@@ -123,7 +126,19 @@ pub enum WorkspaceEvent {
     SessionChanged,
 }
 
-type ActionRegistration = Rc<dyn Fn(Div, &mut Window, &mut Context<Workspace>) -> Div>;
+/// An action handler a feature crate registered on the window, and when it is registered:
+/// always, or while its condition holds, so the palette lists it only then.
+#[derive(Clone)]
+struct ActionRegistration {
+    when: Option<ActionCondition>,
+    register: ActionHandler,
+}
+
+/// Whether a registered action is available where the window is now.
+type ActionCondition = Rc<dyn Fn(&Workspace, &App) -> bool>;
+
+/// Puts a registered action's handler on the window's root.
+type ActionHandler = Rc<dyn Fn(Div, &mut Window, &mut Context<Workspace>) -> Div>;
 
 /// A graph open in this window but not shown (spec 002: several graph sessions as tabs): its
 /// tabs, splits and back/forward trail wait here until it is shown again.
@@ -2142,13 +2157,35 @@ impl Workspace {
         &mut self,
         handler: impl Fn(&mut Workspace, &A, &mut Window, &mut Context<Workspace>) + 'static,
     ) {
+        self.register(None, handler);
+    }
+
+    /// As [`Self::register_action`], registered only while `when` holds: an action the window
+    /// cannot take now is not offered by the palette or the keys (constitution VIII). It is
+    /// asked at every draw, so it reads what it needs cheaply.
+    pub fn register_action_when<A: Action>(
+        &mut self,
+        when: impl Fn(&Workspace, &App) -> bool + 'static,
+        handler: impl Fn(&mut Workspace, &A, &mut Window, &mut Context<Workspace>) + 'static,
+    ) {
+        self.register(Some(Rc::new(when)), handler);
+    }
+
+    fn register<A: Action>(
+        &mut self,
+        when: Option<ActionCondition>,
+        handler: impl Fn(&mut Workspace, &A, &mut Window, &mut Context<Workspace>) + 'static,
+    ) {
         let handler = Rc::new(handler);
-        self.actions.push(Rc::new(move |div, _window, cx| {
-            let handler = handler.clone();
-            div.on_action(cx.listener(move |workspace, action: &A, window, cx| {
-                handler(workspace, action, window, cx)
-            }))
-        }));
+        self.actions.push(ActionRegistration {
+            when,
+            register: Rc::new(move |div, _window, cx| {
+                let handler = handler.clone();
+                div.on_action(cx.listener(move |workspace, action: &A, window, cx| {
+                    handler(workspace, action, window, cx)
+                }))
+            }),
+        });
     }
 
     // ---- rendering ----
@@ -2474,8 +2511,9 @@ impl Workspace {
     /// Delta's sidebar shows the account. It opens the graph switcher: the graphs open in this
     /// window, another graph, closing this one.
     fn render_server_switcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (color, server, url, state) = match &self.session {
+        let (color, server, url, state, actor) = match &self.session {
             Some(session) => {
+                let actor = session.read(cx).actor().map(str::to_owned);
                 let connection = session.read(cx).connection.read(cx);
                 let color = connection_color(&connection.state);
                 // The server's round trip from the last health check, beside its state.
@@ -2490,6 +2528,7 @@ impl Workspace {
                     connection.server.name.clone(),
                     connection.server.url.clone(),
                     state,
+                    actor,
                 )
             }
             None => (
@@ -2497,6 +2536,7 @@ impl Workspace {
                 "No server".to_owned(),
                 String::new(),
                 "Not connected".to_owned(),
+                None,
             ),
         };
         let open = self.open_graphs();
@@ -2514,8 +2554,9 @@ impl Workspace {
                 )
             })
             .collect();
+        let tooltip = connection_tooltip(&url, &state, actor.as_deref());
         let trigger = ButtonLike::new("graph-switcher")
-            .tooltip(Tooltip::text(format!("{url} · {state} · Switch graph")))
+            .tooltip(Tooltip::text(tooltip))
             .child(
                 h_flex()
                     .px(px(studio_ui::ds::space::XS))
@@ -3262,6 +3303,17 @@ impl Workspace {
         let graph = s.graph_id.clone();
         let branch = s.branch.clone();
         let unavailable = s.unavailable.clone();
+        // The access route refused changes on the window's branch: its edits are disabled, so
+        // the bar says so beside the name (spec 002).
+        let read_only = s.refusal(AccessAction::Change, &AccessScope::branch(&branch));
+        let branch_tooltip = if read_only.is_some() {
+            format!(
+                "Reads in this window use {branch}, which your credential may not change. Switch \
+                 branch."
+            )
+        } else {
+            format!("Reads and edits in this window use {branch}. Switch branch.")
+        };
         let session_for_menu = session.clone();
         Some(
             h_flex()
@@ -3313,9 +3365,7 @@ impl Workspace {
                         .trigger(
                             studio_ui::ds::bar_button("branch", branch.clone())
                                 .style(ButtonStyle::Subtle)
-                                .tooltip(Tooltip::text(format!(
-                                    "Reads and edits in this window use {branch}. Switch branch."
-                                )))
+                                .tooltip(Tooltip::text(branch_tooltip))
                                 .start_icon(Icon::new(IconName::GitBranch))
                                 .end_icon(Icon::new(IconName::ChevronUpDown)),
                         )
@@ -3340,7 +3390,24 @@ impl Workspace {
                                 menu
                             }))
                         }),
-                ),
+                )
+                .when_some(read_only, |row, reason| {
+                    row.child(
+                        div()
+                            .id("branch-read-only")
+                            .debug_selector(|| "branch-read-only".into())
+                            .flex_none()
+                            .tooltip(move |_, cx| {
+                                Tooltip::with_meta(
+                                    reason.clone(),
+                                    None,
+                                    "Edits here are off; switch to a branch it may change",
+                                    cx,
+                                )
+                            })
+                            .child(studio_ui::ds::text::muted("read only").single_line()),
+                    )
+                }),
         )
     }
 
@@ -3929,7 +3996,9 @@ impl Render for Workspace {
                 }
             }));
         for registration in self.actions.clone() {
-            root = registration(root, window, cx);
+            if registration.when.as_ref().is_none_or(|when| when(self, cx)) {
+                root = (registration.register)(root, window, cx);
+            }
         }
         // The modal over a dim (a dialog) or a light veil (the palette); a click on either
         // closes it. A dialog sits a quarter of the way down the space it leaves free, as
@@ -4685,6 +4754,15 @@ pub fn connection_color(state: &ConnectionState) -> Color {
     }
 }
 
+/// What the connection chip's tooltip says: the server, its state, and the actor the
+/// credential resolves to once the access route has named it.
+fn connection_tooltip(url: &str, state: &str, actor: Option<&str>) -> String {
+    match actor {
+        Some(actor) => format!("{url} · {state} · as {actor} · Switch graph"),
+        None => format!("{url} · {state} · Switch graph"),
+    }
+}
+
 /// The workspace that owns a window, if any.
 pub fn workspace_for(window: &Window) -> Option<Entity<Workspace>> {
     window.root::<Workspace>().flatten()
@@ -5009,6 +5087,112 @@ mod tests {
         fn caches_its_parts(&self) -> bool {
             self.caches
         }
+    }
+
+    gpui::actions!(workspace_test, [Probe]);
+
+    /// An action a feature registers with a condition is available only while it holds, so
+    /// the palette and the keys offer it only then.
+    #[gpui::test]
+    fn a_conditional_action_is_registered_only_while_it_holds(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            cx.set_global(StudioSettings::default());
+        });
+        let holds = Rc::new(std::cell::Cell::new(false));
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update_in(cx, |workspace, window, cx| {
+            let holds = holds.clone();
+            workspace.register_action_when(move |_, _| holds.get(), |_, _: &Probe, _, _| {});
+            window.focus(&workspace.focus_handle(cx), cx);
+        });
+        let available = |cx: &mut gpui::VisualTestContext| {
+            cx.run_until_parked();
+            cx.update(|window, cx| window.is_action_available(&Probe, cx))
+        };
+        assert!(!available(cx));
+        holds.set(true);
+        workspace.update(cx, |_, cx| cx.notify());
+        assert!(available(cx));
+    }
+
+    /// The status bar's branch reads "read only" once the access route refuses changes there,
+    /// and not while it is unknown (unread, or not answered) or allowed. The connection chip's
+    /// tooltip names the actor once an answer has.
+    #[gpui::test]
+    fn a_branch_the_credential_may_not_change_reads_read_only(cx: &mut gpui::TestAppContext) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+        });
+        let answers = Arc::new(AtomicBool::new(false));
+        let answering = answers.clone();
+        let http = http_client::FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let query = request.uri().query().unwrap_or_default().to_owned();
+            let answering = answering.load(Ordering::SeqCst);
+            async move {
+                // Every branch reads; only fix takes changes. Until `answers`, the route fails.
+                let (status, body) = match (path.ends_with("/access"), answering) {
+                    (true, false) => (503, r#"{"error":"later"}"#.to_owned()),
+                    (true, true) => {
+                        let actions = if query.contains("branch=fix") {
+                            r#"["read","change"]"#
+                        } else {
+                            r#"["read"]"#
+                        };
+                        (
+                            200,
+                            format!(
+                                r#"{{"graph_id":"notes","actor":"act-ada","graph_wide":["read"],"actions":{actions}}}"#
+                            ),
+                        )
+                    }
+                    _ => (200, r#"{"branches":["main","fix"]}"#.to_owned()),
+                };
+                Ok(http_client::http::Response::builder()
+                    .status(status)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(http_client::AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let server = graph_store::ServerEntry {
+            name: "test".into(),
+            url: "http://studio.test".into(),
+            source: graph_store::ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection =
+            cx.new(|_| graph_store::Connection::new(server, Some("t".into()), http).unwrap());
+        let session = cx.new(|cx| GraphSession::new(connection, "notes".into(), "main".into(), cx));
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update(cx, |workspace, cx| {
+            workspace.graph_order.push(session.entity_id());
+            workspace.subscribe_session(session.clone(), cx);
+        });
+        cx.run_until_parked();
+        let read_only = |cx: &mut gpui::VisualTestContext| {
+            cx.run_until_parked();
+            cx.debug_bounds("branch-read-only").is_some()
+        };
+        assert!(!read_only(cx), "not known: edits stay offered");
+        session.read_with(cx, |session, _| assert_eq!(session.actor(), None));
+
+        // Answered at last: main, read again when the window comes back to it, refuses.
+        answers.store(true, Ordering::SeqCst);
+        session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        assert!(!read_only(cx), "fix takes changes");
+        session.update(cx, |session, cx| session.set_branch("main".into(), cx));
+        assert!(read_only(cx), "main is read only");
+        let actor = session.read_with(cx, |session, _| session.actor().map(str::to_owned));
+        assert_eq!(
+            connection_tooltip("http://studio.test", "ready", actor.as_deref()),
+            "http://studio.test · ready · as act-ada · Switch graph"
+        );
     }
 
     /// The tab strip and its tabs are the header strip's height, under which every column's

@@ -417,8 +417,9 @@ impl NodePeek {
     ) -> Self {
         let schema = session.read(cx).schema_model();
         let subscription = cx.subscribe(&session, |this: &mut Self, session, event, cx| {
-            // Its node's drafts are the session's, kept from a table or another view too.
-            if let SessionEvent::DraftsChanged = event {
+            // Its node's drafts are the session's, kept from a table or another view too; what
+            // the credential may do decides which of its controls write.
+            if let SessionEvent::DraftsChanged | SessionEvent::AccessChanged = event {
                 cx.notify();
                 return;
             }
@@ -1061,13 +1062,16 @@ impl NodePeek {
     }
 
     /// Why slot `property` cannot take a file here, or `None` when it can: a peek held at a
-    /// commit, an edge's, a property that is not a Blob.
-    fn blob_write_refusal(&self, property: &str) -> Option<String> {
+    /// commit, a branch the credential may not change, an edge's, a property that is not a
+    /// Blob.
+    fn blob_write_refusal(&self, property: &str, cx: &App) -> Option<String> {
         let pinned = self.held_commit();
+        let denied = self.change_refusal(cx);
         blob_write::write_refusal(
             self.schema.as_deref(),
             &self.blob_cell(property),
             pinned.as_deref(),
+            denied.as_deref(),
         )
     }
 
@@ -1138,12 +1142,13 @@ impl NodePeek {
             return;
         };
         let refusal = match &change {
-            BlobChange::Upload(_) => self.blob_write_refusal(property),
-            BlobChange::Clear if over.is_some() => self.blob_write_refusal(property),
+            BlobChange::Upload(_) => self.blob_write_refusal(property, cx),
+            BlobChange::Clear if over.is_some() => self.blob_write_refusal(property, cx),
             BlobChange::Clear => blob_write::clear_refusal(
                 self.schema.as_deref(),
                 &self.blob_cell(property),
                 self.held_commit().as_deref(),
+                self.change_refusal(cx).as_deref(),
                 self.blobs[index].meta.loaded(),
             ),
         };
@@ -1379,7 +1384,7 @@ impl NodePeek {
                     }
                     _ => None,
                 };
-                let droppable = self.blob_write_refusal(&slot.property).is_none() && !saving;
+                let droppable = self.blob_write_refusal(&slot.property, cx).is_none() && !saving;
                 let body: Option<AnyElement> = match (&slot.meta, &slot.preview) {
                     (Loadable::Failed(error), _) | (_, Loadable::Failed(error)) => {
                         Some(studio_ui::ds::text::error(error.clone()).into_any_element())
@@ -1543,11 +1548,12 @@ impl NodePeek {
         let cell = self.blob_cell(&slot.property);
         let saving = slot.edit.as_ref().is_some_and(BlobEdit::is_saving);
         let pinned = self.held_commit();
-        let upload_refusal = self.blob_write_refusal(&slot.property);
+        let upload_refusal = self.blob_write_refusal(&slot.property, cx);
         let clear_refusal = blob_write::clear_refusal(
             self.schema.as_deref(),
             &cell,
             pinned.as_deref(),
+            self.change_refusal(cx).as_deref(),
             slot.meta.loaded(),
         );
         let branch = self.branch.clone();
@@ -1976,13 +1982,24 @@ impl NodePeek {
 
     // ---- editing (spec 014) ----
 
-    /// Whether this view edits `property` in place: a node's property, read at the head, of a
-    /// kind a table cell edits too.
-    fn edits_property(&self, property: &gq_language::Property) -> bool {
+    /// Whether this view edits `property` in place: a node's property, read at the head of a
+    /// branch the credential may change, of a kind a table cell edits too.
+    fn edits_property(&self, property: &gq_language::Property, cx: &App) -> bool {
         matches!(self.subject, PeekSubject::Node { .. })
             && !self.holds_commit
             && property.editable_in_cell()
             && self.values.loaded().is_some()
+            && self.change_refusal(cx).is_none()
+    }
+
+    /// Why the credential may not change the branch the view reads, once the access route said
+    /// so (spec 002): its fields do not open, and its relationship and Blob controls are
+    /// disabled with this as their reason. A view held at a commit has its own reason.
+    fn change_refusal(&self, cx: &App) -> Option<String> {
+        if self.holds_commit || !matches!(self.subject, PeekSubject::Node { .. }) {
+            return None;
+        }
+        crate::write::change_refusal(&self.session, &self.branch, cx)
     }
 
     fn value_of(&self, name: &str) -> Value {
@@ -2086,7 +2103,7 @@ impl NodePeek {
             window.focus(&edit.editor.focus_handle(cx), cx);
             return;
         }
-        if !self.edits_property(&property) || self.saving.contains(&name) {
+        if !self.edits_property(&property, cx) || self.saving.contains(&name) {
             return;
         }
         // A draft opens with its text, its save bound to the value it was typed over: a
@@ -2273,6 +2290,16 @@ impl NodePeek {
             return;
         };
         let name = property.name.clone();
+        // A field open when the access route refused the branch: what was typed stays as its
+        // draft, and nothing is sent.
+        if self.change_refusal(cx).is_some() {
+            self.edits.remove(&name);
+            if !same_value(&old, &new) {
+                self.put_draft(&name, old, text, cx);
+            }
+            cx.notify();
+            return;
+        }
         let write = match crate::write::write_property(
             &self.session,
             &self.branch,
@@ -2733,6 +2760,7 @@ impl NodePeek {
             .adding
             .as_ref()
             .is_some_and(|adding| adding.index == index)
+            || self.change_refusal(cx).is_some()
         {
             return;
         }
@@ -2916,6 +2944,14 @@ impl NodePeek {
         let Some(group) = self.groups.get(index).map(|group| group.group.clone()) else {
             return;
         };
+        // Asked for before the access route refused the branch: nothing is sent, and the group
+        // says why.
+        if let Some(reason) = self.change_refusal(cx) {
+            self.group_notices
+                .insert(index, Notice::new(Tone::Invalid, reason));
+            cx.notify();
+            return;
+        }
         let mut queries = Vec::new();
         if let Some(edge_id) = &first {
             queries.push((
@@ -3065,7 +3101,7 @@ impl NodePeek {
     /// commit.
     /// A draft that does not parse opens instead, and nothing is sent.
     fn save_drafts(&mut self, _: &SaveNodeDrafts, window: &mut Window, cx: &mut Context<Self>) {
-        if self.saving_drafts || !self.edits_relationships() {
+        if self.saving_drafts || !self.edits_relationships() || self.change_refusal(cx).is_some() {
             return;
         }
         // An open field joins the others.
@@ -3245,6 +3281,7 @@ impl NodePeek {
             return None;
         }
         let branch = self.session.read(cx).branch.clone();
+        let refused = self.change_refusal(cx);
         let label = match count {
             1 => "1 change not saved".to_owned(),
             n => format!("{} changes not saved", studio_ui::group_digits(n)),
@@ -3285,9 +3322,14 @@ impl NodePeek {
                         },
                     )
                     .style(ButtonStyle::Filled)
-                    .disabled(self.saving_drafts)
-                    .tooltip(move |_, cx| {
-                        Tooltip::for_action(format!("One commit to {branch}"), &SaveNodeDrafts, cx)
+                    .disabled(self.saving_drafts || refused.is_some())
+                    .tooltip(move |_, cx| match &refused {
+                        Some(reason) => Tooltip::simple(reason.clone(), cx),
+                        None => Tooltip::for_action(
+                            format!("One commit to {branch}"),
+                            &SaveNodeDrafts,
+                            cx,
+                        ),
                     })
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.save_drafts(&SaveNodeDrafts, window, cx)
@@ -3385,6 +3427,7 @@ impl NodePeek {
         } else {
             studio_ui::ds::size::FIELD_LABEL
         };
+        let refusal = self.change_refusal(cx);
         // Pulled out by the rows' hover inset, as a relationship group's rows are.
         v_flex()
             .mx(px(-space::XS))
@@ -3404,7 +3447,11 @@ impl NodePeek {
                             _ => name.to_owned(),
                         };
                         let copied = self.copied.as_deref() == Some(name);
-                        let editable = self.edits_property(property);
+                        let editable = self.edits_property(property, cx);
+                        // A value the credential may not change says so where it would edit.
+                        let refused = refusal
+                            .as_ref()
+                            .filter(|_| property.editable_in_cell() && !editable);
                         let editing = self.edits.contains_key(name);
                         let saving = self.saving.contains(name);
                         // An unsaved value shows what was typed, with a dot, and opens on a click.
@@ -3465,6 +3512,8 @@ impl NodePeek {
                                     format!("{ty} · click to edit")
                                 } else if editable {
                                     ty.clone()
+                                } else if let Some(reason) = refused {
+                                    format!("{ty} · {reason} · click to copy")
                                 } else {
                                     format!("{ty} · click to copy")
                                 }))
@@ -3906,7 +3955,10 @@ impl NodePeek {
         let required = self.required_edge_properties(index);
         let replaces = self.holds_one(index)
             && matches!(self.groups[index].count, Loadable::Loaded(n) if n > 0);
-        let tooltip = if !required.is_empty() {
+        let refused = self.change_refusal(cx);
+        let tooltip = if let Some(reason) = refused.clone() {
+            reason
+        } else if !required.is_empty() {
             format!(
                 "{} needs {}: add it in its table",
                 group.edge,
@@ -3920,6 +3972,7 @@ impl NodePeek {
         let edge = group.edge.clone();
         studio_ui::ds::row_icon_button(("peek-add", index), IconName::Plus)
             .icon_color(Color::Muted)
+            .disabled(refused.is_some())
             .when(!self.page, |button| button.visible_on_hover(header))
             .tooltip(Tooltip::text(tooltip))
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -4046,13 +4099,17 @@ impl NodePeek {
             }))
             .into_any_element();
         }
+        let refused = self.change_refusal(cx);
         studio_ui::ds::row_icon_button(
             SharedString::from(format!("peek-remove-{index}-{n}")),
             IconName::Close,
         )
         .icon_color(Color::Muted)
+        .disabled(refused.is_some())
         .visible_on_hover(row)
-        .tooltip(Tooltip::text(format!("Remove this {edge}")))
+        .tooltip(Tooltip::text(
+            refused.unwrap_or_else(|| format!("Remove this {edge}")),
+        ))
         .on_click(cx.listener(move |this, _, window, cx| {
             cx.stop_propagation();
             this.press_remove(index, edge_id.clone(), window, cx)
@@ -4423,11 +4480,16 @@ impl NodePeek {
                 self.list.remeasure_items(drawn);
             }
         }
+        // Saves the credential may not make on the branch are not registered (constitution
+        // VIII); a field still open is kept as a draft when it is left.
+        let writable = self.change_refusal(cx).is_none();
         div()
             .id("node-peek")
             .key_context("NodeView")
-            .on_action(cx.listener(Self::save_drafts))
-            .on_action(cx.listener(Self::on_save_field))
+            .when(writable, |view| {
+                view.on_action(cx.listener(Self::save_drafts))
+                    .on_action(cx.listener(Self::on_save_field))
+            })
             .on_action(cx.listener(Self::on_cancel_field))
             .on_action(cx.listener(Self::on_expand_field))
             .size_full()
@@ -6538,7 +6600,7 @@ mod tests {
         let (view, _session, blobs, cx) = page_with_doc(Some(b"old"), Some("c1"), cx);
         let file = crate::test_support::upload_file("held.txt", b"held", None);
         view.update(cx, |view, cx| {
-            assert!(view.blob_write_refusal("doc").is_some());
+            assert!(view.blob_write_refusal("doc", cx).is_some());
             view.upload_blob("doc", file, cx);
             view.clear_blob("doc", cx);
         });
@@ -6553,6 +6615,48 @@ mod tests {
                 "{}",
                 notice.message
             );
+        });
+    }
+
+    /// A page on a branch the access route says the credential may not change edits nothing
+    /// there: a field does not open, and a file stored in a slot is refused before it is sent,
+    /// saying what the credential lacks.
+    #[gpui::test]
+    async fn a_page_on_a_branch_the_credential_may_not_change_sends_nothing(
+        cx: &mut TestAppContext,
+    ) {
+        let (session, sent, blobs) = crate::test_support::session_with_access(
+            DOCS,
+            crate::test_support::read_only_access(),
+            cx,
+        );
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            NodePeek::page(session, "Person".into(), "p1".into(), None, cx)
+        });
+        cx.run_until_parked();
+        let refused = "Your credential may not change main";
+        let file = crate::test_support::upload_file("refused.txt", b"new", None);
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.change_refusal(cx).as_deref(), Some(refused));
+            let name = view.property_named("name").cloned().unwrap();
+            assert!(!view.edits_property(&name, cx));
+            view.start_edit(name, window, cx);
+            assert!(view.edits.is_empty(), "the field does not open");
+            assert_eq!(view.blob_write_refusal("doc", cx).as_deref(), Some(refused));
+            view.upload_blob("doc", file, cx);
+        });
+        cx.run_until_parked();
+        assert!(sent.lock().unwrap().is_empty(), "nothing was sent");
+        assert!(blobs.writes.lock().unwrap().is_empty());
+        view.read_with(cx, |view, _| {
+            assert!(matches!(
+                &view.blobs[0].edit,
+                Some(BlobEdit::Failed { notice, .. }) if notice.message == refused
+            ));
         });
     }
 }

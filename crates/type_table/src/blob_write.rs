@@ -118,17 +118,23 @@ pub(crate) fn again_label(change: &BlobChange, now: &BlobMeta) -> &'static str {
 }
 
 /// Why `cell` cannot be written from a view, or `None` when it can: the view shows a commit
-/// (`pinned`), the cell is an edge's, or the schema has no Blob property by its name.
+/// (`pinned`), the credential may not change the branch (`denied`, the access route's refusal,
+/// [`crate::write::change_refusal`]), the cell is an edge's, or the schema has no Blob property
+/// by its name.
 pub(crate) fn write_refusal(
     schema: Option<&SchemaModel>,
     cell: &BlobCell,
     pinned: Option<&str>,
+    denied: Option<&str>,
 ) -> Option<String> {
     if let Some(commit) = pinned {
         return Some(format!(
             "Read-only: this shows commit {}. Open it at the branch head to change it.",
             studio_ui::short_commit_id(commit)
         ));
+    }
+    if let Some(denied) = denied {
+        return Some(denied.to_owned());
     }
     if cell.edge {
         return Some(format!(
@@ -154,9 +160,10 @@ pub(crate) fn clear_refusal(
     schema: Option<&SchemaModel>,
     cell: &BlobCell,
     pinned: Option<&str>,
+    denied: Option<&str>,
     shown: Option<&BlobMeta>,
 ) -> Option<String> {
-    if let Some(reason) = write_refusal(schema, cell, pinned) {
+    if let Some(reason) = write_refusal(schema, cell, pinned, denied) {
         return Some(reason);
     }
     let nullable = schema
@@ -536,19 +543,25 @@ mod tests {
     const NOTES: &str =
         "node Note {\n  slug: String @key\n  body: String?\n  attachment: Blob?\n  scan: Blob\n}\n";
 
-    /// A Blob is written only at the head, only a node's, and only a Blob property; a clear
-    /// also needs a property that may be empty and a value to clear.
+    /// A Blob is written only at the head, on a branch the credential may change, only a
+    /// node's, and only a Blob property; a clear also needs a property that may be empty and a
+    /// value to clear.
     #[test]
     fn a_blob_is_written_only_where_it_can_be_and_says_why_not() {
         let schema = SchemaModel::parse(NOTES).unwrap();
         let schema = Some(&schema);
-        assert_eq!(write_refusal(schema, &cell(false), None), None);
-        let pinned = write_refusal(schema, &cell(false), Some("01JCOMMIT0000c5")).unwrap();
+        assert_eq!(write_refusal(schema, &cell(false), None, None), None);
+        let pinned = write_refusal(schema, &cell(false), Some("01JCOMMIT0000c5"), None).unwrap();
         assert!(
             pinned.starts_with("Read-only: this shows commit"),
             "{pinned}"
         );
-        let edge = write_refusal(schema, &cell(true), None).unwrap();
+        let denied = "Your credential may not change main";
+        assert_eq!(
+            write_refusal(schema, &cell(false), None, Some(denied)).as_deref(),
+            Some(denied)
+        );
+        let edge = write_refusal(schema, &cell(true), None, None).unwrap();
         assert!(
             edge.contains("omnigraph blob put edge Note n1 attachment"),
             "{edge}"
@@ -556,30 +569,34 @@ mod tests {
         let mut body = cell(false);
         body.property = "body".into();
         assert_eq!(
-            write_refusal(schema, &body, None).as_deref(),
+            write_refusal(schema, &body, None, None).as_deref(),
             Some("body is not a Blob property.")
         );
-        assert!(write_refusal(None, &cell(false), None).is_some());
+        assert!(write_refusal(None, &cell(false), None, None).is_some());
 
         let managed = BlobMeta::Managed {
             size: 3,
             etag: Some("\"e1\"".into()),
         };
         assert_eq!(
-            clear_refusal(schema, &cell(false), None, Some(&managed)),
+            clear_refusal(schema, &cell(false), None, None, Some(&managed)),
             None
+        );
+        assert_eq!(
+            clear_refusal(schema, &cell(false), None, Some(denied), Some(&managed)).as_deref(),
+            Some(denied)
         );
         let mut scan = cell(false);
         scan.property = "scan".into();
         assert_eq!(
-            clear_refusal(schema, &scan, None, Some(&managed)).as_deref(),
+            clear_refusal(schema, &scan, None, None, Some(&managed)).as_deref(),
             Some("scan must hold a value, so it cannot be cleared.")
         );
         assert_eq!(
-            clear_refusal(schema, &cell(false), None, Some(&BlobMeta::Null)).as_deref(),
+            clear_refusal(schema, &cell(false), None, None, Some(&BlobMeta::Null)).as_deref(),
             Some("attachment holds no value.")
         );
-        assert!(clear_refusal(schema, &cell(false), None, None).is_some());
+        assert!(clear_refusal(schema, &cell(false), None, None, None).is_some());
     }
 
     /// A file over 32 MiB is refused without its bytes being read; one at the limit is read.

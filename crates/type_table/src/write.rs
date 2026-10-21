@@ -9,10 +9,23 @@ use gq_language::input::same_value;
 use gq_language::{BuiltQuery, SchemaModel, builder};
 use graph_client::WriteOutcome;
 use graph_client::api::ChangeOutput;
-use graph_store::GraphSession;
+use graph_store::{AccessAction, AccessScope, GraphSession};
 use serde_json::{Map, Value};
 
 use crate::model::{Notice, SaveResult, Tone, save_result};
+
+/// Why the credential may not change `branch`, once the access route refused it (spec 002):
+/// every control that writes there is disabled with this as its reason. `None` while it may,
+/// or before the route answered, so the control stays offered and the server decides.
+pub(crate) fn change_refusal(
+    session: &Entity<GraphSession>,
+    branch: &str,
+    cx: &App,
+) -> Option<String> {
+    session
+        .read(cx)
+        .refusal(AccessAction::Change, &AccessScope::branch(branch))
+}
 
 /// How a write bound to the values it was read at ended: sent, with the server's outcome, or
 /// not sent.

@@ -9909,6 +9909,7 @@ name = "studio_workspace"
 version = "0.2.1"
 dependencies = [
  "gpui",
+ "graph_client",
  "graph_store",
  "http_client",
  "libc",

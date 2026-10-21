@@ -13,7 +13,7 @@ use gpui::{
 };
 use graph_client::WriteOutcome;
 use graph_client::api::{BranchStartRefusalOutput, BranchStartRefusalReason, CommitOutput};
-use graph_store::{BranchStart, GraphSession, SessionEvent};
+use graph_store::{AccessAction, AccessScope, BranchStart, GraphSession, SessionEvent};
 use studio_actions::graph::{
     CreateBranch, CreateBranchAt, DeleteBranch, MergeBranch, ReviewBranch,
 };
@@ -188,6 +188,23 @@ impl BranchList {
                 let session = session.clone();
                 let workspace = workspace.clone();
                 let name = branch.clone();
+                // What the credential may do with the branch is read as its menu opens (once,
+                // until a 403 or a new token); until the answer lands, Delete is offered and the
+                // server decides. A merge is judged with its target, which the review reads.
+                let (delete_refused, merge_refused) = match &session {
+                    Some(session) => session.update(cx, |session, cx| {
+                        let own = AccessScope::branch(&name);
+                        session.read_access(own.clone(), cx);
+                        (
+                            session.refusal(AccessAction::BranchDelete, &own),
+                            session.refusal(
+                                AccessAction::BranchMerge,
+                                &AccessScope::branch_into(&name, TARGET),
+                            ),
+                        )
+                    }),
+                    None => (None, None),
+                };
                 ContextMenu::build(window, cx, move |menu, _, _| {
                     let switch = {
                         let session = session.clone();
@@ -236,19 +253,25 @@ impl BranchList {
                                 .handler(review),
                         )
                         .item(
-                            ContextMenuEntry::new(format!("Merge into {TARGET}…"))
-                                .disabled(is_target)
-                                .handler(merge),
+                            ContextMenuEntry::new(match &merge_refused {
+                                Some(reason) if !is_target => {
+                                    format!("Merge into {TARGET} ({})", aside(reason))
+                                }
+                                _ => format!("Merge into {TARGET}…"),
+                            })
+                            .disabled(is_target || merge_refused.is_some())
+                            .handler(merge),
                         )
                         .separator()
                         .item(
-                            ContextMenuEntry::new(if is_target {
-                                format!("Delete ({TARGET} cannot be deleted)")
-                            } else {
-                                "Delete…".to_owned()
+                            // A menu entry has no tooltip: a disabled one says why in its label.
+                            ContextMenuEntry::new(match &delete_refused {
+                                _ if is_target => format!("Delete ({TARGET} cannot be deleted)"),
+                                Some(reason) => format!("Delete ({})", aside(reason)),
+                                None => "Delete…".to_owned(),
                             })
                             .icon(IconName::Trash)
-                            .disabled(is_target)
+                            .disabled(is_target || delete_refused.is_some())
                             .handler(delete),
                         )
                 })
@@ -304,6 +327,15 @@ impl Render for BranchList {
             .child(new_button)
             .into_any_element()
     }
+}
+
+/// A refusal as a disabled menu entry's aside: "Delete (your credential may not delete fix)".
+fn aside(reason: &str) -> String {
+    let mut chars = reason.chars();
+    chars
+        .next()
+        .map(|first| first.to_lowercase().chain(chars).collect())
+        .unwrap_or_default()
 }
 
 // ---- dialogs ----
@@ -886,22 +918,41 @@ pub fn register(workspace: &mut Workspace) {
             CreateBranchModal::at_commit(session, commit, window, cx)
         });
     });
-    workspace.register_action(|workspace, _: &DeleteBranch, window, cx| {
-        let Some(session) = workspace.session().cloned() else {
-            return;
-        };
-        let branch = session.read(cx).branch.clone();
-        if branch == TARGET {
-            workspace.show_toast(
-                studio_workspace::ToastKind::Info,
-                format!("{TARGET} cannot be deleted. Switch to another branch first."),
-                cx,
-            );
-            return;
-        }
-        workspace.toggle_modal(window, cx, |window, cx| {
-            DeleteBranchModal::new(session, branch, window, cx)
-        });
+    // Not registered while the credential may not delete the window's branch, so the palette
+    // does not offer it (constitution VIII).
+    workspace.register_action_when(
+        |workspace, cx| {
+            workspace.session().is_none_or(|session| {
+                let session = session.read(cx);
+                let own = AccessScope::branch(&session.branch);
+                session.refusal(AccessAction::BranchDelete, &own).is_none()
+            })
+        },
+        delete_current,
+    );
+}
+
+/// Deletes the window's branch, after the dialog asks.
+fn delete_current(
+    workspace: &mut Workspace,
+    _: &DeleteBranch,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(session) = workspace.session().cloned() else {
+        return;
+    };
+    let branch = session.read(cx).branch.clone();
+    if branch == TARGET {
+        workspace.show_toast(
+            studio_workspace::ToastKind::Info,
+            format!("{TARGET} cannot be deleted. Switch to another branch first."),
+            cx,
+        );
+        return;
+    }
+    workspace.toggle_modal(window, cx, |window, cx| {
+        DeleteBranchModal::new(session, branch, window, cx)
     });
 }
 

@@ -14,6 +14,7 @@ mod entity_groups;
 mod exploration;
 pub mod fixes;
 mod memo;
+mod refusal;
 mod registry;
 pub mod scope;
 mod session;
@@ -38,7 +39,7 @@ pub use entity_groups::{
 };
 pub use exploration::*;
 pub use fixes::{RevertUnavailable, revert_query};
-pub use graph_client::api::EntityKind;
+pub use graph_client::api::{AccessAction, EntityKind};
 pub use registry::{ConnectionRegistry, RegistryEvent, data_dir};
 pub use session::{
     BranchStart, CommitList, DraftEntry, DraftKey, ExternalWrite, FollowUp, GraphSession,

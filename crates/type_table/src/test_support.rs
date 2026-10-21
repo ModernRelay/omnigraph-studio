@@ -323,9 +323,43 @@ pub(crate) fn session_with_blobs(
         always(200, committed("c2", "c1")),
         None,
         blobs.clone(),
+        None,
         cx,
     );
     (session, blobs)
+}
+
+/// What the access route answers for a credential that reads every branch and changes none.
+pub(crate) fn read_only_access() -> Value {
+    json!({ "graph_id": "knowledge", "actor": "act-reader", "graph_wide": ["read"], "actions": ["read"] })
+}
+
+/// As [`session_with_blobs`], the access route answering `access` for every branch (the other
+/// sessions' routes answer nothing it can read, so what the credential may do stays unknown),
+/// and every write's request body recorded, in order.
+pub(crate) fn session_with_access(
+    schema: &str,
+    access: Value,
+    cx: &mut TestAppContext,
+) -> (Entity<GraphSession>, Arc<Mutex<Vec<Value>>>, Arc<Blobs>) {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let log = sent.clone();
+    let writes: Writes = Arc::new(move |request: &Value| {
+        log.lock().unwrap().push(request.clone());
+        (200, committed("c2", "c1"))
+    });
+    let blobs = Arc::new(Blobs::default());
+    let rows = Arc::new(people());
+    let session = serve_blobs(
+        schema,
+        Arc::new(move |_: &Value| (*rows).clone()),
+        writes,
+        None,
+        blobs.clone(),
+        Some(access),
+        cx,
+    );
+    (session, sent, blobs)
 }
 
 /// A file of `bytes` named `name` in a folder of this test process's own, for an upload to
@@ -525,7 +559,7 @@ fn serve_with(
     writer: Option<Arc<Writer>>,
     cx: &mut TestAppContext,
 ) -> Entity<GraphSession> {
-    serve_blobs(schema, rows, writes, writer, Arc::default(), cx)
+    serve_blobs(schema, rows, writes, writer, Arc::default(), None, cx)
 }
 
 fn serve_blobs(
@@ -534,13 +568,14 @@ fn serve_blobs(
     writes: Writes,
     writer: Option<Arc<Writer>>,
     blobs: Arc<Blobs>,
+    access: Option<Value>,
     cx: &mut TestAppContext,
 ) -> Entity<GraphSession> {
     use futures::AsyncReadExt as _;
     let schema: Arc<str> = schema.into();
     let http = FakeHttpClient::create(move |request| {
         let (schema, rows, writes) = (schema.clone(), rows.clone(), writes.clone());
-        let (writer, blobs) = (writer.clone(), blobs.clone());
+        let (writer, blobs, access) = (writer.clone(), blobs.clone(), access.clone());
         async move {
             let path = request.uri().path().to_owned();
             let query = request.uri().query().unwrap_or_default().to_owned();
@@ -644,6 +679,8 @@ fn serve_blobs(
                     body.insert("if_graph_commit".into(), Value::String(bound));
                 }
                 writes(&body)
+            } else if let Some(access) = access.filter(|_| path.ends_with("/access")) {
+                (200, access)
             } else {
                 // A second branch, for views that follow the window to another one.
                 (200, json!({ "branches": ["main", "fix"] }))
