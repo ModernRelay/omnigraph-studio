@@ -12,6 +12,7 @@ use omnigraph_compiler::query::typecheck::{
 };
 use omnigraph_compiler::{QueryResultFieldDescriptor, QueryValueKind, describe_query_operation};
 
+use crate::lex::{Outline, TokenKind, tokenize};
 use crate::schema::SchemaModel;
 
 /// One problem in the source, with a position when the compiler gives one.
@@ -374,10 +375,80 @@ pub fn check(schema: &SchemaModel, source: &str) -> QueryCheck {
     result
 }
 
+/// The code of a declaration named like one before it in the same source.
+pub const DUPLICATE_NAME: &str = "duplicate";
+
+/// A problem for each declaration of `outline` (the outline of `source`) named like one before
+/// it, on its name. The compiler takes the copy, but the editor knows each declaration's last
+/// run, its plan and its file name by its name, so two of one name are mixed up there.
+pub fn duplicate_names(source: &str, outline: &Outline) -> Vec<Diagnostic> {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut found = Vec::new();
+    for declaration in &outline.declarations {
+        let name = declaration.name.as_str();
+        if name.is_empty() {
+            continue;
+        }
+        if !seen.contains(&name) {
+            seen.push(name);
+            continue;
+        }
+        let text = &source[declaration.range.clone()];
+        let byte = tokenize(text)
+            .into_iter()
+            .find(|token| token.kind == TokenKind::QueryName)
+            .map_or(declaration.range.start, |token| {
+                declaration.range.start + token.range.start
+            });
+        let before = &source[..byte];
+        found.push(Diagnostic {
+            code: DUPLICATE_NAME.into(),
+            message: format!("Another query above is also named `{name}`"),
+            fix: Some("give this one its own name".into()),
+            line: Some(before.matches('\n').count() as u32 + 1),
+            column: Some(
+                before
+                    .rsplit('\n')
+                    .next()
+                    .map_or(0, |line| line.chars().count()) as u32
+                    + 1,
+            ),
+            byte: Some(byte as u32),
+            query: Some(name.to_owned()),
+            edits: Vec::new(),
+        });
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::schema::tests::dev;
+
+    /// The compiler takes two declarations of one name; the second is a problem, on its name,
+    /// and so is a third. One being named (`query (`) is none.
+    #[test]
+    fn a_second_declaration_of_a_name_is_a_problem() {
+        let source = "query people() { match { $p: Person } return { $p.name } }\n\
+                      query people($slug: String) {\n  delete Person where slug = $slug\n}\n\
+                      query other() { match { $c: Company } return { $c.name } }\n\
+                      query people() { match { $p: Person } return { $p.slug } }";
+        assert!(
+            check(&dev(), source).diagnostics.is_empty(),
+            "the compiler does not refuse it"
+        );
+        let found = duplicate_names(source, &crate::lex::outline(source));
+        let at: Vec<usize> = found.iter().map(|d| d.byte.unwrap() as usize).collect();
+        let second = source.find("people($slug").unwrap();
+        let fourth = source.rfind("people()").unwrap();
+        assert_eq!(at, [second, fourth]);
+        assert_eq!(found[0].code, DUPLICATE_NAME);
+        assert_eq!((found[0].line, found[0].column), (Some(2), Some(7)));
+        assert_eq!(found[0].query.as_deref(), Some("people"));
+        let unnamed = "query a() { match { $p: Person } return { $p } }\nquery (\nquery (";
+        assert!(duplicate_names(unnamed, &crate::lex::outline(unnamed)).is_empty());
+    }
 
     #[test]
     fn a_valid_read_reports_its_columns() {

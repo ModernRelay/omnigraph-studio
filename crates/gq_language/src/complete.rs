@@ -3,11 +3,12 @@
 //! A lexical heuristic, not a parser: after `$` it offers the parameters and bindings of the
 //! declaration under the cursor; after `$var.` the bound type's properties; after `$param:` in
 //! a signature the parameter types; otherwise types, relationships (traversal spelling) and
-//! keywords that start with the word being typed.
+//! keywords that start with the word being typed. Nothing inside a comment or a string, and
+//! nothing after a `.` that follows no `$var`.
 
 use std::ops::Range;
 
-use crate::lex::{KEYWORDS, TokenKind, outline, tokenize};
+use crate::lex::{KEYWORDS, TokenKind, in_comment_or_string, outline, tokenize};
 use crate::schema::{SchemaModel, traversal_name};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +41,11 @@ pub fn completions(schema: &SchemaModel, source: &str, offset: usize) -> (usize,
     } else {
         word
     };
+    // A comment or a string is prose: nothing is offered there, so ↵ (which confirms a shown
+    // completion) ends the line instead of putting a type name in it.
+    if in_comment_or_string(source, offset) {
+        return (start, Vec::new());
+    }
     let prefix = &source[start..offset];
     let lower = prefix.to_lowercase();
     let matches = |label: &str| label.to_lowercase().starts_with(&lower);
@@ -137,6 +143,8 @@ pub fn completions(schema: &SchemaModel, source: &str, offset: usize) -> (usize,
             }
             return (start, items);
         }
+        // Any other `.` (a number's, a sentence's) is followed by nothing a schema names.
+        return (start, Vec::new());
     }
 
     let mut items = Vec::new();
@@ -496,6 +504,52 @@ mod tests {
         let (_, items) = completions(&schema, &typed, typed.len());
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "ids");
+    }
+
+    /// A comment or a string is prose: nothing is offered in it, so ↵ at the end of
+    /// `// see the docs.` or `// group by company` ends the line rather than putting `Company`
+    /// there. Past a closed one, completion offers again.
+    #[test]
+    fn nothing_is_offered_in_a_comment_or_a_string() {
+        let schema = dev();
+        for source in [
+            "// see the docs.",
+            "// group by company",
+            "query q() { match { $p: Person } return { $p.name } } // $p.na",
+            "/* the Pe",
+            "query q() { match { $p: Person { name: \"Pe",
+            "query q() @description(\"people by comp",
+        ] {
+            let (_, items) = completions(&schema, source, source.len());
+            assert!(items.is_empty(), "{source}: {items:?}");
+        }
+        let after = |source: &str| -> Vec<String> {
+            let (_, items) = completions(&schema, source, source.len());
+            items.into_iter().map(|item| item.label).collect()
+        };
+        assert!(after("/* people */ query q() { match { $p: Pe").contains(&"Person".to_owned()));
+        assert!(
+            after("query q() { match { $p: Person { name: \"Ada\" } $p wo")
+                .contains(&"worksAt".to_owned())
+        );
+    }
+
+    /// After a `.` only a variable's fields follow: a number's or a sentence's dot offers
+    /// nothing, where it offered every type.
+    #[test]
+    fn a_dot_offers_only_a_variables_fields() {
+        let schema = dev();
+        for source in [
+            "query q() { match { $p: Person } return { $p.name } limit 1.",
+            "Person.",
+            "query q() { match { $p: Person } return { p.",
+        ] {
+            let (_, items) = completions(&schema, source, source.len());
+            assert!(items.is_empty(), "{source}: {items:?}");
+        }
+        let source = "query q() { match { $p: Person } return { $p.";
+        let (_, items) = completions(&schema, source, source.len());
+        assert!(items.iter().any(|item| item.label == "name"), "{items:?}");
     }
 
     #[test]

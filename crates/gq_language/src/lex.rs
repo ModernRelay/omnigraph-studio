@@ -516,12 +516,14 @@ pub fn outline(source: &str) -> Outline {
 }
 
 impl Outline {
-    /// The declaration to run for a cursor at `offset`: the one containing it, else the last
-    /// one before it, else the first.
+    /// The declaration to run for a cursor at `offset`: the one whose range holds it, its end
+    /// excluded, else the last one ending at or before it, else the first. The end is excluded
+    /// because an unclosed declaration ends where the next one starts: that byte is the next
+    /// one's, so the Run line above it runs it.
     pub fn declaration_at(&self, offset: usize) -> Option<&Declaration> {
         self.declarations
             .iter()
-            .find(|d| d.range.start <= offset && offset <= d.range.end)
+            .find(|d| d.range.contains(&offset))
             .or_else(|| {
                 self.declarations
                     .iter()
@@ -546,6 +548,38 @@ impl Outline {
         text.push_str(&source[declaration.range.clone()]);
         text
     }
+}
+
+/// Whether text typed at `offset` goes into a comment or a string: inside one, or at the end of
+/// one still open. A line comment runs to the end of its line, so its end is inside it.
+pub fn in_comment_or_string(source: &str, offset: usize) -> bool {
+    tokenize(source).into_iter().any(|token| {
+        let text = &source[token.range.clone()];
+        let open = match token.kind {
+            TokenKind::Comment => {
+                text.starts_with("//") || !(text.len() >= 4 && text.ends_with("*/"))
+            }
+            TokenKind::String => !string_is_closed(text),
+            _ => return false,
+        };
+        token.range.start < offset
+            && (offset < token.range.end || (open && offset == token.range.end))
+    })
+}
+
+/// Whether a string token ends with its closing quote, read as [`tokenize`] reads it: a
+/// backslash takes the byte after it, and the first other `"` ends the string.
+fn string_is_closed(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return i + 1 == bytes.len(),
+            _ => i += 1,
+        }
+    }
+    false
 }
 
 /// Whether a declaration's text writes, judged from its words alone: an `insert`, `update` or
@@ -781,6 +815,43 @@ mod tests {
             .map(|d| d.name)
             .collect();
         assert_eq!(names, ["a", "b"]);
+    }
+
+    /// An unclosed declaration ends where the next one starts, and that byte is the next one's:
+    /// the Run line above the second sets the cursor there and runs the second.
+    #[test]
+    fn a_declaration_starts_where_an_unclosed_one_before_it_ends() {
+        let source = "query a() {\n  match { $p: Person }\n  return { $p.name }\n\nquery b() {\n  match { $c: Company }\n  return { $c.name }\n}\n";
+        let outline = outline(source);
+        let (a, b) = (&outline.declarations[0], &outline.declarations[1]);
+        assert_eq!(a.range.end, b.range.start, "a runs on to b");
+        assert_eq!(outline.declaration_at(b.range.start).unwrap().name, "b");
+        assert_eq!(outline.declaration_at(b.range.start - 1).unwrap().name, "a");
+        // Past the last one's end, the last one is still the one to run.
+        assert_eq!(outline.declaration_at(source.len()).unwrap().name, "b");
+    }
+
+    /// Text typed inside a comment or a string, or at the end of one still open, goes into it;
+    /// typed after a closed one, it does not.
+    #[test]
+    fn comments_and_strings_hold_what_is_typed_in_them() {
+        let at_end = |source: &str| in_comment_or_string(source, source.len());
+        assert!(at_end("// see the docs."));
+        assert!(at_end("query q() {} // group by company"));
+        assert!(at_end("/* open"));
+        assert!(at_end("query q() { match { $p: Person { name: \"Ad"));
+        assert!(at_end("query q() @description(\"for comp"));
+        assert!(at_end("\"a \\\""), "an escaped quote does not close it");
+        assert!(!at_end("/* closed */"));
+        assert!(!at_end("query q() { match { $p: Person { name: \"Ada\""));
+        assert!(!at_end("query q() { match { $p: Pe"));
+        let source = "// note\nquery";
+        assert!(in_comment_or_string(source, 3));
+        assert!(
+            !in_comment_or_string(source, 0),
+            "before the comment starts"
+        );
+        assert!(!in_comment_or_string(source, source.len()));
     }
 
     #[test]
