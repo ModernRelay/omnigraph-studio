@@ -31,7 +31,7 @@ pub struct SettingField {
 }
 
 /// Where the settings tab reads and writes: the shared document, or one graph's overrides
-/// under `graphs` (the key from [`crate::graph_key`]).
+/// under `graphs` (the key from [`crate::overrides_key`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
     All,
@@ -473,7 +473,7 @@ mod tests {
         let page = field("studio.tree_page_size");
         assert!(page.per_graph);
         assert!(!field("studio.health_check_seconds").per_graph);
-        let scope = Scope::Graph("dev/knowledge".into());
+        let scope = Scope::Graph(crate::overrides_key("http://127.0.0.1:8787", "knowledge"));
         let settings = StudioSettings::default();
         assert_eq!(
             *settings.values().value_in(&scope, page),
@@ -489,7 +489,12 @@ mod tests {
         );
         assert!(!changed.values().is_default_in(&scope, page));
         assert!(changed.values().is_default_in(&Scope::All, page));
-        assert_eq!(changed.for_graph("dev", "knowledge").tree_page_size, 20);
+        assert_eq!(
+            changed
+                .for_graph("http://127.0.0.1:8787", "knowledge")
+                .tree_page_size,
+            20
+        );
         let cleared = changed.reset_in(&scope, page);
         assert!(
             cleared.graphs.is_empty(),

@@ -105,8 +105,8 @@ a 412 reopens the draft.
   and writes edit only the keys that changed (`studio_settings::document`).
 - `studio_theme` sets up Zed's `theme_settings` with Zed's themes and the ones Studio bundles
   (Studio Light and Dark, the defaults, written by `script/studio-theme.py` from Vitesse Refined
-  with interfaces.dev's greys; Vitesse Refined itself), and adds graph tokens: one color per node type,
-  edge colors, diff colors. Its asset source serves Nucleo drawings for the Zed icon paths
+  with interfaces.dev's greys; Vitesse Refined itself), and adds one graph token: a color per node
+  or edge type (`type_color`). Its asset source serves Nucleo drawings for the Zed icon paths
   `studio_theme::icons` lists, so every `IconName` Studio or Zed's components draw is Tower's
   icon (spec 002, "Icons").
 

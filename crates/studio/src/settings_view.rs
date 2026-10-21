@@ -47,10 +47,10 @@ pub struct SettingsView {
     _subscriptions: Vec<Subscription>,
 }
 
-/// The settings key and name a graph is offered as a scope by.
+/// The `graphs` key and name a graph is offered as a scope by.
 pub fn graph_scope(session: &Entity<GraphSession>, cx: &App) -> (String, String) {
     let session = session.read(cx);
-    (session.settings_key(cx), session.graph_id.clone())
+    (session.overrides_key(cx), session.graph_id.clone())
 }
 
 /// A dropdown's choices: each label and the value it sets.

@@ -208,7 +208,10 @@ and Delta's sidebar.
 
 - **Studio's own index.** Like Zed's metadata store, Studio keeps the list itself
   (`agent/sessions.json` in the data directory, owner-only, format 2): per conversation, the
-  agent's session id, the graph, the agent command, its title, when it started, the last
+  agent's session id, the graph (its one key, `<server url>/<graph id>`, since 2026-10-20; a
+  record filed under its server's name is filed under the key when the index loads, once, if
+  the name is a server Studio knows, and keeps its working directory), the agent command, its
+  title, when it started, the last
   message the person sent, the agent branch its changes go to, and whether it is pinned or
   archived. Ids and titles only; the conversation stays with the agent. The agent's own
   `session/list` is not the source: every graph's agent works in the same directory, so it
@@ -364,6 +367,7 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 | 2026-10-20 | A conversation that asked for the session before the close was sent is freed by the close, not told to try again | `agent_panel` `a_conversation_waiting_before_the_close_is_sent_is_freed_by_the_close` (new), `a_conversation_waits_for_a_start_given_up_only_so_long` (its close step now waits); run on macOS | Before the fix the new test failed with `Err(Late { closing: true })`: the waiter's own bound, started at its claim and shorter than the close's, ran out while the close was under way. After it the waiter waited past its own bound (1 s) and was routed once the close was overdue (2 s after sending, no sooner); a waiter for an open still hears "try again" at its bound |
 | 2026-10-20 | A sessions or preferences file Studio could not read is never written over | `agent_panel` `a_file_that_could_not_be_read_is_never_written_over`, `a_preferences_file_that_could_not_be_read_is_never_written_over` (run on macOS; a folder at each name the file would be set aside as stands in for a program holding it); `a_file_another_program_holds_is_never_written_over` (Windows only: a handle without delete sharing, then without any; runs in CI on `windows-2025`, not run here) | Before the fix: a sessions file that was not UTF-8 was not set aside, and both files were written over when the rename failed. After it: a file that is not text is set aside like one that does not parse; one that cannot be set aside stays byte for byte through a save, the changes kept in memory, and `not_saved` names it for the Conversations panel's note |
 | 2026-10-20 | On Windows agents work in the local application folder | `agent_panel` `agents_work_in_the_local_folder_of_studios_roaming_data` (run on macOS) | A data folder under `%APPDATA%`, local or on a `\\server\share`, maps to the same name under `%LOCALAPPDATA%`; a data folder set elsewhere keeps its agents |
+| 2026-10-20 | Conversations follow the graph's key, and an old one resumes where it ran | `agent_panel` `conversations_filed_by_server_name_move_to_the_graphs_key` (records written as a build before wrote them, loaded with the server list `dev` → `http://127.0.0.1:8787`); `graph_store` `a_name_resolves_only_to_a_known_server`; the panel's working directory now `sessions::working_dir` (`panel.rs`, `start`), the record's own `cwd` when resuming | `dev/crm` became `http://127.0.0.1:8787/crm`, its `cwd` still `graph_cwd("dev/crm")`, and `latest` found it under the key; a new conversation gets `graph_cwd` of the key, another directory; `gone/crm`, a name no server has, stayed; the next load read the record under the key. Import lists only the key's directory, so a conversation the agent has in the old directory and the list lacks is not offered. Not yet seen in the running app |
 
 ## Corrections
 

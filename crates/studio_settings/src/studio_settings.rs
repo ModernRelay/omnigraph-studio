@@ -261,7 +261,7 @@ pub struct GraphOptions {
 /// names"): what a chip's "Show as", a table's "Name rows by" and the settings tab offer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeNaming {
-    /// The graph's `graphs` key ([`graph_key`]).
+    /// The graph's `graphs` key ([`overrides_key`]).
     pub graph: String,
     pub type_name: String,
     /// The property chosen for this graph, when one is and it can name a node.
@@ -282,10 +282,12 @@ impl TypeNaming {
     }
 }
 
-/// The `graphs` key for a graph on a server: `<server name>/<graph id>`, as the settings tab
-/// writes it.
-pub fn graph_key(server: &str, graph: &str) -> String {
-    format!("{server}/{graph}")
+/// A graph's one key: its server's address and its id, `<server url>/<graph id>`, as a window
+/// keeps the graph's tabs. Its `graphs` settings, its saved queries' folder ([`queries_dir`])
+/// and its agent conversations are kept under it, so a server renamed in the CLI's config
+/// keeps them all.
+pub fn overrides_key(server_url: &str, graph: &str) -> String {
+    format!("{}/{graph}", server_url.trim_end_matches('/'))
 }
 
 /// The agent the agent panel runs (spec 011): a program and its arguments, and extra
@@ -351,7 +353,8 @@ pub struct StudioSettings {
     pub studio: StudioOptions,
     #[schemars(extend("x-section" = "Agent"))]
     pub agent: AgentSettings,
-    /// Per-graph overrides, keyed by [`graph_key`]; edited in the settings tab's graph scope.
+    /// Per-graph overrides, keyed by [`overrides_key`]; edited in the settings tab's graph
+    /// scope.
     #[schemars(extend("x-hidden" = true))]
     pub graphs: BTreeMap<String, GraphOverrides>,
     /// Panels moved from their own dock, by panel id (`explore`, `history`, …); edited from a
@@ -498,8 +501,8 @@ fn is_test_binary(exe: &std::path::Path) -> bool {
     in_deps && (hashed || is_build_output(exe))
 }
 
-/// Where a graph's saved queries live (spec 007): one folder per [`graph_key`] under the data
-/// directory, its name made safe for any file system.
+/// Where a graph's saved queries live (spec 007): one folder per graph key ([`overrides_key`])
+/// under the data directory, its name made safe for any file system.
 pub fn queries_dir(graph: &str) -> PathBuf {
     let safe: String = graph
         .chars()
@@ -546,7 +549,7 @@ impl StudioSettings {
         cx.global::<Self>()
     }
 
-    /// The views saved for one type of a graph (key from [`graph_key`]).
+    /// The views saved for one type of a graph (key from [`overrides_key`]).
     pub fn views_for(&self, graph: &str, type_name: &str) -> Vec<SavedView> {
         self.graphs
             .get(graph)
@@ -605,9 +608,9 @@ impl StudioSettings {
         self.graphs.retain(|_, overrides| !overrides.is_empty());
     }
 
-    /// The limits in effect for `graph` on the server named `server`.
-    pub fn for_graph(&self, server: &str, graph: &str) -> GraphOptions {
-        let own = self.graphs.get(&graph_key(server, graph));
+    /// The limits in effect for `graph` on the server at `server_url`.
+    pub fn for_graph(&self, server_url: &str, graph: &str) -> GraphOptions {
+        let own = self.graphs.get(&overrides_key(server_url, graph));
         let pick = |get: fn(&GraphOverrides) -> Option<u32>, fallback: u32| {
             own.and_then(get).unwrap_or(fallback)
         };
@@ -1177,14 +1180,19 @@ mod tests {
         let settings = StudioSettings::parse(
             r#"{
                 "studio": {"canvas_max_nodes": 3000},
-                "graphs": {"dev/knowledge": {"tree_page_size": 10}}
+                "graphs": {"http://127.0.0.1:8787/knowledge": {"tree_page_size": 10}}
             }"#,
         )
         .unwrap();
-        let dev = settings.for_graph("dev", "knowledge");
+        let dev = settings.for_graph("http://127.0.0.1:8787", "knowledge");
         assert_eq!(dev.tree_page_size, 10, "the graph's own value");
         assert_eq!(dev.canvas_max_nodes, 3000, "else the shared value");
-        let other = settings.for_graph("prod", "knowledge");
+        assert_eq!(
+            settings.for_graph("http://127.0.0.1:8787/", "knowledge"),
+            dev,
+            "a trailing slash names the same server"
+        );
+        let other = settings.for_graph("https://prod.example", "knowledge");
         assert_eq!(other.tree_page_size, 50, "a key names one server's graph");
     }
 
@@ -1233,8 +1241,11 @@ mod tests {
 
     #[test]
     fn query_folders_are_safe_names_per_graph() {
-        let dir = queries_dir("environment/knowledge");
-        assert!(dir.ends_with("queries/environment~knowledge"), "{dir:?}");
+        let dir = queries_dir(&overrides_key("http://127.0.0.1:8787", "knowledge"));
+        assert!(
+            dir.ends_with("queries/http_~~127.0.0.1_8787~knowledge"),
+            "{dir:?}"
+        );
         assert!(queries_dir("http://a b/g").ends_with("queries/http_~~a_b~g"));
     }
 

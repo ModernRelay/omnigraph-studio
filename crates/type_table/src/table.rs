@@ -1065,7 +1065,7 @@ impl TypeTable {
 
     /// This type's saved views in this graph.
     fn saved_views(&self, cx: &App) -> Vec<studio_settings::SavedView> {
-        let graph = self.session.read(cx).settings_key(cx);
+        let graph = self.session.read(cx).overrides_key(cx);
         cx.try_global::<studio_settings::StudioSettings>()
             .map(|settings| settings.views_for(&graph, &self.type_name))
             .unwrap_or_default()
@@ -1137,7 +1137,7 @@ impl TypeTable {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
-        let graph = self.session.read(cx).settings_key(cx);
+        let graph = self.session.read(cx).overrides_key(cx);
         let view = self.current_view();
         let taken = self
             .saved_views(cx)
@@ -1848,7 +1848,7 @@ impl TypeTable {
             || self.grouping.is_some()
             || self.layout != ColumnLayout::default();
         let table = cx.entity().downgrade();
-        let graph = self.session.read(cx).settings_key(cx);
+        let graph = self.session.read(cx).overrides_key(cx);
         let type_name = self.type_name.clone();
         let names = match self.kind {
             TableKind::Node => self.session.read(cx).type_naming(&self.type_name, cx),
@@ -9795,7 +9795,7 @@ mod tests {
                 .cell_editor
                 .update(cx, |editor, cx| editor.set_text("Ada L", window, cx));
         });
-        let graph = session.read_with(cx, |session, cx| session.settings_key(cx));
+        let graph = session.read_with(cx, |session, cx| session.overrides_key(cx));
         cx.update(|_, cx| {
             cx.update_global::<studio_settings::StudioSettings, _>(|settings, _| {
                 settings.set_label(&graph, "Person", Some("slug".into()))

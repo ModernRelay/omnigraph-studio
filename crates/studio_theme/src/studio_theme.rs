@@ -1,5 +1,5 @@
-//! Zed's settings, themes and assets, set up for Studio, plus graph tokens (node-type palette,
-//! edge and diff colors).
+//! Zed's settings, themes and assets, set up for Studio, plus the one graph token: a colour per
+//! node or edge type ([`type_color`]).
 //!
 //! Layer 1 (`docs/architecture.md`). Plan: `specs/002-app-shell/plan.md`.
 //!

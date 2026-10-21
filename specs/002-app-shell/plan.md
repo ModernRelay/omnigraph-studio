@@ -130,7 +130,9 @@ title bar; Ragnor's choice over a Zed-style title bar) over one status bar acros
 - ⇧⎋ (`studio::ToggleZoom`) zooms the active pane over the document area, with Zed's 8 px
   inset, a border and a float shadow; the right and bottom docks' headers have a zoom button
   too. Pressing it again, showing a tab of another pane, or hiding the zoomed dock ends the
-  zoom. A zoomed header keeps room for the traffic lights.
+  zoom. A zoomed header keeps room for the traffic lights. ⇧⎋ and every zoom button take the
+  keyboard from what the zoom covers: a zoomed pane's tab takes it from a dock's panel or
+  another pane, a zoomed dock's panel from a tab or another dock.
 - Each graph keeps its own docks: showing a graph again from the switcher brings back its docks
   as it left them (open, active panel, size), not the shown graph's; before, only a graph
   opened fresh read its saved docks.
@@ -335,7 +337,10 @@ Its action is not registered, so the palette and the keyboard button's list leav
     doc comment's lines read as one paragraph. Only `agent.env` (a map) and `graphs` stay in
     `settings.json` alone. The nav counts changed settings per section;
     search spans every section; the search box has focus when the tab opens.
-  - Per-graph overrides: `graphs."<server name>/<graph id>"` holds a graph's own values for
+  - Per-graph overrides: `graphs."<server url>/<graph id>"`, the graph's one key, which also
+    files its saved queries (spec 007) and agent conversations (spec 011) (since 2026-10-20;
+    before, the server's name, which a rename in the CLI's config lost; `graph_store::named_keys`
+    moves what was under a known server's name once, as the graph opens) holds a graph's own values for
     the settings marked `x-per-graph` (table and relationship page sizes, canvas node limit).
     With a graph open, the tab's scope switch ("All graphs" | the graph) shows only those,
     writes the graph's own value, and Reset removes it; an own value's description names the
@@ -344,7 +349,7 @@ Its action is not registered, so the palette and the keyboard button's list leav
     Studio shows it: a canvas chip, a tree row, the inspector's title, a table's relationship
     cell, the palette. By default that is `name`, `title`, `display_name` or `label`, else the
     key (`NodeType::default_label_property`); a graph may choose another of the type's single
-    text properties, kept in `graphs."<server>/<graph>".labels` (`{"Person": "title"}`). The
+    text properties, kept in `graphs."<server url>/<graph>".labels` (`{"Person": "title"}`). The
     choice lives on the schema model (`NodeType::label`, applied by
     `SchemaModel::with_labels`), so every caller of `NodeType::label_property` follows it:
     the session applies the graph's choices when it takes a schema and again when the
@@ -429,6 +434,12 @@ and a 97 % fill let the text behind show through.
 
 - Silent success for routine work. A toast only after a durable publish, with one follow-up
   ("Committed to feature-x · View commit"); 10 s, paused on hover.
+- A write's follow-up (View commit, Undo, Open history) names the graph written to, by its
+  server's address and id as tabs identify it, and the branch, and acts there whatever the
+  window shows when it is pressed: the window shows that graph on that branch first, bringing
+  it back if it is parked. A graph closed since is named, and nothing runs (since 2026-10-20;
+  before, it acted on the graph and branch shown, so "Open history" for an unknown outcome on
+  `fix` could show another graph's or main's history).
 - Errors as notifications that say what happened and what to do; they stay until dismissed.
 - The activity log (bottom dock) keeps every write with its outcome.
 
@@ -497,6 +508,12 @@ than styling one-off elements.
   (a table's rows, query results, settings rows, a queue, storage's sections, a feed's date
   rule) is `ds::dotted`: dotted on glass, as Tower's feeds, solid when flat. A region's edge
   (a toolbar's, a strip's, a pane's, the composer's) is solid in both styles.
+- **Ink on glass** (since 2026-10-20). What glass lays over a sheet (the rule, a well, the
+  selected and hovered rows, an inactive tab) is black in a light theme and white in a dark
+  one, at the same strengths (`surface::ink`): a dark theme's sheet is its own dark surface
+  (`surface::glass`), where black ink moved the sheet by less than a level, so selection,
+  hover and rules did not show. A selected sidebar row's drops (`elevation::raised`) stay
+  none in a dark theme, as interfaces.dev's dark `--shadow-custom` is its ring alone.
 - **One document fill** (since 2026-10-18). Every tab sits on `surface::document`, which the
   pane paints, not the view: before, the table, schema, agent and canvas were white while a
   query, History, Storage and Settings showed the glass sheet through.
@@ -510,8 +527,8 @@ than styling one-off elements.
   branch's lane recede by one opacity, `ds::opacity::DIMMED`; what lies away from the
   canvas's focus, its chips and their lines' labels alike, by `ds::opacity::FAR` (they were
   0.3 and 0.25). Colours a view used to derive
-  itself are surface roles: the canvas's here-ring and its halo, a pointed chip's hairline,
-  the dot grid, the marquee, a highlighted span of query text, rows picked beside the cursor's,
+  itself are surface roles: the canvas's here-ring and its halo (a pointed chip is lifted by
+  its shadow, `elevation::Lift::Hover`, not a hairline), the dot grid, the marquee, a highlighted span of query text, rows picked beside the cursor's,
   a card's hairline (also its footer's rule).
 - **Hover and selection by kind** (since 2026-10-19, when the inspector's and the query
   problems' rows hovered with the control fill, half again darker than a table's or the
@@ -751,6 +768,15 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-20 | A write's toast acts on the graph and branch written to | `studio_workspace` `a_toasts_follow_up_acts_on_the_graph_and_branch_written_to` (two graphs on fakes answering 404, each with a tab that holds its focus); run once with the window's focus left on the shown graph's undrawn tab | Open history for an unknown outcome on notes/fix, pressed with people shown, showed notes on fix and ran there, notes' tab with the keyboard; pressed after notes moved to main, back on fix; Undo for a delete in parked people ran in people on main, people's tab with the keyboard; with people closed, nothing ran and the toast read "Nothing was done: people is no longer open in this window…". With the focus left on the undrawn tab the action reached no handler (`left: None`), which the fix dispatches from the window to avoid |
+| 2026-10-20 | The zoom buttons hand the keyboard over as ⇧⎋ does | `studio_workspace` `a_hidden_or_covered_dock_gives_the_keyboard_back_from_any_field_of_its_panel`, extended with clicks (`simulate_click`) on `zoom-pane-0` and `zoom-dock-Bottom` | The pane's button zoomed out, then zoomed in with the keyboard in the activity panel's field and gave it to the tab; the bottom dock's button took it from the tab to the dock's panel. Before, both buttons set the zoom alone |
+| 2026-10-20 | Glass states show in a dark theme | `studio_ui` `glass_takes_the_dark_themes_surface_and_its_states_show_on_it` (each state composited over the light style's `#fcfbfc` and Studio Dark's `#101010`); an offscreen 2x snapshot in Studio Dark with `window_style: glass` on a scratch `script/dev-server` (Person's table open, the pointer on Knows), sampled by pixel | Every state moves its sheet by 3 or more levels in both themes (a well, the faintest: 3.8 light, 3.6 dark); black at the selected row's 5 % moved the dark sheet 0.8 of a level, which is why selection, hover, rules and wells did not show. In the snapshot the sidebar sheet reads 14, the selected Person row 26 and the hovered Knows row 20; the table's dotted rule reads 45 over a cell at 11 |
+| 2026-10-20 | One key per graph: settings, saved queries and conversations under `<server url>/<graph id>` | `graph_store` `named_keys` tests (`a_name_resolves_only_to_a_known_server`, `settings_kept_under_a_servers_name_move_to_its_address_once`, `saved_queries_move_to_the_graphs_key_without_writing_over_one`, `a_graph_opening_takes_its_saved_queries_along`); `studio_settings` `a_graph_takes_its_own_limits_then_the_shared_ones`, `a_graph_scope_writes_and_clears_its_own_override`; `agent_panel` `conversations_filed_by_server_name_move_to_the_graphs_key`; `GraphSession::settings_key` and `studio_settings::graph_key` removed, every caller on `overrides_key` | `dev/knowledge` moved to `http://127.0.0.1:8787/knowledge` with its limit and node name, once, and never over an entry the address had; a trailing slash names the same server. The session-level settings move writes through `studio_settings::update`, which tests refuse, so only its pure part is tested. Aliases stay keyed by the CLI target's name. Not yet seen in the running app on a renamed target |
+| 2026-10-20 | Dead tokens and stale docs | `grep` over `crates/`: `surface::raised_border` and `surface::pointed_border` had no caller (the canvas lifts a pointed chip with `elevation::Lift::Hover`); `studio_theme` exports only `type_color` | Both tokens removed; the `studio_theme` crate doc and `docs/architecture.md` name the one graph token, not edge and diff colours |
+| 2026-10-20 | ⌘P reads a bounded number of node types and shows each as it answers, in place | `command_palette` tests `node_types_show_as_they_answer_and_keep_their_place` (three types, the first sent answering last; red when the rows wait for every type, as they did), `a_search_reads_a_bounded_number_of_types_and_offers_the_rest` (ten named types and two found by key), `new_text_stops_the_reads_for_the_old`, `named_types_are_searched_first_and_empty_ones_last`, `the_palette_shows_it_is_searching_nodes`, all on fakes sending `graph_client::CONTRACT`; the earlier search, which awaited each type's read in schema order before showing any | Rows came in as n2, then n2 n1, then n2 n1 n0, none moving; a pause sent 8 reads and "Search 4 more types" held Named8, Named9, Code0 and Code1, which ↵ read with the palette open; new text dropped the 3 reads under way (the session's count back to 0) and only its own answers showed. Not yet seen against a large graph in the running app |
+| 2026-10-20 | The settings tab lists fonts off the main thread | `studio` test `fonts_are_listed_off_the_main_thread`; Zed `v1.23.2` `crates/theme/src/font_family_cache.rs` (`prefetch` lists `all_font_names` on the background executor) and `crates/gpui_macos/src/text_system.rs` (`all_font_names` walks every font descriptor through Core Text) | Before, the first frame of Appearance listed and sorted the fonts on the main thread. Now the list is asked for when a tab opens, once for all tabs, is not there until the background task lands, and a font field offers Default and the font chosen meanwhile. The listing's time on this machine was not measured |
+| 2026-10-20 | Stored queries and their aliases open from the palette | `command_palette` test `stored_queries_are_listed_in_the_queries_scope` (a catalog of `people_titled` with a description and `set_title` as a mutation) | Queries listed both; the first row's action is `OpenStoredQuery { name: "people_titled", alias: None }` and the footer shows its description. Aliases come from the registry's CLI config, which no test has: they are read with `aliases_for`, as the panel reads them |
+| 2026-10-20 | An action the credential may not take is disabled, says why and is not offered | Fakes answering `/graphs/{id}/access` with `{"graph_id": …, "actor": …, "graph_wide": ["read"], "actions": ["read"]}` and the contract header: `type_table` `a_branch_the_credential_may_not_change_offers_no_writes`, `a_page_on_a_branch_the_credential_may_not_change_sends_nothing`, `a_tab_at_a_commit_or_on_a_refused_branch_writes_nothing`, `a_text_on_a_refused_branch_is_not_saved`, `a_blob_is_written_only_where_it_can_be_and_says_why_not`; `review` `a_merge_the_credential_may_not_make_is_not_offered`; `studio_workspace` `a_branch_the_credential_may_not_change_reads_read_only`, `a_conditional_action_is_registered_only_while_it_holds`; `graph_store` `a_refusal_names_the_action_and_its_branches`; clippy on the seven crates; not yet seen in the running app against a server with a read-only policy | Refused on main: Edit, New row, Delete row, Save drafts, Choose File and Clear not available where the keyboard is and gone from the keys (Peek, Open page, Explore, Copy, Filter by this value, Refresh stay); a click on a value peeks; no write sent, the file refused with "Your credential may not change main", the draft kept. Unknown (the route unreadable): all six available. A review of feature → main read the route once, Merge not available, no dry run or merge sent, the branch not deleted with it. The bar showed no "read only" before an answer or on fix, and showed it on main; the chip's tooltip named act-ada |
 | 2026-10-20 | Studio's greys are interfaces.dev's | Its `--color-gray-*`, `--color-gray-background` and `--color-preview-*`, light and dark (`_next/static/immutable/chunks/26aw_19s171nu.css`); `script/studio-theme.py`; `studio_theme` test `studio_themes_are_listed_and_read_as_families`; `studio` test `settings_apply`; offscreen snapshots of Settings, the table, History and the ontology in Studio Light and Studio Dark | Text `#202020`, muted `#646464`, placeholders `#bbb`, borders `#e8e8e8`, chrome `#fcfcfc` and documents white; dark `#101010`, `#0b0b0b`, `#191919`, text `#eee`, rings 8 % white. Vitesse's syntax and status colours kept |
 | 2026-10-20 | An on switch shows its knob | Offscreen snapshots of Settings' "Show memory and CPU", light and dark; Zed `v1.23.2` `crates/ui/src/components/toggle.rs` (`thumb_color = base_color`, the text colour) | Before, a dark pill in a grey frame with no knob; now an ink track with a white knob (dark: a light track with a dark knob) |
 | 2026-10-20 | Shadows and borders are interfaces.dev's | Its stylesheets (`_next/static/immutable/chunks/26aw_19s171nu.css`: `--shadow-custom`, `-hover`, `-active`, `--shadow-border`, the `.dark` values); a reference page with those values at whole pixels, captured at 2x in the app's browser; offscreen 2x snapshots of the design gallery | Out from a card's bottom edge, the CSS reads 226, 232, 245, 252, 249, 250 and Studio 226, 230, 247, 249, 251, 251; from its left edge 232, 239, 249, 254 and 235, 236, 252, 253. With the ring drawn as the element's border the bottom edge had read 240, 240, 247: the fill hid the drops. Workspace Clippy (`-D warnings`), 609 tests, and the design-token and layer guards pass |

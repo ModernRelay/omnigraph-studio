@@ -101,7 +101,7 @@ pub fn open(
         workspace.activate_item_by_id(panel.entity_id(), window, cx);
         return Some(panel);
     }
-    let graph = workspace.session()?.read(cx).settings_key(cx);
+    let graph = workspace.session()?.read(cx).overrides_key(cx);
     let agent = StudioSettings::get(cx).agent.command.join(" ");
     let sessions = AgentSessions::global(cx);
     let latest = sessions
@@ -947,13 +947,9 @@ impl AgentPanel {
             }
             saved => saved,
         };
-        // A conversation runs where it ran before; any other in the graph's own directory.
-        let cwd = match &saved {
-            Some(saved) => saved.cwd.clone(),
-            None => crate::sessions::graph_cwd(&self.session.read(cx).settings_key(cx)),
-        };
+        let graph_key = self.session.read(cx).overrides_key(cx);
+        let cwd = crate::sessions::working_dir(saved.as_ref(), &graph_key);
         let base = self.session.read(cx).branch.clone();
-        let graph_key = self.session.read(cx).settings_key(cx);
         // A resumed conversation keeps writing to its branch.
         let branch = match &saved {
             Some(saved) => AgentBranch {
@@ -1237,7 +1233,7 @@ impl AgentPanel {
         let now = chrono::Utc::now();
         let record = SessionRecord {
             session: session.clone(),
-            graph: self.session.read(cx).settings_key(cx),
+            graph: self.session.read(cx).overrides_key(cx),
             agent: Self::command(cx).join(" "),
             title: None,
             title_override: None,

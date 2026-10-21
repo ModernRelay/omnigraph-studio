@@ -60,14 +60,18 @@ pub fn init(cx: &mut App) {
         let handle = cx.entity();
         let session = workspace.session().cloned();
         let tree = cx.new(|cx| RelationshipTree::new(&handle, session, window, cx));
+        let view: gpui::AnyView = tree.clone().into();
         workspace.add_panel(
             PanelPosition::Left,
             EXPLORE_PANEL,
             "Explore",
             IconName::ListTree,
-            tree.clone().into(),
+            view.clone(),
             cx,
         );
+        // The tree is a list that draws only its rows in view, sized from whichever dock it is
+        // in, so the row the keyboard selects scrolls into what shows.
+        workspace.set_panel_scrolls_itself(&view, cx);
         let actions = cx.new(|cx| ExploreActions::new(&tree, cx));
         workspace.set_panel_actions(EXPLORE_PANEL, actions.into(), cx);
         // Shown from its button or its key, the tree takes the keyboard.
@@ -1009,6 +1013,9 @@ impl RelationshipTree {
 
         h_flex()
             .id((if sticky { "sticky-row" } else { "tree-row" }, row))
+            .when(!sticky, |d| {
+                d.debug_selector(move || format!("tree-row-{row}"))
+            })
             .group("tree-row")
             .w_full()
             .h(px(ROW_HEIGHT))
@@ -1182,6 +1189,7 @@ impl RelationshipTree {
         let field = studio_ui::ds::surface::sunken(cx);
         Some(
             v_flex()
+                .flex_none()
                 .px(px(space::MD))
                 .pb(px(space::XS))
                 .gap(px(space::XS))
@@ -1274,12 +1282,9 @@ impl RelationshipTree {
         });
     }
 
-    fn render_list(
-        &self,
-        height: Pixels,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    /// The rows, in what the panel leaves below its header: the tree sizes itself from its
+    /// dock, so the row the keyboard selects is scrolled into what shows.
+    fn render_list(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let focused = self.focus_handle.contains_focused(window, cx);
         let indent_colors = IndentGuideColors::panel(cx);
         let sticky_colors = IndentGuideColors::panel(cx);
@@ -1332,7 +1337,10 @@ impl RelationshipTree {
         )
         .with_sizing_behavior(ListSizingBehavior::Auto)
         .track_scroll(&self.scroll_handle)
-        .h(height)
+        .debug_selector(|| "relationship-tree-list".into())
+        .flex_1()
+        .min_h_0()
+        .pb(px(space::MD))
         .into_any_element()
     }
 }
@@ -1358,7 +1366,8 @@ impl Render for RelationshipTree {
             .id("relationship-tree-root")
             .key_context(context)
             .track_focus(&self.focus_handle)
-            .w_full()
+            // The dock's host gives the tree its size (it scrolls itself).
+            .size_full()
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::expand))
@@ -1390,11 +1399,10 @@ impl Render for RelationshipTree {
                 .into_any_element();
         }
 
+        // The header (a breadcrumb that may wrap, Refresh, the filter) as tall as it is; the
+        // rows take the rest of the dock.
         let header = self.render_header(cx);
-        // The tree fills the sidebar below the section title; other sections scroll above it.
-        let chrome = px(38. + 24. + 32.) + if header.is_some() { px(56.) } else { px(0.) };
-        let height = (window.viewport_size().height - chrome).max(px(200.));
-        let list = self.render_list(height, window, cx);
+        let list = self.render_list(window, cx);
         root.children(header).child(list).into_any_element()
     }
 }
@@ -1571,4 +1579,93 @@ fn how_to_explore(cx: &App) -> String {
         .map(|keys| format!("{keys} and Open Node"))
         .unwrap_or_else(|| "Open Node in the command palette".to_owned());
     format!("{row}, or {palette}, to walk its relationships")
+}
+
+#[cfg(test)]
+mod tests {
+    use graph_store::test_server::followed_session;
+
+    use super::*;
+
+    /// What the dock's host gives a panel that scrolls itself: its size, here shorter than the
+    /// window, as a bottom dock across the window or a tall breadcrumb leaves it.
+    const DOCK_HEIGHT: f32 = 320.;
+
+    struct Dock {
+        tree: Entity<RelationshipTree>,
+        _workspace: Entity<Workspace>,
+    }
+
+    impl Render for Dock {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                div()
+                    .debug_selector(|| "dock".into())
+                    .w(px(260.))
+                    .h(px(DOCK_HEIGHT))
+                    .child(self.tree.clone()),
+            )
+        }
+    }
+
+    /// The rows take what the tree's dock leaves below its header, not the window's height, so
+    /// the row the keyboard selects scrolls into what shows.
+    #[gpui::test]
+    async fn the_rows_fit_the_dock_and_the_selected_row_shows(cx: &mut gpui::TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let edges: String = (0..12)
+            .map(|i| format!("edge Rel{i}: Person -> Person\n"))
+            .collect();
+        let schema = format!("node Person {{\n  slug: String @key\n  name: String\n}}\n{edges}");
+        let (session, _served) = followed_session(
+            &schema,
+            |_| serde_json::json!([{ "id": "p1", "label": "Ada", "n": 0 }]),
+            cx,
+        );
+        cx.run_until_parked();
+        let shown = session.clone();
+        let (dock, cx) = cx.add_window_view(move |window, cx| {
+            let workspace = cx.new(|cx| Workspace::new(window, cx));
+            let tree =
+                cx.new(|cx| RelationshipTree::new(&workspace, Some(shown.clone()), window, cx));
+            Dock {
+                tree,
+                _workspace: workspace,
+            }
+        });
+        let exploration = cx.update(|_, cx| Exploration::for_session(&session, cx));
+        exploration.update(cx, |exploration, cx| {
+            exploration.root_at(NodeRef::new("Person", "p1"), cx)
+        });
+        // The tree draws reads that land together once they all have.
+        for _ in 0..3 {
+            cx.run_until_parked();
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(10));
+        }
+        cx.run_until_parked();
+
+        let dock_bounds = cx.debug_bounds("dock").expect("the dock");
+        let list = cx.debug_bounds("relationship-tree-list").expect("the rows");
+        assert!(
+            list.top() >= dock_bounds.top() && list.bottom() <= dock_bounds.bottom(),
+            "the rows {list:?} within the dock {dock_bounds:?}"
+        );
+        let tree = dock.read_with(cx, |dock, _| dock.tree.clone());
+        let last = tree.read_with(cx, |tree, _| tree.visible.len() - 1);
+        assert!(
+            (last + 1) as f32 * ROW_HEIGHT > DOCK_HEIGHT,
+            "more rows than the dock holds"
+        );
+        tree.update(cx, |tree, cx| tree.select_row(last, cx));
+        cx.run_until_parked();
+        let selector: &'static str = format!("tree-row-{last}").leak();
+        let row = cx
+            .debug_bounds(selector)
+            .expect("the selected row is drawn");
+        assert!(
+            row.bottom() <= dock_bounds.bottom(),
+            "the selected row {row:?} shows in the dock {dock_bounds:?}"
+        );
+    }
 }

@@ -21,7 +21,7 @@ use serde_json::{Map, Value};
 pub struct SessionRecord {
     /// The agent's session id.
     pub session: String,
-    /// The graph, as its settings key (`server/graph`).
+    /// The graph, as its key (`<server url>/<graph id>`, `GraphSession::overrides_key`).
     pub graph: String,
     /// The agent command, joined with spaces: a session belongs to the agent that made it.
     pub agent: String,
@@ -90,7 +90,12 @@ impl AgentSessions {
         let path = studio_settings::data_dir()
             .join("agent")
             .join("sessions.json");
-        let sessions = cx.new(|_| AgentSessions::load(path));
+        let servers = graph_store::named_keys::known_servers(cx);
+        let sessions = cx.new(|_| {
+            let mut sessions = AgentSessions::load(path);
+            sessions.move_named_graphs(&servers);
+            sessions
+        });
         cx.set_global(GlobalSessions(sessions.clone()));
         sessions
     }
@@ -104,6 +109,23 @@ impl AgentSessions {
             live: HashMap::new(),
             unread: HashSet::new(),
             deleted: HashSet::new(),
+        }
+    }
+
+    /// Files the conversations a build before 2026-10-20 filed under a graph's server name
+    /// under the graph's key instead, when the name is one of `servers` (name, address); each
+    /// keeps its working directory, where the agent keeps its record of it. Part of the one
+    /// conversion in `graph_store::named_keys`: delete it after the next release.
+    fn move_named_graphs(&mut self, servers: &[(String, String)]) {
+        let mut moved = false;
+        for record in &mut self.records {
+            if let Some(key) = graph_store::named_keys::key_for(&record.graph, servers) {
+                record.graph = key;
+                moved = true;
+            }
+        }
+        if moved {
+            self.save();
         }
     }
 
@@ -326,6 +348,15 @@ impl AgentSessions {
         if self.unread.remove(session) {
             cx.notify();
         }
+    }
+}
+
+/// Where a conversation runs: where it ran before (`saved`), so a resumed one finds the agent's
+/// own record of it whatever key its graph had then; a new one in its graph's directory.
+pub fn working_dir(saved: Option<&SessionRecord>, graph: &str) -> PathBuf {
+    match saved {
+        Some(saved) => saved.cwd.clone(),
+        None => graph_cwd(graph),
     }
 }
 
@@ -705,6 +736,56 @@ mod tests {
             assert_eq!(store.unused_branch("server/notes", second.into()), second);
         });
         studio_settings::writes_done();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Conversations a build before filed under a graph's server name are filed under the
+    /// graph's key once the index loads, each keeping its working directory, so resuming one
+    /// finds the agent's own record of it; a new conversation works in the key's directory. A
+    /// name no server has stays as it is.
+    #[gpui::test]
+    fn conversations_filed_by_server_name_move_to_the_graphs_key(cx: &mut gpui::TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("studio-agent-named-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let path = dir.join("sessions.json");
+        // As a build before wrote them.
+        let store = cx.new(|_| AgentSessions::load(path.clone()));
+        store.update(cx, |store, cx| {
+            store.upsert(record("old", "dev/crm", "claude", 5), cx);
+            store.upsert(record("gone", "gone/crm", "claude", 1), cx);
+        });
+        studio_settings::writes_done();
+
+        let servers = vec![("dev".to_owned(), "http://127.0.0.1:8787".to_owned())];
+        let key = "http://127.0.0.1:8787/crm";
+        let mut loaded = AgentSessions::load(path.clone());
+        loaded.move_named_graphs(&servers);
+        let old = loaded.get("old").unwrap();
+        assert_eq!(old.graph, key);
+        assert_eq!(old.cwd, graph_cwd("dev/crm"), "where the agent has it");
+        assert_eq!(
+            working_dir(Some(old), key),
+            graph_cwd("dev/crm"),
+            "resumed where it ran"
+        );
+        assert_eq!(
+            working_dir(None, key),
+            graph_cwd(key),
+            "a new one: the key's"
+        );
+        assert_ne!(graph_cwd(key), graph_cwd("dev/crm"));
+        assert_eq!(loaded.latest(key, "claude").unwrap().session, "old");
+        assert_eq!(
+            loaded.get("gone").unwrap().graph,
+            "gone/crm",
+            "no server has the name"
+        );
+
+        // Saved under the key, so the next load finds it there.
+        studio_settings::writes_done();
+        let again = AgentSessions::load(path);
+        assert_eq!(again.get("old").unwrap().graph, key);
+        assert_eq!(again.get("old").unwrap().cwd, graph_cwd("dev/crm"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

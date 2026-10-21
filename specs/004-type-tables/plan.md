@@ -153,7 +153,7 @@ stay put), IX (paged, virtualized).
   stands. A "related to" pill reads the picked node's label. The offers hide while the
   property or operator menu is open.
 - A view is a name for a filter, sort, grouping and column state; saved per graph in Studio's
-  settings: `graphs."<server>/<graph>".views` in `settings.json`, each with its type, filters
+  settings: `graphs."<server url>/<graph>".views` in `settings.json`, each with its type, filters
   (`FilterOp::key` names), sort, grouping, hidden columns and column order. The toolbar's
   Views menu lists the type's views with the shown one checked, saves the table's state under
   a name (the same name replaces), and deletes the shown one; the button reads the view's

@@ -88,13 +88,20 @@ on the canvas. Typing filters the visible rows.
   neighbour related to two values is under both, so the values' counts can add up to more than
   the group's.
 - The whole tree reads one commit; when the session sees the branch's head elsewhere (spec 003:
-  Studio's commit, or another writer's at the next poll), "Newer data · Refresh" appears.
+  Studio's commit, or another writer's at the next poll), "Newer data · Refresh" appears. It is
+  read and flattened under one schema too, the one its reads were made under: another writer's
+  schema offers Refresh as a head move does, and the groups stay as read (a dropped
+  relationship's still there, an added one not yet) until Refresh takes the new schema at the
+  head (since 2026-10-20).
 
 ### Rendering and state
 
 - Expanded paths live in `Exploration` (graph_store), shared with the canvas (spec 006).
 - Visible rows are flattened into one list and rendered with `uniform_list`, indent guides, and
-  sticky ancestor rows so the path stays visible however deep the walk.
+  sticky ancestor rows so the path stays visible however deep the walk. The panel scrolls
+  itself (`Workspace::set_panel_scrolls_itself`): its host gives it the dock's size, and the
+  list takes what its header leaves, in whichever dock and layout, so the row the keyboard
+  selects scrolls into what shows.
 - Each expansion loads lazily: an inline spinner row, or an error row with Retry.
 - Reads that finish together are shown in one go: `ExplorationEvent::Loaded` is gathered for up
   to 8 ms before the rows are rebuilt, and an answer for a closed row sends nothing. Opening,
@@ -143,6 +150,8 @@ on the canvas. Typing filters the visible rows.
 | 2026-10-12 | "Newer data · Refresh" after Studio's own write | offscreen snapshot on the scratch branch `drafts-test`: `OpenNode` person-000000, a title edited in the Person table, then the Explore panel | The tree, pinned to its read, showed "Newer data · Refresh" above Radia Knuth |
 | 2026-10-13 | Grouping by a relationship of the neighbour | `gq_language` `neighbours_group_by_a_property_of_either_end_and_narrow_to_one_value` (every relationship choice of every dev relationship compiles: values, none-count, narrowing to a value and to none; a relationship of another type is refused); `graph_store` `neighbours_grouped_by_their_own_relationship_carry_labels_and_skip_an_empty_none`; offscreen snapshots: Radia Knuth's Knows by `worksAt →`, Allen Works opened, then Yukihiro Dijkstra's; the same reads on the dev server | Menu sections Person and "Person's relationships"; Radia's 4 people under 6 companies (two work at two), Allen Works opened to Leslie Dahl; Yukihiro's under Allen Works 1 and "No Company" 3, which opened to Frances Liskov, Tim Hopper and Claude Berners-Lee, as the server answers |
 | 2026-10-13 | At-most-one edges show as fields on their node | a scratch cluster from `dev/cluster` plus `edge ReportsTo: Person -> Person @card(0..1) { since: Date? }`, the dev seed and 170 `ReportsTo` edges, served by `script/dev-server` on another port; offscreen snapshots of `OpenNode` person-000006 and person-000003 | person-000006 read "reportsTo → Donald Dijkstra" (its manager, person-000001) with the type's dot, between the groups; person-000003, who reports to no one, read "reportsTo → —"; the incoming side stayed a group, "← ReportsTo 4" |
+| 2026-10-20 | The rows fit the tree's dock, and the row the keyboard selects shows | `relationship_tree` `the_rows_fit_the_dock_and_the_selected_row_shows` (a 320 px host in a taller window, as the workspace hosts a panel that scrolls itself; 25 rows of 26 px); the same test with the list at the old `viewport − 94` | The list is 320 px from the dock's top and the last row, selected, is drawn inside it. With the old height the list was 986 px in the 320 px dock (`Bounds … 260px × 986px`), so `scroll_to_item` put the selected row below what shows |
+| 2026-10-20 | The tree keeps the schema it was read under until Refresh | `graph_store` `an_exploration_keeps_the_schema_it_was_read_under_until_refresh` (another writer replaces `Knows` with `Follows` at `c2`, seen at a head check); the same test with the rows flattened under the session's schema, as before | Before Refresh: the session reads under `Follows`, the exploration's rows still show `Knows` out and in with their counts (0), and Refresh is offered; after: `Follows` out and in, counted at the head. Flattened as before, the rows were `Follows` out and in with no count (`None`), the dropped `Knows` gone. The canvas's hub menu still reads the session's schema for its grouping choices (`graph_canvas.rs`, `chip_menu`) |
 
 ## Corrections
 

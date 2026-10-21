@@ -283,7 +283,7 @@ impl QueriesPanel {
     }
 
     fn graph_key(&self, cx: &App) -> Option<String> {
-        Some(self.session.as_ref()?.read(cx).settings_key(cx))
+        Some(self.session.as_ref()?.read(cx).overrides_key(cx))
     }
 
     /// Lists the graph's queries folder again, off the main thread.

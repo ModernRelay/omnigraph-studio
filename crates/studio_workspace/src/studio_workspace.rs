@@ -109,10 +109,27 @@ struct Toast {
     kind: ToastKind,
     message: SharedString,
     /// The one follow-up a toast offers ("View commit"), run by its button.
-    action: Option<(SharedString, Box<dyn Action>)>,
+    action: Option<FollowUp>,
     /// Time left on screen; `None` stays until dismissed (errors, spec 002).
     remaining: Option<Duration>,
     hovered: bool,
+}
+
+struct FollowUp {
+    label: SharedString,
+    action: Box<dyn Action>,
+    /// The write's graph and branch, which the action acts on whatever the window shows when
+    /// it is run; `None` for one that acts where the window is ("Open settings").
+    on: Option<WrittenTo>,
+}
+
+/// Where a write went: its graph, by its server's address and id as tabs identify a graph,
+/// and its branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WrittenTo {
+    server_url: String,
+    graph: String,
+    branch: String,
 }
 
 /// How long a success or info toast stays (spec 002); hovering pauses it.
@@ -1153,56 +1170,119 @@ impl Workspace {
     /// toasts its last. A graph not shown names itself.
     fn toast_outcomes(&mut self, session: &Entity<GraphSession>, cx: &mut Context<Self>) {
         let id = session.entity_id();
+        let (server_url, _) = graph_key_of(session, cx);
         let read = session.read(cx);
         let logged = read.outcomes_logged;
         let seen = self.outcomes_toasted.insert(id, logged).unwrap_or(logged);
         let new = (logged.saturating_sub(seen) as usize).min(read.outcomes.len());
         let writing = read.writes_in_flight > 0;
         let fresh = read.outcomes[read.outcomes.len() - new..].to_vec();
-        let graph = (self.session.as_ref() != Some(session)).then(|| read.graph_id.clone());
+        let shown = self.session.as_ref() == Some(session);
+        let graph = read.graph_id.clone();
         for (ix, entry) in fresh.iter().enumerate() {
             if matches!(entry.outcome, OutcomeKind::Committed { .. })
                 && (writing || ix + 1 < fresh.len())
             {
                 continue;
             }
-            self.toast_outcome(entry, graph.as_deref(), cx);
+            let written_to = WrittenTo {
+                server_url: server_url.clone(),
+                graph: graph.clone(),
+                branch: entry.branch.clone(),
+            };
+            self.toast_outcome(entry, written_to, !shown, cx);
         }
     }
 
+    /// Toasts one outcome, its follow-up bound to the graph and branch written to. `named`
+    /// starts the text with the graph's name, for a graph the window does not show.
     fn toast_outcome(
         &mut self,
         latest: &graph_store::OutcomeEntry,
-        graph: Option<&str>,
+        written_to: WrittenTo,
+        named: bool,
         cx: &mut Context<Self>,
     ) {
-        let text = match graph {
-            Some(graph) => format!("{graph}: {}", toast_text(latest)),
-            None => toast_text(latest),
+        let text = if named {
+            format!("{}: {}", written_to.graph, toast_text(latest))
+        } else {
+            toast_text(latest)
         };
         if self.toasts.iter().any(|t| t.message.as_ref() == text) {
             return;
         }
-        match &latest.outcome {
+        let (kind, label, action): (_, SharedString, Box<dyn Action>) = match &latest.outcome {
             // No publish, no toast (constitution VII); the surface that wrote explains it.
-            OutcomeKind::Committed { commit: None } => {}
+            OutcomeKind::Committed { commit: None } => return,
             OutcomeKind::Committed {
                 commit: Some(commit),
             } => {
                 let (label, action) = committed_follow_up(latest, commit);
-                self.show_toast_with_action(ToastKind::Success, text, label, action, cx);
+                (ToastKind::Success, label.into(), action)
             }
             // The write may or may not have landed: the branch's history says which.
-            OutcomeKind::Unknown { .. } => {
-                self.show_toast_with_action(
+            OutcomeKind::Unknown { .. } => (
+                ToastKind::Error,
+                "Open history".into(),
+                Box::new(OpenHistory),
+            ),
+            OutcomeKind::Refused { .. } => return self.show_toast(ToastKind::Error, text, cx),
+        };
+        let follow_up = FollowUp {
+            label,
+            action,
+            on: Some(written_to),
+        };
+        self.push_toast(kind, text.into(), Some(follow_up), cx);
+    }
+
+    /// Runs a toast's follow-up. One about a write acts on the graph and branch written to,
+    /// shown first (the graph brought back if parked), so "Open history" never opens another
+    /// graph's or branch's history, nor Undo puts rows back elsewhere. A graph closed since is
+    /// named, and nothing runs.
+    fn run_follow_up(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((action, on)) = self
+            .toasts
+            .iter()
+            .find(|toast| toast.id == id)
+            .and_then(|toast| toast.action.as_ref())
+            .map(|follow_up| (follow_up.action.boxed_clone(), follow_up.on.clone()))
+        else {
+            return;
+        };
+        self.dismiss_toast(id, cx);
+        let mut switched = false;
+        if let Some(on) = on {
+            let Some(session) = self.open_session_for(&on.server_url, &on.graph, cx) else {
+                self.show_toast(
                     ToastKind::Error,
-                    text,
-                    "Open history",
-                    Box::new(OpenHistory),
+                    format!(
+                        "Nothing was done: {} is no longer open in this window. Open it, then \
+                         check its History.",
+                        on.graph
+                    ),
                     cx,
                 );
+                return;
+            };
+            switched = self.session.as_ref() != Some(&session);
+            session.update(cx, |session, cx| session.set_branch(on.branch, cx));
+            self.show_graph(session.entity_id(), window, cx);
+            // Actions reach the window's handlers along the focus path of the frame drawn last,
+            // which has no tab of the graph just shown: dispatched from the window, they do.
+            if switched {
+                window.focus(&self.focus_handle, cx);
             }
-            OutcomeKind::Refused { .. } => self.show_toast(ToastKind::Error, text, cx),
+        }
+        window.dispatch_action(action, cx);
+        if switched {
+            // One that opened no tab (Undo) leaves the keyboard on the window: the graph's tab
+            // takes it.
+            cx.defer_in(window, |this, window, cx| {
+                if this.focus_handle.is_focused(window) {
+                    this.focus_active_tab(window, cx);
+                }
+            });
         }
     }
 
@@ -2031,7 +2111,8 @@ impl Workspace {
         self.push_toast(kind, message.into(), None, cx);
     }
 
-    /// A toast with one follow-up button, such as "View commit" (spec 002).
+    /// A toast with one follow-up button, such as "Open settings" (spec 002), run where the
+    /// window is when it is pressed.
     pub fn show_toast_with_action(
         &mut self,
         kind: ToastKind,
@@ -2040,7 +2121,12 @@ impl Workspace {
         action: Box<dyn Action>,
         cx: &mut Context<Self>,
     ) {
-        self.push_toast(kind, message.into(), Some((label.into(), action)), cx);
+        let follow_up = FollowUp {
+            label: label.into(),
+            action,
+            on: None,
+        };
+        self.push_toast(kind, message.into(), Some(follow_up), cx);
     }
 
     fn show_settings_error(&mut self, cx: &mut Context<Self>) {
@@ -2087,7 +2173,7 @@ impl Workspace {
         &mut self,
         kind: ToastKind,
         message: SharedString,
-        action: Option<(SharedString, Box<dyn Action>)>,
+        action: Option<FollowUp>,
         cx: &mut Context<Self>,
     ) {
         let id = self.next_toast;
@@ -2459,23 +2545,79 @@ impl Workspace {
 
     /// ⇧⎋: zooms the active pane over the document area, or ends any zoom.
     fn toggle_zoom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_zoom_of(Zoomed::Pane(self.active_pane), window, cx);
+    }
+
+    /// Zooms `target` over the document area, or ends any zoom: ⇧⎋ zooms the active pane, a
+    /// pane's or a dock's header button its own. The keyboard leaves what the zoom covers, or
+    /// it would go on driving a panel or a tab nobody sees: a zoomed pane takes it from the
+    /// docks and the other panes, a zoomed dock from the panes and the other docks.
+    fn toggle_zoom_of(&mut self, target: Zoomed, window: &mut Window, cx: &mut Context<Self>) {
         self.zoomed = match self.zoomed {
             Some(_) => None,
-            None => Some(Zoomed::Pane(self.active_pane)),
+            None => Some(target),
         };
-        // The docks are under the zoomed pane now.
-        if self.zoomed.is_some()
-            && [
-                PanelPosition::Left,
-                PanelPosition::Right,
-                PanelPosition::Bottom,
-            ]
-            .into_iter()
-            .any(|position| self.dock_has_focus(position, window, cx))
-        {
-            self.focus_active_tab(window, cx);
+        let docks = [
+            PanelPosition::Left,
+            PanelPosition::Right,
+            PanelPosition::Bottom,
+        ];
+        let in_pane = |pane: PaneId| self.pane_has_focus(pane, window, cx);
+        match self.zoomed {
+            Some(Zoomed::Pane(zoomed)) => {
+                let covered = docks
+                    .into_iter()
+                    .any(|dock| self.dock_has_focus(dock, window, cx))
+                    || self.panes.iter().any(|p| p.id != zoomed && in_pane(p.id));
+                if covered {
+                    let index = self.pane(zoomed).map_or(0, |p| p.active);
+                    self.activate_in(zoomed, index, false, window, cx);
+                }
+            }
+            Some(Zoomed::Dock(zoomed)) => {
+                let covered = docks
+                    .into_iter()
+                    .any(|dock| dock != zoomed && self.dock_has_focus(dock, window, cx))
+                    || self.panes.iter().any(|p| in_pane(p.id));
+                if covered {
+                    self.focus_dock_panel(zoomed, window, cx);
+                }
+            }
+            None => {}
         }
         cx.notify();
+    }
+
+    /// Whether the keyboard is in the tab `pane` shows.
+    fn pane_has_focus(&self, pane: PaneId, window: &Window, cx: &App) -> bool {
+        self.pane(pane)
+            .and_then(|pane| pane.active_item())
+            .is_some_and(|item| item.focus_handle(cx).contains_focused(window, cx))
+    }
+
+    /// Gives the keyboard to the active panel of the dock at `position`: the focus the panel
+    /// names for itself, else its body.
+    fn focus_dock_panel(&self, position: PanelPosition, window: &mut Window, cx: &mut App) {
+        let dock = match position {
+            PanelPosition::Left => &self.left,
+            PanelPosition::Right => &self.right,
+            PanelPosition::Bottom => &self.bottom,
+        };
+        let Some(panel) = dock.active_panel() else {
+            return;
+        };
+        let focus = panel
+            .focus
+            .as_ref()
+            .and_then(|focus| focus(cx))
+            .or_else(|| {
+                self.dock_hosts
+                    .get(&panel.view.entity_id())
+                    .map(|host| host.read(cx).focus_handle.clone())
+            });
+        if let Some(focus) = focus {
+            window.focus(&focus, cx);
+        }
     }
 
     /// Whether the keyboard is in a panel of the dock at `position`: in any element of its body
@@ -2950,27 +3092,29 @@ impl Workspace {
                     }),
             )
             .child(
-                IconButton::new(
-                    SharedString::from(format!("zoom-pane-{pane_id}")),
-                    IconName::Maximize,
-                )
-                .toggle_state(zoomed)
-                .selected_icon(IconName::Minimize)
-                .tooltip(move |_, cx| {
-                    Tooltip::for_action(
-                        if zoomed { "Zoom out" } else { "Zoom in" },
-                        &ToggleZoom,
-                        cx,
-                    )
-                })
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.zoomed = if zoomed {
-                        None
-                    } else {
-                        Some(Zoomed::Pane(pane_id))
-                    };
-                    cx.notify();
-                })),
+                div()
+                    .flex_none()
+                    .debug_selector(move || format!("zoom-pane-{pane_id}"))
+                    .child(
+                        IconButton::new(
+                            SharedString::from(format!("zoom-pane-{pane_id}")),
+                            IconName::Maximize,
+                        )
+                        .toggle_state(zoomed)
+                        .selected_icon(IconName::Minimize)
+                        .tooltip(move |_, cx| {
+                            Tooltip::for_action(
+                                if zoomed { "Zoom out" } else { "Zoom in" },
+                                &ToggleZoom,
+                                cx,
+                            )
+                        })
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.toggle_zoom_of(Zoomed::Pane(pane_id), window, cx)
+                            },
+                        )),
+                    ),
             )
     }
 
@@ -3516,31 +3660,31 @@ impl Workspace {
         )
         .children(dock.active_panel().map(dock_title))
         .child(
-            IconButton::new(
-                SharedString::from(format!("zoom-dock-{position:?}")),
-                if zoomed {
-                    IconName::Minimize
-                } else {
-                    IconName::Maximize
-                },
-            )
-            // ⇧⎋ ends any zoom but zooms the active pane, not this dock, so only "Zoom out"
-            // shows it.
-            .tooltip(move |_, cx| {
-                if zoomed {
-                    Tooltip::for_action("Zoom out", &ToggleZoom, cx)
-                } else {
-                    Tooltip::simple("Zoom in", cx)
-                }
-            })
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.zoomed = if zoomed {
-                    None
-                } else {
-                    Some(Zoomed::Dock(position))
-                };
-                cx.notify();
-            })),
+            div()
+                .flex_none()
+                .debug_selector(move || format!("zoom-dock-{position:?}"))
+                .child(
+                    IconButton::new(
+                        SharedString::from(format!("zoom-dock-{position:?}")),
+                        if zoomed {
+                            IconName::Minimize
+                        } else {
+                            IconName::Maximize
+                        },
+                    )
+                    // ⇧⎋ ends any zoom but zooms the active pane, not this dock, so only "Zoom
+                    // out" shows it.
+                    .tooltip(move |_, cx| {
+                        if zoomed {
+                            Tooltip::for_action("Zoom out", &ToggleZoom, cx)
+                        } else {
+                            Tooltip::simple("Zoom in", cx)
+                        }
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.toggle_zoom_of(Zoomed::Dock(position), window, cx)
+                    })),
+                ),
         )
         .child(
             IconButton::new(
@@ -3780,13 +3924,11 @@ impl Workspace {
                             .min_w_0()
                             .child(studio_ui::ds::text::body(toast.message.clone())),
                     )
-                    .children(toast.action.as_ref().map(|(label, action)| {
-                        let action = action.boxed_clone();
-                        studio_ui::ds::button(("toast-action", id), label.clone())
+                    .children(toast.action.as_ref().map(|follow_up| {
+                        studio_ui::ds::button(("toast-action", id), follow_up.label.clone())
                             .style(ButtonStyle::Subtle)
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.dismiss_toast(id, cx);
-                                window.dispatch_action(action.boxed_clone(), cx);
+                                this.run_follow_up(id, window, cx)
                             }))
                     }))
                     .child(
@@ -4917,7 +5059,9 @@ mod tests {
 
     impl Render for Unsaved {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div()
+            // Holding its focus, as a tab does: an action dispatched from it reaches the
+            // window's handlers once it is drawn.
+            div().size_full().track_focus(&self.focus_handle)
         }
     }
 
@@ -5324,7 +5468,8 @@ mod tests {
     /// Hiding a dock, or zooming a pane over it, gives the keyboard back to the tab from
     /// anywhere in the dock's panel: from a field of a panel that names no focus of its own
     /// too, as the Conversations filter, the inspector and the activity log are. A side panel
-    /// and a bottom one are drawn differently, so both are asked.
+    /// and a bottom one are drawn differently, so both are asked. The zoom buttons hand it over
+    /// as ⇧⎋ does: a pane's from the panel under it, a dock's from the tab under it.
     #[gpui::test]
     fn a_hidden_or_covered_dock_gives_the_keyboard_back_from_any_field_of_its_panel(
         cx: &mut gpui::TestAppContext,
@@ -5333,8 +5478,12 @@ mod tests {
             studio_theme::init_test(cx);
             studio_settings::init_test(cx);
         });
+        // A graph shown, for the pane's buttons.
+        let session = idle_session("http://studio.test", "notes", cx);
         let (workspace, cx) = cx.add_window_view(Workspace::new);
         let (fields, tab) = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.graph_order.push(session.entity_id());
+            workspace.subscribe_session(session.clone(), cx);
             let mut fields = Vec::new();
             for (position, id) in [
                 (PanelPosition::Right, "inspector"),
@@ -5371,6 +5520,58 @@ mod tests {
             workspace.toggle_zoom(window, cx);
             assert!(tab.is_focused(window), "so does zooming the pane over it");
         });
+
+        let click = |selector: &'static str, cx: &mut gpui::VisualTestContext| {
+            cx.run_until_parked();
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} was drawn"));
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane);
+        let pane_button: &'static str = format!("zoom-pane-{pane}").leak();
+        click(pane_button, cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert_eq!(workspace.zoomed, None, "the button zooms out");
+            window.focus(&fields[1], cx);
+        });
+        click(pane_button, cx);
+        workspace.update_in(cx, |workspace, window, _| {
+            assert_eq!(workspace.zoomed, Some(Zoomed::Pane(pane)));
+            assert!(
+                tab.is_focused(window),
+                "the pane's button takes the keyboard from the panel under it"
+            );
+        });
+        click(pane_button, cx);
+        click("zoom-dock-Bottom", cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert_eq!(workspace.zoomed, Some(Zoomed::Dock(PanelPosition::Bottom)));
+            assert!(
+                !tab.is_focused(window)
+                    && workspace.dock_has_focus(PanelPosition::Bottom, window, cx),
+                "the dock's button takes it from the tab under it"
+            );
+        });
+    }
+
+    /// A session for `graph` on the server at `url`, which answers every request with a 404.
+    fn idle_session(url: &str, graph: &str, cx: &mut gpui::TestAppContext) -> Entity<GraphSession> {
+        let http = http_client::FakeHttpClient::create(|_| async {
+            Ok(http_client::http::Response::builder()
+                .status(404)
+                .body(http_client::AsyncBody::default())
+                .unwrap())
+        });
+        let server = graph_store::ServerEntry {
+            name: "test".into(),
+            url: url.into(),
+            source: graph_store::ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| graph_store::Connection::new(server, None, http).unwrap());
+        cx.new(|cx| GraphSession::new(connection, graph.into(), "main".into(), cx))
     }
 
     fn add_panels(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
@@ -5879,8 +6080,6 @@ mod tests {
         );
     }
 
-    /// The window leaving marks the last reading at once, so a return before the next tick
-    /// does not measure across the time away.
     /// A delete Studio can put back offers Undo on its toast, bound to its commit and branch;
     /// any other commit offers itself.
     #[test]
@@ -5907,6 +6106,164 @@ mod tests {
         assert!(action.partial_eq(&OpenCommit {
             commit_id: "c2".into()
         }));
+    }
+
+    /// A write's toast acts on the graph and branch written to, whatever the window shows when
+    /// its button is pressed: "Open history" after moving to another graph shows the written
+    /// graph again, on its branch; after moving to another branch, the branch written to; Undo
+    /// from a parked graph undoes there. A graph closed since is named, and nothing runs.
+    #[gpui::test]
+    fn a_toasts_follow_up_acts_on_the_graph_and_branch_written_to(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+        });
+        let notes = idle_session("http://a.test", "notes", cx);
+        let people = idle_session("http://b.test", "people", cx);
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        // Where each follow-up ran: the action, the graph shown and its branch.
+        type Ran = Vec<(&'static str, String, String)>;
+        let ran: Rc<RefCell<Ran>> = Rc::default();
+        workspace.update(cx, |workspace, cx| {
+            let shown = |workspace: &Workspace, cx: &App| {
+                let session = workspace.session().unwrap().read(cx);
+                (session.graph_id.clone(), session.branch.clone())
+            };
+            let history = ran.clone();
+            workspace.register_action(move |workspace, _: &OpenHistory, _, cx| {
+                let (graph, branch) = shown(workspace, cx);
+                history.borrow_mut().push(("history", graph, branch));
+            });
+            let undo = ran.clone();
+            workspace.register_action(
+                move |workspace, action: &studio_actions::graph::UndoDelete, _, cx| {
+                    let (graph, branch) = shown(workspace, cx);
+                    assert_eq!(action.branch, branch, "undone on the delete's branch");
+                    undo.borrow_mut().push(("undo", graph, branch));
+                },
+            );
+            workspace.graph_order.push(notes.entity_id());
+            workspace.subscribe_session(notes.clone(), cx);
+            workspace.add_behind(people.clone(), None, cx);
+        });
+        // A tab in each graph: the one shown when a follow-up runs has not been drawn yet.
+        let mut tabs = Vec::new();
+        for session in [&people, &notes] {
+            let tab = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.show_graph(session.entity_id(), window, cx);
+                let focus_handle = cx.focus_handle();
+                let held = focus_handle.clone();
+                workspace.open_item(session.entity_id().to_string(), window, cx, |_, _| {
+                    Unsaved { focus_handle }
+                });
+                held
+            });
+            tabs.push(tab);
+        }
+        let (people_tab, notes_tab) = (tabs[0].clone(), tabs[1].clone());
+        notes.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        cx.run_until_parked();
+        let log = |session: &Entity<GraphSession>,
+                   description: &str,
+                   outcome: OutcomeKind,
+                   follow_up: Option<graph_store::FollowUp>,
+                   cx: &mut gpui::VisualTestContext| {
+            session.update(cx, |session, cx| {
+                session.outcomes.push(graph_store::OutcomeEntry {
+                    at: std::time::SystemTime::now(),
+                    branch: session.branch.clone(),
+                    description: description.into(),
+                    outcome,
+                    follow_up,
+                });
+                session.outcomes_logged += 1;
+                cx.emit(SessionEvent::ActivityChanged);
+            });
+            cx.run_until_parked();
+            workspace.read_with(cx, |workspace, _| workspace.toasts.last().unwrap().id)
+        };
+        let follow = |toast: usize, cx: &mut gpui::VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.run_follow_up(toast, window, cx)
+            });
+            cx.run_until_parked();
+        };
+        let shown = |cx: &mut gpui::VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                let session = workspace.session().unwrap().read(cx);
+                (session.graph_id.clone(), session.branch.clone())
+            })
+        };
+        let unknown = || OutcomeKind::Unknown {
+            reason: "the connection closed".into(),
+        };
+
+        // A write to notes on fix whose outcome nobody knows, then people shown.
+        let toast = log(&notes, "Edit Person ada", unknown(), None, cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.show_graph(people.entity_id(), window, cx)
+        });
+        follow(toast, cx);
+        assert_eq!(shown(cx), ("notes".into(), "fix".into()));
+        assert_eq!(
+            ran.borrow_mut().pop(),
+            Some(("history", "notes".into(), "fix".into()))
+        );
+        let focused = |tab: &FocusHandle, cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, _| tab.is_focused(window))
+        };
+        assert!(focused(&notes_tab, cx), "the graph's tab has the keyboard");
+
+        // Another, then notes moved to main.
+        let toast = log(&notes, "Edit Person grace", unknown(), None, cx);
+        notes.update(cx, |session, cx| session.set_branch("main".into(), cx));
+        follow(toast, cx);
+        assert_eq!(shown(cx), ("notes".into(), "fix".into()), "back on fix");
+        assert_eq!(
+            ran.borrow_mut().pop(),
+            Some(("history", "notes".into(), "fix".into()))
+        );
+
+        // A delete in people while notes is shown: its Undo runs in people.
+        let toast = log(
+            &people,
+            "Delete Person ada",
+            OutcomeKind::Committed {
+                commit: Some("c2".into()),
+            },
+            Some(graph_store::FollowUp::UndoDelete),
+            cx,
+        );
+        let message = workspace.read_with(cx, |workspace, _| {
+            workspace.toasts.last().unwrap().message.clone()
+        });
+        assert!(message.starts_with("people: "), "{message}");
+        follow(toast, cx);
+        assert_eq!(shown(cx), ("people".into(), "main".into()));
+        assert_eq!(
+            ran.borrow_mut().pop(),
+            Some(("undo", "people".into(), "main".into()))
+        );
+        assert!(
+            focused(&people_tab, cx),
+            "an undo opens no tab: the graph's has it"
+        );
+
+        // people closed with its toast still up: nothing runs, and the toast says why.
+        let toast = log(&people, "Edit Person lin", unknown(), None, cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.close_graph_asking(false, window, cx)
+        });
+        follow(toast, cx);
+        assert_eq!(shown(cx), ("notes".into(), "fix".into()));
+        assert!(ran.borrow().is_empty(), "nothing ran");
+        let message = workspace.read_with(cx, |workspace, _| {
+            workspace.toasts.last().unwrap().message.clone()
+        });
+        assert!(
+            message.contains("people is no longer open in this window"),
+            "{message}"
+        );
     }
 
     #[gpui::test]

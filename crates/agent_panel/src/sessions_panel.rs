@@ -163,7 +163,7 @@ impl SessionsPanel {
     fn graph(&self, cx: &App) -> Option<String> {
         let workspace = self.workspace.upgrade()?;
         let session = workspace.read(cx).session()?.clone();
-        Some(session.read(cx).settings_key(cx))
+        Some(session.read(cx).overrides_key(cx))
     }
 
     /// The conversation in the shown tab; a new one has none until the agent names it.

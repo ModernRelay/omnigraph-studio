@@ -325,12 +325,35 @@ pub mod surface {
         }
     }
 
+    /// How much ink each state laid over a glass sheet takes ([`ink`]).
+    pub(crate) const RULE_INK: f32 = 0.14;
+    pub(crate) const WELL_INK: f32 = 0.015;
+    pub(crate) const SELECTED_INK: f32 = 0.05;
+    pub(crate) const HOVER_INK: f32 = 0.025;
+    pub(crate) const TAB_INK: f32 = 0.025;
+
+    /// The ink a state is laid over a sheet in ([`rule`], [`well`], [`selected_chrome`],
+    /// [`hover`], [`tab_inactive`]), at `alpha`: black on the light style's warm white; white in
+    /// a dark theme, whose sheet is the theme's own dark surface ([`glass`]), where black would
+    /// not show.
+    pub(crate) fn ink(light: bool, alpha: f32) -> Hsla {
+        if light {
+            gpui::black().opacity(alpha)
+        } else {
+            gpui::white().opacity(alpha)
+        }
+    }
+
+    fn ink_in(alpha: f32, cx: &App) -> Hsla {
+        ink(cx.theme().appearance.is_light(), alpha)
+    }
+
     /// The rule between regions and rows: the [`divider`] when flat; on glass 14% ink, which
     /// a row's or a section's dotted rule (`super::dotted`) lands at about half a solid line's
     /// weight. A region's edge (a toolbar's, a strip's, a pane's) stays solid in both styles.
     pub fn rule(cx: &App) -> Hsla {
         if is_glass(cx) {
-            gpui::black().opacity(0.14)
+            ink_in(RULE_INK, cx)
         } else {
             divider(cx)
         }
@@ -387,19 +410,15 @@ pub mod surface {
         }
     }
 
-    /// A recessed area inside a container (an empty list, a code block on glass): a darkening
-    /// rather than a fill, so the glass still shows through.
-    pub fn well(_cx: &App) -> Hsla {
-        gpui::black().opacity(0.015)
+    /// A recessed area inside a container (an empty list, a code block on glass): a faint ink
+    /// rather than a fill, so the glass still shows through; a darkening in a light theme, a
+    /// lightening in a dark one.
+    pub fn well(cx: &App) -> Hsla {
+        ink_in(WELL_INK, cx)
     }
 
     /// A card's hairline, and the rule inside it over its footer: the [`outline`].
     pub fn card_border(cx: &App) -> Hsla {
-        outline(cx)
-    }
-
-    /// The hairline of a solid item that sits on glass: the [`outline`].
-    pub fn raised_border(cx: &App) -> Hsla {
         outline(cx)
     }
 
@@ -420,7 +439,7 @@ pub mod surface {
     /// A selected row on chrome (the sidebar): a pressed pill, 5% ink, in both styles.
     pub fn selected_chrome(cx: &App) -> Hsla {
         if is_glass(cx) {
-            gpui::black().opacity(0.05)
+            ink_in(SELECTED_INK, cx)
         } else {
             cx.theme().colors().ghost_element_hover
         }
@@ -435,7 +454,7 @@ pub mod surface {
     /// A hovered row: half the selected fill.
     pub fn hover(cx: &App) -> Hsla {
         if is_glass(cx) {
-            gpui::black().opacity(0.025)
+            ink_in(HOVER_INK, cx)
         } else {
             cx.theme().colors().ghost_element_hover.opacity(0.5)
         }
@@ -515,7 +534,7 @@ pub mod surface {
     /// An inactive tab: barely shaded on glass, the tab strip's tint when flat.
     pub fn tab_inactive(cx: &App) -> Hsla {
         if is_glass(cx) {
-            gpui::black().opacity(0.025)
+            ink_in(TAB_INK, cx)
         } else {
             cx.theme().colors().tab_bar_background.opacity(0.35)
         }
@@ -615,11 +634,6 @@ pub mod surface {
     /// The halo around [`here`]'s ring.
     pub fn here_halo(cx: &App) -> Hsla {
         here(cx).opacity(0.2)
-    }
-
-    /// A pointed item's hairline on the canvas: the ink at 20 %, twice a control's.
-    pub fn pointed_border(cx: &App) -> Hsla {
-        cx.theme().colors().text.opacity(0.2)
     }
 
     /// A relationship's label on the canvas: a chip's fill, a little clear so the line under it
@@ -2602,8 +2616,11 @@ mod tests {
 
     /// A glass sheet or toast keeps the light style's warm white in a light theme, and takes the
     /// dark theme's own surface in a dark one: near-white there would put light text on light.
+    /// What glass lays over a sheet (a rule, a well, a selected or hovered row, an inactive tab)
+    /// shows on both: black ink on the white, white ink on the dark surface, where black moved
+    /// Studio Dark's sheet by less than a level.
     #[test]
-    fn glass_takes_the_dark_themes_surface() {
+    fn glass_takes_the_dark_themes_surface_and_its_states_show_on_it() {
         let dark_panel = gpui::hsla(0.6, 0.1, 0.16, 1.);
         let light = surface::glass_fill(true, dark_panel, 0.8);
         assert!(light.l > 0.95, "the light style's white");
@@ -2611,6 +2628,32 @@ mod tests {
         let dark = surface::glass_fill(false, dark_panel, 0.8);
         assert_eq!(dark.l, dark_panel.l, "the theme's surface");
         assert!((dark.a - 0.8).abs() < 1e-6);
+
+        // Studio Dark's panel, under its sheet.
+        let studio_dark: Hsla = gpui::rgb(0x101010).into();
+        let states = [
+            ("a rule", surface::RULE_INK),
+            ("a well", surface::WELL_INK),
+            ("a selected row", surface::SELECTED_INK),
+            ("a hovered row", surface::HOVER_INK),
+            ("an inactive tab", surface::TAB_INK),
+        ];
+        for light in [true, false] {
+            let sheet = surface::glass_fill(light, studio_dark, 1.);
+            for (state, alpha) in states {
+                let levels = (sheet.blend(surface::ink(light, alpha)).l - sheet.l).abs() * 255.;
+                assert!(
+                    levels >= 3.,
+                    "{state} moves a {} sheet {levels:.1} levels",
+                    if light { "light" } else { "dark" }
+                );
+            }
+        }
+        let black = studio_dark.blend(gpui::black().opacity(surface::SELECTED_INK));
+        assert!(
+            (black.l - studio_dark.l).abs() * 255. < 1.,
+            "black ink is lost on a dark sheet"
+        );
     }
 
     /// The nested pairs the design system draws stay concentric (`radius::around`/`within`),

@@ -681,6 +681,10 @@ impl GraphSession {
             _stored_queries_task: None,
             access: Access::default(),
         };
+        // What builds before 2026-10-20 filed under the server's name; delete after the next
+        // release.
+        let server = session.connection.read(cx).server.clone();
+        crate::named_keys::move_named(&server, &session.graph_id, cx);
         session.labels = session.chosen_labels(cx);
         session._settings = Some(
             cx.observe_global::<studio_settings::StudioSettings>(|this, cx| {
@@ -981,7 +985,7 @@ impl GraphSession {
         let schema = self.schema_model()?;
         let node = schema.node(type_name)?;
         Some(studio_settings::TypeNaming {
-            graph: self.settings_key(cx),
+            graph: self.overrides_key(cx),
             type_name: type_name.to_owned(),
             chosen: node
                 .label
@@ -995,7 +999,7 @@ impl GraphSession {
     /// The property chosen to name each type's nodes in this graph, in the settings.
     fn chosen_labels(&self, cx: &App) -> BTreeMap<String, String> {
         match cx.try_global::<studio_settings::StudioSettings>() {
-            Some(settings) => settings.labels_for(&self.settings_key(cx)),
+            Some(settings) => settings.labels_for(&self.overrides_key(cx)),
             None => BTreeMap::new(),
         }
     }
@@ -1326,15 +1330,17 @@ impl GraphSession {
         }));
     }
 
-    /// The `graphs` key of this graph in the settings (spec 002).
-    pub fn settings_key(&self, cx: &App) -> String {
-        studio_settings::graph_key(&self.connection.read(cx).server.name, &self.graph_id)
+    /// This graph's one key: its server's address and its id, as its tabs are kept
+    /// ([`studio_settings::overrides_key`]). Its settings (spec 002), its saved queries' folder
+    /// and its agent conversations are filed under it.
+    pub fn overrides_key(&self, cx: &App) -> String {
+        studio_settings::overrides_key(&self.connection.read(cx).server.url, &self.graph_id)
     }
 
     /// The browsing limits in effect for this graph: its overrides in the settings, else the
     /// shared ones.
     pub fn options(&self, cx: &App) -> studio_settings::GraphOptions {
-        let server = &self.connection.read(cx).server.name;
+        let server = &self.connection.read(cx).server.url;
         match cx.try_global::<studio_settings::StudioSettings>() {
             Some(settings) => settings.for_graph(server, &self.graph_id),
             None => studio_settings::StudioSettings::default().for_graph(server, &self.graph_id),
@@ -5899,7 +5905,7 @@ mod tests {
         // A graph's node names (spec 002, "Node names"): a choice in the settings names the
         // type's nodes by it at once, announced as a change of the same text; none goes back.
         events.lock().unwrap().clear();
-        let key = session.read_with(cx, |session, cx| session.settings_key(cx));
+        let key = session.read_with(cx, |session, cx| session.overrides_key(cx));
         let named = |cx: &mut TestAppContext| {
             session.read_with(cx, |session, _| {
                 let schema = session.schema_model().unwrap();

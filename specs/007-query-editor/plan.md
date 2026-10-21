@@ -47,7 +47,10 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   the query.
 - **Files:** `.gq` files on disk can be opened; queries can be saved per graph.
   Built: ⌘S saves a query tab to its file; a new query goes to the graph's queries folder
-  (`<data dir>/queries/<server>~<graph>/`), named after its first declaration
+  (`<data dir>/queries/<graph key>/`, the graph's one key `<server url>/<graph id>` made safe,
+  `http_~~127.0.0.1_8787~knowledge`; since 2026-10-20, before which the folder was the server's
+  name, `<server>~<graph>`, and opening the graph moves it once: renamed when the key has no
+  folder, else each file the key's folder lacks, never over one), named after its first declaration
   (`list_company.gq`, then `-2`, …). ⌘⇧S picks any path in the system dialog; ⌘O opens a file
   (or `studio_graph::OpenQueryFile { path }`). A file tab is titled by the file, keyed by its
   path so it opens once, and shows the changed dot while its text differs from the file; its

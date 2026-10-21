@@ -1159,9 +1159,11 @@ pub struct Exploration {
     pin: Option<String>,
     newer_available: bool,
     generation: u64,
-    /// The schema the names shown were read under: one that names a type's nodes otherwise
-    /// (spec 002, "Node names") reads them again.
-    named_by: Option<Arc<SchemaModel>>,
+    /// The schema what is shown was read under, which it is flattened and read under: the
+    /// session's, until another writer moves it ([`SessionEvent::SchemaMoved`]); then this one
+    /// stays, as the commit does, until Refresh. One that names a type's nodes otherwise (spec
+    /// 002, "Node names") reads them again.
+    schema: Option<Arc<SchemaModel>>,
     tasks: HashMap<LoadTarget, Task<()>>,
     /// What the exploration has read at its pin: a head move that changed none of it moves the
     /// pin without reading again (spec 015).
@@ -1205,23 +1207,28 @@ impl Exploration {
             let branch = session.branch.clone();
             session.read_scope(&branch)
         });
-        let named_by = session.read(cx).schema_model();
+        let schema = session.read(cx).schema_model();
         let subscription = cx.subscribe(&session, |this, session, event, cx| match event {
             SessionEvent::SchemaChanged => {
-                let schema = session.read(cx).schema_model();
-                let renamed = matches!(
-                    (&this.named_by, &schema),
-                    (Some(was), Some(now)) if was.source == now.source && !was.same_as(now)
-                );
-                this.named_by = schema;
-                if renamed {
-                    this.rename(cx);
-                } else {
-                    this.request_missing(cx);
+                let now = session.read(cx).schema_model();
+                match (&this.schema, &now) {
+                    (Some(was), Some(now)) if was.source == now.source && !was.same_as(now) => {
+                        this.schema = Some(now.clone());
+                        this.rename(cx);
+                    }
+                    // Another text: what was read under the old one is read again under it,
+                    // at the head, as Refresh reads it.
+                    (Some(was), Some(now)) if was.source != now.source => this.refresh(cx),
+                    _ => {
+                        this.schema = now;
+                        this.request_missing(cx);
+                    }
                 }
             }
-            // Another writer changed the schema: what is shown stays until Refresh.
-            SessionEvent::SchemaMoved if this.pin.is_some() && !this.newer_available => {
+            // Another writer changed the schema: what is shown stays, under the schema it was
+            // read under, until Refresh. Nothing read at a commit yet is read under the new.
+            SessionEvent::SchemaMoved if this.pin.is_none() => this.refresh(cx),
+            SessionEvent::SchemaMoved if !this.newer_available => {
                 this.newer_available = true;
                 this.changed(cx);
             }
@@ -1246,7 +1253,7 @@ impl Exploration {
             pin: None,
             newer_available: false,
             generation: 0,
-            named_by,
+            schema,
             tasks: HashMap::new(),
             scope,
             awaiting_changes: false,
@@ -1287,8 +1294,10 @@ impl Exploration {
         &self.state
     }
 
-    pub fn schema(&self, cx: &App) -> Option<Arc<SchemaModel>> {
-        self.session.read(cx).schema_model()
+    /// The schema what is shown was read under, which may be older than the session's until
+    /// Refresh ([`Self::newer_available`]).
+    pub fn schema(&self, _cx: &App) -> Option<Arc<SchemaModel>> {
+        self.schema.clone()
     }
 
     pub fn root(&self) -> Option<&NodeRef> {
@@ -1301,16 +1310,17 @@ impl Exploration {
         self.pin.as_deref()
     }
 
-    /// The branch moved since the pin; offer Refresh.
+    /// The branch, or the schema, moved since the pin; offer Refresh.
     pub fn newer_available(&self) -> bool {
         self.newer_available
     }
 
-    /// The exploration flattened in tree order; empty until the schema loads. Made once per
-    /// change to it, whoever asks.
-    pub fn entries(&self, cx: &App) -> Arc<Vec<Entry>> {
-        match self.schema(cx) {
-            Some(schema) => self.state.entries(&schema),
+    /// The exploration flattened in tree order under the schema it was read under
+    /// ([`Self::schema`]); empty until the schema loads. Made once per change to it, whoever
+    /// asks.
+    pub fn entries(&self, _cx: &App) -> Arc<Vec<Entry>> {
+        match &self.schema {
+            Some(schema) => self.state.entries(schema),
             None => Arc::default(),
         }
     }
@@ -1549,7 +1559,8 @@ impl Exploration {
         self.changed(cx);
     }
 
-    /// Drops the pin and everything read, and reads what is visible again at the branch head.
+    /// Drops the pin and everything read, and reads what is visible again at the branch head,
+    /// under the schema the session reads under now.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         self.reset_reads(cx);
         self.state.clear_loaded();
@@ -1567,11 +1578,13 @@ impl Exploration {
         self.changed(cx);
     }
 
+    /// Drops the pin: what is read next is read at the branch head, under the session's schema.
     fn reset_reads(&mut self, cx: &mut Context<Self>) {
         self.generation += 1;
         self.tasks.clear();
         self.pin = None;
         self.newer_available = false;
+        self.schema = self.session.read(cx).schema_model();
         let scope = &self.scope;
         self.session.update(cx, |session, _| {
             let branch = session.branch.clone();
@@ -2533,5 +2546,62 @@ mod tests {
         session.update(cx, |session, cx| session.check_heads(cx));
         cx.run_until_parked();
         assert_eq!(pin(cx), (Some("c3".into()), true), "the root changed");
+    }
+
+    /// Another writer's schema leaves the exploration as it was read: its rows flattened under
+    /// the schema they were read under, a dropped relationship still shown and an added one not
+    /// yet, with Refresh offered; Refresh takes the new schema at the head (constitution II).
+    #[gpui::test]
+    async fn an_exploration_keeps_the_schema_it_was_read_under_until_refresh(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::test_server::followed_session;
+        const PERSON: &str = "node Person {\n  slug: String @key\n  name: String\n}\n";
+        let (session, served) = followed_session(
+            &format!("{PERSON}edge Knows: Person -> Person\n"),
+            |_| json!([{ "id": "p1", "label": "Ada", "n": 0 }]),
+            cx,
+        );
+        cx.run_until_parked();
+        let exploration = cx.update(|cx| Exploration::for_session(&session, cx));
+        exploration.update(cx, |exploration, cx| exploration.root_at(person("p1"), cx));
+        cx.run_until_parked();
+        let shown = |cx: &mut gpui::TestAppContext| {
+            exploration.read_with(cx, |exploration, cx| {
+                let groups = kinds(&exploration.entries(cx))
+                    .into_iter()
+                    .filter(|row| row.trim_start().starts_with("group"))
+                    .collect::<Vec<_>>();
+                (groups, exploration.newer_available())
+            })
+        };
+        let knows = vec![
+            "  group Knows Outgoing Some(0)".to_owned(),
+            "  group Knows Incoming Some(0)".to_owned(),
+        ];
+        assert_eq!(shown(cx), (knows.clone(), false));
+
+        served.lock().unwrap().schema = format!("{PERSON}edge Follows: Person -> Person\n");
+        served.lock().unwrap().commit("c2", Vec::new());
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        let moved = session.read_with(cx, |session, _| {
+            session.schema_model().unwrap().edge("Follows").is_some()
+        });
+        assert!(moved, "the session reads under the new schema");
+        assert_eq!(shown(cx), (knows, true), "as read, with Refresh offered");
+
+        exploration.update(cx, |exploration, cx| exploration.refresh(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            shown(cx),
+            (
+                vec![
+                    "  group Follows Outgoing Some(0)".to_owned(),
+                    "  group Follows Incoming Some(0)".to_owned(),
+                ],
+                false
+            )
+        );
     }
 }

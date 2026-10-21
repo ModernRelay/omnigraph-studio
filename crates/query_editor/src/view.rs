@@ -971,7 +971,7 @@ impl QueryEditor {
         let path = match &self.path {
             Some(path) => path.clone(),
             None => {
-                let graph = self.session.read(cx).settings_key(cx);
+                let graph = self.session.read(cx).overrides_key(cx);
                 let name = gq_language::outline(&self.editor.read(cx).text(cx))
                     .declarations
                     .first()
@@ -994,7 +994,7 @@ impl QueryEditor {
         if self.stored.is_some() {
             return;
         }
-        let graph = self.session.read(cx).settings_key(cx);
+        let graph = self.session.read(cx).overrides_key(cx);
         let directory = self
             .path
             .as_ref()
