@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use gpui::{AppContext as _, Entity, TestAppContext};
-use http_client::http::Response;
+use http_client::http::{Method, Response};
 use http_client::{AsyncBody, FakeHttpClient};
 use serde_json::{Value, json};
 
@@ -27,7 +27,8 @@ pub struct Served {
     pub commits: Vec<(String, String, Vec<Value>)>,
     /// The query string of every feed read.
     pub feeds: Vec<String>,
-    /// The branch list, and what every other route answers: `main` alone at first.
+    /// The branch list, and what every other route but a branch delete answers: `main` alone
+    /// at first.
     pub branches: Vec<String>,
     rows: Rows,
 }
@@ -131,6 +132,7 @@ pub fn followed_session(
     let http = FakeHttpClient::create(move |request| {
         let path = request.uri().path().to_owned();
         let query = request.uri().query().unwrap_or_default().to_owned();
+        let deletes = request.method() == Method::DELETE;
         let state = state.clone();
         async move {
             let mut bytes = Vec::new();
@@ -178,6 +180,9 @@ pub fn followed_session(
                     "rows": rows,
                     "graph_commit_id": served.head,
                 })
+            } else if deletes && let Some((_, branch)) = path.split_once("/branches/") {
+                // A branch delete's receipt, as the server answers it.
+                json!({ "uri": "memory://knowledge", "name": branch, "actor_id": null })
             } else {
                 json!({ "branches": served.branches })
             };

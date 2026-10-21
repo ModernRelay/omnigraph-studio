@@ -15,11 +15,11 @@ use gq_language::builder::{Depends, Seeds};
 use gq_language::input::same_value;
 use gq_language::{BuiltQuery, RelationshipGroup, SchemaModel, builder};
 use graph_client::api::{
-    AccessAction, BranchCreateOutput, BranchCreateRequest, BranchMergeOutput, BranchMergeRequest,
-    ChangeFeedOutput, ChangeOutput, ChangeRequest, CommitKind, CommitOutput, DiffOutput,
-    EntityKind, GraphListResponse, InvokeStoredQueryRequest, MergeBaseOutput, QueryCatalogEntry,
-    QueryRequest, ReadOutput, ReadTargetOutput, ReadinessOutput, SnapshotDatasetOutput,
-    SnapshotOutput,
+    AccessAction, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchMergeOutput,
+    BranchMergeRequest, ChangeFeedOutput, ChangeOutput, ChangeRequest, CommitKind, CommitOutput,
+    DiffOutput, EntityKind, GraphListResponse, InvokeStoredQueryRequest, MergeBaseOutput,
+    QueryCatalogEntry, QueryRequest, ReadOutput, ReadTargetOutput, ReadinessOutput,
+    SnapshotDatasetOutput, SnapshotOutput,
 };
 use graph_client::{
     ApiErrorSummary, BlobAt, BlobCell, BlobMeta, CommitChanges, FeedAt, GraphClient, ReadError,
@@ -3684,7 +3684,7 @@ impl GraphSession {
         &mut self,
         name: String,
         cx: &mut Context<Self>,
-    ) -> Task<WriteOutcome<serde_json::Value>> {
+    ) -> Task<WriteOutcome<BranchDeleteOutput>> {
         let client = self.client(cx);
         let graph = self.graph_id.clone();
         let sent = name.clone();

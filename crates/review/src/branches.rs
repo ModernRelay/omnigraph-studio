@@ -1139,8 +1139,12 @@ mod tests {
                         200,
                         json!({ "merge_base": commit(base), "source": "x", "source_commit_id": head, "target": "main", "target_commit_id": "m2" }),
                     )
-                } else if path.contains("/branches/") {
-                    (200, json!({}))
+                } else if let Some((_, branch)) = path.split_once("/branches/") {
+                    // A branch delete's receipt, as the server answers it.
+                    (
+                        200,
+                        json!({ "uri": "memory://knowledge", "name": branch, "actor_id": null }),
+                    )
                 } else {
                     (200, json!({ "branches": ["main", "feature", "spike"] }))
                 }
@@ -1169,6 +1173,9 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(deletes(), 1, "deleted with no name typed");
+        merged.read_with(cx, |modal, _| {
+            assert_eq!(modal.error, None, "the receipt settles the delete")
+        });
 
         let (unmerged, cx) = cx.add_window_view(|window, cx| {
             DeleteBranchModal::new(session.clone(), "spike".into(), window, cx)

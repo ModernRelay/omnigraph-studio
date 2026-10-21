@@ -345,6 +345,17 @@ pub struct BranchCreateOutput {
     pub actor_id: Option<String>,
 }
 
+/// `DELETE /graphs/{id}/branches/{branch}`: the receipt of a branch deletion.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BranchDeleteOutput {
+    /// The graph's URI, as the server names it.
+    pub uri: String,
+    /// The branch deleted, as the request's path named it.
+    pub name: String,
+    #[serde(default)]
+    pub actor_id: Option<String>,
+}
+
 /// A branch create refused at the commit `from_commit` named (409, or 410 for
 /// `not_retained`); nothing was created.
 #[derive(Debug, Clone, Deserialize)]
@@ -908,6 +919,7 @@ mod contract_tests {
             "BranchCreateOutput",
             &["uri", "from", "name", "from_commit_id", "actor_id"],
         ),
+        ("BranchDeleteOutput", &["uri", "name", "actor_id"]),
         (
             "BranchStartRefusalOutput",
             &["reason", "graph_commit_id", "branch", "type_name"],

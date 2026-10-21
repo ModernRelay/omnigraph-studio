@@ -16,11 +16,11 @@ use serde_json::Value;
 use url::Url;
 
 use crate::api::{
-    AccessOutput, BlobWriteOutput, BranchCreateOutput, BranchCreateRequest, BranchListOutput,
-    BranchMergeOutput, BranchMergeRequest, ChangeFeedOutput, ChangeOutput, ChangeRequest,
-    CommitChanges, CommitListOutput, DiffOutput, ErrorOutput, GraphListResponse, HealthOutput,
-    InvokeStoredQueryRequest, MergeBaseOutput, QueriesCatalogOutput, QueryRequest, ReadOutput,
-    ReadinessOutput, SchemaOutput, SnapshotOutput,
+    AccessOutput, BlobWriteOutput, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput,
+    BranchListOutput, BranchMergeOutput, BranchMergeRequest, ChangeFeedOutput, ChangeOutput,
+    ChangeRequest, CommitChanges, CommitListOutput, DiffOutput, ErrorOutput, GraphListResponse,
+    HealthOutput, InvokeStoredQueryRequest, MergeBaseOutput, QueriesCatalogOutput, QueryRequest,
+    ReadOutput, ReadinessOutput, SchemaOutput, SnapshotOutput,
 };
 use crate::{
     ApiError, CONTRACT, CONTRACT_HEADER, IF_GRAPH_COMMIT_HEADER, WriteOutcome, speaks_contract,
@@ -1289,7 +1289,11 @@ impl GraphClient {
         .await
     }
 
-    pub async fn delete_branch(&self, graph: &str, branch: &str) -> WriteOutcome<Value> {
+    pub async fn delete_branch(
+        &self,
+        graph: &str,
+        branch: &str,
+    ) -> WriteOutcome<BranchDeleteOutput> {
         self.write(
             Method::DELETE,
             &["graphs", graph, "branches", branch],
@@ -2022,6 +2026,33 @@ mod tests {
             None,
         ));
         assert!(matches!(outcome, WriteOutcome::Unknown { .. }));
+    }
+
+    /// A branch delete's receipt is read as `BranchDeleteOutput`: the branch it names and the
+    /// actor. A success whose body is not one cannot say what was deleted, so it is unknown.
+    #[test]
+    fn a_branch_delete_reads_its_receipt() {
+        let outcome = block_on(
+            client(respond(
+                200,
+                Some(CONTRACT),
+                r#"{"uri":"s3://graphs/g","name":"feature","actor_id":"act-dev"}"#,
+            ))
+            .delete_branch("g", "feature"),
+        );
+        let WriteOutcome::Committed(receipt) = outcome else {
+            panic!("expected a receipt, got {outcome:?}");
+        };
+        assert_eq!(receipt.name, "feature");
+        assert_eq!(receipt.uri, "s3://graphs/g");
+        assert_eq!(receipt.actor_id.as_deref(), Some("act-dev"));
+
+        let outcome =
+            block_on(client(respond(200, Some(CONTRACT), "{}")).delete_branch("g", "feature"));
+        assert!(
+            matches!(outcome, WriteOutcome::Unknown { .. }),
+            "{outcome:?}"
+        );
     }
 
     #[test]
