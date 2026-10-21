@@ -58,6 +58,7 @@ the interaction and asserts the count:
 | `type_table` `rows_draw_only_the_columns_in_view` | A 21-column type draws the pinned column and those in view; scrolled to the end, the last; the cursor's column always; a line lays out one gap for the rest, as wide as they are; widened, every column in the frame of the resize |
 | `query_editor` `a_wide_result_draws_only_the_columns_in_view` | A 60-column result draws the columns in view and one gap for the rest, as wide as they are; scrolled to the end, the last |
 | `query_editor` `typing_in_the_query_leaves_the_results_as_they_were` | The result area follows the tab's `notify`; typing in the query does not draw it |
+| `query_editor` `typing_leaves_the_problems_as_they_were` | The problems strip is a cached view of its own; typing that leaves the problems unchanged does not draw it |
 | `studio_workspace` `a_tab_that_caches_its_parts_keeps_them_while_a_field_changes` | A tab that caches its parts keeps them while a field changes; a cached tab draws them again, which is the GPUI behavior the opt-out exists for |
 
 Draw counts are exact, so they run in CI. Times are not: the machine's load moves them several
