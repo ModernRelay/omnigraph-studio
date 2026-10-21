@@ -8,7 +8,8 @@
 //! - `credentials` (`0600`) holds the gateway's session token, never the person's, bound to the
 //!   gateway's address;
 //! - `omnigraph` (`0700`) runs the CLI Studio found with that directory as `OMNIGRAPH_HOME`,
-//!   loopback outside any proxy, and no other OmniGraph token in its environment.
+//!   loopback outside any proxy, and no other OmniGraph token in its environment: a shell
+//!   script on Unix, a batch file `omnigraph.cmd` on Windows ([`Wrapper`]).
 //!
 //! The agent learns the wrapper's path from its conversation's MCP instructions and the
 //! `omnigraph_cli` tool; `<cwd>/AGENTS.md` gives the rules shared by the graph's conversations.
@@ -114,7 +115,7 @@ impl CliHome {
 
         let dir = cwd.join(".studio").join(&name);
         Ok(Self {
-            command: dir.join("omnigraph"),
+            command: dir.join(WRAPPER_NAME),
             dir,
             graph: graph.to_owned(),
             branch: branch.to_owned(),
@@ -153,8 +154,8 @@ impl CliHome {
             }
         }
         let no_proxy = match std::env::var("NO_PROXY") {
-            Ok(also) if !also.is_empty() => format!("127.0.0.1,localhost,{also}"),
-            _ => "127.0.0.1,localhost".to_owned(),
+            Ok(also) if !also.is_empty() => format!("{LOOPBACK},{also}"),
+            _ => LOOPBACK.to_owned(),
         };
         command
             .env("OMNIGRAPH_HOME", &self.private)
@@ -171,21 +172,12 @@ impl CliHome {
 
     /// Points the wrapper at `cli`.
     pub fn use_cli(&self, cli: &Path) -> std::io::Result<()> {
-        let script = format!(
-            "#!/bin/sh\n\
-             # Written by OmniGraph Studio for one agent conversation (spec 013): the omnigraph\n\
-             # CLI, pointed at Studio's gateway for this conversation.\n\
-             for name in $(env | sed -n 's/^\\(OMNIGRAPH_TOKEN_[A-Za-z0-9_]*\\)=.*/\\1/p'); do unset \"$name\"; done\n\
-             unset OMNIGRAPH_BEARER_TOKEN OMNIGRAPH_PROFILE OMNIGRAPH_CONTROL_TOKEN OMNIGRAPH_CONTROL_API\n\
-             OMNIGRAPH_HOME={home}\n\
-             NO_PROXY=\"127.0.0.1,localhost${{NO_PROXY:+,$NO_PROXY}}\"\n\
-             no_proxy=\"$NO_PROXY\"\n\
-             export OMNIGRAPH_HOME NO_PROXY no_proxy\n\
-             exec {cli} \"$@\"\n",
-            home = shell_quote(&self.dir.to_string_lossy()),
-            cli = shell_quote(&cli.to_string_lossy()),
-        );
-        self.home()?.write("omnigraph", script.as_bytes(), 0o700)?;
+        let wrapper = Wrapper::Run {
+            home: &self.dir,
+            cli,
+        };
+        self.home()?
+            .write(WRAPPER_NAME, wrapper.script().as_bytes(), 0o700)?;
         self.set_cli(Ok(cli));
         Ok(())
     }
@@ -193,22 +185,32 @@ impl CliHome {
     /// Makes the wrapper run nothing and say `why`: the conversation has no CLI that speaks the
     /// graph's contract, and one the server would refuse must not run in its place.
     pub fn refuse(&self, why: &str) -> std::io::Result<()> {
-        let script = format!(
-            "#!/bin/sh\n\
-             # Written by OmniGraph Studio for one agent conversation (spec 013).\n\
-             echo {why} >&2\n\
-             exit 1\n",
-            why = shell_quote(why),
-        );
         self.set_cli(Err(why));
-        self.home()?.write("omnigraph", script.as_bytes(), 0o700)
+        self.home()?.write(
+            WRAPPER_NAME,
+            Wrapper::Refuse { why }.script().as_bytes(),
+            0o700,
+        )
     }
 
     /// What the agent is told about this conversation's CLI: in its MCP instructions and by the
     /// `omnigraph_cli` tool. The home's config makes the gateway and the graph the default, so
     /// the agent passes neither.
     pub fn instructions(&self, cli_ready: Option<bool>) -> String {
+        self.instructions_on(cli_ready, cfg!(windows))
+    }
+
+    /// [`CliHome::instructions`] on Windows when `windows`, where the wrapper is a batch file
+    /// and the agent is told what that means for its arguments ([`cmd_script`]).
+    fn instructions_on(&self, cli_ready: Option<bool>, windows: bool) -> String {
         let command = self.command.to_string_lossy();
+        let batch = if windows {
+            " It is a batch file, so cmd reads its arguments first: pass a query or parameters \
+             holding \" with %, &, |, <, > or ^ in a file (--query, --params-file), or use \
+             omnigraph_run."
+        } else {
+            ""
+        };
         match cli_ready {
             Some(false) => format!(
                 "Studio found no omnigraph CLI that speaks this graph's HTTP API, so the graph is \
@@ -219,8 +221,8 @@ impl CliHome {
             ),
             _ => format!(
                 "This conversation's omnigraph CLI is {command} (run it by that path; another \
-                 omnigraph on PATH is not connected to Studio). Its config already points it at \
-                 Studio and the graph {graph}: give no --target or --graph. Read any \
+                 omnigraph on PATH is not connected to Studio).{batch} Its config already points \
+                 it at Studio and the graph {graph}: give no --target or --graph. Read any \
                  branch. Write only to your branch, {branch}: create it first with `{command} \
                  branch create {branch} --from {base}`, then pass `--branch {branch}` to mutate \
                  and load. Prefer one load of NDJSON to many \
@@ -239,6 +241,14 @@ impl CliHome {
 /// Writes `<cwd>/AGENTS.md`, the rules every conversation on the graph shares. Codex reads
 /// `AGENTS.md`; Claude reads it when there is no `CLAUDE.md`.
 pub fn write_agents_md(cwd: &Path, graph: &str) -> std::io::Result<()> {
+    let windows = if cfg!(windows) {
+        "- On Windows the CLI is a batch file, `omnigraph.cmd`, and cmd reads its arguments \
+         before the CLI does: pass a query or parameters that hold `\"` together with `%`, `&`, \
+         `|`, `<`, `>` or `^` in a file (`--query`, `--params-file`), or run the command with \
+         the `omnigraph_run` tool, which takes its arguments as a list.\n"
+    } else {
+        ""
+    };
     let text = format!(
         "# OmniGraph graph `{graph}`\n\n\
          Written by OmniGraph Studio. You work on the OmniGraph graph `{graph}` with a person in \
@@ -251,6 +261,7 @@ pub fn write_agents_md(cwd: &Path, graph: &str) -> std::io::Result<()> {
          instructions of the `omnigraph` MCP server, and the `omnigraph_cli` tool returns it \
          with your branch. Run it by that path: another `omnigraph` on PATH is not connected \
          to Studio.\n\
+         {windows}\
          - Its config already points it at Studio and this graph: give no `--target` or \
          `--graph`.\n\
          - Read any branch or commit (`--branch`, `--snapshot`).\n\
@@ -742,9 +753,15 @@ impl Stage {
     fn new(home: &Path) -> std::io::Result<Self> {
         let tag = crate::confined::random_hex(8)?;
         let dir = home.join(format!("run-{tag}"));
-        let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        let builder = {
+            let mut builder = std::fs::DirBuilder::new();
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder
+        };
+        // Windows has no mode bits: the folder takes the private home's access.
+        #[cfg(not(unix))]
+        let builder = std::fs::DirBuilder::new();
         builder.create(&dir)?;
         Ok(Self(dir))
     }
@@ -928,8 +945,12 @@ fn is_executable(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
 }
 
+/// `path` with a leading `~/` (or `~\` on Windows) as the person's home folder.
 pub fn expand_home(path: &str) -> PathBuf {
-    match (path.strip_prefix("~/"), std::env::home_dir()) {
+    let rest = path
+        .strip_prefix("~/")
+        .or_else(|| path.strip_prefix("~\\").filter(|_| cfg!(windows)));
+    match (rest, std::env::home_dir()) {
         (Some(rest), Some(home)) => home.join(rest),
         _ => PathBuf::from(path),
     }
@@ -943,15 +964,245 @@ fn yaml_string(text: &str) -> String {
     serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into())
 }
 
-// The tests run fake CLIs, which are shell scripts.
-#[cfg(all(test, unix))]
+/// The wrapper's file name in the conversation's home: the name the agent runs it by.
+const WRAPPER_NAME: &str = if cfg!(windows) {
+    "omnigraph.cmd"
+} else {
+    "omnigraph"
+};
+
+/// Variables the wrapper removes from the CLI's environment by the start of their name: tokens
+/// kept for other targets (`OMNIGRAPH_TOKEN_<NAME>`), which the CLI would send to them.
+const WRAPPER_UNSET_PREFIXES: &[&str] = &["OMNIGRAPH_TOKEN_"];
+
+/// Variables the wrapper removes by name: a token the CLI's older releases read, and its profile
+/// and control-plane addressing, which would choose another destination.
+const WRAPPER_UNSET: &[&str] = &[
+    "OMNIGRAPH_BEARER_TOKEN",
+    "OMNIGRAPH_PROFILE",
+    "OMNIGRAPH_CONTROL_TOKEN",
+    "OMNIGRAPH_CONTROL_API",
+];
+
+/// The hosts put first in the CLI's `NO_PROXY`, so it reaches the gateway outside any proxy.
+const LOOPBACK: &str = "127.0.0.1,localhost";
+
+/// What the agent's `omnigraph` wrapper does, the one account both scripts are written from
+/// ([`posix_script`], [`cmd_script`]), so only their syntax differs. Run, it removes the
+/// variables of [`WRAPPER_UNSET_PREFIXES`] and [`WRAPPER_UNSET`] from the CLI's environment,
+/// sets `OMNIGRAPH_HOME` to `home`, its own folder, puts [`LOOPBACK`] first in `NO_PROXY` (and
+/// `no_proxy`), and runs `cli` with the agent's arguments as they came. Refusing, it runs
+/// nothing and says `why`.
+enum Wrapper<'a> {
+    Run { home: &'a Path, cli: &'a Path },
+    Refuse { why: &'a str },
+}
+
+impl Wrapper<'_> {
+    /// The wrapper as this platform runs it.
+    fn script(&self) -> String {
+        if cfg!(windows) {
+            cmd_script(self)
+        } else {
+            posix_script(self)
+        }
+    }
+}
+
+/// The wrapper as a `/bin/sh` script. Every path is in single quotes, and the agent's
+/// arguments pass on as `"$@"`, which the shell hands over as they came.
+fn posix_script(wrapper: &Wrapper<'_>) -> String {
+    let (home, cli) = match wrapper {
+        Wrapper::Run { home, cli } => (home, cli),
+        Wrapper::Refuse { why } => {
+            return format!(
+                "#!/bin/sh\n\
+                 # Written by OmniGraph Studio for one agent conversation (spec 013).\n\
+                 echo {why} >&2\n\
+                 exit 1\n",
+                why = shell_quote(why),
+            );
+        }
+    };
+    let mut script = String::from(
+        "#!/bin/sh\n\
+         # Written by OmniGraph Studio for one agent conversation (spec 013): the omnigraph\n\
+         # CLI, pointed at Studio's gateway for this conversation.\n",
+    );
+    for prefix in WRAPPER_UNSET_PREFIXES {
+        script.push_str(&format!(
+            "for name in $(env | sed -n 's/^\\({prefix}[A-Za-z0-9_]*\\)=.*/\\1/p'); do unset \
+             \"$name\"; done\n"
+        ));
+    }
+    script.push_str(&format!(
+        "unset {unset}\n\
+         OMNIGRAPH_HOME={home}\n\
+         NO_PROXY=\"{LOOPBACK}${{NO_PROXY:+,$NO_PROXY}}\"\n\
+         no_proxy=\"$NO_PROXY\"\n\
+         export OMNIGRAPH_HOME NO_PROXY no_proxy\n\
+         exec {cli} \"$@\"\n",
+        unset = WRAPPER_UNSET.join(" "),
+        home = shell_quote(&home.to_string_lossy()),
+        cli = shell_quote(&cli.to_string_lossy()),
+    ));
+    script
+}
+
+/// The wrapper as a Windows batch file, `omnigraph.cmd`, which a shell runs by its path as it
+/// runs `omnigraph` (cmd and PowerShell find the `.cmd` by PATHEXT; Git Bash, where Claude Code
+/// runs its commands, is given the whole name).
+///
+/// A batch file, not a launcher of Studio's own: Studio's executable opens its window when run
+/// as `omnigraph`, is large to copy into each home (the debug build is 490 MB), and a hard link
+/// to it would let the agent write Studio's own executable. The cost is cmd's reading of the
+/// arguments. Windows starts a batch file through `cmd /c` with the caller's command line, and
+/// cmd reads that line before the batch file runs: it expands `%NAME%`, and outside double
+/// quotes takes `&`, `|`, `<` and `>` as its own and drops `^`. A caller that escapes for cmd,
+/// as Rust's standard library does, gets every argument through as given. A shell that quotes
+/// only for programs (Git Bash, PowerShell) leaves text between two quotes inside one argument
+/// outside cmd's quotes, where those characters act. That is true of every `.cmd`, npm's own
+/// shims included; the agent's instructions say so, and `omnigraph_run` takes arguments as a
+/// list.
+///
+/// The batch file adds no reading of its own beyond that one. `%*` is the arguments as cmd
+/// read them and is expanded once, never again: its quotes stand where they stood, so what was
+/// quoted stays quoted, and a `%` in it stays. (A `^` the caller wrote before one of `&|<>`
+/// outside quotes is read twice, as in any batch file that passes `%*` on.) Delayed expansion
+/// is off, so `!` is plain. Each path Studio writes is in double quotes, which a Windows path
+/// cannot hold, with its `%` doubled: inside quotes `&`, `|`, `<`, `>`, `^`, `(` and `)` are
+/// plain. Lines end with CRLF, as cmd reads them.
+///
+/// cmd reads a batch file's text in the console's code page, so the file is ASCII only. Its
+/// folder, the home, may hold any character: cmd knows it as `%~dp0`, from its own Unicode
+/// path. The CLI is named by its path when that is ASCII, else from `%~dp0` when that path is
+/// (as when the CLI and the home are both under the person's profile, whose name is not);
+/// otherwise the wrapper refuses and points at `omnigraph_run`, which starts the CLI by its
+/// path without cmd.
+fn cmd_script(wrapper: &Wrapper<'_>) -> String {
+    let (home, cli) = match wrapper {
+        Wrapper::Run { home, cli } => (home, cli),
+        Wrapper::Refuse { why } => return cmd_refusal(why),
+    };
+    let Some(cli_named) = cmd_program(home, cli) else {
+        return cmd_refusal(&format!(
+            "The omnigraph CLI Studio chose for this conversation, {}, is in a folder whose \
+             name a batch file cannot hold. Run the same commands with the omnigraph_run tool, \
+             or set agent.omnigraph_cli to a CLI whose path is in plain ASCII.",
+            cli.display()
+        ));
+    };
+    let mut lines = vec![
+        "@echo off".to_owned(),
+        "rem Written by OmniGraph Studio for one agent conversation (spec 013): the omnigraph"
+            .to_owned(),
+        "rem CLI, pointed at Studio's gateway for this conversation.".to_owned(),
+        "setlocal EnableExtensions DisableDelayedExpansion".to_owned(),
+    ];
+    // `set NAME` lists every variable whose name starts with NAME, in any case, as Windows
+    // reads names.
+    for prefix in WRAPPER_UNSET_PREFIXES {
+        lines.push(format!(
+            "for /f \"delims==\" %%N in ('set {prefix} 2^>nul') do set \"%%N=\""
+        ));
+    }
+    for name in WRAPPER_UNSET {
+        lines.push(format!("set \"{name}=\""));
+    }
+    lines.extend([
+        // The batch file's own folder, without its last `\`.
+        "set \"OMNIGRAPH_HOME=%~dp0\"".to_owned(),
+        "set \"OMNIGRAPH_HOME=%OMNIGRAPH_HOME:~0,-1%\"".to_owned(),
+        // `NO_PROXY` and `no_proxy` are one variable to Windows.
+        format!(
+            "if defined NO_PROXY (set \"NO_PROXY={LOOPBACK},%NO_PROXY%\") else set \
+             \"NO_PROXY={LOOPBACK}\""
+        ),
+        format!("{cli_named} %*"),
+    ]);
+    lines.iter().map(|line| format!("{line}\r\n")).collect()
+}
+
+/// How the batch file in `home` names `cli`: its path in double quotes, or the same from the
+/// batch file's own folder (`%~dp0`), whichever is ASCII first; `None` when neither is. Both are
+/// read as Windows paths, whatever platform reads them.
+fn cmd_program(home: &Path, cli: &Path) -> Option<String> {
+    let quoted = |text: &str| format!("\"{}\"", text.replace('%', "%%"));
+    let ascii = |text: &str| text.chars().all(|c| c.is_ascii() && !c.is_ascii_control());
+    let cli = cli.to_str()?;
+    if ascii(cli) {
+        return Some(quoted(cli));
+    }
+    // Windows matches names in any case; the walk up ends where the two paths part.
+    let parts = |path: &str| -> Vec<String> {
+        path.split(['\\', '/'])
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    let (home, cli) = (parts(home.to_str()?), parts(cli));
+    let shared = home
+        .iter()
+        .zip(&cli)
+        .take_while(|(a, b)| a.to_lowercase() == b.to_lowercase())
+        .count();
+    // Not even the drive in common.
+    if shared == 0 {
+        return None;
+    }
+    let mut relative: Vec<&str> = vec![".."; home.len() - shared];
+    relative.extend(cli[shared..].iter().map(String::as_str));
+    let relative = relative.join("\\");
+    ascii(&relative).then(|| format!("\"%~dp0{}\"", relative.replace('%', "%%")))
+}
+
+/// A batch file that runs nothing and writes `why` to standard error, as plain ASCII: a
+/// character outside it shows as `?`, a double quote as `'`, and every character cmd would
+/// read (`%`, `^`, `&`, `|`, `<`, `>`, `(`, `)`) is escaped. A long text is split over lines
+/// short of cmd's limit.
+fn cmd_refusal(why: &str) -> String {
+    let plain: String = why
+        .chars()
+        .map(|c| match c {
+            '"' => '\'',
+            c if c.is_ascii() && !c.is_ascii_control() => c,
+            _ => '?',
+        })
+        .collect();
+    let mut lines = vec![
+        "@echo off".to_owned(),
+        "rem Written by OmniGraph Studio for one agent conversation (spec 013).".to_owned(),
+    ];
+    for chunk in plain.as_bytes().chunks(1000) {
+        let mut escaped = String::new();
+        for &byte in chunk {
+            match byte {
+                b'%' => escaped.push_str("%%"),
+                b'^' | b'&' | b'|' | b'<' | b'>' | b'(' | b')' => {
+                    escaped.push('^');
+                    escaped.push(char::from(byte));
+                }
+                _ => escaped.push(char::from(byte)),
+            }
+        }
+        // `echo(` prints any text, an empty one, `on`, `off` or `/?` included.
+        lines.push(format!("1>&2 echo({escaped}"));
+    }
+    lines.push("exit /b 1".to_owned());
+    lines.iter().map(|line| format!("{line}\r\n")).collect()
+}
+
+// Most tests run fake CLIs, which are shell scripts: those run on Unix.
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
 
     /// The first candidate that speaks the graph's contract is chosen, as the CLI reports it and
     /// with no server behind the gateway; with none, the wrapper runs nothing and names each CLI
     /// found.
+    #[cfg(unix)]
     #[test]
     fn the_cli_that_speaks_the_contract_is_chosen_without_a_server() {
         let dir = std::env::temp_dir().join(format!("studio-cli-choice-{}", std::process::id()));
@@ -1070,6 +1321,7 @@ mod tests {
 
     /// `omnigraph_run` runs outside the agent's sandbox: it speaks only to the conversation's
     /// gateway and touches files only in the conversation's working directory.
+    #[cfg(unix)]
     #[test]
     fn run_arguments_stay_on_the_gateway_and_in_the_working_directory() {
         let cwd = std::env::temp_dir().join(format!("studio-run-args-{}", std::process::id()));
@@ -1180,6 +1432,7 @@ mod tests {
 
     /// The agent can change a part of a path into a link after the check: Studio stages each
     /// file by handle, so a link is refused on the way in and replaced on the way out.
+    #[cfg(unix)]
     #[test]
     fn a_runs_files_are_staged_without_following_links() {
         let cwd = std::env::temp_dir().join(format!("studio-run-stage-{}", std::process::id()));
@@ -1235,6 +1488,7 @@ mod tests {
     /// its sandbox: it starts the chosen CLI itself, with the private home, in a private folder,
     /// and without Studio's own OmniGraph variables. Ending the conversation leaves a later one's
     /// credentials in the same folder alone.
+    #[cfg(unix)]
     #[test]
     fn a_run_starts_the_chosen_cli_with_its_private_home() {
         let cwd = std::env::temp_dir().join(format!("studio-run-private-{}", std::process::id()));
@@ -1319,6 +1573,7 @@ mod tests {
 
     /// A command that writes past the output cap is stopped, not left blocked on its pipe
     /// until the 30-minute timeout.
+    #[cfg(unix)]
     #[test]
     fn a_run_that_writes_too_much_is_stopped() {
         let cwd = std::env::temp_dir().join(format!("studio-run-cap-{}", std::process::id()));
@@ -1380,6 +1635,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_conversation_home_holds_its_config_token_and_wrapper() {
         let cwd = std::env::temp_dir().join(format!("studio-cli-home-{}", std::process::id()));
@@ -1441,24 +1697,33 @@ mod tests {
 
         // Claude Code keeps the first 2,048 characters of a server's instructions, so the
         // server's and the conversation's fit, with a long data directory in the command path.
+        // Windows's batch file adds a note on its arguments, and its name is longer.
         let long = cwd
             .join("d".repeat(120))
             .join(".studio/agent-20261013-101500");
-        let longest = CliHome {
-            command: long.join("omnigraph"),
-            dir: long,
-            graph: "g".repeat(64),
-            branch: "agent/20261013-101500".into(),
-            base: "b".repeat(64),
-            cwd: cwd.clone(),
-            folder: ".studio/agent-20261013-101500".into(),
-            credentials: String::new(),
-            private: cwd.join("private/longest"),
-            cli: std::sync::Mutex::new(Err(String::new())),
-        };
-        for ready in [None, Some(true), Some(false)] {
-            let length = crate::mcp::INSTRUCTIONS.len() + 2 + longest.instructions(ready).len();
-            assert!(length <= 2048, "{length} characters");
+        for (windows, wrapper) in [(false, "omnigraph"), (true, "omnigraph.cmd")] {
+            let longest = CliHome {
+                command: long.join(wrapper),
+                dir: long.clone(),
+                graph: "g".repeat(64),
+                branch: "agent/20261013-101500".into(),
+                base: "b".repeat(64),
+                cwd: cwd.clone(),
+                folder: ".studio/agent-20261013-101500".into(),
+                credentials: String::new(),
+                private: cwd.join("private/longest"),
+                cli: std::sync::Mutex::new(Err(String::new())),
+            };
+            for ready in [None, Some(true), Some(false)] {
+                let instructions = longest.instructions_on(ready, windows);
+                let length = crate::mcp::INSTRUCTIONS.len() + 2 + instructions.len();
+                assert!(length <= 2048, "{length} characters (Windows: {windows})");
+                assert_eq!(
+                    instructions.contains("batch file"),
+                    windows && ready != Some(false),
+                    "{instructions}"
+                );
+            }
         }
 
         let credentials = home.dir.join("credentials");
@@ -1471,5 +1736,236 @@ mod tests {
         let rules = std::fs::read_to_string(cwd.join("AGENTS.md")).unwrap();
         assert!(rules.contains("give no `--target` or `--graph`"), "{rules}");
         std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// The shell script and the batch file are written from one account of the wrapper: the
+    /// same variables removed, its own folder as the home, loopback first in `NO_PROXY`, and the
+    /// CLI run with the agent's arguments as they came. Only the syntax differs.
+    #[test]
+    fn both_wrappers_are_written_from_one_account() {
+        let posix = posix_script(&Wrapper::Run {
+            home: Path::new("/data/agent/graphs/g/.studio/agent-x"),
+            cli: Path::new("/opt/it's here/omnigraph"),
+        });
+        assert_eq!(
+            posix,
+            "#!/bin/sh\n\
+             # Written by OmniGraph Studio for one agent conversation (spec 013): the omnigraph\n\
+             # CLI, pointed at Studio's gateway for this conversation.\n\
+             for name in $(env | sed -n 's/^\\(OMNIGRAPH_TOKEN_[A-Za-z0-9_]*\\)=.*/\\1/p'); do unset \"$name\"; done\n\
+             unset OMNIGRAPH_BEARER_TOKEN OMNIGRAPH_PROFILE OMNIGRAPH_CONTROL_TOKEN OMNIGRAPH_CONTROL_API\n\
+             OMNIGRAPH_HOME='/data/agent/graphs/g/.studio/agent-x'\n\
+             NO_PROXY=\"127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}\"\n\
+             no_proxy=\"$NO_PROXY\"\n\
+             export OMNIGRAPH_HOME NO_PROXY no_proxy\n\
+             exec '/opt/it'\\''s here/omnigraph' \"$@\"\n"
+        );
+        let cmd = cmd_script(&Wrapper::Run {
+            home: Path::new(
+                r"C:\Users\ada\AppData\Roaming\OmniGraph Studio\agent\graphs\g\.studio\agent-x",
+            ),
+            cli: Path::new(r"C:\Users\ada\.local\bin\omnigraph.exe"),
+        });
+        let lines = [
+            "@echo off",
+            "rem Written by OmniGraph Studio for one agent conversation (spec 013): the omnigraph",
+            "rem CLI, pointed at Studio's gateway for this conversation.",
+            "setlocal EnableExtensions DisableDelayedExpansion",
+            "for /f \"delims==\" %%N in ('set OMNIGRAPH_TOKEN_ 2^>nul') do set \"%%N=\"",
+            "set \"OMNIGRAPH_BEARER_TOKEN=\"",
+            "set \"OMNIGRAPH_PROFILE=\"",
+            "set \"OMNIGRAPH_CONTROL_TOKEN=\"",
+            "set \"OMNIGRAPH_CONTROL_API=\"",
+            "set \"OMNIGRAPH_HOME=%~dp0\"",
+            "set \"OMNIGRAPH_HOME=%OMNIGRAPH_HOME:~0,-1%\"",
+            "if defined NO_PROXY (set \"NO_PROXY=127.0.0.1,localhost,%NO_PROXY%\") else set \
+             \"NO_PROXY=127.0.0.1,localhost\"",
+            "\"C:\\Users\\ada\\.local\\bin\\omnigraph.exe\" %*",
+        ];
+        assert_eq!(cmd, lines.map(|line| format!("{line}\r\n")).concat());
+        for name in WRAPPER_UNSET_PREFIXES.iter().chain(WRAPPER_UNSET) {
+            assert!(posix.contains(name) && cmd.contains(name), "{name}");
+        }
+    }
+
+    /// The batch file quotes every path it names, doubling `%`, the one character cmd reads
+    /// inside double quotes, and holds nothing but ASCII, which every console code page reads
+    /// alike. A CLI whose path is not ASCII is named from the batch file's own folder when that
+    /// way is; otherwise the wrapper says so and runs nothing. Its refusals are escaped too.
+    #[test]
+    fn the_batch_file_names_hostile_paths_and_refuses_what_it_cannot_name() {
+        let home = r"C:\Users\Jürgen\AppData\Roaming\OmniGraph Studio\agent\graphs\g\.studio\a";
+        let name = |cli: &str| cmd_program(Path::new(home), Path::new(cli));
+        assert_eq!(
+            name(r"C:\Tools\50% & ^y (z) !w! 'q';=,\omnigraph.exe").as_deref(),
+            Some(r#""C:\Tools\50%% & ^y (z) !w! 'q';=,\omnigraph.exe""#)
+        );
+        // Under the same profile, in any case, the way up is ASCII.
+        let up = r"..\..\..\..\..\..\..\..";
+        assert_eq!(
+            name(r"C:\Users\Jürgen\.local\bin\omnigraph.exe"),
+            Some(format!(r#""%~dp0{up}\.local\bin\omnigraph.exe""#))
+        );
+        assert_eq!(
+            name(r"c:\users\JÜRGEN\100%\omnigraph.exe"),
+            Some(format!(r#""%~dp0{up}\100%%\omnigraph.exe""#))
+        );
+        for cli in [
+            r"C:\Users\Jürgen\Ünïcode\omnigraph.exe",
+            r"D:\Jürgen\omnigraph.exe",
+            r"C:\日本\omnigraph.exe",
+        ] {
+            assert_eq!(name(cli), None, "{cli}");
+            let refusal = cmd_script(&Wrapper::Run {
+                home: Path::new(home),
+                cli: Path::new(cli),
+            });
+            assert!(refusal.contains("omnigraph_run") && !refusal.contains("%*"));
+            assert!(refusal.is_ascii(), "{refusal}");
+        }
+
+        let refusal = cmd_refusal("No CLI: \"C:\\Jürgen\\x\" 100% & <a|b> ^c (d)");
+        assert_eq!(
+            refusal,
+            "@echo off\r\n\
+             rem Written by OmniGraph Studio for one agent conversation (spec 013).\r\n\
+             1>&2 echo(No CLI: 'C:\\J?rgen\\x' 100%% ^& ^<a^|b^> ^^c ^(d^)\r\n\
+             exit /b 1\r\n"
+        );
+        // A long text is split short of cmd's 8,191-character line.
+        let long = cmd_refusal(&"x".repeat(2500));
+        assert_eq!(long.matches("echo(").count(), 3);
+        for script in [refusal, long] {
+            assert!(script.lines().all(|line| line.len() < 8191));
+        }
+    }
+
+    /// Set for this test binary when it runs as the CLI.
+    #[cfg(windows)]
+    const STAND_IN: &str = "STUDIO_TEST_CLI_STAND_IN";
+    /// The test that is the CLI when this test binary runs as one.
+    #[cfg(windows)]
+    const STAND_IN_TEST: &str = "cli_home::tests::stands_in_for_the_cli";
+    /// Where the stand-in CLI's own arguments start.
+    #[cfg(windows)]
+    const CLI: &str = "studio-test-cli";
+
+    /// What the batch file test starts this test binary as: the CLI, which prints its
+    /// arguments and what it inherited, and exits with 7. Run as a test, it does nothing.
+    #[cfg(windows)]
+    #[test]
+    fn stands_in_for_the_cli() {
+        if std::env::var_os(STAND_IN).is_none() {
+            return;
+        }
+        let args: Vec<String> = std::env::args().collect();
+        let Some(at) = args.iter().position(|arg| arg == CLI) else {
+            return;
+        };
+        let var = |name: &str| std::env::var(name).ok();
+        let seen = serde_json::json!({
+            "args": &args[at + 1..],
+            "home": var("OMNIGRAPH_HOME"),
+            "no_proxy": var("NO_PROXY"),
+            "token": var("OMNIGRAPH_TOKEN_PERSONAL"),
+            "bearer": var("OMNIGRAPH_BEARER_TOKEN"),
+            "kept": var("STUDIO_TEST_KEPT"),
+        });
+        println!("cli {seen}");
+        std::process::exit(7);
+    }
+
+    /// The batch file runs the CLI from a home whose folder holds what cmd reads and what a
+    /// batch file's text cannot, with its own home, loopback first in `NO_PROXY` and no other
+    /// token, and every argument as given by a caller that escapes for cmd, as Rust's standard
+    /// library does. This test binary stands in for the CLI. Its refusal says why and fails.
+    #[cfg(windows)]
+    #[test]
+    fn the_batch_file_runs_the_cli_with_every_argument_as_given() {
+        // No `%`: the standard library escapes a batch file's arguments for cmd, not its path,
+        // which cmd would read; the batch file never writes its folder's name in its text.
+        let root =
+            std::env::temp_dir().join(format!("studio-cmd & ^x (ü) !y! {}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        let home = CliHome::write(
+            &root,
+            &root.join("private"),
+            1,
+            "t",
+            "knowledge",
+            "agent/x",
+            "main",
+        )
+        .unwrap();
+        assert!(home.command.ends_with("omnigraph.cmd"));
+        let cli = std::env::current_exe().unwrap();
+        home.use_cli(&cli).unwrap();
+        let script = std::fs::read_to_string(&home.command).unwrap();
+        assert!(script.is_ascii(), "{script}");
+
+        let given = [
+            "one",
+            "two words",
+            "a \"quoted\" word",
+            "",
+            "100%",
+            "%PATH%",
+            "^caret",
+            "a&b",
+            "x|y",
+            "<in>",
+            "(paren)",
+            "!bang!",
+            "trailing\\",
+            "naïve 日本",
+        ];
+        let output = std::process::Command::new(&home.command)
+            .args(["--exact", STAND_IN_TEST, "--nocapture", "--", CLI])
+            .args(given)
+            .env(STAND_IN, "1")
+            .env("OMNIGRAPH_TOKEN_PERSONAL", "secret")
+            .env("OMNIGRAPH_BEARER_TOKEN", "secret")
+            .env("NO_PROXY", "corp.example")
+            .env("STUDIO_TEST_KEPT", "kept")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let line = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("cli "))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the CLI did not run: {stdout}{}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+        let seen: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(seen["args"], serde_json::json!(given));
+        assert_eq!(seen["home"], serde_json::json!(home.dir.to_str().unwrap()));
+        assert_eq!(seen["no_proxy"], "127.0.0.1,localhost,corp.example");
+        assert!(
+            seen["token"].is_null() && seen["bearer"].is_null(),
+            "{seen}"
+        );
+        assert_eq!(seen["kept"], "kept");
+        assert_eq!(
+            output.status.code(),
+            Some(7),
+            "the wrapper exits as the CLI does"
+        );
+
+        home.refuse("No CLI: \"x\" 100% & <a|b> ^c (d)").unwrap();
+        let output = std::process::Command::new(&home.command)
+            .arg("query")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr).trim_end(),
+            "No CLI: 'x' 100% & <a|b> ^c (d)"
+        );
+        drop(home);
+        std::fs::remove_dir_all(&root).ok();
     }
 }

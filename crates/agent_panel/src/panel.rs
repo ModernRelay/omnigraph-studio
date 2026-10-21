@@ -34,7 +34,7 @@ use ui::{CircularProgress, Indicator, KeyBinding, PopoverMenu, Severity, Tooltip
 
 use crate::cli_home::{self, CliHome};
 use crate::gateway::{Gateway, GatewayEvent, OnOutcome, Seen};
-use crate::gateway_rules::{Sandbox, WriteKind, WriteSummary};
+use crate::gateway_rules::{Creates, Sandbox, WriteKind, WriteSummary};
 use crate::host::{AgentLaunch, HostCommand, HostEvent, Opened, SessionLaunch};
 use crate::sessions::{AgentSessions, Live, SessionRecord};
 use crate::socket::{ToolRequest, ToolSocket};
@@ -70,6 +70,9 @@ fn outcome_kind(seen: &Seen) -> OutcomeKind {
         Seen::Committed { commit, .. } => OutcomeKind::Committed {
             commit: commit.clone(),
         },
+        // It went through, and no branch has its commit: recorded as a write that moved no
+        // branch's head, as one that made no commit is.
+        Seen::Unpublished { .. } => OutcomeKind::Committed { commit: None },
         Seen::Refused(message) => OutcomeKind::Refused {
             message: message.clone(),
         },
@@ -201,6 +204,9 @@ enum WriteState {
     Rejected,
     /// A write that made no commit of its own went through, such as creating a branch.
     Done(String),
+    /// The server held the write as this commit, which no branch shows: the agent's branch did
+    /// not move.
+    Unpublished(String),
 }
 
 /// The card of a write the agent's CLI sends through the gateway (spec 013): what it does, the
@@ -454,6 +460,10 @@ fn hash_entry(entry: &Entry, hasher: &mut impl std::hash::Hasher) {
                     6u8.hash(hasher);
                     label.hash(hasher);
                 }
+                WriteState::Unpublished(commit) => {
+                    7u8.hash(hasher);
+                    commit.hash(hasher);
+                }
             }
         }
         Entry::Notice { text, error } => {
@@ -702,8 +712,9 @@ pub struct AgentPanel {
     runs: std::collections::HashMap<u64, CliRun>,
     next_run: u64,
     /// The card of each write the gateway forwards, by the gateway's id: the entry, what the
-    /// write is, and whether it creates the agent's branch (a branch create, a load `--from`).
-    gateway_cards: std::collections::HashMap<u64, (usize, WriteKind, bool)>,
+    /// write is, and whether it creates the agent's branch (a branch create; a load `--from`
+    /// when its answer says so).
+    gateway_cards: std::collections::HashMap<u64, (usize, WriteKind, Creates)>,
 }
 
 impl EventEmitter<ItemEvent> for AgentPanel {}
@@ -909,15 +920,6 @@ impl AgentPanel {
     }
 
     fn start(&mut self, cx: &mut Context<Self>) {
-        // The agent's `omnigraph` wrapper is a shell script (`cli_home`); Windows needs one of
-        // its own, with its own quoting, before an agent may run there.
-        if cfg!(windows) {
-            self.fail_start(
-                "The agent panel is not available on Windows yet; the rest of Studio is.".into(),
-                cx,
-            );
-            return;
-        }
         let settings = StudioSettings::get(cx).agent.clone();
         if settings.command.is_empty() {
             self.state = State::Setup;
@@ -946,10 +948,10 @@ impl AgentPanel {
             saved => saved,
         };
         // A conversation runs where it ran before; any other in the graph's own directory.
-        let cwd = saved
-            .as_ref()
-            .and_then(|saved| saved.cwd.clone())
-            .unwrap_or_else(|| crate::sessions::graph_cwd(&self.session.read(cx).settings_key(cx)));
+        let cwd = match &saved {
+            Some(saved) => saved.cwd.clone(),
+            None => crate::sessions::graph_cwd(&self.session.read(cx).settings_key(cx)),
+        };
         let base = self.session.read(cx).branch.clone();
         let graph_key = self.session.read(cx).settings_key(cx);
         // A resumed conversation keeps writing to its branch.
@@ -1227,7 +1229,9 @@ impl AgentPanel {
 
     /// Records the open session, to come back to it at the next start.
     fn remember_session(&self, cx: &mut Context<Self>) {
-        let (Some(session), Some(branch)) = (&self.session_id, &self.branch) else {
+        // All three are set once the agent was launched, which is before it opens a session.
+        let (Some(session), Some(branch), Some(cwd)) = (&self.session_id, &self.branch, &self.cwd)
+        else {
             return;
         };
         let now = chrono::Utc::now();
@@ -1243,7 +1247,7 @@ impl AgentPanel {
             branch_created: branch.created,
             pinned: false,
             archived: false,
-            cwd: self.cwd.clone(),
+            cwd: cwd.clone(),
         };
         self.sessions
             .update(cx, |sessions, cx| sessions.upsert(record, cx));
@@ -1932,16 +1936,19 @@ impl AgentPanel {
             query: write.query.clone().unwrap_or_default(),
             params: write.params.clone(),
             branch: branch.name.clone(),
-            creates_from: write.creates_branch.then(|| branch.base.clone()),
+            // A load given `from` is marked new only once its answer says it made the branch.
+            creates_from: (write.creates_branch == Creates::Always).then(|| branch.base.clone()),
             state,
         }));
         self.gateway_cards
             .insert(id, (index, write.kind, write.creates_branch));
-        // A write that makes or deletes the agent's branch reads the branch list again.
+        // A write that makes or deletes the agent's branch reads the branch list again, and so
+        // does a load that may make it: the session takes that from the request, as only the
+        // session can drop the history it holds for a branch made again under its name.
         let (branch, description, moves_branches) = (
             branch.name.clone(),
             format!("Agent CLI: {}", write.summary),
-            write.creates_branch || write.kind == WriteKind::BranchDelete,
+            write.creates_branch != Creates::Never || write.kind == WriteKind::BranchDelete,
         );
         match waiting {
             None => {
@@ -1999,28 +2006,50 @@ impl AgentPanel {
         let Some((index, kind, creates_branch)) = self.gateway_cards.remove(&id) else {
             return;
         };
+        let went_through = matches!(outcome, Seen::Committed { .. });
+        // Whether this write made the agent's branch: a load given `from` says in its answer.
+        let made_branch = match creates_branch {
+            Creates::Always => went_through,
+            Creates::IfMissing => matches!(
+                outcome,
+                Seen::Committed {
+                    branch_created: true,
+                    ..
+                }
+            ),
+            Creates::Never => false,
+        };
         let state = match &outcome {
             Seen::Committed {
                 commit: Some(commit),
                 nodes,
                 edges,
+                ..
             } => WriteState::Committed {
                 commit: commit.clone(),
                 nodes: *nodes,
                 edges: *edges,
             },
-            Seen::Committed { commit: None, .. } => WriteState::Done(if creates_branch {
+            Seen::Committed { commit: None, .. } => WriteState::Done(if made_branch {
                 "Branch created".into()
             } else {
                 "Done".into()
             }),
+            Seen::Unpublished { commit } => WriteState::Unpublished(commit.clone()),
             Seen::Refused(message) => WriteState::Refused(message.clone()),
             Seen::Unknown(_) => WriteState::Unknown,
         };
-        let went_through = matches!(outcome, Seen::Committed { .. });
+        if made_branch
+            && let (Some(Entry::Write(card)), Some(branch)) =
+                (self.entries.get_mut(index), &self.branch)
+        {
+            card.creates_from = Some(branch.base.clone());
+        }
         let mut created = false;
         if let Some(branch) = &mut self.branch {
-            if went_through && creates_branch && !branch.created {
+            // A write that may make the branch and went through leaves it there, made now or
+            // before.
+            if went_through && creates_branch != Creates::Never && !branch.created {
                 branch.created = true;
                 created = true;
             }
@@ -3696,6 +3725,17 @@ impl AgentPanel {
                     WriteState::Done(label) => {
                         (Some(IconName::Check), Color::Success, label.clone(), None)
                     }
+                    WriteState::Unpublished(commit) => (
+                        Some(IconName::Warning),
+                        Color::Warning,
+                        "Not on the branch".into(),
+                        Some(format!(
+                            "The server held this write as commit {commit}, which no branch \
+                             shows, so {} did not change. Publishing it is yours, outside \
+                             Studio.",
+                            card.branch
+                        )),
+                    ),
                     _ => (Some(IconName::Close), Color::Muted, "Rejected".into(), None),
                 };
                 let commit = match state {

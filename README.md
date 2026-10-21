@@ -17,8 +17,7 @@ GPU, through Metal on macOS and Vulkan (wgpu) on Linux; there is no web view or 
 [Releases](https://github.com/ModernRelay/omnigraph-studio/releases) have a macOS DMG (Apple
 silicon), Linux tarballs (x86_64, arm64) and a Windows zip (x86_64, Windows 10 1809 or later).
 macOS builds are not notarized and the Windows build is not signed yet; the release notes say
-how to open them. On Windows the agent panel is not available yet. To build from source
-instead, see below.
+how to open them. To build from source instead, see below.
 
 ## Quick start
 
@@ -177,7 +176,6 @@ Built against OmniGraph 0.14 (`edge-20261018-0a62bb7`); macOS is the primary pla
 test in CI. Not implemented:
 
 - Signed and notarized releases, a Windows installer, auto-update.
-- The agent panel on Windows.
 - OIDC sign-in; Studio authenticates with bearer tokens.
 - Approvals and comments on reviews.
 - Features that depend on deferred engine changes ([spec 012](specs/012-omnigraph-engine-changes/plan.md)).

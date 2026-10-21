@@ -45,8 +45,20 @@ pub struct WriteSummary {
     /// The query text, for a mutation.
     pub query: Option<String>,
     pub params: Option<Map<String, Value>>,
-    /// The write creates the agent's branch.
-    pub creates_branch: bool,
+    /// Whether the write creates the agent's branch.
+    pub creates_branch: Creates,
+}
+
+/// Whether a write creates the agent's branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Creates {
+    Never,
+    /// A branch create.
+    Always,
+    /// A load given `from`, which creates the branch only when it does not exist yet: its
+    /// answer says whether it did (`branch_created`). The gateway's own refusal of a load tells
+    /// the agent to pass `--from`, so such a load often lands on a branch that exists.
+    IfMissing,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -89,8 +101,22 @@ fn graph_route(request: &Incoming<'_>, sandbox: &Sandbox, graph: &str, rest: &[&
     if matches!(request.method, "GET" | "HEAD") {
         return Verdict::Read;
     }
+    let flag = |key: &str| {
+        request
+            .json
+            .and_then(|json| json.get(key))
+            .and_then(Value::as_bool)
+            == Some(true)
+    };
     match (request.method, rest) {
         ("POST", ["query"]) | ("POST", ["export"]) | ("POST", ["changes", "baseline"]) => {
+            return Verdict::Read;
+        }
+        // A merge's dry run reads both branches and writes nothing: a preview, into any branch
+        // of any graph, as the other reads are.
+        ("POST", ["branches", "merge"])
+            if flag("dry_run") && !flag("as_commit") && !flag("delete_branch") =>
+        {
             return Verdict::Read;
         }
         _ => {}
@@ -112,9 +138,24 @@ fn graph_route(request: &Incoming<'_>, sandbox: &Sandbox, graph: &str, rest: &[&
                 return Verdict::Refuse(branch_refusal(sandbox));
             }
             let query = json_str(request.json, "query").map(str::to_owned);
+            let name = json_str(request.json, "name");
+            // A mutation held as an unpublished commit or an unattached snapshot does not move
+            // the agent's branch: Studio lists such commits nowhere, and publishing one is the
+            // person's.
+            if query
+                .as_deref()
+                .is_some_and(|query| held_off_the_branch(query, name))
+            {
+                return Verdict::Refuse(
+                    "Studio: a mutation written `as commit` or `as unattached branch` is held as a \
+                     commit no branch shows, and is not forwarded; leave the clause out to write \
+                     to the agent's branch. Nothing was sent."
+                        .into(),
+                );
+            }
             Verdict::Write(WriteSummary {
                 kind: WriteKind::Mutate,
-                summary: match json_str(request.json, "name") {
+                summary: match name {
                     Some(name) => format!("Mutation {name}"),
                     None => "Mutation".into(),
                 },
@@ -124,7 +165,7 @@ fn graph_route(request: &Incoming<'_>, sandbox: &Sandbox, graph: &str, rest: &[&
                     .and_then(|json| json.get("params"))
                     .and_then(Value::as_object)
                     .cloned(),
-                creates_branch: false,
+                creates_branch: Creates::Never,
             })
         }
         ("POST", ["load", "ndjson"]) | ("POST", ["load"]) => {
@@ -158,7 +199,11 @@ fn graph_route(request: &Incoming<'_>, sandbox: &Sandbox, graph: &str, rest: &[&
                 summary: format!("Load ({}) into {}", mode.unwrap_or("?"), sandbox.branch),
                 query: None,
                 params: None,
-                creates_branch: from.is_some(),
+                creates_branch: if from.is_some() {
+                    Creates::IfMissing
+                } else {
+                    Creates::Never
+                },
             })
         }
         ("PUT", ["blob"]) | ("DELETE", ["blob"]) => {
@@ -178,7 +223,7 @@ fn graph_route(request: &Incoming<'_>, sandbox: &Sandbox, graph: &str, rest: &[&
                 summary: format!("{} Blob {cell}", if clear { "Clear" } else { "Set" }),
                 query: None,
                 params: None,
-                creates_branch: false,
+                creates_branch: Creates::Never,
             })
         }
         ("POST", ["branches"]) => {
@@ -202,7 +247,7 @@ fn graph_route(request: &Incoming<'_>, sandbox: &Sandbox, graph: &str, rest: &[&
                 summary: format!("Create {} from {}", sandbox.branch, sandbox.base),
                 query: None,
                 params: None,
-                creates_branch: true,
+                creates_branch: Creates::Always,
             })
         }
         ("DELETE", ["branches", name]) => {
@@ -217,21 +262,11 @@ fn graph_route(request: &Incoming<'_>, sandbox: &Sandbox, graph: &str, rest: &[&
                 summary: format!("Delete {}", sandbox.branch),
                 query: None,
                 params: None,
-                creates_branch: false,
+                creates_branch: Creates::Never,
             })
         }
+        // A dry run was read above.
         ("POST", ["branches", "merge"]) => {
-            let flag = |key: &str| {
-                request
-                    .json
-                    .and_then(|json| json.get(key))
-                    .and_then(Value::as_bool)
-                    == Some(true)
-            };
-            // A dry run reads both branches and writes nothing: a preview, into any branch.
-            if flag("dry_run") && !flag("as_commit") && !flag("delete_branch") {
-                return Verdict::Read;
-            }
             // A merge held as an unpublished commit is listed nowhere in Studio, and publishing
             // it is the person's.
             if flag("as_commit") {
@@ -265,7 +300,7 @@ fn graph_route(request: &Incoming<'_>, sandbox: &Sandbox, graph: &str, rest: &[&
                 ),
                 query: None,
                 params: None,
-                creates_branch: false,
+                creates_branch: Creates::Never,
             })
         }
         ("POST", ["queries", name]) | ("POST", ["queries", name, "if-graph-commit"]) => {
@@ -279,7 +314,7 @@ fn graph_route(request: &Incoming<'_>, sandbox: &Sandbox, graph: &str, rest: &[&
                         .and_then(|json| json.get("params"))
                         .and_then(Value::as_object)
                         .cloned(),
-                    creates_branch: false,
+                    creates_branch: Creates::Never,
                 });
             }
             // Off the agent's branch a stored query may only read: the server refuses one that
@@ -325,6 +360,53 @@ fn statement_refusal(sandbox: &Sandbox) -> String {
          only in the query text, are not forwarded. Nothing was sent.",
         sandbox.branch, sandbox.branch, sandbox.base
     )
+}
+
+/// Whether the declaration a mutation runs, `name` (every declaration when none is named, or
+/// when none has that name), is written `as commit` or `as unattached branch`: the server then
+/// holds the write as a commit no branch shows rather than moving the branch.
+///
+/// The clause stands in a declaration's head, between its parameters (and annotations) and the
+/// `{` of its body (`query_decl` in the compiler's grammar), where `gq_language`'s lexer marks
+/// `as commit` and `as unattached` as keywords; comments between the words are passed over, as
+/// the server passes them over, and a string or a comment holding the words is not read as
+/// them. The body is not read: there `as` names a column. A source in which the lexer finds no
+/// declaration is read whole, so what it cannot place is not let through unread.
+fn held_off_the_branch(query: &str, name: Option<&str>) -> bool {
+    use gq_language::TokenKind;
+    let tokens = gq_language::tokenize(query);
+    let mut declarations: Vec<std::ops::Range<usize>> = Vec::new();
+    let outline = gq_language::outline(query).declarations;
+    let named = outline
+        .iter()
+        .any(|declaration| Some(declaration.name.as_str()) == name);
+    for declaration in &outline {
+        if !named || Some(declaration.name.as_str()) == name {
+            declarations.push(declaration.range.clone());
+        }
+    }
+    let body_opens = |token: &gq_language::Token| {
+        !outline.is_empty()
+            && token.kind == TokenKind::Punctuation
+            && &query[token.range.clone()] == "{"
+    };
+    if outline.is_empty() {
+        declarations.push(0..query.len());
+    }
+    let keyword = |token: &gq_language::Token, word: &str| {
+        token.kind == TokenKind::Keyword && &query[token.range.clone()] == word
+    };
+    declarations.iter().any(|declaration| {
+        let head: Vec<&gq_language::Token> = tokens
+            .iter()
+            .filter(|token| declaration.contains(&token.range.start))
+            .filter(|token| token.kind != TokenKind::Comment)
+            .take_while(|token| !body_opens(token))
+            .collect();
+        head.windows(2).any(|pair| {
+            keyword(pair[0], "as") && (keyword(pair[1], "commit") || keyword(pair[1], "unattached"))
+        })
+    })
 }
 
 fn json_str<'a>(json: Option<&'a Value>, key: &str) -> Option<&'a str> {
@@ -433,6 +515,47 @@ mod tests {
             &[],
             Some(json!({"query": "q", "branch": AGENT})),
         )));
+
+        // A mutation held as an unpublished commit or an unattached snapshot never moves the
+        // agent's branch: refused, as its words are written in the declaration's head.
+        let mutation = |query: &str, name: Option<&str>| {
+            verdict(
+                "POST",
+                "/graphs/knowledge/mutate",
+                &[],
+                Some(json!({"query": query, "name": name, "branch": AGENT})),
+            )
+        };
+        for held in [
+            "query add($n: String) as commit { insert Person { name: $n } }",
+            "query add() @description(\"one\") as /* held */ commit {\n insert Person { name: \"a\" }\n}",
+            "query add() as unattached branch { insert Person { name: \"a\" } }",
+            "query add($b: String) as unattached branch on $b { insert Person { name: \"a\" } }",
+            "set x = 1;\nquery add() as unattached branch on \"01J\" { delete Person where name = \"a\" }",
+        ] {
+            let refusal = mutation(held, None);
+            assert!(
+                matches!(&refusal, Verdict::Refuse(text) if text.contains("as commit")),
+                "{held}: {refusal:?}"
+            );
+        }
+        let two = "query keep() { insert Person { name: \"a\" } }\n\
+                   query hold() as commit { insert Person { name: \"b\" } }";
+        assert!(refused(&mutation(two, Some("hold"))));
+        assert!(refused(&mutation(two, None)), "unnamed, either may run");
+        assert!(refused(&mutation(two, Some("missing"))));
+        // The words elsewhere than the head are not the clause.
+        for written in [
+            "query keep() { insert Person { name: \"as commit\" } }",
+            "// as commit\nquery keep() { insert Person { name: \"a\" } }",
+            "query keep() /* as commit */ { insert Person { name: \"a\" } }",
+        ] {
+            assert!(
+                matches!(mutation(written, None), Verdict::Write(_)),
+                "{written}"
+            );
+        }
+        assert!(matches!(mutation(two, Some("keep")), Verdict::Write(_)));
     }
 
     #[test]
@@ -443,9 +566,9 @@ mod tests {
             &[("branch", AGENT), ("mode", "append"), ("from", "main")],
             None,
         );
-        assert!(
-            matches!(&write, Verdict::Write(s) if s.creates_branch && s.kind == WriteKind::Load)
-        );
+        // Given `from`, the load creates the branch only when it is missing: its answer says.
+        assert!(matches!(&write, Verdict::Write(s)
+            if s.creates_branch == Creates::IfMissing && s.kind == WriteKind::Load));
         assert!(matches!(
             verdict(
                 "POST",
@@ -454,7 +577,7 @@ mod tests {
                 None
             ),
             Verdict::Write(WriteSummary {
-                creates_branch: false,
+                creates_branch: Creates::Never,
                 ..
             })
         ));
@@ -484,7 +607,7 @@ mod tests {
             ),
             Verdict::Write(WriteSummary {
                 kind: WriteKind::BranchCreate,
-                creates_branch: true,
+                creates_branch: Creates::Always,
                 ..
             })
         ));
@@ -544,17 +667,26 @@ mod tests {
             &[],
             Some(json!({"source": "main", "target": AGENT, "delete_branch": true}))
         )));
-        // A dry run writes nothing, into any branch; a merge held as an unpublished commit is
-        // never forwarded.
-        assert_eq!(
-            verdict(
-                "POST",
-                "/graphs/knowledge/branches/merge",
-                &[],
-                Some(json!({"source": AGENT, "target": "main", "dry_run": true}))
-            ),
-            Verdict::Read
-        );
+        // A dry run writes nothing: a read, into any branch of any graph. A merge held as an
+        // unpublished commit is never forwarded.
+        for graph in ["knowledge", "other"] {
+            assert_eq!(
+                verdict(
+                    "POST",
+                    &format!("/graphs/{graph}/branches/merge"),
+                    &[],
+                    Some(json!({"source": AGENT, "target": "main", "dry_run": true}))
+                ),
+                Verdict::Read,
+                "{graph}"
+            );
+        }
+        assert!(refused(&verdict(
+            "POST",
+            "/graphs/other/branches/merge",
+            &[],
+            Some(json!({"source": "main", "target": AGENT, "dry_run": true, "as_commit": true}))
+        )));
         assert!(refused(&verdict(
             "POST",
             "/graphs/knowledge/branches/merge",

@@ -48,10 +48,13 @@ const LIST_PAGES: usize = 20;
 /// an agent may never answer an open it was asked to cancel. A load replays the whole
 /// conversation first, so a long one takes a while.
 const FREED_WITHIN: Duration = Duration::from_secs(60);
-/// How long a conversation that let go waits for the agent to answer its close. One not
-/// answered by then is taken as over, so the session can be opened again rather than waiting
-/// for an answer that may never come.
-const CLOSE_WITHIN: Duration = Duration::from_secs(15);
+/// How long the conversations waiting for a session are kept from it while the agent has not
+/// answered the close of a conversation that let go. The close itself is never given up: it
+/// runs on the connection until the agent answers. Only the wait ends here, so the session can
+/// be opened again from an agent that never answers. A live agent answers a close at once, so
+/// this matters only for one that stalls: as long as a load is given ([`FREED_WITHIN`]), so a
+/// slow agent's close does not run beside the next load.
+const CLOSE_WITHIN: Duration = FREED_WITHIN;
 
 /// How to start an agent: one process for all of its conversations.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -950,8 +953,8 @@ async fn until_answered<T>(
 /// The panel of `events`' conversation let go of `session`: unless the session is no longer its
 /// own, the agent stops its turn (when one is `running`) and may free it. Both are sent while
 /// the routes are held. A conversation waiting for the session is woken once the agent answered
-/// the close, or at once when no close is sent, so its open never runs beside the close; a close
-/// not answered within [`CLOSE_WITHIN`] is taken as over.
+/// the close, or at once when no close is sent, so its open never runs beside the close; past
+/// [`CLOSE_WITHIN`] it is woken though the close runs on ([`free_after_close`]).
 async fn let_go(
     connection: &ConnectionTo<Agent>,
     routes: &SharedRoutes,
@@ -973,16 +976,56 @@ async fn let_go(
     });
     if let Some(close) = close {
         // Answered or failed, the close is over; it fails when the connection ends.
-        let answered = futures::FutureExt::fuse(close.block_task());
-        let late = futures::FutureExt::fuse(smol::Timer::after(CLOSE_WITHIN));
+        let answer = async move {
+            close.block_task().await.ok();
+        };
+        let spawn = |task: CloseTask| {
+            connection
+                .spawn(async move {
+                    task.await;
+                    Ok(())
+                })
+                .is_ok()
+        };
+        free_after_close(routes, &session, answer, spawn, CLOSE_WITHIN).await;
+    }
+}
+
+/// The close of a session, run to its answer.
+type CloseTask = std::pin::Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// Frees `session` for the conversations waiting for it once `close` is answered, or after
+/// `within`, whichever comes first. `close` runs to its answer on `spawn` (the connection's
+/// tasks), never in this wait: an ACP request dropped unanswered is cancelled at the agent
+/// (`$/cancel_request`), and a close cancelled may leave the session open, or still close it
+/// beside the next load. Past `within` only Studio's wait ends; the close's later answer then
+/// changes nothing, so it cannot free the session from under a later conversation's own close.
+async fn free_after_close(
+    routes: &SharedRoutes,
+    session: &SessionId,
+    close: impl Future<Output = ()> + Send + 'static,
+    spawn: impl FnOnce(CloseTask) -> bool,
+    within: Duration,
+) {
+    let (answered_tx, answered) = oneshot::channel::<()>();
+    let task: CloseTask = Box::pin(async move {
+        close.await;
+        answered_tx.send(()).ok();
+    });
+    // Not spawned, the connection has ended, and with it the close.
+    if spawn(task) {
+        // A close dropped with the connection's tasks drops its sender too, which ends the
+        // wait as an answer does.
+        let answered = futures::FutureExt::fuse(answered);
+        let late = futures::FutureExt::fuse(smol::Timer::after(within));
         futures::pin_mut!(answered, late);
         futures::select_biased! {
             _ = answered => {}
             _ = late => {}
         }
-        if let Ok(mut routes) = routes.lock() {
-            routes.close_answered(&session);
-        }
+    }
+    if let Ok(mut routes) = routes.lock() {
+        routes.close_answered(session);
     }
 }
 
@@ -1334,6 +1377,82 @@ mod tests {
         assert!(told.try_recv().is_err());
     }
 
+    /// The agent does not answer a close in time: the conversation waiting for the session goes
+    /// on, and the close runs on to its answer rather than being dropped, which would cancel it
+    /// at the agent. Its late answer leaves a later conversation's close of the same session as
+    /// it was.
+    #[test]
+    fn an_overdue_close_frees_the_session_and_still_runs_to_its_answer() {
+        let routes = SharedRoutes::default();
+        let session = SessionId::new("s");
+        let (first_tx, first_rx) = mpsc::unbounded();
+        assert!(routed(&routes, &session, &first_tx));
+        drop(first_rx);
+        assert!(routes.lock().unwrap().remove(&session, &first_tx, true));
+        let Claim::Wait(mut freed) = routes
+            .lock()
+            .unwrap()
+            .claim(session.clone(), mpsc::unbounded().0)
+        else {
+            panic!("a session being closed is not taken before the close is answered");
+        };
+
+        let (agent, answer) = oneshot::channel::<()>();
+        let ran_to_its_answer = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let close = {
+            let ran = ran_to_its_answer.clone();
+            async move {
+                answer.await.ok();
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        };
+        let mut spawned = None;
+        smol::block_on(free_after_close(
+            &routes,
+            &session,
+            close,
+            |task| {
+                spawned = Some(smol::spawn(task));
+                true
+            },
+            Duration::from_millis(20),
+        ));
+        assert!(
+            freed.try_recv().is_err(),
+            "past the bound the waiting conversation is woken"
+        );
+        assert!(!routes.lock().unwrap().closing.contains(&session));
+
+        // A later conversation lets go of the session, and its close is under way when the
+        // first close is answered at last: that answer frees nothing.
+        let (later_tx, later_rx) = mpsc::unbounded();
+        assert!(routed(&routes, &session, &later_tx));
+        drop(later_rx);
+        assert!(routes.lock().unwrap().remove(&session, &later_tx, true));
+        agent.send(()).unwrap();
+        smol::block_on(spawned.take().unwrap());
+        assert!(
+            ran_to_its_answer.load(std::sync::atomic::Ordering::SeqCst),
+            "the close was not dropped when Studio stopped waiting"
+        );
+        assert!(routes.lock().unwrap().closing.contains(&session));
+
+        // Answered within the bound, the session is freed then, without waiting it out.
+        let started = std::time::Instant::now();
+        smol::block_on(free_after_close(
+            &routes,
+            &session,
+            async {},
+            |task| {
+                smol::spawn(task).detach();
+                true
+            },
+            Duration::from_secs(60),
+        ));
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert!(!routes.lock().unwrap().closing.contains(&session));
+    }
+
     /// The panel lets go while the agent opens a session: the agent is asked to cancel, and its
     /// answer is still waited for, since a load's replay ends only with it. What the panel sent
     /// before is kept for the session.
@@ -1373,21 +1492,26 @@ mod tests {
 
 /// The command that runs `program` with `args` and none of `removed` in its environment: as it
 /// is when nothing is removed, else through `env -u`. `env` reads a word holding `=` as an
-/// assignment, so such a program runs through `sh`, which takes it as its own argument. Windows
-/// has no `env`, so there it runs through Studio's own executable as its launcher (`launch.rs`).
+/// assignment, so such a program runs through `sh`, which takes it as its own argument.
+///
+/// On Windows it always runs through Studio's own executable as its launcher (`launch.rs`),
+/// removed names or none: Windows has no `env`, the ACP crate ends only the process it started
+/// (its process group is Unix's), which for `npx` is `cmd` and not the agent under it, and the
+/// standard library finds only `.exe` programs on PATH, where `npx` is `npx.cmd`. The launcher
+/// holds the agent in a job that ends with it and finds a program as a shell does.
 fn without_variables(
     removed: &[String],
     program: &str,
     args: &[String],
 ) -> std::io::Result<(PathBuf, Vec<String>)> {
-    if removed.is_empty() {
-        return Ok((program.into(), args.to_vec()));
-    }
     if cfg!(windows) {
         return Ok((
             std::env::current_exe()?,
             crate::launch::arguments(removed, program, args),
         ));
+    }
+    if removed.is_empty() {
+        return Ok((program.into(), args.to_vec()));
     }
     let mut wrapped: Vec<String> = removed
         .iter()
@@ -1534,11 +1658,21 @@ mod credential_tests {
         let program = studio.to_string_lossy();
         let launcher = crate::launch::arguments(&removed, &program, &agent_args);
         #[cfg(windows)]
-        assert_eq!(
-            without_variables(&removed, &program, &agent_args).unwrap(),
-            (studio.clone(), launcher.clone()),
-            "Windows has no `env`: the agent starts through Studio's launcher"
-        );
+        {
+            assert_eq!(
+                without_variables(&removed, &program, &agent_args).unwrap(),
+                (studio.clone(), launcher.clone()),
+                "Windows has no `env`: the agent starts through Studio's launcher"
+            );
+            // With nothing to remove too: only the launcher's job ends what the agent starts.
+            assert_eq!(
+                without_variables(&[], "npx", &["x".to_owned()]).unwrap(),
+                (
+                    studio.clone(),
+                    crate::launch::arguments(&[], "npx", &["x".to_owned()])
+                ),
+            );
+        }
         let output = std::process::Command::new(&studio)
             .args(&libtest)
             .args(&launcher)

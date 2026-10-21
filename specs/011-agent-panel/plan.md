@@ -78,8 +78,8 @@ Nothing is downloaded until the person picks one and sends a prompt.
 `Setup` (no command) → `Starting` (spawn, `initialize`, `session/new`) → `Ready` →
 `Prompting` (Stop sends `session/cancel`) → `Ready`. If the process exits, `Exited` shows the
 exit status and the last 20 lines (at most 4 KB) of its stderr, and **Restart**. Changing the
-graph or closing the window ends the agent (the process group is killed) and removes the
-socket.
+graph or closing the window ends the agent (the process group is killed; on Windows, the job
+Studio's launcher holds it in, spec 013) and removes the socket.
 
 `session/new` gets `cwd` = `<data dir>/agent/workspace` (created empty) and one MCP server:
 `{ name: "omnigraph", command: <Studio's executable>, args: ["mcp-proxy", <socket>] }`. The
@@ -88,7 +88,10 @@ socket is `<runtime dir>/<pid>-<n>.sock`, where the runtime directory is
 `$XDG_RUNTIME_DIR/omnigraph-studio`, else `/tmp/omnigraph-studio-$USER`, on Linux. Studio
 creates it with mode `0700`, refuses an existing one that is not a real directory owned by the
 user with mode `0700`, and refuses a socket path longer than 100 bytes. Unix socket paths are
-limited to 104 bytes on macOS.
+limited to 104 bytes on macOS. On Windows the socket is a Unix socket too (`uds_windows`,
+Windows 10 1809 and later), in `%TEMP%\omnigraph-studio`: the person's temporary folder is under
+their profile, which only they, the system and administrators can open, and the folder takes
+that access; Windows has no mode bits to check.
 
 ### Tools
 
@@ -316,9 +319,6 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 
 ## Deferred
 
-- Windows: the tool socket uses Unix sockets there too (`uds_windows`, Windows 10 1809 and
-  later), but the agent's `omnigraph` wrapper is a shell script (spec 013), so the panel says it
-  is not available on Windows until a `cmd` wrapper with its own quoting exists.
 - Agent-attributed commits: commits are recorded under the person's actor. Recording "on
   behalf of an agent" needs an engine change, E20 in `docs/deferred-engine-changes.md`.
 - Steering (ending a turn at the next tool boundary for a queued message): Zed does it only for
@@ -349,6 +349,9 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 | 2026-10-13 | The thread lays out only what shows and follows the newest reply | Read `gpui/src/elements/list.rs` (`ListState::splice`, `remeasure_items`, `FollowMode::Tail`, `scroll_to_end`) at `v1.23.2`; offscreen snapshots with the test agent: three questions in a 1300×800 window, then an empty conversation | The view stood at the end of the third reply, its markdown at full height (lists, inline code and the code block), the earlier turns above it; the empty conversation still showed "Ask about the graph" |
 | 2026-10-14 | Typing in the composer does not grow with the conversation | Snapshot tool on `release-fast` with the test agent in a scratch data folder: one and three markdown replies, a click into the composer, then 200 keys | 0.85 ms of main-thread CPU a key beside one reply, 0.93 ms beside three: the composer and the thread are one view, but the thread's `list` lays out only the replies that show. No change needed. `studio_agent::Ask` leaves focus off the composer, so the measurement clicks into it first |
 | 2026-10-16 | Send and the options sit under the prompt | Offscreen snapshot of a conversation tab with text in the composer | Once the status bar became one bar across the window, the composer's controls had landed at the window's bottom edge; they now end the composer, right-aligned under the prompt, and the status bar shows the graph and branch alone |
+| 2026-10-20 | The agent panel and the Conversations panel run agents on Windows | Both refusals removed (`panel.rs` `start`, `sessions_panel.rs` `agent`); spec 013's Windows rows | Not run on Windows here: the Windows-only tests run in CI on `windows-2025` |
+| 2026-10-20 | An overdue close is not cancelled, and does not free a later conversation's close | `agent_panel` `an_overdue_close_frees_the_session_and_still_runs_to_its_answer` | Past the bound the waiting conversation was woken and the close still ran to its answer; its late answer left a later conversation's close of the session in place. Dropping the unanswered request had sent `$/cancel_request` (`SentRequestCancellation::drop`, agent-client-protocol 2.2.0); the bound is now `FREED_WITHIN` (60 s), not 15 s |
+| 2026-10-20 | Sessions files of another build are set aside, not lost | `agent_panel` `a_record_that_cannot_be_read_leaves_the_others` | A record without `cwd`, with `cwd: null`, or without its marks sets the file aside (renamed beside itself, byte for byte); a file of version 3, 1 or none is set aside with nothing read |
 
 ## Corrections
 

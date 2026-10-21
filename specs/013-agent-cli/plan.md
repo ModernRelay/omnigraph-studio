@@ -120,7 +120,7 @@ Agents (claude-agent-acp 0.89.1 with Claude Agent SDK 0.3.293; codex-acp 2.2.2 w
 | Gateway | `crates/agent_panel/src/gateway.rs` | A loopback HTTP/1.1 server per conversation (`127.0.0.1:0`, one request per connection). Checks the session token and contract header, applies the rules, forwards, and reports writes to the panel |
 | CLI home | `crates/agent_panel/src/cli_home.rs` | The conversation's directory, config, credentials and wrapper; the shared `AGENTS.md`; finding a CLI that answers |
 | Panel | `crates/agent_panel/src/panel.rs` | Starts the gateway and home with the conversation, shows each write as a card, and records outcomes in the session's write log (`GraphSession::note_write`) |
-| Agent launch | `crates/agent_panel/src/host.rs`, `launch.rs`; `omnigraph-studio launch-agent` in `crates/studio/src/main.rs` | Starts the agent without OmniGraph credentials in its environment: through `env -u` on Unix, through Studio's own launcher on Windows |
+| Agent launch | `crates/agent_panel/src/host.rs`, `launch.rs`; `omnigraph-studio launch-agent` in `crates/studio/src/main.rs` | Starts the agent without OmniGraph credentials in its environment: through `env -u` on Unix, always through Studio's own launcher on Windows |
 
 ### One directory per conversation
 
@@ -159,6 +159,23 @@ the directory, puts `127.0.0.1,localhost` in `NO_PROXY`, and runs the chosen CLI
 it by absolute path, so neither an environment filter nor a shell snapshot that reorders PATH
 can change what the CLI reads.
 
+On Windows the wrapper is the batch file `omnigraph.cmd`, written from the same account of what
+it does as the shell script (`cli_home::Wrapper`), so only the syntax differs. It removes the
+same variables (`set OMNIGRAPH_TOKEN_` lists each of that prefix, in any case), sets
+`OMNIGRAPH_HOME` to its own folder (`%~dp0`), prefixes `NO_PROXY` (one variable with `no_proxy`
+there) and runs the CLI with `%*`. Windows starts a batch file through `cmd /c`, which reads the
+caller's command line first: it expands `%NAME%` and, outside double quotes, acts on `&`, `|`,
+`<`, `>` and `^`. A caller that escapes for cmd, as Rust's standard library does, gets every
+argument through as given; a shell that quotes only for programs (Git Bash, PowerShell) leaves
+the text between two quotes inside one argument outside cmd's quotes. That holds for every
+`.cmd`, npm's shims included, so on Windows the instructions and `AGENTS.md` tell the agent to
+put such a query or its parameters in a file, or to use `omnigraph_run`. The batch file reads
+nothing more itself: `%*` is expanded once, delayed expansion is off, each path it names is in
+double quotes with `%` doubled, and its lines end with CRLF. cmd reads a batch file in the
+console's code page, so the file is ASCII only: its home is `%~dp0`; the CLI is named by its
+path when that is ASCII, else from `%~dp0` when that way is (both under a profile whose name is
+not); otherwise the wrapper says so and points at `omnigraph_run`.
+
 The agent learns the path two ways: the conversation's MCP server adds it to its `initialize`
 instructions, and a new `omnigraph_cli` tool returns it with the branch, its base and the rules.
 The config makes the gateway and the graph the default, so they tell the agent to give no
@@ -181,13 +198,22 @@ it is.
   as an assignment, so a program path holding one runs through `/bin/sh -c 'exec "$0" "$@"'`.
 - Windows has no `env`. There Studio starts its own executable as
   `omnigraph-studio launch-agent NAME… -- PROGRAM ARGS…` (`launch.rs`), as it does for
-  `mcp-proxy`. The launcher removes the names, starts the program as the ACP crate would (with
-  no window), and exits with its code. Its arguments travel on the command line the standard
-  library writes and reads back, so a path or argument arrives as given. Studio stops an agent by
-  ending the process it started, which is the launcher, so the launcher puts itself in a job that
-  ends every process in it when the launcher ends; the agent and what it starts join that job.
-  Windows reads a variable by its name in any case, so there names are matched in any ASCII
-  case.
+  `mcp-proxy`, with no names to remove as well. The launcher removes the names, starts the
+  program as the ACP crate would (with no window), and exits with its code. Its arguments travel
+  on the command line the standard library writes and reads back, so a path or argument arrives
+  as given. Studio stops an agent by ending the process it started, which is the launcher, so
+  the launcher puts itself in a job that ends every process in it when the launcher ends; the
+  agent and what it starts join that job. On Windows the ACP crate ends only the process it
+  started (its process group is Unix's), which for `npx` is `cmd`, not the agent under it, so
+  every agent goes through the job. A program named without a folder or an extension is found
+  as a shell finds it, by PATHEXT in PATH's order and never in the working directory: the
+  standard library looks only for `NAME.exe`, and npm installs `npx` as `npx.cmd`. Windows reads
+  a variable by its name in any case, so there names are matched in any ASCII case.
+- Studio's files in the agent's working directory are written by handle on both
+  (`agent_panel::confined`): Unix opens each name relative to its folder's descriptor; Windows
+  holds each folder open without sharing deletion, so it cannot be renamed, removed or swapped
+  for a junction while Studio works in it, and opens each part with
+  `FILE_FLAG_OPEN_REPARSE_POINT`, so a link or a junction is refused, never followed.
 
 ### Choosing the CLI
 
@@ -219,13 +245,13 @@ server never sees, and a repeated key could be judged by one value and read as a
 | Request | Rule |
 |---|---|
 | `GET`/`HEAD` anything; `POST /query`, `/export`, `/changes/baseline` | Forward, any graph, branch or snapshot; the answer streams back |
-| `POST /mutate`, `/mutate/if-graph-commit` | Only when `branch` is the agent branch. `branch: null` (branch and commit statements) is refused |
-| `POST /load/ndjson`, `/load` | Only when `branch` is the agent branch; `from`, when given, must be the base (it creates the branch) |
+| `POST /mutate`, `/mutate/if-graph-commit` | Only when `branch` is the agent branch. `branch: null` (branch and commit statements) is refused, and so is a declaration written `as commit` or `as unattached branch`, read from its head with `gq_language`'s lexer: it moves no branch |
+| `POST /load/ndjson`, `/load` | Only when `branch` is the agent branch; `from`, when given, must be the base (it creates the branch when the branch is missing; the answer's `branch_created` says whether it did) |
 | `PUT`/`DELETE /blob` | Only when `branch` is the agent branch |
 | `POST /branches` | Only `{name: <agent branch>, from: <base>}` |
 | `DELETE /branches/{name}` | Only the agent branch |
-| `POST /branches/merge` | Only into the agent branch, and never with `delete_branch: true` |
-| `POST /queries/{name}` | On the agent branch, a write; elsewhere forwarded with `expect_mutation: false` |
+| `POST /branches/merge` | Only into the agent branch, and never with `delete_branch: true` or `as_commit`. A `dry_run` is a read, on any graph, as the other reads are |
+| `POST /queries/{name}` | On the agent branch, a write; elsewhere forwarded with `expect_mutation: false`. Its text is not in the request and the catalog (`GET /queries`) says only whether it writes, so one held as an unpublished commit is known from its answer alone |
 | `POST /commits/{id}/publish`, `DELETE /commits/{id}`, non-`GET` `/cluster/…`, anything else | Refused |
 
 Writes are checked on the conversation's graph only. A refusal is a 403 `ErrorOutput` with
@@ -242,7 +268,10 @@ reports the outcome as unknown, as it is.
 Each write is a card in the thread, like a proposal: the summary ("Mutation", "Load (append)
 into …", "Create … from main"), the query when there is one, the branch, and the outcome:
 Committed with the commit and the change count, Done or "Branch created" for a write without a
-commit, Refused with the server's message, or Outcome unknown. A committed write is logged in the
+commit, Not on the branch for one the server held as a commit no branch shows (`kind`
+`unpublished` or `unattached`), Refused with the server's message, or Outcome unknown, which a
+success whose body cannot be read is too, as Studio's own writes judge it. A load given `from`
+is tagged new only when its answer says it created the branch. A committed write is logged in the
 session (the workspace's "Agent CLI: … committed" notice) and the agent branch banner counts it.
 
 - **Sandbox** (default): writes to the agent branch go through at once.
@@ -354,6 +383,7 @@ same write would split the cards and the rules.
 | A wrapper per conversation, run by absolute path | Environment variables and a PATH entry on the agent process; one `AGENTS.md` naming the command | The agent process and working directory are shared by the graph's conversations, so per-conversation values cannot live there. Codex's shell snapshot may reorder PATH |
 | Remove only OmniGraph's variables from the agent's environment | Also remove `AWS_*`, `AZURE_*`, Google credentials | The agent may need them for its model provider |
 | On Windows the agent starts through Studio's own executable as `launch-agent` | `cmd /c set NAME= & PROGRAM ARGS…`; starting the agent's process without the ACP crate | `cmd` expands `%` even inside quotes and does not read the quotes the standard library writes, and the ACP crate passes arguments only through the standard library, so a path or argument could change. Starting the process without the crate would repeat its stderr capture, exit and shutdown handling. Studio already re-runs its executable as `mcp-proxy` |
+| On Windows the agent's wrapper is a batch file, `omnigraph.cmd`, written from the same account as the shell script | A native launcher in each home; a PowerShell script | A launcher means a second executable to build and ship, or Studio's own: that opens its window when run as `omnigraph`, is large to copy into each home, and a hard link to it would let the agent write Studio's executable. PowerShell's default execution policy on Windows 10 and 11 refuses scripts, and Git Bash cannot run one. A batch file's cost is cmd's reading of the caller's line, which no batch file can undo; the agent is told, and `omnigraph_run` takes a list |
 | Request bodies read whole, at most 64 MiB; answers to reads stream | Stream request bodies too | The rules need small JSON bodies whole; a load larger than 64 MiB is refused before sending, which bounds memory (IX) |
 | The gateway passes the upstream contract through and refuses a CLI that speaks another | Translate between contracts | The contract is an exact-match safety property. A translation layer would be a second API that drifts |
 | Studio tests each CLI once against the gateway | Map package versions to contracts | The package version does not determine the contract; a real request does, until E23. Superseded by `version --json` (see "Choosing the CLI") |
@@ -430,6 +460,9 @@ CLI is the one they trust).
 | 2026-10-20 | The 0.14 CLI works with no destination flags and an `endpoint` in its credentials | `agent_panel` `the_stock_cli_reads_and_writes_its_branch_through_the_gateway` (ignored by default) with `omnigraph` 0.14.0-edge+0a62bb7 against `script/dev-server` on `127.0.0.1:8791` | Passed: `omnigraph_run` reads, a saved read, a read on main, the refused writes to main and branch statements, branch creation and writes on the agent's branch, all through the home's defaults. A CLI with targets was not run against the gateway: no edge build with them is installed here (`edge-20261020-b692610` is the first) |
 | 2026-10-20 | A CLI without targets is not chosen | `agent_panel` `the_cli_that_speaks_the_contract_is_chosen_without_a_server` | A 0.14 CLI that speaks the contract but reports no `protocols.target` is passed over for the one that does; with none, the notice says "0.14.0, which has no CLI targets"; both homes are the target form |
 | 2026-10-20 | The CLI with targets works through the gateway with the home's defaults | `agent_panel` `the_stock_cli_reads_and_writes_its_branch_through_the_gateway` (ignored by default) with `omnigraph` 0.14.0-edge+b692610 against `script/dev-server` on `127.0.0.1:8792`; by hand, that CLI with a home as Studio writes it | Passed (0.95 s): `omnigraph_run` reads, whole and saved to a file, a read on main, writes to main and branch statements refused, the branch created and written, all with no destination flags. By hand: `query` with no flags resolved "target studio (default) … graph=knowledge" and read 200 people; the same home in the `servers` form was refused (`target_config_invalid`), and a token saved without `endpoint` (`credential_scope_missing`) |
+| 2026-10-20 | The Windows wrapper is written from the shell script's account, and names only what cmd reads as written | `agent_panel` `both_wrappers_are_written_from_one_account`, `the_batch_file_names_hostile_paths_and_refuses_what_it_cannot_name` (pure, run on macOS) | The shell script byte for byte as before; the batch file in CRLF and ASCII only, with the same names removed; `%` doubled inside quotes and `&`, `^`, `(`, `)`, `!`, `'`, `;`, `=` left plain there; a CLI under a profile named `Jürgen` (in another case too) named from `%~dp0`; one on another drive or under another non-ASCII folder refused, pointing at `omnigraph_run`; a refusal's `"`, `%`, `&|<>^()` and `ü` escaped or replaced |
+| 2026-10-20 | On Windows the batch file passes every argument as given, Studio's folders cannot be swapped, and an agent named `npx` starts | `the_batch_file_runs_the_cli_with_every_argument_as_given`, `a_held_folder_cannot_be_swapped_and_a_junction_is_not_followed` (Windows only); `a_bare_program_name_is_found_by_its_extensions_in_path_order` (run on macOS); `cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings` on macOS over a scratch crate that includes the real `cli_home`, `confined`, `host`, `launch`, `mcp`, `socket` and `tools` files | Clippy clean once an unused `mut` in `cli_home::Stage::new`, which fails Windows's `-D warnings`, was fixed. `cargo check --workspace --target x86_64-pc-windows-msvc` cannot run on macOS: `zstd-sys`'s build script needs an MSVC C compiler. The Windows-only tests have not run yet; CI runs them on `windows-2025` |
+| 2026-10-20 | The gateway refuses a mutation held off the branch, reads a merge's dry run anywhere, and reads a write's answer as Studio does | `gateway_rules` `mutations_need_the_agent_branch_in_their_branch_field`, `branches_merges_and_blobs_stay_on_the_agent_branch`, `loads_name_their_branch_and_base_in_the_query_string`; `gateway` `a_writes_success_answer_says_what_it_did` | `as commit` and `as unattached branch [on …]` refused, after an annotation, with a comment between the words and after a settings line; the words in a string, a comment or a declaration not run let through; a dry run on another graph read, with `as_commit` refused; a load's `branch_created` read from its answer; `kind` `unpublished` or `unattached`, or `published: false`, read as not on the branch; an empty or unreadable success body unknown |
 
 ## Corrections
 

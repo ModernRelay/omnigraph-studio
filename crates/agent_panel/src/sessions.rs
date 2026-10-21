@@ -25,11 +25,10 @@ pub struct SessionRecord {
     pub graph: String,
     /// The agent command, joined with spaces: a session belongs to the agent that made it.
     pub agent: String,
-    /// The agent's title for it, else the start of the first message.
-    #[serde(default)]
+    /// The agent's title for it, else the start of the first message; none until one of them
+    /// names it.
     pub title: Option<String>,
     /// The person's own name for it, which wins over the agent's.
-    #[serde(default)]
     pub title_override: Option<String>,
     pub created_at: DateTime<Utc>,
     /// The last message the person sent. The list sorts by it, as Zed's sorts by the last
@@ -37,16 +36,11 @@ pub struct SessionRecord {
     pub updated_at: DateTime<Utc>,
     /// The agent's branch, and whether it was created yet.
     pub branch: String,
-    #[serde(default)]
     pub branch_created: bool,
-    #[serde(default)]
     pub pinned: bool,
-    #[serde(default)]
     pub archived: bool,
-    /// The directory the agent worked in for it. Every record Studio writes has one; one
-    /// without runs in its graph's ([`graph_cwd`]).
-    #[serde(default)]
-    pub cwd: Option<PathBuf>,
+    /// The directory the agent worked in for it, where it runs again.
+    pub cwd: PathBuf,
 }
 
 impl SessionRecord {
@@ -112,7 +106,7 @@ impl AgentSessions {
     /// Writes the list on Studio's writer thread, in order with its other writes: a write
     /// waits for the disk to sync it, too long for the main thread at every prompt.
     fn save(&self) {
-        let value = serde_json::json!({ "version": 2, "sessions": self.records });
+        let value = serde_json::json!({ "version": VERSION, "sessions": self.records });
         if let Ok(text) = serde_json::to_string_pretty(&value) {
             studio_settings::write_atomic_in_turn(
                 self.path.clone(),
@@ -175,9 +169,6 @@ impl AgentSessions {
                 existing.branch = record.branch;
                 existing.branch_created = record.branch_created;
                 existing.archived = false;
-                if existing.cwd.is_none() {
-                    existing.cwd = record.cwd;
-                }
             }
             None => self.records.push(record),
         }
@@ -359,20 +350,29 @@ fn provisional_title(message: &str) -> Option<String> {
     Some(studio_ui::text::cut(line, TITLE_CHARS))
 }
 
-/// The records on disk, each read on its own: one Studio cannot read (damaged, or written by a
-/// newer Studio) leaves the others. A file with any it cannot read is set aside first, so the
-/// next save, which writes only the ones read, loses nothing.
+/// The form of the file's records. A build that reads a file of another version sets it
+/// aside whole: serde passes over fields it does not know, so a record a newer build wrote
+/// with one more field would read here and be written back without it. It changes when a build
+/// reading the other's records would drop or misread what they hold; a form that only accepts
+/// less (every field required, which Studio always wrote) keeps it, since a record of the
+/// older form that no longer reads sets its file aside on its own.
+const VERSION: u64 = 2;
+
+/// The records on disk, each read on its own: one Studio cannot read (damaged, or written by an
+/// older build without a field this one requires) leaves the others. A file with any it cannot
+/// read, or of another [`VERSION`], is set aside first, renamed beside itself, so the next
+/// save, which writes only the ones read, loses nothing.
 fn read_records(path: &Path) -> Vec<SessionRecord> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
-    let records =
-        serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|value| match value.get("sessions") {
-                Some(Value::Array(records)) => Some(records.clone()),
-                _ => None,
-            });
+    let records = serde_json::from_str::<Value>(&text)
+        .ok()
+        .filter(|value| value.get("version").and_then(Value::as_u64) == Some(VERSION))
+        .and_then(|value| match value.get("sessions") {
+            Some(Value::Array(records)) => Some(records.clone()),
+            _ => None,
+        });
     let Some(records) = records else {
         studio_settings::set_aside(path);
         return Vec::new();
@@ -487,7 +487,7 @@ mod tests {
             branch_created: false,
             pinned: false,
             archived: false,
-            cwd: None,
+            cwd: graph_cwd(graph),
         }
     }
 
@@ -603,7 +603,9 @@ mod tests {
     }
 
     /// One record Studio cannot read leaves the others, and the file is set aside before the
-    /// next save writes only those.
+    /// next save writes only those. A record an older build wrote without a field this one
+    /// requires is such a record, and a file of another version is set aside whole: in both,
+    /// the file is renamed beside itself, not lost.
     #[test]
     fn a_record_that_cannot_be_read_leaves_the_others() {
         let dir = std::env::temp_dir().join(format!("studio-agent-records-{}", std::process::id()));
@@ -623,15 +625,53 @@ mod tests {
             branch_created: true,
             pinned: false,
             archived: false,
-            cwd: None,
+            cwd: graph_cwd("server/crm"),
         };
-        let file = json!({ "version": 2, "sessions": [record, { "session": 3 }] });
+        // As an older build wrote it: no working directory, and no marks.
+        let mut older = serde_json::to_value(&record).unwrap();
+        let older_fields = older.as_object_mut().unwrap();
+        older_fields.insert("session".into(), json!("s-2"));
+        older_fields.insert("cwd".into(), Value::Null);
+        let mut oldest = older.clone();
+        let oldest_fields = oldest.as_object_mut().unwrap();
+        oldest_fields.insert("session".into(), json!("s-3"));
+        for field in ["cwd", "pinned", "archived", "branch_created"] {
+            oldest_fields.remove(field);
+        }
+        let file = json!({
+            "version": VERSION,
+            "sessions": [record, { "session": 3 }, older, oldest],
+        });
         std::fs::write(&path, file.to_string()).unwrap();
         let records = read_records(&path);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].session, "s-1");
         assert!(!path.exists(), "set aside before it is written again");
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let aside = || -> Vec<std::path::PathBuf> {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect()
+        };
+        assert_eq!(aside().len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&aside()[0]).unwrap(),
+            file.to_string(),
+            "the file set aside is the file as it was"
+        );
+
+        // Every record readable, but the file of another version, or of none: nothing is read,
+        // and the file is set aside.
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        for version in [json!(VERSION + 1), json!(1), Value::Null] {
+            let file = json!({ "version": version, "sessions": [record] });
+            std::fs::write(&path, file.to_string()).unwrap();
+            assert!(read_records(&path).is_empty(), "version {version}");
+            assert!(!path.exists(), "version {version}");
+            std::fs::remove_dir_all(&dir).ok();
+            std::fs::create_dir_all(&dir).unwrap();
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

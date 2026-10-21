@@ -75,6 +75,14 @@ pub enum Seen {
         commit: Option<String>,
         nodes: i64,
         edges: i64,
+        /// A load's answer says it created its branch (`branch_created`).
+        branch_created: bool,
+    },
+    /// The server held the write as a commit no branch shows (a stored mutation written `as
+    /// commit` or `as unattached branch`, whose text the gateway never sees): it went through,
+    /// and the agent's branch did not move.
+    Unpublished {
+        commit: String,
     },
     Refused(String),
     Unknown(String),
@@ -416,30 +424,53 @@ async fn read_write_answer(
         (Some(one), None) => Some(one),
         _ => None,
     };
-    // Judged as Studio's own writes are.
+    // Judged as Studio's own writes are, a success whose body cannot be read included: it
+    // confirms nothing.
     let outcome = match graph_client::judge_write(response.status, contract, &body) {
-        WriteOutcome::Committed(body) => {
-            let json: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-            Seen::Committed {
-                commit: commit_of(&json),
-                nodes: count_of(&json, "affected_nodes", "nodes"),
-                edges: count_of(&json, "affected_edges", "edges"),
-            }
-        }
+        WriteOutcome::Committed(body) => match serde_json::from_slice::<Value>(body) {
+            Ok(json) => seen_committed(&json),
+            Err(error) => Seen::Unknown(format!("the success response could not be read: {error}")),
+        },
         WriteOutcome::Refused(error) => Seen::Refused(error.body.error),
         WriteOutcome::Unknown { reason } => Seen::Unknown(reason),
     };
     (outcome, Some((response.status, response.headers, body)))
 }
 
-/// The commit a write's answer names: a mutation's `commit.graph_commit_id`, or a top-level
-/// `graph_commit_id`.
-fn commit_of(json: &Value) -> Option<String> {
-    json.get("commit")
-        .and_then(|commit| commit.get("graph_commit_id"))
-        .or_else(|| json.get("graph_commit_id"))
+/// What a write's success answer says it did.
+fn seen_committed(json: &Value) -> Seen {
+    let commit = json.get("commit").filter(|commit| !commit.is_null());
+    if let Some(commit) = commit
+        && !is_published(commit)
+    {
+        return Seen::Unpublished {
+            commit: id_of(commit).unwrap_or_default(),
+        };
+    }
+    Seen::Committed {
+        commit: commit.and_then(id_of).or_else(|| id_of(json)),
+        nodes: count_of(json, "affected_nodes", "nodes"),
+        edges: count_of(json, "affected_edges", "edges"),
+        branch_created: json.get("branch_created").and_then(Value::as_bool) == Some(true),
+    }
+}
+
+/// A commit's id (`graph_commit_id`), in a write's `commit` or at its top level.
+fn id_of(json: &Value) -> Option<String> {
+    json.get("graph_commit_id")
         .and_then(Value::as_str)
         .map(str::to_owned)
+}
+
+/// Whether a write's commit is one of a branch's history: an unpublished commit (`kind:
+/// unpublished`) or an unattached snapshot (`kind: unattached`) is readable by its id and shown
+/// by no branch. A kind this build does not know is read by `published`, and a commit that
+/// says neither as published, as Studio's own writes read it.
+fn is_published(commit: &Value) -> bool {
+    match commit.get("kind").and_then(Value::as_str) {
+        Some("unpublished" | "unattached") => false,
+        _ => commit.get("published").and_then(Value::as_bool) != Some(false),
+    }
 }
 
 /// A mutation's affected count, or a load's entities loaded per type summed.
@@ -976,10 +1007,81 @@ mod tests {
                 super::Seen::Committed {
                     commit: Some("c9".into()),
                     nodes: 1,
-                    edges: 0
+                    edges: 0,
+                    branch_created: false,
                 }
             );
         });
+    }
+
+    /// A write's success answer says what it did, as Studio's own writes read theirs: its
+    /// commit and counts, whether a load created its branch, a commit no branch shows (a stored
+    /// mutation held `as commit` or `as unattached branch`), or, a body that cannot be read,
+    /// nothing confirmed.
+    #[test]
+    fn a_writes_success_answer_says_what_it_did() {
+        let answer = |body: &str| {
+            let mut headers = HeaderMap::new();
+            headers.append(CONTRACT_HEADER, "0.13".parse().unwrap());
+            let response = graph_client::ForwardResponse {
+                status: StatusCode::OK,
+                headers,
+                body: AsyncBody::from(body.to_owned()),
+            };
+            smol::block_on(super::read_write_answer(Ok(response))).0
+        };
+        let committed =
+            |commit: Option<&str>, nodes, edges, branch_created| super::Seen::Committed {
+                commit: commit.map(str::to_owned),
+                nodes,
+                edges,
+                branch_created,
+            };
+        assert_eq!(
+            answer(
+                r#"{"branch":"b","query_name":"m","affected_nodes":2,"affected_edges":1,
+                    "commit":{"graph_commit_id":"c1","kind":"published","published":true}}"#
+            ),
+            committed(Some("c1"), 2, 1, false)
+        );
+        for (created, expected) in [("true", true), ("false", false)] {
+            assert_eq!(
+                answer(&format!(
+                    r#"{{"branch":"b","branch_created":{created},"mode":"append",
+                        "nodes":[{{"entities_loaded":3}},{{"entities_loaded":4}}],"edges":[],
+                        "commit":{{"graph_commit_id":"c2","kind":"published"}}}}"#
+                )),
+                committed(Some("c2"), 7, 0, expected)
+            );
+        }
+        // A branch created through the API publishes no commit.
+        assert_eq!(
+            answer(r#"{"uri":"u","from":"main","name":"b","commit":null}"#),
+            committed(None, 0, 0, false)
+        );
+        for commit in [
+            r#"{"graph_commit_id":"c3","kind":"unpublished","published":false}"#,
+            r#"{"graph_commit_id":"c3","kind":"unattached","published":false}"#,
+            r#"{"graph_commit_id":"c3","published":false}"#,
+        ] {
+            assert_eq!(
+                answer(&format!(
+                    r#"{{"branch":"b","query_name":"m","affected_nodes":1,"affected_edges":0,
+                        "commit":{commit}}}"#
+                )),
+                super::Seen::Unpublished {
+                    commit: "c3".into()
+                },
+                "{commit}"
+            );
+        }
+        for unreadable in ["", "done", "{\"commit\":"] {
+            assert!(
+                matches!(answer(unreadable), super::Seen::Unknown(reason)
+                    if reason.contains("could not be read")),
+                "{unreadable:?}"
+            );
+        }
     }
 
     /// A read whose answer breaks off partway closes without the chunked stream's end: the CLI
@@ -1183,7 +1285,8 @@ mod tests {
                 super::Seen::Committed {
                     commit: Some("c9".into()),
                     nodes: 2,
-                    edges: 1
+                    edges: 1,
+                    branch_created: false,
                 }
             );
             assert_eq!(recorded.lock().unwrap().as_ref(), Some(&outcome));

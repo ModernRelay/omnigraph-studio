@@ -170,12 +170,8 @@ impl SessionsPanel {
         key.strip_prefix("agent:").map(str::to_owned)
     }
 
-    /// The agent the settings name, as this panel runs it to import or delete conversations;
-    /// none on Windows, where the agent panel does not run agents yet.
+    /// The agent the settings name, as this panel runs it to import or delete conversations.
     fn agent(cx: &App) -> Option<AgentLaunch> {
-        if cfg!(windows) {
-            return None;
-        }
         let settings = &StudioSettings::get(cx).agent;
         (!settings.command.is_empty()).then(|| AgentLaunch {
             command: settings.command.clone(),
@@ -253,11 +249,7 @@ impl SessionsPanel {
         else {
             self.toast(
                 ToastKind::Info,
-                if cfg!(windows) {
-                    "Removed here. Agents do not run on Windows yet, so it stays at the agent."
-                } else {
-                    "Removed. Another agent holds the conversation, so it stays there."
-                },
+                "Removed. Another agent holds the conversation, so it stays there.",
                 cx,
             );
             return;
@@ -578,7 +570,7 @@ fn imported(info: SessionInfo, graph: &str, agent: &str, cwd: &Path) -> SessionR
         branch_created: false,
         pinned: false,
         archived: false,
-        cwd: Some(cwd.to_owned()),
+        cwd: cwd.to_owned(),
     }
 }
 
@@ -862,7 +854,8 @@ fn agent_name(command: &str) -> String {
         .split_whitespace()
         .rfind(|part| !part.starts_with('-'))
         .unwrap_or(command);
-    let base = program.rsplit('/').next().unwrap_or(program);
+    // A Windows path parts its folders with `\` too.
+    let base = program.rsplit(['/', '\\']).next().unwrap_or(program);
     base.split('@')
         .find(|part| !part.is_empty())
         .unwrap_or(base)
@@ -880,5 +873,6 @@ mod tests {
             "claude-agent-acp"
         );
         assert_eq!(agent_name("/usr/local/bin/my-agent --acp"), "my-agent");
+        assert_eq!(agent_name(r"C:\Tools\my-agent --acp"), "my-agent");
     }
 }

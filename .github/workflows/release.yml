@@ -181,7 +181,7 @@ jobs:
 
           On Linux, unpack the tarball and run \`bin/omnigraph-studio\`; copy its \`share/\` into \`~/.local/share\` to list Studio, with its icon, in a launcher.
 
-          On Windows, unzip anywhere and run \`omnigraph-studio.exe\`. It is not signed, so SmartScreen may ask first: choose More info, then Run anyway. The agent panel is not available on Windows yet.
+          On Windows, unzip anywhere and run \`omnigraph-studio.exe\`. It is not signed, so SmartScreen may ask first: choose More info, then Run anyway.
 
           Studio connects to an OmniGraph 0.14 server or later; see the README for connecting and for a sample graph.
           NOTES
