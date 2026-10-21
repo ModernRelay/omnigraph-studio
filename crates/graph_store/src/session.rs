@@ -377,6 +377,7 @@ fn node_answers(
                 columns: output.columns.clone(),
                 rows: Value::Array(vec![row.clone()]).into(),
                 graph_commit_id: Some(commit.clone()),
+                page: None,
             };
             Some((key, answer))
         })

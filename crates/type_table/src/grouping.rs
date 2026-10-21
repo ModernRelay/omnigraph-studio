@@ -421,6 +421,7 @@ mod tests {
             columns: vec!["value".into(), "n".into()],
             rows: rows.into(),
             graph_commit_id: Some("c1".into()),
+            page: None,
         }
     }
 

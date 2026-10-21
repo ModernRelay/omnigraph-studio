@@ -129,7 +129,9 @@ pub fn operator_parts(parts: &[QueryPart], node: &str, detail: &str) -> Vec<Rang
         "Limit" | "Page" | "GlobalLimit" | "LocalLimit" | "Offset" => of_kind(PartKind::Limit),
         "Sort" | "TopK" | "PartialSort" | "SortPreservingMerge" => of_kind(PartKind::Order),
         // A count answered from table metadata, and the late read of returned columns, stand
-        // for the `return` too.
+        // for the `return` too: that read is `HydrateColumns` in the physical tree and
+        // `HydrateExec` in DataFusion's. The planner's other hydration, `HydrateByAddress`,
+        // serves diffs and merges, never a query's plan.
         "Projection" | "Aggregate" | "MetadataCount" | "Hydrate" | "HydrateColumns" => {
             of_kind(PartKind::Return)
         }
@@ -885,6 +887,14 @@ mod tests {
             at("Aggregate", r#"{"exprs":["$p.name","count($f)"]}"#),
             ["return { $p.name, count($f) as friends }"]
         );
+        // The late read of returned columns, as `physical.rs` writes its detail.
+        assert_eq!(
+            at(
+                "HydrateColumns",
+                r#"{"node":"HydrateColumns","bindings":[{"binding":"p","table":"node:Person","columns":["name"]}]}"#
+            ),
+            ["return { $p.name, count($f) as friends }"]
+        );
         assert!(at("OuterReference", r#"{"outer_var":"f"}"#).is_empty());
     }
 
@@ -926,6 +936,11 @@ mod tests {
             ["count { $p contributes $j } > 2"]
         );
         assert_eq!(at("LimitExec", "rows=5"), ["limit 5"]);
+        // The late read of returned columns, as `operators/hydrate.rs` prints it.
+        assert_eq!(
+            at("HydrateExec", "$p: [name]"),
+            ["return { $p.name, count($f) as friends }"]
+        );
     }
 
     #[test]

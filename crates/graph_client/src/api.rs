@@ -260,6 +260,24 @@ pub struct ReadOutput {
     pub rows: Arc<Value>,
     #[serde(default)]
     pub graph_commit_id: Option<String>,
+    /// Where a paged statement read (`branch diff`) stands; `None` for every other answer.
+    #[serde(default)]
+    pub page: Option<ReadPageOutput>,
+}
+
+/// A `branch diff` answer's page: the commits it compares, and the token `after page "<token>"`
+/// continues it with, which its last page has none of.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct ReadPageOutput {
+    #[serde(default)]
+    pub from_commit_id: Option<String>,
+    #[serde(default)]
+    pub to_commit_id: Option<String>,
+    /// The merge base, for a branch's diff since it.
+    #[serde(default)]
+    pub base_commit_id: Option<String>,
+    #[serde(default)]
+    pub next_page_token: Option<String>,
 }
 
 /// A JSON value read once and shared.
@@ -818,6 +836,16 @@ mod contract_tests {
                 "columns",
                 "rows",
                 "graph_commit_id",
+                "page",
+            ],
+        ),
+        (
+            "ReadPageOutput",
+            &[
+                "from_commit_id",
+                "to_commit_id",
+                "base_commit_id",
+                "next_page_token",
             ],
         ),
         ("ReadTargetOutput", &["branch", "snapshot"]),
@@ -1103,5 +1131,30 @@ mod contract_tests {
         assert_eq!(state, GraphAvailability::Other);
         let op: super::ChangeOp = serde_json::from_str(r#""upsert""#).unwrap();
         assert_eq!(op, super::ChangeOp::Other);
+    }
+
+    /// A `branch diff` answer says where its page stands, as `branch_diff_read_output` writes
+    /// it; any other answer has no page.
+    #[test]
+    fn a_branch_diff_answer_carries_its_page() {
+        use super::{ReadOutput, ReadPageOutput};
+        let diff: ReadOutput = serde_json::from_str(
+            r#"{"query_name":"branch diff","target":{"branch":null,"snapshot":null},"row_count":0,"columns":["kind","type","id","op","before","after"],"rows":[],"page":{"from_commit_id":"c1","to_commit_id":"c2","next_page_token":"t2"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            diff.page,
+            Some(ReadPageOutput {
+                from_commit_id: Some("c1".into()),
+                to_commit_id: Some("c2".into()),
+                base_commit_id: None,
+                next_page_token: Some("t2".into()),
+            })
+        );
+        let read: ReadOutput = serde_json::from_str(
+            r#"{"query_name":"q","target":{"branch":"main"},"row_count":0,"rows":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(read.page, None);
     }
 }

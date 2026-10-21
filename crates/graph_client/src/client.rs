@@ -52,6 +52,8 @@ pub enum ReadError {
     Refused(ApiErrorSummary),
     /// The body did not match the contract.
     Decode(String),
+    /// The answer is longer than the `limit` bytes its read takes; none of it was decoded.
+    TooLarge { limit: usize },
 }
 
 /// A cloneable copy of a refusal, for showing in the UI.
@@ -159,6 +161,15 @@ impl std::fmt::Display for ReadError {
             }
             ReadError::Refused(summary) => write!(f, "{} ({})", summary.message, summary.status),
             ReadError::Decode(message) => write!(f, "Unexpected response: {message}"),
+            ReadError::TooLarge { limit } if *limit >= 1024 * 1024 => write!(
+                f,
+                "The answer is over {} MB, the most Studio reads at once",
+                limit / (1024 * 1024)
+            ),
+            ReadError::TooLarge { limit } => write!(
+                f,
+                "The answer is over {limit} bytes, the most Studio reads at once"
+            ),
         }
     }
 }
@@ -220,6 +231,14 @@ pub enum BlobMeta {
 
 /// The most bytes [`GraphClient::blob_bytes`] reads in one request.
 const BLOB_READ_MAX: u64 = 16 * 1024 * 1024;
+
+/// The most of a query's answer a read takes ([`GraphClient::query`], a stored read). A query
+/// written in the editor bounds its rows only by its own `limit`, and its answer is decoded
+/// whole into JSON values before a row is shown: 13.8 MB of node rows decoded to 164 MB
+/// (11.9 times, serde_json with `preserve_order` as Studio builds it), so an answer this long
+/// holds about 400 MB once read. A page Studio asks for itself stays far below it: a type
+/// table's longest page, 1,000 rows, would need rows of 33 KB each to reach it.
+const QUERY_ANSWER_MAX: usize = 32 * 1024 * 1024;
 
 /// A server address as typed, made into the root URL a client is built on: trimmed, without a
 /// trailing slash, and with `http://` (loopback hosts) or `https://` (any other host) when no
@@ -545,10 +564,29 @@ impl GraphClient {
         query: &[(&str, &str)],
         body: Option<Vec<u8>>,
     ) -> Result<T, ReadError> {
+        self.read_capped(method, segments, query, body, usize::MAX)
+            .await
+    }
+
+    /// [`Self::read`] of an answer of at most `cap` bytes. One byte past `cap` is read, to know
+    /// the answer goes on, and none after it: a longer answer is [`ReadError::TooLarge`], never
+    /// a part of one decoded as if it were whole.
+    async fn read_capped<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        segments: &[&str],
+        query: &[(&str, &str)],
+        body: Option<Vec<u8>>,
+        cap: usize,
+    ) -> Result<T, ReadError> {
         let url = self.url(segments, query);
-        let raw = self.fetch(method, url, body, &[]).await?;
+        let limit = BodyLimit::First(cap.saturating_add(1));
+        let raw = self.fetch_reading(method, url, body, &[], limit).await?;
         if raw.status.is_success() {
             check_contract(&raw)?;
+            if raw.body.len() > cap {
+                return Err(ReadError::TooLarge { limit: cap });
+            }
             serde_json::from_slice(&raw.body).map_err(|error| ReadError::Decode(error.to_string()))
         } else {
             Err(ReadError::Refused(summary(raw.status, &raw.body)))
@@ -866,16 +904,18 @@ impl GraphClient {
         .await
     }
 
+    /// `POST /graphs/{id}/query`, its answer read up to [`QUERY_ANSWER_MAX`] bytes.
     pub async fn query(
         &self,
         graph: &str,
         request: &QueryRequest,
     ) -> Result<ReadOutput, ReadError> {
-        self.read(
+        self.read_capped(
             Method::POST,
             &["graphs", graph, "query"],
             &[],
             Some(json(request)),
+            QUERY_ANSWER_MAX,
         )
         .await
     }
@@ -886,8 +926,9 @@ impl GraphClient {
             .await
     }
 
-    /// Runs a stored read. `request.expect_mutation` is set to `false`, so a stored query that
-    /// writes is refused by the server rather than run as a read.
+    /// Runs a stored read, its answer read up to [`QUERY_ANSWER_MAX`] bytes as a query's is.
+    /// `request.expect_mutation` is set to `false`, so a stored query that writes is refused by
+    /// the server rather than run as a read.
     pub async fn invoke_stored_read(
         &self,
         graph: &str,
@@ -898,11 +939,12 @@ impl GraphClient {
             expect_mutation: Some(false),
             ..request.clone()
         };
-        self.read(
+        self.read_capped(
             Method::POST,
             &["graphs", graph, "queries", name],
             &[],
             Some(json(&request)),
+            QUERY_ANSWER_MAX,
         )
         .await
     }
@@ -2132,6 +2174,75 @@ mod tests {
             block_on(client.blob_bytes("g", &cell("whole"), BlobAt::Branch("main"), 10..14));
         assert_eq!(bytes.unwrap(), [7, 7, 7, 7]);
         assert_eq!(read.load(std::sync::atomic::Ordering::SeqCst), 14);
+    }
+
+    /// A query's answer past its cap is refused whole, read one byte past the cap and no
+    /// further; one of exactly the cap decodes. Every query and stored read takes the cap.
+    #[test]
+    fn a_query_answer_over_its_cap_is_refused_and_read_no_further() {
+        let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = read.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let counted = counted.clone();
+            let body = if request.uri().path().ends_with("/small") {
+                AsyncBody::from(r#"{"a":1}"#)
+            } else {
+                AsyncBody::from_reader(Endless(counted))
+            };
+            async move {
+                Ok(Response::builder()
+                    .status(200)
+                    .header(CONTRACT_HEADER, CONTRACT)
+                    .body(body)
+                    .unwrap())
+            }
+        });
+        let client = client(http);
+        let read_count = || read.swap(0, std::sync::atomic::Ordering::SeqCst);
+        let capped = block_on(client.read_capped::<Value>(
+            Method::POST,
+            &["graphs", "g", "query"],
+            &[],
+            None,
+            64,
+        ));
+        assert!(matches!(capped, Err(ReadError::TooLarge { limit: 64 })));
+        assert_eq!(read_count(), 65);
+        let whole = block_on(client.read_capped::<Value>(
+            Method::GET,
+            &["graphs", "g", "small"],
+            &[],
+            None,
+            r#"{"a":1}"#.len(),
+        ));
+        assert_eq!(whole.unwrap(), serde_json::json!({"a": 1}));
+
+        let query = block_on(client.query("g", &QueryRequest::default()));
+        assert!(matches!(
+            query,
+            Err(ReadError::TooLarge {
+                limit: QUERY_ANSWER_MAX
+            })
+        ));
+        assert_eq!(read_count(), QUERY_ANSWER_MAX + 1);
+        let stored = block_on(client.invoke_stored_read(
+            "g",
+            "people",
+            &InvokeStoredQueryRequest::default(),
+        ));
+        assert!(matches!(
+            stored,
+            Err(ReadError::TooLarge {
+                limit: QUERY_ANSWER_MAX
+            })
+        ));
+        assert_eq!(
+            ReadError::TooLarge {
+                limit: QUERY_ANSWER_MAX
+            }
+            .to_string(),
+            "The answer is over 32 MB, the most Studio reads at once"
+        );
     }
 
     #[test]

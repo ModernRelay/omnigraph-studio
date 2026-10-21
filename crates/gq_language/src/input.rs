@@ -190,7 +190,8 @@ pub(crate) fn integer(base_type: &str, text: &str) -> Result<Value, IntegerError
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FloatError {
     NotANumber,
-    /// Infinite as an `F32`, which the engine refuses.
+    /// Infinite as an `F32`, which the engine refuses: a parameter when it binds the query, a
+    /// value when it writes the column.
     OutOfRange,
 }
 

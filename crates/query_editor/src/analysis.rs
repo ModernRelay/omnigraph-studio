@@ -9,6 +9,9 @@ use gq_language::{Diagnostic, Outline, QueryInfo, SchemaModel};
 #[derive(Debug, Clone, Default)]
 pub struct Analysis {
     pub text: String,
+    /// The source of the schema `text` was checked against: the check answers for that schema
+    /// only.
+    pub schema_source: std::sync::Arc<str>,
     pub outline: Outline,
     /// Problems in the whole source, with the range to underline when the position is known.
     pub problems: Vec<(Diagnostic, Option<Range<usize>>)>,
@@ -77,10 +80,35 @@ impl Analysis {
         problems.sort_by_key(|(_, range)| range.as_ref().map_or(usize::MAX, |range| range.start));
         Self {
             text,
+            schema_source: schema.source.clone(),
             outline,
             problems,
             queries,
         }
+    }
+
+    /// Whether this is the check of `text` against `schema`, so what it says of a declaration
+    /// is what checking it again would say.
+    pub fn is_of(&self, text: &str, schema: &SchemaModel) -> bool {
+        self.text == text
+            && (std::sync::Arc::ptr_eq(&self.schema_source, &schema.source)
+                || self.schema_source == schema.source)
+    }
+
+    /// What the check says of `declaration` of its outline, found by its place in the text.
+    pub fn query_of(&self, declaration: &gq_language::Declaration) -> Option<&QueryInfo> {
+        let index = self
+            .outline
+            .declarations
+            .iter()
+            .position(|d| d == declaration)?;
+        self.queries.get(index).and_then(Option::as_ref)
+    }
+
+    /// Whether every declaration parsed, so the parameters the check lists are all the text
+    /// declares.
+    pub fn read_every_declaration(&self) -> bool {
+        self.queries.iter().all(Option::is_some)
     }
 
     /// The declaration under `offset` and what the compiler says about it.

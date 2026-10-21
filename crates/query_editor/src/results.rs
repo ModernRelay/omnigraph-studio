@@ -5,9 +5,11 @@ use std::time::Duration;
 
 use std::collections::{HashMap, HashSet};
 
-use gq_language::{ResultColumn, SchemaModel};
+use gq_language::{ResultColumn, SchemaModel, TokenKind};
+use graph_client::api::{BranchMergeOutcome, ChangeOutput, CommitKind};
 use serde_json::{Map, Value};
 use studio_actions::graph::ResultNode;
+use studio_ui::short_commit_id;
 
 /// A result's distinct nodes and the pairs of them that share a row.
 pub type ResultGraph = (Vec<ResultNode>, Vec<(usize, usize)>);
@@ -26,9 +28,8 @@ pub struct ResultTable {
 
 impl ResultTable {
     /// Builds a table from a read's `columns` and `rows`, whose cells move into it: a large
-    /// answer is held once, not twice. `expected` is the compiler's view of the same query; its
-    /// types are matched to the server's columns by position, because the compiler names
-    /// `$p.name` `name` where the server names it `p.name`.
+    /// answer is held once, not twice. `expected` is the compiler's view of the same query,
+    /// whose columns are named as the server names them; a column it does not name has no type.
     pub fn new(columns: Vec<String>, rows: Value, expected: Option<&[ResultColumn]>) -> Self {
         // A column named twice reads the same cell twice, so it is copied rather than moved.
         let unique = columns.iter().collect::<HashSet<_>>().len() == columns.len();
@@ -48,13 +49,20 @@ impl ResultTable {
                 .collect(),
             _ => Vec::new(),
         };
-        let (types, node_types) = match expected {
-            Some(expected) if expected.len() == columns.len() => (
-                expected.iter().map(|c| Some(type_label(c))).collect(),
-                expected.iter().map(|c| c.node_type.clone()).collect(),
-            ),
-            _ => (vec![None; columns.len()], vec![None; columns.len()]),
+        let described = |column: &String| {
+            expected
+                .unwrap_or_default()
+                .iter()
+                .find(|expected| expected.column == *column)
         };
+        let types = columns
+            .iter()
+            .map(|column| described(column).map(type_label))
+            .collect();
+        let node_types = columns
+            .iter()
+            .map(|column| described(column).and_then(|c| c.node_type.clone()))
+            .collect();
         Self {
             columns,
             types,
@@ -237,14 +245,20 @@ pub fn plan_items(rows: &Value) -> Vec<PlanItem> {
     items
 }
 
+/// A tree's header, from the `tree` names the engine's explain writes (`engine/explain.rs`):
+/// `logical_initial` (the plan of a load before the optimizer), `logical`, `physical`,
+/// `datafusion`, then `plan` for the planner's notes. A name a later build adds reads as its
+/// words.
 fn tree_title(tree: &str) -> String {
     match tree {
+        "logical_initial" => "Initial logical plan".into(),
         "logical" => "Logical plan".into(),
         "physical" => "Physical plan".into(),
         "datafusion" => "DataFusion plan".into(),
         "plan" => "Planner".into(),
         other => {
-            let mut chars = other.chars();
+            let words = other.replace('_', " ");
+            let mut chars = words.trim().chars();
             match chars.next() {
                 Some(first) => first.to_uppercase().chain(chars).collect(),
                 None => "Plan".into(),
@@ -364,6 +378,294 @@ pub fn rows_label(count: i64) -> String {
     }
 }
 
+/// What a write the server committed did, read from its answer (constitution III): a
+/// mutation's by its commit's `kind`, a statement's by its `outcome` (`ChangeOutput.outcome`,
+/// `BranchOutcomeOutput` in the contract). A commit moved its branch only when it is
+/// `published`, the rule the session's write log follows too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteEffect {
+    /// `branch`'s head moved to `commit`.
+    Committed {
+        branch: String,
+        commit: String,
+    },
+    /// The write made no commit.
+    Unchanged {
+        branch: String,
+    },
+    /// A proposal (`as commit`): held as `commit`, on no branch until `commit publish` puts it
+    /// on `target`.
+    Proposal {
+        target: String,
+        commit: String,
+    },
+    /// An unattached snapshot (`as unattached branch`): read by its id, never published.
+    Snapshot {
+        commit: String,
+    },
+    /// A commit of a kind this build does not know: whether `branch` moved is not known.
+    UnknownKind {
+        branch: String,
+        commit: String,
+    },
+    /// `branch create`: `name` starts at `from`'s commit `at`.
+    BranchCreated {
+        name: String,
+        from: String,
+        at: String,
+    },
+    BranchDeleted {
+        name: String,
+    },
+    /// `branch merge`: `commit` is `target`'s new head, none when it already had `source`.
+    Merged {
+        source: String,
+        target: String,
+        outcome: BranchMergeOutcome,
+        commit: Option<String>,
+    },
+    /// `commit publish`: the proposal is `commit` on `branch` now.
+    Published {
+        branch: String,
+        commit: Option<String>,
+    },
+    /// `commit drop`: the proposal `commit` is gone.
+    Dropped {
+        commit: String,
+    },
+    /// A statement's outcome of a `kind` this build does not know.
+    Statement {
+        kind: String,
+        branch: String,
+    },
+}
+
+impl WriteEffect {
+    pub fn of(output: &ChangeOutput) -> Self {
+        let field = |key: &str| {
+            output
+                .outcome
+                .as_ref()
+                .and_then(|outcome| outcome.get(key))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        let branch = output.branch.clone();
+        let kind = field("kind");
+        // Neither publishes a commit.
+        match kind.as_deref() {
+            Some("created") => {
+                return WriteEffect::BranchCreated {
+                    name: field("name").unwrap_or(branch),
+                    from: field("from").unwrap_or_default(),
+                    at: field("from_commit_id").unwrap_or_default(),
+                };
+            }
+            Some("deleted") => {
+                return WriteEffect::BranchDeleted {
+                    name: field("name").unwrap_or(branch),
+                };
+            }
+            Some("dropped") => {
+                return WriteEffect::Dropped {
+                    commit: field("graph_commit_id").unwrap_or_default(),
+                };
+            }
+            _ => {}
+        }
+        // A merge or a mutation `as commit` holds its result as a proposal, and a mutation
+        // `as unattached branch` as a snapshot: no branch moved.
+        if let Some(commit) = &output.commit {
+            let id = commit.graph_commit_id.clone();
+            match commit.kind {
+                CommitKind::Published => {}
+                CommitKind::Unpublished => {
+                    return WriteEffect::Proposal {
+                        target: branch,
+                        commit: id,
+                    };
+                }
+                CommitKind::Unattached => return WriteEffect::Snapshot { commit: id },
+                CommitKind::Other => {
+                    return WriteEffect::UnknownKind { branch, commit: id };
+                }
+            }
+        }
+        let published = output.commit.as_ref().map(|c| c.graph_commit_id.clone());
+        match kind {
+            Some(kind) if kind == "merged" => WriteEffect::Merged {
+                source: field("source").unwrap_or_default(),
+                target: field("target").unwrap_or(branch),
+                outcome: output
+                    .outcome
+                    .as_ref()
+                    .and_then(|outcome| outcome.get("merge"))
+                    .and_then(|merge| serde_json::from_value(merge.clone()).ok())
+                    .unwrap_or(BranchMergeOutcome::Other),
+                commit: published,
+            },
+            Some(kind) if kind == "published" => WriteEffect::Published {
+                branch,
+                commit: published,
+            },
+            Some(kind) => WriteEffect::Statement { kind, branch },
+            None => match published {
+                Some(commit) => WriteEffect::Committed { branch, commit },
+                None => WriteEffect::Unchanged { branch },
+            },
+        }
+    }
+
+    /// The outcome's title.
+    pub fn title(&self) -> String {
+        match self {
+            WriteEffect::Committed { branch, .. } => format!("Committed to {branch}"),
+            WriteEffect::Unchanged { branch } => format!("Nothing changed on {branch}"),
+            WriteEffect::Proposal { commit, .. } => format!(
+                "Held as commit {}, not on any branch yet",
+                short_commit_id(commit)
+            ),
+            WriteEffect::Snapshot { commit } => format!(
+                "Saved as snapshot {}, on no branch",
+                short_commit_id(commit)
+            ),
+            WriteEffect::UnknownKind { commit, .. } => format!(
+                "Wrote commit {}, of a kind Studio does not know",
+                short_commit_id(commit)
+            ),
+            WriteEffect::BranchCreated { name, at, .. } => {
+                format!("Created branch {name} at commit {}", short_commit_id(at))
+            }
+            WriteEffect::BranchDeleted { name } => format!("Deleted branch {name}"),
+            WriteEffect::Merged {
+                source,
+                target,
+                outcome: BranchMergeOutcome::AlreadyUpToDate,
+                ..
+            } => format!("{target} already has {source}; nothing changed"),
+            WriteEffect::Merged {
+                source,
+                target,
+                outcome: BranchMergeOutcome::FastForward,
+                ..
+            } => format!("Merged {source} into {target} by fast-forward"),
+            WriteEffect::Merged { source, target, .. } => {
+                format!("Merged {source} into {target}")
+            }
+            WriteEffect::Published {
+                branch,
+                commit: Some(commit),
+            } => format!("Published commit {} to {branch}", short_commit_id(commit)),
+            WriteEffect::Published { branch, .. } => format!("Published to {branch}"),
+            WriteEffect::Dropped { commit } => {
+                format!("Dropped commit {}", short_commit_id(commit))
+            }
+            WriteEffect::Statement { kind, branch } => {
+                format!("Ran on {branch}, with an outcome Studio does not know ({kind})")
+            }
+        }
+    }
+
+    /// What to do next, when there is something to say.
+    pub fn detail(&self) -> Option<String> {
+        match self {
+            WriteEffect::Proposal { target, commit } => Some(format!(
+                "Nothing moved on {target}. `commit publish \"{commit}\"` puts it there; \
+                 `commit drop \"{commit}\"` drops it."
+            )),
+            WriteEffect::Snapshot { .. } => {
+                Some("Nothing moved on any branch. Read it by its id; it never publishes.".into())
+            }
+            WriteEffect::UnknownKind { branch, .. } | WriteEffect::Statement { branch, .. } => {
+                Some(format!("Check {branch}'s history to see what changed."))
+            }
+            _ => None,
+        }
+    }
+
+    /// A run line's few words: `nodes` and `edges` are a mutation's counts.
+    pub fn note(&self, nodes: i64, edges: i64) -> String {
+        match self {
+            WriteEffect::Committed { .. } => format!("Committed · {nodes} nodes, {edges} edges"),
+            WriteEffect::Unchanged { .. } => "Nothing changed".into(),
+            WriteEffect::Proposal { commit, .. } => {
+                format!("Held as commit {}", short_commit_id(commit))
+            }
+            WriteEffect::Snapshot { commit } => format!("Snapshot {}", short_commit_id(commit)),
+            WriteEffect::UnknownKind { commit, .. } => {
+                format!("Wrote commit {}", short_commit_id(commit))
+            }
+            other => other.title(),
+        }
+    }
+
+    /// The commit the outcome names, and what it is, for its fact's tooltip.
+    pub fn commit(&self) -> Option<(&str, &'static str)> {
+        match self {
+            WriteEffect::Committed { commit, .. }
+            | WriteEffect::Merged {
+                commit: Some(commit),
+                ..
+            }
+            | WriteEffect::Published {
+                commit: Some(commit),
+                ..
+            } => Some((commit, "Graph commit")),
+            WriteEffect::Proposal { commit, .. } => Some((commit, "Unpublished commit")),
+            WriteEffect::Snapshot { commit } => Some((commit, "Unattached snapshot")),
+            WriteEffect::UnknownKind { commit, .. } => Some((commit, "Commit")),
+            WriteEffect::BranchCreated { at, .. } if !at.is_empty() => {
+                Some((at, "The branch starts at graph commit"))
+            }
+            WriteEffect::Dropped { commit } if !commit.is_empty() => {
+                Some((commit, "Dropped commit"))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The `branch diff` statement of `source` (after its settings prefix) continued at the page
+/// `token` names, as the server's `page.next_page_token` asks: its `after page` clause given
+/// `token`, or one put before its `limit`, else at its end. `None` for any other statement.
+pub fn diff_page_text(source: &str, token: &str) -> Option<String> {
+    let tokens = diff_tokens(source)?;
+    let word = |i: usize| tokens.get(i).map(|t| &source[t.range.clone()]);
+    let quoted = format!("\"{}\"", token.replace('\\', "\\\\").replace('"', "\\\""));
+    let mut text = source.to_owned();
+    if let Some(after) =
+        (0..tokens.len()).find(|&i| word(i) == Some("after") && word(i + 1) == Some("page"))
+    {
+        let string = tokens
+            .get(after + 2)
+            .filter(|t| t.kind == TokenKind::String)?;
+        text.replace_range(string.range.clone(), &quoted);
+    } else if let Some(limit) = tokens.iter().find(|t| &source[t.range.clone()] == "limit") {
+        text.insert_str(limit.range.start, &format!("after page {quoted} "));
+    } else {
+        let end = tokens.last()?.range.end;
+        text.insert_str(end, &format!(" after page {quoted}"));
+    }
+    Some(text)
+}
+
+/// Whether `source` is a `branch diff` statement, which the server answers a page at a time.
+pub fn is_branch_diff(source: &str) -> bool {
+    diff_tokens(source).is_some()
+}
+
+/// The words of the `branch diff` statement `source` holds after its settings prefix, or
+/// `None` when it holds another.
+fn diff_tokens(source: &str) -> Option<Vec<gq_language::Token>> {
+    let prefix = gq_language::outline(source).prefix.end;
+    let tokens: Vec<gq_language::Token> = gq_language::tokenize(source)
+        .into_iter()
+        .filter(|t| t.range.start >= prefix && t.kind != TokenKind::Comment)
+        .collect();
+    let word = |i: usize| tokens.get(i).map(|t| &source[t.range.clone()]);
+    (word(0) == Some("branch") && word(1) == Some("diff")).then_some(tokens)
+}
+
 /// Where the text sent to the server came from, so a position the server reports can be
 /// mapped back into the editor's text as it was sent: the settings prefix is copied as is,
 /// then `inserted` bytes the editor added (`explain `), then the declaration that starts at
@@ -429,9 +731,11 @@ mod tests {
 
     use super::*;
 
-    fn column(name: &str, kind: &str, nullable: bool) -> ResultColumn {
+    /// A column the compiler described, named `column` in the server's answer.
+    fn column(column: &str, kind: &str, nullable: bool) -> ResultColumn {
         ResultColumn {
-            name: name.into(),
+            name: column.rsplit('.').next().unwrap_or(column).into(),
+            column: column.into(),
             kind: kind.into(),
             nullable,
             node_type: None,
@@ -460,12 +764,14 @@ mod tests {
         assert!(plain.graph(&schema).is_none());
     }
 
+    /// The compiler names a column as the server does (`gq_language::check`), so types are
+    /// matched by name: a column it did not describe has none, wherever it stands.
     #[test]
-    fn tables_fill_missing_cells_and_take_types_by_position() {
+    fn tables_fill_missing_cells_and_take_types_by_name() {
         let rows = json!([{"p.name": "Ada", "p.born": "1984-04-14"}, {"p.name": "Alan"}]);
         let expected = [
-            column("name", "String", false),
-            column("born", "Date", true),
+            column("p.born", "Date", true),
+            column("p.name", "String", false),
         ];
         let table = ResultTable::new(
             vec!["p.name".into(), "p.born".into()],
@@ -474,9 +780,12 @@ mod tests {
         );
         assert_eq!(table.rows[1], vec![json!("Alan"), Value::Null]);
         assert_eq!(table.types, [Some("String".into()), Some("Date?".into())]);
-        // A different column count means the compiler described another query.
-        let table = ResultTable::new(vec!["p.name".into()], rows, Some(&expected));
-        assert_eq!(table.types, [None]);
+        let table = ResultTable::new(
+            vec!["p.name".into(), "p.title".into()],
+            rows,
+            Some(&expected),
+        );
+        assert_eq!(table.types, [Some("String".into()), None]);
         assert!(table.row_json(0).unwrap().contains("\"p.name\": \"Ada\""));
         assert!(table.row_json(5).is_none());
         // A column named twice shows its cell twice.
@@ -541,6 +850,172 @@ mod tests {
                 value: "engine".into()
             }
         );
+        // A load's plan begins with its logical plan before the optimizer; a tree a later
+        // build adds reads as its words.
+        let load = json!([
+            {"tree": "logical_initial", "depth": 0, "node": "FragmentWrite", "detail": "{}"},
+            {"tree": "later_tree", "depth": 0, "node": "Validate", "detail": "{}"}
+        ]);
+        let headers: Vec<PlanItem> = plan_items(&load)
+            .into_iter()
+            .filter(|item| matches!(item, PlanItem::Header(_)))
+            .collect();
+        assert_eq!(
+            headers,
+            [
+                PlanItem::Header("Initial logical plan".into()),
+                PlanItem::Header("Later tree".into())
+            ]
+        );
+    }
+
+    fn change(json: Value) -> ChangeOutput {
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn commit(kind: &str) -> Value {
+        json!({"graph_commit_id": "01JCOMMITAAAA", "graph_manifest_version": 3, "created_at": 0, "kind": kind})
+    }
+
+    /// Each outcome says what moved, from the commit's kind and the statement's outcome, as
+    /// the server answers them (`run_branch_statement`, `run_commit_statement`): only a
+    /// published commit moved a branch.
+    #[test]
+    fn write_effects_say_what_moved() {
+        let mutation = |commit: Value| {
+            change(
+                json!({"branch": "main", "query_name": "add", "affected_nodes": 1, "affected_edges": 0, "commit": commit}),
+            )
+        };
+        let committed = WriteEffect::of(&mutation(commit("published")));
+        assert_eq!(committed.title(), "Committed to main");
+        assert_eq!(committed.note(1, 0), "Committed · 1 nodes, 0 edges");
+        assert_eq!(committed.commit(), Some(("01JCOMMITAAAA", "Graph commit")));
+        let unchanged = WriteEffect::of(&mutation(Value::Null));
+        assert_eq!(unchanged.title(), "Nothing changed on main");
+        assert_eq!(unchanged.commit(), None);
+
+        let proposal = WriteEffect::of(&mutation(commit("unpublished")));
+        assert_eq!(
+            proposal,
+            WriteEffect::Proposal {
+                target: "main".into(),
+                commit: "01JCOMMITAAAA".into()
+            }
+        );
+        let title = proposal.title();
+        assert!(title.starts_with("Held as commit ") && title.ends_with(", not on any branch yet"));
+        assert!(!title.contains("Committed"), "{title}");
+        assert!(
+            proposal
+                .detail()
+                .unwrap()
+                .contains("`commit publish \"01JCOMMITAAAA\"`")
+        );
+        let snapshot = WriteEffect::of(&mutation(commit("unattached")));
+        assert!(snapshot.title().starts_with("Saved as snapshot "));
+        assert_eq!(
+            snapshot.commit(),
+            Some(("01JCOMMITAAAA", "Unattached snapshot"))
+        );
+
+        let statement = |outcome: Value, commit: Value| {
+            change(
+                json!({"branch": "feature", "query_name": "branch", "affected_nodes": 0, "affected_edges": 0, "commit": commit, "outcome": outcome}),
+            )
+        };
+        let created = WriteEffect::of(&statement(
+            json!({"kind": "created", "from": "main", "name": "feature", "from_commit_id": "01JSTARTAAAA"}),
+            Value::Null,
+        ));
+        assert_eq!(
+            created,
+            WriteEffect::BranchCreated {
+                name: "feature".into(),
+                from: "main".into(),
+                at: "01JSTARTAAAA".into()
+            }
+        );
+        assert!(
+            created
+                .title()
+                .starts_with("Created branch feature at commit ")
+        );
+        let deleted = WriteEffect::of(&statement(
+            json!({"kind": "deleted", "name": "feature"}),
+            Value::Null,
+        ));
+        assert_eq!(deleted.title(), "Deleted branch feature");
+        let dropped = WriteEffect::of(&statement(
+            json!({"kind": "dropped", "graph_commit_id": "01JCOMMITAAAA"}),
+            Value::Null,
+        ));
+        assert!(dropped.title().starts_with("Dropped commit "));
+        let published = WriteEffect::of(&statement(
+            json!({"kind": "published"}),
+            commit("published"),
+        ));
+        assert!(published.title().starts_with("Published commit "));
+        assert!(published.title().ends_with(" to feature"));
+        let up_to_date = WriteEffect::of(&statement(
+            json!({"kind": "merged", "source": "feature", "target": "main", "merge": "already_up_to_date"}),
+            Value::Null,
+        ));
+        assert_eq!(
+            up_to_date.title(),
+            "main already has feature; nothing changed"
+        );
+        let merged = WriteEffect::of(&statement(
+            json!({"kind": "merged", "source": "feature", "target": "main", "merge": "merged"}),
+            commit("published"),
+        ));
+        assert_eq!(merged.title(), "Merged feature into main");
+        // A merge `as commit` is a proposal: main did not move.
+        let proposed = WriteEffect::of(&statement(
+            json!({"kind": "merged", "source": "feature", "target": "main", "merge": "merged"}),
+            commit("unpublished"),
+        ));
+        assert!(matches!(proposed, WriteEffect::Proposal { .. }));
+        let later = WriteEffect::of(&statement(json!({"kind": "renamed"}), Value::Null));
+        assert_eq!(
+            later,
+            WriteEffect::Statement {
+                kind: "renamed".into(),
+                branch: "feature".into()
+            }
+        );
+    }
+
+    /// A diff's next page is the same statement with the token: its clause's token replaced,
+    /// or a clause put before its `limit`, else at its end.
+    #[test]
+    fn a_diff_continues_at_its_next_page() {
+        assert_eq!(
+            diff_page_text("branch diff feature into main", "t2").as_deref(),
+            Some("branch diff feature into main after page \"t2\"")
+        );
+        assert_eq!(
+            diff_page_text(
+                "set x = 1;\n// changes\nbranch diff a to b limit 10\n",
+                "t\"2"
+            )
+            .as_deref(),
+            Some("set x = 1;\n// changes\nbranch diff a to b after page \"t\\\"2\" limit 10\n")
+        );
+        assert_eq!(
+            diff_page_text("branch diff a after page \"t1\" limit 10", "t2").as_deref(),
+            Some("branch diff a after page \"t2\" limit 10")
+        );
+        assert_eq!(diff_page_text("branch list", "t2"), None);
+        // Each continued text parses as a diff with that token.
+        let schema = SchemaModel::parse(include_str!("../../../dev/cluster/knowledge.pg")).unwrap();
+        let check = |text: &str| gq_language::check(&schema, text).diagnostics;
+        for text in [
+            diff_page_text("branch diff feature into main", "t2").unwrap(),
+            diff_page_text("branch diff a to b limit 10", "t\"2").unwrap(),
+        ] {
+            assert_eq!(check(&text), [], "{text}");
+        }
     }
 
     #[test]

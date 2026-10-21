@@ -109,16 +109,21 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   columns, so one broken declaration does not hide its siblings. Problems are underlined and
   listed under the editor (code, message, fix, line:column; a click moves the cursor there).
   A type error the compiler reports without a position is placed on the last name its message
-  quotes.
+  quotes. F8 and ⇧F8 go to the next and previous problem (in the order of the text, round
+  again), lighting its row; ⌘. applies the suggested fix of the problem gone to or under the
+  cursor, and that problem's Fix button shows the key. A check redraws the problems, the run
+  lines and the parameters, never the result grid; an input whose parameter no declaration
+  declares any more goes once a check reads every declaration.
 - A run line above each declaration (a Zed editor block anchored to the declaration, rebuilt
   when the declarations change): ▶ Run, then that declaration's last outcome ("25 rows · 96
   ms", "Committed · 1 nodes, 0 edges", "Refused", "Outcome unknown · check History"). A line,
   not a gutter glyph: Zed's gutter run indicators belong to its task system, which needs a
   project.
 - The toolbar's snapshot picker reads "Head of <branch>" or "Read only · <commit>": the head,
-  or one of the branch's 15 latest commits (short id, age, actor), read when the tab opens and
-  when the branch changes. A commit pins reads (`QueryRequest.snapshot`) and refuses writes;
-  the head unpins.
+  or one of the branch's 15 latest commits (short id, age, actor), read when the picker opens
+  and kept until a commit lands on the branch or the branch changes; then read again only
+  while the picker is open, which shows them as they come. A tab that never opens it reads no
+  commits. A commit pins reads (`QueryRequest.snapshot`) and refuses writes; the head unpins.
 - Hover goes through Zed's `SemanticsProvider` (`query_editor::hover`), the rest of which
   answers that it has nothing, with `gq_language::hover`: `$p: Person · node`, `$name: String
   · parameter`, `Person.born: Date?`, `node Person · 6 properties`, `worksAt: Person →
@@ -131,12 +136,27 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   settings prefix plus that declaration, so a broken sibling does not stop it. A read goes to
   `POST /query` on the session branch; the result header shows rows, elapsed time, the branch
   and the `graph_commit_id` read at. Before the first run, the expected columns and their
-  compiler types are shown.
-- A mutation never runs on ⌘↵: a bar names the branch ("Run on main", ↵) and Esc cancels. The
-  write is sent once, never retried, and its outcome is shown as committed (nodes, edges,
-  commit), refused ("Nothing was written", with the server's diagnostic) or unknown ("Check
-  History before trying again"). The text is the draft and is never cleared. Closing the tab
-  does not cancel a write in flight; the session logs its outcome.
+  compiler types are shown, named as the answer will name them (`p.name`, from the compiler's
+  `executed_column_name`), so a run leaves the headers as they were. A query's answer is read
+  up to 32 MB (`graph_client`'s cap on every query and stored read): a longer one shows
+  nothing of itself and says "The answer is over 32 MB, the most Studio reads at once. Add a
+  `limit` to the query, or return fewer properties". F6 moves the keyboard to the result grid
+  and back; ↑↓←→ move its cell, ⌘C copies the cell and ⌘⇧C the row.
+- A mutation never runs on ⌘↵: a bar names the branch ("Run on main", ↵) and Esc cancels. A
+  write Studio cannot put back says what goes and waits for its name typed (constitution IV):
+  `branch delete x` the branch and its commits no other branch holds (type `x`), `commit drop`
+  the proposal (its short id), `load … mode overwrite` every row of the type (the type), and a
+  `delete` that publishes what its `where` matches (the type; the query's name for several).
+  The write is sent once, never retried, and its outcome is shown as what the server says it
+  did, from the commit's `kind` and a statement's `outcome`: committed to the branch (nodes,
+  edges, commit) only for a `published` commit; "Held as commit <id>, not on any branch yet"
+  for `as commit`, with the `commit publish`/`commit drop` commands; "Saved as snapshot <id>,
+  on no branch" for `as unattached branch`; "Created branch x at commit <id>", "Deleted
+  branch x", "Merged a into b" (or already up to date), "Published commit <id> to b" and
+  "Dropped commit <id>" for statements, which report no counts; "Nothing changed" for no
+  commit. Refused ("Nothing was written", with the server's diagnostic) or unknown ("Check
+  History before trying again") as before. The text is the draft and is never cleared.
+  Closing the tab does not cancel a write in flight; the session logs its outcome.
 - Parameters of the query under the cursor get an input each; values are typed by
   `gq_language::param_value` and sent as JSON (`null` for an empty nullable).
 - ⌘⇧↵ sends `explain query …` and shows the logical, physical and DataFusion trees indented by
@@ -153,7 +173,11 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   the compiler's AST has no spans; the declaration is found again by name, so edits since the
   plan move the light with the text. An operator the planner adds on its own lights nothing.
 - Statements (`branch …`, `show …`) run without a request target; `branch create/delete/merge`
-  asks first like a mutation.
+  asks first like a mutation. A statement read names no branch of the tab's ("Running branch
+  diff a into b…"); a `branch diff` shows the two commits its page compared and, while the
+  server's `page.next_page_token` says more follow, "Page N · more follow" and Next page
+  (⌘⌥N), which reads the same statement with `after page "<token>"`. The plan of a load
+  heads its first tree "Initial logical plan" (`logical_initial`).
 - To adopt with the next minimum-server bump (spec 012, "On OmniGraph main, 2026-10-20"):
   - The compiler's new checks show as you type: `T27` for a full-text call (`search`, `fuzzy`,
     `match_text`, `bm25`) on a property without `@index`, `T59` for an `rrf()` over two bindings
@@ -173,8 +197,10 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 
 - Editing a schema: the schema view is read-only. Schema changes stay with
   `omnigraph cluster apply`; E14 would add a read-only migration plan, not an apply.
-- A row cap: the result shows every row the server returns, so the query's own `limit` is the
-  cap today (constitution IX). The example query carries `limit 50`.
+- A row cap: the cap is on the answer's bytes (32 MB), not its rows, so the query's own
+  `limit` is the way past it (constitution IX). Paging a query's rows needs a cursor the
+  server does not offer for queries; only `branch diff` pages. The example query carries
+  `limit 50`.
 - A write from the editor sends no `Omnigraph-If-Graph-Commit`: it is not based on a read, and
   the person confirms it against the branch head.
 - Engine changes, [spec 012](../012-omnigraph-engine-changes/plan.md):
@@ -208,10 +234,35 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 | 2026-10-14 | The query page follows the design system | offscreen snapshots of a query tab and a stored query's tab after a run | Toolbar: name and kind leading, picker, Explain and Run trailing; parameters as fields; rows, time and commit in the window footer beside the graph and branch, no second strip |
 | 2026-10-14 | Result columns are resized from their header's edge | `query_editor` headless test `a_dragged_result_column_keeps_its_width_by_name`; `studio_ui` test `a_drag_follows_the_pointer_within_bounds`; offscreen snapshots of `people` (slug, name, title) on the dev graph, then `drag:604,446,704,446` on name's edge and `hover:704,446` | Name went 100 px wider and title and its cells moved with it; the edge's line showed on hover. The test: the width held for `name` when the next result put it second, the tab saved `"widths": {"name": 250.0}`, and resetting fitted it to its values again |
 | 2026-10-14 | Typing in the query does not draw the results | Main-thread CPU per key from the snapshot tool, `release-fast`, `people` with no result, 3 and 6 columns of 200 rows, before and after in one session; headless `typing_in_the_query_leaves_the_results_as_they_were`, which fails with the per-key `notify` restored | Before: 1.7 ms with no result, 2.3 to 2.7 ms with 3 columns, 3.2 to 3.5 ms with 6, each column about 0.25 ms more. After: 1.5, 1.55 and 1.85 to 2.0 ms. A run, a column drag and a cell click drew as before |
+| 2026-10-20 | A write's outcome says what the server says it did | `run_branch_statement` and `run_commit_statement` (`crates/omnigraph-server/src/handlers/dispatch.rs`), `BranchOutcomeOutput` and `CommitOutput.kind` (`crates/omnigraph-api-types/src/lib.rs`) at `edge-20261020-7fd9cc9`: a statement answers `commit: null` (create, delete, drop, an up-to-date merge) with its effect in `outcome`; a write `as commit`/`as unattached branch` answers `kind` `unpublished`/`unattached`. `query_editor` tests `write_effects_say_what_moved` and `a_write_says_what_it_did_from_the_commits_kind_and_the_outcome` (a served `as commit` write) | "Committed to main" only for a `published` commit, as the session's `published()` reads it; a proposal reads "Held as commit …, not on any branch yet", a `branch create` "Created branch feature at commit …" with no counts |
+| 2026-10-20 | A query's answer is capped | `graph_client` test `a_query_answer_over_its_cap_is_refused_and_read_no_further` (an endless body: 64-byte cap reads 65 bytes; `query` and `invoke_stored_read` read 32 MiB + 1 and refuse); `query_editor` `an_answer_over_the_cap_says_so_and_shows_nothing`. The size: a scratch decode of 100,000 node rows (13.8 MB of JSON) into `serde_json::Value` with `preserve_order`, counting allocations, Apple M5 Pro, 48 GB, release build | 164 MB live after decoding, 11.9 times the body: a 32 MB answer can hold about 400 MB as values before the table is built, the most one answer should take; a type table's longest page (1,000 rows) reaches 32 MB only with 33 KB rows |
+| 2026-10-20 | `branch diff` pages | `branch_diff_read_output` at `edge-20261020-7fd9cc9` (a statement read's `target` is null on both sides; `page` carries `from_commit_id`, `to_commit_id`, `base_commit_id`, `next_page_token`); `graph_client` `a_branch_diff_answer_carries_its_page` and the contract table (`ReadPageOutput`); `query_editor` `a_diff_continues_at_its_next_page` and `a_branch_diff_names_its_sides_and_reads_its_next_page` (the session on `dev`) | Run says "Running branch diff feature into main limit 1…", not "on dev"; the rows are read at the statement, not dev; Next page reads `… after page "t2" limit 1` as page 2 |
+| 2026-10-20 | Expected columns are named as the answer names them | `executed_column_name` (`crates/omnigraph-compiler/src/query/typecheck.rs`, the name T25 guards the executed batch by) at `edge-20261020-7fd9cc9`; `gq_language` `a_valid_read_reports_its_columns`; `query_editor` `tables_fill_missing_cells_and_take_types_by_name` | `ResultColumn.column` is `p.name`, `p.born`, `who` for an alias; `name` stays the inferred schema's `name`. Types are matched to the answer's columns by name, so the positional match is gone |
+| 2026-10-20 | The snapshot picker reads commits when it opens | `query_editor` `commits_are_read_when_the_picker_opens` (requests to `/commits` counted) | None at open; one when the picker opens, none when it opens again; one more for a commit landing while it is open; none for one landing while it is closed until it opens |
+| 2026-10-20 | A check does not draw the results | `typing_in_the_query_leaves_the_results_as_they_were`, now on a session serving a schema so the check after typing runs (its analysis holds the typed text and the `namesake` problem); it fails with a results redraw put back in `apply_analysis` (5 draws against 4) | Typing and its check leave the grid; a notify of the tab leaves it; a moved cell draws it once |
+| 2026-10-20 | Keyboard reach | `query_editor` `the_result_grid_is_reached_and_crossed_by_keys` (F6 in and out, ← → by column, ⌘C copies `title` from the middle column) and `problems_are_gone_to_and_fixed_by_keys` (F8 to the only problem, ⌘. adds `()`); the three keymaps checked against Zed's and Studio's bindings for F6, F8, ⇧F8, ⌘./Ctrl-., ⌘⌥N/Ctrl-Alt-N, ← → | No clash where they apply: Zed's F8/⇧F8/⌘. are its project diagnostics and code actions in `Editor`, which `QueryEditor > Editor` overrides; Zed's F6 is `Workspace`; ⌘⌥N is Studio's Reject in `AgentPanel` only |
+| 2026-10-20 | A destructive write waits for its name | `gq_language` `writes_say_what_they_destroy`; `query_editor` `a_destructive_write_waits_for_its_name` | `branch delete feature` says "Deletes branch feature, with its commits no other branch holds. Studio cannot put it back. Type feature to confirm."; ↵ with the field empty sends nothing; with `feature` typed it sends once; `branch create` confirms with ↵ |
+| 2026-10-20 | Plan names | `engine/explain.rs` (`logical_initial`, `logical`, `physical`, `datafusion`, `plan`), `omnigraph-planner/src/physical.rs` and `engine/operators/hydrate.rs` at `edge-20261020-7fd9cc9`; `query_editor` `plans_become_an_indented_list_under_tree_headers`; `gq_language` `logical_and_physical_operators_find_their_clauses`, `datafusion_operators_find_their_clauses` | `logical_initial` heads "Initial logical plan". `Hydrate` was right: it is DataFusion's `HydrateExec` (the `Exec` is dropped before matching); `HydrateColumns` and `HydrateExec` light the `return`. `HydrateByAddress` is planned only for diffs and merges (`optimizer.rs`, `LogicalNode::Join` and `MergeClassify`), never for a query or a load, so nothing in the editor's plans needs it |
+| 2026-10-20 | F32 parameters | `json_value_to_literal_typed` (`omnigraph-compiler/src/query_input.rs`) takes any finite number for F32, but the v2 binding of every declared parameter (`engine/typed_value.rs`, `validate_params` → `typed_scalar`) refuses one infinite as a Float32, and its test `direct_parameter_values_are_checked_even_without_a_consumer` holds an F32 of `f64::MAX` refused | Studio's refusal of `1e39` for F32 is the engine's; the test comment now says which step refuses it |
+| 2026-10-20 | Saved queries follow the graph's key, not its server's name | `graph_store` `named_keys` tests `saved_queries_move_to_the_graphs_key_without_writing_over_one` (neither folder, the name's only, both), `a_graph_opening_takes_its_saved_queries_along` (a `GraphSession` made for `dev` at `http://127.0.0.1:8787`), `a_name_resolves_only_to_a_known_server`; `studio_settings` `query_folders_are_safe_names_per_graph`; every caller of the removed `GraphSession::settings_key` (Queries panel, ⌘S, ⌘⇧S, the palette's Queries scope) now on `overrides_key` | With neither folder nothing is made; the name's alone is renamed whole; with both, `a.gq` moved, `b.gq` kept the key's text ("new b") and stayed in the old folder with `notes.txt`. Opening the graph moved `people.gq` to `queries/http_~~127.0.0.1_8787~moved-queries`. Not yet seen in the running app on a renamed CLI target |
+| 2026-10-20 | Run reuses the check | `query_editor` `a_run_reuses_the_check_of_the_same_text` | A held check of the same text and schema answers Run and Confirm; text changed since is checked again |
 
 
 ## Corrections
 
+- 2026-10-20 · A write `as commit` or `as unattached branch` showed "Committed to main" with its
+  commit, though nothing moved main; `branch create`, `branch delete` and `commit drop`
+  showed "Nothing changed · 0 nodes, 0 edges". The outcome now reads the commit's `kind` and
+  the statement's `outcome` (`results::WriteEffect`).
+- 2026-10-20 · A query's answer was read and decoded whole, however long; it is capped at
+  32 MB with an honest exit, and a `branch diff` showed its first page as if it were all of
+  it. Statement reads said "Running … on dev" and filed their rows under the tab's branch.
+- 2026-10-20 · Every check drew the result grid again: the grid followed every notify of the
+  tab. It is drawn now only when what it shows changes (`QueryEditor::redraw_results`), and
+  the expected columns when the declaration under the cursor, its check or the branch
+  changes. Each tab read 15 commits when it opened and after every commit, picker or not.
+- 2026-10-20 · The expected columns took the compiler's projection names (`name`), so the
+  header became `p.name` after a run and types were matched by position.
 - 2026-10-14 · Every key in the query drew the result grid again, so wide results made typing
   slower. The result area is now a view of its own (`QueryResults`), made with the tab and
   drawn cached; the tab answers `caches_its_parts`; and a moved cursor notifies only when it

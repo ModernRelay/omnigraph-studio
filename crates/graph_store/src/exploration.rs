@@ -1910,6 +1910,7 @@ mod tests {
             columns: columns.iter().map(|c| c.to_string()).collect(),
             rows: rows.into(),
             graph_commit_id: Some("c1".into()),
+            page: None,
         }
     }
 

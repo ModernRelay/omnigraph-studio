@@ -134,7 +134,10 @@ mod tests {
             param_value("t", "DateTime", false, "2024-01-02 10:00:00"),
             Ok(Some(json!("2024-01-02T10:00:00")))
         );
-        // As the engine takes them: U64 up to i64's maximum, and an F32 that stays finite.
+        // As the engine takes them: U64 up to i64's maximum, as its JSON reading does
+        // (`json_value_to_literal_typed`); and an F32 that stays finite as a Float32, which its
+        // JSON reading does not check (it takes any finite number for F32) but its binding of
+        // every declared parameter does (`validate_params`, `typed_scalar`).
         assert!(param_value("n", "U64", false, &u64::MAX.to_string()).is_err());
         assert!(param_value("f", "F32", false, "1e39").is_err());
         assert_eq!(

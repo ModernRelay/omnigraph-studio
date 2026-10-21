@@ -489,6 +489,20 @@ pub mod query {
             Save,
             /// Save the query to a file you choose.
             SaveAs,
+            /// Read the next page of a paged result, such as a branch diff's.
+            NextPage,
+            /// Move the keyboard between the query and its results.
+            ToggleResultsFocus,
+            /// Select the result cell to the left.
+            SelectPreviousColumn,
+            /// Select the result cell to the right.
+            SelectNextColumn,
+            /// Go to the next problem in the query.
+            NextProblem,
+            /// Go to the previous problem in the query.
+            PreviousProblem,
+            /// Apply the compiler's suggested fix for the problem gone to or under the cursor.
+            ApplyFix,
         ]
     );
 }

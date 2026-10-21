@@ -1,11 +1,15 @@
 //! Diagnostics and result types for `.gq` source, from `omnigraph-compiler` (spec 007).
 
 use omnigraph_compiler::error::CompilerError;
-use omnigraph_compiler::query::ast::Expr;
-use omnigraph_compiler::query::ast::FileBody;
+use omnigraph_compiler::query::ast::{
+    BranchStmt, BranchWrite, CommitWrite, Expr, FileBody, LoadStmtMode, LoadTarget, Mutation,
+    MutationWriteMode, QueryDecl,
+};
 use omnigraph_compiler::query::diagnostic::QueryDiagnostic;
 use omnigraph_compiler::query::parser::parse_query_diagnostic;
-use omnigraph_compiler::query::typecheck::{BoundVariable, CheckedQuery, typecheck_query_decl};
+use omnigraph_compiler::query::typecheck::{
+    BoundVariable, CheckedQuery, executed_column_name, typecheck_query_decl,
+};
 use omnigraph_compiler::{QueryResultFieldDescriptor, QueryValueKind, describe_query_operation};
 
 use crate::schema::SchemaModel;
@@ -56,7 +60,12 @@ impl Diagnostic {
 /// A result column a read query will return, known before it runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultColumn {
+    /// The name the compiler's inferred schema gives it (`name` for `$p.name`).
     pub name: String,
+    /// The name of its column in the server's answer (`p.name` for `$p.name`, an alias as
+    /// written): the compiler's `executed_column_name`, which the executor names its result
+    /// batch by. A view of the answer names and matches its columns by this one.
+    pub column: String,
     /// The value's kind as a type reads: `String`, `Int`, `[Date]`, `Vector(3)`, or the node
     /// type of a whole node.
     pub kind: String,
@@ -98,6 +107,65 @@ pub struct QueryInfo {
     /// `(name, type, nullable)` for each parameter.
     pub params: Vec<(String, String, bool)>,
     pub columns: Vec<ResultColumn>,
+    /// What running it destroys: the rows a `delete` removes from its branch.
+    pub destroys: Option<Destroys>,
+}
+
+/// What a write destroys that Studio cannot put back (constitution IV), so it is confirmed by
+/// typing what it names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Destroys {
+    /// `branch delete <name>`: the branch, and its commits no other branch holds.
+    Branch(String),
+    /// `commit drop "<id>"`: the unpublished commit.
+    Commit(String),
+    /// `load … mode overwrite`: every row of the type, replaced by the file's.
+    Overwrite { type_name: String, edge: bool },
+    /// A `delete` that publishes: what its `where` matches of each type it names, in order.
+    Rows(Vec<String>),
+}
+
+/// What running the statement `source` destroys, read from its parse alone: a `branch delete`,
+/// a `commit drop` or an overwriting `load`. `None` for any other statement, for declarations
+/// (their [`QueryInfo::destroys`] says), and for text that does not parse, which the server
+/// refuses before it writes.
+pub fn statement_destroys(source: &str) -> Option<Destroys> {
+    match parse_query_diagnostic(source).ok()?.body {
+        FileBody::Branch(BranchStmt::Write(BranchWrite::Delete { name })) => {
+            Some(Destroys::Branch(name))
+        }
+        FileBody::Commit(CommitWrite::Drop { graph_commit_id }) => {
+            Some(Destroys::Commit(graph_commit_id))
+        }
+        FileBody::Load(load) if load.mode == LoadStmtMode::Overwrite => Some(match load.target {
+            LoadTarget::Node(type_name) => Destroys::Overwrite {
+                type_name,
+                edge: false,
+            },
+            LoadTarget::Edge(type_name) => Destroys::Overwrite {
+                type_name,
+                edge: true,
+            },
+        }),
+        _ => None,
+    }
+}
+
+/// The types a declaration's `delete`s remove rows from, when its result publishes: a write
+/// `as commit` or `as unattached branch` moves no branch, so it deletes nothing there.
+fn deletes(decl: &QueryDecl) -> Option<Destroys> {
+    if decl.write_mode != MutationWriteMode::Publish {
+        return None;
+    }
+    let mut types: Vec<String> = Vec::new();
+    for mutation in &decl.mutations {
+        if let Mutation::Delete(delete) = mutation
+            && !types.contains(&delete.type_name)
+        {
+            types.push(delete.type_name.clone());
+        }
+    }
+    (!types.is_empty()).then_some(Destroys::Rows(types))
 }
 
 /// What the compiler says about a `.gq` source.
@@ -154,6 +222,7 @@ pub fn check(schema: &SchemaModel, source: &str) -> QueryCheck {
                 .map(|p| (p.name.clone(), p.type_name.clone(), p.nullable))
                 .collect(),
             columns: Vec::new(),
+            destroys: deletes(decl),
         };
         match typecheck_query_decl(&schema.catalog, decl) {
             Ok(checked) => {
@@ -181,19 +250,27 @@ pub fn check(schema: &SchemaModel, source: &str) -> QueryCheck {
                 if !info.is_mutation {
                     match describe_query_operation(&schema.catalog, decl) {
                         Ok(operation) => {
+                            // One descriptor per projection, in the `return`'s order; each
+                            // knows its column in the server's answer too.
                             info.columns = operation
                                 .result
                                 .iter()
-                                .map(|field| {
+                                .zip(&decl.return_clause)
+                                .map(|(field, projection)| {
+                                    let column = executed_column_name(
+                                        &projection.expr,
+                                        projection.alias.as_deref(),
+                                    );
                                     let node_type = node_types
                                         .iter()
-                                        .find(|(name, _)| *name == field.name)
+                                        .find(|(name, _)| *name == column)
                                         .map(|(_, ty)| ty.clone());
                                     ResultColumn {
                                         name: field.name.clone(),
                                         kind: kind_label(field, node_type.as_deref()),
                                         nullable: field.nullable,
                                         node_type,
+                                        column,
                                     }
                                 })
                                 .collect();
@@ -232,6 +309,79 @@ mod tests {
         // Each kind reads as a type: a list by its items, a whole node by its type.
         let kinds: Vec<&str> = columns.iter().map(|c| c.kind.as_str()).collect();
         assert_eq!(kinds, ["String", "Date", "[String]", "Person"]);
+        // Each knows its column in the server's answer, which its inferred name (`name`) is
+        // not.
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["name", "born", "tags", "p"]);
+        let columns: Vec<&str> = columns.iter().map(|c| c.column.as_str()).collect();
+        assert_eq!(columns, ["p.name", "p.born", "p.tags", "p"]);
+        let aliased = check(
+            &dev(),
+            "query q() { match { $p: Person } return { $p.name as who, count($p) as n } }",
+        );
+        let columns: Vec<&str> = aliased.queries[0]
+            .columns
+            .iter()
+            .map(|c| c.column.as_str())
+            .collect();
+        assert_eq!(columns, ["who", "n"]);
+    }
+
+    /// What a write destroys that Studio cannot put back: a deleted branch, a dropped commit,
+    /// an overwritten type, and the types a published `delete` removes rows from. A proposal's
+    /// delete removes nothing from a branch.
+    #[test]
+    fn writes_say_what_they_destroy() {
+        assert_eq!(
+            statement_destroys("branch delete feature"),
+            Some(Destroys::Branch("feature".into()))
+        );
+        assert_eq!(
+            statement_destroys("commit drop \"01JCOMMIT\""),
+            Some(Destroys::Commit("01JCOMMIT".into()))
+        );
+        assert_eq!(
+            statement_destroys("load csv \"s3://b/p.csv\" into node:Person mode overwrite header"),
+            Some(Destroys::Overwrite {
+                type_name: "Person".into(),
+                edge: false
+            })
+        );
+        assert_eq!(
+            statement_destroys("load csv \"s3://b/k.csv\" into edge:Knows mode overwrite header"),
+            Some(Destroys::Overwrite {
+                type_name: "Knows".into(),
+                edge: true
+            })
+        );
+        for kept in [
+            "load csv \"s3://b/p.csv\" into node:Person mode append header",
+            "branch create feature",
+            "branch merge feature",
+            "commit publish \"01JCOMMIT\"",
+            "branch delete",
+        ] {
+            assert_eq!(statement_destroys(kept), None, "{kept}");
+        }
+        let deletes = check(
+            &dev(),
+            "query purge($s: String) {\n  delete Person where slug = $s\n  delete Company where slug = $s\n  delete Person where name = $s\n}",
+        );
+        assert!(deletes.diagnostics.is_empty(), "{:?}", deletes.diagnostics);
+        assert_eq!(
+            deletes.queries[0].destroys,
+            Some(Destroys::Rows(vec!["Person".into(), "Company".into()]))
+        );
+        let proposed = check(
+            &dev(),
+            "query purge($s: String) as commit {\n  delete Person where slug = $s\n}",
+        );
+        assert_eq!(proposed.queries[0].destroys, None);
+        let insert = check(
+            &dev(),
+            "query add($s: String) {\n  insert Company { slug: $s, name: $s }\n}",
+        );
+        assert_eq!(insert.queries[0].destroys, None);
     }
 
     #[test]

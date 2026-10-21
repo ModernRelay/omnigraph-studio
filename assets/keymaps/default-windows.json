@@ -301,7 +301,10 @@
       "ctrl-enter": "studio_query::Run",
       "ctrl-shift-enter": "studio_query::Explain",
       "ctrl-s": "studio_query::Save",
-      "ctrl-shift-s": "studio_query::SaveAs"
+      "ctrl-shift-s": "studio_query::SaveAs",
+      "f8": "studio_query::NextProblem",
+      "shift-f8": "studio_query::PreviousProblem",
+      "ctrl-.": "studio_query::ApplyFix"
     }
   },
   {
@@ -310,7 +313,12 @@
       "ctrl-enter": "studio_query::Run",
       "ctrl-shift-enter": "studio_query::Explain",
       "ctrl-s": "studio_query::Save",
-      "ctrl-shift-s": "studio_query::SaveAs"
+      "ctrl-shift-s": "studio_query::SaveAs",
+      "f8": "studio_query::NextProblem",
+      "shift-f8": "studio_query::PreviousProblem",
+      "ctrl-.": "studio_query::ApplyFix",
+      "f6": "studio_query::ToggleResultsFocus",
+      "ctrl-alt-n": "studio_query::NextPage"
     }
   },
   {
@@ -330,7 +338,9 @@
     "context": "QueryResults",
     "bindings": {
       "ctrl-c": "studio_query::CopyCell",
-      "ctrl-shift-c": "studio_query::CopyRow"
+      "ctrl-shift-c": "studio_query::CopyRow",
+      "left": "studio_query::SelectPreviousColumn",
+      "right": "studio_query::SelectNextColumn"
     }
   },
   {
