@@ -339,6 +339,9 @@ pub(crate) struct GraphCanvas {
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     /// The read ahead for the chip the pointer rests on, once it has rested.
     _prefetch: Option<Task<()>>,
+    /// Where the chip the pointer is on sits in the exploration, whose read ahead stops when
+    /// the pointer leaves it.
+    read_ahead: Option<ExplorePath>,
     /// The wait before the chip the pointer rests on opens.
     _open: Option<Task<()>>,
     /// A rebuild waiting for reads that finish together.
@@ -516,6 +519,7 @@ impl GraphCanvas {
             area: None,
             context_menu: None,
             _prefetch: None,
+            read_ahead: None,
             _open: None,
             _loaded: None,
             char_widths: CharWidths::default(),
@@ -992,6 +996,7 @@ impl GraphCanvas {
     /// and what resting on one would read or open is let go.
     fn pointer_left(&mut self, cx: &mut Context<Self>) {
         self._prefetch = None;
+        self.end_read_ahead(None, cx);
         self._open = None;
         if self.hovered.take().is_some() | self.opened.take().is_some() {
             cx.notify();
@@ -1191,13 +1196,16 @@ impl GraphCanvas {
     }
 
     /// A pointer that rests on a node or a relationship pill reads ahead what opening it will
-    /// show, so it opens at once; passing over chips reads nothing.
+    /// show, so it opens at once; passing over chips reads nothing, and leaving one after stops
+    /// what was read ahead for it and is still out.
     fn prefetch_hovered(&mut self, cx: &mut Context<Self>) {
         let path = self
             .hovered
             .and_then(|index| self.scene.nodes.get(index))
             .filter(|node| matches!(node.kind, SceneKind::Node { .. } | SceneKind::Hub { .. }))
             .and_then(|node| node.path.clone());
+        self.end_read_ahead(path.as_ref(), cx);
+        self.read_ahead = path.clone();
         self._prefetch = path.map(|path| {
             let exploration = self.exploration.clone();
             cx.spawn(async move |_, cx| {
@@ -1205,6 +1213,16 @@ impl GraphCanvas {
                 exploration.update(cx, |e, cx| e.prefetch(&path, cx));
             })
         });
+    }
+
+    /// The pointer left the chip it was on for `now` (another chip, or none): what was read
+    /// ahead for the chip left and is still out stops, unless it was opened since
+    /// ([`Exploration::end_prefetch`]).
+    fn end_read_ahead(&mut self, now: Option<&ExplorePath>, cx: &mut Context<Self>) {
+        if let Some(left) = self.read_ahead.take().filter(|left| Some(left) != now) {
+            self.exploration
+                .update(cx, |exploration, cx| exploration.end_prefetch(&left, cx));
+        }
     }
 
     fn is_marked(&self, index: usize) -> bool {
@@ -2838,6 +2856,60 @@ mod tests {
             assert_eq!(canvas.scene.cap, 3);
             assert!(canvas.scene.capped.is_none());
         });
+    }
+
+    /// Leaving a chip stops what was read ahead for it and is still out, as leaving a tree row
+    /// does: the read is let go, and nothing says it was asked for.
+    #[gpui::test]
+    async fn leaving_a_chip_stops_its_read_ahead(cx: &mut gpui::TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let (session, _served) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\n",
+            |_| serde_json::json!([{ "id": "p1", "label": "Ada", "n": 1 }]),
+            cx,
+        );
+        cx.run_until_parked();
+        let canvas = cx.new(|cx| GraphCanvas::new(session, cx));
+        let exploration = canvas.read_with(cx, |canvas, _| canvas.exploration.clone());
+        exploration.update(cx, |exploration, cx| {
+            exploration.root_at(NodeRef::new("Person", "p1"), cx)
+        });
+        cx.run_until_parked();
+        // Answers that come in together are laid out after a short wait.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        let (hub, key) = canvas.read_with(cx, |canvas, _| {
+            canvas
+                .scene
+                .nodes
+                .iter()
+                .enumerate()
+                .find_map(|(index, node)| match &node.kind {
+                    SceneKind::Hub { key, .. } => Some((index, key.clone())),
+                    _ => None,
+                })
+                .unwrap()
+        });
+        let asked = |cx: &mut gpui::TestAppContext| {
+            exploration.read_with(cx, |exploration, _| {
+                exploration.state().neighbours.contains_key(&key)
+            })
+        };
+        // The pointer rests on a relationship pill: its first neighbours are read ahead.
+        canvas.update(cx, |canvas, cx| {
+            canvas.hovered = Some(hub);
+            canvas.prefetch_hovered(cx);
+            let path = canvas.read_ahead.clone().unwrap();
+            canvas
+                .exploration
+                .update(cx, |exploration, cx| exploration.prefetch(&path, cx));
+        });
+        assert!(asked(cx), "read ahead");
+        // It leaves before they answer: they stop.
+        canvas.update(cx, |canvas, cx| canvas.pointer_left(cx));
+        cx.run_until_parked();
+        assert!(!asked(cx), "stopped, and nothing says they were asked for");
     }
 
     /// Show on canvas of a node the exploration shows selects it there: it does not start the
