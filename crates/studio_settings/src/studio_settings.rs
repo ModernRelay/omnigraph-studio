@@ -631,19 +631,6 @@ impl StudioSettings {
         document::read(text)
     }
 
-    /// The settings of a file that has no problem at all. Studio reads its file with
-    /// [`Self::read`]; this is left for `crates/studio/tests/settings_apply.rs`, the one test
-    /// outside this crate that still calls it.
-    #[cfg(feature = "test-support")]
-    pub fn parse(text: &str) -> Result<Self, String> {
-        let reading = Self::read(text)?;
-        if reading.problems.is_empty() {
-            Ok(reading.settings)
-        } else {
-            Err(reading.problems.join("\n"))
-        }
-    }
-
     /// The keys Zed's settings store understands.
     fn zed_user_settings(&self) -> String {
         let mode = match self.theme.mode {

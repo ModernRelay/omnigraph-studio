@@ -64,9 +64,10 @@ fn settings_choose_the_active_theme(cx: &mut HeadlessAppContext, data: &Path) {
     assert_eq!(cx.update(|cx| cx.theme().name.to_string()), "Gruvbox Dark");
 
     let written = std::fs::read_to_string(data.join("settings.json")).unwrap();
-    let read = StudioSettings::parse(&written).unwrap();
-    assert_eq!(read.theme.mode, ThemeMode::Dark);
-    assert_eq!(read.theme.dark, "Gruvbox Dark");
+    let reading = StudioSettings::read(&written).unwrap();
+    assert!(reading.problems.is_empty(), "{:?}", reading.problems);
+    assert_eq!(reading.settings.theme.mode, ThemeMode::Dark);
+    assert_eq!(reading.settings.theme.dark, "Gruvbox Dark");
     assert_eq!(cx.update(|cx| studio_settings::file_error(cx)), None);
     let keys: serde_json::Value = serde_json::from_str(&written).unwrap();
     assert_eq!(
