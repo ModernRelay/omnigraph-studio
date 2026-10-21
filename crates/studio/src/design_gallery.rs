@@ -249,10 +249,11 @@ impl Render for DesignGallery {
             ("person-000001", "Donald Dijkstra", "Researcher"),
             ("person-000002", "Grace Allen", "—"),
         ];
-        // A grid card, as the type table and an agent's record cards draw one: header cells
-        // of the kind's icon and a muted name (the first ordering the rows, in ink, its menu
-        // shown as under the pointer), then data cells, every cell's rule on its right but the
-        // last's; the selected row on its fill and its Peek shown.
+        // A grid card, as an agent's record cards draw one; the type table draws the same cells
+        // with no card, flush in its document under its toolbar: header cells of the kind's
+        // icon and a muted name (the first ordering the rows, in ink, its menu shown as under
+        // the pointer), then data cells, every cell's rule on its right but the last's; the
+        // selected row on its fill and its Peek shown.
         let last = columns.len() - 1;
         let ruled = |cell: Div, at: usize| {
             let cell = cell.flex_1().min_w_0();

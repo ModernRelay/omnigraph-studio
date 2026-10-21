@@ -631,15 +631,16 @@ than styling one-off elements.
   (`ds::header_row`, the `ds::header_fill` faint ink, `#fafafa` on white, which lightens a dark
   document) holds header cells (`ds::header_cell`: the property kind's icon, then its name,
   muted, in ink while it orders the rows, 30 px); data cells (`ds::data_cell`) are 28 px; both
-  are 12 px in from either side and ruled on their right (`ds::cell_rule`), a card's last column
-  but; rows are `ds::grid_row`s under a hairline. A cell's trailing action (`ds::cell_action`,
+  are 12 px in from either side and ruled on their right (`ds::cell_rule`), but for the last
+  column, whose edge is the grid's; rows are `ds::grid_row`s under a hairline. A cell's trailing action (`ds::cell_action`,
   a row's icon button) shows while its header or row is hovered: in a wide cell in its own
   place, over a header's end on the header's opaque fill (`ds::hover_slot`,
   `ds::header_fill_opaque`), so a narrow column's name and type keep their room. It never
   takes room on hover only: GPUI lays a frame out before it paints the hover, and an element
   shown by hover alone panics ("must call prepaint before paint"). A record card is a
   `ds::card` with a title line (`ds::card_title`: a tile, the record's name, then muted facts
-  after a middle dot) over a grid. The type table and the agent's record cards share these.
+  after a middle dot) over a grid. The type table and the agent's record cards share these: a
+  record card in its card, the type table flush in its document (since 2026-10-21).
 - **Composers and notice strips** (since 2026-10-21, after the reference agent chat). A
   composer is a card (`ds::composer_card`: the card's corner, fill and `shadow-custom`) holding
   the message, then its controls on one line at its end (`ds::composer_controls`). A notice
@@ -783,12 +784,15 @@ than styling one-off elements.
   through `SidebarRow::icon`, at 14 px, or a type mark) sits in one 16 px slot
   (`size::ROW_ICON`), so every list's labels start on one edge, 36 px in.
 - **Context once.** The branch appears once, in the document footer's branch menu.
-- **Tables.** A 48 px toolbar, then the grid as a rounded card inset from the document's edges
-  (16 px either side, 12 above and below), as the reference table (since 2026-10-21; until then
-  the grid ran to the document's edges with no column rules): a one-line header row of header
-  cells (the kind's icon, the name, the type muted, 30 px), drawn by Studio rather than Zed's
-  table, whose header padded it to 42 px; the key's header and the others scroll sideways with
-  the rows. Each header ends in its column menu (⋯, the right-click menu) while hovered; the key
+- **Tables.** A 48 px toolbar, then the grid flush in the document under it, with no card:
+  from the document's left edge, the key column's content at the page's 16 px gutter
+  (`space::EDGE`, as the toolbar's title), the other cells 12 px in (since 2026-10-21; that day
+  the grid was briefly a rounded card inset 16 px either side and 12 above and below, which read
+  as a second border inside the page). The grid ends at its last column: its header and rows
+  are no wider than the columns, so no fill or hairline runs past it, and the last column has no
+  rule on its right. A one-line header row of header cells (the kind's icon, the name, the type
+  muted, 30 px), drawn by Studio rather than Zed's table, whose header padded it to 42 px; the
+  key's header and the others scroll sideways with the rows. Each header ends in its column menu (⋯, the right-click menu) while hovered; the key
   cell ends in the row's Peek while the row is hovered. 28 px rows split by hairlines, every
   cell ruled on its right, cells 12 px in either side, the cursor as a ring and the selected row
   on its fill. Dense enough to scan a page at a glance; an 18 px borderless tag or chip still
@@ -922,6 +926,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 | 2026-10-13 | A busy modal stays open until it agrees | `studio_workspace` GPUI test `a_busy_modal_stays_open_until_it_agrees` (a real `Workspace` in a test window, Zed's base theme) | `hide_modal` and the same command again leave it open while busy; it closes once not. Before the change, every close went straight through |
 | 2026-10-14 | Review findings on the footer, settings fields and controls | `studio` `typing_not_yet_written_outlives_the_values_drawn_again` (fails on the earlier show logic); `studio_workspace` `leaving_the_window_pauses_the_cpu_reading` (fails without the mark on leaving); `studio_ui` `a_pill_button_keeps_the_focus_and_the_click` (fails without it: the click reached the surface around it) and `controls_draw_at_their_sizes` (a float bar's buttons 22 px, inside its border) | All pass. The settings test runs on `studio_settings::init_test`, settings in memory that refuse every write, so no test reaches `settings.json` |
 | 2026-10-13 | A panic message loses quoted text | `studio` test `a_panic_message_loses_the_text_it_quotes` | ``'é'`` and `` `Ada Lovelace's notes` `` become `'…'` and `` `…` ``; messages over 300 characters are cut |
+| 2026-10-21 | The type table is flush in its document and ends at its last column; an agent's write shows its query once | Offscreen snapshots (1440×900 at 2×) against a scratch dev server and the test agent, light and dark, before and after: Person, Project (narrower than the page), Company, Person at 2400×700, and "list people, then make a change"; `agent_panel` `a_write_shows_its_query_once_on_its_card` | Before, the table was a card inset in the page, a second border; its "empty strip" after `tags` was the first 12 px of the next column (`contributes`), the cell's own inset, cut at the card's edge. After, the grid runs from the document's edge under the toolbar, the key's text on the toolbar title's 16 px; a grid narrower than the page ends at its last column with no rule after it (Project ends 26 px short of the edge, the page plain there), and a wider one scrolls with its last column unruled. The chat showed the retitle query twice, highlighted under "Mutate retitle" with its `--branch` line and again on the Mutation card; the call's line is now "Mutate retitle" alone over the card |
 | 2026-10-21 | The palette, the agent's composer and the type table follow the three reference frames on the design system | Offscreen snapshots (1440×900 at 2×) against a scratch dev server, light, dark and glass, before and after, cropped at 2× beside the references; `studio_ui` `key_caps_are_one_box_per_key`, `a_row_knows_its_place_in_its_panel`, `controls_draw_at_their_sizes` (a tile, a segment and the grid's cells at their tokens), `values_pick_their_kind_icon`; `command_palette` `rows_are_grouped_by_kind_until_text_is_typed`; `agent_panel` `a_querys_rows_are_read_from_what_its_call_returned`, `a_tool_call_keeps_the_result_its_agent_reported`, `a_turn_ends_at_its_last_reply` | The palette is a tray of inset panels, its groups named while nothing is typed and counted once text is, rows led by tiles with their keys as caps; the inset panels' corners stayed square until each end was drawn as tall as its corner (GPUI clamps a corner to half its box). The type table's header was 42 px under Zed's padding; Studio's own header row is 30. In a dark theme a darker header fill did not show, so the header takes the well's ink |
 
 ## Corrections

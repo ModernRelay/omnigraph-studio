@@ -388,7 +388,7 @@ pub enum BranchStartRefusalReason {
 }
 
 /// A commit's changes the server cannot compare with its parent's (409); nothing was read. It
-/// is an error's `change_diff_refusal`, read from [`ErrorOutput::other`].
+/// is an error's [`ErrorOutput::change_diff_refusal`].
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ChangeDiffRefusalOutput {
     pub reason: ChangeDiffRefusalReason,
@@ -700,8 +700,9 @@ pub struct BlobPreconditionFailureOutput {
 // ---- errors ----
 
 /// Every refusal's body. Typed details are added as surfaces need them; the rest stay in
-/// `other` so nothing the server sent is lost.
-#[derive(Debug, Clone, Deserialize)]
+/// `other` so nothing the server sent is lost. `Default` is an empty body, for building one
+/// field by field.
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ErrorOutput {
     pub error: String,
     #[serde(default)]
@@ -717,6 +718,10 @@ pub struct ErrorOutput {
     /// Set when a branch could not start at the commit `from_commit` named.
     #[serde(default)]
     pub branch_start_refusal: Option<BranchStartRefusalOutput>,
+    /// Set with a 409 when a commit's changes cannot be compared with its parent's: the graph's
+    /// first commit, or a schema change between them.
+    #[serde(default)]
+    pub change_diff_refusal: Option<ChangeDiffRefusalOutput>,
     #[serde(default)]
     pub diagnostic: Option<Value>,
     #[serde(flatten)]
@@ -996,6 +1001,7 @@ mod contract_tests {
                 "precondition_failure",
                 "blob_precondition_failure",
                 "branch_start_refusal",
+                "change_diff_refusal",
                 "diagnostic",
             ],
         ),

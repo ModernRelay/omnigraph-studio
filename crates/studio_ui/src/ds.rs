@@ -2986,7 +2986,8 @@ pub fn inset_label(label: impl Into<SharedString>, height: f32) -> Div {
 }
 
 /// A rule between a grid's cells, on the cell's right ([`header_cell`], [`data_cell`]). Give
-/// it to every cell but a card's last column, whose edge is the card's.
+/// it to every cell but the last column's: a record card's edge is the card's, and the type
+/// table, flush in its document, ends at its last column.
 pub fn cell_rule<E: Styled>(cell: E, cx: &App) -> E {
     cell.border_r_1().border_color(surface::rule(cx))
 }

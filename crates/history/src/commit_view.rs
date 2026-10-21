@@ -907,16 +907,34 @@ fn is_parentless(error: &ReadError) -> bool {
     matches!(
         error,
         ReadError::Refused(summary)
-            if summary.change_diff_refusal == Some(ChangeDiffRefusalReason::ParentlessCommit)
+            if summary.change_diff_refusal.as_ref().map(|refusal| refusal.reason)
+                == Some(ChangeDiffRefusalReason::ParentlessCommit)
     )
 }
 
+/// Why a commit's changes could not be read, with the server's reason as it came. A comparison
+/// the server refused says what stopped it by the refusal's reason: a schema change between the
+/// commit and its parent, naming the type at it; any other reason claims no schema change.
 fn describe(error: &ReadError) -> String {
     match error {
-        ReadError::Refused(summary) if summary.status == 409 => format!(
-            "This commit cannot be compared with its parent (a schema change between them): {}",
-            summary.message
-        ),
+        ReadError::Refused(summary) if summary.status == 409 => {
+            let message = &summary.message;
+            match summary.change_diff_refusal.as_ref() {
+                Some(refusal) if refusal.reason == ChangeDiffRefusalReason::SchemaBoundary => {
+                    match &refusal.type_name {
+                        Some(type_name) => format!(
+                            "This commit cannot be compared with its parent across a change to \
+                             {type_name}'s schema: {message}"
+                        ),
+                        None => format!(
+                            "This commit cannot be compared with its parent across a schema \
+                             change: {message}"
+                        ),
+                    }
+                }
+                _ => format!("This commit cannot be compared with its parent: {message}"),
+            }
+        }
         ReadError::Refused(summary) if summary.status == 410 => {
             "The history behind this commit was cleaned up, so its changes cannot be read.".into()
         }
@@ -991,6 +1009,43 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// A comparison the server refused says why by the refusal's typed reason: the graph's first
+    /// commit is told apart, a schema change names its type, and another 409 is told as the
+    /// server put it, claiming no schema change.
+    #[test]
+    fn a_refused_comparison_says_why() {
+        use ChangeDiffRefusalReason::{ParentlessCommit, SchemaBoundary};
+        use graph_client::api::ChangeDiffRefusalOutput;
+        let refused = |refusal: Option<(ChangeDiffRefusalReason, Option<&str>)>| {
+            ReadError::Refused(graph_client::ApiErrorSummary {
+                status: 409,
+                message: "as the server put it".into(),
+                code: None,
+                diagnostic: None,
+                change_diff_refusal: refusal.map(|(reason, type_name)| {
+                    Box::new(ChangeDiffRefusalOutput {
+                        reason,
+                        graph_commit_id: "c1".into(),
+                        type_name: type_name.map(str::to_owned),
+                    })
+                }),
+            })
+        };
+        assert!(is_parentless(&refused(Some((ParentlessCommit, None)))));
+        assert!(!is_parentless(&refused(Some((SchemaBoundary, None)))));
+        assert!(!is_parentless(&refused(None)));
+        let typed = describe(&refused(Some((SchemaBoundary, Some("Person")))));
+        assert!(typed.contains("a change to Person's schema"), "{typed}");
+        let untyped = describe(&refused(Some((SchemaBoundary, None))));
+        assert!(untyped.contains("across a schema change"), "{untyped}");
+        let other = describe(&refused(None));
+        assert!(!other.contains("schema"), "{other}");
+        // Each keeps the server's reason as it came.
+        for said in [typed, untyped, other] {
+            assert!(said.ends_with(": as the server put it"), "{said}");
+        }
+    }
 
     /// A failed read of more changes keeps those read before it, and the next press goes on
     /// from the page that failed; the counts say they are partial until the last page is in.

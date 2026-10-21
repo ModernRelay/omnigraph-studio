@@ -1507,16 +1507,11 @@ mod tests {
             status,
             body: ErrorOutput {
                 error: "policy denied".into(),
-                code: None,
-                merge_conflicts: None,
                 precondition_failure: precondition.then(|| PreconditionFailureOutput {
                     expected: "c1".into(),
                     actual: Some("c2".into()),
                 }),
-                blob_precondition_failure: None,
-                branch_start_refusal: None,
-                diagnostic: None,
-                other: Map::new(),
+                ..Default::default()
             },
         })
     }

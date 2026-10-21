@@ -65,8 +65,9 @@ pub struct ApiErrorSummary {
     pub code: Option<crate::api::ErrorCode>,
     /// The server's diagnostic for a refused query: where in the text, and what (spec 007).
     pub diagnostic: Option<Value>,
-    /// Why a commit's changes could not be compared with its parent's (a 409).
-    pub change_diff_refusal: Option<crate::api::ChangeDiffRefusalReason>,
+    /// Why a commit's changes could not be compared with its parent's (a 409), and the type
+    /// at a schema boundary. Boxed, so every read's error stays small.
+    pub change_diff_refusal: Option<Box<crate::api::ChangeDiffRefusalOutput>>,
 }
 
 /// What a read at a commit was refused for because the commit predates the current schema: a
@@ -1340,14 +1341,7 @@ fn summary(status: StatusCode, body: &[u8]) -> ApiErrorSummary {
             message: error.error,
             code: error.code,
             diagnostic: error.diagnostic,
-            change_diff_refusal: error
-                .other
-                .get("change_diff_refusal")
-                .cloned()
-                .and_then(|refusal| {
-                    serde_json::from_value::<crate::api::ChangeDiffRefusalOutput>(refusal).ok()
-                })
-                .map(|refusal| refusal.reason),
+            change_diff_refusal: error.change_diff_refusal.map(Box::new),
         },
         Err(_) => ApiErrorSummary {
             status: status.as_u16(),
@@ -2036,31 +2030,55 @@ mod tests {
     }
 
     /// A commit's changes refused because it has no parent say so by the refusal's reason, as
-    /// the server answers for the graph's first commit (`change_diff_refusal`); a schema boundary
-    /// says its own, and another refusal none.
+    /// the server answers for the graph's first commit (`change_diff_refusal`, a typed field of
+    /// the error); a schema boundary says its own and names its type, and another refusal none.
     #[test]
     fn a_refused_commit_comparison_names_its_reason() {
-        use crate::api::ChangeDiffRefusalReason;
+        use crate::api::{ChangeDiffRefusalOutput, ChangeDiffRefusalReason};
         let refused = |body: &'static str| {
             let client = client(respond(409, Some(CONTRACT), body));
             match block_on(client.commit_changes("g", "c0", None, 10)) {
-                Err(ReadError::Refused(summary)) => summary.change_diff_refusal,
+                Err(ReadError::Refused(summary)) => (
+                    summary.message,
+                    summary.change_diff_refusal.map(|refusal| *refusal),
+                ),
                 other => panic!("expected a refusal, got {other:?}"),
             }
         };
         assert_eq!(
             refused(
                 r#"{"error":"commit 'c0' has no first parent; bootstrap from an exact baseline","code":"conflict","change_diff_refusal":{"reason":"parentless_commit","graph_commit_id":"c0"}}"#
-            ),
-            Some(ChangeDiffRefusalReason::ParentlessCommit)
+            )
+            .1,
+            Some(ChangeDiffRefusalOutput {
+                reason: ChangeDiffRefusalReason::ParentlessCommit,
+                graph_commit_id: "c0".into(),
+                type_name: None,
+            })
         );
         assert_eq!(
             refused(
                 r#"{"error":"schema boundary","change_diff_refusal":{"reason":"schema_boundary","graph_commit_id":"c0","type_name":"Person"}}"#
             ),
-            Some(ChangeDiffRefusalReason::SchemaBoundary)
+            (
+                "schema boundary".to_owned(),
+                Some(ChangeDiffRefusalOutput {
+                    reason: ChangeDiffRefusalReason::SchemaBoundary,
+                    graph_commit_id: "c0".into(),
+                    type_name: Some("Person".into()),
+                })
+            )
         );
-        assert_eq!(refused(r#"{"error":"conflict"}"#), None);
+        // A reason a later build may send still names the refusal.
+        assert_eq!(
+            refused(
+                r#"{"error":"later","change_diff_refusal":{"reason":"retention_gap","graph_commit_id":"c0"}}"#
+            )
+            .1
+            .map(|refusal| refusal.reason),
+            Some(ChangeDiffRefusalReason::Other)
+        );
+        assert_eq!(refused(r#"{"error":"conflict"}"#).1, None);
     }
 
     /// A merge preview reads what a merge would do, or the conflicts that would stop it; any

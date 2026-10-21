@@ -61,12 +61,16 @@ stay put), IX (paged, virtualized).
   table's commit, that property with the save's dot and not editable there, and follows the
   save as it follows its own writes: landed on its commit, the peek moves to the save's commit
   with the value; refused, it keeps the value it shows (since 2026-10-21; before, it showed the
-  value sent as stored, kept it after a refusal, and bound an edit to it). Every write of the
-  table's own tells its peek, which follows it so (since 2026-10-21; before, only a cell's save
-  and a drafts' save did, and the rest left the peek offering Refresh): a bulk set, a row
+  value sent as stored, kept it after a refusal, and bound an edit to it). Every value write of
+  the table's own tells its peek, which follows it so (since 2026-10-21; before, only a cell's
+  save and a drafts' save did, and the rest left the peek offering Refresh): a bulk set, a row
   inserted, a Blob stored or cleared, whose value the peek's slot then shows. One that changed
   another row the peek shows among a group's neighbours leaves the peek behind, since it would
-  show that neighbour by its old name. A peek opened from the table shows its Blob values as the
+  show that neighbour by its old name. A delete is not told, nor is its Undo, which the
+  workspace sends through the session: both change relationships as well as rows (a deleted
+  node takes its edges with it, Undo puts them back), which a told write cannot carry, so the
+  peek compares that commit as it does another writer's, moving to the head when nothing it
+  shows changed and offering Refresh when something did; the peek of a deleted row closes. A peek opened from the table shows its Blob values as the
   cells show them, where they hold (`TableBlobs`: past the pin after the table's own Blob write
   over another writer's commit), binds its Blob writes there, and a tab it opens for a value
   reads there; where they hold at no known commit, the tab reads the branch head. A peek opened from the table reads no
@@ -368,6 +372,8 @@ kept answers.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | The grid sits flush in the document and ends at its last column | Offscreen snapshots (1440×900 at 2×) against a scratch dev server, light and dark, before and after: Person, Project, Company, and Person at 2400×700 | Before, the grid was a card inset 16 px in the page, and the thin strip after `tags` was the next column's (`contributes`) first 12 px, its cell inset, cut at the card's edge. After, the header and rows start at the document's edge under the toolbar, the key's text at the toolbar title's 16 px, every column but the last ruled on its right; Project, narrower than the page, ends at its last column with no fill or hairline past it |
+| 2026-10-21 | Which of the table's writes tell its peek | `table.rs` `tell_peek_wrote`'s callers: a saved cell, drafts saved together, a bulk set, `row_inserted`, a Blob stored or cleared; not `rows_deleted`, nor `undo_delete`, which writes through `GraphSession::write_on` | The doc said the peek hears every write; it now names these and says why a delete and its Undo are not told (they change relationships, which `TableWrote` cannot carry) and what the peek does instead |
 | 2026-10-21 | A Blob tab or a peek shows Blob values where they hold, not at the pin | `type_table` `a_views_own_blob_write_leaves_its_next_one_bound_where_it_holds`, extended (after the page's bound write over another writer's commit, `BlobsAt::Own("c2")` and Open's `at_commit` `c2`), and `a_peek_opened_after_its_tables_blob_write_shows_it_where_it_holds` (a table behind its branch stores a Blob: a peek opened then reads at the table's pin `c1`, shows the 6-byte value written, and holds its Blobs at `c3`) | Before, Open read at the view's commit (`c0`), the value replaced, and that tab's first upload was refused as changed; a peek opened from a table got the pin alone and read the value replaced there |
 | 2026-10-21 | The table tells its peek of every write it makes | `type_table` `a_peek_follows_every_write_of_its_table` (a bulk set of two rows, then a row inserted through `GraphSession::write_on`), `a_peek_shows_the_blobs_its_table_stores` (a 5-byte file stored in the peek's row), and the peek test `a_group_that_fits_its_page_is_read_once`, extended (`table_wrote` naming a neighbour shown, then one not shown) | The peek moves to `c2` with "Ida" and is not newer, then to `c3` for the insert; its slot shows the 5 bytes stored at `c2`; a write to a neighbour it shows leaves it behind at its commit, one to another row moves it on. Before, a bulk set, an insert and a Blob write reached the peek only as a head move, which offered Refresh or kept the old value |
 | 2026-10-21 | An edit open when the table changes branch or goes is kept as a draft | `type_table` `a_branch_change_keeps_an_open_edit_on_the_branch_it_was_typed_on`, `a_table_let_go_keeps_its_open_edit_as_a_draft`; each run again with its fix undone | Typed "Ada King" in p1's name, then the session moved to fix: main held the draft bound to "Ada", fix none, the keys back on the table; a table with the edit open was dirty (typed back to "Ada", it was not) and, its window removed, left the draft. With the fixes undone both failed: the branch change set the edit to none before the reload that keeps it, and the table had no release hook |

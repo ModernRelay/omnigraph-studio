@@ -206,6 +206,10 @@ struct BulkDraft {
 /// The hover group of a grid row, for the actions its cells show under the pointer.
 const ROW_GROUP: &str = "table-row";
 
+/// Where the key column's content starts: the page's gutter, as the toolbar's title does,
+/// since the grid runs to the document's edges. The other cells keep a cell's inset.
+const KEY_INSET: f32 = space::EDGE;
+
 /// A property's icon, by what it holds: text, a number, a time, a choice, a file.
 fn property_icon(property: &Property) -> IconName {
     if property.enum_values.is_some() {
@@ -3793,12 +3797,20 @@ impl TypeTable {
         peek.update(cx, |peek, cx| peek.table_saves(saving, cx));
     }
 
-    /// Tells the peek that one of the table's own writes landed at `commit`, made on `parent`:
-    /// every write, so the peek follows it as it follows its own writes rather than offering
-    /// Refresh for it. `written` is what it wrote, by row and property, and `blob` the Blob
-    /// value it stored or cleared in one cell, by row; the peek takes those of its own row, and
-    /// the other rows only by id, since it may show one of them among its neighbours. A write
-    /// that only added rows (an insert) changed no row the peek shows.
+    /// Tells the peek that one of the table's value writes landed at `commit`, made on `parent`:
+    /// a saved cell, drafts saved together, a value set on many rows, an inserted row, and a
+    /// Blob stored or cleared. The peek follows such a write as it follows its own writes,
+    /// rather than offering Refresh for it. `written` is what it wrote, by row and property, and
+    /// `blob` the Blob value it stored or cleared in one cell, by row; the peek takes those of
+    /// its own row, and the other rows only by id, since it may show one of them among its
+    /// neighbours. A write that only added rows (an insert) changed no row the peek shows.
+    ///
+    /// A delete ([`Self::rows_deleted`]) is not told, nor is Undo of one, which the workspace
+    /// sends through the session: either changes relationships as well as rows (a deleted node
+    /// takes its edges with it, and Undo puts them back), so the peek's groups of neighbours
+    /// may have changed in ways `written` cannot carry. The peek sees that commit move the
+    /// branch as another writer's does, and compares it with what it shows: unchanged, it moves
+    /// to the head; changed, it offers Refresh. The peek of a deleted row closes.
     fn tell_peek_wrote(
         &self,
         written: Vec<(String, String, Value)>,
@@ -6223,11 +6235,9 @@ impl TypeTable {
         }
         let grid = self.render_grid(window, cx);
         // A column's edge dragged anywhere over the grid resizes it until released. The grid
-        // is a card inset from the document's edges, as the reference table's.
+        // sits in the document under the toolbar, from the document's edge, with no frame.
         div()
             .size_full()
-            .px(px(space::EDGE))
-            .py(px(space::LG))
             .on_drag_move(
                 cx.listener(|this, event: &DragMoveEvent<ColumnDrag>, _, cx| {
                     this.drag_column(event, cx)
@@ -6239,7 +6249,7 @@ impl TypeTable {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| this.end_resize(cx)),
             )
-            .child(studio_ui::ds::card(cx).size_full().child(grid))
+            .child(grid)
             .into_any_element()
     }
 
@@ -6257,6 +6267,20 @@ impl TypeTable {
             .collect();
         let places: Rc<[GridPlace]> = grid_places(&drawn, &column_widths).into();
         self.frame_places = places.clone();
+        // The grid ends at its last column: a header and rows no wider than the columns, so no
+        // fill or rule runs on past it when they are narrower than the document.
+        let content_width = column_widths
+            .iter()
+            .fold(Pixels::ZERO, |sum, width| sum + *width);
+        let last = self.columns.len().saturating_sub(1);
+        // A rule on every header's right but the last column's: the grid's edge is its own.
+        let ruled = move |header: Div, index: usize, cx: &App| {
+            if index < last {
+                studio_ui::ds::cell_rule(header, cx)
+            } else {
+                header
+            }
+        };
         let headers: Vec<AnyElement> = places
             .iter()
             .map(|place| {
@@ -6275,8 +6299,11 @@ impl TypeTable {
                 let resize = self.render_resize_handle(index, column, cx);
                 let group = SharedString::from(format!("column-header-{index}"));
                 let kind = Some(self.column_icon(column));
-                let header = studio_ui::ds::cell_rule(
-                    studio_ui::ds::header_cell(kind, column.title.clone(), sorted.is_some()),
+                // The key's header starts at the page's gutter, as its cells do.
+                let header = ruled(
+                    studio_ui::ds::header_cell(kind, column.title.clone(), sorted.is_some())
+                        .when(index == 0, |header| header.pl(px(KEY_INSET))),
+                    index,
                     cx,
                 )
                 .id(("column-header", index))
@@ -6396,7 +6423,7 @@ impl TypeTable {
                 GridPlace::Gap(width) => width,
             })
             .collect();
-        let header = self.render_header_row(headers, &widths, cx);
+        let header = self.render_header_row(headers, &widths, content_width, cx);
         let table = Table::new(places.len())
             .interactable(&self.table_state)
             .width_config(ColumnWidthConfig::explicit(widths))
@@ -6406,6 +6433,7 @@ impl TypeTable {
             .map_row(move |(ix, row), _window, cx| {
                 let look = looks.borrow().get(&ix).copied().unwrap_or_default();
                 studio_ui::ds::dotted(row.border_b_1(), cx)
+                    .max_w(content_width)
                     .group(ROW_GROUP)
                     .when(look.header, |row| row.bg(header_bg))
                     .when(look.picked, |row| row.bg(picked_bg))
@@ -6505,13 +6533,15 @@ impl TypeTable {
     }
 
     /// The grid's header row, drawn here rather than by Zed's table, which pads its header row
-    /// and cells beyond [`size::HEADER`]: the header's fill under a hairline, its top corners the
-    /// card's, the pinned key column's header, then the others in a strip that scrolls sideways
-    /// with the rows (the table's horizontal scroll handle), each place as wide as its cells.
+    /// and cells beyond [`size::HEADER`]: the header's fill under a hairline, the pinned key
+    /// column's header, then the others in a strip that scrolls sideways with the rows (the
+    /// table's horizontal scroll handle), each place as wide as its cells. It is no wider than
+    /// the columns (`content_width`), as the rows are, so it ends where they do.
     fn render_header_row(
         &self,
         headers: Vec<AnyElement>,
         widths: &[Pixels],
+        content_width: Pixels,
         cx: &App,
     ) -> AnyElement {
         let handle = self.table_state.read(cx).horizontal_scroll_handle.clone();
@@ -6525,12 +6555,11 @@ impl TypeTable {
         });
         let pinned: Vec<Div> = places.by_ref().take(1).collect();
         let scrolled: Vec<Div> = places.collect();
-        let corner = studio_ui::ds::radius::flush(studio_ui::ds::radii(cx).md);
         h_flex()
             .w_full()
+            .max_w(content_width)
             .h(px(studio_ui::HEADER_HEIGHT))
             .flex_none()
-            .rounded_t(px(corner))
             .bg(studio_ui::ds::header_fill(cx))
             .border_b_1()
             .border_color(studio_ui::ds::surface::rule(cx))
@@ -6617,7 +6646,8 @@ impl TypeTable {
             .id(("section-header", index))
             .h(px(ROW_HEIGHT))
             .w_full()
-            .px(px(space::LG))
+            .pl(px(KEY_INSET))
+            .pr(px(space::LG))
             .gap(px(space::SM))
             .items_center()
             .overflow_hidden()
@@ -6717,7 +6747,8 @@ impl TypeTable {
             h_flex()
                 .h(px(ROW_HEIGHT))
                 .w_full()
-                .px(px(space::LG))
+                .pl(px(KEY_INSET))
+                .pr(px(space::LG))
                 .items_center()
                 .child(content)
                 .into_any_element(),
@@ -6729,7 +6760,8 @@ impl TypeTable {
             h_flex()
                 .h(px(ROW_HEIGHT))
                 .w_full()
-                .px(px(space::LG))
+                .pl(px(KEY_INSET))
+                .pr(px(space::LG))
                 .items_center()
                 .child(
                     studio_ui::ds::text::meta(format!(
@@ -7469,12 +7501,15 @@ impl TypeTable {
             .h(px(ROW_HEIGHT))
             .w_full()
             .px(px(space::LG))
+            .when(col == 0, |d| d.pl(px(KEY_INSET)))
             .flex()
             .items_center()
             .gap(px(space::XS))
             .overflow_hidden()
-            .border_r_1()
-            .border_color(divider)
+            // A rule on every cell's right but the last column's: the grid's edge is its own.
+            .when(col + 1 < self.columns.len(), |d| {
+                d.border_r_1().border_color(divider)
+            })
             .when(column.align_right, |d| d.justify_end());
         // The cursor and the editor are drawn as a ring over the cell, so no cell changes size.
         let ring = || {

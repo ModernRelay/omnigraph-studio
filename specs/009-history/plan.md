@@ -49,7 +49,11 @@ from Zed with notices).
   "View commit", a parent link) asks for its changes beside its own read, not after it, and
   the server's `parentless_commit` refusal shows it as the first (since 2026-10-21; before, it
   waited for its own read, a round trip more on every commit tab). A commit tab's "Load more
-  changes", and "Try again" after a read of them failed, is ⌘⌥N (`LoadMoreChanges`).
+  changes", and "Try again" after a read of them failed, is ⌘⌥N (`LoadMoreChanges`). Another
+  refused comparison says what stopped it by the refusal's typed reason
+  (`ErrorOutput.change_diff_refusal`), then the server's reason as it came: a schema change
+  between the commit and its parent names the type at it, and no other reason claims a schema
+  change (since 2026-10-21; before, every 409 was said to be a schema change).
 - Search by id prefix or actor with an i/N counter; ↵ and ⇧↵ step through the matches, and
   typing in the field never moves the selection.
 - Any commit can open a type table or query editor pinned to it (read-only chip): the commit
@@ -123,6 +127,7 @@ away are dropped.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | A refused comparison is read from a typed field | `graph_client` `a_refused_commit_comparison_names_its_reason`, extended (the whole refusal with its type, and a reason a later build sends); `history` `a_refused_comparison_says_why`; the contract test tables (`ErrorOutput` now lists `change_diff_refusal`, checked against `openapi/omnigraph-0.14.0-edge.json`) | `ErrorOutput` carries `change_diff_refusal` as `ChangeDiffRefusalOutput`, and `ApiErrorSummary` keeps it whole, boxed so a read's error stays under clippy's `result_large_err` bound; before, it was parsed out of `ErrorOutput::other`. A schema boundary on `Person` says it is "across a change to Person's schema", then the server's reason; another 409 gives the server's reason and claims no schema change |
 | 2026-10-11 | `git_graph.rs` exists at the pin | `git ls-tree -r v1.23.2 crates/git_ui/src` | Present |
 | 2026-10-12 | Lanes connect and never collide | `history::lanes` property test over 2,000 seeded random commit graphs (up to 60 commits, merges, missing parents): every edge is one line, rows join edge to edge, no two lines share a lane, width bounded | Passes; a mutation that leaves ending lanes busy fails at seed 0 |
 | 2026-10-12 | Merges draw against a live server | offscreen snapshot of main after merging `feature-y` and fast-forwarding `feature-z` | Both merged lanes join main; heads shown as branch chips |
