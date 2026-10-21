@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::schema::ast::{Constraint, SchemaDecl, SchemaFile};
+use omnigraph_compiler::schema::ast::{Annotation, Constraint, SchemaDecl, SchemaFile};
 use omnigraph_compiler::schema::parser::parse_persisted_schema_contract;
 use omnigraph_compiler::types::{PropType, ScalarType};
 use omnigraph_compiler::{
@@ -85,6 +85,8 @@ pub struct NodeType {
     /// The property the person chose to name this type's nodes by, for this graph (spec 002,
     /// "Node names"); [`NodeType::label_property`] takes it when it can name a node.
     pub label: Option<String>,
+    /// What the schema says the type is ([`about`]).
+    pub about: Option<String>,
 }
 
 impl NodeType {
@@ -133,6 +135,8 @@ pub struct EdgeType {
     /// (`builder::required_dependents`).
     pub min: u32,
     pub properties: Vec<Property>,
+    /// What the schema says the relationship is ([`about`]).
+    pub about: Option<String>,
 }
 
 impl EdgeType {
@@ -230,6 +234,7 @@ impl SchemaModel {
                     properties,
                     key,
                     label: None,
+                    about: declared(&file, &node.name).and_then(about),
                 }
             })
             .collect();
@@ -248,6 +253,7 @@ impl SchemaModel {
                     at_most_one: edge.cardinality.max == Some(1),
                     min: edge.cardinality.min,
                     properties,
+                    about: declared(&file, &edge.name).and_then(about),
                 }
             })
             .collect();
@@ -340,6 +346,27 @@ fn groups_of(edges: &[EdgeType], node_type: &str) -> Vec<RelationshipGroup> {
 /// The compiled shape lists properties by name; tables and forms show them as the `.pg` file
 /// declares them. Properties a type inherits from an interface follow its own, in the
 /// interface's order.
+/// The annotations a node or edge type is declared with.
+fn declared<'a>(file: &'a SchemaFile, type_name: &str) -> Option<&'a [Annotation]> {
+    file.declarations.iter().find_map(|decl| match decl {
+        SchemaDecl::Node(node) if node.name == type_name => Some(node.annotations.as_slice()),
+        SchemaDecl::Edge(edge) if edge.name == type_name => Some(edge.annotations.as_slice()),
+        _ => None,
+    })
+}
+
+/// What a type is, in the schema's words: its `@description`, else its `@instruction` (the
+/// guidance for whoever writes it, which says what it is where no description does).
+fn about(annotations: &[Annotation]) -> Option<String> {
+    ["description", "instruction"].iter().find_map(|name| {
+        annotations
+            .iter()
+            .find(|annotation| annotation.name == *name)
+            .and_then(|annotation| annotation.value.clone())
+            .filter(|value| !value.trim().is_empty())
+    })
+}
+
 fn in_declared_order(file: &SchemaFile, type_name: &str, properties: &mut [Property]) {
     let mut declared: Vec<&str> = Vec::new();
     let mut interfaces: Vec<&str> = Vec::new();
@@ -497,6 +524,29 @@ pub(crate) mod tests {
             assert!(member.is_key && !member.editable_in_cell(), "{name}");
         }
         assert!(pair.property("note").unwrap().editable_in_cell());
+    }
+
+    /// A type's description is what it is; without one, its instruction says it; neither, and
+    /// the schema says nothing.
+    #[test]
+    fn a_type_says_what_it_is() {
+        let schema = SchemaModel::parse(
+            r#"
+node Task @description("A unit of work") @instruction("Query by slug") { slug: String @key }
+node Note @instruction("A remark kept for later") { slug: String @key }
+node Tag { slug: String @key }
+edge Blocks: Task -> Task @instruction("Only for hard blockers")
+"#,
+        )
+        .unwrap();
+        let about = |name: &str| schema.node(name).unwrap().about.clone();
+        assert_eq!(about("Task").as_deref(), Some("A unit of work"));
+        assert_eq!(about("Note").as_deref(), Some("A remark kept for later"));
+        assert_eq!(about("Tag"), None);
+        assert_eq!(
+            schema.edges[0].about.as_deref(),
+            Some("Only for hard blockers")
+        );
     }
 
     #[test]

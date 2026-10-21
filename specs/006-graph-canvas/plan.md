@@ -28,9 +28,10 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 
 ## Design
 
-- **Landing:** the ontology (types as nodes, edge types as lines), laid out from the schema
-  alone, with counts from `/snapshot` added after layout. Hovering a type highlights its edges
-  and, on an ontology too large to label every line, names them over the chips.
+- **Ontology page:** the schema's types grouped into domains, the types related to most of the
+  others set apart, and any type in focus with its relationships either side; a small schema
+  drawn whole as one map. Grouped and laid out from the schema alone, with counts from
+  `/snapshot` shown beside the types, so a count never moves anything.
 - **Exploring:** expanding a node adds one hub per relationship group with its count; opening a
   hub adds 8 neighbours, then "+K more". State lives in `Exploration`, shared with the tree.
 - **Rendering:** one custom element. Nodes as quads with labels shown above a zoom threshold;
@@ -50,13 +51,43 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 | Custom GPUI canvas | WebView with a JS renderer | WebView embedding needs a GPUI fork; not on Zed's lineage |
 | Grow by relationship group | Show the whole neighbourhood | Counts first keep large hubs from flooding the view |
 
-## Ontology, explorer and placed nodes
+## Ontology page, canvas and placed nodes
 
-- The canvas has two faces, named for what they show: the **Ontology** (the schema's types
-  and relationships, `studio_graph::OpenOntology`, ⌘⇧O) and the **Canvas** (the nodes walked
-  from a root, `studio_graph::OpenCanvas`, ⌘⇧E; "Explorer" until 2026-10-19). Both are rows at
-  the top of the sidebar's Graph panel, above Types, and items of the Graph menu; the tab and
-  the mode switch are titled by the face shown.
+- Two pages, each a tab of its own (since 2026-10-20; before, two faces of one tab with a
+  switch): the **Ontology** (the schema's types and relationships,
+  `studio_graph::OpenOntology`, ⌘⇧O, `ontology.rs`) and the **Canvas** (the nodes walked from
+  a root, `studio_graph::OpenCanvas`, ⌘⇧E; "Explorer" until 2026-10-19). Both are rows at the
+  top of the sidebar's Graph panel, above Types, and items of the Graph menu.
+- **The ontology page** (2026-10-20) is built from Studio's own parts, not painted chips, and
+  draws no web of every relationship: a schema of a hundred types has hundreds, and no layout
+  made that readable (Corrections, "Ontology layout (2026-10-20)").
+  - **Domains.** The types related to more than 30% of the others ("Linked to most types",
+    pills at the top) belong to every group and so to none. The rest are grouped by
+    modularity (Louvain: each type joins the group it has most relationships with beyond
+    chance, then the groups are grouped once more), a type left alone joins the group it is
+    most related to, and the types related only to shared ones, or to none, go last as "Other
+    types" (`domains.rs`). Each domain is a card titled by its most related type ("Account and
+    17 more"), listing its types with their counts, its footer naming the domains it has most
+    relationships with. Cards stand in as many columns as the page holds, each card in the
+    column with least in it. Pointing at a type lights the types it is related to, in every
+    card. Deterministic: a function of the schema alone. Twelve types or fewer are one group.
+  - **A type in focus** (a click on any type): its card in the middle, with its count, its
+    domain, how many relationships reach it and leave it, what the schema says it is (its
+    `@description`, else its `@instruction`; `NodeType::about`), its properties, and Open
+    table, Browse rows and Schema. The relationships that reach it stand on the left, those it
+    reaches on the right (one to itself once, on the right), each a row of the type at the
+    other end and the relationship's name, cut before the type's; past eight a side is
+    grouped by domain, the shared types first. Each row's dashed line runs to an upright
+    between the side and the card, each end in a ring, as the canvas draws its lines; the
+    row pointed at draws its line stronger and shows the relationship's own description. A
+    click on a row brings that type into focus; ← and Esc go back through the types shown,
+    Domains to the domains. The tab reads "Ontology · Type" and comes back with its type in
+    focus (`{"focus": "Type"}`).
+  - **A small schema** (12 types or fewer, 24 relationships or fewer) is drawn whole as a map:
+    each type a card in columns (`layered.rs`), each relationship a dashed right-angle line
+    between their sides, named on its own upright, a type's relationships to itself as
+    brackets over its card; pointing at a type draws its lines stronger, a click brings it
+    into focus.
 - **Opened chips** (2026-10-19). A node's chip shows 32 characters of its name, then "…"
   (`CHIP_LABEL_CHARS`); layout always measures that, so opening a chip never moves another.
   Pointing at a cut chip for a moment opens it: its whole name, wrapped at 320 px at zoom 1
@@ -67,27 +98,25 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   it is drawn. A node chip's menu offers "Show as ▸"
   with its type's single text properties and "Automatic": the graph's node name for the type
   (spec 002, "Node names"), so the whole graph, not only the canvas, takes it.
-- Chips and relationship labels take the radius scale's `sm` corner, fill, border, shadow and
-  ring alike (the fill was drawn round until 2026-10-19 while its shadow took `sm`). Since
-  2026-10-20 their shadow is interfaces.dev's `shadow-custom` (spec 002, "Shadows and
-  borders"), painted as a browser paints a CSS `box-shadow`: the ring outside the chip and
-  each layer's corner grown or shrunk with its spread (`elevation::paint_layers`). A chip has
-  no border but where you are (the here ring); pointing at one steps its shadow to `-hover`;
-  a label shows the ring alone while every line is named, and the drops too when it floats
-  over the pointed type's lines. The canvas's ground is `surface::canvas`, interfaces.dev's
+- Chips take the radius scale's `sm` corner, fill, border, shadow and ring alike (the fill
+  was drawn round until 2026-10-19 while its shadow took `sm`). Since 2026-10-20 their shadow
+  is interfaces.dev's `shadow-custom` (spec 002, "Shadows and borders"), painted as a browser
+  paints a CSS `box-shadow`: the ring outside the chip and each layer's corner grown or shrunk
+  with its spread (`elevation::paint_layers`). A chip has no border but where you are (the here
+  ring); pointing at one steps its shadow to `-hover`. The canvas's ground is `surface::canvas`, interfaces.dev's
   `#fcfcfc` in a light theme, so its white chips read as they do there.
-- Dragging a type, a node or a relationship pill places it: it stays where it was dropped
-  through every later layout, and the canvas tab saves the placed chips with the graph's tabs
-  (`{"pinned": {key: [x, y]}}`, keys `type:Name`, `node:Type/id` and
-  `hub:Type/id/out:Edge`). A dragged node carries its pills that were not placed by hand, and
+- Dragging a node or a relationship pill places it: it stays where it was dropped through
+  every later layout, and the canvas tab saves the placed chips with the graph's tabs
+  (`{"pinned": {key: [x, y]}}`, keys `node:Type/id` and `hub:Type/id/out:Edge`). A dragged node carries its pills that were not placed by hand, and
   their "+K more", so they keep their places beside it; "+K more" is never placed alone.
   Reset layout (↺, R) forgets them all. A drag that starts on empty space pans.
-- **Drawing cost.** Dotted lines are cut into 2-on 3-off dashes by walking each line once, in
-  paths of at most 6,000 dashes, each dash placed at a whole number of periods along the line
-  (in f64, stepped by an integer, so every walk ends; a straight piece of more than 100,000
-  dashes is drawn solid); GPUI's own `dash_array` measured the batch's whole path every
-  frame and overflowed a path's 65k-vertex cap, which dropped the batch. A path that still
-  overflows is painted in halves. Labels scale in half-pixel text steps while zooming, since
+- **Drawing cost.** Every line is right-angle pieces, and each frame merges the pieces of one
+  tone that run along the same stretch (a trunk carries many lines) into one span, takes out
+  what a stronger tone already drew there, clips it to the view, and cuts it into dashes, each
+  a 1 px quad on the pixel grid: no paths, so no vertex cap. A dash sits at a whole number of
+  periods from the world's origin on screen (in f64, stepped by an integer, so every walk
+  ends; a span of more than 100,000 dashes is drawn solid), so lines sharing a stretch share
+  their dashes and the dashes travel with the lines as the view pans. Labels scale in half-pixel text steps while zooming, since
   GPUI keeps a shaped line for one frame only and a smooth zoom reshaped every label every
   frame. Chip widths come from character widths kept per canvas (GPUI's app-level
   `layout_width` shapes each character anew). Reads that finish together (a node's counts)
@@ -112,7 +141,7 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   unmarks them.
 - **Right-click menus.** A node: Open, Expand or Collapse, Explore from here, Open in table,
   Copy key. A relationship pill: Open or Close, Group by ▸ (the tree's grouping, spec 005),
-  Open related table. "+K more": Show more. A type on the ontology: Browse rows, Open table.
+  Open related table. "+K more": Show more.
   A chip placed by hand adds "Let the layout place it". A right click on a marked chip, with
   several marked, acts on all of them: Expand all, Collapse all, Keep where they are, Let the
   layout place them, Clear selection. On empty space: Fit to window, Select all, Reset layout.
@@ -127,6 +156,8 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-20 | A large ontology reads as domains and one type at a time; a small one as a named map | `graph_canvas` `domains::tests` (cliques around a hub group apart and the hub is shared, every type has one place, a small schema is one group), `ontology::tests` (each relationship once on its side of a type in focus; past twelve types no map), `layered::tests`; `gq_language` `a_type_says_what_it_is`; workspace clippy `-D warnings`; offscreen snapshots on a scratch server holding a 101-type, 555-relationship schema with the structure of a personal graph and made-up names, and on `script/dev-server` | Four shared types and nine domains of 4 to 18 types in four columns; pointing at a type lit the 16 types it is related to; a shared type in focus listed 77 relationships reaching it and 12 it reaches, grouped by domain, long names cut before the type's; the dev graph drawn as three cards with Owns, Contributes, WorksAt and the Knows loop named |
+| 2026-10-20 | The canvas's lines are dashed as interfaces.dev's borders, at right angles, drawn once where they share a stretch | `paint` tests (`lines_turn_at_right_angles`, `lines_along_one_stretch_share_their_dashes`, `overlapping_lines_are_drawn_once_in_their_strongest_tone`); a 1 px dashed border in a local page captured at 2x in the browser pane; offscreen snapshot of Donald Dijkstra's walk | Chrome: 6 device pixels on, 4 off; Studio: 3 px on, 2 off, crisp on the pixel grid; Donald's four relationship pills hang from one upright each side, rings at every end, the top left reading "From Donald Dijkstra · 1 node" |
 | 2026-10-20 | Chips carry interfaces.dev's shadow | Offscreen 2x ontology snapshots on `script/dev-server` (light, pointed, dark) against the site's `x-height` chip at 2x | Out from the top edge, the site reads 240, 238, 239, 246 and Studio 242, 236, 236, 245; from the bottom 234, 231, 235, 245 and 236, 226, 228, 240 (a chip sits at a fractional position, so its ring spreads over three pixels); pointed, the bottom reads 230, 217, 219; dark, the 8 % white ring alone. Before, a chip showed no ring and a broad, soft shadow |
 | 2026-10-11 | Layout and edge costs at 1k/10k/50k | research benchmark on this Mac | 2.2/34/254 ms per layout step; 0.14/1.3/8 ms edges per frame |
 | superseded | Pan and zoom p95 < 16 ms at 10k nodes, 30k edges | spike S2 | Answered by the rows below: met at the default cap of 2,000, not at 10,000. First pass 2026-10-13, debug build, not yet the claim: branch `perf-10k` of the dev graph (`dev-seed.py --people 10000`, loaded in chunks of at most 8,000 per type, the server's limit), the `knows` query's 20,534 rows drawn as 9,767 nodes, `canvas_max_nodes` 10,000, the snapshot tool's new `measure:120,drag=8:0` and `measure:120,scroll=40`. Pan p95 24.8 ms, zoom p95 25.0 ms, a notify alone p95 1.6 ms. The canvas stayed blank from about 4,000 nodes: a result's roots sit on one ring sized by their count, which at thousands of roots is wider than the view can zoom out to, so the frame time measures per-frame work over every edge with few chips on screen. Needs a release build and a result layout for many components |
@@ -134,7 +165,7 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 | 2026-10-13 | A result with many roots is drawn, not an empty ring's middle | `layout` test `many_result_roots_stand_in_a_landscape_grid_a_view_can_hold`; offscreen snapshots of the `knows` result on `perf-10k` at the default cap (2,000 of 2,409 nodes) and at 9,767 nodes | Before: blank from about 4,000 nodes (and at the default cap for results of many small groups). After: roots past 12 stand in a 16:9 grid and their columns grow beside them; 2,000 nodes drawn with "Too many nodes to draw · 409 not shown". Debug-build frames at 2,000: notify p95 17.9 ms, pan p95 53 ms, zoom p95 67 ms. At 9,767 visible nodes, pan and zoom took 0.7 to 0.9 s a frame and the screenshot failed to render: the cap is what keeps the canvas usable |
 | 2026-10-13 | A result's layout grows about linearly | `layout` instrument `explore_layout_time` (debug build, results shaped as the canvas builds them); `free_room_is_found_as_testing_every_block_finds_it` (2,000 random cases against the first implementation) | Before: 0.40 s at 4,000 nodes, 2.44 s at 10,000: each column listed every chip again and tested every candidate start against every chip. After: 39 ms and 198 ms, chips kept as they are placed and room found from merged gaps |
 | 2026-10-12 | Schema landing: types on a circle by sorted name, sized by `/snapshot` counts, one arrowed line per edge type, self-loops | offscreen snapshot, `OpenCanvas`, dev graph | Company 25, Person 200, Project 40; Knows drawn as a loop on Person (superseded by the stress layout below) |
-| 2026-10-12 | The ontology reads as a map | `layout` tests (determinism, no overlaps, related types nearer than unrelated by 1.5×, hubs central, landscape, fewer crossings and shorter edges than a ring, unrelated types beside, placed types fixed); a CRM ontology (25 types, 78 relationships) measured locally; the app on that graph | Ring 668 crossings / 78.7k px edges; map 117 / 26.5k; fit shows every type named |
+| 2026-10-12 (superseded 2026-10-20) | The ontology reads as a map | `layout` tests (determinism, no overlaps, related types nearer than unrelated by 1.5×, hubs central, landscape, fewer crossings and shorter edges than a ring, unrelated types beside, placed types fixed); a CRM ontology (25 types, 78 relationships) measured locally; the app on that graph | Ring 668 crossings / 78.7k px edges; map 117 / 26.5k; fit shows every type named |
 | 2026-10-12 | The explorer is a compact mind map | `layout` tests (hubs split across the root's sides, neighbours in one column beyond their hub within a chip and a gap, rectangle overlap, drawn columns grow at the bottom with "+K more" last); offscreen snapshots of Goldwasser Labs → WorksAt → Ivan Hopper expanded | One aligned column of nine people and "+1 more"; Ivan's four hubs in a column beside him; nothing drawn moved |
 | 2026-10-13 | A column opened later finds room | `layout` `exploration_chips_do_not_overlap` (a root's four hubs drawn, four neighbours under one, then one under the next hub on the same side; it overlapped before the fix); offscreen snapshots of Radia Knuth opening → Knows 4, ← Knows 1, → Contributes 1 and → WorksAt 1 in turn | Jean Shannon under Leslie Dahl, the nearest free row to "← Knows"; Ole Lamarr visible; nothing drawn moved |
 | 2026-10-12 | Exploring shares the tree's `Exploration`: hubs per group with counts, 8 neighbours then "+K more", each node drawn once, selection mirrored | snapshot Company `company-00000` with 103 incoming `WorksAt` | "← WorksAt · 103", eight people, "+95 more"; the tree's selected row is the ringed node |
@@ -166,7 +197,7 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   often (3 of the first 20 random three-point lines in an f32 emulation). Dashes are now
   placed at whole periods along the line in f64; the same expansion peaks at 220 MB.
 
-- **Ontology layout (2026-10-12).** Types on a circle by name gave position no meaning: on a
+- **Ontology layout (2026-10-12; superseded 2026-10-20, below).** Types on a circle by name gave position no meaning: on a
   25-type, 78-relationship CRM ontology it drew 668 crossings. The ontology is now laid out by
   stress majorization (Gansner, Koren and North 2004; Graphviz neato's model): every pair of
   types as far apart as their graph distance, so related types sit together and hubs in the
@@ -179,6 +210,32 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   (`paint::chip_text`), with room for a six-digit count, so a count never moves a type.
   Several relationships between the same two types fan out as bowed lines with their own
   labels; several loops on one type nest.
+- **Ontology layout (2026-10-20).** On a 101-type ontology with 555 relationships (445
+  related pairs, four types related to a third or more of the rest) the stress map was a
+  tangle of diagonal lines, and fitted to the window every type was a letter mark (Ragnor:
+  "too messy", "the zoomed out view is useless with these random letters and lines
+  everywhere"). A first answer kept the map and laid it out in columns with right-angle,
+  dashed lines (a layered layout after Sugiyama, Tagawa and Toda 1981: columns by least total
+  distance with related types never sharing one, waypoints shared per hub so its lines ran as
+  one trunk, barycentre ordering, a least-squares placement by pooling adjacent violators, and
+  the fewest uprights per channel, a smallest vertex cover), with faint lines drawn in full
+  under the pointer. It was orderly, and still a web: Ragnor found it ugly and still messy,
+  and the fit still showed letters. The ontology became a page of domains and of one type at
+  a time (above), and Ragnor asked for it to be a page apart from the canvas, which it shares
+  little with. The layered layout draws a small schema's map, every line on its own track;
+  its trunk mode, which only a large map used, was removed. Grouping the 101-type schema
+  (structure taken, names replaced) gave the four shared types and nine domains of 4 to 18
+  types that name recognisable parts of it (money, work, learning and events, health,
+  automation, commerce, investments, equity); grouping three levels deep merged them into
+  groups of 23 and 32, so it stops at two.
+- **Canvas lines (2026-10-20).** The explorer's and a query result's lines are dashed 3 on 2
+  off, as Chrome draws a 1 px dashed border (measured at 2x: 6 device pixels on, 4 off), and
+  turn at right angles: out of a node's side, turning 18 px beyond it (within the narrower of
+  the gaps the layout leaves), into the neighbour's side, so a column of neighbours hangs from
+  one upright. Each end is a small ring filled with the ground, as interfaces.dev ends its
+  connectors; a closed hub hangs on a dotted line (1 on 2 off). A dash sits at a whole number
+  of periods from the world's origin on screen, so lines sharing a stretch share their dashes,
+  drawn once in the strongest tone among them.
 - **Explorer layout (2026-10-12).** Radial rings put neighbours ~450 px from their node: chips
   are wide and short, and a ring spaces them by width. The explorer is now a mind map: a node's
   hubs stand in a column beside it (a root's split across both sides), a hub's neighbours in a
@@ -198,13 +255,13 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   new places (220 ms, ease-out); Fit, F, zoom buttons and centring glide the camera (ease
   in-out, zoom on a log scale). Wheel, pinch and drags are immediate and stop a glide where it
   is. Off when the system asks for reduced motion (and in offscreen snapshots).
-- **From the ontology to the explorer (2026-10-12).** The Explorer face is always available;
-  before a node is chosen it says how to start: Search nodes (⌘P, which roots the exploration
-  at the node picked) or G on a row in any table (`studio_table::ExploreRow`, also in the Nodes
-  panel a type click opens from the ontology, and in its footer hints). The inspector's node
-  header has an Explore button. The face shown is saved with the tab (`"ontology": bool`); a
-  new canvas shows the ontology. The face switch is `ds::segmented`, and the search and zoom
-  panels share its height and radius.
+- **Starting a walk (2026-10-12).** The canvas, before a node is chosen, says how to start:
+  Search nodes (⌘P, which roots the exploration at the node picked) or G on a row in any table
+  (`studio_table::ExploreRow`, also in the Nodes panel, and in its footer hints). The
+  inspector's node header has an Explore button. Until 2026-10-20 the canvas was also the
+  ontology, a face chosen with a segmented switch and saved with the tab (`"ontology": bool`,
+  now ignored); its top left now says what is drawn (the walk's root and its nodes, or the
+  query), beside the search and zoom pills.
 - **Relationships first.** A relationship with at most one target is a hub on the canvas like
   any other ("→ WorksAt · 1"), so expanding a node shows its relationships before the nodes
   they reach; the tree still shows it inline, as a field.
@@ -214,22 +271,18 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   R-tree.
 - **Hub labels** sit between the hub and its node, on a backdrop, so they never cover the fan
   of neighbours.
-- **Mode.** "Schema" and "Exploration" toggle in the canvas; the schema view never clears the
-  shared exploration.
-- **Look (2026-10-12):** every type, node, hub and "+K more" is a chip, a white pill with a
+- **Look (2026-10-12):** every node, hub and "+K more" is a chip, a white pill with a
   hairline and a soft contact shadow (since 2026-10-20 interfaces.dev's ring and two drops),
-  with a letter mark (the label's initial in white on one of
-  eight muted tints, chosen by a hash of the type's name) and a muted
-  count; lines are 1-pixel greys (schema 15%, a pointed type's 40% and the rest 5%; hub lines
-  20% and dotted while the hub is closed); in the ontology, pointing at a chip fades what it
-  does not reach to 30% (the explorer stopped fading under the pointer on 2026-10-19, at
-  Ragnor's request, for now: its pointed chip's lines still stand out); the selection carries a warm ring; a faint dot grid lies behind; a schema with up
-  to 16 relationships labels every line. Chips grow with the view to their size at zoom 1 and
-  become marks alone from afar. Overlay: the mode switch, a "Search nodes…" pill (⌘P) and the
-  zoom controls on top, the caption bottom left. Colour is kept to node types: relationships
-  show a neutral arrow wherever a type is listed. A click on a type chip browses its rows in
-  the Nodes panel of the bottom dock (`studio_graph::BrowseType`), under the canvas;
-  a double click opens its table as a tab.
+  with a letter mark (the label's initial in white on one of eight muted tints, chosen by a
+  hash of the type's name) and a muted count; lines are 1-pixel greys (since 2026-10-20
+  dashed, at right angles, each end in a ring: Corrections, "Canvas lines"), 16%, a hub's line
+  to its node 22%, its lines to its neighbours 13%, the pointed chip's 45% and the selected
+  chip's 28%, dotted while the hub is closed (the canvas stopped fading under the pointer on
+  2026-10-19, at Ragnor's request, for now); the selection carries a warm ring; a faint dot
+  grid lies behind. Chips grow with the view to their size at zoom 1 and become marks alone
+  from afar. Overlay: what is drawn, a "Search nodes…" pill (⌘P) and the zoom controls on
+  top, what a click does bottom left. Colour is kept to node types: relationships show a
+  neutral arrow wherever a type is listed.
 - **Keys:** ←↑→↓ (`canvas::MoveLeft` …, nearest node in a 45° cone, `along + 2 × across`),
   `0`, `=`/`+`, `-`, ↵ expand, ⌫ collapse, Space peek, F focus on the selected node's
   neighbourhood, `[`/`]` step back and forward along the nodes walked. Bound in the `Canvas`

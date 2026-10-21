@@ -1,15 +1,16 @@
-//! How the canvas looks (spec 006): a faint dot grid; hairline grey lines; every node,
-//! type, hub and "+K more" a chip, a white pill with interfaces.dev's shadow (a 1 px ring and
-//! two soft drops, on its `#fcfcfc` ground), with
-//! the type's letter mark and a muted count. Pointing at a chip lights its lines and fades the
-//! rest; the selected chip carries a warm ring. Colour is kept to the small type marks.
+//! How the canvas looks (spec 006): a faint dot grid; dashed grey lines that turn at right
+//! angles, each end in a small ring, as interfaces.dev draws its connectors; every node, type,
+//! hub and "+K more" a chip, a white pill with interfaces.dev's shadow (a 1 px ring and two soft
+//! drops, on its `#fcfcfc` ground), with the type's letter mark and a muted count. Pointing at a
+//! chip lights its lines and fades the rest; the selected chip carries a warm ring. Colour is
+//! kept to the small type marks.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use gpui::{
-    App, BorderStyle, Bounds, BoxShadow, Corners, Font, FontWeight, Hsla, PathBuilder, Pixels,
-    Point, ShapedLine, SharedString, TextAlign, TextRun, Window, point, px, quad, size,
+    App, BorderStyle, Bounds, BoxShadow, Corners, Font, FontWeight, Hsla, Pixels, Point,
+    ShapedLine, SharedString, TextAlign, TextRun, Window, point, px, quad, size,
 };
 use studio_ui::ds::elevation::Layer;
 use studio_ui::type_color;
@@ -33,8 +34,9 @@ pub(crate) struct Palette {
     pub here_halo: Hsla,
     /// The dot grid's dots.
     pub grid_dot: Hsla,
-    /// A relationship label's fill, and a closed hub's dot from afar.
-    pub label_fill: Hsla,
+    /// The canvas behind the chips: a line end's ring is filled with it.
+    pub canvas: Hsla,
+    /// A closed hub's dot from afar.
     pub hub_dot: Hsla,
     pub font: Font,
 }
@@ -48,8 +50,6 @@ const GRID_DOT: f32 = 1.2;
 /// 1 they are the design system's body (13 px) and small (11 px) sizes at its default.
 const CHIP_TEXT: f32 = 13.;
 const HUB_TEXT: f32 = 12.5;
-/// A relationship label's text size at zoom 1.
-const LABEL_TEXT: f32 = 11.;
 /// A pill's inner spacing at zoom 1: between pieces, at each end, and its mark's size.
 const PILL_GAP: f32 = studio_ui::ds::space::SM;
 const PILL_PAD_X: f32 = studio_ui::ds::space::CONTROL_INSET;
@@ -61,130 +61,41 @@ pub(crate) const CHIP_LABEL_CHARS: usize = 32;
 const OPEN_CHIP_MAX_WIDTH: f32 = 320.;
 /// Below this text size a node is drawn as its mark alone, unless it is selected or pointed at.
 const MARK_ONLY_BELOW: f32 = 8.5;
-const TYPE_MARK_ONLY_BELOW: f32 = 6.;
 /// A closed hub's dot from afar: its radius, in screen pixels.
 const HUB_DOT: f32 = 4.;
+/// A node's letter mark from afar, across, in screen pixels.
+const MARK_SIZE: f32 = 12.;
 /// The dot grid's spacing, in screen pixels.
 const DOT_STEP: f32 = 22.;
-/// Up to this many relationships, the schema labels every line.
-pub(crate) const ALWAYS_LABEL: usize = 16;
-/// Segments per path: GPUI caps one path near 65k vertices. A batch that still needs more is
-/// painted in halves (`stroke_lines`), never dropped.
-const SEGMENTS_PER_PATH: usize = 2_000;
-/// A dotted line's pattern in screen pixels: a dash, then a gap.
-const DASH: f32 = 2.;
-const GAP: f32 = 3.;
-/// Dashes per path: each is a short straight stroke of a few vertices.
-const DASHES_PER_PATH: usize = 6_000;
-/// The most dashes one straight piece of a dotted line is cut into (half a million pixels); a
-/// longer piece is drawn solid.
-const DASHES_PER_LINE: usize = 100_000;
+/// A line's pattern in screen pixels: dashed as interfaces.dev's 1 px dashed borders are (3 on,
+/// 2 off), or dotted (1 on, 2 off) where a hub is closed or a "+K more" stands for what is not
+/// drawn.
+const DASH: (f32, f32) = (3., 2.);
+const DOT: (f32, f32) = (1., 2.);
+/// The most dashes one run of a line is cut into; a longer run (only possible far beyond the
+/// view, which runs are clipped to first) is drawn solid.
+const DASHES_PER_RUN: f64 = 100_000.;
+/// A line end's ring: its diameter, its 1 px border included, in screen pixels.
+pub(crate) const RING: f32 = 6.;
+/// How far from a node an exploration's line turns, at zoom 1: within the narrower of the gaps
+/// the exploration leaves between a node and its hubs and a hub and its neighbours.
+const ELBOW: f32 = 18.;
+/// How much taller each further loop on one type is, and wider, at zoom 1.
+const LOOP_STEP: f32 = 6.;
 
-/// How a line runs between its two ends.
-#[derive(Clone, Copy)]
-enum Curve {
-    Straight,
-    /// Bowed through one control point: one of several relationships between two types.
-    Bowed(Point<Pixels>),
-    /// Leaving and arriving level: an exploration's branch, as a mind map draws it.
-    Level(Point<Pixels>, Point<Pixels>),
+/// What the lines are drawn from, besides the scene: each node's half width at zoom 1, where
+/// its lines meet its chip, and the world's origin on screen, so a line's dashes keep their
+/// place on it as the view pans.
+pub(crate) struct Lines<'a> {
+    pub half_widths: &'a [f32],
+    pub origin: Point<Pixels>,
 }
 
-/// One line on screen.
-type Segment = (Point<Pixels>, Point<Pixels>, Curve);
-
-/// How far apart, at zoom 1, the lines of several relationships between the same two types
-/// run at their middle, and how much taller each further loop on one type is.
-const FAN: f32 = 30.;
-const LOOP_STEP: f32 = 26.;
-
-/// Where one relationship runs on screen: its line (bowed when several join the same two types,
-/// so each has its own line and label; a loop when it joins a type to itself) and where its
-/// label sits.
-struct Route {
-    curve: Curve,
-    label_at: Point<Pixels>,
-    /// For a loop: which of the type's loops this is, from the inside out.
-    loop_rank: usize,
-}
-
-fn routes(scene: &Scene, screen: &[Point<Pixels>], scale: f32, schema: bool) -> Vec<Route> {
-    // Painted every frame: only the ontology bows the lines two types share, so only it counts
-    // them, and a rank is kept only where one is drawn.
-    let mut pair_count: HashMap<(usize, usize), usize> = HashMap::new();
-    if schema {
-        for edge in &scene.edges {
-            *pair_count
-                .entry((edge.from.min(edge.to), edge.from.max(edge.to)))
-                .or_default() += 1;
-        }
-    }
-    let mut seen: HashMap<(usize, usize), usize> = HashMap::new();
-    let mut rank_of = |key: (usize, usize)| {
-        let seen = seen.entry(key).or_default();
-        *seen += 1;
-        *seen - 1
-    };
-    scene
-        .edges
-        .iter()
-        .map(|edge| {
-            let key = (edge.from.min(edge.to), edge.from.max(edge.to));
-            let (a, b) = (screen[key.0], screen[key.1]);
-            if edge.from == edge.to {
-                let rank = rank_of(key);
-                let height = (60. + LOOP_STEP * rank as f32) * scale;
-                return Route {
-                    curve: Curve::Straight,
-                    label_at: point(a.x, a.y - px(height - 10. * scale)),
-                    loop_rank: rank,
-                };
-            }
-            let mid = point((a.x + b.x) / 2., (a.y + b.y) / 2.);
-            // An exploration's branch leaves its node level and arrives level, so a column of
-            // neighbours reads as one fan.
-            if !schema {
-                let (from, to) = (screen[edge.from], screen[edge.to]);
-                let half = (to.x - from.x) / 2.;
-                return Route {
-                    curve: Curve::Level(point(from.x + half, from.y), point(to.x - half, to.y)),
-                    label_at: mid,
-                    loop_rank: 0,
-                };
-            }
-            let rank = rank_of(key);
-            let count = pair_count[&key];
-            if count < 2 {
-                return Route {
-                    curve: Curve::Straight,
-                    label_at: mid,
-                    loop_rank: 0,
-                };
-            }
-            // Fan around the straight line, the same side for the same pair whichever way a
-            // relationship points.
-            let (dx, dy) = (f32::from(b.x - a.x), f32::from(b.y - a.y));
-            let length = (dx * dx + dy * dy).sqrt().max(1.);
-            let normal = (-dy / length, dx / length);
-            let offset = (rank as f32 - (count - 1) as f32 / 2.) * FAN * scale;
-            Route {
-                // A quadratic curve passes halfway to its control point at its middle.
-                curve: Curve::Bowed(point(
-                    mid.x + px(normal.0 * offset * 2.),
-                    mid.y + px(normal.1 * offset * 2.),
-                )),
-                label_at: point(mid.x + px(normal.0 * offset), mid.y + px(normal.1 * offset)),
-                loop_rank: 0,
-            }
-        })
-        .collect()
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct Tone {
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct Tone {
     /// Line opacity, in thousandths, so tones batch.
-    alpha: u16,
-    dotted: bool,
+    pub alpha: u16,
+    pub dotted: bool,
 }
 
 /// What a piece of a chip's text is, which sets its colour and weight.
@@ -222,14 +133,6 @@ pub(crate) fn chip_text(node: &SceneNode) -> ChipText {
     let label = ui::utils::replace_control_characters(&node.label);
     let initial = initial(&node.label, &node.color_key);
     match &node.kind {
-        SceneKind::Type { count } => ChipText {
-            mark: true,
-            initial,
-            pieces: std::iter::once((label.into_owned().into(), Role::RootName))
-                .chain(count.map(|count| (studio_ui::group_count(count).into(), Role::Count)))
-                .collect(),
-            size: CHIP_TEXT,
-        },
         SceneKind::Node { root, .. } => ChipText {
             mark: true,
             initial,
@@ -289,19 +192,6 @@ pub(crate) fn chip_width(text: &ChipText, measure: impl Fn(&str, f32, FontWeight
     PILL_PAD_X * 2. + widths + gaps + mark
 }
 
-/// A relationship label's width at zoom 1, as the canvas draws its pill.
-pub(crate) fn label_width(label: &str, measure: impl Fn(&str, f32, FontWeight) -> f32) -> f32 {
-    chip_width(
-        &ChipText {
-            mark: false,
-            initial: SharedString::default(),
-            pieces: vec![(label.to_owned().into(), Role::Muted)],
-            size: LABEL_TEXT,
-        },
-        measure,
-    )
-}
-
 /// One piece of a chip's text.
 struct Piece {
     text: SharedString,
@@ -315,6 +205,7 @@ pub(crate) fn paint(
     scene: &Scene,
     texts: &[ChipText],
     screen: &[Point<Pixels>],
+    lines: &Lines,
     bounds: Bounds<Pixels>,
     zoom: f32,
     selected: Option<usize>,
@@ -340,179 +231,110 @@ pub(crate) fn paint(
             && p.y >= bounds.top() - px(margin)
             && p.y <= bounds.bottom() + px(margin)
     };
-    let schema = !scene.nodes.is_empty()
-        && scene
-            .nodes
-            .iter()
-            .all(|n| matches!(n.kind, SceneKind::Type { .. }));
-    // What pointing at a chip brings out in the ontology: the chip and what its lines reach,
-    // the rest fading. The explorer fades nothing under the pointer for now; the pointed chip's
-    // own lines still stand out.
-    let near: Option<HashSet<usize>> = hovered.filter(|_| schema).map(|h| {
-        let mut near = HashSet::from([h]);
-        for edge in &scene.edges {
-            if edge.from == h {
-                near.insert(edge.to);
-            }
-            if edge.to == h {
-                near.insert(edge.from);
-            }
-        }
-        near
-    });
-
-    // Lines, batched by tone.
-    let routes = routes(scene, screen, scale, schema);
-    let far = CHIP_TEXT * scale < MARK_ONLY_BELOW;
-    let mut batches: HashMap<Tone, Vec<Segment>> = HashMap::new();
-    let mut loops: Vec<(usize, usize, Tone)> = Vec::new();
-    for (edge, route) in scene.edges.iter().zip(&routes) {
-        let (a, b) = (screen[edge.from], screen[edge.to]);
-        // Zoomed in, a line can cross the view with both ends far outside it.
-        if !crosses(a, b, bounds, 400.) {
-            continue;
-        }
-        let kinds = (&scene.nodes[edge.from].kind, &scene.nodes[edge.to].kind);
-        let hub_link = matches!(kinds.0, SceneKind::Hub { .. } | SceneKind::More { .. })
-            || matches!(kinds.1, SceneKind::Hub { .. } | SceneKind::More { .. });
-        let member = matches!(
-            kinds,
-            (SceneKind::Hub { .. }, SceneKind::Node { .. })
-                | (SceneKind::Node { .. }, SceneKind::Hub { .. })
-        ) && edge_is_member(scene, edge.from, edge.to);
-        // A closed hub hangs from its node on a dotted line, and so does "+K more".
-        let dotted = matches!(kinds.0, SceneKind::More { .. })
-            || matches!(kinds.1, SceneKind::More { .. })
-            || matches!(kinds.1, SceneKind::Hub { open: false, .. })
-            || matches!(kinds.0, SceneKind::Hub { open: false, .. });
-        let base = if schema {
-            0.15
-        } else if member {
-            0.10
-        } else if hub_link {
-            0.20
-        } else {
-            0.12
-        };
-        let touches = |i: Option<usize>| i.is_some_and(|i| edge.from == i || edge.to == i);
-        let alpha = match hovered {
-            Some(_) if touches(hovered) => {
-                if schema {
-                    0.40
-                } else {
-                    0.45
-                }
-            }
-            Some(_) if schema => 0.05,
-            _ if !schema && touches(selected) => 0.25,
-            _ => base,
-        };
-        let tone = Tone {
-            alpha: (alpha * 1000.) as u16,
-            dotted,
-        };
-        if edge.from == edge.to {
-            loops.push((edge.from, route.loop_rank, tone));
-        } else {
-            // From afar an exploration's lines are straight: at mark size the fan of curves
-            // reads the same, and a straight line costs two triangles, a curve dozens.
-            let curve = match route.curve {
-                Curve::Level(..) if far => Curve::Straight,
-                curve => curve,
-            };
-            batches.entry(tone).or_default().push((a, b, curve));
-        }
-    }
-    window.paint_layer(bounds, |window| {
-        for (tone, segments) in &batches {
-            let color = palette.text.opacity(f32::from(tone.alpha) / 1000.);
-            if tone.dotted {
-                // Dotted lines are cut into dashes here, by walking each line once. GPUI's
-                // `dash_array` measures the batch's whole path on every frame, and its dashes
-                // overflow a path's vertex cap, which would drop the batch.
-                let mut pieces = Vec::new();
-                for (from, to, curve) in segments {
-                    dashes(&flatten(*from, *to, *curve), &mut pieces);
-                }
-                for chunk in pieces.chunks(DASHES_PER_PATH) {
-                    stroke_lines(window, chunk, color);
+    let text_size = CHIP_TEXT * scale;
+    // From afar a node is its mark alone, and a closed hub a dot on its line, unless it is where
+    // you are.
+    let mark_only = |index: usize| {
+        let node = &scene.nodes[index];
+        let focus = selected == Some(index) || marked.contains(&index);
+        let root = matches!(node.kind, SceneKind::Node { root: true, .. });
+        text_size < MARK_ONLY_BELOW && !focus && hovered != Some(index) && !root
+    };
+    // How far from its centre each node's lines meet it: its chip's side, or its mark's.
+    let reach: Vec<f32> = (0..scene.nodes.len())
+        .map(|index| {
+            if mark_only(index) {
+                match scene.nodes[index].kind {
+                    SceneKind::Hub { .. } | SceneKind::More { .. } => HUB_DOT,
+                    SceneKind::Node { .. } => MARK_SIZE / 2.,
                 }
             } else {
-                for chunk in segments.chunks(SEGMENTS_PER_PATH) {
-                    stroke_lines(window, chunk, color);
+                lines.half_widths.get(index).copied().unwrap_or(0.) * scale
+            }
+        })
+        .collect();
+
+    // Each line as right-angle pieces, with its tone: out of the node it hangs from, turning
+    // near it, so a column of neighbours shares one upright.
+    let mut drawn: Vec<(usize, Vec<Point<Pixels>>, Tone)> = Vec::new();
+    let mut loop_rank: HashMap<usize, usize> = HashMap::new();
+    for (index, edge) in scene.edges.iter().enumerate() {
+        let tone = line_tone(scene, edge.from, edge.to, hovered, selected);
+        let points = if edge.from == edge.to {
+            let rank = loop_rank.entry(edge.from).or_default();
+            *rank += 1;
+            if mark_only(edge.from) {
+                continue;
+            }
+            loop_points(screen[edge.from], reach[edge.from], scale, *rank - 1)
+        } else {
+            let from_is_parent = scene.nodes[edge.from].parent != Some(edge.to);
+            let (parent, child) = if from_is_parent {
+                (edge.from, edge.to)
+            } else {
+                (edge.to, edge.from)
+            };
+            elbow(
+                (screen[parent], reach[parent]),
+                (screen[child], reach[child]),
+                ELBOW * zoom,
+            )
+        };
+        if !crosses(&points, bounds, 40.) {
+            continue;
+        }
+        drawn.push((index, points, tone));
+    }
+    window.paint_layer(bounds, |window| {
+        paint_runs(&drawn, bounds, lines.origin, palette.text, window);
+        // Each line end's ring, once where ends meet, in its strongest tone; none at a mark,
+        // nor at a loop's feet, which rings would crowd.
+        let mut rings: BTreeMap<(i64, i64), (Point<Pixels>, u16)> = BTreeMap::new();
+        for (index, points, tone) in &drawn {
+            let edge = &scene.edges[*index];
+            if edge.from == edge.to || points.len() < 2 {
+                continue;
+            }
+            // Drawn from the node a line hangs from to the other.
+            let (parent, child) = if scene.nodes[edge.from].parent != Some(edge.to) {
+                (edge.from, edge.to)
+            } else {
+                (edge.to, edge.from)
+            };
+            let last = points.len() - 1;
+            for (end, next, node) in [(0, 1, parent), (last, last - 1, child)] {
+                if mark_only(node) {
+                    continue;
                 }
+                let (at, toward) = (points[end], points[next]);
+                let along = point(
+                    f32::from(toward.x - at.x).signum(),
+                    f32::from(toward.y - at.y).signum(),
+                );
+                let centre = point(
+                    at.x + px(along.x * RING / 2.),
+                    at.y + px(along.y * RING / 2.),
+                );
+                let key = (
+                    (f32::from(centre.x) * 4.).round() as i64,
+                    (f32::from(centre.y) * 4.).round() as i64,
+                );
+                let ring = rings.entry(key).or_insert((centre, 0));
+                ring.1 = ring.1.max(tone.alpha);
             }
         }
-        // A relationship from a type to itself: a loop over its chip, each further loop on the
-        // same type a size larger.
-        for (node, rank, tone) in &loops {
-            let p = screen[*node];
-            let s = scale;
-            let grow = *rank as f32;
-            let spread = (10. + 6. * grow) * s;
-            let height = (60. + LOOP_STEP * grow) * s;
-            let mut builder = PathBuilder::stroke(px(1.));
-            builder.move_to(point(p.x - px(spread), p.y - px(12. * s)));
-            builder.cubic_bezier_to(
-                point(p.x + px(spread), p.y - px(12. * s)),
-                point(p.x - px(30. * s + spread), p.y - px(height)),
-                point(p.x + px(30. * s + spread), p.y - px(height)),
-            );
-            if let Ok(path) = builder.build() {
-                window.paint_path(path, palette.text.opacity(f32::from(tone.alpha) / 1000.));
+        for (centre, alpha) in rings.into_values() {
+            if !visible(centre, RING) {
+                continue;
             }
+            paint_ring(
+                centre,
+                palette.text.opacity(f32::from(alpha) / 1000.),
+                palette.canvas,
+                window,
+            );
         }
     });
-
-    // A small schema names every line up front, under the chips; a larger one names the lines
-    // of the type the pointer is on, over them, so no chip hides a name.
-    let label_all = schema && scene.edges.len() <= ALWAYS_LABEL;
-    let paint_labels = |window: &mut Window, cx: &mut App| {
-        for (edge, route) in scene.edges.iter().zip(&routes) {
-            let Some(label) = &edge.label else { continue };
-            let touches_hovered = hovered.is_some_and(|h| edge.from == h || edge.to == h);
-            if !label_all && !touches_hovered {
-                continue;
-            }
-            let at = route.label_at;
-            if !visible(at, 60.) {
-                continue;
-            }
-            let dim = near
-                .as_ref()
-                .is_some_and(|n| !(n.contains(&edge.from) && n.contains(&edge.to)));
-            let alpha = if dim { studio_ui::ds::opacity::FAR } else { 1. };
-            let pieces = [Piece {
-                text: label.clone().into(),
-                color: palette.muted.opacity(alpha),
-                weight: studio_ui::ds::text::weight::BODY,
-            }];
-            paint_pill(
-                at,
-                &pieces,
-                None,
-                LABEL_TEXT * scale.max(0.8),
-                // Every line named up front: the ring alone, so the names do not read as chips.
-                PillStyle {
-                    fill: palette.label_fill.opacity(alpha),
-                    border: None,
-                    shadow: if label_all {
-                        &palette.shadow[..1]
-                    } else {
-                        &palette.shadow
-                    },
-                    alpha,
-                    ring: None,
-                },
-                palette,
-                window,
-                cx,
-            );
-        }
-    };
-    if label_all {
-        paint_labels(window, cx);
-    }
 
     // Chips. From afar most are a letter mark, and a frame of thousands repeats a few letters:
     // each is shaped once here, not once a chip.
@@ -520,7 +342,6 @@ pub(crate) fn paint(
     let mut rects = chips.borrow_mut();
     rects.clear();
     rects.resize(scene.nodes.len(), Bounds::default());
-    let text_size = CHIP_TEXT * scale;
     for (index, node) in scene.nodes.iter().enumerate() {
         let p = screen[index];
         if !visible(p, 300.) {
@@ -529,33 +350,23 @@ pub(crate) fn paint(
         // A marked chip is drawn as the selected one is.
         let focus = selected == Some(index) || marked.contains(&index);
         let pointed = hovered == Some(index);
-        let dim = !marked.contains(&index) && near.as_ref().is_some_and(|n| !n.contains(&index));
-        let alpha = if dim { studio_ui::ds::opacity::FAR } else { 1. };
-        let root = matches!(node.kind, SceneKind::Node { root: true, .. });
-        // From afar a node is its mark alone, and a closed hub a dot on its line. A type keeps
-        // its name further out: an ontology has few, and their names are the point.
-        let mark_only_below = if matches!(node.kind, SceneKind::Type { .. }) {
-            TYPE_MARK_ONLY_BELOW
-        } else {
-            MARK_ONLY_BELOW
-        };
-        if text_size < mark_only_below && !focus && !pointed && !root {
+        if mark_only(index) {
             rects[index] = match node.kind {
                 SceneKind::Hub { .. } | SceneKind::More { .. } => {
-                    paint_dot(p, HUB_DOT, palette.hub_dot.opacity(alpha), window)
+                    paint_dot(p, HUB_DOT, palette.hub_dot, window)
                 }
-                _ => {
+                SceneKind::Node { .. } => {
                     let initial = &texts[index].initial;
                     let line = letters
-                        .entry((initial.clone(), alpha.to_bits()))
-                        .or_insert_with(|| shape_letter(initial, 12., alpha, palette, window))
+                        .entry((initial.clone(), 1f32.to_bits()))
+                        .or_insert_with(|| shape_letter(initial, MARK_SIZE, 1., palette, window))
                         .clone();
                     paint_letter_mark(
                         p,
                         type_color(&node.color_key),
                         &line,
-                        12.,
-                        alpha,
+                        MARK_SIZE,
+                        1.,
                         window,
                         cx,
                     )
@@ -574,8 +385,7 @@ pub(crate) fn paint(
                 color: match role {
                     Role::Name | Role::RootName | Role::OpenHub => palette.text,
                     Role::Count | Role::Muted => palette.muted,
-                }
-                .opacity(alpha),
+                },
                 weight: role.weight(),
             })
             .collect();
@@ -586,14 +396,14 @@ pub(crate) fn paint(
             mark,
             size,
             PillStyle {
-                fill: palette.card.opacity(alpha),
-                border: focus.then_some(palette.here.opacity(alpha)),
+                fill: palette.card,
+                border: focus.then_some(palette.here),
                 shadow: if pointed {
                     &palette.pointed
                 } else {
                     &palette.shadow
                 },
-                alpha,
+                alpha: 1.,
                 ring: focus.then_some(palette.here_halo),
             },
             palette,
@@ -626,120 +436,318 @@ pub(crate) fn paint(
             cx,
         );
     }
-    drop(rects);
-    if schema && !label_all {
-        paint_labels(window, cx);
-    }
 }
 
-/// Strokes lines as one path. Lines that need more vertices than a path holds are painted in
-/// halves, so a batch is never dropped.
-fn stroke_lines(window: &mut Window, lines: &[Segment], color: Hsla) {
-    let mut builder = PathBuilder::stroke(px(1.));
-    for (from, to, curve) in lines {
-        builder.move_to(*from);
-        match curve {
-            Curve::Straight => builder.line_to(*to),
-            Curve::Bowed(control) => builder.curve_to(*to, *control),
-            Curve::Level(first, second) => builder.cubic_bezier_to(*to, *first, *second),
-        }
-    }
-    match builder.build() {
-        Ok(path) => window.paint_path(path, color),
-        Err(_) if lines.len() > 1 => {
-            let (first, second) = lines.split_at(lines.len() / 2);
-            stroke_lines(window, first, color);
-            stroke_lines(window, second, color);
-        }
-        Err(_) => {}
-    }
+/// A line end's ring at `centre`: a small circle in `ink`, filled with the ground (`fill`) so
+/// the line stops at it, as interfaces.dev ends its connectors.
+pub(crate) fn paint_ring(centre: Point<Pixels>, ink: Hsla, fill: Hsla, window: &mut Window) {
+    window.paint_quad(quad(
+        Bounds::new(
+            point(centre.x - px(RING / 2.), centre.y - px(RING / 2.)),
+            size(px(RING), px(RING)),
+        ),
+        px(RING / 2.),
+        fill,
+        px(1.),
+        ink,
+        BorderStyle::Solid,
+    ));
 }
 
-/// Points along a line, close enough that the straight pieces between them follow its curve.
-fn flatten(from: Point<Pixels>, to: Point<Pixels>, curve: Curve) -> Vec<Point<Pixels>> {
-    let at = |p: Point<Pixels>| (f32::from(p.x), f32::from(p.y));
-    let (a, b) = (at(from), at(to));
-    let controls: Vec<(f32, f32)> = match curve {
-        Curve::Straight => return vec![from, to],
-        Curve::Bowed(control) => vec![at(control)],
-        Curve::Level(first, second) => vec![at(first), at(second)],
+/// A line's tone: how strong it is drawn, and whether dotted. A hub's line to its node is a
+/// little stronger than its lines to its neighbours, the pointed and the selected chip's lines
+/// stand out, and a closed hub hangs on a dotted line.
+fn line_tone(
+    scene: &Scene,
+    from: usize,
+    to: usize,
+    hovered: Option<usize>,
+    selected: Option<usize>,
+) -> Tone {
+    let touches = |i: Option<usize>| i.is_some_and(|i| from == i || to == i);
+    let kinds = (&scene.nodes[from].kind, &scene.nodes[to].kind);
+    let hub_link = matches!(kinds.0, SceneKind::Hub { .. } | SceneKind::More { .. })
+        || matches!(kinds.1, SceneKind::Hub { .. } | SceneKind::More { .. });
+    let member = matches!(
+        kinds,
+        (SceneKind::Hub { .. }, SceneKind::Node { .. })
+            | (SceneKind::Node { .. }, SceneKind::Hub { .. })
+    ) && edge_is_member(scene, from, to);
+    let alpha = if touches(hovered) {
+        0.45
+    } else if touches(selected) {
+        0.28
+    } else if member {
+        0.13
+    } else if hub_link {
+        0.22
+    } else {
+        0.16
     };
-    // The control polygon is at least as long as the curve: a piece every 6 px or so.
-    let mut polygon = 0.;
-    let mut previous = a;
-    for p in controls.iter().copied().chain([b]) {
-        polygon += ((p.0 - previous.0).powi(2) + (p.1 - previous.1).powi(2)).sqrt();
-        previous = p;
+    let dotted = matches!(
+        kinds.0,
+        SceneKind::More { .. } | SceneKind::Hub { open: false, .. }
+    ) || matches!(
+        kinds.1,
+        SceneKind::More { .. } | SceneKind::Hub { open: false, .. }
+    );
+    Tone {
+        alpha: (alpha * 1000.) as u16,
+        dotted,
     }
-    let steps = ((polygon / 6.).ceil() as usize).clamp(4, 96);
-    (0..=steps)
-        .map(|i| {
-            let t = i as f32 / steps as f32;
-            let u = 1. - t;
-            let (x, y) = match controls.as_slice() {
-                [c] => (
-                    u * u * a.0 + 2. * u * t * c.0 + t * t * b.0,
-                    u * u * a.1 + 2. * u * t * c.1 + t * t * b.1,
-                ),
-                [c1, c2] => (
-                    u * u * u * a.0
-                        + 3. * u * u * t * c1.0
-                        + 3. * u * t * t * c2.0
-                        + t * t * t * b.0,
-                    u * u * u * a.1
-                        + 3. * u * u * t * c1.1
-                        + 3. * u * t * t * c2.1
-                        + t * t * t * b.1,
-                ),
-                _ => (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t),
-            };
-            point(px(x), px(y))
-        })
-        .collect()
 }
 
-/// The dashes of a dotted line through `points`, as straight pieces: `DASH` on, `GAP` off,
-/// continuing across the line's bends. Dash `k` covers `[k·period, k·period + DASH]` of the
-/// distance along the whole line, in f64 and stepped by `k`, so the walk always ends: a walk
-/// that carried its place in the pattern from piece to piece in f32 stopped advancing when
-/// the step left was below the resolution of the distance walked, and pushed empty dashes
-/// until memory ran out. A piece longer than `DASHES_PER_LINE` dashes is drawn solid.
-fn dashes(points: &[Point<Pixels>], out: &mut Vec<Segment>) {
-    let period = f64::from(DASH + GAP);
-    let dash = f64::from(DASH);
-    // Distance along the line where the current piece starts.
-    let mut start = 0f64;
-    for pair in points.windows(2) {
-        let (from, to) = (pair[0], pair[1]);
-        let dx = f64::from(f32::from(to.x - from.x));
-        let dy = f64::from(f32::from(to.y - from.y));
-        let length = (dx * dx + dy * dy).sqrt();
-        if !length.is_finite() {
-            return;
-        }
-        if length <= f64::from(f32::EPSILON) {
-            continue;
-        }
-        let end = start + length;
-        let first = (start / period).floor();
-        let last = (end / period).ceil();
-        if last - first > DASHES_PER_LINE as f64 {
-            out.push((from, to, Curve::Straight));
-            start = end;
-            continue;
-        }
-        let at = |s: f64| {
-            let d = (s - start) / length;
-            point(from.x + px((dx * d) as f32), from.y + px((dy * d) as f32))
-        };
-        for k in first as u64..last as u64 {
-            let on = (k as f64 * period).max(start);
-            let off = (k as f64 * period + dash).min(end);
-            if off > on {
-                out.push((at(on), at(off), Curve::Straight));
+/// A line from a parent node to a child as right-angle pieces: out of the parent's side towards
+/// the child, turning `turn` beyond it (or halfway, where the two are closer), and into the
+/// child's side.
+fn elbow(
+    (parent, parent_reach): (Point<Pixels>, f32),
+    (child, child_reach): (Point<Pixels>, f32),
+    turn: f32,
+) -> Vec<Point<Pixels>> {
+    let side = if child.x >= parent.x { 1. } else { -1. };
+    let start = point(parent.x + px(side * parent_reach), parent.y);
+    let end = point(child.x - px(side * child_reach), child.y);
+    let room = f32::from(end.x - start.x).abs();
+    let x = start.x + px(side * turn.min(room / 2.));
+    right_angles(vec![start, point(x, parent.y), point(x, child.y), end])
+}
+
+/// A loop over a type's chip, its `rank`th from the inside out: up from the chip's top near its
+/// right end, across, and down again, each further loop wider and taller.
+pub(crate) fn loop_points(
+    at: Point<Pixels>,
+    reach: f32,
+    scale: f32,
+    rank: usize,
+) -> Vec<Point<Pixels>> {
+    let grow = LOOP_STEP * rank as f32 * scale;
+    let top = at.y - px(13. * scale);
+    let right = at.x + px(reach - 12. * scale + grow);
+    let left = right - px(36. * scale + grow * 2.);
+    let height = px(16. * scale + grow);
+    vec![
+        point(left, top),
+        point(left, top - height),
+        point(right, top - height),
+        point(right, top),
+    ]
+}
+
+/// Where a loop's label goes: over its top.
+pub(crate) fn loop_label_at(points: &[Point<Pixels>]) -> Point<Pixels> {
+    match points {
+        [_, a, b, ..] => point((a.x + b.x) / 2., a.y - px(10.)),
+        _ => points.first().copied().unwrap_or_default(),
+    }
+}
+
+/// The same line with every slanted piece turned at right angles halfway across, and repeated
+/// points dropped.
+fn right_angles(points: Vec<Point<Pixels>>) -> Vec<Point<Pixels>> {
+    let mut out: Vec<Point<Pixels>> = Vec::with_capacity(points.len() + 2);
+    for p in points {
+        if let Some(&last) = out.last() {
+            let (dx, dy) = (f32::from(p.x - last.x).abs(), f32::from(p.y - last.y).abs());
+            if dx < 0.01 && dy < 0.01 {
+                continue;
+            }
+            if dx >= 0.01 && dy >= 0.01 {
+                let mid = (last.x + p.x) / 2.;
+                out.push(point(mid, last.y));
+                out.push(point(mid, p.y));
             }
         }
-        start = end;
+        out.push(p);
+    }
+    out
+}
+
+/// Straight runs of one tone: level runs by their height, upright ones by their x, each as
+/// spans along it, merged where they meet. Lines that share a stretch (a trunk) are drawn once
+/// there, so their dashes neither double nor blur.
+#[derive(Default)]
+struct Runs {
+    level: BTreeMap<i64, (f32, Vec<(f32, f32)>)>,
+    upright: BTreeMap<i64, (f32, Vec<(f32, f32)>)>,
+}
+
+impl Runs {
+    fn add(&mut self, a: Point<Pixels>, b: Point<Pixels>) {
+        let (ax, ay, bx, by) = (
+            f32::from(a.x),
+            f32::from(a.y),
+            f32::from(b.x),
+            f32::from(b.y),
+        );
+        if !(ax.is_finite() && ay.is_finite() && bx.is_finite() && by.is_finite()) {
+            return;
+        }
+        let key = |v: f32| (v * 8.).round() as i64;
+        if (ay - by).abs() < 0.01 {
+            let run = self.level.entry(key(ay)).or_insert((ay, Vec::new()));
+            run.1.push((ax.min(bx), ax.max(bx)));
+        } else if (ax - bx).abs() < 0.01 {
+            let run = self.upright.entry(key(ax)).or_insert((ax, Vec::new()));
+            run.1.push((ay.min(by), ay.max(by)));
+        }
+    }
+
+    /// Merges each run's spans, less what `covered` already holds there.
+    fn settle(&mut self, covered: &Runs) {
+        for (runs, cover) in [
+            (&mut self.level, &covered.level),
+            (&mut self.upright, &covered.upright),
+        ] {
+            for (key, (_, spans)) in runs.iter_mut() {
+                *spans = merge(std::mem::take(spans));
+                if let Some((_, taken)) = cover.get(key) {
+                    *spans = subtract(spans, taken);
+                }
+            }
+        }
+    }
+
+    fn absorb(&mut self, other: &Runs) {
+        for (mine, theirs) in [
+            (&mut self.level, &other.level),
+            (&mut self.upright, &other.upright),
+        ] {
+            for (key, (at, spans)) in theirs {
+                let run = mine.entry(*key).or_insert((*at, Vec::new()));
+                run.1.extend(spans.iter().copied());
+                run.1 = merge(std::mem::take(&mut run.1));
+            }
+        }
+    }
+}
+
+/// Spans merged where they overlap or touch, in order.
+fn merge(mut spans: Vec<(f32, f32)>) -> Vec<(f32, f32)> {
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut out: Vec<(f32, f32)> = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        match out.last_mut() {
+            Some(last) if start <= last.1 + 0.01 => last.1 = last.1.max(end),
+            _ => out.push((start, end)),
+        }
+    }
+    out
+}
+
+/// Merged `spans` less merged `taken`.
+fn subtract(spans: &[(f32, f32)], taken: &[(f32, f32)]) -> Vec<(f32, f32)> {
+    let mut out = Vec::new();
+    for &(start, end) in spans {
+        let mut from = start;
+        for &(t0, t1) in taken {
+            if t1 <= from || t0 >= end {
+                continue;
+            }
+            if t0 > from {
+                out.push((from, t0));
+            }
+            from = from.max(t1);
+        }
+        if from < end {
+            out.push((from, end));
+        }
+    }
+    out
+}
+
+/// The dashes of a span from `start` to `end` along an axis, `origin` being where the pattern
+/// starts on that axis: dash `k` covers `[origin + k·period, origin + k·period + on]`, so every
+/// line along the same stretch has the same dashes. The walk counts dashes in f64 and is
+/// bounded by [`DASHES_PER_RUN`]: a longer span comes back whole, drawn solid.
+fn dashes_along(start: f32, end: f32, origin: f32, (on, off): (f32, f32)) -> Vec<(f32, f32)> {
+    if !(start.is_finite() && end.is_finite() && origin.is_finite()) || end <= start {
+        return Vec::new();
+    }
+    let period = f64::from(on + off);
+    let (s, e) = (f64::from(start - origin), f64::from(end - origin));
+    let first = (s / period).floor();
+    let last = (e / period).ceil();
+    if last - first > DASHES_PER_RUN {
+        return vec![(start, end)];
+    }
+    let mut out = Vec::with_capacity((last - first) as usize);
+    let mut k = first;
+    while k < last {
+        let a = (k * period).max(s);
+        let b = (k * period + f64::from(on)).min(e);
+        if b > a {
+            out.push((a as f32 + origin, b as f32 + origin));
+        }
+        k += 1.;
+    }
+    out
+}
+
+/// Paints the lines: by tone, strongest first, each tone's runs merged and less what a
+/// stronger tone already drew there, clipped to the view, then cut into dashes or dots, each a
+/// 1 px quad on the pixel grid.
+pub(crate) fn paint_runs(
+    drawn: &[(usize, Vec<Point<Pixels>>, Tone)],
+    bounds: Bounds<Pixels>,
+    origin: Point<Pixels>,
+    ink: Hsla,
+    window: &mut Window,
+) {
+    let mut tones: BTreeMap<std::cmp::Reverse<Tone>, Runs> = BTreeMap::new();
+    for (_, points, tone) in drawn {
+        let runs = tones.entry(std::cmp::Reverse(*tone)).or_default();
+        for pair in points.windows(2) {
+            runs.add(pair[0], pair[1]);
+        }
+    }
+    let scale = window.scale_factor();
+    // A line's top edge on a device pixel, so it is one crisp pixel row wide.
+    let snap = |at: f32| (((at - 0.5) * scale).round() / scale, 1.);
+    let (left, right) = (
+        f32::from(bounds.left()) - 2.,
+        f32::from(bounds.right()) + 2.,
+    );
+    let (top, bottom) = (
+        f32::from(bounds.top()) - 2.,
+        f32::from(bounds.bottom()) + 2.,
+    );
+    let mut covered = Runs::default();
+    for (std::cmp::Reverse(tone), mut runs) in tones {
+        runs.settle(&covered);
+        let color = ink.opacity(f32::from(tone.alpha) / 1000.);
+        let pattern = if tone.dotted { DOT } else { DASH };
+        for (y, spans) in runs.level.values() {
+            if *y < top || *y > bottom {
+                continue;
+            }
+            let (row, thick) = snap(*y);
+            for &(a, b) in spans {
+                for (s, e) in dashes_along(a.max(left), b.min(right), f32::from(origin.x), pattern)
+                {
+                    window.paint_quad(gpui::fill(
+                        Bounds::new(point(px(s), px(row)), size(px(e - s), px(thick))),
+                        color,
+                    ));
+                }
+            }
+        }
+        for (x, spans) in runs.upright.values() {
+            if *x < left || *x > right {
+                continue;
+            }
+            let (column, thick) = snap(*x);
+            for &(a, b) in spans {
+                for (s, e) in dashes_along(a.max(top), b.min(bottom), f32::from(origin.y), pattern)
+                {
+                    window.paint_quad(gpui::fill(
+                        Bounds::new(point(px(column), px(s)), size(px(thick), px(e - s))),
+                        color,
+                    ));
+                }
+            }
+        }
+        covered.absorb(&runs);
     }
 }
 
@@ -1082,14 +1090,21 @@ fn initial(label: &str, type_name: &str) -> SharedString {
     studio_ui::text::initial(label, type_name).into()
 }
 
-/// Whether the box around the line from `a` to `b` meets `bounds` grown by `margin`: a curve
-/// bends within the margin.
-fn crosses(a: Point<Pixels>, b: Point<Pixels>, bounds: Bounds<Pixels>, margin: f32) -> bool {
+/// Whether the box around a line's points meets `bounds` grown by `margin`.
+fn crosses(points: &[Point<Pixels>], bounds: Bounds<Pixels>, margin: f32) -> bool {
     let margin = px(margin);
-    a.x.max(b.x) >= bounds.left() - margin
-        && a.x.min(b.x) <= bounds.right() + margin
-        && a.y.max(b.y) >= bounds.top() - margin
-        && a.y.min(b.y) <= bounds.bottom() + margin
+    let Some(first) = points.first() else {
+        return false;
+    };
+    let (mut min, mut max) = (*first, *first);
+    for p in points {
+        min = point(min.x.min(p.x), min.y.min(p.y));
+        max = point(max.x.max(p.x), max.y.max(p.y));
+    }
+    max.x >= bounds.left() - margin
+        && min.x <= bounds.right() + margin
+        && max.y >= bounds.top() - margin
+        && min.y <= bounds.bottom() + margin
 }
 
 #[cfg(test)]
@@ -1121,114 +1136,77 @@ mod tests {
     #[test]
     fn a_line_across_the_view_is_drawn_with_both_ends_outside() {
         let view = Bounds::new(point(px(0.), px(0.)), size(px(800.), px(600.)));
-        let (left, right) = (point(px(-5000.), px(300.)), point(px(5000.), px(300.)));
-        assert!(crosses(left, right, view, 400.));
-        let below = (point(px(-5000.), px(5000.)), point(px(5000.), px(5000.)));
-        assert!(!crosses(below.0, below.1, view, 400.));
-    }
-
-    #[test]
-    fn a_dotted_line_is_cut_into_dashes_across_its_bends() {
-        let mut pieces = Vec::new();
-        dashes(
-            &[point(px(0.), px(0.)), point(px(50.), px(0.))],
-            &mut pieces,
-        );
-        assert_eq!(pieces.len(), 10, "a dash every 5 px");
-        assert!(
-            pieces
-                .iter()
-                .all(|(a, b, _)| (f32::from(b.x - a.x) - DASH).abs() < 1e-3)
-        );
-        // A bend in the middle of a dash continues it on the next piece.
-        let mut bent = Vec::new();
-        dashes(
-            &[
-                point(px(0.), px(0.)),
-                point(px(6.), px(0.)),
-                point(px(6.), px(10.)),
-            ],
-            &mut bent,
-        );
-        let drawn: f32 = bent
-            .iter()
-            .map(|(a, b, _)| f32::from(b.x - a.x).abs() + f32::from(b.y - a.y).abs())
-            .sum();
-        assert!(
-            (drawn - 7.).abs() < 1e-3,
-            "16 px of line, 7 px of dashes: {drawn}"
-        );
-        // A curve is followed from end to end.
-        let curve = flatten(
-            point(px(0.), px(0.)),
-            point(px(100.), px(0.)),
-            Curve::Bowed(point(px(50.), px(50.))),
-        );
-        assert_eq!(curve.first(), Some(&point(px(0.), px(0.))));
-        assert_eq!(curve.last(), Some(&point(px(100.), px(0.))));
-        assert!(curve.len() > 4);
-    }
-
-    /// The canvas froze, its memory growing without end, when a dotted line's walk stopped
-    /// advancing: at the second bend of this line the step left in the dash fell below the
-    /// f32 resolution of the distance walked (found by emulating the old walk's f32 steps;
-    /// common on curves, which bend every few pixels). Every line now ends, with a dash count
-    /// set by its length.
-    #[test]
-    fn every_dotted_line_ends_with_dashes_set_by_its_length() {
-        let lines: Vec<Vec<Point<Pixels>>> = vec![
-            vec![
-                point(px(243.6), px(29.3)),
-                point(px(204.8), px(66.0)),
-                point(px(136.8), px(373.3)),
-            ],
-            flatten(
-                point(px(168.45694), px(355.29034)),
-                point(px(160.164), px(355.26978)),
-                Curve::Bowed(point(px(120.), px(300.))),
-            ),
-            flatten(
-                point(px(-300.), px(40.)),
-                point(px(900.), px(700.)),
-                Curve::Level(point(px(100.), px(40.)), point(px(500.), px(700.))),
-            ),
+        let across = [point(px(-5000.), px(300.)), point(px(5000.), px(300.))];
+        assert!(crosses(&across, view, 400.));
+        let below = [point(px(-5000.), px(5000.)), point(px(5000.), px(5000.))];
+        assert!(!crosses(&below, view, 400.));
+        // A route that turns around the view's corner crosses it.
+        let around = [
+            point(px(-100.), px(-100.)),
+            point(px(900.), px(-100.)),
+            point(px(900.), px(700.)),
         ];
-        for points in lines {
-            let length: f32 = points
-                .windows(2)
-                .map(|pair| {
-                    let (dx, dy) = (
-                        f32::from(pair[1].x - pair[0].x),
-                        f32::from(pair[1].y - pair[0].y),
-                    );
-                    (dx * dx + dy * dy).sqrt()
-                })
-                .sum();
-            let mut pieces = Vec::new();
-            dashes(&points, &mut pieces);
-            let most = (length / (DASH + GAP)).ceil() as usize + points.len();
-            assert!(
-                !pieces.is_empty() && pieces.len() <= most,
-                "{} dashes on {length} px",
-                pieces.len()
-            );
-            assert!(pieces.iter().all(|(a, b, _)| {
-                let (dx, dy) = (f32::from(b.x - a.x), f32::from(b.y - a.y));
-                (dx * dx + dy * dy).sqrt() <= DASH + 1e-3
-            }));
-        }
-        // A piece too long to cut is drawn whole; one that is not a number draws nothing.
-        let mut pieces = Vec::new();
-        dashes(
-            &[point(px(0.), px(0.)), point(px(1e7), px(0.))],
-            &mut pieces,
+        assert!(crosses(&around, view, 0.));
+    }
+
+    /// Two lines along the same stretch are cut into the same dashes, wherever each starts, so
+    /// a shared trunk is drawn once; the walk ends, and a span too long to cut is drawn whole.
+    #[test]
+    fn lines_along_one_stretch_share_their_dashes() {
+        let one = dashes_along(10., 60., 0., DASH);
+        let other = dashes_along(10., 60., 0., DASH);
+        assert_eq!(one, other);
+        assert_eq!(one.first(), Some(&(10., 13.)));
+        assert!(one.iter().all(|(a, b)| b - a <= 3. + 1e-4));
+        // A dash is where the origin puts it, not where the span begins.
+        assert_eq!(dashes_along(11., 20., 0., DASH).first(), Some(&(11., 13.)));
+        assert_eq!(dashes_along(0., 20., 1., DASH).first(), Some(&(1., 4.)));
+        assert!(dashes_along(0., 1e7, 0., DASH) == vec![(0., 1e7)]);
+        assert!(dashes_along(0., f32::INFINITY, 0., DASH).is_empty());
+        assert!(dashes_along(5., 5., 0., DASH).is_empty());
+    }
+
+    /// Lines of one tone that overlap are merged into one span; a stronger tone's span is taken
+    /// out of a weaker one's, so each stretch is drawn once, in its strongest tone.
+    #[test]
+    fn overlapping_lines_are_drawn_once_in_their_strongest_tone() {
+        let at = |x: f32, y: f32| point(px(x), px(y));
+        let mut faint = Runs::default();
+        faint.add(at(0., 10.), at(50., 10.));
+        faint.add(at(40., 10.), at(100., 10.));
+        faint.add(at(20., 0.), at(20., 30.));
+        let mut strong = Runs::default();
+        strong.add(at(30., 10.), at(60., 10.));
+        let mut covered = Runs::default();
+        strong.settle(&covered);
+        covered.absorb(&strong);
+        faint.settle(&covered);
+        let level: Vec<&(f32, f32)> = faint.level.values().flat_map(|(_, s)| s).collect();
+        assert_eq!(level, vec![&(0., 30.), &(60., 100.)]);
+        let upright: Vec<&(f32, f32)> = faint.upright.values().flat_map(|(_, s)| s).collect();
+        assert_eq!(upright, vec![&(0., 30.)]);
+    }
+
+    /// A slanted piece turns at right angles halfway across, and a line from a parent to its
+    /// child leaves and enters their sides level, turning near the parent.
+    #[test]
+    fn lines_turn_at_right_angles() {
+        let at = |x: f32, y: f32| point(px(x), px(y));
+        let slanted = right_angles(vec![at(0., 0.), at(10., 20.)]);
+        assert_eq!(
+            slanted,
+            vec![at(0., 0.), at(5., 0.), at(5., 20.), at(10., 20.)]
         );
-        assert_eq!(pieces.len(), 1);
-        let mut pieces = Vec::new();
-        dashes(
-            &[point(px(0.), px(0.)), point(px(f32::INFINITY), px(0.))],
-            &mut pieces,
+        let line = elbow((at(0., 0.), 20.), (at(200., 50.), 30.), 18.);
+        assert_eq!(line.first(), Some(&at(20., 0.)));
+        assert_eq!(line.last(), Some(&at(170., 50.)));
+        assert_eq!(line[1], at(38., 0.), "turns 18 px beyond the parent");
+        assert!(
+            line.windows(2)
+                .all(|p| p[0].x == p[1].x || p[0].y == p[1].y)
         );
-        assert!(pieces.is_empty());
+        // Two children in one column share the parent's upright.
+        let other = elbow((at(0., 0.), 20.), (at(210., -40.), 40.), 18.);
+        assert_eq!(other[1].x, line[1].x);
     }
 }

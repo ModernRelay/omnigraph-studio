@@ -1,6 +1,7 @@
-//! The graph canvas (spec 006): the schema as a landing view, then a growing neighbourhood of
-//! real nodes, drawn from the session's shared [`Exploration`], so the relationship tree and
-//! the canvas always show the same walk.
+//! The graph canvas (spec 006): a growing neighbourhood of real nodes, drawn from the
+//! session's shared [`Exploration`], so the relationship tree and the canvas always show the
+//! same walk, and a query's result nodes. The schema's types have a page of their own, the
+//! ontology ([`ontology`]).
 //!
 //! One `canvas()` element paints everything: edges batched by color into paths in one paint
 //! layer, nodes as quads, labels above a zoom threshold. Layout runs on a background thread
@@ -8,8 +9,11 @@
 //!
 //! Layer 5 (`docs/architecture.md`). Plan: `specs/006-graph-canvas/plan.md`.
 
+mod domains;
+mod layered;
 mod layout;
 mod model;
+mod ontology;
 mod paint;
 
 use std::cell::{Cell, RefCell};
@@ -41,7 +45,7 @@ use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
 use ui::Tooltip;
 use ui::prelude::*;
 
-use layout::{LayoutKind, LayoutNode, OntologyEdge, OntologyNode, Vec2};
+use layout::{LayoutKind, LayoutNode, Vec2};
 use model::{HUB_STEP, Scene, SceneId, SceneKind};
 use studio_ui::menu::ContextMenu;
 use studio_ui::motion::{self, Ease, Lerp, Tween};
@@ -53,18 +57,22 @@ const ZOOM_STEP: f32 = 1.25;
 
 /// Registers the canvas's keys and the actions that open it.
 pub fn init(cx: &mut App) {
+    studio_workspace::register_item_kind(
+        cx,
+        ontology::ONTOLOGY_KIND,
+        |data, workspace, window, cx| {
+            let focus = ontology::saved_focus(data);
+            if let Some(page) = open_ontology(workspace, window, cx)
+                && let Some(focus) = focus
+            {
+                page.update(cx, |page, cx| page.focus_on(&focus, cx));
+            }
+        },
+    );
     studio_workspace::register_item_kind(cx, "canvas", |data, workspace, window, cx| {
         let pinned = pins_from_json(data);
-        // A canvas saved before the face was kept shows the ontology, as it did.
-        let ontology = data
-            .get("ontology")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true);
         if let Some(canvas) = open_canvas(workspace, window, cx) {
-            canvas.update(cx, |canvas, cx| {
-                canvas.set_ontology(ontology, cx);
-                canvas.restore_pins(pinned, cx);
-            });
+            canvas.update(cx, |canvas, cx| canvas.restore_pins(pinned, cx));
         }
     });
     cx.observe_new(|workspace: &mut Workspace, window, _cx| {
@@ -85,14 +93,10 @@ pub fn init(cx: &mut App) {
             );
         });
         workspace.register_action(|workspace, _: &OpenCanvas, window, cx| {
-            if let Some(canvas) = open_canvas(workspace, window, cx) {
-                canvas.update(cx, |canvas, cx| canvas.set_ontology(false, cx));
-            }
+            open_canvas(workspace, window, cx);
         });
         workspace.register_action(|workspace, _: &OpenOntology, window, cx| {
-            if let Some(canvas) = open_canvas(workspace, window, cx) {
-                canvas.update(cx, |canvas, cx| canvas.set_ontology(true, cx));
-            }
+            open_ontology(workspace, window, cx);
         });
         workspace.register_action(|workspace, action: &ShowNodeOnCanvas, window, cx| {
             if let Some(canvas) = open_canvas(workspace, window, cx) {
@@ -102,6 +106,18 @@ pub fn init(cx: &mut App) {
         });
     })
     .detach();
+}
+
+fn open_ontology(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Option<Entity<ontology::OntologyPage>> {
+    let session = workspace.session()?.clone();
+    let key = ontology::ontology_key(&session.read(cx).graph_id);
+    workspace.open_item::<ontology::OntologyPage>(key, window, cx, |_window, cx| {
+        ontology::OntologyPage::new(session, cx)
+    })
 }
 
 fn open_canvas(
@@ -120,7 +136,6 @@ fn canvas_key(graph_id: &str) -> SharedString {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
-    Schema,
     Explore,
     /// A query's result nodes (specs 006, 007).
     Results,
@@ -220,11 +235,10 @@ enum More {
     Open(ExplorePath),
 }
 
-/// The key a placed chip is remembered by: a type on the schema canvas, a node or a
-/// relationship pill while exploring. "+K more" follows its pill and is never placed by hand.
+/// The key a placed chip is remembered by: a node or a relationship pill. "+K more" follows
+/// its pill and is never placed by hand.
 fn pin_key(id: &SceneId) -> Option<String> {
     match id {
-        SceneId::Type(name) => Some(format!("type:{name}")),
         SceneId::Node(node) => Some(format!("node:{}/{}", node.type_name, node.id)),
         SceneId::Hub(key) => Some(format!(
             "hub:{}/{}/{}",
@@ -271,8 +285,6 @@ pub(crate) struct GraphCanvas {
     /// Set for a canvas of query results; such a canvas never shows the exploration.
     results: Option<(usize, Arc<ResultsData>)>,
     focus_handle: FocusHandle,
-    /// The person asked to see the schema although an exploration exists.
-    show_schema: bool,
     mode: Mode,
     scene: Arc<Scene>,
     positions: Arc<Vec<Vec2>>,
@@ -283,7 +295,7 @@ pub(crate) struct GraphCanvas {
     /// The scene's node chips, counted with it for the caption and the overlay.
     node_count: usize,
     /// Where each node was drawn, for the explorer's root (or the query, on a results
-    /// canvas): such nodes never move. A visit to the ontology keeps them.
+    /// canvas): such nodes never move.
     known: HashMap<SceneId, Vec2>,
     /// The root the explorer's `known` places are for.
     known_root: Option<NodeRef>,
@@ -295,10 +307,6 @@ pub(crate) struct GraphCanvas {
     /// The layout being worked out off the main thread, until it is applied: a fit waits
     /// for it, rather than framing the layout it replaces.
     layout_task: Option<Task<()>>,
-    /// The ontology's last layout: what it was laid out from, and where it put each type. The
-    /// same types, sizes, pins and relationships are not laid out again: a count changes no
-    /// place, since each type has room for a six-digit one.
-    ontology_layout: Option<(Vec<OntologyNode>, Vec<OntologyEdge>, Vec<Vec2>)>,
     hub_limits: HashMap<GroupKey, usize>,
     center: Vec2,
     zoom: f32,
@@ -354,17 +362,16 @@ impl Item for GraphCanvas {
     fn tab_title(&self, _cx: &App) -> SharedString {
         match &self.results {
             Some((_, results)) => results.title.clone().into(),
-            None if self.mode == Mode::Explore => "Canvas".into(),
-            None => "Ontology".into(),
+            None => "Canvas".into(),
         }
     }
 
-    /// The icons of the Graph panel's rows: the explorer is a walk from a node, the ontology
-    /// and a query's result nodes are a map.
+    /// The icons of the Graph panel's rows: the canvas is a walk from a node, a query's result
+    /// nodes are a map.
     fn tab_icon(&self, _cx: &App) -> Option<IconName> {
         Some(match self.mode {
             Mode::Explore => IconName::Crosshair,
-            Mode::Schema | Mode::Results => IconName::GitGraph,
+            Mode::Results => IconName::GitGraph,
         })
     }
 
@@ -375,26 +382,16 @@ impl Item for GraphCanvas {
         })
     }
 
-    /// The ontology is what `OpenOntology` opens and the walk from a node what `OpenCanvas`
-    /// opens; a query's result nodes are neither.
+    /// The walk from a node is what `OpenCanvas` opens; a query's result nodes are not.
     fn opened_by(&self, action: &dyn gpui::Action, _cx: &App) -> bool {
-        let action = action.as_any();
-        match self.mode {
-            Mode::Schema => action.is::<OpenOntology>(),
-            Mode::Explore => action.is::<OpenCanvas>(),
-            Mode::Results => false,
-        }
+        self.mode == Mode::Explore && action.as_any().is::<OpenCanvas>()
     }
 
     /// The exploration canvas comes back after a restart; a results canvas is transient.
     fn serialize(&self, _cx: &App) -> Option<SavedItem> {
         self.results.is_none().then(|| SavedItem {
             kind: "canvas".into(),
-            data: {
-                let mut data = pins_to_json(&self.pinned);
-                data["ontology"] = serde_json::Value::Bool(self.show_schema);
-                data
-            },
+            data: pins_to_json(&self.pinned),
         })
     }
 
@@ -404,9 +401,9 @@ impl Item for GraphCanvas {
 }
 
 impl GraphCanvas {
-    /// Whether the canvas draws the exploration: not a results canvas, nor the ontology.
+    /// Whether the canvas draws the exploration: not a results canvas.
     fn draws_exploration(&self) -> bool {
-        self.results.is_none() && !self.show_schema
+        self.results.is_none()
     }
 }
 
@@ -459,18 +456,11 @@ impl GraphCanvas {
                     }
                 }
             }),
-            cx.subscribe(&session, |this, _, event: &SessionEvent, cx| match event {
-                SessionEvent::SchemaChanged => this.rebuild(cx),
-                // The ontology is the schema itself, as the types list: it shows another
-                // writer's change at once. The explorer's data says it is newer instead.
-                SessionEvent::SchemaMoved if this.results.is_none() && this.show_schema => {
+            // Another writer's schema change shows as newer data, not at once.
+            cx.subscribe(&session, |this, _, event: &SessionEvent, cx| {
+                if let SessionEvent::SchemaChanged = event {
                     this.rebuild(cx)
                 }
-                // Counts are drawn on the ontology's types only.
-                SessionEvent::CountsChanged if this.results.is_none() && this.show_schema => {
-                    this.rebuild(cx)
-                }
-                _ => {}
             }),
         ];
         let mut canvas = Self {
@@ -478,8 +468,7 @@ impl GraphCanvas {
             exploration,
             results,
             focus_handle: cx.focus_handle(),
-            show_schema: true,
-            mode: Mode::Schema,
+            mode: Mode::Explore,
             scene: Arc::default(),
             positions: Arc::default(),
             half_widths: Arc::default(),
@@ -491,7 +480,6 @@ impl GraphCanvas {
             layout_key: None,
             layout_generation: 0,
             layout_task: None,
-            ontology_layout: None,
             hub_limits: HashMap::new(),
             center: Vec2::default(),
             zoom: 1.,
@@ -548,23 +536,9 @@ impl GraphCanvas {
         Self::build(session, Some((seq, results)), cx)
     }
 
-    /// Shows the ontology (the schema's types and relationships), or the exploration when
-    /// there is one.
-    fn set_ontology(&mut self, ontology: bool, cx: &mut Context<Self>) {
-        if self.show_schema != ontology {
-            self.show_schema = ontology;
-            if self.draws_exploration() {
-                self.follow_selection(cx);
-            }
-            self.rebuild(cx);
-            cx.emit(ItemEvent::UpdateTab);
-        }
-    }
-
     /// Shows `node`: selects it where the exploration shows it, else roots the exploration
     /// there; then centers on it.
     fn show_node(&mut self, node: NodeRef, cx: &mut Context<Self>) {
-        self.show_schema = false;
         let id = SceneId::Node(node.clone());
         self.center_on = Some(id.clone());
         self.selected = Some(id.clone());
@@ -604,7 +578,7 @@ impl GraphCanvas {
     }
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
-        let Some(schema) = self.session.read(cx).schema_model() else {
+        if self.session.read(cx).schema_model().is_none() {
             self.scene = Arc::default();
             self.texts = Arc::default();
             self.node_count = 0;
@@ -613,152 +587,75 @@ impl GraphCanvas {
             self.chips.borrow_mut().clear();
             cx.notify();
             return;
-        };
+        }
         if let Some((_, results)) = self.results.clone() {
             self.rebuild_results(&results, cx);
             return;
         }
         let exploration = self.exploration.read(cx);
         let root = exploration.root().cloned();
-        // The face chosen, even before a node is: an explorer with no node says how to start.
-        let mode = if self.show_schema {
-            Mode::Schema
-        } else {
-            Mode::Explore
-        };
-        let key = (mode, root.filter(|_| mode == Mode::Explore));
+        let key = (Mode::Explore, root);
         if self.layout_key.as_ref() != Some(&key) {
-            if mode == Mode::Explore && self.known_root != key.1 {
+            if self.known_root != key.1 {
                 self.known.clear();
                 self.known_root = key.1.clone();
             }
             self.fit_pending = true;
             self.layout_key = Some(key);
         }
-        self.mode = mode;
+        self.mode = Mode::Explore;
         self.layout_generation += 1;
-        let generation = self.layout_generation;
-        match mode {
-            // Handled before: a results canvas never reaches here.
-            Mode::Results => {}
-            Mode::Schema => {
-                let session = self.session.read(cx);
-                let scene = model::schema_scene(&schema, |name| {
-                    session.count_of(graph_store::EntityKind::Node, name)
-                });
-                let measure = measurer(cx, &self.char_widths);
-                let widths = half_widths(&scene, &measure);
-                // From the schema and the placed types only: each type is laid out with room
-                // for a six-digit count, whatever its count, so a count never moves a type.
-                let nodes: Vec<OntologyNode> = scene
-                    .nodes
+        // Chips being dragged are laid out from where they are now, so what opens on
+        // them meanwhile grows from there.
+        let dragged: HashMap<SceneId, Vec2> = match self.drag.as_mut() {
+            Some(drag) if drag.moved => {
+                drag.follow(&self.scene);
+                drag.node
                     .iter()
-                    .map(|node| OntologyNode {
-                        half_width: {
-                            let mut sized = node.clone();
-                            sized.kind = SceneKind::Type {
-                                count: Some(888_888),
-                            };
-                            paint::chip_width(&paint::chip_text(&sized), &measure) / 2.
-                        },
-                        pinned: pin_key(&node.id).and_then(|key| self.pinned.get(&key).copied()),
+                    .chain(&drag.followers)
+                    .filter_map(|&(index, _)| {
+                        let id = self.scene.nodes.get(index)?.id.clone();
+                        Some((id, *self.positions.get(index)?))
                     })
-                    .collect();
-                // Labels shown at all times get room between their types; a larger ontology
-                // names a type's relationships on hover, over the chips, and stays compact.
-                let labelled = scene.edges.len() <= paint::ALWAYS_LABEL;
-                let edges: Vec<OntologyEdge> = scene
-                    .edges
-                    .iter()
-                    .map(|edge| OntologyEdge {
-                        from: edge.from,
-                        to: edge.to,
-                        label_half_width: match &edge.label {
-                            Some(label) if labelled => paint::label_width(label, &measure) / 2.,
-                            _ => 0.,
-                        },
-                    })
-                    .collect();
-                if let Some((_, _, positions)) = self
-                    .ontology_layout
-                    .as_ref()
-                    .filter(|(laid, links, _)| *laid == nodes && *links == edges)
-                {
-                    let positions = positions.clone();
-                    self.layout_task = None;
-                    self.apply_layout(scene, widths, positions, cx);
-                    return;
-                }
-                let positions = cx.background_spawn(async move {
-                    let positions = layout::ontology_positions(&nodes, &edges);
-                    (nodes, edges, positions)
-                });
-                self.layout_task = Some(cx.spawn(async move |this, cx| {
-                    let (nodes, edges, positions) = positions.await;
-                    this.update(cx, |this, cx| {
-                        this.layout_task = None;
-                        if this.layout_generation == generation {
-                            this.ontology_layout = Some((nodes, edges, positions.clone()));
-                            this.apply_layout(scene, widths, positions, cx);
-                        }
-                    })
-                    .ok();
-                }));
+                    .collect()
             }
-            Mode::Explore => {
-                // Chips being dragged are laid out from where they are now, so what opens on
-                // them meanwhile grows from there.
-                let dragged: HashMap<SceneId, Vec2> = match self.drag.as_mut() {
-                    Some(drag) if drag.moved => {
-                        drag.follow(&self.scene);
-                        drag.node
-                            .iter()
-                            .chain(&drag.followers)
-                            .filter_map(|&(index, _)| {
-                                let id = self.scene.nodes.get(index)?.id.clone();
-                                Some((id, *self.positions.get(index)?))
-                            })
-                            .collect()
-                    }
-                    _ => HashMap::new(),
-                };
-                let entries = exploration.entries(cx);
-                let scene = model::explore_scene(
-                    &entries,
-                    exploration.state(),
-                    &self.hub_limits,
-                    self.node_cap(cx),
-                );
-                let widths = half_widths(&scene, &measurer(cx, &self.char_widths));
-                let nodes: Vec<LayoutNode> = scene
-                    .nodes
-                    .iter()
-                    .zip(&widths)
-                    .map(|(node, width)| LayoutNode {
-                        parent: node.parent,
-                        kind: match node.kind {
-                            SceneKind::Hub { .. } => LayoutKind::Hub,
-                            SceneKind::More { .. } => LayoutKind::More,
-                            _ => LayoutKind::Node,
-                        },
-                        space: *width,
-                        // "+K more" stands for what is not drawn yet: it moves to the end of
-                        // its column as neighbours come in, while drawn nodes stay put.
-                        previous: if matches!(node.kind, SceneKind::More { .. }) {
-                            None
-                        } else {
-                            dragged.get(&node.id).copied().or_else(|| {
-                                pin_key(&node.id)
-                                    .and_then(|key| self.pinned.get(&key))
-                                    .or_else(|| self.known.get(&node.id))
-                                    .copied()
-                            })
-                        },
+            _ => HashMap::new(),
+        };
+        let entries = exploration.entries(cx);
+        let scene = model::explore_scene(
+            &entries,
+            exploration.state(),
+            &self.hub_limits,
+            self.node_cap(cx),
+        );
+        let widths = half_widths(&scene, &measurer(cx, &self.char_widths));
+        let nodes: Vec<LayoutNode> = scene
+            .nodes
+            .iter()
+            .zip(&widths)
+            .map(|(node, width)| LayoutNode {
+                parent: node.parent,
+                kind: match node.kind {
+                    SceneKind::Hub { .. } => LayoutKind::Hub,
+                    SceneKind::More { .. } => LayoutKind::More,
+                    _ => LayoutKind::Node,
+                },
+                space: *width,
+                // "+K more" stands for what is not drawn yet: it moves to the end of
+                // its column as neighbours come in, while drawn nodes stay put.
+                previous: if matches!(node.kind, SceneKind::More { .. }) {
+                    None
+                } else {
+                    dragged.get(&node.id).copied().or_else(|| {
+                        pin_key(&node.id)
+                            .and_then(|key| self.pinned.get(&key))
+                            .or_else(|| self.known.get(&node.id))
+                            .copied()
                     })
-                    .collect();
-                self.lay_out(scene, widths, move || layout::explore_positions(&nodes), cx);
-            }
-        }
+                },
+            })
+            .collect();
+        self.lay_out(scene, widths, move || layout::explore_positions(&nodes), cx);
     }
 
     /// Places `scene` off the main thread with `place`, and shows it unless a newer layout
@@ -1113,7 +1010,7 @@ impl GraphCanvas {
             .or_else(|| self.selected_index().filter(cut))
     }
 
-    /// Double click and ↵: expand a node or open a hub, show more, or open a type's table.
+    /// Double click and ↵: expand a node or open a hub, or show more.
     fn activate(
         &mut self,
         index: usize,
@@ -1123,18 +1020,6 @@ impl GraphCanvas {
     ) {
         let node = self.scene.nodes[index].clone();
         match node.kind {
-            SceneKind::Type { .. } => {
-                window.dispatch_action(
-                    Box::new(OpenType {
-                        type_name: node.label.clone(),
-                        at_commit: None,
-                        filter_id: None,
-                        via: None,
-                        preview: false,
-                    }),
-                    cx,
-                );
-            }
             SceneKind::Node {
                 node: graph_node,
                 expanded,
@@ -1452,15 +1337,6 @@ impl GraphCanvas {
         }
         let clicked_open = self.clicked_open.take().filter(|_| event.click_count >= 2);
         match self.scene.nodes[index].kind {
-            // A click on a type browses its rows under the canvas.
-            SceneKind::Type { .. } if event.click_count < 2 => {
-                window.dispatch_action(
-                    Box::new(studio_actions::graph::BrowseType {
-                        type_name: self.scene.nodes[index].label.clone(),
-                    }),
-                    cx,
-                );
-            }
             // A click opens a relationship or closes it, and shows more; a double click is
             // that one click, not an open and a close.
             SceneKind::Hub { .. } | SceneKind::More { .. } => {
@@ -1494,7 +1370,6 @@ impl GraphCanvas {
         let node = match &self.scene.nodes[index].kind {
             SceneKind::Node { node, .. } => node.clone(),
             SceneKind::Hub { key, .. } | SceneKind::More { key, .. } => key.node.clone(),
-            SceneKind::Type { .. } => return,
         };
         window.dispatch_action(
             Box::new(PeekNode {
@@ -1544,7 +1419,6 @@ impl GraphCanvas {
                 self.pinned.insert(key, *at);
             }
         }
-        self.keep_ontology_as_drawn();
         cx.emit(ItemEvent::UpdateTab);
         // A layout begun during the drag took where the chips were then: laid out again from
         // where they were dropped.
@@ -1553,25 +1427,6 @@ impl GraphCanvas {
         }
         // The canvas is drawn cached: Reset layout shows once something is placed.
         cx.notify();
-    }
-
-    /// After types were placed: the ontology as drawn is the layout of its pins now, so a later
-    /// rebuild of the same ontology (a count, an expansion elsewhere) keeps every type where it
-    /// is, rather than laying the rest out again around the new pins.
-    fn keep_ontology_as_drawn(&mut self) {
-        if self.mode != Mode::Schema {
-            return;
-        }
-        let Some((nodes, _, positions)) = &mut self.ontology_layout else {
-            return;
-        };
-        if nodes.len() != self.positions.len() || nodes.len() != self.scene.nodes.len() {
-            return;
-        }
-        for (node, drawn) in nodes.iter_mut().zip(&self.scene.nodes) {
-            node.pinned = pin_key(&drawn.id).and_then(|key| self.pinned.get(&key).copied());
-        }
-        *positions = self.positions.as_ref().clone();
     }
 
     // ---- the right-click menu ----
@@ -1644,7 +1499,6 @@ impl GraphCanvas {
         };
         let names = match &node.kind {
             SceneKind::Node { node, .. } => self.session.read(cx).type_naming(&node.type_name, cx),
-            SceneKind::Type { .. } => self.session.read(cx).type_naming(&node.label, cx),
             _ => None,
         };
         ContextMenu::build(window, cx, move |mut menu, _, _| {
@@ -1807,33 +1661,6 @@ impl GraphCanvas {
                         }),
                     );
                 }
-                SceneKind::Type { .. } => {
-                    let type_name = node.label.clone();
-                    menu = menu
-                        .entry(
-                            "Browse rows",
-                            None,
-                            open_action(studio_actions::graph::BrowseType {
-                                type_name: type_name.clone(),
-                            }),
-                        )
-                        .entry(
-                            "Open table",
-                            None,
-                            open_action(OpenType {
-                                type_name,
-                                at_commit: None,
-                                filter_id: None,
-                                via: None,
-                                preview: false,
-                            }),
-                        )
-                        .when_some(names.clone(), |menu, names| {
-                            menu.submenu("Name nodes by", move |menu, _, _| {
-                                studio_ui::node_names::add_to(menu, &names)
-                            })
-                        });
-                }
             }
             if pinned {
                 let id = node.id.clone();
@@ -1948,7 +1775,6 @@ impl GraphCanvas {
                 self.pinned.insert(key, *position);
             }
         }
-        self.keep_ontology_as_drawn();
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
     }
@@ -2055,9 +1881,7 @@ impl GraphCanvas {
             return;
         };
         let id = self.scene.nodes[index].id.clone();
-        if !matches!(id, SceneId::Type(_)) {
-            self.close(&id, cx);
-        }
+        self.close(&id, cx);
     }
 
     /// The node a node was reached from, past its hub: what `[` walks back to.
@@ -2175,7 +1999,7 @@ impl GraphCanvas {
             here: studio_ui::ds::surface::here(cx),
             here_halo: studio_ui::ds::surface::here_halo(cx),
             grid_dot: studio_ui::ds::surface::grid_dot(cx),
-            label_fill: studio_ui::ds::surface::canvas_label(cx),
+            canvas: studio_ui::ds::surface::canvas(cx),
             hub_dot: studio_ui::ds::surface::canvas_hub(cx),
             font: theme::theme_settings(cx).ui_font(cx).clone(),
         };
@@ -2201,6 +2025,7 @@ impl GraphCanvas {
         let opened = self.opened_index();
         let bounds_cell = self.bounds.clone();
         let chips = self.chips.clone();
+        let half_widths = self.half_widths.clone();
         canvas(
             move |bounds, window, _cx| {
                 // A new size is fitted on the next frame, once the view knows it. Only this view
@@ -2219,9 +2044,13 @@ impl GraphCanvas {
                         .iter()
                         .map(|world| to_screen(*world, bounds, center, zoom))
                         .collect();
+                    let lines = paint::Lines {
+                        half_widths: &half_widths,
+                        origin: to_screen(Vec2::default(), bounds, center, zoom),
+                    };
                     paint::paint(
-                        &scene, &texts, &screen, bounds, zoom, selected, &marked, hovered, opened,
-                        &palette, &chips, window, cx,
+                        &scene, &texts, &screen, &lines, bounds, zoom, selected, &marked, hovered,
+                        opened, &palette, &chips, window, cx,
                     );
                 });
             },
@@ -2253,29 +2082,8 @@ impl GraphCanvas {
 
     /// The caption, bottom left: what is drawn, and what a click does.
     fn render_caption(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let text = match self.mode {
-            Mode::Schema => {
-                let schema = self.session.read(cx).schema_model();
-                let types = schema.as_ref().map_or(0, |s| s.nodes.len());
-                let edges = schema.as_ref().map_or(0, |s| s.edges.len());
-                format!(
-                    "{types} {} · {edges} {} · click a type to browse it, G on a row explores it",
-                    if types == 1 { "type" } else { "types" },
-                    if edges == 1 {
-                        "relationship"
-                    } else {
-                        "relationships"
-                    }
-                )
-            }
-            Mode::Explore | Mode::Results => {
-                let nodes = self.node_count;
-                format!(
-                    "{nodes} {} · click to open · ⇧-click to inspect · ⇧-drag to select",
-                    if nodes == 1 { "node" } else { "nodes" }
-                )
-            }
-        };
+        // What a click does; the summary at the top says what is drawn.
+        let text = "click to open · ⇧-click to inspect · ⇧-drag to select";
         div()
             .absolute()
             .bottom(px(space::LG))
@@ -2299,15 +2107,8 @@ impl GraphCanvas {
     fn render_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let exploration = self.exploration.read(cx);
         let state = exploration.state();
-        let has_root = exploration.root().is_some();
         let newer = exploration.newer_available();
         let summary = match self.mode {
-            Mode::Schema => {
-                let schema = self.session.read(cx).schema_model();
-                let types = schema.as_ref().map_or(0, |s| s.nodes.len());
-                let edges = schema.as_ref().map_or(0, |s| s.edges.len());
-                format!("{types} types · {edges} relationships")
-            }
             Mode::Results => {
                 let count = self.scene.nodes.len();
                 let noun = if count == 1 { "node" } else { "nodes" };
@@ -2339,9 +2140,9 @@ impl GraphCanvas {
         };
         let capped = self.scene.capped.clone();
         let cap = self.node_cap(cx);
-        // Floating pills are white cards in the light theme, like the chips.
-        // The canvas's floating controls: the mode switch (the segmented control), search and
-        // zoom read as one family, each concentric around what it holds.
+        // Floating pills are white cards in the light theme, like the chips. The canvas's
+        // floating controls (what is drawn, search and zoom) read as one family, each
+        // concentric around what it holds.
         let panel = |id: &'static str| studio_ui::ds::float_bar(id, cx);
         let mode = self.mode;
         v_flex()
@@ -2354,49 +2155,14 @@ impl GraphCanvas {
                 h_flex()
                     .w_full()
                     .gap(px(space::MD))
+                    // What is drawn, in a floating pill: the walk's root and its nodes, or the
+                    // query.
                     .child(
-                        // The face switch is the design system's segmented control, floating.
-                        if mode == Mode::Results {
-                            panel("canvas-mode")
-                                .child(
-                                    div().px(px(space::MD)).child(
-                                        studio_ui::ds::text::muted(summary)
-                                            .single_line(),
-                                    ),
-                                )
-                                .into_any_element()
-                        } else {
-                            panel("canvas-mode")
-                                .child(
-                                    studio_ui::ds::segment(
-                                        "mode-schema",
-                                        "Ontology",
-                                        mode == Mode::Schema,
-                                        cx,
-                                    )
-                                    .tooltip(Tooltip::text("The types and their relationships"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.set_ontology(true, cx)
-                                    })),
-                                )
-                                .child(
-                                    studio_ui::ds::segment(
-                                        "mode-explore",
-                                        "Canvas",
-                                        mode == Mode::Explore,
-                                        cx,
-                                    )
-                                    .tooltip(Tooltip::text(if has_root {
-                                        "The nodes walked from a node, here and in the tree"
-                                    } else {
-                                        "Walk the graph from a node: search for one, or G on a table row"
-                                    }))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.set_ontology(false, cx)
-                                    })),
-                                )
-                                .into_any_element()
-                        },
+                        panel("canvas-summary").child(
+                            div()
+                                .px(px(space::MD))
+                                .child(studio_ui::ds::text::muted(summary).single_line()),
+                        ),
                     )
                     .when(newer && mode != Mode::Results, |d| {
                         d.child(
@@ -2417,12 +2183,8 @@ impl GraphCanvas {
                             .px(px(space::LG))
                             .gap(px(space::MD))
                             .cursor_pointer()
-                            .child(
-                                studio_ui::ds::icon::lead(IconName::MagnifyingGlass),
-                            )
-                            .child(
-                                studio_ui::ds::text::muted("Search nodes…"),
-                            )
+                            .child(studio_ui::ds::icon::lead(IconName::MagnifyingGlass))
+                            .child(studio_ui::ds::text::muted("Search nodes…"))
                             .child(ui::KeyBinding::for_action(
                                 &studio_actions::workspace::GoTo,
                                 cx,
@@ -2437,17 +2199,22 @@ impl GraphCanvas {
                         panel("canvas-zoom")
                             .when(!self.pinned.is_empty(), |panel| {
                                 panel.child(
-                                    studio_ui::ds::bar_icon_button("reset-layout", IconName::RotateCcw)
-                                        .tooltip(|_window, cx| {
-                                            Tooltip::for_action(
-                                                "Reset the layout: forget the nodes you placed",
-                                                &ResetLayout,
-                                                cx,
-                                            )
-                                        })
-                                        .on_click(cx.listener(|this, _, window, cx| {
+                                    studio_ui::ds::bar_icon_button(
+                                        "reset-layout",
+                                        IconName::RotateCcw,
+                                    )
+                                    .tooltip(|_window, cx| {
+                                        Tooltip::for_action(
+                                            "Reset the layout: forget the nodes you placed",
+                                            &ResetLayout,
+                                            cx,
+                                        )
+                                    })
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| {
                                             this.reset_layout(&ResetLayout, window, cx)
-                                        })),
+                                        },
+                                    )),
                                 )
                             })
                             .child(
@@ -2482,35 +2249,24 @@ impl GraphCanvas {
             .children(root_error.map(|message| {
                 h_flex().child(
                     panel("canvas-error")
-                        .child(
-                            studio_ui::ds::icon::lead(IconName::Warning)
-                                .color(Color::Error),
-                        )
-                        .child(
-                            studio_ui::ds::text::error(message),
-                        )
-                        .child(
-                            studio_ui::ds::bar_button("canvas-retry", "Retry")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.exploration.update(cx, |e, cx| {
-                                        e.retry(&graph_store::LoadTarget::Root, cx)
-                                    });
-                                })),
-                        ),
+                        .child(studio_ui::ds::icon::lead(IconName::Warning).color(Color::Error))
+                        .child(studio_ui::ds::text::error(message))
+                        .child(studio_ui::ds::bar_button("canvas-retry", "Retry").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.exploration.update(cx, |e, cx| {
+                                    e.retry(&graph_store::LoadTarget::Root, cx)
+                                });
+                            }),
+                        )),
                 )
             }))
             .children(capped.map(|(hidden, type_name)| {
                 h_flex().child(
                     panel("canvas-capped")
-                        .child(
-                            studio_ui::ds::icon::lead(IconName::Warning)
-                                .color(Color::Warning),
-                        )
-                        .child(
-                            studio_ui::ds::text::body(format!(
-                                "Too many nodes to draw · {hidden} not shown (limit {cap})"
-                            )),
-                        )
+                        .child(studio_ui::ds::icon::lead(IconName::Warning).color(Color::Warning))
+                        .child(studio_ui::ds::text::body(format!(
+                            "Too many nodes to draw · {hidden} not shown (limit {cap})"
+                        )))
                         .child(
                             studio_ui::ds::bar_button("canvas-tree", "Show in tree")
                                 .style(ButtonStyle::Outlined)
@@ -2656,7 +2412,6 @@ impl Render for GraphCanvas {
             }
             Loadable::Loaded(_) if self.scene.nodes.is_empty() => Some(
                 match self.mode {
-                    Mode::Schema => studio_ui::ds::empty_state(IconName::GitGraph, "No node types"),
                     Mode::Explore => studio_ui::ds::loading_state("Laying out…"),
                     Mode::Results => {
                         studio_ui::ds::empty_state(IconName::Hash, "No nodes in the result")
@@ -2792,8 +2547,12 @@ mod tests {
                 nodes: names
                     .iter()
                     .map(|name| crate::model::SceneNode {
-                        id: SceneId::Type((*name).into()),
-                        kind: SceneKind::Type { count: None },
+                        id: SceneId::Node(NodeRef::new("T", *name)),
+                        kind: SceneKind::Node {
+                            node: NodeRef::new("T", *name),
+                            root: false,
+                            expanded: false,
+                        },
                         label: (*name).into(),
                         color_key: (*name).into(),
                         parent: None,
@@ -2854,15 +2613,10 @@ mod tests {
             id: "person-000001".into(),
         });
         let mut pinned = HashMap::new();
-        pinned.insert(
-            pin_key(&SceneId::Type("Person".into())).unwrap(),
-            Vec2::new(12.4, -30.6),
-        );
-        pinned.insert(pin_key(&node).unwrap(), Vec2::new(-5., 7.));
+        pinned.insert(pin_key(&node).unwrap(), Vec2::new(-5.4, 7.4));
         let saved = pins_to_json(&pinned);
         let back = pins_from_json(&saved);
-        assert_eq!(back.len(), 2);
-        assert_eq!(back["type:Person"], Vec2::new(12., -31.));
+        assert_eq!(back.len(), 1);
         assert_eq!(back["node:Person/person-000001"], Vec2::new(-5., 7.));
         // A relationship pill is placed by hand like a node; "+K more" follows its pill.
         let hub = SceneId::Hub(GroupKey::new(
@@ -2910,13 +2664,17 @@ mod tests {
         (canvas, exploration, ada)
     }
 
-    fn type_scene(names: &[&str]) -> Scene {
+    fn scene_of(names: &[&str]) -> Scene {
         Scene {
             nodes: names
                 .iter()
                 .map(|name| crate::model::SceneNode {
-                    id: SceneId::Type((*name).into()),
-                    kind: SceneKind::Type { count: None },
+                    id: SceneId::Node(NodeRef::new("T", *name)),
+                    kind: SceneKind::Node {
+                        node: NodeRef::new("T", *name),
+                        root: false,
+                        expanded: false,
+                    },
                     label: (*name).into(),
                     color_key: (*name).into(),
                     parent: None,
@@ -2939,14 +2697,14 @@ mod tests {
         let (canvas, _, _) = canvas_of_ada(cx);
         canvas.update(cx, |canvas, cx| {
             canvas.apply_layout(
-                type_scene(&["A", "B"]),
+                scene_of(&["A", "B"]),
                 vec![10.; 2],
                 vec![Vec2::default(); 2],
                 cx,
             );
             canvas.hovered = Some(1);
             canvas.apply_layout(
-                type_scene(&["New", "A", "B"]),
+                scene_of(&["New", "A", "B"]),
                 vec![10.; 3],
                 vec![Vec2::default(); 3],
                 cx,
@@ -2965,7 +2723,7 @@ mod tests {
                 scene: canvas.scene.clone(),
             });
             canvas.apply_layout(
-                type_scene(&["Z", "New", "A", "B"]),
+                scene_of(&["Z", "New", "A", "B"]),
                 vec![10.; 4],
                 vec![Vec2::default(); 4],
                 cx,
@@ -3004,29 +2762,8 @@ mod tests {
         assert!(notified.load(Ordering::SeqCst) > 0);
     }
 
-    /// The ontology keeps its own selection when the tree's moves; back on the explorer, the
-    /// canvas shows the tree's.
-    #[gpui::test]
-    async fn the_ontology_keeps_its_selection_from_the_tree(cx: &mut gpui::TestAppContext) {
-        let (canvas, exploration, ada) = canvas_of_ada(cx);
-        let person = SceneId::Type("Person".into());
-        canvas.update(cx, |canvas, _| canvas.selected = Some(person.clone()));
-        exploration.update(cx, |exploration, cx| exploration.select(None, cx));
-        exploration.update(cx, |exploration, cx| {
-            exploration.select(Some(ExplorePath::root()), cx)
-        });
-        cx.run_until_parked();
-        canvas.read_with(cx, |canvas, _| {
-            assert_eq!(canvas.selected, Some(person.clone()))
-        });
-        canvas.update(cx, |canvas, cx| canvas.set_ontology(false, cx));
-        canvas.read_with(cx, |canvas, _| {
-            assert_eq!(canvas.selected, Some(SceneId::Node(ada)))
-        });
-    }
-
-    /// Show on canvas, from the ontology, of a node the exploration shows selects it there;
-    /// it does not start the exploration again at it, though the ontology drawn has no nodes.
+    /// Show on canvas of a node the exploration shows selects it there: it does not start the
+    /// exploration again at it.
     #[gpui::test]
     async fn showing_a_shown_node_keeps_the_exploration(cx: &mut gpui::TestAppContext) {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3052,12 +2789,10 @@ mod tests {
                 }
             })
         });
-        assert!(canvas.read_with(cx, |canvas, _| canvas.show_schema));
         canvas.update(cx, |canvas, cx| canvas.show_node(ada.clone(), cx));
         cx.run_until_parked();
         assert_eq!(changes.load(Ordering::SeqCst), 0, "not rooted again");
         canvas.read_with(cx, |canvas, _| {
-            assert!(!canvas.show_schema);
             assert!(canvas.scene.index_of(&SceneId::Node(ada)).is_some());
         });
     }

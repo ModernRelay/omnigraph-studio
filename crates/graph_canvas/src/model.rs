@@ -1,10 +1,8 @@
-//! What the canvas draws, without GPUI: the schema graph for the landing view, and the
-//! exploration as nodes, hubs (one per opened relationship group) and "+K more" chips, each
-//! node drawn once.
+//! What the canvas draws, without GPUI: the exploration as nodes, hubs (one per opened
+//! relationship group) and "+K more" chips, each node drawn once, and a query's result nodes.
 
 use std::collections::{HashMap, HashSet};
 
-use gq_language::SchemaModel;
 use graph_store::{Entry, EntryKind, ExplorePath, ExploreState, GroupKey, Loadable, NodeRef};
 
 /// Neighbours a hub shows before "+K more", and how many each click on it adds.
@@ -17,7 +15,6 @@ pub const NODE_CAP: usize = 2_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SceneId {
-    Type(String),
     Node(NodeRef),
     Hub(GroupKey),
     More(GroupKey),
@@ -25,8 +22,6 @@ pub enum SceneId {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SceneKind {
-    /// A node type in the schema view, with its row count when known.
-    Type { count: Option<i64> },
     /// A node of the graph. `root` marks where the exploration started.
     Node {
         node: NodeRef,
@@ -103,7 +98,6 @@ pub fn open_paths(entries: &[Entry], state: &ExploreState, ids: &[SceneId]) -> V
             SceneId::Hub(key) | SceneId::More(key) => {
                 hubs.insert(key);
             }
-            SceneId::Type(_) => {}
         }
     }
     entries
@@ -120,44 +114,6 @@ pub fn open_paths(entries: &[Entry], state: &ExploreState, ids: &[SceneId]) -> V
         })
         .map(|entry| entry.path.clone())
         .collect()
-}
-
-/// The schema graph: one node per type, sorted by name, one edge per edge type.
-pub fn schema_scene(schema: &SchemaModel, count_of: impl Fn(&str) -> Option<i64>) -> Scene {
-    let mut names: Vec<&str> = schema.nodes.iter().map(|n| n.name.as_str()).collect();
-    names.sort_unstable();
-    let nodes: Vec<SceneNode> = names
-        .iter()
-        .map(|name| {
-            let count = count_of(name);
-            SceneNode {
-                id: SceneId::Type((*name).to_owned()),
-                kind: SceneKind::Type { count },
-                label: (*name).to_owned(),
-                color_key: (*name).to_owned(),
-                parent: None,
-                path: None,
-            }
-        })
-        .collect();
-    let index = |name: &str| names.iter().position(|n| *n == name);
-    let edges = schema
-        .edges
-        .iter()
-        .filter_map(|edge| {
-            Some(SceneEdge {
-                from: index(&edge.from)?,
-                to: index(&edge.to)?,
-                color_key: edge.name.clone(),
-                label: Some(edge.name.clone()),
-            })
-        })
-        .collect();
-    Scene {
-        nodes,
-        edges,
-        capped: None,
-    }
 }
 
 /// A query result as the canvas draws it: each node once, a line between the nodes of a row.
@@ -507,7 +463,6 @@ pub fn explore_scene(
             let type_name = match id {
                 SceneId::Node(node) => node.type_name.as_str(),
                 SceneId::Hub(key) | SceneId::More(key) => key.group.other_type.as_str(),
-                SceneId::Type(name) => name.as_str(),
             };
             *counts.entry(type_name).or_default() += 1;
         }
@@ -573,6 +528,7 @@ fn push_edge(scene: &mut Scene, lines: &mut HashSet<(usize, usize)>, from: usize
 #[cfg(test)]
 mod tests {
     use gq_language::Direction;
+    use gq_language::SchemaModel;
 
     /// Of types with as many nodes left out, the banner names the first by name, whatever
     /// order they were counted in.
@@ -597,21 +553,6 @@ mod tests {
 
     fn person(id: &str) -> NodeRef {
         NodeRef::new("Person", id)
-    }
-
-    #[test]
-    fn the_schema_scene_is_sorted_by_name_with_one_edge_per_edge_type() {
-        let schema = SchemaModel::parse(SCHEMA).unwrap();
-        let scene = schema_scene(&schema, |name| (name == "Person").then_some(200));
-        let names: Vec<&str> = scene.nodes.iter().map(|n| n.label.as_str()).collect();
-        assert_eq!(names, ["Company", "Person"]);
-        assert_eq!(scene.edges.len(), 2);
-        let knows = scene
-            .edges
-            .iter()
-            .find(|e| e.label.as_deref() == Some("Knows"))
-            .unwrap();
-        assert_eq!((knows.from, knows.to), (1, 1));
     }
 
     /// Ada knows 20 people; Bob, the first, knows Ada back.
