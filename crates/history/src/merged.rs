@@ -17,8 +17,9 @@
 //! until the page that reaches its time is read. Once their merged-in commits are read, the rows
 //! drawn are the newest of the whole history, and a page read adds rows below them. A merged
 //! parent not read yet, one the server does not have (a deleted branch's commit, cleaned up),
-//! or, for a token refused commits by id, one the other branches' pages read do not hold,
-//! draws as a stub, which says which ([`Absent`]).
+//! or, for a token refused commits by id, one the other branches' pages read do not hold
+//! (perhaps on a branch whose page could not be read), draws as a stub, which says which
+//! ([`Absent`]).
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -48,6 +49,9 @@ pub enum Absent {
     NotHad,
     /// The other branches' pages read for a token refused commits by id do not hold it.
     NotListed,
+    /// Those pages do not hold it, and some branch's page could not be read: it may be there,
+    /// so it is answered again once that page is read.
+    Unlisted,
 }
 
 /// What History draws from what it has read ([`HistoryRead::draw`]).
@@ -119,10 +123,24 @@ impl HistoryRead {
         self.missing.clear();
     }
 
+    /// Forgets which merged-in commits a listing that could not be read left unanswered
+    /// ([`Absent::Unlisted`]), so they are asked for again.
+    pub fn forget_unlisted(&mut self) {
+        self.missing.retain(|_, absent| *absent != Absent::Unlisted);
+    }
+
     /// Answers the merged-in commits wanted from `listed`, commits by id from the other
     /// branches' listings, then those they name in turn, as far as the pages read reach. An id
-    /// `listed` does not hold draws as a stub.
-    pub fn take_from(&mut self, listed: &HashMap<String, CommitOutput>) {
+    /// `listed` does not hold draws as a stub: not listed when every branch's page was read
+    /// (`complete`), else perhaps on a branch whose page was not, and answered again when
+    /// `listed` holds more.
+    pub fn take_from(&mut self, listed: &HashMap<String, CommitOutput>, complete: bool) {
+        self.forget_unlisted();
+        let absent = if complete {
+            Absent::NotListed
+        } else {
+            Absent::Unlisted
+        };
         // Each pass answers every id wanted, so the passes end.
         loop {
             let wanted = self.draw().wanted;
@@ -133,7 +151,7 @@ impl HistoryRead {
                 match listed.get(&id) {
                     Some(commit) => self.merged_read(id, Some(commit.clone())),
                     None => {
-                        self.missing.insert(id, Absent::NotListed);
+                        self.missing.insert(id, absent);
                     }
                 }
             }
@@ -420,13 +438,65 @@ mod tests {
         .into_iter()
         .map(|c| (c.graph_commit_id.clone(), c))
         .collect();
-        read.take_from(&listed);
+        read.take_from(&listed, true);
         let drawn = read.draw();
         assert_eq!(ids(&drawn), ["m4", "b3", "m3", "b2", "m2"]);
         assert!(drawn.wanted.is_empty());
         assert_eq!(read.merged_held(), 3, "b1 is kept, held back");
         assert_eq!(read.absent("gone"), Some(Absent::NotListed), "says why");
         assert_eq!(read.absent("b3"), None);
+    }
+
+    /// While some branch's page could not be read, an id the pages read do not hold may be on
+    /// that branch: it says so, and is answered again once that page is read, there or not.
+    #[test]
+    fn a_commit_a_page_not_read_may_hold_is_answered_once_it_is_read() {
+        let mut read = HistoryRead::default();
+        read.first_page(
+            vec![
+                commit("m3", 30, Some("m2"), Some("b2")),
+                commit("m2", 20, Some("m1"), Some("gone")),
+                commit("m1", 10, None, None),
+            ],
+            true,
+            false,
+        );
+        read.take_from(&HashMap::new(), false);
+        assert_eq!(ids(&read.draw()), ["m3", "m2", "m1"]);
+        assert_eq!(read.absent("b2"), Some(Absent::Unlisted));
+        assert_eq!(read.absent("gone"), Some(Absent::Unlisted));
+        // The page read now holds b2 and the commit it names.
+        let listed: HashMap<String, CommitOutput> = [
+            commit("b2", 25, Some("b1"), None),
+            commit("b1", 15, Some("m1"), None),
+        ]
+        .into_iter()
+        .map(|c| (c.graph_commit_id.clone(), c))
+        .collect();
+        read.take_from(&listed, true);
+        let drawn = read.draw();
+        assert_eq!(ids(&drawn), ["m3", "b2", "m2", "b1", "m1"]);
+        assert!(drawn.wanted.is_empty());
+        assert_eq!(read.absent("b2"), None);
+        assert_eq!(read.absent("gone"), Some(Absent::NotListed));
+        // A load forgets what a page not read left unanswered, and nothing else: that commit is
+        // wanted again.
+        let mut read = HistoryRead::default();
+        read.first_page(
+            vec![
+                commit("m2", 20, Some("m1"), Some("x1")),
+                commit("m1", 10, None, Some("gone")),
+            ],
+            true,
+            false,
+        );
+        read.merged_read("gone".into(), None);
+        read.take_from(&HashMap::new(), false);
+        assert_eq!(read.absent("x1"), Some(Absent::Unlisted));
+        read.forget_unlisted();
+        assert_eq!(read.absent("x1"), None);
+        assert_eq!(read.absent("gone"), Some(Absent::NotHad));
+        assert_eq!(read.draw().wanted, ["x1"]);
     }
 
     #[test]

@@ -73,10 +73,17 @@ const GRAPH_PADDING: f32 = studio_ui::ds::space::MD;
 /// Changes read per commit for a row's counts.
 const ROW_COUNT_PAGE: u32 = 500;
 
+/// The read of the listing's first page.
 enum State {
+    /// Being read. Commits read before stay shown meanwhile.
     Loading,
     Ready,
+    /// It could not be read and no commit is shown: why takes the list's place.
     Failed(SharedString),
+    /// Read again (a commit landing, a Refresh), it could not be read while commits were shown.
+    /// They stay as read, and their pages and the commits merged into them go on being read;
+    /// the toolbar says why and offers Try again ([`HistoryView::retry`]).
+    Stale(SharedString),
 }
 
 /// The read of the listing's next page.
@@ -113,6 +120,76 @@ impl Listing {
             complete: next.is_none(),
             next,
         }
+    }
+}
+
+/// Whether a read that failed with `error` would fail so again: the server refused it with a
+/// 4xx other than a timeout (408) or too many requests (429). A read that did not complete, or
+/// met a busy or failing server, may pass when sent again.
+fn refused_again(error: &ReadError) -> bool {
+    matches!(
+        error,
+        ReadError::Refused(refusal)
+            if (400..500).contains(&refusal.status) && !matches!(refusal.status, 408 | 429)
+    )
+}
+
+/// The other branches' pages read for a token the server refuses commits by id
+/// ([`HistoryView::read_listed`]). A branch whose page could not be read is kept out of
+/// `commits`, so a merged-in commit none of the pages read holds is not taken for one no branch
+/// holds ([`Absent::Unlisted`]).
+#[derive(Clone, Default)]
+struct Listed {
+    /// The commits of the pages read, by id.
+    commits: Arc<HashMap<String, CommitOutput>>,
+    /// The branches whose page could not be read in passing (a timeout, a 5xx, a 429), and
+    /// when the last read of them failed: they alone are read again once [`MERGED_RETRY_AFTER`]
+    /// has passed, while a drawn row names a merged-in commit their pages may hold.
+    failed: Vec<String>,
+    failed_at: Option<Instant>,
+    /// The branches whose page the server refused ([`refused_again`]: a branch the credential
+    /// may not read, one deleted since the branch list was read). Read again at the next load
+    /// or Refresh, not before, as the refusal would stand.
+    refused: Vec<String>,
+}
+
+impl Listed {
+    /// Every branch's page was read.
+    fn complete(&self) -> bool {
+        self.failed.is_empty() && self.refused.is_empty()
+    }
+
+    /// Whether the branches whose page failed in passing are read again at `now`.
+    fn due(&self, now: Instant) -> bool {
+        !self.failed.is_empty()
+            && self
+                .failed_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= MERGED_RETRY_AFTER)
+    }
+
+    /// Why a merged-in commit the pages read do not hold is not drawn while some page could not
+    /// be read: it may be there.
+    fn why_unlisted(&self) -> String {
+        let names: Vec<&str> = self
+            .failed
+            .iter()
+            .chain(&self.refused)
+            .map(String::as_str)
+            .collect();
+        let lists = match names.as_slice() {
+            [one] => format!("Branch {one}'s list"),
+            more => format!("The lists of branches {}", more.join(", ")),
+        };
+        let again = if self.failed.is_empty() {
+            "Refresh asks for it again."
+        } else {
+            "It is asked for again while this row shows."
+        };
+        format!(
+            "{lists} could not be read, and the merged commit is not among the newest {} commits \
+             of the other branches read. {again}",
+            group_digits(LISTED_PAGE as usize)
+        )
     }
 }
 
@@ -192,9 +269,10 @@ pub struct HistoryView {
     /// Whether merged-in commits are read by id. The server checks that route against a read
     /// grant on every branch, so it refuses (403) a token whose grant names branches; merged-in
     /// commits then come from the other branches' listings, which it checks branch by branch,
-    /// a page of [`LISTED_PAGE`] each, read once into `listed`, until the next load or Refresh.
+    /// a page of [`LISTED_PAGE`] each, read once into `listed`, until the next load or Refresh;
+    /// a page that could not be read in passing is read again alone ([`Listed::failed`]).
     by_id: bool,
-    listed: Option<Arc<HashMap<String, CommitOutput>>>,
+    listed: Option<Listed>,
     /// The commits drawn, newest first: the branch's own and those merged in.
     commits: Vec<CommitOutput>,
     /// What the search finds each commit by, made with the list.
@@ -469,24 +547,41 @@ impl HistoryView {
     }
 
     /// The branch list changed: the tags follow the branches made and gone. A history that
-    /// could not be read is read again, as its branch may have been made since.
+    /// could not be read is read again, as its branch may have been made since; one whose first
+    /// page could not be read again is read again as Try again reads it.
     fn branches_changed(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.state, State::Failed(_)) {
-            self.load(false, cx);
+        match self.state {
+            State::Failed(_) => self.load(false, cx),
+            State::Stale(_) => self.retry(cx),
+            State::Loading | State::Ready => {}
         }
         self.load_heads(false, cx);
     }
 
+    /// Try again, after the first page could not be read again while commits were shown: reads
+    /// it again from the branch's head, and the pages read stay below it when it reaches the
+    /// head they were read from, as for a commit landing.
+    fn retry(&mut self, cx: &mut Context<Self>) {
+        self.load(true, cx);
+    }
+
+    /// Whether the commits read are shown and go on being read: the first page was read, or
+    /// a read of it again failed while they were shown.
+    fn shown(&self) -> bool {
+        matches!(self.state, State::Ready | State::Stale(_))
+    }
+
     /// Reads the branch's first page and lays it out, then the merged-in commits it names. With
     /// `landed`, the pages read stay below it when it reaches the head they were read from
-    /// ([`HistoryRead::first_page`]), and go on continuing their listing.
+    /// ([`HistoryRead::first_page`]), and go on continuing their listing. Until it is read,
+    /// what was read stays as it is: a read that fails changes none of it.
     fn load(&mut self, landed: bool, cx: &mut Context<Self>) {
         self.state = State::Loading;
-        // A next page under way continues a listing this read may replace.
-        self.more = More::Idle;
-        self.merged_failed.clear();
-        self.by_id = true;
-        self.listed = None;
+        // A next page or a walk of merged-in commits under way ends here (`_task` is
+        // replaced); one that failed stays failed, its row saying so.
+        if matches!(self.more, More::Reading) {
+            self.more = More::Idle;
+        }
         let page = self.session.update(cx, |session, cx| {
             session.commit_page(&self.branch, PAGE, None, cx)
         });
@@ -507,7 +602,14 @@ impl HistoryView {
             Ok(page) => page,
             Err(error) => {
                 this.update(cx, |this, cx| {
-                    this.state = State::Failed(error.to_string().into());
+                    let error = error.to_string().into();
+                    // Commits shown stay as read (constitution V): only a history showing none
+                    // gives the list's place to why.
+                    this.state = if this.commits.is_empty() {
+                        State::Failed(error)
+                    } else {
+                        State::Stale(error)
+                    };
                     cx.notify();
                 })
                 .ok();
@@ -524,6 +626,9 @@ impl HistoryView {
         let (arranged, kept) = cx
             .background_spawn(async move {
                 let mut read = HistoryRead::clone(&held);
+                // The other branches' pages are read again after this one, so what a page that
+                // could not be read left unanswered is asked for again.
+                read.forget_unlisted();
                 let kept = read.first_page(page.commits, complete, landed);
                 (arrange(read), kept)
             })
@@ -533,6 +638,13 @@ impl HistoryView {
                 this.next_page = listing.next;
                 this.listing_head = listing.head;
             }
+            this.state = State::Ready;
+            this.more = More::Idle;
+            // The merged-in commits this page names are read afresh: by id first, and those
+            // whose read failed without waiting.
+            this.merged_failed.clear();
+            this.by_id = true;
+            this.listed = None;
             this.take(arranged, cx);
         });
         if laid_out.is_ok() {
@@ -545,7 +657,7 @@ impl HistoryView {
     /// one failed until it is tried again. It takes the place of a walk of merged-in commits
     /// under way, which the walk after the page goes on with.
     fn load_next(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.state, State::Ready) || !matches!(self.more, More::Idle) {
+        if !self.shown() || !matches!(self.more, More::Idle) {
             return;
         }
         let Some(token) = self.next_page.clone() else {
@@ -575,12 +687,7 @@ impl HistoryView {
             Err(error) => {
                 // A continuation refused (its token rejected, say) is refused again when sent
                 // again; one that did not complete, or met a busy server, is sent again.
-                let restart = matches!(
-                    &error,
-                    ReadError::Refused(refusal)
-                        if (400..500).contains(&refusal.status)
-                            && !matches!(refusal.status, 408 | 429)
-                );
+                let restart = refused_again(&error);
                 this.update(cx, |this, cx| {
                     this.more = More::Failed {
                         error: error.to_string().into(),
@@ -653,10 +760,11 @@ impl HistoryView {
 
     /// Goes on reading merged-in commits once the rows drawn name one not read yet, when
     /// nothing is being read: those a walk left for want of [`MERGED_READS`], read as the person
-    /// scrolls to them, and those whose read failed [`MERGED_RETRY_AFTER`] ago. A walk asks
+    /// scrolls to them, and those whose read failed [`MERGED_RETRY_AFTER`] ago, or whose
+    /// branch's page, read for a token refused commits by id, failed so long ago. A walk asks
     /// for none it asked for within that time, so the walks end once the rows drawn name none.
     fn want_merged(&mut self, rows: &Range<usize>, cx: &mut Context<Self>) {
-        if self._task.is_some() || !matches!(self.state, State::Ready) {
+        if self._task.is_some() || !self.shown() {
             return;
         }
         // From the listings, which cannot be read before the branch list is.
@@ -669,10 +777,14 @@ impl HistoryView {
             .commits
             .get(rows.start..rows.end.min(self.commits.len()))
             .unwrap_or_default();
+        let lists_due = !self.by_id && self.listed.as_ref().is_some_and(|l| l.due(now));
         let names_unread = drawn
             .iter()
             .flat_map(|c| c.parent_commit_id.iter().chain(&c.merged_parent_commit_id))
-            .any(|id| self.wanted.contains(id) && self.may_ask(id, now));
+            .any(|id| {
+                (self.wanted.contains(id) && self.may_ask(id, now))
+                    || (lists_due && self.read.absent(id) == Some(Absent::Unlisted))
+            });
         if names_unread {
             self._task = Some(cx.spawn(async move |this, cx| {
                 Self::read_merged(&this, cx).await;
@@ -832,19 +944,19 @@ impl HistoryView {
     /// Answers the merged-in commits wanted from the other branches' listings, for a token the
     /// server refuses commits by id: the newest [`LISTED_PAGE`] commits of up to
     /// [`OTHER_BRANCHES`] live branches, one page each, read once into `listed`, then laid out
-    /// once. A commit none of those pages holds draws as a stub, saying so
-    /// ([`Absent::NotListed`]).
+    /// once. A commit none of those pages holds draws as a stub, saying so: not listed
+    /// ([`Absent::NotListed`]), or, while some branch's page could not be read, perhaps on that
+    /// branch ([`Absent::Unlisted`]). A page that could not be read in passing is read again,
+    /// it alone, once [`MERGED_RETRY_AFTER`] has passed ([`Self::want_merged`]).
     async fn read_listed(this: &WeakEntity<Self>, cx: &mut AsyncApp) {
-        let Ok(held) = this.update(cx, |this, _| this.listed.clone()) else {
-            return;
-        };
-        let listed = match held {
-            Some(listed) => listed,
-            None => {
-                let Ok(Some(reads)) = this.update(cx, |this, cx| {
+        // The pages to read: every other branch's the first time, then those that failed in
+        // passing, once their wait is over.
+        let Ok(Some((mut listed, reads, now))) = this.update(cx, |this, cx| {
+            let now = cx.background_executor().now();
+            let names: Vec<String> = match &this.listed {
+                None => {
                     let branch = this.branch.clone();
-                    let names: Vec<String> = this
-                        .session
+                    this.session
                         .read(cx)
                         .branches
                         .loaded()?
@@ -852,56 +964,67 @@ impl HistoryView {
                         .filter(|name| **name != branch)
                         .take(OTHER_BRANCHES)
                         .cloned()
-                        .collect();
-                    Some(
-                        names
-                            .into_iter()
-                            .map(|name| {
-                                this.session.update(cx, |session, cx| {
-                                    session.commit_page(&name, LISTED_PAGE, None, cx)
-                                })
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                }) else {
-                    // No branch list yet: the stubs stay, and a drawn row naming one walks again
-                    // once it is in.
-                    return;
-                };
-                // As a branch whose page could not be read holds none of them.
-                let mut lists = Vec::with_capacity(reads.len());
-                for read in reads {
-                    if let Ok(page) = read.await {
-                        lists.push(page.commits);
-                    }
+                        .collect()
                 }
-                let listed = cx
-                    .background_spawn(async move {
-                        let mut by_id: HashMap<String, CommitOutput> = HashMap::new();
-                        for commit in lists.iter().flat_map(|list| list.iter()) {
-                            by_id
-                                .entry(commit.graph_commit_id.clone())
-                                .or_insert_with(|| commit.clone());
-                        }
-                        Arc::new(by_id)
-                    })
-                    .await;
-                if this
-                    .update(cx, |this, _| this.listed = Some(listed.clone()))
-                    .is_err()
-                {
-                    return;
-                }
-                listed
-            }
+                Some(listed) if listed.due(now) => listed.failed.clone(),
+                Some(_) => Vec::new(),
+            };
+            let reads: Vec<_> = names
+                .into_iter()
+                .map(|name| {
+                    let read = this.session.update(cx, |session, cx| {
+                        session.commit_page(&name, LISTED_PAGE, None, cx)
+                    });
+                    (name, read)
+                })
+                .collect();
+            Some((this.listed.clone().unwrap_or_default(), reads, now))
+        }) else {
+            // No branch list yet: the stubs stay, and a drawn row naming one walks again once
+            // it is in.
+            return;
         };
+        if !reads.is_empty() {
+            let mut lists = Vec::with_capacity(reads.len());
+            let mut failed = Vec::new();
+            for (name, read) in reads {
+                match read.await {
+                    Ok(page) => lists.push(page.commits),
+                    Err(error) if refused_again(&error) => listed.refused.push(name),
+                    Err(_) => failed.push(name),
+                }
+            }
+            let held = listed.commits.clone();
+            listed.commits = cx
+                .background_spawn(async move {
+                    let mut by_id = HashMap::clone(&held);
+                    for commit in lists.iter().flat_map(|list| list.iter()) {
+                        by_id
+                            .entry(commit.graph_commit_id.clone())
+                            .or_insert_with(|| commit.clone());
+                    }
+                    Arc::new(by_id)
+                })
+                .await;
+            listed.failed_at = (!failed.is_empty()).then_some(now);
+            listed.failed = failed;
+            let stored = this.update(cx, |this, cx| {
+                if !listed.failed.is_empty() {
+                    this.retry_merged_later(cx);
+                }
+                this.listed = Some(listed.clone());
+            });
+            if stored.is_err() {
+                return;
+            }
+        }
         let Ok(held) = this.update(cx, |this, _| this.read.clone()) else {
             return;
         };
         let arranged = cx
             .background_spawn(async move {
                 let mut read = HistoryRead::clone(&held);
-                read.take_from(&listed);
+                read.take_from(&listed.commits, listed.complete());
                 arrange(read)
             })
             .await;
@@ -922,7 +1045,6 @@ impl HistoryView {
         self.graph = arranged.graph;
         self.wanted = arranged.wanted;
         self.heads = self.branch_heads();
-        self.state = State::Ready;
         // The drawn rows' counts were found in the list before.
         self.count_rows = None;
         self.keep_place(place);
@@ -1606,7 +1728,8 @@ impl HistoryView {
     }
 
     /// Why the commits a merge brought in are not drawn below it, by its merged parent `id`: not
-    /// had, not in the listings read, its read failed, not read yet, or older than the rows read.
+    /// had, not in the listings read, perhaps in a listing that could not be read, its read
+    /// failed, not read yet, or older than the rows read.
     fn why_not_drawn(&self, id: &str) -> String {
         match self.read.absent(id) {
             Some(Absent::NotHad) => {
@@ -1619,6 +1742,11 @@ impl HistoryView {
                  this credential may not read a commit by its id.",
                 group_digits(LISTED_PAGE as usize)
             ),
+            Some(Absent::Unlisted) => self
+                .listed
+                .as_ref()
+                .map(Listed::why_unlisted)
+                .unwrap_or_else(|| "The merged commits are being read.".into()),
             None if self.merged_failed.contains_key(id) => {
                 "The merged commit could not be read; it is asked for again while this row shows."
                     .into()
@@ -1865,13 +1993,17 @@ impl Render for HistoryView {
             .w(px(if self.compact { 200. } else { 240. }))
             .children(counter.map(studio_ui::ds::text::meta));
         let summary = match self.state {
-            State::Ready => summary(
+            State::Ready | State::Stale(_) => summary(
                 count,
                 count.saturating_sub(self.read.own.len()),
                 self.read.complete,
             ),
             State::Loading => "Reading…".into(),
             State::Failed(_) => String::new(),
+        };
+        let stale = match &self.state {
+            State::Stale(error) => Some(error.clone()),
+            _ => None,
         };
         let header = studio_ui::ds::toolbar(cx)
             .when(!self.compact, |header| {
@@ -1882,6 +2014,35 @@ impl Render for HistoryView {
             // One quiet fact after the title, as the table's row count: the tab already names
             // the branch.
             .child(studio_ui::ds::text::muted(summary))
+            // The commits shown stay as read when the first page read again fails: the failure
+            // sits beside their count, the reason in its tooltip.
+            .when_some(stale, |header, error| {
+                header
+                    .child(
+                        div()
+                            .id("history-read-again-failed")
+                            .debug_selector(|| "history-read-again-failed".into())
+                            .min_w_0()
+                            .overflow_hidden()
+                            .tooltip(Tooltip::text(format!(
+                                "{error}. The commits shown are as read before."
+                            )))
+                            .child(
+                                studio_ui::ds::text::error("The newest commits could not be read")
+                                    .single_line()
+                                    .truncate(),
+                            ),
+                    )
+                    .child(
+                        studio_ui::ds::toolbar_button("retry-history", "Try again")
+                            .style(ButtonStyle::Subtle)
+                            .tooltip(Tooltip::text(
+                                "Read the branch's newest commits again; the commits read stay \
+                                 below them",
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
+                    )
+            })
             .child(div().flex_1())
             .child(search)
             .child(
@@ -1891,8 +2052,10 @@ impl Render for HistoryView {
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             );
         let body = match &self.state {
+            // Only while no commit is shown ([`Self::first_page`]).
             State::Failed(error) => {
                 studio_ui::ds::error_state("History could not be read", error.clone())
+                    .debug_selector(|| "history-error".into())
                     .into_any_element()
             }
             State::Loading if self.commits.is_empty() => {
@@ -1981,6 +2144,10 @@ mod tests {
         /// A page token is refused (400), or its read fails (500).
         refuse_tokens: bool,
         fail_tokens: bool,
+        /// Listings, by query, whose read fails (503, a server shedding load), and how many
+        /// times more; and those refused (403, a branch the credential may not read).
+        fail_listings: HashMap<String, usize>,
+        refuse_listings: Vec<String>,
         /// Every request's path and query.
         asked: Vec<String>,
     }
@@ -2014,6 +2181,17 @@ mod tests {
         fn reads_of(&self, id: &str) -> usize {
             let path = format!("/graphs/knowledge/commits/{id}?");
             self.asked.iter().filter(|asked| **asked == path).count()
+        }
+
+        /// Whether the listing asked by `query` fails this time.
+        fn fails_listing(&mut self, query: &str) -> bool {
+            match self.fail_listings.get_mut(query) {
+                Some(left) if *left > 0 => {
+                    *left -= 1;
+                    true
+                }
+                _ => false,
+            }
         }
 
         fn answer(&mut self, path: &str, query: &str, body: &Value) -> (u16, Value) {
@@ -2061,6 +2239,11 @@ mod tests {
                 && self.fail_tokens
             {
                 (500, json!({ "error": "busy" }))
+            } else if path.ends_with("/commits") && self.refuse_listings.iter().any(|q| q == query)
+            {
+                (403, json!({ "error": "forbidden" }))
+            } else if path.ends_with("/commits") && self.fails_listing(query) {
+                (503, json!({ "error": "busy" }))
             } else if path.ends_with("/commits") {
                 let branch = pairs.get("branch").copied().unwrap_or("main");
                 let limit = pairs.get("limit").map(|limit| limit.parse().unwrap());
@@ -2403,6 +2586,123 @@ mod tests {
         );
     }
 
+    /// The first page read again for a commit landing, failing while commits are shown (the
+    /// server timed out, shed load, was busy), keeps them as read: the toolbar says why beside
+    /// their count and offers Try again, and their pages go on being read below them. Recovery,
+    /// by the branch list read again or Try again, reads the first page again from the head and
+    /// keeps the pages read below it.
+    #[gpui::test]
+    async fn a_failed_read_again_keeps_the_commits_shown(cx: &mut TestAppContext) {
+        let (session, served) = serve(
+            Served {
+                branches: vec![("main".into(), chain("m", 450))],
+                ..Default::default()
+            },
+            cx,
+        );
+        let (view, cx) = open(&session, cx);
+        view.update(cx, |view, cx| view.want_more(&(170..200), cx));
+        cx.run_until_parked();
+        let first_page = "branch=main&limit=200";
+        // Another writer commits m450; the first page read for it fails.
+        session
+            .update(cx, |session, cx| session.head_now("main", cx))
+            .await;
+        {
+            let mut served = served.lock().unwrap();
+            served
+                .chain_mut("main")
+                .insert(0, commit("m450", 4_510, Some("m449"), None));
+            served.fail_listings.insert(first_page.into(), usize::MAX);
+        }
+        session
+            .update(cx, |session, cx| session.head_now("main", cx))
+            .await;
+        cx.run_until_parked();
+        let stale = |view: &HistoryView| matches!(view.state, State::Stale(_));
+        view.read_with(cx, |view, _| {
+            assert!(stale(view));
+            assert_eq!(view.commits.len(), 400);
+            assert_eq!(view.commits[0].graph_commit_id, "m449");
+            assert_eq!(view.selected, Some(0));
+        });
+        assert!(cx.debug_bounds("history-read-again-failed").is_some());
+        assert!(
+            cx.debug_bounds("history-error").is_none(),
+            "the rows gave their place to the error"
+        );
+        // Their next page is read as before, continuing the listing they were read from.
+        view.update(cx, |view, cx| view.want_more(&(380..401), cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(stale(view));
+            assert_eq!(view.commits.len(), 450);
+            assert!(view.read.complete);
+        });
+        // The branch list read again tries the first page again, which fails again: the
+        // commits stay.
+        view.update(cx, |view, cx| view.branches_changed(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(stale(view));
+            assert_eq!(view.commits.len(), 450);
+        });
+        // Try again reads it; it reaches the head the pages were read from, so m450 goes on top
+        // of them.
+        served.lock().unwrap().fail_listings.clear();
+        view.update(cx, |view, cx| view.retry(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.state, State::Ready));
+            assert_eq!(view.commits.len(), 451);
+            assert_eq!(view.commits[0].graph_commit_id, "m450");
+            assert_eq!(view.commits[450].graph_commit_id, "m0");
+            assert!(view.read.complete);
+        });
+        assert!(cx.debug_bounds("history-read-again-failed").is_none());
+        assert_eq!(
+            served.lock().unwrap().listings(),
+            [
+                first_page,
+                "branch=main&limit=200&page_token=m449_200",
+                first_page,
+                "branch=main&limit=200&page_token=m449_400",
+                first_page,
+                first_page,
+            ]
+        );
+    }
+
+    /// A first read that fails, with no commit shown, says why in the list's place; the branch
+    /// list read again reads the history from its first page.
+    #[gpui::test]
+    async fn a_first_read_that_fails_says_why_in_place_of_the_list(cx: &mut TestAppContext) {
+        let first_page = "branch=main&limit=200";
+        let (session, served) = serve(
+            Served {
+                branches: vec![("main".into(), chain("m", 3))],
+                fail_listings: HashMap::from([(first_page.to_owned(), usize::MAX)]),
+                ..Default::default()
+            },
+            cx,
+        );
+        let (view, cx) = open(&session, cx);
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.state, State::Failed(_)));
+            assert!(view.commits.is_empty());
+        });
+        assert!(cx.debug_bounds("history-error").is_some());
+        assert!(cx.debug_bounds("history-read-again-failed").is_none());
+        served.lock().unwrap().fail_listings.clear();
+        view.update(cx, |view, cx| view.branches_changed(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.state, State::Ready));
+            assert_eq!(ids(view), ["m2", "m1", "m0"]);
+        });
+        assert!(cx.debug_bounds("history-error").is_none());
+    }
+
     /// Commits merged in are read one at a time by their ids, as each names the next, and join
     /// the history in time order with their lanes. A merged parent the server does not have
     /// stays a stub. A Refresh (⌘R, where the history has the keyboard) reads none of those
@@ -2624,6 +2924,99 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, _| assert_eq!(ids(view).len(), 5));
         assert_eq!(pages(&served), [2, 2]);
+    }
+
+    /// For a token refused commits by id, a branch whose page could not be read is not taken for
+    /// one without the merged commit: the stub says that branch's list could not be read. Once
+    /// a while has passed, while the row shows, a page that failed in passing is read again, it
+    /// alone, and draws the merge; one the server refused is read again only by a Refresh.
+    #[gpui::test]
+    async fn a_listing_that_could_not_be_read_is_read_again_alone(cx: &mut TestAppContext) {
+        let (session, served) = serve(
+            Served {
+                branches: vec![
+                    (
+                        "main".into(),
+                        vec![
+                            commit("m3", 30, Some("m2"), Some("b2")),
+                            commit("m2", 20, Some("m1"), Some("z9")),
+                            commit("m1", 10, None, None),
+                        ],
+                    ),
+                    (
+                        "feature".into(),
+                        vec![
+                            commit("b2", 25, Some("b1"), None),
+                            commit("b1", 15, Some("m1"), None),
+                            commit("m1", 10, None, None),
+                        ],
+                    ),
+                    (
+                        "fix".into(),
+                        vec![
+                            commit("f1", 12, Some("m1"), None),
+                            commit("m1", 10, None, None),
+                        ],
+                    ),
+                    ("secret".into(), vec![commit("m1", 10, None, None)]),
+                ],
+                refuse_by_id: true,
+                fail_listings: HashMap::from([(format!("branch=feature&limit={LISTED_PAGE}"), 1)]),
+                refuse_listings: vec![format!("branch=secret&limit={LISTED_PAGE}")],
+                ..Default::default()
+            },
+            cx,
+        );
+        let (view, cx) = open(&session, cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(ids(view), ["m3", "m2", "m1"]);
+            assert!(view.is_stub(0) && view.is_stub(1));
+            assert_eq!(view.read.absent("b2"), Some(Absent::Unlisted));
+            assert_eq!(
+                view.why_not_drawn("b2"),
+                "The lists of branches feature, secret could not be read, and the merged commit \
+                 is not among the newest 1,000 commits of the other branches read. It is asked \
+                 for again while this row shows."
+            );
+        });
+        let pages = |served: &Arc<Mutex<Served>>| {
+            let served = served.lock().unwrap();
+            let listings = served.listings();
+            ["feature", "fix", "secret"].map(|branch| {
+                let page = format!("branch={branch}&limit={LISTED_PAGE}");
+                listings.iter().filter(|listing| **listing == page).count()
+            })
+        };
+        assert_eq!(pages(&served), [1, 1, 1]);
+        cx.executor()
+            .advance_clock(MERGED_RETRY_AFTER - Duration::from_millis(1));
+        cx.run_until_parked();
+        view.update(cx, |view, cx| view.want_merged(&(0..3), cx));
+        cx.run_until_parked();
+        assert_eq!(pages(&served), [1, 1, 1], "read again too soon");
+        cx.executor().advance_clock(Duration::from_millis(1));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(ids(view), ["m3", "b2", "m2", "b1", "m1"]);
+            assert!(!view.is_stub(0) && view.is_stub(2));
+            assert_eq!(view.read.absent("b2"), None);
+            assert_eq!(
+                view.why_not_drawn("z9"),
+                "Branch secret's list could not be read, and the merged commit is not among the \
+                 newest 1,000 commits of the other branches read. Refresh asks for it again."
+            );
+        });
+        assert_eq!(
+            pages(&served),
+            [2, 1, 1],
+            "only feature's page is read again"
+        );
+        // Nothing is left to read again in passing.
+        cx.executor().advance_clock(MERGED_RETRY_AFTER);
+        cx.run_until_parked();
+        view.update(cx, |view, cx| view.want_merged(&(0..5), cx));
+        cx.run_until_parked();
+        assert_eq!(pages(&served), [2, 1, 1]);
     }
 
     /// A merged-in commit whose read failed is asked for again once a while has passed, while a

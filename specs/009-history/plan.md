@@ -76,6 +76,14 @@ from Zed with notices).
   read as one page. When a later page fails, the list's last row says why and offers Try
   again, which reads the listing from its first page when the server refused the page's
   continuation. Search finds the commits read so far, and a page read finds them again.
+  A first page read again (a commit landing, a Refresh) that fails while commits are shown
+  keeps them as read (constitution V): beside their count the toolbar says "The newest commits
+  could not be read", the reason in its tooltip, and offers Try again, which reads the first
+  page again from the head and keeps the pages read below it when it reaches their head, as a
+  commit landing does; the branch list read again does the same. Meanwhile the pages below and
+  the commits merged into them go on being read. Only a first read with no commit shown gives
+  the list's place to the error (since 2026-10-21; before, any failed first page replaced every
+  row with it, stopped paging and merged reads, and its recovery dropped the pages read).
 - Built (row counts): a drawn row without counts reads its commit's first 500 changes and nets
   them as the detail does ("+ more" when there are more); answers are kept, since a commit's
   changes never change, and the detail's full count replaces a first-page one. A commit
@@ -98,12 +106,18 @@ once, the rows drawn first. A walk follows each page read and starts again while
 names one not read; a read that failed is asked again 5 s later, while its row is drawn. That
 route checks `read` on no branch, so it refuses (403) a token whose read grant names branches:
 History then reads the newest 1,000 commits of up to 20 other branches, one page each (the
-server's most), once until the next load or Refresh, and never a listing whole. A merged
-parent not read yet, not had, or in none of those pages draws as a stub, and the merge mark's
-tooltip says which: the server does not serve it (a deleted branch's latest commits, history
-cleaned up); it is not among the newest 1,000 commits of any branch read and the credential may
-not read a commit by its id; its read failed and is asked again while the row shows; it is
-being read; or it is older than the commits read so far.
+server's most), once until the next load or Refresh, and never a listing whole. A branch whose
+page could not be read is kept out of those read: one that failed in passing (a timeout, a 5xx,
+a 429) is read again, it alone, 5 s later while a row naming a commit it may hold is drawn, and
+one the server refused (another 4xx: a branch the credential may not read, one deleted since)
+at the next load or Refresh (since 2026-10-21; before, a page that failed counted as one
+without the commit, until the next load). A merged parent not read yet, not had, or in none of
+those pages draws as a stub, and the merge mark's tooltip says which: the server does not serve
+it (a deleted branch's latest commits, history cleaned up); it is not among the newest 1,000
+commits of any branch read and the credential may not read a commit by its id; it is not among
+those of the branches read and the lists named could not be read, so it may be there, asked
+for again while the row shows or at a Refresh; its read failed and is asked again while the row
+shows; it is being read; or it is older than the commits read so far.
 A row's change count is read once scrolling has paused for 120 ms, and reads for rows scrolled
 away are dropped.
 
@@ -145,6 +159,8 @@ away are dropped.
 | 2026-10-21 | ⌘R refreshes History, and a commit tab's Load more has a key | `history` `merged_in_commits_are_read_by_their_ids` (⌘R dispatched as `studio::Refresh` with the view focused: the first page and the missing merged parent read again); `studio` `keymaps` (`studio_history::LoadMoreChanges` bound on every platform, ⌘⌥N / Ctrl+Alt+N in `CommitView`) | Before, nothing in History handled `Refresh`, so ⌘R went to the workspace and "Newer data" stayed; the refresh button showed no key, and Load more and Try again had no action |
 | 2026-10-21 | The toolbar's counts are grouped | `history` `the_summary_groups_its_counts` | "12,480 commits so far · 1,200 merged in"; before, "12480 commits" |
 | 2026-10-21 | The graph's first commit is named, and its changes never asked for | `history` `the_first_commits_changes_are_never_asked_for` (a three-commit chain, row counts read for every row) and `a_branch_starts_here_only_at_a_published_commit` (the first commit listed and in its own tab) | Before (found in the running app on the edge server), each History open sent `/commits/{root}/changes` and the server answered 409; the row showed nothing and the detail an error. Now no `/commits/m0/changes` is sent, the row reads "first commit", and both views are in their `First` state: "The graph's first commit", with no read. Not yet seen in the running app |
+| 2026-10-21 | A first page read again that fails keeps the commits shown | `history` `a_failed_read_again_keeps_the_commits_shown` (two pages read, m450 lands, its first page answers 503 until cleared: the rows stay, the next page is read, the branch list read again fails again, then Try again) and `a_first_read_that_fails_says_why_in_place_of_the_list` (the first read answers 503 with nothing shown); both check the drawn window for the toolbar's note and the error state | Before (found in review), `first_page` set `Failed` even for a commit landing, so the error state took every row's place, paging and merged reads stopped, and the branch list read again ran `load(false)`, which dropped the pages read. Now the 400 rows stay with "The newest commits could not be read" in the toolbar and no error state, the third page brings 450, and Try again puts m450 on top of them (451, `m0` last) with no listing read again but the first page; with nothing shown, the error state takes the list's place, and the branch list read again reads it. A mutation that always sets `Failed` fails the first test |
+| 2026-10-21 | A listing that could not be read is not taken for one without the commit | `history` `a_listing_that_could_not_be_read_is_read_again_alone` (a token refused by id; `feature`'s page answers 503 once, `secret`'s 403); `history::merged` `a_commit_a_page_not_read_may_hold_is_answered_once_it_is_read` | Before (found in review), `read_listed` dropped a failed page and `take_from` marked every commit it may hold `NotListed`, kept until the next load, its tooltip saying it was among the newest 1,000 commits of no branch read. Now b2 is `Absent::Unlisted`, its tooltip naming the lists of `feature` and `secret`; 5 s later, with the row drawn, `feature`'s page alone is read again (not `fix`'s, nor the refused `secret`'s), b2 and b1 draw, and z9's tooltip names `secret` alone, which a Refresh reads again. A mutation that drops the failure fails the test |
 
 ## Corrections
 
