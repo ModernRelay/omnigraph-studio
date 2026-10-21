@@ -1464,9 +1464,13 @@ impl Render for OntologyPage {
                     .min_h_0()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll)
+                    // Room above the first row: the scrolling body clips what is drawn outside
+                    // it, and a raised card there (the type in focus, a domain) would lose the
+                    // top of its ring and shadow.
                     .child(
                         div()
                             .px(px(space::PAGE))
+                            .pt(px(space::MD))
                             .pb(px(space::PAGE))
                             .child(div().relative().child(self.measure(cx)).child(body)),
                     ),

@@ -252,7 +252,9 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   page's width between two bounds and the view stacks below them, enumerations wrap under
   their property, and type and name share a row half and half. The page's width is read for
   every view, not only the domains. The map's cards were 180 px whatever their names and
-  could cut one; they are sized to it now.
+  could cut one; they are sized to it now. The page's body began flush under its header, and
+  its scrolling clipped the top of the card in focus, its ring and shadow (Ragnor: "its cut
+  off at top"); the body keeps 8 px above its first row.
 - **Canvas lines (2026-10-20).** The explorer's and a query result's lines are dashed 3 on 2
   off, as Chrome draws a 1 px dashed border (measured at 2x: 6 device pixels on, 4 off), and
   turn at right angles: out of a node's side, turning 18 px beyond it (within the narrower of
