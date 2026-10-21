@@ -63,6 +63,9 @@ pub struct Scene {
     pub edges: Vec<SceneEdge>,
     /// Nodes left out because of the node cap, and the type most of them belong to.
     pub capped: Option<(usize, String)>,
+    /// The node cap the scene was built under, which its banner names: a setting changed
+    /// since is not this scene's until it is built again.
+    pub cap: usize,
 }
 
 impl Scene {
@@ -157,6 +160,7 @@ pub fn results_scene(
         nodes: scene_nodes,
         edges,
         capped,
+        cap,
     }
 }
 
@@ -168,7 +172,10 @@ pub fn explore_scene(
     limits: &HashMap<GroupKey, usize>,
     cap: usize,
 ) -> Scene {
-    let mut scene = Scene::default();
+    let mut scene = Scene {
+        cap,
+        ..Scene::default()
+    };
     let mut by_id: HashMap<SceneId, usize> = HashMap::new();
     // The scene index each entry maps to (its node or hub), and entries left out.
     let mut placed: Vec<Option<usize>> = vec![None; entries.len()];

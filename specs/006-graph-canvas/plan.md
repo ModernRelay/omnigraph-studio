@@ -39,7 +39,8 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   R-tree. Layout runs on a background thread and streams positions; the main thread only paints.
 - **Caps:** a legibility cap (start at 2,000 visible nodes, tune with spike S2) with "Too many
   nodes to draw · Open as table · Show in tree". The cap is `studio.canvas_max_nodes`, which
-  a graph can override (spec 002).
+  a graph can override (spec 002). An open canvas draws a changed cap at once, and the banner
+  names the cap its drawn scene was built under (`Scene::cap`), never a newer setting.
 - **Keys (context `Canvas`):** arrows move to the nearest node; ↵ expand; Space peek; ⌫ collapse;
   `0` fit; `+`/`-` zoom; F focus; `[`/`]` walk the expansion path.
 - **Query results:** a query whose result has node or edge columns can open as a canvas.
@@ -170,6 +171,7 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | A changed node cap reaches an open canvas, and showing a node builds its scene once | `graph_canvas` `a_new_node_cap_is_drawn_at_once` (a results canvas of three people under a cap of 2, then 3: two chips and "1 not shown", then three and no banner; it fails with the settings watch removed); `showing_a_shown_node_keeps_the_exploration`; clippy `-D warnings`; design tokens and layers; offscreen snapshots of Show on canvas, once and twice, on `script/dev-server` | Before: a cap changed in settings showed in the banner over the chips drawn under the old one until something else redrew the canvas, and Show on canvas built the whole scene twice on the main thread, once to ask whether the node was in it. After: the cap redraws the canvas at once, and a node already drawn is laid out from the one scene built to look for it; both snapshots are pixel-identical to the build before |
 | 2026-10-20 | Nothing on the ontology page is cut off at any width | `layered` `a_line_meets_a_chip_level_with_its_other_end_where_it_can` and the existing route soundness tests; `ontology` tests; workspace clippy `-D warnings`; design tokens and layers; offscreen snapshots on a third scratch server whose 101 types carry made-up properties and descriptions shaped like a personal graph's (enumerations of up to 20 values, descriptions of up to 600 characters), at 1440 and 1100 px wide, light and dark, a row pointed at; the dev graph's map | Before: at 1100 px the focus view's fixed 1,084 px of columns ran off both edges, cutting the type names on each side, and enumerations ran out of the card. After: at 1440 px the sides take 330 px each; at 1100 px the card stands above the two sides, nothing cut; enumeration values wrap under their property; a 600-character description shows five lines and More; the side titles read "Reach it 14" and "It reaches 10"; the dev map's Contributes line runs straight into Person, where it stepped 5 px |
 | 2026-10-20 | The ontology page is keyed, packs its columns on first draw and drops a type the schema lost | `ontology` `the_keys_walk_the_types_and_their_lines`; `studio` `keymaps` (every action bound or palette-only); workspace clippy `-D warnings`; offscreen snapshots on the 101-type scratch schema: open, ↓↓↓, ↓↓↵, ↓↓↵ Esc | Four columns on the first render, before any pointer; ↓↓↓ selected the third shared type and dimmed the types it is not related to; ↓↓↵ brought the second into focus; Esc returned to the domains |
 | 2026-10-20 | A large ontology reads as domains and one type at a time; a small one as a named map | `graph_canvas` `domains::tests` (cliques around a hub group apart and the hub is shared, every type has one place, a small schema is one group), `ontology::tests` (each relationship once on its side of a type in focus; past twelve types no map), `layered::tests`; `gq_language` `a_type_says_what_it_is`; workspace clippy `-D warnings`; offscreen snapshots on a scratch server holding a 101-type, 555-relationship schema with the structure of a personal graph and made-up names, and on `script/dev-server` | Four shared types and nine domains of 4 to 18 types in four columns; pointing at a type lit the 16 types it is related to; a shared type in focus listed 77 relationships reaching it and 12 it reaches, grouped by domain, long names cut before the type's; the dev graph drawn as three cards with Owns, Contributes, WorksAt and the Knows loop named |
@@ -244,6 +246,13 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   types that name recognisable parts of it (money, work, learning and events, health,
   automation, commerce, investments, equity); grouping three levels deep merged them into
   groups of 23 and 32, so it stops at two.
+- **A changed cap did not reach an open canvas (2026-10-21).** The canvas read
+  `canvas_max_nodes` only when it built a scene and did not watch settings, so after a change
+  the banner named the new limit over chips drawn under the old one. The canvas now watches
+  settings and builds again when the cap differs from its drawn scene's, which records the cap
+  it was built under for its banner. Show on canvas also built the explorer's scene twice, once
+  only to ask whether the node was in it; a node already drawn is now laid out from that scene,
+  and one not drawn is left to the exploration's change, which lays it out.
 - **Ontology cut off (2026-10-20).** The focus view's columns were fixed (300, 72, 340, 72 and
   300 px) and centred, so on a page narrower than their 1,084 px (a smaller window, or a
   panel open beside it) both sides ran off the page's edges and their type names were cut

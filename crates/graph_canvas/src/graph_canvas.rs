@@ -40,6 +40,7 @@ use studio_actions::canvas::{
 use studio_actions::graph::{
     OpenCanvas, OpenNode, OpenOntology, OpenType, PeekNode, ShowNodeOnCanvas, ShowResultsOnCanvas,
 };
+use studio_settings::StudioSettings;
 use studio_ui::ds::space;
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
 use ui::Tooltip;
@@ -471,6 +472,13 @@ impl GraphCanvas {
                     this.rebuild(cx)
                 }
             }),
+            // A new node cap (the setting, or the graph's own) is drawn at once, so the canvas
+            // and its banner never show different limits.
+            cx.observe_global::<StudioSettings>(|this, cx| {
+                if this.scene.cap != this.node_cap(cx) {
+                    this.rebuild(cx);
+                }
+            }),
         ];
         let mut canvas = Self {
             session,
@@ -553,14 +561,25 @@ impl GraphCanvas {
         let shown = self
             .exploration
             .update(cx, |exploration, cx| exploration.reveal(node.clone(), cx));
-        // In the tree but not drawn here (a hub draws some of its neighbours): rooted at it,
-        // it is. Asked of the scene the exploration makes now, not of the one drawn, which is
-        // the one before until its layout comes back from the background.
-        if shown && self.results.is_none() && !self.would_draw(&id, cx) {
-            self.exploration
-                .update(cx, |exploration, cx| exploration.root_at(node, cx));
+        if !self.draws_exploration() {
+            self.rebuild(cx);
+            return;
         }
-        self.rebuild(cx);
+        // Not shown, the exploration was rooted at it, and that change is laid out
+        // (`ExplorationEvent::Changed`). Shown in the tree but not drawn here (a hub draws some of
+        // its neighbours): rooted at it, it is. Asked of the scene the exploration makes now, not
+        // of the one drawn, which is the one before until its layout comes back; when that scene
+        // has it, it is the one laid out.
+        if !shown {
+            return;
+        }
+        match self.explore_scene(cx) {
+            Some(scene) if scene.index_of(&id).is_some() => self.lay_out_explore(scene, cx),
+            Some(_) => self
+                .exploration
+                .update(cx, |exploration, cx| exploration.root_at(node, cx)),
+            None => self.rebuild(cx),
+        }
     }
 
     /// Roots the exploration at `node`, which `path` reaches, keeping what is open below it.
@@ -571,18 +590,18 @@ impl GraphCanvas {
         self.rebuild(cx);
     }
 
-    /// Whether the explorer's scene, as the exploration stands, has `id`.
-    fn would_draw(&self, id: &SceneId, cx: &App) -> bool {
+    /// The explorer's scene as the exploration stands, under the node cap; none without a
+    /// schema.
+    fn explore_scene(&self, cx: &App) -> Option<Scene> {
+        self.session.read(cx).schema_model()?;
         let exploration = self.exploration.read(cx);
         let entries = exploration.entries(cx);
-        model::explore_scene(
+        Some(model::explore_scene(
             &entries,
             exploration.state(),
             &self.hub_limits,
             self.node_cap(cx),
-        )
-        .index_of(id)
-        .is_some()
+        ))
     }
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
@@ -600,8 +619,15 @@ impl GraphCanvas {
             self.rebuild_results(&results, cx);
             return;
         }
-        let exploration = self.exploration.read(cx);
-        let root = exploration.root().cloned();
+        if let Some(scene) = self.explore_scene(cx) {
+            self.lay_out_explore(scene, cx);
+        }
+    }
+
+    /// Lays out `scene`, the exploration's as it stands, off the main thread: drawn chips keep
+    /// their places, and what is new grows from beside them.
+    fn lay_out_explore(&mut self, scene: Scene, cx: &mut Context<Self>) {
+        let root = self.exploration.read(cx).root().cloned();
         let key = (Mode::Explore, root);
         if self.layout_key.as_ref() != Some(&key) {
             if self.known_root != key.1 {
@@ -628,13 +654,6 @@ impl GraphCanvas {
             }
             _ => HashMap::new(),
         };
-        let entries = exploration.entries(cx);
-        let scene = model::explore_scene(
-            &entries,
-            exploration.state(),
-            &self.hub_limits,
-            self.node_cap(cx),
-        );
         let widths = half_widths(&scene, &measurer(cx, &self.char_widths));
         let nodes: Vec<LayoutNode> = scene
             .nodes
@@ -2147,7 +2166,7 @@ impl GraphCanvas {
             _ => None,
         };
         let capped = self.scene.capped.clone();
-        let cap = self.node_cap(cx);
+        let cap = self.scene.cap;
         // Floating pills are white cards in the light theme, like the chips. The canvas's
         // floating controls (what is drawn, search and zoom) read as one family, each
         // concentric around what it holds.
@@ -2569,6 +2588,7 @@ mod tests {
                     .collect(),
                 edges: Vec::new(),
                 capped: None,
+                cap: 0,
             })
         };
         let before = scene(&["A", "B", "C"]);
@@ -2691,6 +2711,7 @@ mod tests {
                 .collect(),
             edges: Vec::new(),
             capped: None,
+            cap: 0,
         }
     }
 
@@ -2768,6 +2789,55 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(notified.load(Ordering::SeqCst) > 0);
+    }
+
+    /// A new node cap is drawn at once: the canvas lays out again under it, and its banner names
+    /// the cap the drawn scene was built under, never a newer one.
+    #[gpui::test]
+    async fn a_new_node_cap_is_drawn_at_once(cx: &mut gpui::TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let (session, _served) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\n",
+            |_| serde_json::json!([]),
+            cx,
+        );
+        cx.run_until_parked();
+        let cap = |limit: u32, cx: &mut gpui::TestAppContext| {
+            cx.update(|cx| {
+                let mut settings = StudioSettings::default();
+                settings.studio.canvas_max_nodes = limit;
+                cx.set_global(settings);
+            })
+        };
+        cap(2, cx);
+        let person = |id: &str| studio_actions::graph::ResultNode {
+            type_name: "Person".into(),
+            id: id.into(),
+            label: None,
+        };
+        let action = ShowResultsOnCanvas {
+            title: "people".into(),
+            nodes: vec![person("p1"), person("p2"), person("p3")],
+            links: Vec::new(),
+        };
+        let canvas = cx.new(|cx| GraphCanvas::with_results(session, &action, cx));
+        cx.run_until_parked();
+        canvas.read_with(cx, |canvas, _| {
+            assert_eq!(canvas.scene.nodes.len(), 2);
+            assert_eq!(canvas.scene.cap, 2);
+            assert_eq!(canvas.scene.capped.as_ref().map(|c| c.0), Some(1));
+        });
+        cap(3, cx);
+        cx.run_until_parked();
+        canvas.read_with(cx, |canvas, _| {
+            assert_eq!(
+                canvas.scene.nodes.len(),
+                3,
+                "laid out again under the new cap"
+            );
+            assert_eq!(canvas.scene.cap, 3);
+            assert!(canvas.scene.capped.is_none());
+        });
     }
 
     /// Show on canvas of a node the exploration shows selects it there: it does not start the
