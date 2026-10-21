@@ -452,6 +452,59 @@ pub fn count_of(rows: &Value) -> Option<i64> {
     rows.as_array()?.first()?.get("n")?.as_i64()
 }
 
+/// Where the Blob values a view shows hold as it shows them, which a Blob write is bound at: a
+/// managed value's validator names its type's table version, so it is read at a commit holding
+/// that table as the view shows it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum BlobsAt {
+    /// At the view's pin.
+    #[default]
+    Pin,
+    /// At one of the view's own commits past its pin, made while it was behind its branch.
+    Own(String),
+    /// At no commit the view knows of: a write is bound to the validators the view shows.
+    Unknown,
+}
+
+impl BlobsAt {
+    /// The commit, for a view pinned at `pin`.
+    pub fn commit<'a>(&'a self, pin: Option<&'a str>) -> Option<&'a str> {
+        match self {
+            BlobsAt::Pin => pin,
+            BlobsAt::Own(commit) => Some(commit),
+            BlobsAt::Unknown => None,
+        }
+    }
+
+    /// One of the view's own writes landed at `commit`, made on `parent`; `pin` is the view's
+    /// pin as it was sent, and `followed` says the pin moved to `commit`. A write made on the
+    /// commit they held at holds them at its own, its changes being what the view shows; any
+    /// other leaves a gap the view cannot see into.
+    pub fn after_own_write(
+        &mut self,
+        pin: Option<&str>,
+        parent: Option<&str>,
+        commit: &str,
+        followed: bool,
+    ) {
+        let on_them = parent.is_some() && self.commit(pin) == parent;
+        *self = match (followed, on_them) {
+            (true, true) => BlobsAt::Pin,
+            (false, true) => BlobsAt::Own(commit.to_owned()),
+            (_, false) => BlobsAt::Unknown,
+        };
+    }
+
+    /// A Blob write bound to a validator read at `bound_at`, where they held as it was sent,
+    /// landed at `commit` past the pin: the server applied it only while the type's table was
+    /// as it was there, so the commit holds them, with the value written.
+    pub fn after_bound_write(&mut self, bound_at: &str, before: Option<&str>, commit: &str) {
+        if before == Some(bound_at) {
+            *self = BlobsAt::Own(commit.to_owned());
+        }
+    }
+}
+
 /// Keyset paging pinned to the commit the first page read (constitution II).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Paging {
@@ -461,6 +514,11 @@ pub struct Paging {
     pub start: PageStart,
     /// The last page came back short; there is nothing more to read.
     pub exhausted: bool,
+    /// The pin moved to one of the view's own commits since its first page: later pages are
+    /// read there, where a row already read may sort again further on.
+    pub moved: bool,
+    /// Where the Blob values the view shows hold.
+    pub blobs: BlobsAt,
 }
 
 impl Default for Paging {
@@ -469,15 +527,25 @@ impl Default for Paging {
             pinned: None,
             start: PageStart::First,
             exhausted: false,
+            moved: false,
+            blobs: BlobsAt::Pin,
         }
     }
 }
 
 impl Paging {
     /// Forget the rows but keep the pin: the same view re-read with other filters or order.
+    /// Every page is read at the pin from now on; the Blob values read stay as they were.
     pub fn restart(&mut self) {
         self.start = PageStart::First;
         self.exhausted = false;
+        self.moved = false;
+    }
+
+    /// The commit the Blob values the view shows hold at ([`BlobsAt`]); `None` when it knows of
+    /// none.
+    pub fn blobs_at(&self) -> Option<&str> {
+        self.blobs.commit(self.pinned.as_deref())
     }
 
     /// Forget everything, the pin included: Refresh.
@@ -540,12 +608,15 @@ impl Paging {
     /// view holds exactly the new commit's state and the pin moves with it; otherwise someone
     /// else committed in between and the view is now behind. Returns whether it is behind.
     pub fn advance_for_own_commit(&mut self, parent: Option<&str>, commit: &str) -> bool {
-        if self.pinned.is_some() && self.pinned.as_deref() == parent {
+        let followed = self.pinned.is_some() && self.pinned.as_deref() == parent;
+        let pin = self.pinned.clone();
+        self.blobs
+            .after_own_write(pin.as_deref(), parent, commit, followed);
+        if followed {
             self.pinned = Some(commit.to_owned());
-            false
-        } else {
-            true
+            self.moved = true;
         }
+        !followed
     }
 }
 
@@ -1244,9 +1315,35 @@ mod tests {
         };
         assert!(!paging.advance_for_own_commit(Some("c1"), "c2"));
         assert_eq!(paging.pinned.as_deref(), Some("c2"));
-        // Someone else committed c3 first: the view is now behind.
+        assert!(paging.moved, "later pages are read at another commit");
+        assert_eq!(paging.blobs_at(), Some("c2"));
+        // Someone else committed c3 first: the view is now behind, and cannot see what c3 did
+        // to the Blob values it shows.
         assert!(paging.advance_for_own_commit(Some("c3"), "c4"));
         assert_eq!(paging.pinned.as_deref(), Some("c2"));
+        assert_eq!(paging.blobs_at(), None);
+        paging.restart();
+        assert!(!paging.moved);
+
+        // Behind, a Blob write bound to a validator read where the values held lands past the
+        // pin: they hold at its commit, and at the own commits made on it after.
+        let mut behind = Paging {
+            pinned: Some("c1".into()),
+            ..Paging::default()
+        };
+        let before = behind.blobs_at().map(str::to_owned);
+        assert!(behind.advance_for_own_commit(Some("c5"), "c6"));
+        behind
+            .blobs
+            .after_bound_write("c1", before.as_deref(), "c6");
+        assert_eq!(behind.blobs_at(), Some("c6"));
+        assert!(behind.advance_for_own_commit(Some("c6"), "c7"));
+        assert_eq!(behind.blobs_at(), Some("c7"), "made on them");
+        assert!(behind.advance_for_own_commit(Some("c9"), "c10"));
+        assert_eq!(behind.blobs_at(), None, "made over another writer's");
+        // A validator read elsewhere than where they held proves nothing about them.
+        behind.blobs.after_bound_write("c1", Some("c7"), "c11");
+        assert_eq!(behind.blobs_at(), None);
     }
 
     #[test]

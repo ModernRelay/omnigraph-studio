@@ -35,11 +35,14 @@ pub(crate) enum BlobChange {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum BlobWritten {
     /// Published: the cell holds `meta` at `commit`, made on `parent`. A clear of a cell that
-    /// was already null publishes nothing, and has no commit.
+    /// was already null publishes nothing, and has no commit. `bound` when the write carried a
+    /// managed value's validator, which the server applied it under: the type's table was then
+    /// as it was where the validator was read.
     Saved {
         commit: Option<String>,
         parent: Option<String>,
         meta: BlobMeta,
+        bound: bool,
     },
     /// The cell holds another value than the one the view shows, so nothing was written: `now`
     /// is what it holds at the branch head, `None` when that could not be read.
@@ -319,11 +322,12 @@ pub(crate) fn upload(
             cell.property,
             cell.id
         );
+        let bound = names_a_version(if_match.as_deref());
         let write = session.update(cx, |session, cx| {
             session.blob_put_on(&branch, cell.clone(), if_match, bytes, description, cx)
         });
         let outcome = write.await;
-        written(outcome, &session, &branch, &cell, cx).await
+        written(outcome, &session, &branch, &cell, bound, cx).await
     })
 }
 
@@ -343,11 +347,12 @@ pub(crate) fn clear(
             Err(unsent) => return unsent,
         };
         let description = format!("Clear {} of {}", cell.property, cell.id);
+        let bound = names_a_version(if_match.as_deref());
         let write = session.update(cx, |session, cx| {
             session.blob_clear_on(&branch, cell.clone(), if_match, description, cx)
         });
         let outcome = write.await;
-        written(outcome, &session, &branch, &cell, cx).await
+        written(outcome, &session, &branch, &cell, bound, cx).await
     })
 }
 
@@ -410,6 +415,11 @@ async fn bind(
     Err(BlobWritten::Changed { now })
 }
 
+/// Whether an `If-Match` names a version of the value: an ETag, not `*` (any value) or none.
+fn names_a_version(if_match: Option<&str>) -> bool {
+    if_match.is_some_and(|tag| tag.trim() != "*")
+}
+
 /// What binds a write to a value that is not null: a managed value's ETag, or `*` (any value)
 /// for a reference, which has none. `None` for a managed value the server named no ETag for:
 /// bound to `*`, the write would replace whatever value is there.
@@ -444,13 +454,15 @@ async fn head(
     read.await.ok()
 }
 
-/// How a sent Blob write ended. A refused binding reads what the cell holds at the head now,
-/// for the view to show and bind the change to if the person sends it again.
+/// How a sent Blob write ended; `bound` when it carried a validator ([`BlobWritten::Saved`]). A
+/// refused binding reads what the cell holds at the head now, for the view to show and bind the
+/// change to if the person sends it again.
 async fn written(
     outcome: WriteOutcome<BlobWriteOutput>,
     session: &Entity<GraphSession>,
     branch: &str,
     cell: &BlobCell,
+    bound: bool,
     cx: &mut AsyncApp,
 ) -> BlobWritten {
     match outcome {
@@ -466,6 +478,7 @@ async fn written(
                 commit: output.commit.as_ref().map(|c| c.graph_commit_id.clone()),
                 parent: output.commit.and_then(|c| c.parent_commit_id),
                 meta,
+                bound,
             }
         }
         WriteOutcome::Refused(error)
@@ -694,6 +707,7 @@ mod tests {
             commit: Some("c2".into()),
             parent: Some("c1".into()),
             meta: now,
+            bound: true,
         };
         assert_eq!(BlobEdit::ended(saved, upload, "attachment"), None);
         assert!(dropped_file(&[]).is_err());

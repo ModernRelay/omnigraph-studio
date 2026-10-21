@@ -34,8 +34,8 @@ use crate::blob::{
 };
 use crate::blob_write::{self, BlobChange, BlobEdit, BlobWritten};
 use crate::model::{
-    FROM_COLUMN, Notice, SaveResult, TO_COLUMN, Tone, changed_elsewhere, count_of, display_value,
-    edited, field_rows, node_label, node_rows, reads_as_markdown, save_result,
+    BlobsAt, FROM_COLUMN, Notice, SaveResult, TO_COLUMN, Tone, changed_elsewhere, count_of,
+    display_value, edited, field_rows, node_label, node_rows, reads_as_markdown, save_result,
 };
 use crate::suggest;
 use gq_language::input::same_value;
@@ -309,6 +309,11 @@ pub struct NodePeek {
     edits: HashMap<String, FieldEdit>,
     /// Properties whose write is out, shown with their new value and a dot.
     saving: HashSet<String>,
+    /// Properties the table this peek was opened from has a save of out: shown with a dot over
+    /// the value the node holds at the view's commit, and not edited here until it lands.
+    saving_elsewhere: HashSet<String>,
+    /// Where the Blob values the view shows hold, which a file stored in a slot is bound at.
+    blobs_at: BlobsAt,
     /// A relationship being added.
     adding: Option<AddEdge>,
     /// The edge whose × was pressed once: the next press removes it.
@@ -460,15 +465,18 @@ impl NodePeek {
                 && !this.holds_commit
                 && session.read(cx).branch != this.branch
             {
-                this.branch = session.read(cx).branch.clone();
+                let left = std::mem::replace(&mut this.branch, session.read(cx).branch.clone());
                 // A file still being stored goes on to the branch left, and its toast tells how
                 // it ended: the new branch's values show none of it, and its head moves are
                 // compared again.
                 this.saving.clear();
+                this.saving_elsewhere.clear();
                 for slot in &mut this.blobs {
                     slot.edit = None;
                 }
-                this.edits.clear();
+                // A field open on the branch left, one a refused save opened again included, is
+                // kept as a draft there, as leaving it keeps it.
+                this.keep_open_fields(&left, cx);
                 this.adding = None;
                 this.removing = None;
                 this.group_notices.clear();
@@ -493,9 +501,7 @@ impl NodePeek {
                 SessionEvent::ChangesRead { branch } if this.awaiting_changes => Some(branch),
                 _ => None,
             };
-            if moved.is_some_and(|branch| *branch == session.read(cx).branch)
-                && this.saving.is_empty()
-                && this.edge_writes.is_empty()
+            if moved.is_some_and(|branch| *branch == session.read(cx).branch) && !this.writes_out()
             {
                 this.compare_head(cx);
             }
@@ -523,6 +529,8 @@ impl NodePeek {
             plain_text: HashMap::new(),
             edits: HashMap::new(),
             saving: HashSet::new(),
+            saving_elsewhere: HashSet::new(),
+            blobs_at: BlobsAt::Pin,
             adding: None,
             removing: None,
             edge_writes: HashSet::new(),
@@ -665,6 +673,7 @@ impl NodePeek {
         self.schema = schema;
         self.newer = false;
         self.snapshot = None;
+        self.blobs_at = BlobsAt::Pin;
         // What the table read belongs to the old commit.
         self.known.clear();
         self.groups.clear();
@@ -785,11 +794,7 @@ impl NodePeek {
             Ok(output) => {
                 if self.snapshot.is_none() {
                     self.snapshot = output.graph_commit_id.clone();
-                    if asked.is_some()
-                        && self.snapshot == asked
-                        && self.saving.is_empty()
-                        && self.edge_writes.is_empty()
-                    {
+                    if asked.is_some() && self.snapshot == asked && !self.writes_out() {
                         self.compare_head(cx);
                     }
                 }
@@ -898,6 +903,15 @@ impl NodePeek {
                 save.detach();
             }
         }
+        let branch = self.branch.clone();
+        self.keep_open_fields(&branch, cx);
+    }
+
+    /// Closes every open field, keeping what a changed one holds as its property's draft on
+    /// `branch`, the branch it was typed on: a field a refused or conflicting save opened again
+    /// holds text nothing else keeps. One typed back to what the node holds keeps nothing. A
+    /// branch deleted meanwhile keeps none ([`GraphSession::settle_draft_on`]).
+    fn keep_open_fields(&mut self, branch: &str, cx: &mut App) {
         for (name, edit) in std::mem::take(&mut self.edits) {
             let text = edit.editor.read(cx).text(cx);
             let unchanged = self.asks_nothing(&name, &edit, &text);
@@ -907,10 +921,69 @@ impl NodePeek {
                     text,
                 };
                 self.session.update(cx, |session, cx| {
-                    session.set_draft_on(&self.branch, key, entry, cx)
+                    let held = session.draft_on(branch, &key).cloned();
+                    session.settle_draft_on(branch, key, held.as_ref(), Some(entry), cx);
                 });
             }
         }
+    }
+
+    /// Whether a write of the view's, or of the table it was opened from, is out: a head seen
+    /// meanwhile may be its commit, and is compared once they are in.
+    fn writes_out(&self) -> bool {
+        !self.saving.is_empty() || !self.edge_writes.is_empty() || !self.saving_elsewhere.is_empty()
+    }
+
+    /// One of the view's own writes, or its table's, landed at `commit` on `parent`: made on the
+    /// commit the view shows, the view moves there; otherwise someone else committed in between,
+    /// and the view is behind. Whether it moved.
+    fn follow_own_commit(&mut self, parent: Option<&str>, commit: &str) -> bool {
+        let followed = parent.is_some() && parent == self.snapshot.as_deref();
+        let pin = self.snapshot.clone();
+        self.blobs_at
+            .after_own_write(pin.as_deref(), parent, commit, followed);
+        if followed {
+            self.snapshot = Some(commit.to_owned());
+        } else {
+            self.newer = true;
+        }
+        followed
+    }
+
+    /// The saves of the table this peek was opened from that are out for its row (`names`):
+    /// their properties show with a dot over the value the node holds, and do not open here,
+    /// until they land. A head seen while they are out is compared once they are all in.
+    pub(crate) fn table_saves(&mut self, names: HashSet<String>, cx: &mut Context<Self>) {
+        if self.holds_commit || names == self.saving_elsewhere {
+            return;
+        }
+        let ended = names.is_empty();
+        self.saving_elsewhere = names;
+        if ended && !self.writes_out() {
+            self.compare_head(cx);
+        }
+        cx.notify();
+    }
+
+    /// A save of the table this peek was opened from landed at `commit`, made on `parent`,
+    /// writing `values` to the node: the view follows it as it follows its own writes, showing
+    /// the values at that commit, or is behind when another writer's commit came between.
+    pub(crate) fn table_saved(
+        &mut self,
+        values: Vec<(String, Value)>,
+        commit: &str,
+        parent: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.holds_commit || self.values.loaded().is_none() {
+            return;
+        }
+        if self.follow_own_commit(parent, commit) {
+            for (name, value) in values {
+                self.restore(&name, value);
+            }
+        }
+        cx.notify();
     }
 
     /// Frees the images this peek decoded; GPUI would keep them otherwise.
@@ -1172,14 +1245,18 @@ impl NodePeek {
             cx.notify();
             return;
         };
-        // A change offered again after a conflict is bound to what the head held then, and so
-        // is a view behind its branch, whose commit may not hold the value it shows (its own
-        // write's, made over another writer's): bound to what it shows, a change since is found.
-        let read_at = if over.is_some() || self.newer {
-            None
-        } else {
-            self.snapshot.clone()
+        // Bound where the values the slots show hold: the view's commit, or past it the view's
+        // own commit that holds them; where none is known (its own write made over another
+        // writer's), to the validator the slot shows. A change elsewhere since is found either
+        // way. A change offered again after a conflict is bound to what the head held then.
+        let read_at = match &over {
+            Some(_) => None,
+            None => self
+                .blobs_at
+                .commit(self.snapshot.as_deref())
+                .map(str::to_owned),
         };
+        let bound_at = read_at.clone();
         slot.edit = Some(BlobEdit::Saving(change.clone()));
         self.saving.insert(property.to_owned());
         let (cell, branch) = (self.blob_cell(property), self.branch.clone());
@@ -1201,7 +1278,7 @@ impl NodePeek {
         cx.spawn(async move |this, cx| {
             let written = write.await;
             this.update(cx, |this, cx| {
-                this.blob_written(&property, &branch, change, written, cx)
+                this.blob_written(&property, &branch, change, (written, bound_at), cx)
             })
             .ok();
         })
@@ -1209,17 +1286,21 @@ impl NodePeek {
         cx.notify();
     }
 
-    /// Lands a Blob write of slot `property` sent on `branch`. A commit made on the one the view
+    /// Lands a Blob write of slot `property` sent on `branch`, with the commit its validator was
+    /// read at (`landed`: how it ended, and that commit). A commit made on the one the view
     /// shows moves the view to it, and the slot shows the new value; over another writer's, the
-    /// view is behind and says so. One that did not land says why on its slot.
+    /// view is behind and says so, and a write bound to a validator read where the values shown
+    /// hold leaves them holding at its commit, which the next write is bound at. One that did
+    /// not land says why on its slot.
     fn blob_written(
         &mut self,
         property: &str,
         branch: &str,
         change: BlobChange,
-        written: BlobWritten,
+        landed: (BlobWritten, Option<String>),
         cx: &mut Context<Self>,
     ) {
+        let (written, bound_at) = landed;
         self.saving.remove(property);
         let index = self.blobs.iter().position(|slot| slot.property == property);
         // The view reads another branch now; the write's outcome is told by its toast.
@@ -1235,18 +1316,24 @@ impl NodePeek {
                 commit,
                 parent,
                 meta,
-            } => Some((commit.clone(), parent.clone(), meta.clone())),
+                bound,
+            } => Some((commit.clone(), parent.clone(), meta.clone(), *bound)),
             _ => None,
         };
         if let Some(index) = index {
             self.blobs[index].edit = BlobEdit::ended(written, change, property);
         }
-        if let Some((commit, parent, meta)) = saved {
+        if let Some((commit, parent, meta, bound)) = saved {
             if let Some(commit) = commit {
-                if parent.is_some() && parent == self.snapshot {
-                    self.snapshot = Some(commit);
-                } else {
-                    self.newer = true;
+                let before = self
+                    .blobs_at
+                    .commit(self.snapshot.as_deref())
+                    .map(str::to_owned);
+                if !self.follow_own_commit(parent.as_deref(), &commit)
+                    && let Some(at) = bound_at.as_deref().filter(|_| bound)
+                {
+                    self.blobs_at
+                        .after_bound_write(at, before.as_deref(), &commit);
                 }
             }
             if let Some(index) = index {
@@ -1265,7 +1352,7 @@ impl NodePeek {
                 }
             }
         }
-        if self.saving.is_empty() && self.edge_writes.is_empty() {
+        if !self.writes_out() {
             self.compare_head(cx);
         }
         cx.notify();
@@ -1475,13 +1562,7 @@ impl NodePeek {
                             h_flex()
                                 .gap(px(space::XXS))
                                 .child({
-                                    let open = OpenBlob {
-                                        type_name: self.subject.type_name().to_owned(),
-                                        id: self.subject.id().to_owned(),
-                                        property: slot.property.clone(),
-                                        edge: matches!(self.subject, PeekSubject::Edge { .. }),
-                                        at_commit: self.snapshot.clone(),
-                                    };
+                                    let open = self.open_blob_action(&slot.property);
                                     studio_ui::ds::button(("open-blob", index), "Open")
                                         .style(ButtonStyle::Subtle)
                                         .color(Color::Muted)
@@ -1535,6 +1616,21 @@ impl NodePeek {
                 }
             }))
             .into_any_element()
+    }
+
+    /// Opening slot `property`'s value in a tab of its own: read at the view's commit, so it
+    /// shows what the slot shows, and held there, read-only, only when the view holds that
+    /// commit; a view at the branch head opens one that writes on its branch, bound to the
+    /// value read at that commit.
+    fn open_blob_action(&self, property: &str) -> OpenBlob {
+        OpenBlob {
+            type_name: self.subject.type_name().to_owned(),
+            id: self.subject.id().to_owned(),
+            property: property.to_owned(),
+            edge: matches!(self.subject, PeekSubject::Edge { .. }),
+            at_commit: self.snapshot.clone(),
+            held: self.holds_commit,
+        }
     }
 
     /// Slot `index`'s Choose File and Clear, each disabled with its reason where the value
@@ -2103,7 +2199,10 @@ impl NodePeek {
             window.focus(&edit.editor.focus_handle(cx), cx);
             return;
         }
-        if !self.edits_property(&property, cx) || self.saving.contains(&name) {
+        if !self.edits_property(&property, cx)
+            || self.saving.contains(&name)
+            || self.saving_elsewhere.contains(&name)
+        {
             return;
         }
         // A draft opens with its text, its save bound to the value it was typed over: a
@@ -2392,11 +2491,7 @@ impl NodePeek {
                 self.settle_draft_on(&branch, &name, sent.as_ref(), None, cx);
                 // Made on the commit shown, the view holds the new commit's state; otherwise
                 // someone else committed in between and the view is behind.
-                if parent.is_some() && parent == self.snapshot {
-                    self.snapshot = Some(commit);
-                } else {
-                    self.newer = true;
-                }
+                self.follow_own_commit(parent.as_deref(), &commit);
             }
             SaveResult::NoMatch => {
                 self.put_back(&name, &new, shown);
@@ -2408,7 +2503,7 @@ impl NodePeek {
                 self.reopen(property, (old, text, notice), sent.as_ref(), window, cx);
             }
         }
-        if self.saving.is_empty() {
+        if !self.writes_out() {
             self.compare_head(cx);
         }
         cx.notify();
@@ -2485,7 +2580,7 @@ impl NodePeek {
                     });
                     this.settle_draft_on(&branch, &name, sent.as_ref(), keep, cx);
                 }
-                if this.saving.is_empty() && this.edge_writes.is_empty() {
+                if !this.writes_out() {
                     this.compare_head(cx);
                 }
                 cx.notify();
@@ -2542,7 +2637,7 @@ impl NodePeek {
                     let now = found.or_else(|| this.values.loaded().cloned().map(Some));
                     this.drafts_read(sent, now.as_ref(), cx);
                 }
-                if this.saving.is_empty() && this.edge_writes.is_empty() {
+                if !this.writes_out() {
                     this.compare_head(cx);
                 }
                 cx.notify();
@@ -3044,7 +3139,17 @@ impl NodePeek {
                 // was written, and the view offers Refresh for the rest.
                 let mut read_at = None;
                 if landed > 0 {
-                    if chained && first_parent.is_some() && this.snapshot == first_parent {
+                    let followed =
+                        chained && first_parent.is_some() && this.snapshot == first_parent;
+                    // Made one on another from where the Blob values hold, the writes hold them
+                    // at the last; a gap between them leaves them where the view cannot see.
+                    if let Some(reached) = &reached {
+                        let pin = this.snapshot.clone();
+                        let parent = first_parent.as_deref().filter(|_| chained);
+                        this.blobs_at
+                            .after_own_write(pin.as_deref(), parent, reached, followed);
+                    }
+                    if followed {
                         this.snapshot = reached;
                     } else {
                         this.newer = true;
@@ -3223,11 +3328,7 @@ impl NodePeek {
                             this.settle_draft_on(&branch, &draft.name, Some(&entry), None, cx);
                             this.restore(&draft.name, draft.new);
                         }
-                        if parent.is_some() && parent == this.snapshot {
-                            this.snapshot = Some(commit);
-                        } else {
-                            this.newer = true;
-                        }
+                        this.follow_own_commit(parent.as_deref(), &commit);
                     }
                     SaveResult::NoMatch => {
                         this.newer = true;
@@ -3239,7 +3340,7 @@ impl NodePeek {
                         this.drafts_notice = Some(notice);
                     }
                 }
-                if this.saving.is_empty() && this.edge_writes.is_empty() {
+                if !this.writes_out() {
                     this.compare_head(cx);
                 }
                 cx.notify();
@@ -3453,7 +3554,8 @@ impl NodePeek {
                             .as_ref()
                             .filter(|_| property.editable_in_cell() && !editable);
                         let editing = self.edits.contains_key(name);
-                        let saving = self.saving.contains(name);
+                        let saving =
+                            self.saving.contains(name) || self.saving_elsewhere.contains(name);
                         // An unsaved value shows what was typed, with a dot, and opens on a click.
                         let draft = (editable && !editing && !saving)
                             .then(|| self.draft_of(name, cx))
@@ -4702,6 +4804,21 @@ fn listed_properties<'a>(
 }
 
 #[cfg(test)]
+impl NodePeek {
+    /// What the view shows of property `name`, and whether it shows it saving: for tests of the
+    /// views that open a peek.
+    pub(crate) fn shown(&self, name: &str) -> (Value, bool) {
+        let saving = self.saving.contains(name) || self.saving_elsewhere.contains(name);
+        (self.value_of(name), saving)
+    }
+
+    /// The commit the view reads.
+    pub(crate) fn reads_at(&self) -> Option<&str> {
+        self.snapshot.as_deref()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use gpui::{TestAppContext, VisualTestContext};
@@ -4800,6 +4917,127 @@ mod tests {
                 session.draft(&key).map(|draft| draft.text.as_str()),
                 Some("Ada King"),
                 "fix's draft stays"
+            );
+        });
+    }
+
+    /// A page that follows the window to another branch keeps each open field as a draft on
+    /// the branch it was typed on: one being typed, and one a refused save opened again, whose
+    /// text nothing else holds. The new branch gets none of it.
+    #[gpui::test]
+    async fn open_fields_stay_drafts_on_the_branch_a_page_leaves(cx: &mut TestAppContext) {
+        const TITLED: &str =
+            "node Person {\n  slug: String @key\n  name: String\n  title: String?\n}\n";
+        let refused = json!({ "error": "policy denied", "code": "forbidden" });
+        let session = session_answering(TITLED, 403, refused, cx);
+        let (view, cx) = page(session.clone(), cx);
+        edit_name(&view, "Ada Lovelace", cx);
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.edits["name"].notice.is_some(), "refused, open again");
+            let title = view.property_named("title").cloned().unwrap();
+            view.start_edit(title, window, cx);
+            let editor = view.edits["title"].editor.clone();
+            editor.update(cx, |editor, cx| editor.set_text("Countess", window, cx));
+        });
+        session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        cx.run_until_parked();
+        let key = |property: &str| DraftKey {
+            type_name: "Person".into(),
+            id: "p1".into(),
+            property: property.into(),
+        };
+        session.read_with(cx, |session, _| {
+            let entry = |old: Value, text: &str| DraftEntry {
+                old,
+                text: text.into(),
+            };
+            let mut on_main: Vec<_> = session.drafts_on("main").collect();
+            on_main.sort_by_key(|(key, _)| key.property.clone());
+            assert_eq!(
+                on_main,
+                vec![
+                    (&key("name"), &entry(json!("Ada"), "Ada Lovelace")),
+                    (&key("title"), &entry(Value::Null, "Countess")),
+                ]
+            );
+            assert_eq!(session.drafts().count(), 0, "nothing on fix");
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.branch, "fix");
+            assert!(view.edits.is_empty());
+        });
+    }
+
+    /// A slot's Open shows the value in a tab read at the view's commit: one the view holds
+    /// opens held, read-only; one at the branch head opens writable, on the view's branch.
+    #[gpui::test]
+    async fn a_slot_opens_its_tab_held_only_where_the_view_holds_its_commit(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, _session, _blobs, cx) = page_with_doc(Some(b"old"), None, cx);
+        view.read_with(cx, |view, _| {
+            let open = view.open_blob_action("doc");
+            assert_eq!(
+                open.at_commit.as_deref(),
+                Some("c1"),
+                "read where the slot was"
+            );
+            assert!(!open.held, "a view at the head writes on its branch");
+        });
+        view.update(cx, |view, _| view.hold_commit());
+        view.read_with(cx, |view, _| {
+            let open = view.open_blob_action("doc");
+            assert_eq!(open.at_commit.as_deref(), Some("c1"));
+            assert!(open.held);
+        });
+    }
+
+    /// A view behind its branch binds a second file at the commit its first one made: the
+    /// first moved every validator of the type, and the server applied it only while the node's
+    /// table was as the view showed it, so the second is stored, not refused as changed.
+    #[gpui::test]
+    async fn a_views_own_blob_write_leaves_its_next_one_bound_where_it_holds(
+        cx: &mut TestAppContext,
+    ) {
+        const SCANS: &str =
+            "node Person {\n  slug: String @key\n  name: String\n  doc: Blob?\n  scan: Blob?\n}\n";
+        let (session, blobs) = crate::test_support::session_with_blobs(SCANS, cx);
+        blobs
+            .versioned
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        blobs.set("Person/p1/doc", b"doc");
+        blobs.set("Person/p1/scan", b"scan");
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (view, cx) = cx.add_window_view({
+            let session = session.clone();
+            move |_, cx| NodePeek::page(session, "Person".into(), "p1".into(), None, cx)
+        });
+        cx.run_until_parked();
+        // Behind its branch: another writer's commit came after the view's read.
+        view.update(cx, |view, _| {
+            view.snapshot = Some("c0".into());
+            view.newer = true;
+        });
+        let file = crate::test_support::upload_file("doc.txt", b"new doc", None);
+        view.update(cx, |view, cx| view.upload_blob("doc", file, cx));
+        cx.run_until_parked();
+        let scan_now = blobs.get("Person/p1/scan").unwrap().1;
+        let file = crate::test_support::upload_file("scan.txt", b"new scan", None);
+        view.update(cx, |view, cx| view.upload_blob("scan", file, cx));
+        cx.run_until_parked();
+        {
+            let writes = blobs.writes.lock().unwrap();
+            assert_eq!(writes.len(), 2);
+            assert_eq!(writes[1].if_match.as_deref(), Some(scan_now.as_str()));
+        }
+        assert_eq!(blobs.get("Person/p1/scan").unwrap().0, b"new scan");
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.blobs.iter().all(|slot| slot.edit.is_none()),
+                "both stored"
             );
         });
     }

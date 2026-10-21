@@ -232,8 +232,13 @@ pub mod graph {
         pub property: String,
         #[serde(default)]
         pub edge: bool,
+        /// The commit the value is read at; `None` reads the branch head.
         #[serde(default)]
         pub at_commit: Option<String>,
+        /// The tab holds `at_commit`, read-only, as a view held at a commit does. Otherwise it
+        /// reads the value there and writes on its branch, bound to the value read.
+        #[serde(default)]
+        pub held: bool,
     }
 
     /// Show one node in the inspector without revealing it in the tree, read at the branch

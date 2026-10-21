@@ -44,18 +44,25 @@ use types_list::TypesList;
 /// `PeekNode`, `OpenBlob`, `OpenTextEditor`, `UndoDelete`). Its keys are in `assets/keymaps/`
 /// (`TypeTable`, `TypeTable && editing`).
 pub fn init(cx: &mut App) {
-    // A Blob tab comes back with the value it showed, at the same commit.
+    // A Blob tab comes back with the value it showed, at the same commit. One saved before a
+    // tab said whether it holds its commit held it.
     studio_workspace::register_item_kind(cx, "blob", |data, workspace, window, cx| {
         let text = |key: &str| data.get(key).and_then(|v| v.as_str()).map(str::to_owned);
         if let (Some(type_name), Some(id), Some(property)) =
             (text("type_name"), text("id"), text("property"))
         {
+            let at_commit = text("at_commit");
+            let held = data
+                .get("held")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(at_commit.is_some());
             let action = OpenBlob {
                 type_name,
                 id,
                 property,
                 edge: data.get("edge").and_then(|v| v.as_bool()).unwrap_or(false),
-                at_commit: text("at_commit"),
+                at_commit,
+                held,
             };
             open_blob(workspace, &action, window, cx);
         }
@@ -269,11 +276,14 @@ fn open_type(
     )
 }
 
+/// What every type table's tab key starts with ([`table_key`]).
+pub(crate) const TABLE_KEY_PREFIX: &str = "type:";
+
 /// One tab per type at the head, and one per type and commit.
 pub(crate) fn table_key(type_name: &str, at_commit: Option<&str>) -> String {
     match at_commit {
-        Some(commit) => format!("type:{type_name}@{commit}"),
-        None => format!("type:{type_name}"),
+        Some(commit) => format!("{TABLE_KEY_PREFIX}{type_name}@{commit}"),
+        None => format!("{TABLE_KEY_PREFIX}{type_name}"),
     }
 }
 
@@ -377,10 +387,10 @@ fn open_blob(
         id: action.id.clone(),
         property: action.property.clone(),
     };
-    let snapshot = action.at_commit.clone();
-    let key = BlobView::key(&cell, snapshot.as_deref());
+    let (snapshot, held) = (action.at_commit.clone(), action.held);
+    let key = BlobView::key(&cell, snapshot.as_deref(), held);
     workspace.open_item(key, window, cx, move |window, cx| {
-        BlobView::new(session, cell, snapshot, window, cx)
+        BlobView::new(session, cell, snapshot, held, window, cx)
     });
 }
 

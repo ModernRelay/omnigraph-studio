@@ -391,13 +391,23 @@ pub(crate) struct BlobWriteSent {
     pub bytes: usize,
 }
 
+/// Blob cells by `type/id/property`, each with its bytes and ETag.
+type BlobCells = std::collections::HashMap<String, (Vec<u8>, String)>;
+
 /// The fake server's Blob cells by `type/id/property`, each with its bytes and ETag; a cell
 /// absent is null. It keeps no history: a read at any commit answers what a cell holds now,
 /// so a view's read at its commit is what the session's memo kept of it. A write that lands
 /// publishes the next commit (`c2`, then `c3`, …) on the one before.
+///
+/// With [`Blobs::versioned`] set it answers as the server does: an ETag names the type's table
+/// version, so a change to any cell of a type gives every cell of it a new ETag, and a read at
+/// a commit a write published answers what the cells held there.
 #[derive(Default)]
 pub(crate) struct Blobs {
-    cells: Mutex<std::collections::HashMap<String, (Vec<u8>, String)>>,
+    cells: Mutex<BlobCells>,
+    pub(crate) versioned: std::sync::atomic::AtomicBool,
+    /// The cells as each commit a write published left them, by commit, while `versioned`.
+    history: Mutex<std::collections::HashMap<String, BlobCells>>,
     pub(crate) writes: Mutex<Vec<BlobWriteSent>>,
     /// Writes are applied, but their answers lost on the way back: a gateway's 504 comes back
     /// instead, without the server's contract header.
@@ -410,15 +420,48 @@ pub(crate) struct Blobs {
 }
 
 impl Blobs {
-    /// Sets a cell's value, as another writer would: it gets an ETag of its own.
+    /// Sets a cell's value, as another writer would: it gets an ETag of its own, and while
+    /// `versioned` so does every other cell of its type.
     pub(crate) fn set(&self, cell: &str, bytes: &[u8]) -> String {
-        let n = self.tags.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        let etag = format!("\"e{n}\"");
-        self.cells
-            .lock()
-            .unwrap()
-            .insert(cell.to_owned(), (bytes.to_vec(), etag.clone()));
+        let etag = self.next_tag();
+        let mut cells = self.cells.lock().unwrap();
+        cells.insert(cell.to_owned(), (bytes.to_vec(), etag.clone()));
+        self.retag_type_of(cell, &mut cells);
         etag
+    }
+
+    fn next_tag(&self) -> String {
+        let n = self.tags.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        format!("\"e{n}\"")
+    }
+
+    /// While `versioned`, gives every cell of `cell`'s type but `cell` a new ETag: the table
+    /// version they name moved.
+    fn retag_type_of(&self, cell: &str, cells: &mut BlobCells) {
+        if !self.versioned.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let of_type = |other: &str| other.split('/').next() == cell.split('/').next();
+        let others: Vec<String> = cells
+            .keys()
+            .filter(|other| *other != cell && of_type(other))
+            .cloned()
+            .collect();
+        for other in others {
+            let etag = self.next_tag();
+            if let Some(held) = cells.get_mut(&other) {
+                held.1 = etag;
+            }
+        }
+    }
+
+    /// What a cell holds at `snapshot`, a commit a versioned write published, else now.
+    fn get_at(&self, cell: &str, snapshot: &str) -> Option<(Vec<u8>, String)> {
+        let history = self.history.lock().unwrap();
+        match history.get(snapshot) {
+            Some(cells) => cells.get(cell).cloned(),
+            None => self.get(cell),
+        }
     }
 
     /// What a cell holds: its bytes and ETag, or `None` for null.
@@ -444,7 +487,10 @@ impl Blobs {
                 .unwrap_or_default()
         };
         let cell = format!("{}/{}/{}", param("type"), param("id"), param("property"));
-        let held = self.get(&cell);
+        let held = match method {
+            "HEAD" | "GET" => self.get_at(&cell, &param("snapshot")),
+            _ => self.get(&cell),
+        };
         match method {
             "HEAD" | "GET" => {
                 let Some((bytes, etag)) = held else {
@@ -504,11 +550,20 @@ impl Blobs {
                     let size = body.len();
                     (json!("managed"), json!(size), json!(self.set(&cell, &body)))
                 } else {
-                    self.cells.lock().unwrap().remove(&cell);
+                    let mut cells = self.cells.lock().unwrap();
+                    cells.remove(&cell);
+                    self.retag_type_of(&cell, &mut cells);
                     (json!("null"), Value::Null, Value::Null)
                 };
                 let mut published = self.published.lock().unwrap();
                 *published += 1;
+                if self.versioned.load(std::sync::atomic::Ordering::SeqCst) {
+                    let cells = self.cells.lock().unwrap().clone();
+                    self.history
+                        .lock()
+                        .unwrap()
+                        .insert(format!("c{}", *published + 1), cells);
+                }
                 let commit = json!({
                     "graph_commit_id": format!("c{}", *published + 1),
                     "graph_manifest_version": 2, "kind": "published",

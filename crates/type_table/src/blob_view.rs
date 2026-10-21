@@ -89,8 +89,11 @@ enum Export {
 pub struct BlobView {
     session: Entity<GraphSession>,
     cell: BlobCell,
-    /// The commit the tab was opened at, read-only; `None` reads the branch head.
+    /// The commit the tab was opened at; `None` reads the branch head.
     snapshot: Option<String>,
+    /// The tab holds `snapshot`, read-only (opened from a view held at a commit). Otherwise it
+    /// reads the value there and writes on its branch, bound to the value it read.
+    held: bool,
     /// The branch the tab read the value on, which a file chosen or dropped is stored on.
     branch: String,
     /// The commit of the tab's own last write, which it reads the value at since: the head it
@@ -127,6 +130,7 @@ impl BlobView {
         session: Entity<GraphSession>,
         cell: BlobCell,
         snapshot: Option<String>,
+        held: bool,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -141,6 +145,7 @@ impl BlobView {
         Self {
             session,
             cell,
+            held: held && snapshot.is_some(),
             snapshot,
             branch,
             own_commit: None,
@@ -162,15 +167,26 @@ impl BlobView {
         }
     }
 
-    pub fn key(cell: &BlobCell, snapshot: Option<&str>) -> String {
+    /// One tab per value at the head, per value and held commit, and per value and the commit
+    /// a view at the head read it at.
+    pub fn key(cell: &BlobCell, snapshot: Option<&str>, held: bool) -> String {
+        let at = match (snapshot, held) {
+            (None, _) => "head".to_owned(),
+            (Some(commit), true) => commit.to_owned(),
+            (Some(commit), false) => format!("head@{commit}"),
+        };
         format!(
-            "blob:{}:{}:{}:{}:{}",
+            "blob:{}:{}:{}:{}:{at}",
             if cell.edge { "edge" } else { "node" },
             cell.type_name,
             cell.id,
             cell.property,
-            snapshot.unwrap_or("head")
         )
+    }
+
+    /// The commit the tab holds, read-only.
+    fn held_commit(&self) -> Option<&str> {
+        self.snapshot.as_deref().filter(|_| self.held)
     }
 
     /// Reads what the cell holds, then the value, then what it is.
@@ -462,7 +478,7 @@ impl BlobView {
         blob_write::write_refusal(
             schema.as_deref(),
             &self.cell,
-            self.snapshot.as_deref(),
+            self.held_commit(),
             denied.as_deref(),
         )
     }
@@ -474,7 +490,7 @@ impl BlobView {
         blob_write::clear_refusal(
             schema.as_deref(),
             &self.cell,
-            self.snapshot.as_deref(),
+            self.held_commit(),
             denied.as_deref(),
             self.meta.as_ref(),
         )
@@ -711,8 +727,8 @@ impl BlobView {
             _ => {}
         }
         facts.extend(size);
-        if let Some(commit) = &self.snapshot {
-            facts.push(format!("at {}", studio_ui::short_commit_id(commit)));
+        if let Some(commit) = self.reading_at() {
+            facts.push(format!("at {}", studio_ui::short_commit_id(&commit)));
         }
         facts.join(" · ")
     }
@@ -1001,7 +1017,7 @@ impl Item for BlobView {
     }
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
-        Some(Self::key(&self.cell, self.snapshot.as_deref()).into())
+        Some(Self::key(&self.cell, self.snapshot.as_deref(), self.held).into())
     }
 
     /// The tab's dot shows while a file is being stored or the value cleared.
@@ -1018,6 +1034,7 @@ impl Item for BlobView {
                 "property": self.cell.property,
                 "edge": self.cell.edge,
                 "at_commit": self.snapshot,
+                "held": self.held,
             }),
         })
     }
@@ -1363,7 +1380,7 @@ mod tests {
             property: "scan".into(),
         };
         let (view, cx) =
-            cx.add_window_view(|window, cx| BlobView::new(session, cell, None, window, cx));
+            cx.add_window_view(|window, cx| BlobView::new(session, cell, None, false, window, cx));
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert!(matches!(view.content, Loadable::Loaded(Content::TooLarge)));
@@ -1394,7 +1411,7 @@ mod tests {
         let (session, blobs) = crate::test_support::session_with_blobs(DOCS, cx);
         let read = blobs.set("Person/p1/doc", &[0xff, 0x00, 0x13]);
         let (view, cx) =
-            cx.add_window_view(|window, cx| BlobView::new(session, doc(), None, window, cx));
+            cx.add_window_view(|window, cx| BlobView::new(session, doc(), None, false, window, cx));
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert!(matches!(view.content, Loadable::Loaded(Content::Bytes(_))));
@@ -1438,6 +1455,47 @@ mod tests {
         });
     }
 
+    /// A tab opened from a view at the branch head reads the value at that view's commit, so it
+    /// shows what the view showed, and stores a file on its branch bound to the value it read
+    /// there. It is a tab of its own, apart from one held at that commit and from the head's.
+    #[gpui::test]
+    async fn a_tab_from_a_view_at_the_head_stores_a_file_bound_to_what_it_read(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, blobs) = crate::test_support::session_with_blobs(DOCS, cx);
+        let read = blobs.set("Person/p1/doc", b"old");
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            BlobView::new(session, doc(), Some("c1".into()), false, window, cx)
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert_eq!(view.write_refusal(cx), None);
+            assert_eq!(view.clear_refusal(cx), None);
+            let key = |at: Option<&str>, held: bool| BlobView::key(&doc(), at, held);
+            assert_eq!(
+                view.dedupe_key(cx).as_deref(),
+                Some(key(Some("c1"), false).as_str())
+            );
+            assert_ne!(key(Some("c1"), false), key(Some("c1"), true));
+            assert_ne!(key(Some("c1"), false), key(None, false));
+        });
+        let file = crate::test_support::upload_file("from-head.txt", b"new", None);
+        view.update(cx, |view, cx| view.upload(file, cx));
+        cx.run_until_parked();
+        let writes = blobs.writes.lock().unwrap().clone();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].branch, "main");
+        assert_eq!(writes[0].if_match.as_deref(), Some(read.as_str()));
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.edit, None, "stored");
+            assert_eq!(view.own_commit.as_deref(), Some("c2"));
+        });
+    }
+
     /// A tab opened at a commit, or on a branch the access route says the credential may not
     /// change, stores no file and clears nothing, and says why; on the branch, Choose File and
     /// Clear are not registered either.
@@ -1449,7 +1507,7 @@ mod tests {
         let (session, blobs) = crate::test_support::session_with_blobs(DOCS, cx);
         blobs.set("Person/p1/doc", b"old");
         let (view, held_cx) = cx.add_window_view(|window, cx| {
-            BlobView::new(session, doc(), Some("c1".into()), window, cx)
+            BlobView::new(session, doc(), Some("c1".into()), true, window, cx)
         });
         held_cx.run_until_parked();
         let file = crate::test_support::upload_file("tab.txt", b"tab", None);
@@ -1473,7 +1531,7 @@ mod tests {
         );
         blobs.set("Person/p1/doc", b"old");
         let (view, cx) =
-            cx.add_window_view(|window, cx| BlobView::new(session, doc(), None, window, cx));
+            cx.add_window_view(|window, cx| BlobView::new(session, doc(), None, false, window, cx));
         cx.run_until_parked();
         cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
         cx.run_until_parked();

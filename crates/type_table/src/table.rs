@@ -77,8 +77,9 @@ pub struct Cursor {
 /// A cell whose edit is not settled.
 #[derive(Debug, Clone)]
 enum CellState {
-    /// The save is out; the cell shows an amber dot.
-    Saving,
+    /// The save is out; the cell shows the value sent with an amber dot. `stored` is what the
+    /// row held at the table's commit before it, which a peek of the row shows meanwhile.
+    Saving { stored: Value },
     /// An unsaved value: the session's draft for this property (spec 014), which every table,
     /// page and peek of the branch shares, with why its last save did not land. Reopening the
     /// cell restores the text and the notice.
@@ -184,6 +185,14 @@ struct CountShift {
     matching: i64,
 }
 
+/// A Blob write as the table sent it: the cell, the change, and the commit its validator was
+/// read at, where the values the cells showed held ([`Paging::blobs_at`]).
+struct BlobSent {
+    key: (String, String),
+    change: BlobChange,
+    bound_at: Option<String>,
+}
+
 /// A bulk set being written: the property, and what came of the last try.
 #[derive(Default)]
 struct BulkDraft {
@@ -214,6 +223,53 @@ struct Relation {
     count: Result<i64, String>,
     neighbours: Vec<(String, Option<String>)>,
     whole: bool,
+}
+
+/// Values by row id and column, looked up without copying either key: every cell drawn asks
+/// for its own.
+struct CellMap<V>(HashMap<String, HashMap<String, V>>);
+
+impl<V> Default for CellMap<V> {
+    fn default() -> Self {
+        Self(HashMap::new())
+    }
+}
+
+impl<V> CellMap<V> {
+    fn get(&self, row: &str, column: &str) -> Option<&V> {
+        self.0.get(row)?.get(column)
+    }
+
+    fn contains(&self, row: &str, column: &str) -> bool {
+        self.get(row, column).is_some()
+    }
+
+    fn insert(&mut self, row: String, column: String, value: V) {
+        self.0.entry(row).or_default().insert(column, value);
+    }
+
+    fn remove(&mut self, row: &str, column: &str) -> Option<V> {
+        let cells = self.0.get_mut(row)?;
+        let removed = cells.remove(column);
+        if cells.is_empty() {
+            self.0.remove(row);
+        }
+        removed
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+/// What a cell shows, made the first time it is drawn ([`TypeTable::cell_text`]): its text,
+/// and a date's or time's exact value, its tooltip. A date or a time reads relative to now, so
+/// it is made again in a later minute than the one it was made in (`minute`).
+#[derive(Clone)]
+struct CellText {
+    shown: SharedString,
+    exact: Option<SharedString>,
+    minute: Option<i64>,
 }
 
 /// `id → n` from a `page_degrees` result.
@@ -333,8 +389,9 @@ pub struct TypeTable {
     /// width were when the drag began.
     resizing: Option<ColumnResize<String>>,
     /// The time relative dates are read against, taken once a frame rather than once a cell
-    /// (reading the local time zone is not free).
+    /// (reading the local time zone is not free), and its minute since the epoch.
     frame_now: chrono::DateTime<chrono::Local>,
+    frame_minute: i64,
     /// The grid as a view of its own, drawn again whenever the table notifies.
     grid: Entity<TableGrid>,
     /// Where the grid drew the cell being edited; the cell's editor is drawn over it from
@@ -373,14 +430,14 @@ pub struct TypeTable {
     drafts_due: bool,
     /// What each Blob cell drawn so far holds, by row id and property, read at the page's
     /// commit; and the reads under way.
-    blobs: HashMap<(String, String), Loadable<BlobMeta>>,
+    blobs: CellMap<Loadable<BlobMeta>>,
     blob_tasks: HashMap<(String, String), Task<()>>,
     /// Files dropped on Blob cells being stored, by row id and property, and why one that did
     /// not land did not.
     blob_edits: HashMap<(String, String), BlobEdit>,
     /// Each row's neighbours in the relationship columns, by row id and relationship key;
     /// read for each page at the page's commit.
-    relations: HashMap<(String, String), Relation>,
+    relations: CellMap<Relation>,
     /// Relationship reads out, each taking itself out when done; a reload drops them all.
     relation_tasks: HashMap<u64, Task<()>>,
     next_relation_task: u64,
@@ -410,7 +467,7 @@ pub struct TypeTable {
     /// What each cell shows, by row id and column, made the first time it is drawn: a text
     /// value is read as markdown to show its first line, too slow to do for every cell every
     /// frame. A cell set, or rows read again, are made again.
-    cell_text: RefCell<HashMap<String, HashMap<String, SharedString>>>,
+    cell_text: RefCell<HashMap<String, HashMap<String, CellText>>>,
     peek: Option<(String, Entity<NodePeek>)>,
     newer: bool,
     /// Writes out for this table: its own saves and the dialogs' inserts and deletes. Each moves
@@ -488,12 +545,17 @@ impl Item for TypeTable {
         })
     }
 
-    fn is_dirty(&self, _cx: &App) -> bool {
+    /// A save out, a draft, or an edit open that leaving its cell would keep as a draft.
+    fn is_dirty(&self, cx: &App) -> bool {
         self.saves_in_flight > 0
             || self
                 .cells
                 .values()
                 .any(|state| matches!(state, CellState::Draft { .. }))
+            || self.editing.as_ref().is_some_and(|editing| {
+                let text = self.cell_editor.read(cx).text(cx);
+                self.edit_keeps(editing, &text)
+            })
     }
 
     fn is_stale(&self, _cx: &App) -> bool {
@@ -625,6 +687,7 @@ impl TypeTable {
             #[cfg(test)]
             frame_drawn: Vec::new(),
             frame_now: chrono::Local::now(),
+            frame_minute: 0,
             grid,
             edit_slot: Default::default(),
             resizing: None,
@@ -646,10 +709,10 @@ impl TypeTable {
             cells: HashMap::new(),
             draft_notices: HashMap::new(),
             drafts_due: false,
-            blobs: HashMap::new(),
+            blobs: CellMap::default(),
             blob_tasks: HashMap::new(),
             blob_edits: HashMap::new(),
-            relations: HashMap::new(),
+            relations: CellMap::default(),
             relation_tasks: HashMap::new(),
             next_relation_task: 0,
             relations_drawn: HashSet::new(),
@@ -677,6 +740,14 @@ impl TypeTable {
             count_shift: None,
             _subscriptions: subscriptions,
         };
+        // The tab closes, or the Nodes panel lets the table go: an edit open is kept as its
+        // cell's draft, as leaving the cell keeps it.
+        cx.on_release(|this: &mut Self, cx| {
+            if let Some(editing) = this.editing.take() {
+                this.keep_edit_on(&this.branch, editing, cx);
+            }
+        })
+        .detach();
         // Drafts already kept for this type (on a node's page, in another table) show at once.
         this.sync_drafts(cx);
         this.load_schema(cx);
@@ -693,7 +764,7 @@ impl TypeTable {
         &mut self,
         _session: &Entity<GraphSession>,
         event: &SessionEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match event {
@@ -711,7 +782,16 @@ impl TypeTable {
             SessionEvent::BranchChanged | SessionEvent::HeadMoved { .. }
                 if self.at_commit.is_some() => {}
             SessionEvent::BranchChanged => {
-                self.branch = self.session.read(cx).branch.clone();
+                let left =
+                    std::mem::replace(&mut self.branch, self.session.read(cx).branch.clone());
+                // An edit open on the branch left is kept as a draft there, as leaving its cell
+                // keeps it: a link or a toast's follow-up that moves the window loses nothing.
+                if let Some(editing) = self.editing.take() {
+                    self.keep_edit_on(&left, editing, cx);
+                    if self.cell_editor.focus_handle(cx).is_focused(window) {
+                        window.focus(&self.focus_handle, cx);
+                    }
+                }
                 // A Refresh asked for on the branch left reads nothing here.
                 self._refresh = None;
                 // A file still being stored goes on to the branch left, and its toast tells how
@@ -720,7 +800,6 @@ impl TypeTable {
                 // The branch's own drafts show; the other's wait in the session.
                 self.cells.clear();
                 self.draft_notices.clear();
-                self.editing = None;
                 self.sync_drafts(cx);
                 self.reload(false, cx);
             }
@@ -1324,10 +1403,11 @@ impl TypeTable {
                 match output.commit.as_ref() {
                     Some(commit) if changed == rows.len() => {
                         let places = self.row_places();
+                        let filters = self.resolved_filters();
                         for (id, _) in &rows {
                             if let Some(at) = places.get(id) {
                                 self.set_cell_at(at, &column, new.clone());
-                                let fits = self.row_fits(at[0]);
+                                let fits = self.row_fits_under(&filters, at[0]);
                                 self.set_dimmed_at(at, !fits);
                             }
                         }
@@ -1952,8 +2032,13 @@ impl TypeTable {
             .any(|p| p.name == sort.property && Sort::allowed(p))
     }
 
-    /// The filters with each date preset's start computed now, in local time.
+    /// The filters with each date preset's days computed now, in local time: a preset holds no
+    /// value of its own, so a row is judged against these, as the engine is asked with them.
     fn resolved_filters(&self) -> Vec<Filter> {
+        // Reading the local time zone is not free: only a preset needs it.
+        if !self.filters.iter().any(|filter| filter.op.is_date_preset()) {
+            return self.filters.clone();
+        }
         let now = chrono::Local::now();
         self.filters
             .iter()
@@ -2531,7 +2616,8 @@ impl TypeTable {
                         sort_column.as_deref(),
                     );
                 }
-                self.not_placed_here(page)
+                let page = self.not_placed_here(page);
+                self.not_shown_already(page, Some(index))
             }
             Err(error) => {
                 if let Some(section) = self.grouping.as_mut().and_then(|g| g.section_mut(index)) {
@@ -2559,6 +2645,33 @@ impl TypeTable {
         self.rows_inserted(at, count);
         self.load_relations(ids, cx);
         cx.notify();
+    }
+
+    /// `page` without the rows the table shows already, once its pin moved to one of its own
+    /// commits ([`Paging::moved`]): read there, a row the table's write moved further on in the
+    /// order (a title edited from "B" to "Zed"), or into another section, comes again, and stays
+    /// where it was read (constitution V). A row shows once in a table, or grouped by its own
+    /// property; grouped otherwise it may show under several sections, once in each (`section`).
+    /// A section counts only the rows it shows, so one skipped here leaves its count to the
+    /// rows still unread.
+    fn not_shown_already(&self, page: Vec<Row>, section: Option<usize>) -> Vec<Row> {
+        if !self.paging.moved || page.is_empty() {
+            return page;
+        }
+        let within = match (section, &self.grouping) {
+            (Some(index), Some(grouping)) if !grouping.by_own_property() => {
+                grouping.sections().get(index).map(|s| s.range.clone())
+            }
+            _ => None,
+        };
+        let rows = match within {
+            Some(range) => self.rows.get(range).unwrap_or_default(),
+            None => self.rows.as_slice(),
+        };
+        let shown: HashSet<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        page.into_iter()
+            .filter(|row| !shown.contains(row.id.as_str()))
+            .collect()
     }
 
     /// `page` without the rows shown already where they were made ([`Self::placed_here`]).
@@ -2684,10 +2797,16 @@ impl TypeTable {
     /// Whether a row still belongs where it is shown: it matches the filters and, grouped, holds
     /// its section's value.
     fn row_fits(&self, ix: usize) -> bool {
+        self.row_fits_under(&self.resolved_filters(), ix)
+    }
+
+    /// [`Self::row_fits`] under `filters`, the table's filters resolved once for a batch of
+    /// rows ([`Self::resolved_filters`]).
+    fn row_fits_under(&self, filters: &[Filter], ix: usize) -> bool {
         let Some(row) = self.rows.get(ix) else {
             return true;
         };
-        if !row_matches(&self.filters, &row.values) {
+        if !row_matches(filters, &row.values) {
             return false;
         }
         match &self.grouping {
@@ -2716,6 +2835,7 @@ impl TypeTable {
                 self.paging
                     .accept(output.graph_commit_id.as_deref(), &page, size, sort_column);
                 let page = self.not_placed_here(page);
+                let page = self.not_shown_already(page, None);
                 let ids: Vec<String> = page.iter().map(|row| row.id.clone()).collect();
                 self.rows.extend(page);
                 self.load_relations(ids, cx);
@@ -2888,8 +3008,8 @@ impl TypeTable {
             let ids: Vec<String> = ids
                 .iter()
                 .filter(|id| {
-                    let asked = ((*id).clone(), key.clone());
-                    !self.relations.contains_key(&asked) && !self.relations_asked.contains(&asked)
+                    !self.relations.contains(id, &key)
+                        && !self.relations_asked.contains(&((*id).clone(), key.clone()))
                 })
                 .cloned()
                 .collect();
@@ -2959,7 +3079,7 @@ impl TypeTable {
                             whole: read_whole && sampled.contains(&id),
                             neighbours: shown.remove(&id).unwrap_or_default(),
                         };
-                        this.relations.insert((id, key.clone()), relation);
+                        this.relations.insert(id, key.clone(), relation);
                     }
                     cx.notify();
                 })
@@ -3158,7 +3278,8 @@ impl TypeTable {
             self.newer = true;
             cx.emit(ItemEvent::UpdateTab);
         }
-        let matching = i64::from(row_matches(&self.filters, &values));
+        let filters = self.resolved_filters();
+        let matching = i64::from(row_matches(&filters, &values));
         match key {
             Some(id) => {
                 values.insert(crate::model::ID_COLUMN.into(), Value::String(id.clone()));
@@ -3199,7 +3320,7 @@ impl TypeTable {
                     if self.sort.is_some() || section.is_some() {
                         self.placed_here.insert(id.clone());
                     }
-                    let dimmed = !row_matches(&self.filters, &values);
+                    let dimmed = !row_matches(&filters, &values);
                     self.rows.insert(position, Row { id, values, dimmed });
                     // The row a range starts from moves with the rows below it; the cursor goes
                     // to the new row.
@@ -3291,11 +3412,12 @@ impl TypeTable {
         let (rows, matching) = {
             let going: HashSet<&str> = ids.iter().map(String::as_str).collect();
             let mut counted = HashSet::new();
+            let filters = self.resolved_filters();
             self.rows
                 .iter()
                 .filter(|row| going.contains(row.id.as_str()) && counted.insert(row.id.as_str()))
                 .fold((0, 0), |(rows, matching), row| {
-                    let shown = row_matches(&self.filters, &row.values);
+                    let shown = row_matches(&filters, &row.values);
                     (rows + 1, matching + i64::from(shown))
                 })
         };
@@ -3554,7 +3676,17 @@ impl TypeTable {
                 }
             }
         };
-        let values = row.values.clone();
+        // What the row holds at the table's commit: a cell with a save out shows the value sent,
+        // which is not stored until the save lands, and the peek shows it as saving.
+        let mut values = row.values.clone();
+        let saving = self.saves_of(&row.id);
+        for (column, stored) in &saving {
+            match stored {
+                Value::Null => values.remove(column),
+                stored => values.insert(column.clone(), stored.clone()),
+            };
+        }
+        let saving: HashSet<String> = saving.into_iter().map(|(column, _)| column).collect();
         let id = row.id.clone();
         let session = self.session.clone();
         let snapshot = self.paging.pinned.clone();
@@ -3571,7 +3703,7 @@ impl TypeTable {
                 .filter_map(ColumnSpec::relationship)
                 .filter_map(|group| {
                     let key = builder::relationship_key(group);
-                    let relation = self.relations.get(&(id.clone(), key.clone()))?;
+                    let relation = self.relations.get(&id, &key)?;
                     let count = *relation.count.as_ref().ok()?;
                     let first = (holds_commit && relation.whole).then(|| {
                         relation
@@ -3602,6 +3734,7 @@ impl TypeTable {
             if holds_commit {
                 peek.hold_commit();
             }
+            peek.table_saves(saving, cx);
             peek
         });
         if let Some(workspace) = self.workspace.upgrade() {
@@ -3620,6 +3753,51 @@ impl TypeTable {
         }
         self.peek = Some((id, peek));
         cx.notify();
+    }
+
+    /// The cells of the row with `row_id` with a save out, each with the value the row holds
+    /// at the table's commit.
+    fn saves_of(&self, row_id: &str) -> Vec<(String, Value)> {
+        self.cells
+            .iter()
+            .filter_map(|((row, column), state)| match state {
+                CellState::Saving { stored } if row == row_id => {
+                    Some((column.clone(), stored.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Tells the peek of a row which of the row's cells have a save out: it shows them as
+    /// saving, over the value the row holds, until they land.
+    fn tell_peek_saves(&self, cx: &mut Context<Self>) {
+        let Some((id, peek)) = &self.peek else {
+            return;
+        };
+        let saving: HashSet<String> = self
+            .saves_of(id)
+            .into_iter()
+            .map(|(column, _)| column)
+            .collect();
+        peek.update(cx, |peek, cx| peek.table_saves(saving, cx));
+    }
+
+    /// Tells the peek of the row with `row_id` that a save of it landed at `commit`, made on
+    /// `parent`, writing `values`: the peek follows it as it follows its own writes.
+    fn tell_peek_saved(
+        &self,
+        row_id: &str,
+        values: Vec<(String, Value)>,
+        commit: &str,
+        parent: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((id, peek)) = &self.peek
+            && id == row_id
+        {
+            peek.update(cx, |peek, cx| peek.table_saved(values, commit, parent, cx));
+        }
     }
 
     /// Opens a node row's page, at the commit the table holds or the branch head.
@@ -3671,7 +3849,7 @@ impl TypeTable {
             return;
         };
         let key = (row.id.clone(), column.key.clone());
-        if matches!(self.cells.get(&key), Some(CellState::Saving)) {
+        if matches!(self.cells.get(&key), Some(CellState::Saving { .. })) {
             return;
         }
         // A draft's save is bound to the value it was typed over, which a Refresh since may
@@ -3740,14 +3918,7 @@ impl TypeTable {
     /// for nothing; text that does not parse is kept, to be corrected.
     fn keep_edit(&mut self, editing: Editing, cx: &mut Context<Self>) {
         let text = self.cell_editor.read(cx).text(cx);
-        let changes = match self.property_of(&editing.column) {
-            Some(property) => edited(&property, &editing.old, &text).is_some(),
-            None => text != edit_text(&editing.old),
-        };
-        // Typed back to the value it is bound to, over another the row shows since, it asks
-        // for that value back: a change.
-        let shows_old = self.row_shows(&editing.row_id, &editing.column, &editing.old);
-        if changes || editing.notice.is_some() || !shows_old {
+        if self.edit_keeps(&editing, &text) {
             self.put_draft(
                 &editing.row_id,
                 &editing.column,
@@ -3759,6 +3930,40 @@ impl TypeTable {
         } else {
             self.drop_draft(&editing.row_id, &editing.column, cx);
         }
+    }
+
+    /// Whether an edit closed with `text` is kept as its cell's draft ([`Self::keep_edit`]):
+    /// it changes the value, or says why its last save did not land, or asks for the value it
+    /// is bound to over another the row shows since, which is a change too.
+    fn edit_keeps(&self, editing: &Editing, text: &str) -> bool {
+        let changes = match self.property_of(&editing.column) {
+            Some(property) => edited(&property, &editing.old, text).is_some(),
+            None => text != edit_text(&editing.old),
+        };
+        changes
+            || editing.notice.is_some()
+            || !self.row_shows(&editing.row_id, &editing.column, &editing.old)
+    }
+
+    /// [`Self::keep_edit`] for an edit typed on `branch`, which the table may no longer show,
+    /// or whose table is going: kept as that branch's draft, or its draft let go. A branch
+    /// deleted meanwhile keeps none ([`GraphSession::settle_draft_on`]).
+    fn keep_edit_on(&self, branch: &str, editing: Editing, cx: &mut App) {
+        let text = self.cell_editor.read(cx).text(cx);
+        let keeps = self.edit_keeps(&editing, &text);
+        let key = self.draft_key(&editing.row_id, &editing.column);
+        self.session.update(cx, |session, cx| {
+            if keeps {
+                let held = session.draft_on(branch, &key).cloned();
+                let entry = DraftEntry {
+                    old: editing.old,
+                    text,
+                };
+                session.settle_draft_on(branch, key, held.as_ref(), Some(entry), cx);
+            } else {
+                session.remove_draft_on(branch, &key, cx);
+            }
+        });
     }
 
     fn finish_editing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3877,8 +4082,12 @@ impl TypeTable {
         };
         // Show the new value with an amber dot while the save is out.
         self.set_cell(row_ix, &column, new.clone());
-        self.cells
-            .insert((row_id.clone(), column.clone()), CellState::Saving);
+        let stored = shown.clone();
+        self.cells.insert(
+            (row_id.clone(), column.clone()),
+            CellState::Saving { stored },
+        );
+        self.tell_peek_saves(cx);
         self.saves_in_flight += 1;
         self.finish_editing(window, cx);
         let (session, branch) = (self.session.clone(), self.branch.clone());
@@ -3956,6 +4165,8 @@ impl TypeTable {
                 {
                     self.newer = true;
                 }
+                let written = vec![(cell.column.clone(), cell.new.clone())];
+                self.tell_peek_saved(&cell.row_id, written, &commit, parent.as_deref(), cx);
                 // Shown again: the rows may have been read again, at the commit before, while
                 // the write was out.
                 if let Some(ix) = self.row_index(&cell.row_id) {
@@ -3982,6 +4193,7 @@ impl TypeTable {
                 );
             }
         }
+        self.tell_peek_saves(cx);
         self.saves_settled(cx);
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
@@ -4056,7 +4268,7 @@ impl TypeTable {
     /// (a cell with a save out shows that).
     fn sync_drafts(&mut self, cx: &App) {
         self.cells
-            .retain(|_, state| matches!(state, CellState::Saving));
+            .retain(|_, state| matches!(state, CellState::Saving { .. }));
         if self.at_commit.is_some() {
             return;
         }
@@ -4377,11 +4589,14 @@ impl TypeTable {
             }
             self.cells.insert(
                 (edit.row_id.clone(), edit.column.clone()),
-                CellState::Saving,
+                CellState::Saving {
+                    stored: edit.shown.clone(),
+                },
             );
         }
         self.drafts.saving = true;
         self.saves_in_flight += 1;
+        self.tell_peek_saves(cx);
         cx.notify();
         let (session, branch) = (self.session.clone(), self.branch.clone());
         let row_count = rows.len();
@@ -4460,6 +4675,19 @@ impl TypeTable {
                     self.newer = true;
                 }
                 let changed = output.affected_nodes as usize;
+                if let Some(commit) = output.commit.as_ref().filter(|_| changed == row_count)
+                    && let Some((id, _)) = &self.peek
+                {
+                    let written: Vec<(String, Value)> = edits
+                        .iter()
+                        .filter(|edit| edit.row_id == *id)
+                        .map(|edit| (edit.column.clone(), edit.new.clone()))
+                        .collect();
+                    if !written.is_empty() {
+                        let (id, parent) = (id.clone(), commit.parent_commit_id.as_deref());
+                        self.tell_peek_saved(&id, written, &commit.graph_commit_id, parent, cx);
+                    }
+                }
                 if output.commit.is_some() && changed == row_count {
                     // Shown again, as one saved cell is: the rows may have been read again.
                     let places = self.row_places();
@@ -4513,6 +4741,7 @@ impl TypeTable {
                 }
             }
         }
+        self.tell_peek_saves(cx);
         self.saves_settled(cx);
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
@@ -4520,9 +4749,10 @@ impl TypeTable {
 
     fn refresh_dimmed(&mut self, edits: &[DraftEdit]) {
         let places = self.row_places();
+        let filters = self.resolved_filters();
         for edit in edits {
             if let Some(at) = places.get(&edit.row_id) {
-                let fits = self.row_fits(at[0]);
+                let fits = self.row_fits_under(&filters, at[0]);
                 self.set_dimmed_at(at, !fits);
             }
         }
@@ -4664,6 +4894,7 @@ impl TypeTable {
             );
         }
         self.sync_drafts(cx);
+        self.tell_peek_saves(cx);
         // The table now shows values newer than its pin.
         self.newer = true;
         cx.emit(ItemEvent::UpdateTab);
@@ -4811,8 +5042,12 @@ impl TypeTable {
                 return;
             }
         };
-        self.cells
-            .insert((row_id.clone(), column.clone()), CellState::Saving);
+        self.cells.insert(
+            (row_id.clone(), column.clone()),
+            CellState::Saving {
+                stored: shown.clone(),
+            },
+        );
         self.saves_in_flight += 1;
         let read = self
             .session
@@ -4863,6 +5098,7 @@ impl TypeTable {
                 let (row_id, column) = (row_id.clone(), column.clone());
                 let edit = (bound, text.clone(), notice);
                 this.reopen(row_id, column, edit, sent.as_ref(), window, cx);
+                this.tell_peek_saves(cx);
                 true
             });
             // The table moved on, or its tab closed: the text stays a draft where it was typed,
@@ -5879,6 +6115,7 @@ impl TypeTable {
 
     fn render_body(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         self.frame_now = chrono::Local::now();
+        self.frame_minute = self.frame_now.timestamp().div_euclid(60);
         self.edit_slot.clear();
         if self.missing {
             return studio_ui::ds::empty_state(
@@ -6463,7 +6700,7 @@ impl TypeTable {
                     .collect();
                 for key in gone {
                     this.blob_tasks.remove(&key);
-                    this.blobs.remove(&key);
+                    this.blobs.remove(&key.0, &key.1);
                 }
                 this.load_blob_metas(rows, cx);
             })
@@ -6502,11 +6739,12 @@ impl TypeTable {
             .collect();
         for id in rows {
             for property in &properties {
-                let key = (id.clone(), property.clone());
-                if self.blobs.contains_key(&key) {
+                if self.blobs.contains(&id, property) {
                     continue;
                 }
-                self.blobs.insert(key.clone(), Loadable::Loading);
+                let key = (id.clone(), property.clone());
+                self.blobs
+                    .insert(id.clone(), property.clone(), Loadable::Loading);
                 let cell = BlobCell {
                     edge,
                     type_name: self.type_name.clone(),
@@ -6524,8 +6762,10 @@ impl TypeTable {
                     this.update(cx, |this, cx| {
                         // A reload since this read began leaves its answer out.
                         if this.blob_tasks.remove(&task_key).is_some() {
+                            let (id, property) = task_key;
                             this.blobs.insert(
-                                task_key,
+                                id,
+                                property,
                                 match result {
                                     Ok(meta) => Loadable::Loaded(meta),
                                     Err(error) => Loadable::Failed(error.to_string()),
@@ -6673,7 +6913,7 @@ impl TypeTable {
                 &cell,
                 pinned,
                 denied.as_deref(),
-                self.blobs.get(&key).and_then(Loadable::loaded),
+                self.blobs.get(&key.0, &key.1).and_then(Loadable::loaded),
             ),
             _ => blob_write::write_refusal(schema, &cell, pinned, denied.as_deref()),
         };
@@ -6682,9 +6922,10 @@ impl TypeTable {
             cx.notify();
             return;
         }
-        let shown = over
-            .clone()
-            .or_else(|| self.blobs.get(&key).and_then(Loadable::loaded).cloned());
+        let shown = over.clone().or_else(|| {
+            let shown = self.blobs.get(&key.0, &key.1);
+            shown.and_then(Loadable::loaded).cloned()
+        });
         let Some(shown) = shown else {
             let reason =
                 format!("Nothing was written: Studio has not read what {property} holds yet.");
@@ -6692,13 +6933,15 @@ impl TypeTable {
             cx.notify();
             return;
         };
-        // A table behind its branch may not hold at its commit what a cell shows (its own
-        // write's, made over another writer's): bound to what it shows, a change since is found.
-        let read_at = if over.is_some() || self.newer {
-            None
-        } else {
-            self.paging.pinned.clone()
+        // Bound where the values the cells show hold: the pin, or past it the table's own
+        // commit that holds them; where none is known (its own write made over another
+        // writer's), to the validator the cell shows. A change elsewhere since is found either
+        // way. After a conflict, the change made again is bound to what the head held then.
+        let read_at = match &over {
+            Some(_) => None,
+            None => self.paging.blobs_at().map(str::to_owned),
         };
+        let bound_at = read_at.clone();
         let write = match &change {
             BlobChange::Upload(path) => blob_write::upload(
                 &self.session,
@@ -6721,7 +6964,12 @@ impl TypeTable {
         cx.spawn(async move |this, cx| {
             let written = write.await;
             this.update(cx, |this, cx| {
-                this.blob_written(key, &session, &branch, change, written, cx)
+                let sent = BlobSent {
+                    key,
+                    change,
+                    bound_at,
+                };
+                this.blob_written(sent, &session, &branch, written, cx)
             })
             .ok();
         })
@@ -6730,18 +6978,24 @@ impl TypeTable {
         cx.notify();
     }
 
-    /// Lands a Blob write of the cell `key` sent on `session`'s `branch`. A commit on the one the
-    /// table shows moves it there, and the cell shows the new value; over another writer's, the
-    /// table is behind and offers Refresh. One that did not land says why on its cell.
+    /// Lands a Blob write sent on `session`'s `branch`. A commit on the one the table shows
+    /// moves it there, and the cell shows the new value; over another writer's, the table is
+    /// behind and offers Refresh, and a write bound to a validator read where the values shown
+    /// hold leaves them holding at its commit, which the next write is bound at. One that did
+    /// not land says why on its cell.
     fn blob_written(
         &mut self,
-        key: (String, String),
+        sent: BlobSent,
         session: &Entity<GraphSession>,
         branch: &str,
-        change: BlobChange,
         written: BlobWritten,
         cx: &mut Context<Self>,
     ) {
+        let BlobSent {
+            key,
+            change,
+            bound_at,
+        } = sent;
         self.saves_in_flight = self.saves_in_flight.saturating_sub(1);
         // The table moved to another branch or graph meanwhile; the outcome is told by its
         // toast.
@@ -6756,19 +7010,27 @@ impl TypeTable {
             commit,
             parent,
             meta,
+            bound,
         } = &written
         {
-            if let Some(commit) = commit
-                && self
+            if let Some(commit) = commit {
+                let before = self.paging.blobs_at().map(str::to_owned);
+                if self
                     .paging
                     .advance_for_own_commit(parent.as_deref(), commit)
-            {
-                self.newer = true;
+                {
+                    self.newer = true;
+                    if let Some(at) = bound_at.as_deref().filter(|_| *bound) {
+                        self.paging
+                            .blobs
+                            .after_bound_write(at, before.as_deref(), commit);
+                    }
+                }
             }
             // A read of the cell still out would land the value replaced.
             self.blob_tasks.remove(&key);
             self.blobs
-                .insert(key.clone(), Loadable::Loaded(meta.clone()));
+                .insert(key.0.clone(), key.1.clone(), Loadable::Loaded(meta.clone()));
         }
         match BlobEdit::ended(written, change, &key.1) {
             Some(edit) => self.blob_edits.insert(key, edit),
@@ -6779,26 +7041,39 @@ impl TypeTable {
         cx.notify();
     }
 
-    /// A relationship cell: the first neighbours as chips, then "+N"; "—" for none.
+    /// Column `col`'s relationship cell of `row`: the first neighbours as chips, then "+N"; "—"
+    /// for none. Drawn for every row in view at every draw, so its id is the cell's place (`id`,
+    /// as [`Self::render_cell`] names the cell) and its tooltip is made only when it shows.
     fn render_relation_cell(
         &self,
+        id: u64,
+        col: usize,
         row: &Row,
-        key: &str,
-        group: &RelationshipGroup,
         available: f32,
-        cx: &App,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(relation) = self.relations.get(&(row.id.clone(), key.to_owned())) else {
+        let key = self.columns[col].key.as_str();
+        let Some(relation) = self.relations.get(&row.id, key) else {
             return studio_ui::cell_text("…", cx)
                 .color(Color::Disabled.color(cx))
                 .into_any_element();
         };
         let count = match &relation.count {
             Ok(count) => *count,
-            Err(error) => {
+            Err(_) => {
+                let (table, row_id, key) = (cx.weak_entity(), row.id.clone(), key.to_owned());
                 return div()
-                    .id(SharedString::from(format!("relation-{}-{key}", row.id)))
-                    .tooltip(Tooltip::text(error.clone()))
+                    .id(ElementId::NamedInteger("relation".into(), id))
+                    .tooltip(move |_, cx| {
+                        let error = table.upgrade().and_then(|table| {
+                            let table = table.read(cx);
+                            match &table.relations.get(&row_id, &key)?.count {
+                                Err(error) => Some(error.clone()),
+                                Ok(_) => None,
+                            }
+                        });
+                        Tooltip::simple(error.unwrap_or_default(), cx)
+                    })
                     .child(studio_ui::ds::text::body("?").color(Color::Warning))
                     .into_any_element();
             }
@@ -6816,17 +7091,28 @@ impl TypeTable {
             .collect();
         let fit = chips_that_fit(&labels, count, available);
         let more = count - fit as i64;
+        // The other type is the column's, looked up when the tooltip shows.
+        let table = cx.weak_entity();
         // The count stays in view; the tags give way, whole.
         h_flex()
-            .id(SharedString::from(format!("relation-{}-{key}", row.id)))
+            .id(ElementId::NamedInteger("relation".into(), id))
             .w_full()
             .min_w_0()
             .gap(px(space::XS))
-            .tooltip(Tooltip::text(format!(
-                "{} {} · click to open them",
-                studio_ui::group_count(count),
-                group.other_type
-            )))
+            .tooltip(move |_, cx| {
+                let other = table.upgrade().and_then(|table| {
+                    let group = table.read(cx).columns.get(col)?.relationship()?;
+                    Some(group.other_type.clone())
+                });
+                Tooltip::simple(
+                    format!(
+                        "{} {} · click to open them",
+                        studio_ui::group_count(count),
+                        other.unwrap_or_default()
+                    ),
+                    cx,
+                )
+            })
             .child(
                 h_flex()
                     .min_w_0()
@@ -6858,9 +7144,17 @@ impl TypeTable {
     }
 
     /// A Blob cell: "Blob" while it is read, then its size and "Preview" (a click opens the
-    /// peek, which shows it), "—" for null, or the host of an external reference.
-    fn render_blob_cell(&self, row: &Row, property: &Property) -> AnyElement {
-        let state = self.blobs.get(&(row.id.clone(), property.name.clone()));
+    /// peek, which shows it), "—" for null, or the host of an external reference. As a
+    /// relationship cell, its id is the cell's place (`id`) and its tooltip is made only when
+    /// it shows.
+    fn render_blob_cell(
+        &self,
+        id: u64,
+        row: &Row,
+        property: &Property,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let state = self.blobs.get(&row.id, &property.name);
         let (text, color, preview, tooltip) = match state {
             Some(Loadable::Loaded(meta)) => (
                 crate::blob::cell_label(meta),
@@ -6870,31 +7164,33 @@ impl TypeTable {
                     Color::Default
                 },
                 matches!(meta, BlobMeta::Managed { size, .. } if *size > 0),
-                match meta {
-                    BlobMeta::External { uri } => {
-                        Some(format!("{uri}\nStudio does not fetch external objects."))
-                    }
-                    _ => None,
-                },
+                matches!(meta, BlobMeta::External { .. }),
             ),
-            Some(Loadable::Failed(error)) => (
-                "Blob · ?".into(),
-                Color::Warning,
-                false,
-                Some(error.clone()),
-            ),
-            _ => ("Blob".into(), Color::Disabled, false, None),
+            Some(Loadable::Failed(_)) => ("Blob · ?".into(), Color::Warning, false, true),
+            _ => ("Blob".into(), Color::Disabled, false, false),
         };
+        // What the cell holds when the tooltip shows: a reference's address, or why it could
+        // not be read.
+        let tooltip = tooltip.then(|| {
+            let (table, row_id, name) = (cx.weak_entity(), row.id.clone(), property.name.clone());
+            move |_: &mut Window, cx: &mut App| {
+                let text = table.upgrade().and_then(|table| {
+                    match table.read(cx).blobs.get(&row_id, &name)? {
+                        Loadable::Loaded(BlobMeta::External { uri }) => {
+                            Some(format!("{uri}\nStudio does not fetch external objects."))
+                        }
+                        Loadable::Failed(error) => Some(error.clone()),
+                        _ => None,
+                    }
+                });
+                Tooltip::simple(text.unwrap_or_default(), cx)
+            }
+        });
         h_flex()
-            .id(SharedString::from(format!(
-                "blob-{}-{}",
-                row.id, property.name
-            )))
+            .id(ElementId::NamedInteger("blob".into(), id))
             .min_w_0()
             .gap(px(space::XS))
-            .when_some(tooltip, |cell, tooltip| {
-                cell.tooltip(Tooltip::text(tooltip))
-            })
+            .when_some(tooltip, |cell, tooltip| cell.tooltip(tooltip))
             .child(
                 studio_ui::ds::text::body(text)
                     .color(color)
@@ -6967,23 +7263,41 @@ impl TypeTable {
         drawn
     }
 
-    /// What a cell shows, made once (see `cell_text`): looked up without allocating.
-    fn cell_text_of(&self, row: &Row, column: &ColumnSpec, value: &Value) -> SharedString {
-        if let Some(shown) = self
+    /// What a cell shows, and a date's or time's exact value, made once (see `cell_text`):
+    /// looked up without allocating. A date or a time reads relative to now, and is made again
+    /// in a later minute.
+    fn cell_text_of(&self, row: &Row, column: &ColumnSpec, value: &Value) -> CellText {
+        if let Some(made) = self
             .cell_text
             .borrow()
             .get(&row.id)
             .and_then(|cells| cells.get(&column.key))
+            .filter(|made| made.minute.is_none_or(|minute| minute == self.frame_minute))
         {
-            return shown.clone();
+            return made.clone();
         }
-        let shown: SharedString = display_value(column.property(), value).into();
+        let property = column.property();
+        let temporal = property.is_some_and(|property| {
+            !property.list && matches!(property.kind, ScalarKind::Date | ScalarKind::DateTime)
+        });
+        let made = match crate::model::relative_value(property, value, self.frame_now) {
+            Some((shown, exact)) => CellText {
+                shown: shown.into(),
+                exact: Some(exact.into()),
+                minute: Some(self.frame_minute),
+            },
+            None => CellText {
+                shown: display_value(property, value).into(),
+                exact: None,
+                minute: temporal.then_some(self.frame_minute),
+            },
+        };
         self.cell_text
             .borrow_mut()
             .entry(row.id.clone())
             .or_default()
-            .insert(column.key.clone(), shown.clone());
-        shown
+            .insert(column.key.clone(), made.clone());
+        made
     }
 
     fn render_cell(
@@ -7055,22 +7369,23 @@ impl TypeTable {
                 .into_any_element();
         }
         // Dates read relative; the exact value is the cell's tooltip.
-        let relative = crate::model::relative_value(column.property(), value, self.frame_now);
-        let shown: SharedString = match &relative {
-            Some((shown, _)) => shown.clone().into(),
-            None => self.cell_text_of(row, column, value),
-        };
+        let CellText {
+            shown,
+            exact: relative,
+            ..
+        } = self.cell_text_of(row, column, value);
+        let place = (ix * self.columns.len() + col) as u64;
         let text_color = if value.is_null() {
             Color::Disabled
         } else {
             Color::Default
         };
         let numeric = column.align_right;
-        if let Some(group) = column.relationship() {
+        if column.relationship().is_some() {
             // The cell's padding (`px_4`) on both sides.
             let available = self.layout.width(column) - 32.;
             return cell
-                .child(self.render_relation_cell(row, &column.key, group, available, cx))
+                .child(self.render_relation_cell(place, col, row, available, cx))
                 .when(is_cursor, |cell| cell.child(ring()))
                 .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                     this.click_cell(ix, col, event.modifiers(), event.click_count(), window, cx)
@@ -7097,7 +7412,7 @@ impl TypeTable {
                     .into_any_element()
             }
             Some(property) if property.kind == ScalarKind::Blob => {
-                self.render_blob_cell(row, property)
+                self.render_blob_cell(place, row, property, cx)
             }
             Some(property) if property.enum_values.is_some() && !value.is_null() => {
                 studio_ui::ds::chip(shown, cx).into_any_element()
@@ -7115,10 +7430,10 @@ impl TypeTable {
                 text.into_any_element()
             }
         };
-        let (dot, tooltip) = match state {
-            Some(CellState::Saving) => (
+        let (dot, tooltip): (_, Option<SharedString>) = match state {
+            Some(CellState::Saving { .. }) => (
                 Some(Color::Warning),
-                Some(format!("Saving to {}…", self.branch)),
+                Some(format!("Saving to {}…", self.branch).into()),
             ),
             Some(CellState::Draft { text, notice }) => {
                 let color = match notice.as_ref().map(|n| n.tone) {
@@ -7140,13 +7455,16 @@ impl TypeTable {
                 };
                 (
                     Some(color),
-                    Some(format!(
-                        "{message}Not saved: “{text}”. {held} \
-                         Reopen it to edit; Save as one commit saves every draft together."
-                    )),
+                    Some(
+                        format!(
+                            "{message}Not saved: “{text}”. {held} \
+                             Reopen it to edit; Save as one commit saves every draft together."
+                        )
+                        .into(),
+                    ),
                 )
             }
-            None => (None, relative.map(|(_, exact)| exact)),
+            None => (None, relative),
         };
         // A Blob cell takes a file dropped on it from the file manager, and shows the write's
         // dot while it is out and why it did not land after.
@@ -7162,7 +7480,7 @@ impl TypeTable {
         {
             Some(BlobEdit::Saving(_)) => (
                 Some(Color::Warning),
-                Some(format!("Saving to {}…", self.branch)),
+                Some(format!("Saving to {}…", self.branch).into()),
             ),
             Some(BlobEdit::Failed { notice, again }) => (
                 Some(notice.tone.color()),
@@ -7170,8 +7488,9 @@ impl TypeTable {
                     Some(_) => format!(
                         "{} Drop the file again to write it over that.",
                         notice.message
-                    ),
-                    None => notice.message.clone(),
+                    )
+                    .into(),
+                    None => notice.message.clone().into(),
                 }),
             ),
             None => (dot, tooltip),
@@ -9020,12 +9339,8 @@ mod tests {
                 );
                 assert!(!table.relations_drawn.is_empty());
                 drawn.iter().all(|row| {
-                    let read =
-                        |key: &String| table.relations.contains_key(&(row.id.clone(), key.clone()));
-                    table.relations_drawn.iter().all(read)
-                        && table
-                            .blobs
-                            .contains_key(&(row.id.clone(), "doc".to_owned()))
+                    let read = |key: &String| table.relations.contains(&row.id, key);
+                    table.relations_drawn.iter().all(read) && table.blobs.contains(&row.id, "doc")
                 })
             })
         };
@@ -9497,11 +9812,11 @@ mod tests {
             assert!(!table.newer && table.saves_in_flight == 0);
             assert!(!table.blob_edits.contains_key(&key));
             assert_eq!(
-                table.blobs[&key],
-                Loadable::Loaded(BlobMeta::Managed {
+                table.blobs.get(&key.0, &key.1),
+                Some(&Loadable::Loaded(BlobMeta::Managed {
                     size: 10,
                     etag: Some(stored.1.clone())
-                })
+                }))
             );
         });
     }
@@ -9620,7 +9935,10 @@ mod tests {
         assert_eq!(writes[0].if_match.as_deref(), Some(read.as_str()));
         table.read_with(cx, |table, _| {
             let key = ("p1".to_owned(), "doc".to_owned());
-            assert_eq!(table.blobs[&key], Loadable::Loaded(BlobMeta::Null));
+            assert_eq!(
+                table.blobs.get(&key.0, &key.1),
+                Some(&Loadable::Loaded(BlobMeta::Null))
+            );
         });
     }
 
@@ -9877,5 +10195,434 @@ mod tests {
             .filter(|name| *name == "studio_value_counts")
             .count();
         assert_eq!(groups, 1, "{names:?}");
+    }
+
+    /// The key of p1's name, the cell these tests edit.
+    fn name_key() -> DraftKey {
+        DraftKey {
+            type_name: "Person".into(),
+            id: "p1".into(),
+            property: "name".into(),
+        }
+    }
+
+    /// The Person table on `session`, read.
+    fn people_table<'a>(
+        session: &Entity<GraphSession>,
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<TypeTable>, &'a mut VisualTestContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let session = session.clone();
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        (table, cx)
+    }
+
+    /// Opens p1's name in the cell editor with `text` typed.
+    fn type_in_name(table: &Entity<TypeTable>, text: &str, cx: &mut VisualTestContext) {
+        table.update_in(cx, |table, window, cx| {
+            let col = table.column_index("name").unwrap();
+            table.start_edit(Cursor { row: 0, col }, window, cx);
+            table
+                .cell_editor
+                .update(cx, |editor, cx| editor.set_text(text, window, cx));
+        });
+    }
+
+    /// The table moved to another branch with an edit open keeps what was typed as a draft on
+    /// the branch it was typed on, as leaving the cell would: a link or a toast's follow-up that
+    /// moves the window loses nothing, and the new branch gets none of it.
+    #[gpui::test]
+    async fn a_branch_change_keeps_an_open_edit_on_the_branch_it_was_typed_on(
+        cx: &mut TestAppContext,
+    ) {
+        let session = session(PEOPLE, cx);
+        let (table, cx) = people_table(&session, cx);
+        type_in_name(&table, "Ada King", cx);
+        session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| {
+            let typed = DraftEntry {
+                old: "Ada".into(),
+                text: "Ada King".into(),
+            };
+            let on_main: Vec<_> = session.drafts_on("main").collect();
+            assert_eq!(on_main, vec![(&name_key(), &typed)]);
+            assert!(session.draft(&name_key()).is_none(), "nothing on fix");
+        });
+        table.update_in(cx, |table, window, _| {
+            assert!(table.editing.is_none());
+            assert!(
+                table.focus_handle.is_focused(window),
+                "the table has the keys"
+            );
+        });
+    }
+
+    /// An edit open that changes its cell is unsaved work, so closing the tab asks first; let
+    /// go (its tab closed, or the Nodes panel's table replaced), the table keeps what was typed
+    /// as the cell's draft.
+    #[gpui::test]
+    async fn a_table_let_go_keeps_its_open_edit_as_a_draft(cx: &mut TestAppContext) {
+        let session = session(PEOPLE, cx);
+        let (table, cx) = people_table(&session, cx);
+        type_in_name(&table, "Ada", cx);
+        table.read_with(cx, |table, cx| {
+            assert!(!table.is_dirty(cx), "typed back, it asks for nothing")
+        });
+        type_in_name(&table, "Ada King", cx);
+        table.read_with(cx, |table, cx| assert!(table.is_dirty(cx)));
+        drop(table);
+        cx.update(|window, _| window.remove_window());
+        cx.run_until_parked();
+        let draft = session.read_with(cx, |session, _| session.draft(&name_key()).cloned());
+        assert_eq!(
+            draft,
+            Some(DraftEntry {
+                old: "Ada".into(),
+                text: "Ada King".into(),
+            })
+        );
+    }
+
+    /// A date preset holds no value of its own: a row is judged against its days, as the engine
+    /// is asked, so an edit that leaves a row born today under "born is today" keeps it plain,
+    /// and a row inserted born today counts as matching.
+    #[gpui::test]
+    async fn a_date_preset_judges_edited_and_inserted_rows_by_its_days(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        const BORN: &str = "node Person {\n  slug: String @key\n  name: String\n  born: Date?\n}\n";
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let rows = serde_json::json!([
+            {"n": {"@id": "p1", "slug": "p1", "name": "Ada", "born": today}},
+            {"n": {"@id": "p2", "slug": "p2", "name": "Grace", "born": today}},
+        ]);
+        let session = crate::test_support::session_reading(BORN, rows, cx);
+        let opening = Opening {
+            filters: vec![Filter {
+                property: "born".into(),
+                op: FilterOp::Today,
+                value: Value::Null,
+            }],
+            ..Opening::default()
+        };
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::opening(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                opening,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        type_in_name(&table, "Ada Lovelace", cx);
+        table.update_in(cx, |table, window, cx| table.confirm_edit(window, cx));
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.rows[0].value("name"), "Ada Lovelace");
+            assert!(!table.rows[0].dimmed, "born today, it still matches");
+        });
+        // Inserted behind the branch, so the counts are adjusted here.
+        table.update(cx, |table, cx| {
+            table.count = Loadable::Loaded(2);
+            let mut values = serde_json::Map::new();
+            values.insert("slug".into(), "p3".into());
+            values.insert("name".into(), "Cy".into());
+            values.insert("born".into(), today.clone().into());
+            table.row_inserted("main", Some("p3".into()), values, "c9", Some("c8"), cx);
+            assert_eq!(table.count, Loadable::Loaded(3), "it matches the preset");
+            let p3 = table.row_index("p3").expect("placed");
+            assert!(!table.rows[p3].dimmed);
+        });
+    }
+
+    /// A page read after the table's own write is read at its commit, where a row it edited can
+    /// sort again further on (a title edited from "B" to "Zed"): it shows once, where it was
+    /// read (constitution V). Before any own write, every page is read at one commit.
+    #[gpui::test]
+    async fn a_row_the_tables_write_moved_further_on_shows_once(cx: &mut TestAppContext) {
+        let session = session(PEOPLE, cx);
+        let (table, cx) = people_table(&session, cx);
+        let page = |rows: Value| -> Result<ReadOutput, ReadError> {
+            Ok(serde_json::from_value(serde_json::json!({
+                "query_name": "studio_page",
+                "target": {"branch": "main"},
+                "row_count": 2,
+                "columns": ["n"],
+                "rows": rows,
+                "graph_commit_id": "c2",
+            }))
+            .unwrap())
+        };
+        type_in_name(&table, "Zed", cx);
+        table.update_in(cx, |table, window, cx| table.confirm_edit(window, cx));
+        cx.run_until_parked();
+        // The next page at the table's commit holds Cy, then Ada, now Zed.
+        let next = serde_json::json!([
+            {"n": {"@id": "p3", "slug": "p3", "name": "Cy"}},
+            {"n": {"@id": "p1", "slug": "p1", "name": "Zed"}},
+        ]);
+        table.update(cx, |table, cx| {
+            assert_eq!(table.paging.pinned.as_deref(), Some("c2"), "its own commit");
+            table.apply_page(page(next), false, 2, cx);
+            let ids: Vec<&str> = table.rows.iter().map(|row| row.id.as_str()).collect();
+            assert_eq!(ids, ["p1", "p2", "p3"]);
+            assert_eq!(table.rows[0].value("name"), "Zed");
+        });
+    }
+
+    /// Grouped by name, a row the table's write moved from Ada's section into Grace's stays in
+    /// Ada's, and Grace's pages, read at the table's commit, leave it out: Grace's count, read
+    /// before the write, is spent on the rows still unread there, so none stays unread.
+    #[gpui::test]
+    async fn a_row_moved_into_another_section_leaves_its_rows_to_read(cx: &mut TestAppContext) {
+        let session = session(PEOPLE, cx);
+        let (table, cx) = people_table(&session, cx);
+        let page = |rows: Value| -> Result<ReadOutput, ReadError> {
+            Ok(serde_json::from_value(serde_json::json!({
+                "query_name": "studio_page",
+                "target": {"branch": "main"},
+                "row_count": 1,
+                "columns": ["n"],
+                "rows": rows,
+                "graph_commit_id": "c2",
+            }))
+            .unwrap())
+        };
+        let generation = table.update(cx, |table, _| {
+            let mut grouping = Grouping::new("name");
+            let generation = grouping.restart();
+            let counts: ReadOutput = serde_json::from_value(serde_json::json!({
+                "query_name": "studio_value_counts",
+                "target": {"branch": "main"},
+                "row_count": 2,
+                "columns": ["value", "n"],
+                "rows": [{"value": "Ada", "n": 1}, {"value": "Grace", "n": 2}],
+            }))
+            .unwrap();
+            grouping.accept_counts(&counts, GROUP_LIMIT);
+            for (index, range) in [0..1, 1..2].into_iter().enumerate() {
+                grouping.section_mut(index).unwrap().range = range;
+            }
+            table.grouping = Some(grouping);
+            // Ada renamed Grace, committed on the table's commit.
+            table.set_cell(0, "name", "Grace".into());
+            assert!(!table.paging.advance_for_own_commit(Some("c1"), "c2"));
+            let fits = table.row_fits(0);
+            table.set_dimmed(0, !fits);
+            assert!(table.rows[0].dimmed, "out of its section, it stays");
+            generation
+        });
+        let grace = |table: &TypeTable| table.grouping.as_ref().unwrap().sections()[1].clone();
+        // Grace's next row at the new commit is Ada, already shown.
+        let only_ada = serde_json::json!([{"n": {"@id": "p1", "slug": "p1", "name": "Grace"}}]);
+        table.update(cx, |table, cx| {
+            table.apply_section_page(generation, 1, page(only_ada), 1, cx);
+            assert_eq!(table.rows.len(), 2, "shown once");
+            assert!(grace(table).has_more(), "a Grace is still unread");
+        });
+        let grace_row = serde_json::json!([{"n": {"@id": "p3", "slug": "p3", "name": "Grace"}}]);
+        table.update(cx, |table, cx| {
+            table.apply_section_page(generation, 1, page(grace_row), 1, cx);
+            let ids: Vec<&str> = table.rows.iter().map(|row| row.id.as_str()).collect();
+            assert_eq!(ids, ["p1", "p2", "p3"]);
+            assert!(!grace(table).has_more());
+        });
+    }
+
+    /// A Blob value's validator names its type's table version, so a file stored in one cell
+    /// moves every other cell's. A table behind its branch binds its next write at the commit
+    /// its own write made, which the server applied only while the table was as it showed it:
+    /// a second file is stored, not refused as changed elsewhere. A change made elsewhere
+    /// after it is still refused.
+    #[gpui::test]
+    async fn a_tables_own_blob_write_leaves_its_next_one_bound_where_it_holds(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let schema = PEOPLE.replace("  name: String\n", "  name: String\n  doc: Blob?\n");
+        let (session, blobs) = crate::test_support::session_with_blobs(&schema, cx);
+        blobs
+            .versioned
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        blobs.set("Person/p1/doc", b"one");
+        blobs.set("Person/p2/doc", b"two");
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(BLOB_READ_AFTER);
+        cx.run_until_parked();
+        // Behind its branch: another writer's commit came after the table's read.
+        table.update(cx, |table, _| {
+            table.paging.pinned = Some("c0".into());
+            table.newer = true;
+        });
+        let file = crate::test_support::upload_file("first.txt", b"first", None);
+        table.update(cx, |table, cx| table.upload_blob("p1", "doc", file, cx));
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert!(!table.blob_edits.contains_key(&("p1".into(), "doc".into())));
+            assert_eq!(table.paging.blobs_at(), Some("c2"), "its own commit");
+        });
+        let p2_now = blobs.get("Person/p2/doc").unwrap().1;
+        let file = crate::test_support::upload_file("second.txt", b"second", None);
+        table.update(cx, |table, cx| table.upload_blob("p2", "doc", file, cx));
+        cx.run_until_parked();
+        {
+            let writes = blobs.writes.lock().unwrap();
+            assert_eq!(writes.len(), 2);
+            assert_eq!(writes[1].if_match.as_deref(), Some(p2_now.as_str()));
+        }
+        assert_eq!(blobs.get("Person/p2/doc").unwrap().0, b"second");
+        let p2 = ("p2".to_owned(), "doc".to_owned());
+        table.read_with(cx, |table, _| {
+            assert!(!table.blob_edits.contains_key(&p2), "stored");
+        });
+
+        // Another writer's value of the same size after it: refused, never written over.
+        blobs.set("Person/p2/doc", b"theirs");
+        let file = crate::test_support::upload_file("third.txt", b"third", None);
+        table.update(cx, |table, cx| table.upload_blob("p2", "doc", file, cx));
+        cx.run_until_parked();
+        assert_eq!(blobs.writes.lock().unwrap().len(), 3, "sent once");
+        assert_eq!(blobs.get("Person/p2/doc").unwrap().0, b"theirs");
+        table.read_with(cx, |table, _| {
+            assert!(matches!(
+                &table.blob_edits[&p2],
+                BlobEdit::Failed { notice, .. } if notice.tone == Tone::Conflict
+            ));
+        });
+    }
+
+    /// A peek of a row whose cell save is out shows what the row holds at the table's commit,
+    /// with the property saving, not the value sent as if stored. Refused, the peek keeps the
+    /// stored value; saved, it follows the save to its commit, as it follows its own writes.
+    #[gpui::test]
+    async fn a_peek_of_a_row_being_saved_shows_what_is_stored(cx: &mut TestAppContext) {
+        for (status, body, landed) in [
+            (
+                403,
+                serde_json::json!({ "error": "policy denied", "code": "forbidden" }),
+                false,
+            ),
+            (200, crate::test_support::committed("c2", "c1"), true),
+        ] {
+            let session = crate::test_support::session_answering(PEOPLE, status, body, cx);
+            let (table, cx) = people_table(&session, cx);
+            type_in_name(&table, "Ada Lovelace", cx);
+            let peek = table.update_in(cx, |table, window, cx| {
+                table.confirm_edit(window, cx);
+                assert_eq!(table.rows[0].value("name"), "Ada Lovelace", "sent");
+                table.peek_row(0, cx)
+            });
+            peek.read_with(cx, |peek, _| {
+                assert_eq!(peek.shown("name"), ("Ada".into(), true), "stored, saving");
+            });
+            cx.run_until_parked();
+            peek.read_with(cx, |peek, _| {
+                if landed {
+                    assert_eq!(peek.shown("name"), ("Ada Lovelace".into(), false));
+                    assert_eq!(peek.reads_at(), Some("c2"), "the save's commit");
+                    assert!(!peek.is_newer());
+                } else {
+                    let nothing_written = ("Ada".into(), false);
+                    assert_eq!(peek.shown("name"), nothing_written);
+                    assert_eq!(peek.reads_at(), Some("c1"));
+                }
+            });
+        }
+    }
+
+    /// A date or a time reads relative to now: what its cell shows is made once a minute, kept
+    /// with the cell's other text, not parsed and spelled again at every draw.
+    #[gpui::test]
+    async fn a_dates_relative_text_is_kept_for_its_minute(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        const SEEN: &str =
+            "node Person {\n  slug: String @key\n  name: String\n  seen: DateTime?\n}\n";
+        let rows = serde_json::json!([
+            {"n": {"@id": "p1", "slug": "p1", "name": "Ada", "seen": "2020-01-02T03:04:05"}},
+        ]);
+        let session = crate::test_support::session_reading(SEEN, rows, cx);
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        table.update(cx, |table, cx| {
+            let made = |table: &TypeTable| {
+                let cells = table.cell_text.borrow();
+                cells.get("p1").and_then(|cells| cells.get("seen")).cloned()
+            };
+            let made_then = made(table).expect("made as the row drew");
+            assert_eq!(made_then.minute, Some(table.frame_minute));
+            assert_eq!(made_then.shown.as_ref(), "2020-01-02");
+            assert_eq!(
+                made_then.exact.as_deref(),
+                Some("2020-01-02 03:04:05.000 UTC")
+            );
+            // Made in an earlier minute, it is made again; within it, kept as made.
+            if let Some(cell) = table
+                .cell_text
+                .borrow_mut()
+                .get_mut("p1")
+                .and_then(|cells| cells.get_mut("seen"))
+            {
+                cell.shown = "kept".into();
+            }
+            let (row, column) = (table.rows[0].clone(), table.columns[2].clone());
+            assert_eq!(column.key, "seen");
+            let value = row.value("seen").clone();
+            assert_eq!(
+                table.cell_text_of(&row, &column, &value).shown.as_ref(),
+                "kept"
+            );
+            table.frame_minute += 1;
+            let again = table.cell_text_of(&row, &column, &value);
+            assert_eq!(again.shown.as_ref(), "2020-01-02");
+            assert_eq!(again.minute, Some(table.frame_minute));
+            cx.notify();
+        });
     }
 }

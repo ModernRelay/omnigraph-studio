@@ -13,6 +13,8 @@ use studio_workspace::{Workspace, WorkspaceEvent};
 use ui::Tooltip;
 use ui::prelude::*;
 
+use crate::TABLE_KEY_PREFIX;
+
 /// One row of the sidebar's list.
 enum Row {
     Ontology,
@@ -29,6 +31,8 @@ pub struct TypesList {
     /// the list draws only the rows in view.
     rows: Vec<Row>,
     rows_for: Option<Arc<str>>,
+    /// The active tab's key as this frame draws the rows, taken once for all of them.
+    frame_active: Option<SharedString>,
     list: ListState,
     _workspace_subscription: Option<Subscription>,
     _session_subscription: Option<Subscription>,
@@ -58,6 +62,7 @@ impl TypesList {
             session: None,
             rows: Vec::new(),
             rows_for: None,
+            frame_active: None,
             list: ListState::new(0, ListAlignment::Top, px(400.)),
             _workspace_subscription: workspace_subscription,
             _session_subscription: None,
@@ -151,6 +156,7 @@ impl Render for TypesList {
             self.rows = rows;
             self.rows_for = Some(schema.source.clone());
         }
+        self.frame_active = self.active_key(cx);
         list(
             self.list.clone(),
             // Each row in a column of the list's width, as the rows sat in one before.
@@ -172,7 +178,7 @@ impl TypesList {
         let (Some(row), Some(session)) = (self.rows.get(ix), &self.session) else {
             return div().into_any_element();
         };
-        let active = self.active_key(cx);
+        let active = self.frame_active.as_deref();
         let view_row = |id: &'static str, label: &'static str, icon: IconName| {
             studio_ui::ds::SidebarRow::new(id, label).icon(icon)
         };
@@ -200,7 +206,7 @@ impl TypesList {
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenCanvas), cx))
                 .into_any_element(),
             Row::Schema => view_row("view-schema", "Schema", IconName::Code)
-                .selected(active.as_deref() == Some("schema"))
+                .selected(active == Some("schema"))
                 .tooltip_fn(|_, cx| {
                     Tooltip::for_action(
                         "The schema's source, read-only",
@@ -233,7 +239,9 @@ impl TypesList {
                     Loadable::Failed(error) => format!("Counts could not be read: {error}"),
                     _ => format!("Rows at the head of {}", s.branch),
                 };
-                let selected = active.as_deref() == Some(crate::table_key(name, None).as_str());
+                // The type's table at the head is the active tab ([`crate::table_key`]).
+                let selected = active.and_then(|key| key.strip_prefix(TABLE_KEY_PREFIX))
+                    == Some(name.as_str());
                 // A click previews the type in the pane's preview tab; a double click keeps it.
                 let action = OpenType {
                     type_name: name.clone(),

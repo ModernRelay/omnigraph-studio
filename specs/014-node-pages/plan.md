@@ -132,7 +132,13 @@ Four parts, built in this order; each lands on its own.
   in another view during the round trip stands, and nothing reopens over it
   (`GraphSession::settle_draft_on`). Opening a cell or a field no longer
   takes its draft, so Esc ends the edit and keeps it; switching branch keeps each branch's
-  drafts for when it is shown again (they were dropped before).
+  drafts for when it is shown again (they were dropped before). A field open when the page or
+  the peek follows the window to another branch, or when the peek goes, is kept as its draft
+  on the branch it was typed on, a field a refused or conflicting save opened again included,
+  whose text nothing else holds; a branch deleted meanwhile keeps none (since 2026-10-21;
+  before, a branch change closed every field and kept nothing). While the table the peek came
+  from saves one of the node's cells, the peek shows the value stored, the save's dot, and
+  does not open that field.
 - **One draft per branch**, the `graph_store::Draft` that `docs/architecture.md` describes:
   entries keyed by type, id and property (or by edge), each holding the value it was read at
   (so saves stay value-bound) and the new value. Table cells, peek fields and page fields read
@@ -257,6 +263,7 @@ Four parts, built in this order; each lands on its own.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | A field open when the view follows another branch stays a draft there | `type_table` `open_fields_stay_drafts_on_the_branch_a_page_leaves` (name refused with a 403 and opened again with its notice, title being typed), failing with the fields cleared as before; `peek` `a_refused_field_opens_again_with_its_text_and_reason` (the peek going keeps the refused text) unchanged | After the session moved to fix, main held name "Ada Lovelace" bound to "Ada" and title "Countess" bound to null, fix none, and no field stayed open. Before, both texts were lost: a field with a notice stays open after a blur, so nothing else had kept it |
 | 2026-10-20 | A draft retyped elsewhere while its save is out stands | `graph_store` `drafts_wait_with_their_branch` (settled only as it went out); `type_table` `a_save_that_lands_after_a_branch_switch_keeps_the_new_branchs_draft` (a landed and a refused cell save over a retyped draft), `a_batch_reads_its_rows_again_in_one_read` and `peek` `a_conflict_is_bound_to_the_value_read_at_the_head` (a batch's and a node's drafts read again) | The retyped draft keeps its text after the save lands or is refused, and no editor reopens over it; a draft unchanged since the save settles as before |
 | 2026-10-18 | A node's relationship groups are read as their rows are drawn | `type_table` `only_the_groups_drawn_are_read_and_scrolling_reads_the_rest_once` (60 groups on a 480 × 360 page, then scrolled to the end), `a_peek_reads_only_what_the_table_did_not`, `relationships_with_none_fold_away_until_asked_for`; offscreen snapshots against a local server holding a made-up graph whose Person takes part in 72 relationship groups, with the server's read requests counted | The table alone took 13 requests and the table with a row's peek 37, where the peek used to read all 72 groups and the node. Opening the page took 31 requests; scrolled to its end, 79, each group read once. Groups read as empty kept their rows, and small ones opened once read |
 | 2026-10-17 | A node lists only the relationships it has | `type_table` `relationships_with_none_fold_away_until_asked_for` (not counted, with neighbours, with none, a failed count, a write out, the row open, adding with it closed); offscreen snapshots of Leslie Wirth's page, then with Empty opened | Three groups with neighbours, then "Empty 1"; opened, `contributes Project` with "+" and 0 appeared under it and the rows above stayed where they were |

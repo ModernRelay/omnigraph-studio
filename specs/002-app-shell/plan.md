@@ -72,7 +72,10 @@ again brings them back) and shows the one opened before; a graph with a write st
 stays open, so the write's outcome is never dropped. The same holds for its window and for
 Studio: closing a window or quitting while one of its graphs has a write running is refused
 with a toast in that window, which comes forward. Toasts follow the shown graph; a parked
-graph's writes still land in its activity log. Each window's graphs (server URL, graph,
+graph's writes still land in its activity log. A parked graph asks after no branch head and no
+branch list, and its server's health is checked only while something else shows that server
+(a graph of it shown in a window, or the Open dialog) (since 2026-10-21); shown again, it asks
+at once when a poll came meanwhile. Each window's graphs (server URL, graph,
 branch, and the one shown) and bounds are written to the owner-only `session.json` as they
 change, in the order the windows opened. The next start reopens every window that has a graph
 on a server still known, where it was, showing the graph it showed; with none it opens one
@@ -267,11 +270,15 @@ second line shows it (`omnigraph branch create feature-x --from main`).
 ### What the credential may do (E15)
 
 Built 2026-10-20 on `GET /graphs/{id}/access` (OmniGraph #1073, E15). The session reads it for
-its branch when the graph opens and when the branch changes, and again after a 403 or a new
-token, which the client counts; a branch's menu reads it for that branch as it opens, and a
-review for its branch and target (`AccessScope::branch_into`) as it opens. Each is read once
-until the credential may have changed, and views draw again when an answer lands
-(`SessionEvent::AccessChanged`). Studio offers every action not known to be refused
+its branch when the graph opens and when the branch changes, and again after a 403 on the graph
+or a new token, which the client counts apart; a branch's menu reads it for that branch as it
+opens, and a review for its branch and target (`AccessScope::branch_into`) as it opens. Each is
+read once until the credential may have changed, and views draw again when an answer lands
+(`SessionEvent::AccessChanged`). A new token (typed in, or `omnigraph login` changing the CLI's
+files) reads it at once, with no write to bring it about, and forgets every answer the session
+kept with the old token; a 403 reads it again and keeps them. An answer that lands after
+either was read for the credential before, and lands nowhere. A 403 from the server's own
+routes (listing its graphs, which most tokens may not) is not counted. Studio offers every action not known to be refused
 (`Allowed::offered`): before an answer lands, or when none can be read, everything is offered.
 The server stays the authority: a 403 still shows as a denial, and the draft stays.
 
@@ -425,7 +432,10 @@ and a 97 % fill let the text behind show through.
 - The log (`logs/Studio.log` in the data directory, about 1 MB, with `Studio.old.log`) holds
   warnings, errors and panics from Studio and the Zed crates, through Zed's `zlog`; a run from a
   terminal logs to standard output, and `RUST_LOG` changes the level. A panic is logged with its
-  thread and location, its message stripped of quoted text. Help → Reveal Log File shows it.
+  thread and location, its message stripped of quoted text, and that line is all it prints:
+  Studio's panic hook replaces Rust's, which printed the message whole to standard error (and
+  a backtrace when one was asked for), and writes the line there itself when the log does not
+  go to the terminal (since 2026-10-21). Help → Reveal Log File shows it.
 - A transport failure reads as its cause ("Could not reach the server: the connection was
   refused", "… the request timed out"), never with the request URL, which can hold a Blob
   row's key.
@@ -441,7 +451,10 @@ and a 97 % fill let the text behind show through.
   before, it acted on the graph and branch shown, so "Open history" for an unknown outcome on
   `fix` could show another graph's or main's history).
 - Errors as notifications that say what happened and what to do; they stay until dismissed.
-- The activity log (bottom dock) keeps every write with its outcome.
+- The activity log (bottom dock) keeps every write with its outcome. It draws again when an
+  outcome is logged, and once a minute while it lists writes, for the times they read; a read
+  starting or ending, which raises the same session event, leaves it as it was (since
+  2026-10-21; before, every session event drew it).
 
 ### Visual language
 
@@ -768,6 +781,11 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | A panic prints only its redacted line | `studio` `a_panic_reports_one_line_without_the_text_it_quotes` (a panic quoting 'Ada Lovelace' and `secret notes` on a named thread, through `panic_line`, which the hook prints); `logging::init` no longer chains to `std::panic::take_hook()` | "panic on thread quoting-panic at crates/studio/src/logging.rs:…: no row for '…' in `…`", nothing else. Before, the line was logged and then Rust's own hook printed the panic whole to standard error, with a backtrace under `RUST_BACKTRACE`. Not yet seen in the running app |
+| 2026-10-21 | The activity log draws for outcomes, not for reads | `studio` `the_log_draws_for_outcomes_not_for_reads` (renders counted: `ActivityChanged` and `CountsChanged` with no outcome logged, then an external write refused), failing with the subscription that drew on every event | No draw for the read-like events; one for the outcome. Its times are drawn again once a minute (`TIMES_EVERY`) while it lists writes |
+| 2026-10-21 | A link checks no more and no less than "Open a graph" before it opens a session | A read of `studio::open_link`, `open_graph::OpenGraphModal::open` and `show_graph_in` (both open through `show_graph_in`, on any known connection, whatever its state) and of `graph_client`'s contract check on every response | Not changed: "Open a graph" opens a remembered or typed id on a server in any state, as a link does, so a link skips no check it applies. A server speaking another contract still serves nothing: every response without the contract header is refused (constitution I, X), and a refused token answers 401 to every read |
+| 2026-10-21 | What the credential may do follows a new token at once | `graph_store` `a_new_token_reads_access_and_every_answer_again` (spec 003's log has the detail) | A read-only token replaced by a write-capable one allowed changing main at once, without a write; the old token's late answer was dropped |
+| 2026-10-21 | A parked graph polls nothing | `studio_workspace` `a_graph_reopened_behind_opens_its_tabs_when_first_shown` (shown state of a graph opened behind, then shown, and of the one it replaced); `graph_store` `the_head_watch_sees_other_writers_commits_while_a_window_is_active` | Behind or switched from: not shown, no head probe, branch list or health check of its own; shown again: asks at once |
 | 2026-10-20 | A write's toast acts on the graph and branch written to | `studio_workspace` `a_toasts_follow_up_acts_on_the_graph_and_branch_written_to` (two graphs on fakes answering 404, each with a tab that holds its focus); run once with the window's focus left on the shown graph's undrawn tab | Open history for an unknown outcome on notes/fix, pressed with people shown, showed notes on fix and ran there, notes' tab with the keyboard; pressed after notes moved to main, back on fix; Undo for a delete in parked people ran in people on main, people's tab with the keyboard; with people closed, nothing ran and the toast read "Nothing was done: people is no longer open in this window…". With the focus left on the undrawn tab the action reached no handler (`left: None`), which the fix dispatches from the window to avoid |
 | 2026-10-20 | The zoom buttons hand the keyboard over as ⇧⎋ does | `studio_workspace` `a_hidden_or_covered_dock_gives_the_keyboard_back_from_any_field_of_its_panel`, extended with clicks (`simulate_click`) on `zoom-pane-0` and `zoom-dock-Bottom` | The pane's button zoomed out, then zoomed in with the keyboard in the activity panel's field and gave it to the tab; the bottom dock's button took it from the tab to the dock's panel. Before, both buttons set the zoom alone |
 | 2026-10-20 | Glass states show in a dark theme | `studio_ui` `glass_takes_the_dark_themes_surface_and_its_states_show_on_it` (each state composited over the light style's `#fcfbfc` and Studio Dark's `#101010`); an offscreen 2x snapshot in Studio Dark with `window_style: glass` on a scratch `script/dev-server` (Person's table open, the pointer on Knows), sampled by pixel | Every state moves its sheet by 3 or more levels in both themes (a well, the faintest: 3.8 light, 3.6 dark); black at the selected row's 5 % moved the dark sheet 0.8 of a level, which is why selection, hover, rules and wells did not show. In the snapshot the sidebar sheet reads 14, the selected Person row 26 and the hovered Knows row 20; the table's dotted rule reads 45 over a cell at 11 |

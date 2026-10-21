@@ -56,14 +56,22 @@ stay put), IX (paged, virtualized).
   "Show in Finder". The peek reads at one commit; once the session sees its branch's head
   elsewhere (spec 003, Studio's commit or another writer's), a node's peek shows "Newer data ·
   Refresh" beside that commit, and Refresh reads the node, its relationships and its Blobs again
-  at the head. A peek from a table opened at a commit holds that commit and offers no Refresh. A peek opened from the table reads no
+  at the head. A peek from a table opened at a commit holds that commit and offers no Refresh.
+  A peek opened while one of the row's cell saves is out shows what the row holds at the
+  table's commit, that property with the save's dot and not editable there, and follows the
+  save as it follows its own writes: landed on its commit, the peek moves to the save's commit
+  with the value; refused, it keeps the value it shows (since 2026-10-21; before, it showed the
+  value sent as stored, kept it after a refusal, and bound an edit to it). A peek opened from the table reads no
   relationship the table already read at the same commit: the table's relationship columns
   read every row's count and, for rows of up to 200 neighbours, the whole list (keeping the
   first eight, the cell showing two), so the peek takes the count and its first neighbours from
   there and reads only what a hidden column left unread.
 - "Open" shows a stored value in a tab of its own (`studio_graph::OpenBlob`), read whole at the
-  peek's commit (up to 64 MB; a larger value says so and offers Save and the default app), and
-  shown for what its bytes are, as Zed shows an image: an image fitted to the tab (never past its
+  peek's commit (up to 64 MB; a larger value says so and offers Save and the default app). A
+  peek held at a commit opens it held there, read-only (`OpenBlob.held`); a peek at the branch
+  head opens one that writes on its branch, bound to the value read at that commit (since
+  2026-10-21; before, every tab opened from a peek was read-only). The value is shown for what
+  its bytes are, as Zed shows an image: an image fitted to the tab (never past its
   own size) on a checkerboard with a hairline, ⌘-scroll or `=`/`-` zooming about the pointer,
   `1` its actual size, `0` fit again, a drag to pan; an SVG fitted; a PDF's pages drawn by the
   system (CoreGraphics on macOS, twice the width shown, the first 20 pages: a page's pixels are
@@ -86,7 +94,12 @@ stay put), IX (paged, virtualized).
   tooltips name the keys. The file is read off the main thread and refused over 32 MiB before anything
   is sent. The write goes to the branch the view shows, once, bound to the value shown as read
   at the view's commit: a managed value by its ETag, which names the type's table version, so
-  it is read again at the view's commit when the view moved since (its own writes move it); a
+  it is read again at the view's commit when the view moved since (its own writes move it). A
+  view behind its branch reads it at its own last commit when that commit's write was itself
+  bound to an ETag read where the values shown hold, since the server applied it only while
+  the type's table was as the view showed it, and else is bound to the ETag the cell shows
+  (`model::BlobsAt`; since 2026-10-21, before which a second file stored behind was refused as
+  changed elsewhere); a
   null cell and an external reference have none, so the cell is read at the head first and the
   write goes only while it still holds what is shown (`*` for a reference, no `If-Match` for
   null). While out the value shows the amber dot and "saving to <branch>…"; committed, the view
@@ -119,6 +132,12 @@ stay put), IX (paged, virtualized).
 - A page holds `studio.type_table_page_size` rows (100 by default; a graph can have its own,
   spec 002), the `limit` above.
 - The first page records `graph_commit_id`; later pages pass it as `snapshot` (constitution II).
+- Once the table's own write moved its pin, a later page leaves out the rows the table shows
+  already (grouped by a relationship or a neighbour, those its section shows): read at the new
+  commit, a row it edited can sort again further on, or into another section, and stays where
+  it was read (constitution V). A section's count, read before the write, is spent only on the
+  rows it shows, so none is left unread (since 2026-10-21; before, such a row showed twice and
+  could take the place of a row of its new section).
 - The next page is fetched when the viewport passes 80% of loaded rows. No row cap: the grid is
   virtualized.
 - Relationship columns: one query per page and relationship, with the page's ids as an `in`
@@ -140,7 +159,10 @@ stay put), IX (paged, virtualized).
 ### Filters and views
 
 - Filter chips per column: equals, not equals, greater or less, contains, in list, is empty, is
-  not empty; dates as Today, This week, Last 30 days, or a range, through `now()`.
+  not empty; dates as Today, This week, Last 30 days, or a range, through `now()`. A preset
+  holds no value of its own: a row edited, inserted or deleted is judged here against the days
+  it stands for now, as the engine is asked (since 2026-10-21; before, every row was dimmed
+  after an edit and counted as not matching).
 - Relationship filters: "has any", "has none", "related to …" through `exists { }`, `not { }`,
   and a bound endpoint. Measure "has none" on a large type before shipping it (it was too
   slow on an older engine).
@@ -282,6 +304,10 @@ its open section.
   asks for the key, or `delete N` for several rows, to be typed (constitution IV). An edge
   delete takes no dependents; deleting a relationship its source needs is refused by the
   server, which the dialog shows.
+- An edit open when the table moves to another branch (a link, a toast's follow-up), when its
+  tab closes, or when the Nodes panel lets its table go, is kept as the cell's draft on the
+  branch it was typed on, as leaving the cell keeps it; a tab holding such an edit asks before
+  it closes (since 2026-10-21; before, the text was lost).
 - Every editing surface shows `write · <branch>`. A 403 shows "Your token cannot change
   <branch>" and keeps the draft.
 
@@ -296,7 +322,9 @@ opens the branch's recent commits.
 
 The table is a cached view (spec 002): it is drawn again only when it notifies. When it is, the
 row callback works out how each drawn line looks (picked, dimmed, the cursor's, a group
-header) for the lines it draws, not for every loaded row, and the grouped line list is built
+header) for the lines it draws, not for every loaded row; a date's or time's relative text is
+made once a minute with the cell's other text; relationship and Blob cells name their elements
+by their place and make their tooltips only when shown; and the grouped line list is built
 once a frame. Blob cells are read once scrolling has paused for 120 ms, for the rows then
 drawn; reads still out for rows scrolled away are dropped and asked again when they return. A
 new order or filter at the same commit keeps the relationship cells and Blob cells already
@@ -332,6 +360,14 @@ kept answers.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | An edit open when the table changes branch or goes is kept as a draft | `type_table` `a_branch_change_keeps_an_open_edit_on_the_branch_it_was_typed_on`, `a_table_let_go_keeps_its_open_edit_as_a_draft`; each run again with its fix undone | Typed "Ada King" in p1's name, then the session moved to fix: main held the draft bound to "Ada", fix none, the keys back on the table; a table with the edit open was dirty (typed back to "Ada", it was not) and, its window removed, left the draft. With the fixes undone both failed: the branch change set the edit to none before the reload that keeps it, and the table had no release hook |
+| 2026-10-21 | A Blob tab opened from a peek at the head writes | `type_table` `a_slot_opens_its_tab_held_only_where_the_view_holds_its_commit`, `a_tab_from_a_view_at_the_head_stores_a_file_bound_to_what_it_read` (failing with the tab's held commit taken from its snapshot alone, as before) | `OpenBlob` from a page at the head: `at_commit` c1, `held` false; held page: `held` true. The tab at c1 not held offered Choose File and Clear and stored a file on main with `If-Match` the ETag read at c1; its key is apart from the held tab's and the head's |
+| 2026-10-21 | A date preset judges rows by its days | `type_table` `a_date_preset_judges_edited_and_inserted_rows_by_its_days` (born is today; a name edited, a row inserted behind the branch), failing with `row_fits` on the stored filters | The edited row stayed plain and the inserted one counted (2 → 3). Before, the preset's stored null matched no row: every edit dimmed its row and an insert counted none |
+| 2026-10-21 | A row read again after the table's own write shows once | `type_table` `a_row_the_tables_write_moved_further_on_shows_once`, `a_row_moved_into_another_section_leaves_its_rows_to_read`, both failing with the check undone | After p1's name saved at c2, a page at c2 holding Cy and p1 added Cy alone. Grouped by name, p1 moved from Ada to Grace: Grace's page holding only p1 added nothing and Grace still had a row to read, which the next page added (rows p1, p2, p3). Undone, p1 showed twice and Grace's count of 2 was spent on it |
+| 2026-10-21 | A table behind its branch stores a second file | `type_table` `a_tables_own_blob_write_leaves_its_next_one_bound_where_it_holds`; `model` `own_commits_move_the_pin_only_from_the_pinned_parent`; the fake server's Blob cells made to tag by table version (`Blobs::versioned`: a write gives every cell of its type a new ETag, and a read at a commit it published answers there) | Pinned at c0 behind c1: p1's file landed at c2 and p2's, bound to p2's ETag at c2, landed too; then another writer's value of the same size in p2 refused the third (412, a conflict) and kept theirs. Undone (bound to the shown ETag while behind), the second was refused as changed elsewhere |
+| 2026-10-21 | A peek opened while a cell saves shows what is stored | `type_table` `a_peek_of_a_row_being_saved_shows_what_is_stored` (refused with a 403, then saved at c2), failing with the row's values given as they were | While out: "Ada", saving. Refused: "Ada" at c1. Saved: "Ada Lovelace" at c2, not newer. Before, the peek showed "Ada Lovelace" as stored and kept it after the refusal |
+| 2026-10-21 | Dates are not parsed at every draw | `type_table` `a_dates_relative_text_is_kept_for_its_minute`; a read of `render_cell`, `render_relation_cell`, `render_blob_cell` and `TypesList::render_row` | A DateTime cell's text and exact value are kept with its minute, given back within it and made again in the next. Relationship and Blob cells take their element ids from their place (`ElementId::NamedInteger`) and look their tooltip's text up when it shows; their state is looked up without copying keys (`CellMap`); the Types list reads the active tab's key once a frame. No measurement was taken |
+| 2026-10-21 | A table follows a new token without a write | `graph_store` `a_new_token_reads_access_and_every_answer_again` (the session's branch access read again on the token change; the table draws on `SessionEvent::AccessChanged`, as `type_table` `a_branch_the_credential_may_not_change_offers_no_writes` checks) | A read-only token replaced by a write-capable one allowed changing main as soon as its answer landed. Before, the table said "Your credential may not change main" until the branch moved or a write was sent, and none could be |
 | 2026-10-11 | Grammar features used above exist in 0.13.0 | `git show v0.13.0:crates/omnigraph-compiler/src/query/query.pest` | `or`, `in`, null tests, `exists`, `@id` metadata, `update … set { } where` present |
 | 2026-10-11 | Compiler describes result columns | `git show v0.13.0:crates/omnigraph-compiler/src/lib.rs` | `describe_query_operation`, `QueryResultFieldDescriptor` exported |
 | 2026-10-11 | Zed table sources exist | `git ls-tree -r v1.23.2 crates/ui/src/components crates/tabular_data_preview/src` | `data_table.rs`, `table_view.rs`, `table_data_engine.rs`, `types/coordinates.rs` |
