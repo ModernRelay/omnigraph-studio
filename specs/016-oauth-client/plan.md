@@ -84,10 +84,12 @@ Studio holds no static credential for it:
 |---|---|
 | CLI server target with a `token` or `exec` provider | The CLI's exported token (spec 003). A refused one is said as refused; Studio does not swap in OAuth. |
 | CLI server target with `auth: anonymous` | None; if the server's challenge offers OAuth, "Sign in" is offered. |
-| Server added in Studio without a token | As anonymous. |
 | CLI managed target with a data `endpoint` | Always OAuth. The CLI's managed credential is never exported. |
 | CLI managed target without an `endpoint` | Refused: "This managed target has no data endpoint." |
 | Direct target | Refused (spec 003). |
+
+Studio keeps no server list of its own (RFC #1017, "Changes by repository"): every server is a
+CLI target, and a target names one identity, so two targets on one endpoint are two accounts.
 
 A challenge without `resource_metadata` offers no sign-in, and Studio says the server asks for
 a token, as today.
@@ -163,11 +165,11 @@ Studio restarts; they hold no secrets.
 
 ### Custody
 
-- The refresh token goes to the OS keychain, under the issuer and the resource, with the
-  account as the item's user: key `omnigraph-studio-oauth:<issuer>#<resource>`, which no server
-  URL equals, so a static token's item is never replaced. One account is signed in per issuer
-  and resource; signing in as another replaces it.
-- The access token stays in memory, per issuer and resource, for at most its lifetime. Neither
+- The refresh token goes to the OS keychain, under the target, the issuer and the resource,
+  with the account as the item's user: key
+  `omnigraph-studio-oauth:<target>#<issuer>#<resource>`. One account is signed in per target;
+  signing in as another replaces it, and a second account is a second CLI target.
+- The access token stays in memory, per target, for at most its lifetime. Neither
   token is written to disk, logs, saved state, links, crash reports or any agent's environment;
   the agent gateway uses Studio's connection, and the agent never sees the token.
 - A keychain that refuses the write leaves the sign-in good for this run and says so ("Signed
@@ -181,8 +183,8 @@ Studio restarts; they hold no secrets.
 - An access token is refreshed when 60 seconds or less of its life remain and the server is in
   use, and before a request that would otherwise send an expired one. Nothing refreshes for a
   server no view reads.
-- One refresh runs at a time per client, issuer, resource and account, for every view and
-  window; others wait for its answer. These tokens are never mixed with a static token or the
+- One refresh runs at a time per target (its client, issuer, resource and account), for
+  every view and window; others wait for its answer. These tokens are never mixed with a static token or the
   CLI's credentials.
 - Every refresh sends `grant_type=refresh_token`, `refresh_token`, `client_id` and `resource`;
   without the resource an authorization server may issue a token for a default audience. The
@@ -256,7 +258,7 @@ Studio restarts; they hold no secrets.
 | Loopback HTTP redirect on `127.0.0.1` | `omnigraph-studio://` as the redirect | A private-use scheme can be claimed by another app on the machine; RFC 8252 §7.3 loopback is what A2 names |
 | A browser opens only when the person asks | Open it on the first 401 | A window appearing unasked is loud and looks like phishing; a 401 can come from a background read |
 | A refused write is not re-sent after sign-in | Re-send it once the token is fresh | The person may not want it after a detour through the browser; constitution III keeps writes explicit |
-| One account per issuer and resource | Several accounts kept side by side | GPUI keeps one keychain item per key; a second account is a separate Studio-added server |
+| One account per CLI target | Several accounts per target, kept side by side | A CLI target names one identity, and GPUI keeps one keychain item per key; a second account is a second target on the same endpoint |
 | Claims read unverified, for audience and display only | Verify the JWT in Studio | The server verifies; Studio's check only stops it sending a token issued for another resource |
 
 ## Deferred
