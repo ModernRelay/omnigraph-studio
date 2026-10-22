@@ -94,19 +94,19 @@ a token, as today.
 
 ### Discovery
 
-1. **Protected-resource metadata.** Take the URL from the challenge's `resource_metadata`. The
-   server derives it from its resource identifier (RFC 9728 §3.1), so it can name another
-   origin than the endpoint's: a managed target's resource is published by the managed control
-   plane. With no challenge yet, Studio sends one request without a credential to get one; it
-   never assumes the metadata sits at the host's root. `GET` it over HTTPS (HTTP only for a
-   loopback endpoint), 10 seconds, at most 64 KiB, JSON.
-2. **Check it.** `resource` must be an absolute HTTPS URL (HTTP only on loopback) on an origin
-   Studio expects: for a server target, the endpoint's origin; for a managed target, the origin
-   of the target's profile `api`, the managed control plane that publishes it. A resource on any
-   other origin is refused, so a data host cannot have Studio fetch a token for someone else's
-   resource. The token is requested for exactly that resource and sent only to the endpoint,
-   on REST and `/mcp` alike (RFC #1017, A2). `authorization_servers` must name exactly one
-   issuer, an HTTPS URL; several are refused for now (open question 7).
+1. **Protected-resource metadata.** Take the URL from the challenge's `resource_metadata`, which
+   the server derives from its resource identifier (RFC 9728 §3.1). With no challenge yet,
+   Studio sends one request without a credential to get one; it never assumes the metadata
+   sits at the host's root. `GET` it over HTTPS (HTTP only for a loopback endpoint), 10 seconds,
+   at most 64 KiB, JSON.
+2. **Check it.** `resource` must be an absolute HTTPS URL (HTTP only on loopback) on the
+   endpoint's origin, for every target, managed ones included: a managed cluster's resource
+   names its own data host, `https://<data host>/mcp`. A resource on any other origin is
+   refused, so a data host cannot have Studio fetch a token for someone else's resource. The
+   token is requested for exactly that resource, as written, and sent only to the endpoint, on
+   REST and `/mcp` alike (RFC #1017, A2): a server has one audience and accepts it on every
+   route. `authorization_servers` must name exactly one
+   issuer, an HTTPS URL; several are refused for now (open question 6).
    `bearer_methods_supported`, when present, must include `header`.
 3. **Authorization-server metadata.** Fetch RFC 8414's
    `/.well-known/oauth-authorization-server` for the issuer (path inserted after the host),
@@ -236,8 +236,11 @@ Studio restarts; they hold no secrets.
     OIDC identity trust (which also admits the resource's host for MCP);
   - register Studio as a public client with loopback redirects, or accept its Client ID
     Metadata Document;
-  - expose the protected-resource metadata and `/mcp` on public data hosts, and give each data
-    host a public route: OAuth does not make a private serving endpoint reachable.
+  - name each managed cluster's resource on its own data host, `https://<data host>/mcp`, and
+    forward that path and its metadata through the data host's public route, which OAuth alone
+    does not create. Today the resource is published on the control plane's own origin, which
+    a client following RFC 9728 §3.3 (the MCP TypeScript SDK's `checkResourceAllowed`
+    included) refuses; the move is decided and under review there.
 
   Its authorization server is AuthKit. Studio must not depend on `/openapi.json` being
   reachable through every deployment's proxy.
@@ -261,7 +264,7 @@ Studio restarts; they hold no secrets.
 - The implementation, after the prerequisites and open questions are settled.
 - Whether managed agents use the CLI's relay or are OAuth clients themselves (RFC #1017, A3;
   #1025's last item).
-- Several authorization servers for one resource (open question 7).
+- Several authorization servers for one resource (open question 6).
 - Signing in from a link (`omnigraph-studio://open?target=…`): a link never starts a sign-in on
   its own; it opens the server, which then shows Sign in needed.
 
@@ -278,13 +281,10 @@ Studio restarts; they hold no secrets.
    resource is settled.
 4. How a person in several organizations gets a token for the target's organization: the
    hosted flow's organization choice, or a hint Studio sends.
-5. Whether a managed target's resource on the managed control plane's origin, accepted under
-   the profile-`api` rule above, is acceptable to a strict RFC 9728 §3.3 reading (the resource
-   should match the URL requested), or the resource should be named on the data host.
-6. What to show for the account: `sub` is an opaque identifier, and Studio requests no ID
+5. What to show for the account: `sub` is an opaque identifier, and Studio requests no ID
    token.
-7. What to do with metadata naming several authorization servers (none does today).
-8. Whether the authorization server publishes a `revocation_endpoint`.
+6. What to do with metadata naming several authorization servers (none does today).
+7. Whether the authorization server publishes a `revocation_endpoint`.
 
 ## Validation log
 
@@ -294,6 +294,7 @@ Studio restarts; they hold no secrets.
 | 2026-10-21 | GPUI keeps one keychain item per key string | Zed `v1.23.2` `crates/gpui/src/platform.rs` (`write_credentials(url, username, password)`, `read_credentials(url)`), `crates/gpui_macos/src/platform.rs` (`kSecAttrServer` = the key, `kSecAttrAccount` = the user) | A write replaces the item for its key; a read returns that one item's user and secret |
 | 2026-10-21 | The challenge's metadata URL follows the resource, and the server checks the claims Studio reads | OmniGraph main `7fff9dfd`: `crates/omnigraph-server/src/mcp.rs` (`advertised_metadata_url`: the well-known prefix before the resource's path, on the resource's origin), `src/oidc_identity.rs` (required `iss`, `sub`, `aud`, `iat`, `exp`; `aud` one string equal to the audience, `org_id` equal to the binding's organization, a bounded `client_id`) | A resource on another origin moves the metadata there; an `aud` array is refused, so Studio requires a string |
 | 2026-10-21 | The managed control plane's own design agrees with this plan | Its identity and client specifications, read at their current head (a private repository, not cited here) | It publishes each managed cluster's resource and metadata itself, on its own origin, not on the data host; it prefers metadata-document clients; refresh tokens rotate and must repeat the resource; a client never silently opens a browser or replays a write; OAuth access needs a public route to the data host. Its OAuth profile is built, off by default and enabled per deployment |
+| 2026-10-21 | A managed resource on the data host suits every client | The MCP TypeScript SDK sends `new URL(resource).href` as `resource`, which turns a bare origin into `origin/`; a resource ending in `/mcp` is sent unchanged, and `checkResourceAllowed` requires the server's origin and a path prefix | The managed resource is `https://<data host>/mcp`; Studio requires the endpoint's origin for every target, and the profile-`api` exception is gone |
 | 2026-10-21 | A managed target can name its data endpoint without network access | OmniGraph main `docs/user/cli/targets.md` ("Configure destinations", `target inspect`) | `endpoint` is optional on a managed target and required for data operations |
 
 ## Corrections
