@@ -187,6 +187,108 @@ pub(crate) fn changed(kind: &str, ty: &str, id: &str, ends: Option<(&str, &str)>
     json!({ "kind": kind, "type": { "id": ty, "name": ty }, "id": id, "op": "update", "before": image, "after": image })
 }
 
+/// What a fake server is sent and answers in steps: every read's request body in order, as
+/// the rows see it (with `at`, the commit it is answered at), reads held until a test lets them
+/// go, and the row counts `/snapshot` answers with.
+#[derive(Default)]
+pub(crate) struct Served {
+    reads: Mutex<Vec<Value>>,
+    holds: Mutex<Vec<Hold>>,
+    /// Node types' row counts by name; `/snapshot` answers as before while there are none.
+    counts: Mutex<Vec<(String, i64)>>,
+}
+
+/// The first read `which` matches waits until `until` is sent or dropped.
+struct Hold {
+    which: Box<dyn Fn(&Value) -> bool + Send>,
+    until: futures::channel::oneshot::Receiver<()>,
+}
+
+impl Served {
+    /// Holds the next read `which` matches until the sender returned sends, or is dropped.
+    pub(crate) fn hold(
+        &self,
+        which: impl Fn(&Value) -> bool + Send + 'static,
+    ) -> futures::channel::oneshot::Sender<()> {
+        let (send, until) = futures::channel::oneshot::channel();
+        self.holds.lock().unwrap().push(Hold {
+            which: Box::new(which),
+            until,
+        });
+        send
+    }
+
+    /// The reads named `name` sent so far, in order.
+    pub(crate) fn sent(&self, name: &str) -> Vec<Value> {
+        self.reads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|read| read["name"] == name)
+            .cloned()
+            .collect()
+    }
+
+    /// Has the snapshot count `count` rows of node type `type_name`, at every branch's head.
+    pub(crate) fn count_nodes(&self, type_name: &str, count: i64) {
+        let mut counts = self.counts.lock().unwrap();
+        counts.retain(|(name, _)| name != type_name);
+        counts.push((type_name.to_owned(), count));
+    }
+
+    /// Notes a read, and what it waits for before it is answered.
+    fn take(&self, read: &Value) -> Option<futures::channel::oneshot::Receiver<()>> {
+        self.reads.lock().unwrap().push(read.clone());
+        let mut holds = self.holds.lock().unwrap();
+        let at = holds.iter().position(|hold| (hold.which)(read))?;
+        Some(holds.remove(at).until)
+    }
+
+    /// What `/snapshot` answers, once a count is set.
+    fn snapshot(&self, branch: &str) -> Option<Value> {
+        let counts = self.counts.lock().unwrap();
+        if counts.is_empty() {
+            return None;
+        }
+        let datasets: Vec<Value> = counts
+            .iter()
+            .map(|(name, count)| {
+                json!({
+                    "entity_kind": "node", "type_name": name, "dataset_path": format!("nodes/{name}"),
+                    "published_dataset_version": 1, "entity_count": count,
+                })
+            })
+            .collect();
+        Some(json!({
+            "graph_branch": branch, "graph_manifest_version": 1, "internal_schema_version": 16,
+            "datasets": datasets,
+        }))
+    }
+}
+
+/// As [`session_followed`], with what the server is sent and answers in steps in a [`Served`].
+pub(crate) fn session_served(
+    schema: &str,
+    answer: impl Fn(&Value) -> Value + Send + Sync + 'static,
+    cx: &mut TestAppContext,
+) -> (Entity<GraphSession>, Arc<Writer>, Arc<Served>) {
+    let writer = Arc::new(Writer::default());
+    let served = Arc::new(Served::default());
+    let routes = Routes {
+        served: Some(served.clone()),
+        ..Routes::default()
+    };
+    let session = serve_blobs(
+        schema,
+        Arc::new(answer),
+        always(200, committed("c2", "c1")),
+        Some(writer.clone()),
+        routes,
+        cx,
+    );
+    (session, writer, served)
+}
+
 /// As [`session_routing`], with another writer committing on the branch.
 pub(crate) fn session_followed(
     schema: &str,
@@ -317,13 +419,16 @@ pub(crate) fn session_with_blobs(
 ) -> (Entity<GraphSession>, Arc<Blobs>) {
     let blobs = Arc::new(Blobs::default());
     let rows = Arc::new(people());
+    let routes = Routes {
+        blobs: blobs.clone(),
+        ..Routes::default()
+    };
     let session = serve_blobs(
         schema,
         Arc::new(move |_: &Value| (*rows).clone()),
         always(200, committed("c2", "c1")),
         None,
-        blobs.clone(),
-        None,
+        routes,
         cx,
     );
     (session, blobs)
@@ -350,13 +455,17 @@ pub(crate) fn session_with_access(
     });
     let blobs = Arc::new(Blobs::default());
     let rows = Arc::new(people());
+    let routes = Routes {
+        blobs: blobs.clone(),
+        access: Some(access),
+        served: None,
+    };
     let session = serve_blobs(
         schema,
         Arc::new(move |_: &Value| (*rows).clone()),
         writes,
         None,
-        blobs.clone(),
-        Some(access),
+        routes,
         cx,
     );
     (session, sent, blobs)
@@ -614,7 +723,17 @@ fn serve_with(
     writer: Option<Arc<Writer>>,
     cx: &mut TestAppContext,
 ) -> Entity<GraphSession> {
-    serve_blobs(schema, rows, writes, writer, Arc::default(), None, cx)
+    serve_blobs(schema, rows, writes, writer, Routes::default(), cx)
+}
+
+/// The fake server's routes past the schema, the reads and the writes: its Blob cells, what the
+/// access route answers (nothing it can read when `None`), and what it is sent and answers in
+/// steps ([`Served`]).
+#[derive(Default)]
+struct Routes {
+    blobs: Arc<Blobs>,
+    access: Option<Value>,
+    served: Option<Arc<Served>>,
 }
 
 fn serve_blobs(
@@ -622,15 +741,20 @@ fn serve_blobs(
     rows: Rows,
     writes: Writes,
     writer: Option<Arc<Writer>>,
-    blobs: Arc<Blobs>,
-    access: Option<Value>,
+    routes: Routes,
     cx: &mut TestAppContext,
 ) -> Entity<GraphSession> {
     use futures::AsyncReadExt as _;
     let schema: Arc<str> = schema.into();
+    let Routes {
+        blobs,
+        access,
+        served,
+    } = routes;
     let http = FakeHttpClient::create(move |request| {
         let (schema, rows, writes) = (schema.clone(), rows.clone(), writes.clone());
         let (writer, blobs, access) = (writer.clone(), blobs.clone(), access.clone());
+        let served = served.clone();
         async move {
             let path = request.uri().path().to_owned();
             let query = request.uri().query().unwrap_or_default().to_owned();
@@ -676,19 +800,44 @@ fn serve_blobs(
                     200,
                     json!({ "schema_source": changed.unwrap_or_else(|| schema.to_string()) }),
                 )
+            } else if let Some(snapshot) = served
+                .as_ref()
+                .filter(|_| path.ends_with("/snapshot"))
+                .and_then(|served| {
+                    let branch = query
+                        .split('&')
+                        .find_map(|pair| pair.strip_prefix("branch="))
+                        .unwrap_or("main");
+                    served.snapshot(branch)
+                })
+            {
+                (200, snapshot)
             } else if path.ends_with("/query") {
                 let mut bytes = Vec::new();
                 request.into_body().read_to_end(&mut bytes).await.ok();
                 let mut asked: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
                 // A read at a commit is answered there; a read of the branch at the other
                 // writer's newest commit, or c1. The rows see it as `at`.
-                let at = asked["snapshot"]
-                    .as_str()
-                    .map(str::to_owned)
-                    .or_else(|| writer.as_ref().and_then(|writer| writer.head()))
-                    .unwrap_or_else(|| "c1".to_owned());
+                let at_now = |asked: &Value| {
+                    asked["snapshot"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .or_else(|| writer.as_ref().and_then(|writer| writer.head()))
+                        .unwrap_or_else(|| "c1".to_owned())
+                };
+                let mut at = at_now(&asked);
                 if let Some(asked) = asked.as_object_mut() {
                     asked.insert("at".into(), Value::String(at.clone()));
+                }
+                // A read held waits for the test, then is answered as the server would answer
+                // it then: a read of the branch at the head it has reached meanwhile.
+                let held = served.as_ref().and_then(|served| served.take(&asked));
+                if let Some(held) = held {
+                    held.await.ok();
+                    at = at_now(&asked);
+                    if let Some(asked) = asked.as_object_mut() {
+                        asked.insert("at".into(), Value::String(at.clone()));
+                    }
                 }
                 let rows = rows(&asked);
                 // A read of nodes' fields gets the nodes answered in its shape.

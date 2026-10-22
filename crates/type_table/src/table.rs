@@ -53,11 +53,11 @@ use crate::dialogs::{
 };
 use crate::grouping::{GROUP_LIMIT, Grouping, Line, Lines, SECTION_FIRST_PAGE};
 use crate::model::{
-    ColumnLayout, ColumnRole, ColumnSpec, Notice, Paging, RELATION_CHIPS_SHOWN, Row, SaveResult,
-    TableKind, Tone, changed_elsewhere, chips_that_fit, count_of, display_value, edge_columns,
-    edge_rows, edit_text, edited, field_rows, filter_parts, insert_position, node_columns,
-    node_rows, parse_filter_list, parse_filter_value, parse_input, preset_range, published,
-    reads_as_markdown, relation_sample, row_matches,
+    ColumnLayout, ColumnRole, ColumnSpec, Notice, Paging, RELATION_CHIPS_SHOWN,
+    RELATION_SAMPLE_BUDGET, Row, SaveResult, TableKind, Tone, changed_elsewhere, chips_that_fit,
+    count_of, display_value, edge_columns, edge_rows, edit_text, edited, field_rows, filter_parts,
+    insert_position, node_columns, node_rows, parse_filter_list, parse_filter_value, parse_input,
+    preset_range, published, reads_as_markdown, relation_sample, row_matches,
 };
 use crate::offers::Offers;
 use crate::peek::{
@@ -232,8 +232,49 @@ use crate::peek::property_icon;
 /// was read, so these are its first ones and the peek needs no read.
 struct Relation {
     count: Result<i64, String>,
-    neighbours: Vec<(String, Option<String>)>,
+    neighbours: NeighbourList,
     whole: bool,
+}
+
+/// Neighbours by id, each with its label when the other type has one.
+type NeighbourList = Vec<(String, Option<String>)>;
+
+/// A `page_neighbours` answer by row: how many neighbours it lists for each, and the first
+/// [`NEIGHBOUR_LIMIT`] of them, by id.
+struct NeighbourLists(HashMap<String, (i64, NeighbourList)>);
+
+impl NeighbourLists {
+    fn read(rows: &Value) -> Self {
+        let mut lists: HashMap<String, (i64, NeighbourList)> = HashMap::new();
+        for (id, other, label) in relation_samples(rows) {
+            let (listed, first) = lists.entry(id).or_default();
+            *listed += 1;
+            if first.len() < NEIGHBOUR_LIMIT as usize {
+                first.push((other, label));
+            }
+        }
+        Self(lists)
+    }
+
+    /// Rows `ids` split by whether the answer lists every neighbour `degrees` counts for them:
+    /// those it does with their first neighbours, and the rest, in the order given. A list the
+    /// read's limit cut short, or none, is not the row's.
+    fn split(
+        mut self,
+        ids: Vec<String>,
+        degrees: &HashMap<String, i64>,
+    ) -> (Vec<(String, NeighbourList)>, Vec<String>) {
+        let mut whole = Vec::new();
+        let mut rest = Vec::new();
+        for id in ids {
+            let degree = degrees.get(&id).copied().unwrap_or(0);
+            match self.0.remove(&id) {
+                Some((listed, first)) if listed == degree => whole.push((id, first)),
+                _ => rest.push(id),
+            }
+        }
+        (whole, rest)
+    }
 }
 
 /// Values by row id and column, looked up without copying either key: every cell drawn asks
@@ -249,6 +290,10 @@ impl<V> Default for CellMap<V> {
 impl<V> CellMap<V> {
     fn get(&self, row: &str, column: &str) -> Option<&V> {
         self.0.get(row)?.get(column)
+    }
+
+    fn get_mut(&mut self, row: &str, column: &str) -> Option<&mut V> {
+        self.0.get_mut(row)?.get_mut(column)
     }
 
     fn contains(&self, row: &str, column: &str) -> bool {
@@ -2292,6 +2337,9 @@ impl TypeTable {
             self.relations_asked.clear();
         }
         self.lines_moved();
+        // The view scrolls back to its first line (below): until a frame draws it, the rows
+        // near the lines drawn, and how far the next page is ahead of them, are judged there.
+        self.lines_drawn = 0..0;
         self._blob_wait = None;
         self.cursor = None;
         // Picked rows stay picked by id; the row a range starts from is a place in the old
@@ -3142,11 +3190,19 @@ impl TypeTable {
                 } else {
                     self.loading_more = false;
                 }
-                // A read that showed no row and is not the last (sorted, the rows with a value
-                // ran out, and those without one are next) reads on at once: the next page is
-                // otherwise asked for only as drawn rows near the end, and with none shown the
-                // table would say it has no rows while its count says it has.
-                if !added && !self.paging.exhausted {
+                // The next page is asked for as soon as this one is in while no more than a
+                // page is left past the lines drawn, so a scroll finds its rows read rather
+                // than waiting seconds for them; further ahead, the lines drawn ask for it as
+                // they come near ([`Paging::wants_more`]). A read that showed no row and is not
+                // the last (sorted, the rows with a value ran out, and those without one are
+                // next) reads on at once: with none shown the table would say it has no rows
+                // while its count says it has.
+                let ahead = self.paging.wants_more(
+                    self.rows.len(),
+                    self.lines_drawn.end,
+                    self.loading_more,
+                );
+                if ahead || (!added && !self.paging.exhausted) {
                     self.load_more(cx);
                 }
             }
@@ -3342,11 +3398,25 @@ impl TypeTable {
                 continue;
             };
             let degrees = self.read_shown(&degrees, snapshot.clone(), cx);
+            // The neighbours go out with the degrees, not after them: every neighbour of the
+            // rows, by row then neighbour, up to the budget. Most pages' rows are all in it.
+            // The degrees, in first, show the counts; the rows the answer holds whole show
+            // their chips as it lands; the rows it cut short (a hub, or rows after one that
+            // spent the budget) are read again, sized by their counts, so a hub never leaves
+            // the rows after it bare.
+            let first = builder::page_neighbours(
+                &schema,
+                &self.type_name,
+                &group,
+                &ids,
+                RELATION_SAMPLE_BUDGET as u32,
+            )
+            .ok()
+            .map(|query| self.read_shown(&query, snapshot.clone(), cx));
             let ids = ids.clone();
             let schema = schema.clone();
             let type_name = self.type_name.clone();
             let snapshot = snapshot.clone();
-            // The degrees first: they size the neighbour read, so every row gets its chips.
             self.next_relation_task += 1;
             let task_id = self.next_relation_task;
             let task = cx.spawn(async move |this, cx| {
@@ -3364,55 +3434,73 @@ impl TypeTable {
                         .ok_or_else(|| "The neighbour counts could not be read".to_owned()),
                     Err(error) => Err(error.to_string()),
                 };
-                let (sampled, total) = match &counts {
-                    Ok(counts) => relation_sample(&ids, counts),
-                    Err(_) => (Vec::new(), 0),
-                };
-                let neighbours = if sampled.is_empty() {
-                    None
-                } else {
-                    let query = builder::page_neighbours(
-                        &schema,
-                        &type_name,
-                        &group,
-                        &sampled,
-                        total as u32,
-                    );
-                    match query {
-                        Ok(query) => this
-                            .update(cx, |this, cx| this.read_shown(&query, snapshot.clone(), cx))
-                            .ok(),
-                        Err(_) => None,
+                let shown = this.update(cx, |this, cx| {
+                    for id in &ids {
+                        let count = match &counts {
+                            Ok(counts) => Ok(counts.get(id).copied().unwrap_or(0)),
+                            Err(error) => Err(error.clone()),
+                        };
+                        let relation = Relation {
+                            count,
+                            neighbours: Vec::new(),
+                            whole: false,
+                        };
+                        this.relations.insert(id.clone(), key.clone(), relation);
                     }
+                    if counts.is_err() {
+                        this.relation_tasks.remove(&task_id);
+                    }
+                    cx.notify();
+                });
+                let (Ok(counts), Ok(())) = (counts, shown) else {
+                    return;
                 };
-                let neighbours = match neighbours {
-                    Some(read) => Some(read.await),
+                // The rows that show chips: each whole list in page order while the budget
+                // lasts, none of more than a hub's.
+                let (sampled, _) = relation_sample(&ids, &counts);
+                let output = match first {
+                    Some(read) if !sampled.is_empty() => read.await.ok(),
+                    _ => None,
+                };
+                // Neither read nor wanted: the counts show alone, as a failed read leaves them.
+                let Some(output) = output else {
+                    this.update(cx, |this, _| this.relation_tasks.remove(&task_id))
+                        .ok();
+                    return;
+                };
+                let (whole, rest) = NeighbourLists::read(&output.rows).split(sampled, &counts);
+                let shown = this.update(cx, |this, cx| {
+                    this.show_neighbours(&key, whole);
+                    if rest.is_empty() {
+                        this.relation_tasks.remove(&task_id);
+                    }
+                    cx.notify();
+                });
+                if rest.is_empty() || shown.is_err() {
+                    return;
+                }
+                let (rest, total) = relation_sample(&rest, &counts);
+                let read =
+                    builder::page_neighbours(&schema, &type_name, &group, &rest, total as u32)
+                        .ok()
+                        .and_then(|query| {
+                            this.update(cx, |this, cx| {
+                                this.read_shown(&query, snapshot.clone(), cx)
+                            })
+                            .ok()
+                        });
+                let output = match read {
+                    Some(read) => read.await.ok(),
                     None => None,
                 };
                 this.update(cx, |this, cx| {
                     this.relation_tasks.remove(&task_id);
-                    let mut shown: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
-                    let read_whole = matches!(&neighbours, Some(Ok(_)));
-                    if let Some(Ok(output)) = &neighbours {
-                        for (id, other, label) in relation_samples(&output.rows) {
-                            let list = shown.entry(id).or_default();
-                            if list.len() < NEIGHBOUR_LIMIT as usize {
-                                list.push((other, label));
-                            }
-                        }
+                    // A row this read does not hold whole either shows its count alone.
+                    if let Some(output) = output {
+                        let (whole, _) = NeighbourLists::read(&output.rows).split(rest, &counts);
+                        this.show_neighbours(&key, whole);
+                        cx.notify();
                     }
-                    for id in ids {
-                        let relation = Relation {
-                            count: match &counts {
-                                Ok(counts) => Ok(counts.get(&id).copied().unwrap_or(0)),
-                                Err(error) => Err(error.clone()),
-                            },
-                            whole: read_whole && sampled.contains(&id),
-                            neighbours: shown.remove(&id).unwrap_or_default(),
-                        };
-                        this.relations.insert(id, key.clone(), relation);
-                    }
-                    cx.notify();
                 })
                 .ok();
             });
@@ -3420,14 +3508,80 @@ impl TypeTable {
         }
     }
 
-    fn load_counts(&mut self, cx: &mut Context<Self>) {
-        let snapshot = self.paging.pinned.clone();
-        let filtered = self.count_query(!self.filters.is_empty());
-        self.count_task = self.spawn_count(filtered, snapshot.clone(), true, cx);
-        if !self.filters.is_empty() {
-            let total = self.count_query(false);
-            self.total_task = self.spawn_count(total, snapshot, false, cx);
+    /// Shows the chips of rows whose whole lists of neighbours through relationship `key` were
+    /// read; their counts show already.
+    fn show_neighbours(&mut self, key: &str, whole: Vec<(String, NeighbourList)>) {
+        for (id, neighbours) in whole {
+            if let Some(relation) = self.relations.get_mut(&id, key) {
+                relation.neighbours = neighbours;
+                relation.whole = true;
+            }
         }
+    }
+
+    /// Counts the rows the first read showed, by reads at the pin ([`Self::read_counts`]).
+    /// While the count of every row is out, the session's snapshot's shows in its place when it
+    /// may be the pin's ([`Self::snapshot_count`]), so the rows are counted as the first page
+    /// shows; the read replaces it as it lands, so a snapshot of another commit shows only
+    /// until then, and never past a Refresh.
+    fn load_counts(&mut self, cx: &mut Context<Self>) {
+        let provisional = self.snapshot_count(cx);
+        self.read_counts(cx);
+        let Some(n) = provisional else {
+            return;
+        };
+        let shown = if self.filters.is_empty() {
+            &mut self.count
+        } else {
+            &mut self.total
+        };
+        // Only over a count still being read: one already in is the pin's own.
+        if matches!(shown, Loadable::Loading) {
+            *shown = Loadable::Loaded(n);
+        }
+    }
+
+    /// Reads the counts at the pin: through the filters, and of every row (the count itself
+    /// while no filter is set, else the total shown beside it).
+    fn read_counts(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.paging.pinned.clone();
+        let filtered = !self.filters.is_empty();
+        if filtered {
+            let query = self.count_query(true);
+            self.count_task = self.spawn_count(query, snapshot.clone(), true, cx);
+        }
+        let query = self.count_query(false);
+        let task = self.spawn_count(query, snapshot, !filtered, cx);
+        if filtered {
+            self.total_task = task;
+        } else {
+            self.count_task = task;
+        }
+    }
+
+    /// How many rows the session's snapshot of the branch counts for the type, when that may
+    /// be the count at the pin: the snapshot counts the branch head, so only while the pin is
+    /// the head the session holds. `None` for a table held at a commit, for a pin the
+    /// session's head moved past, while the table's own writes past its pin are counted
+    /// ([`Self::count_shift`]), and while the session holds no count for the type. The snapshot
+    /// is not bound to a commit the table can compare with its pin (the session keeps none of
+    /// its manifest version, and a read's answer names no version), so a commit between the
+    /// session's snapshot and its head read makes it another commit's: it only stands in until
+    /// the read at the pin lands ([`Self::load_counts`]).
+    fn snapshot_count(&self, cx: &App) -> Option<i64> {
+        if self.at_commit.is_some() || self.count_shift.is_some() {
+            return None;
+        }
+        let pin = self.paging.pinned.as_deref()?;
+        let session = self.session.read(cx);
+        if session.branch != self.branch || session.head(&self.branch) != Some(pin) {
+            return None;
+        }
+        let kind = match self.kind {
+            TableKind::Node => graph_store::EntityKind::Node,
+            TableKind::Edge => graph_store::EntityKind::Edge,
+        };
+        session.count_of(kind, &self.type_name)
     }
 
     fn spawn_count(
@@ -3683,11 +3837,12 @@ impl TypeTable {
     /// are read again there: the rows changed are counted as the commit counts them, those not
     /// loaded and those a filter on a relationship keeps included. Behind it, a read at the pin
     /// would not hold the change, so they are adjusted here until Refresh: those shown now, and
-    /// each read at the pin as it lands, one out now included.
+    /// each read at the pin as it lands, one out now included. The counts shown stay until
+    /// the reads land, rather than the session's snapshot, read again for the commit.
     fn recount(&mut self, behind: bool, rows: i64, matching: i64, cx: &mut Context<Self>) {
         if !behind {
             if matches!(self.first_page, Loadable::Loaded(())) {
-                self.load_counts(cx);
+                self.read_counts(cx);
             }
             return;
         }
@@ -9869,6 +10024,166 @@ mod tests {
         });
     }
 
+    /// People who work at companies: one relationship column, `WorksAt`, on Person.
+    const WORKERS: &str = "node Person {\n  slug: String @key\n  name: String\n}\nnode Company {\n  slug: String @key\n  name: String\n}\nedge WorksAt: Person -> Company\n";
+
+    /// What a fake server answers a page's relationship reads with: its two people, how many
+    /// companies each works at (`degrees`), and those companies, `c0` on, for each row the read
+    /// names, in its order. A read naming `cut` answers with `cut`'s first 2,000 companies
+    /// alone, as the limit of a read shared with a row of more ends it.
+    fn workers(degrees: &[(&str, u64)], cut: Option<&str>) -> impl Fn(&Value) -> Value + use<> {
+        let degrees: Vec<(String, u64)> = degrees
+            .iter()
+            .map(|(id, n)| ((*id).to_owned(), *n))
+            .collect();
+        let cut = cut.map(str::to_owned);
+        fn listed(id: &str, n: u64) -> Vec<Value> {
+            (0..n)
+                .map(|i| {
+                    serde_json::json!({"id": id, "other": format!("c{i}"), "label": format!("Company {i}")})
+                })
+                .collect()
+        }
+        move |request| match request["name"].as_str() {
+            Some("studio_page_degrees") => degrees
+                .iter()
+                .map(|(id, n)| serde_json::json!({"id": id, "n": n}))
+                .collect(),
+            Some("studio_page_neighbours") => {
+                let asked: Vec<&str> = request["params"]["ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect();
+                match &cut {
+                    Some(hub) if asked.contains(&hub.as_str()) => listed(hub, 2000).into(),
+                    _ => degrees
+                        .iter()
+                        .filter(|(id, _)| asked.contains(&id.as_str()))
+                        .flat_map(|(id, n)| listed(id, *n))
+                        .collect(),
+                }
+            }
+            _ => serde_json::json!([
+                {"n": {"@id": "p1", "slug": "p1", "name": "Ada"}},
+                {"n": {"@id": "p2", "slug": "p2", "name": "Grace"}},
+            ]),
+        }
+    }
+
+    /// The key of a table's first relationship column.
+    fn relationship_column(table: &Entity<TypeTable>, cx: &mut VisualTestContext) -> String {
+        table.read_with(cx, |table, _| {
+            let column = table.columns.iter().find(|c| c.relationship().is_some());
+            column.expect("a relationship column").key.clone()
+        })
+    }
+
+    /// A page's relationship counts and its neighbours are asked for together: each row's
+    /// count shows as soon as the counts are in, and its chips once the neighbours are, with no
+    /// further read. Before, the neighbours were asked for only once the counts were in, and
+    /// neither showed until both were.
+    #[gpui::test]
+    async fn relationship_counts_show_before_the_neighbours_asked_for_with_them(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let answer = workers(&[("p1", 2), ("p2", 1)], None);
+        let (session, _, served) = crate::test_support::session_served(WORKERS, answer, cx);
+        let degrees = served.hold(|read| read["name"] == "studio_page_degrees");
+        let neighbours = served.hold(|read| read["name"] == "studio_page_neighbours");
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let key = relationship_column(&table, cx);
+        // Both are out, the neighbours of every row of the page, while no count is in.
+        assert_eq!(served.sent("studio_page_degrees").len(), 1);
+        let sent = served.sent("studio_page_neighbours");
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0]["params"]["ids"], serde_json::json!(["p1", "p2"]));
+        table.read_with(cx, |table, _| {
+            assert!(table.relations.get("p1", &key).is_none())
+        });
+
+        // The counts are in: they show, the chips still to come.
+        degrees.send(()).unwrap();
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            let ada = table.relations.get("p1", &key).unwrap();
+            assert_eq!(ada.count, Ok(2));
+            assert!(ada.neighbours.is_empty() && !ada.whole);
+            assert_eq!(table.relations.get("p2", &key).unwrap().count, Ok(1));
+        });
+
+        neighbours.send(()).unwrap();
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            let ada = table.relations.get("p1", &key).unwrap();
+            let named: Vec<&str> = ada.neighbours.iter().map(|(id, _)| id.as_str()).collect();
+            assert_eq!(named, ["c0", "c1"]);
+            assert!(ada.whole);
+            let grace = table.relations.get("p2", &key).unwrap();
+            assert_eq!(grace.neighbours.len(), 1);
+            assert!(grace.whole);
+            assert!(table.relation_tasks.is_empty());
+        });
+        assert_eq!(
+            served.sent("studio_page_neighbours").len(),
+            1,
+            "none read again"
+        );
+    }
+
+    /// A row the first neighbour read cut short, after a hub that spent its limit, is read
+    /// again alone, sized by its count, so it shows its chips; the hub shows its count alone.
+    #[gpui::test]
+    async fn a_row_a_hub_left_bare_is_read_again_sized_by_its_count(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let answer = workers(&[("p1", 5000), ("p2", 3)], Some("p1"));
+        let (session, _, served) = crate::test_support::session_served(WORKERS, answer, cx);
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let key = relationship_column(&table, cx);
+        let sent = served.sent("studio_page_neighbours");
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(sent[1]["params"]["ids"], serde_json::json!(["p2"]));
+        let query = sent[1]["query"].as_str().unwrap_or_default();
+        assert!(query.contains("limit 3\n"), "{query}");
+        table.read_with(cx, |table, _| {
+            let hub = table.relations.get("p1", &key).unwrap();
+            assert_eq!(hub.count, Ok(5000));
+            assert!(hub.neighbours.is_empty() && !hub.whole, "its count alone");
+            let grace = table.relations.get("p2", &key).unwrap();
+            assert_eq!(grace.neighbours.len(), 3);
+            assert!(grace.whole);
+            assert!(table.relation_tasks.is_empty());
+        });
+    }
+
     /// A row draws the columns in view, one either side, the pinned first and the cursor's;
     /// the rest are empty at their width.
     #[gpui::test]
@@ -10146,6 +10461,220 @@ mod tests {
                 "a read after, with all three"
             );
         });
+    }
+
+    /// A table at the head the session holds shows the session's snapshot count of every row
+    /// with its first page, until the read at its pin lands and replaces it: the snapshot is
+    /// bound to no commit the table can compare with its pin. Here another writer's commit
+    /// lands between the session's snapshot and its first head read, so the snapshot counts the
+    /// commit before the pin; the read at the pin corrects it, and Refresh reads it there
+    /// again. Filtered, the count through the filter is read too. A table held at a commit
+    /// shows no snapshot count while its read is out.
+    #[gpui::test]
+    async fn a_tables_snapshot_count_stands_in_until_the_read_at_its_pin(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, writer, served) = crate::test_support::session_served(
+            PEOPLE,
+            |request| {
+                let filtered = request["params"].as_object().is_some_and(|p| !p.is_empty());
+                match request["name"].as_str() {
+                    Some("studio_count") if filtered => serde_json::json!([{"n": 1}]),
+                    // Every row: 70,702 at c1, and one more at c2.
+                    Some("studio_count") if request["at"] == "c2" => {
+                        serde_json::json!([{"n": 70_703}])
+                    }
+                    Some("studio_count") => serde_json::json!([{"n": 70_702}]),
+                    _ => serde_json::json!([
+                        {"n": {"@id": "p1", "slug": "p1", "name": "Ada"}},
+                        {"n": {"@id": "p2", "slug": "p2", "name": "Grace"}},
+                    ]),
+                }
+            },
+            cx,
+        );
+        served.count_nodes("Person", 70_702);
+        fn open<'a>(
+            session: &Entity<GraphSession>,
+            at_commit: Option<&str>,
+            cx: &'a mut TestAppContext,
+        ) -> (Entity<TypeTable>, &'a mut VisualTestContext) {
+            let (session, at_commit) = (session.clone(), at_commit.map(str::to_owned));
+            let (table, cx) = cx.add_window_view(|window, cx| {
+                TypeTable::new(
+                    WeakEntity::new_invalid(),
+                    session,
+                    "Person".into(),
+                    at_commit,
+                    window,
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+            (table, cx)
+        }
+        // The session's first head read waits while another writer adds a person: the
+        // snapshot, read meanwhile, counts c1, and the head the session holds is c2.
+        let head = served.hold(|read| read["name"] == "studio_head");
+        cx.run_until_parked();
+        writer.commit("c2", vec![changed("node", "Person", "p3", None)]);
+        head.send(()).unwrap();
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.head("main"), Some("c2"));
+            let counted = session.count_of(graph_store::EntityKind::Node, "Person");
+            assert_eq!(counted, Some(70_702), "the commit before");
+        });
+
+        // The snapshot's count shows with the first page while the read at the pin is out.
+        let count = served.hold(|read| read["name"] == "studio_count");
+        let (table, table_cx) = open(&session, None, cx);
+        table.read_with(table_cx, |table, _| {
+            assert_eq!(table.paging.pinned.as_deref(), Some("c2"));
+            assert_eq!(table.count, Loadable::Loaded(70_702), "standing in");
+        });
+        let counts = served.sent("studio_count");
+        assert_eq!(counts.len(), 1, "{counts:?}");
+        assert_eq!(counts[0]["at"], "c2");
+        count.send(()).unwrap();
+        table_cx.run_until_parked();
+        table.read_with(table_cx, |table, _| {
+            assert_eq!(table.count, Loadable::Loaded(70_703), "the pin's")
+        });
+
+        // Refresh reads at the head again, and its count there.
+        table.update_in(table_cx, |table, window, cx| table.refresh(window, cx));
+        table_cx.run_until_parked();
+        table.read_with(table_cx, |table, _| {
+            assert_eq!(table.paging.pinned.as_deref(), Some("c2"));
+            assert_eq!(table.count, Loadable::Loaded(70_703));
+        });
+
+        // Filtered, both counts are read at the pin.
+        let only_ada = Filter {
+            property: "name".into(),
+            op: FilterOp::Eq,
+            value: "Ada".into(),
+        };
+        table.update(table_cx, |table, cx| table.show_only(only_ada, cx));
+        table_cx.run_until_parked();
+        table.read_with(table_cx, |table, _| {
+            assert_eq!(table.count, Loadable::Loaded(1));
+            assert_eq!(table.total, Loadable::Loaded(70_703));
+        });
+
+        // Held at c1, a table shows no count from the head's snapshot while its own is read.
+        let held_count = served.hold(|read| read["name"] == "studio_count" && read["at"] == "c1");
+        let (held, held_cx) = open(&session, Some("c1"), cx);
+        held.read_with(held_cx, |held, _| assert_eq!(held.count, Loadable::Loading));
+        held_count.send(()).unwrap();
+        held_cx.run_until_parked();
+        held.read_with(held_cx, |held, _| {
+            assert_eq!(held.count, Loadable::Loaded(70_702))
+        });
+    }
+
+    /// The next page is asked for as soon as a page is in while no more than a page is left
+    /// past the lines in view, so a scroll finds its rows read, and no page further. A read out
+    /// when the order changes is dropped, and the rows are read from the start in the new
+    /// order. Before, the next page was asked for only once the view passed 80% of the rows.
+    #[gpui::test]
+    async fn the_next_page_is_read_a_page_ahead_and_dropped_when_the_order_changes(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        // A thousand people, a hundred a page from the one after `after`: `p…` by id, `s…` by
+        // name.
+        let (session, _, served) = crate::test_support::session_served(
+            PEOPLE,
+            |request| {
+                if request["name"] != "studio_page" {
+                    return serde_json::json!([]);
+                }
+                let query = request["query"].as_str().unwrap_or_default();
+                let prefix = if query.contains("$n.name") { "s" } else { "p" };
+                let from = request["params"]["after"]
+                    .as_str()
+                    .and_then(|after| after.get(1..)?.parse::<usize>().ok())
+                    .map_or(0, |after| after + 1);
+                (from..(from + 100).min(1000))
+                    .map(|i| {
+                        let id = format!("{prefix}{i:03}");
+                        serde_json::json!({"n": {"@id": id, "slug": id, "name": id}})
+                    })
+                    .collect()
+            },
+            cx,
+        );
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session.clone(),
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let after = |read: &Value| read["params"]["after"].as_str().map(str::to_owned);
+        let pages: Vec<Option<String>> = served.sent("studio_page").iter().map(after).collect();
+        assert_eq!(
+            pages,
+            [None, Some("p099".into())],
+            "the second page at once"
+        );
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.rows.len(), 200);
+            assert!(!table.loading_more);
+            assert!(table.lines_drawn.end < 100, "{:?}", table.lines_drawn);
+        });
+
+        // Scrolled into the second page, the third is asked for.
+        let third = served.hold(|read| read["params"]["after"] == "p199");
+        table.update(cx, |table, cx| {
+            let height = table.line_height(cx);
+            {
+                let state = table.table_state.read(cx).scroll_handle.0.borrow();
+                state.base_handle.set_offset(point(px(0.), height * -110.));
+            }
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(served.sent("studio_page").len(), 3);
+        table.read_with(cx, |table, _| {
+            assert!(table.loading_more);
+            assert_eq!(table.rows.len(), 200);
+        });
+
+        // Ordered by name before it lands: it is dropped, and the rows are read again in order,
+        // a page ahead of the view at its top.
+        table.update(cx, |table, cx| {
+            let by_name = Sort {
+                property: "name".into(),
+                descending: false,
+            };
+            table.set_sort(Some(by_name), cx)
+        });
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.reads_in_flight, 0, "the read dropped stopped")
+        });
+        third.send(()).ok();
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.rows.len(), 200);
+            assert!(table.rows.iter().all(|row| row.id.starts_with('s')));
+            assert!(!table.loading_more);
+        });
+        let sorted: Vec<Option<String>> =
+            served.sent("studio_page")[3..].iter().map(after).collect();
+        assert_eq!(sorted, [None, Some("s099".into())]);
     }
 
     /// A head the session sees move while the table's first read is out is compared once the

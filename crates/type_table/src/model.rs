@@ -520,6 +520,9 @@ pub struct Paging {
     pub moved: bool,
     /// Where the Blob values the view shows hold.
     pub blobs: BlobsAt,
+    /// How many rows the last page asked for: the next is read while no more than this many
+    /// are left past the rows in view ([`Self::wants_more`]).
+    pub page_size: u32,
 }
 
 impl Default for Paging {
@@ -530,6 +533,7 @@ impl Default for Paging {
             exhausted: false,
             moved: false,
             blobs: BlobsAt::Pin,
+            page_size: 0,
         }
     }
 }
@@ -567,6 +571,7 @@ impl Paging {
         if self.pinned.is_none() {
             self.pinned = commit.map(str::to_owned);
         }
+        self.page_size = page_size;
         let short = page.len() < page_size as usize;
         let in_nulls = matches!(self.start, PageStart::Nulls { .. });
         match (sort_column, page.last()) {
@@ -599,10 +604,15 @@ impl Paging {
         }
     }
 
-    /// Whether the viewport, which ends at row `visible_end`, has passed 80% of the `loaded`
-    /// rows and another page should be read.
+    /// Whether another page should be read, the view ending at row `visible_end` of the
+    /// `loaded` rows: while no more than a page is left past it. A page is read one page ahead
+    /// of the rows in view, so scrolling finds its rows read, and no further: the rows past
+    /// the view stay within two pages.
     pub fn wants_more(&self, loaded: usize, visible_end: usize, loading: bool) -> bool {
-        !self.exhausted && !loading && loaded > 0 && visible_end * 5 >= loaded * 4
+        !self.exhausted
+            && !loading
+            && loaded > 0
+            && loaded <= visible_end.saturating_add(self.page_size as usize)
     }
 
     /// A write this view made committed. When it was made on top of the pinned commit, the
@@ -1340,18 +1350,35 @@ mod tests {
         assert!(paging.exhausted, "a short page of nulls ends the list");
     }
 
+    /// The next page is read while no more than a page is left past the rows in view: at once
+    /// after a first page, before any row is drawn, and then a page ahead of the view.
     #[test]
-    fn next_page_is_read_past_eighty_percent() {
-        let paging = Paging::default();
-        assert!(!paging.wants_more(100, 79, false));
-        assert!(paging.wants_more(100, 80, false));
-        assert!(!paging.wants_more(100, 100, true));
-        assert!(!paging.wants_more(0, 0, false));
+    fn the_next_page_is_read_a_page_ahead_of_the_view() {
+        let mut paging = Paging::default();
+        assert!(!paging.wants_more(0, 0, false), "nothing read yet");
+        let ids: Vec<String> = (0..100).map(|i| format!("p{i:03}")).collect();
+        let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+        paging.accept(Some("c1"), &rows(&ids), 100, None);
+        assert!(
+            paging.wants_more(100, 0, false),
+            "read as the first page lands"
+        );
+        assert!(paging.wants_more(100, 30, false));
+        assert!(!paging.wants_more(100, 30, true), "one read at a time");
+        assert!(
+            !paging.wants_more(200, 30, false),
+            "a page ahead and no further"
+        );
+        assert!(!paging.wants_more(200, 99, false));
+        assert!(
+            paging.wants_more(200, 100, false),
+            "the view reached the next page"
+        );
         let done = Paging {
             exhausted: true,
-            ..Paging::default()
+            ..paging
         };
-        assert!(!done.wants_more(100, 100, false));
+        assert!(!done.wants_more(200, 200, false));
     }
 
     #[test]
