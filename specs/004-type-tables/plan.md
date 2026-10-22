@@ -158,10 +158,11 @@ stay put), IX (paged, virtualized).
 
 ### Reading
 
-- Page query, generated from the schema (sketch for `Person` ordered by key):
+- Page query, generated from the schema (sketch for `Person` ordered by key, a page after the
+  first; the first page has no cursor, so neither the `$after` parameter nor its clause):
 
   ```
-  query page($after: String) {
+  query studio_page($after: String) {
     match { $n: Person  $n.@id > $after }
     return { $n }
     order { $n.@id asc }
@@ -177,10 +178,11 @@ stay put), IX (paged, virtualized).
 - A page holds `studio.type_table_page_size` rows (100 by default; a graph can have its own,
   spec 002), the `limit` above.
 - The first page records `graph_commit_id`; later pages pass it as `snapshot` (constitution II).
-  Every page, section and group count is sent with how many of the table's own writes had
-  moved its pin by then (`own_writes`); one that lands after another of them is read again at
-  the new pin, never shown under it (since 2026-10-21; before, a page read before a save landed
-  showed the old value, a deleted row came back and an inserted one never showed). A pin
+  Every page, section and group count read is tagged, as it is sent, with how many of the
+  table's own writes had moved its pin by then (`own_writes`); one that lands after another of
+  them is read again at the new pin, never shown under it (since 2026-10-21; before, a page read
+  before a save landed showed the old value, a deleted row came back and an inserted one never
+  showed). A pin
   carried forward to a head that changed nothing the table reads (spec 015) is no such write,
   so a read out then lands as it was (since 2026-10-21; before, each read was tagged with the
   pin it was sent at, and sent again at every move of it).
@@ -193,22 +195,38 @@ stay put), IX (paged, virtualized).
   it was read (constitution V). A section's count, read before the write, is spent only on the
   rows it shows, so none is left unread (since 2026-10-21; before, such a row showed twice and
   could take the place of a row of its new section).
-- The next page is fetched when the viewport passes 80% of loaded rows. No row cap: the grid is
-  virtualized.
-- Relationship columns: one query per page and relationship, with the page's ids as an `in`
-  list parameter; at most two neighbours as chips, those that fit the column whole, then "+N"
-  (a chip is
-  never cut mid-name; its width is estimated from its label, as a cell is laid out before its
-  text is measured). Built as two reads per page and relationship at the page's commit, in
-  turn: a grouped count (`return { $n.@id as id, count($m) as n }`), then every neighbour of
-  the rows it sizes, in page order, up to 2,000 rows; a row with more than 200 neighbours, or
-  past the budget, shows its count alone, so a hub never leaves the rows after it bare. A
-  click opens the other type filtered to this row's neighbours through the same relationship.
+- The next page is read a page ahead of the view: as soon as a page lands, while no more than a
+  page of rows is left past the lines in view (`Paging::wants_more`), so the rows past the view
+  stay within two pages (since 2026-10-22; before, once the view passed 80% of the rows read). A
+  read still out when the order, filters or branch change is dropped with the reload. No row
+  cap: the grid is virtualized.
+- Relationship columns: per page and relationship, with the page's ids as an `in` list
+  parameter; at most two neighbours as chips, those that fit the column whole, then "+N" (a
+  chip is never cut mid-name; its width is estimated from its label, as a cell is laid out
+  before its text is measured). Built as two reads at the page's commit, sent together: a
+  grouped count (`return { $n.@id as id, count($m) as n }`) and every neighbour of the page's
+  rows, by row then neighbour, up to 2,000 rows. The counts show as soon as they land, the
+  chips once the neighbours do (since 2026-10-22; before, the neighbours were asked for only
+  once the counts were in, and neither showed until both were). A row with more than 200
+  neighbours shows its count alone. The rows of up to 200 that the first answer cut short (a
+  hub before them spent the budget) are read again together, sized by their counts, up to
+  2,000 again; a row past that shows its count alone, so a hub never leaves the rows after it
+  bare. A click opens the other type filtered to this row's neighbours through the same
+  relationship.
 - Filters read as segmented pills (`ds::filter_pill`): the field with its kind's icon (text,
   number, time, choice, file, or the relationship's direction), the test, the value and a
   remove button, split by hairlines. A filter being written is the same pill outlined in the
   accent, its field and test as menus (the field menu shows each property's icon) and its value
   as a field at the label size.
+- Counts: the count of every row is the session's snapshot count (`/snapshot`'s
+  `entity_count`) when the snapshot counts the table's pin: the session found the branch's
+  newest commit at the snapshot's manifest version (`GraphSession::counts_commit`), and it is
+  the pin, at the head or held at that commit. Then no count of every row is read, and
+  filtered, only the count through the filters is (since 2026-10-22). Otherwise the counts are
+  read at the pin; while the count of every row is out, a table at the head the session holds
+  shows the snapshot's count in its place, which the read replaces as it lands (since
+  2026-10-22). A table held at another commit, or one whose own writes past its pin change its
+  counts, shows no snapshot count.
 - Filtered counts: `return { count($n) as n }` with the same filters, pinned to the snapshot.
 
 ### Filters and views
@@ -230,7 +248,7 @@ stay put), IX (paged, virtualized).
   stands. A "related to" pill reads the picked node's label. The offers hide while the
   property or operator menu is open.
 - A view is a name for a filter, sort, grouping and column state; saved per graph in Studio's
-  settings: `graphs."<server url>/<graph>".views` in `settings.json`, each with its type, filters
+  settings: `graphs."<target>/<graph>".views` in `settings.json`, each with its type, filters
   (`FilterOp::key` names), sort, grouping, hidden columns and column order. The toolbar's
   Views menu lists the type's views with the shown one checked, saves the table's state under
   a name (the same name replaces), and deletes the shown one; its chip reads "Views" and the
@@ -559,6 +577,15 @@ kept answers.
 | 2026-10-20 | A Blob write is bound to the value read and has three outcomes | `graph_client` `a_blob_put_sends_raw_bytes_bound_to_the_etag_read`, `a_blob_clear_of_a_null_cell_commits_nothing`, `a_changed_blob_refuses_the_write_with_its_current_etag`, `a_blob_put_without_the_servers_answer_is_unknown`; `type_table` `blob_write` tests, the peek's `a_file_stored_in_a_slot_is_bound_to_the_value_read`, `a_value_changed_elsewhere_is_offered_again_over_the_new_one`, `uploads_the_view_cannot_send_say_why_and_send_nothing`, `a_page_held_at_a_commit_stores_no_file`, the table's `a_file_dropped_on_a_blob_cell_is_stored_bound_to_the_value_read`, the tab's `a_file_stored_from_the_tab_shows_at_its_own_commit` and `a_tab_at_a_commit_writes_nothing`, against the fake server's Blob cells | One `PUT` with one content type, the bytes and the ETag read; the view, the table and the tab move to the write's commit and show its value; a value changed elsewhere sends one write, keeps the other writer's bytes and offers "Replace anyway" bound to the new ETag, which lands; a 32 MiB + 1 file and a held view send nothing; a lost answer is unknown and not sent again. The native picker and a drop from Finder were not driven: no test reaches the system's open panel or its file drags, so the paths after them (`upload_blob`, `upload`) are what the tests call |
 
 ## Corrections
+
+- 2026-10-22 · "Reading" still gave what `dab901f` and the snapshot's commit changed. Its sketch
+  put the `$after` cursor on every page; the first page has none. It said the next page was read
+  once the view passed 80% of the rows read; it is read a page ahead. It said a page's
+  relationship counts and neighbours were read in turn; they go out together, the counts
+  showing first. It did not say how a table counts its rows: from the session's snapshot with no
+  read when that snapshot counts the pin, and otherwise by a read at the pin, the snapshot's
+  count standing in meanwhile at the head. Views were filed under `<server url>/<graph>`; the
+  key is `<target>/<graph>`.
 
 - 2026-10-14 · Grouping by a property of a neighbour or of an edge's end, which was deferred, is
   built (see Grouping). "Show N more of M" read "Show 25 more of 25" when the page held the

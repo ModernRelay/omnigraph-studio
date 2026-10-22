@@ -1,9 +1,9 @@
 # 003: Connections
 
-Status: in progress · 2026-10-21. Built: servers from the targets the OmniGraph CLI lists, the
-environment and Studio's own list; tokens from the CLI's `credentials export`; the contract
-check; bounded reads; and replacing a refused token (validation log). OIDC and managed clusters
-wait for Studio's own sign-in (Deferred; spec 016).
+Status: in progress · 2026-10-22. Built: servers from the targets the OmniGraph CLI lists and
+from the environment; a server added as a CLI target, through the CLI; tokens from the CLI's
+`credentials export`; the contract check; bounded reads; and replacing a refused token
+(validation log). OIDC and managed clusters wait for Studio's own sign-in (Deferred; spec 016).
 
 ## Problem
 
@@ -18,9 +18,11 @@ dialog by keyboard), X (capabilities from the served document).
 
 ## What exists today (checked)
 
-- OmniGraph `v0.13.0`, `crates/omnigraph-api-types/src/lib.rs:30-32`: contract header
-  `omnigraph-http-api`, value `0.13`. Every protected request must carry it; a mismatch is
-  `400 api_contract_mismatch`; responses echo it.
+- OmniGraph 0.14, from the edge build `edge-20261020-7fd9cc9` on (Studio's minimum server; its
+  document is `crates/graph_client/openapi/omnigraph-0.14.0-edge.json`): contract header
+  `omnigraph-http-api`, value `0.14` (`graph_client::CONTRACT`). Every protected request must
+  carry it; a mismatch is `400 api_contract_mismatch`; responses echo it. An earlier 0.14 build
+  and `v0.13.0` speak `0.13`, which Studio refuses.
 - Public routes: `GET`/`HEAD /healthz`, `GET /readyz`, `GET /openapi.json`. The CLI checks the
   contract with `HEAD /healthz` before a data request.
 - `GET /graphs` needs the `graph_list` action, which is denied without a cluster policy, even to
@@ -67,7 +69,7 @@ dialog by keyboard), X (capabilities from the served document).
     in colour, a managed target not signed in as `{"type":"login_required",…}`; an unknown target
     is refused with exit 2. It exports a managed target's exchanged data token, which Studio does
     not ask for.
-- Routes on OmniGraph main but not in `v0.13.0`: Blob `PUT`/`DELETE`, commit publish and drop.
+- Routes served from 0.14 on but not in `v0.13.0`: Blob `PUT`/`DELETE`, commit publish and drop.
 
 ## Design
 
@@ -76,51 +78,72 @@ dialog by keyboard), X (capabilities from the served document).
 1. Every server target the OmniGraph CLI lists (since 2026-10-21). Studio parses no operator
    configuration and no credential source, and writes neither (OmniGraph RFC 1017, "Static
    tokens for clients"): it asks the CLI, whose own code is the one reader of its formats.
-   - **The CLI.** Studio runs the first `omnigraph` on `PATH`, then in `~/.local/bin`,
-     `/opt/homebrew/bin` and `/usr/local/bin`, whose `version --json` reports the target,
-     credential and access protocols Studio drives (1 or 2, 1 or 2, and 1: those of main
-     `7fff9dfd`, and the bump #1127 asks for) and which has `target list`, `target inspect`,
-     `credentials status` and `credentials export` (each answers `--help`), since a build before
-     `f7db38da` reports the same numbers without them. Each program passed over is named with
-     why. A program's own answer is kept until its file changes; one that could not be run or
-     did not answer in time is asked again at the next look (since 2026-10-22; before, a slow
-     probe passed a CLI over for the run). Studio needs a CLI from main `ff542202` on and a
-     version-1 operator configuration. The CLI runs off the main thread, one command at a time
-     (it takes its operator home's lock without waiting, so two at once refuse each other), and a
-     command refused for a lock another program holds is run again, four times at most, 250 ms
-     apart. Each command is bounded, its wait for a turn included: 10 s for a read, 30 s for an
-     export, an `exec` helper's timeout and 15 s more for its export. A command held back past
-     its bound by another of Studio's (a helper that takes long) is not run, and says so; the
-     next listing or connect asks again (decided 2026-10-22). It runs with its standard input
-     empty, `NO_COLOR`, and none of Studio's OmniGraph variables but `OMNIGRAPH_HOME` and the one
-     its target's `env` source names, so it reads the operator home Studio's environment names,
-     as it would in a terminal.
-   - **Targets.** `target list --json` names them: at start, before the windows a start reopens
-     look for their servers (within 5 s; past that, the operator file stays watched unstamped,
-     so the first check lists them, since 2026-10-22), and again when the
+   - **The CLI.** Studio looks first at the CLI its settings name (`omnigraph_cli`, Settings →
+     Connection → OmniGraph CLI, a leading `~` read as the home folder), then at each `omnigraph`
+     on `PATH`, then in `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`
+     (`graph_store::cli::candidates`). It runs the first that fits (`cli::probe`): its `version
+     --json` reports Studio's HTTP contract (`0.14`) and the target, credential and access
+     protocols Studio drives (1 or 2, 1 or 2, and 1: those of main `7fff9dfd`, and the bump
+     #1127 asks for), and it has `target list`, `target inspect`, `credentials status` and
+     `credentials export` (each answers `--help`), since a build before `f7db38da` reports the
+     same numbers without them. Each program passed over is named with why. What a program was
+     found to be is kept, in memory and in `cli_probes.json` in the data directory, until its
+     file changes (its modification time, size or permissions), so a start runs no probe an
+     earlier launch ran; one that could not be run or did not answer in time is asked again at
+     the next look (since 2026-10-22; before, a slow probe passed a CLI over for the run, and no
+     probe was kept past the run). A changed setting moves where Studio looks, which the next
+     check of the CLI's files sees: it lists the targets with that CLI and asks every token
+     again. The agent's CLI is chosen from the same places with the same probe, and must also
+     pass its own check of the agent's home (spec 013). Studio needs a CLI from main `ff542202`
+     on and a version-1 operator configuration. On a system without Unix pipes (Windows) Studio
+     lists no targets and says why: the CLI gives a token only through a pipe.
+   - **Running it.** The CLI runs off the main thread, one sequence of Studio's commands at a time
+     (`cli::take_turn`): a listing, an Add server, one target's `credentials status`,
+     `credentials export` and `target inspect` together, or the agent's choice of its CLI. The
+     CLI takes its operator home's lock without waiting, so two commands at once refuse each
+     other, and a command refused for a lock another program holds is run again, four times at
+     most, 250 ms apart. Sequences take the turn in the order they asked, but one a window waits
+     on goes first: the token of a graph a window shows (`Connection::wait_for_token`), and the
+     agent's choice. A sequence waits for its turn 10 s at most for a listing or an Add server,
+     as long as its export may take for a token, and 120 s for the agent's choice; one held back
+     past that by another of Studio's (a helper that takes long) is not run, and says so; the
+     next listing or connect asks again (decided 2026-10-22). Each command is bounded too: 10 s
+     for a read, 30 s for an export, an `exec` helper's timeout and 15 s more for its export. It
+     runs with its standard input empty (but for Add server's entry and token), `NO_COLOR`, and
+     none of the OmniGraph variables in Studio's environment (every name that starts with
+     `OMNIGRAPH_`, in any ASCII case, on every system: `cli::omnigraph_variables`) but
+     `OMNIGRAPH_HOME` and the one its target's `env` source names, so it reads the operator home
+     Studio's environment names, as it would in a terminal.
+   - **Targets.** `target list --json` names them, one command once the CLI is known. A start
+     lists them off the main thread and waits for nothing: the windows it reopens open at once,
+     and they and a link that comes meanwhile take their graphs once the listing lands
+     (`ConnectionRegistry::when_listed`; since 2026-10-22, before which a start waited on the
+     main thread for the listing, up to 5 s). A start connects only the servers it shows, a
+     link's or a reopened window's; the Open dialog connects the others when it lists them. A
+     listing that waited past its bound for its turn lists nothing and leaves the operator file
+     watched unstamped, so the next check lists the targets. They are listed again when the
      operator file, a token file a target names, or a program where Studio looks for the CLI
      changes (their modification time, size and permissions, checked every 2 s off the main
      thread; the file itself is never read). A `server` target is a server, its `default_graph`
      a known graph of it. Each `direct` target is refused with why: Studio never opens storage or
      starts a server. Each `managed` target is refused until Studio has its own sign-in (spec
-     016): Studio does not borrow the CLI's managed data token (RFC 1017, A2), and keeps each as
-     `target inspect --resolved` describes it (its profile with that profile's `api` and
-     `organization_id`, its cluster id and incarnation, and its endpoint;
-     `ConnectionRegistry::managed_targets`), holding no token for it. A target with
-     `transport.tls.ca` is refused as not supported yet rather than reached with other roots
-     (Deferred). One with `proxy: {mode: url}` gets an HTTP client of its own through that proxy
-     (Zed's client, which also leaves out the hosts in `NO_PROXY`); `direct` and `environment`
-     use Studio's client, which follows the system's proxy settings. A `unix:///…` endpoint is
+     016): Studio does not borrow the CLI's managed data token (RFC 1017, A2), and runs no other
+     command for it. The listing describes each as `target list` does (its profile, its cluster
+     id and incarnation, and its endpoint and default graph; `CliTargets::managed`), and Studio
+     holds no token for it. A target with `transport.tls.ca` is refused as not supported yet
+     rather than reached with other roots (Deferred). One with `proxy: {mode: url}` gets an HTTP
+     client of its own through that proxy (Zed's client, which also leaves out the hosts in
+     `NO_PROXY`); `direct` and `environment` use Studio's client, which follows the system's
+     proxy settings. A `unix:///…` endpoint is
      refused, since Studio's client speaks TCP (the CLI refuses one in the file anyway). A
      configuration the CLI refuses lists nothing and keeps every server as it was; the toast,
      which stays until dismissed, gives the CLI's own words, which for a file in the old format
      say how to convert it (OmniGraph's `docs/user/cli/targets.md`, "Upgrade from the old
-     format"; there is no importer). The CLI lists no aliases, so Studio offers none
-     (`ConnectionRegistry::aliases_for` is empty).
+     format"; there is no importer). The CLI lists no aliases, so Studio offers none.
    - **One connection per address, one identity per target** (decided 2026-10-21). An address is
-     one server: every graph's key is its server's address and its id, so a second connection to
-     one address would open its graphs twice, and window restore, links and toasts would each
-     find either. Each server target owns its credential, so two targets on one endpoint (as
+     one server: an open graph is found by its server's address and its id, so a second
+     connection to one address would open its graphs twice, and links and toasts would each find
+     either. Each server target owns its credential, so two targets on one endpoint (as
      `graph_client::server_root` writes it) are two identities. Studio connects as the first of
      them by name, since `target list --json` does not say which is `defaults.target`, and names
      the others in the toast as alternatives it does not connect as (`CLI target 'b' is at … too,
@@ -138,7 +161,8 @@ dialog by keyboard), X (capabilities from the served document).
    - **Tokens.** A server target's token comes from `credentials export --target NAME`, read
      from a pipe: an `env` variable, a `file`, the CLI's secure `store` and an `exec` helper are
      each resolved by OmniGraph's code. It is asked for when the server connects, before
-     anything is sent; once more after a 401 to a token from it, never again until a connect is
+     anything is sent, and a graph's first reads wait until it is in (`Connection::token_ready`,
+     since 2026-10-22); once more after a 401 to a token from it, never again until a connect is
      ready; on the person's Refresh alone, not when a graph is first shown, whose first reads
      use the connect's token (since 2026-10-22; before, opening a graph asked twice and dropped a
      token typed in); and when the target's entry or token file changes. The secure store
@@ -155,12 +179,13 @@ dialog by keyboard), X (capabilities from the served document).
      connection in use checks at once. Every session on the connection then forgets every answer
      its read memo kept with the old one, which may have seen more, and the old token's type
      counts, stored-query catalog and branch list; a shown one reads what the new token may do
-     and those three again at once, a parked one when it is shown again, since a parked graph
-     asks the server nothing (since 2026-10-21), and its views hear of its branch list only then,
-     since History reads on it; neither shows any of the old token's meanwhile (spec 002, "What
-     the credential may do"; `docs/architecture.md` says what is kept and why). A token typed
-     into Studio for a CLI server stands until Refresh, or a change to its target, asks the CLI
-     again.
+     and those three again at once (the catalog once a view has wanted it, and the schema too
+     when none is held: a 401 may have refused it), a parked one when it is shown again, since a
+     parked graph asks the server nothing (since 2026-10-21), and its views hear of its branch
+     list only then, since History reads on it; neither shows any of the old token's meanwhile
+     (spec 002, "What the credential may do"; `docs/architecture.md` says what is kept and
+     why). A token typed into Studio for a CLI server stands until Refresh, or a change to its
+     target, asks the CLI again.
 2. A server is added as a CLI target, through the CLI (since 2026-10-22): Studio keeps no
    server list and no token of its own (RFC 1017; its "Studio keeps its own server list and
    token copies" alternative is rejected). Add server runs `omnigraph target add NAME` with the
@@ -180,7 +205,7 @@ dialog by keyboard), X (capabilities from the served document).
    development server (`script/dev-server`) is plain HTTP with a bearer token, which a CLI
    target cannot be (the CLI takes HTTP only for an anonymous loopback server), and a TLS front
    would need the custom CA Studio does not support yet (Deferred). A problem with it is said
-   in a toast ("Servers at start: …").
+   in a toast ("The server OMNIGRAPH_STUDIO_SERVER names was not added: …").
    An address is made a server root before it is used (`graph_client::server_root`): trimmed,
    without a trailing slash, with `http://` added for a loopback host (`localhost`, `127.*`,
    `[::1]`) and `https://` for any other when no scheme is given; anything but an `http(s)`
@@ -213,7 +238,7 @@ dialog by keyboard), X (capabilities from the served document).
    shows it is skipped and the checks stop; the next watch checks at once. A graph list that
    failed is read again when something next watches the server and on a graph's Refresh
    (`Connection::list_graphs_again`, since 2026-10-21). Refresh also asks the CLI for a CLI
-   server's token again (`Connection::refresh`).
+   server's token again (`GraphSession::refresh`, which calls `Connection::refresh_token`).
 
 ### The Open dialog
 
@@ -227,13 +252,12 @@ or Retry, not at every key that passes it. ↵ on a server goes to its first gra
 field when a ready server lists none), ↵ on a graph opens it, and ↵ in a field uses what was
 typed. A new token typed for a server that refused its token is that server's alone: choosing
 another, by a click, by the keyboard or by the registry dropping the one chosen, clears the field
-and its error, so Update token never sends it to another address nor keeps it for another
-server's keychain entry (since 2026-10-21; before, one field served every server and kept what
-was typed). While a server is added, Tab moves through that form's fields. The dialog lists the
-registry's servers as they are now: a new listing of the CLI's targets that adds, drops or replaces
-one (a new address is a new connection) is followed, so the replacement's state shows and the
-dropped one's no longer reaches the dialog; a choice the registry no longer holds moves to one
-it does.
+and its error, so Update token never sends it to another address (since 2026-10-21; before, one
+field served every server and kept what was typed). While a server is added, Tab moves through
+that form's fields. The dialog lists the registry's servers as they are now: a new listing of the
+CLI's targets that adds, drops or replaces one (a new address is a new connection) is followed,
+so the replacement's state shows and the dropped one's no longer reaches the dialog; a choice
+the registry no longer holds moves to one it does.
 
 ### States (status-bar chip)
 
@@ -285,10 +309,12 @@ and the tooltip named `omnigraph login`, which is managed sign-in only now).
   shared, since a commit never changes. A read under way is let go only for the count, once
   no answer is left to, never for the answers' bytes (spec 015). Failures are not kept, and
   reads at the branch head always go out. A new token forgets every answer kept, and a read
-  still out when it changed keeps nothing: the new token may see less, and its refusals are shown (constitution IV). The type counts, the
-  stored-query catalog and the branch list are read again under it; the schema, the heads and
-  the change logs stay (the schema is answered alike to every credential that may read the
-  graph; heads and logs describe commits, and carry forward only answers read since).
+  still out when it changed keeps nothing: the new token may see less, and its refusals are
+  shown (constitution IV). The type counts, the stored-query catalog (once a view has wanted
+  it) and the branch list are read again under it, and the schema when none is held; a schema
+  held, the heads and the change logs stay (the schema is answered alike to every credential
+  that may read the graph; heads and logs describe commits, and carry forward only answers read
+  since).
 - A session watches branch heads for the views pinned to them: its own branch always, and any
   branch a view holds a `HeadWatch` for (a review's). Every `HEAD_POLL` (30 s) while a Studio
   window is active, and when a window becomes active after a poll came while none was, it reads
@@ -342,7 +368,6 @@ and the tooltip named `omnigraph login`, which is managed sign-in only now).
   v1.23.2 pins) as a dependency of `graph_store`. Until then such a target is refused.
 - Honouring `proxy: {mode: direct}` exactly: Zed's client follows the system's proxy settings and
   has no constructor that turns them off.
-- A second contract (`0.14`) once OmniGraph ships it.
 
 ## Validation log
 
@@ -399,6 +424,22 @@ and the tooltip named `omnigraph login`, which is managed sign-in only now).
 | 2026-10-20 | A real operator config converts | `omnigraph` 0.14.0-edge+b692610 `target import` on a copy (five servers, one profile named like its server, 32 aliases, dummy tokens), then on the live home | It refused the profile named like a server ("names more than one binding"); without the profile it wrote five targets and every token with its server's `endpoint`. The config was then written by hand with the comments kept and the profile as that target's `default_graph`; `target list`, a read through `--target` and an alias answered with the saved tokens |
 
 ## Corrections
+
+- 2026-10-22 · This plan still described what `1b5a110` and the settings' one CLI changed. It
+  said Studio ran the CLI one command at a time, each bounded with its wait for a turn; it runs
+  one sequence at a time (a target's three token commands together), the one a window waits on
+  first. It said a start listed the targets within 5 s before its windows looked for their
+  servers; the listing runs off the main thread with no bound at start. It said managed targets
+  were kept as `target inspect --resolved` describes them (`ConnectionRegistry::managed_targets`,
+  removed) and named `ConnectionRegistry::aliases_for` (removed), `Connection::refresh` (Refresh
+  is `GraphSession::refresh`, which calls `Connection::refresh_token`), a server's keychain entry
+  and the "Servers at start:" prefix, none of which exists. It did not say that Studio looks
+  first at the `omnigraph_cli` setting, that the probe checks the HTTP contract and is kept in
+  `cli_probes.json`, that the CLI's environment loses every `OMNIGRAPH_` name in any case, that
+  the agent's CLI is found the same way, that a graph's first reads wait for the token, or that
+  a new token reads the stored-query catalog only once a view has wanted it and the schema when
+  none is held. "What exists today" gave OmniGraph `v0.13.0`'s contract as the current one, and
+  Deferred still listed contract 0.14, which Studio speaks; that item is removed.
 
 - 2026-10-22 · Studio kept a server list of its own: servers added in Studio, in
   `servers.json` in the data directory, each token in the OS keychain under `omnigraph-studio`

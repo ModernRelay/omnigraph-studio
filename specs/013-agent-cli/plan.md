@@ -1,8 +1,9 @@
 # 013: The agent uses the OmniGraph CLI
 
 Status: implemented; the CLI is the only graph tool · 2026-10-13. The CLI home is OmniGraph's
-version-1 operator configuration over loopback TLS since 2026-10-21; checked against a real CLI
-of that line once an edge build with it exists (see "Choosing the CLI").
+version-1 operator configuration over loopback TLS since 2026-10-21, checked against
+`0.14.0-edge+7fff9df`, the first edge build that reads it (see "Choosing the CLI"). The agent's
+CLI is found as Studio's own is, by `graph_store::cli`, since 2026-10-22.
 
 ## Problem
 
@@ -28,20 +29,24 @@ branch, and changes reach `main` only through review.
 
 ## What exists today (checked)
 
-OmniGraph at `d8d2e3a8` (main), and the released 0.13.0 binaries at `~/.local/bin`:
+OmniGraph at `d8d2e3a8` (main), and the released 0.13.0 binaries at `~/.local/bin`. The first
+three items held there and are gone; the items for #1090 and #1115 below say what replaced them:
 
-- `--server` takes a literal URL with no config (`crates/omnigraph-cli/src/helpers.rs:321-325`).
-  `OMNIGRAPH_HOME` moves both `config.yaml` and `credentials` (`operator.rs:272-281, 355-357`).
-- `defaults.server` plus `defaults.default_graph` make commands run with no flags
+- `--server` took a literal URL with no config (`crates/omnigraph-cli/src/helpers.rs:321-325`).
+  `OMNIGRAPH_HOME` moved both `config.yaml` and `credentials` (`operator.rs:272-281, 355-357`);
+  it still names the operator home, which holds no `credentials` file since #1115.
+- `defaults.server` plus `defaults.default_graph` made commands run with no flags
   (`scope.rs:128-141`). An `OMNIGRAPH_PROFILE`, a `defaults.store`, or a `./.omnigraph/context`
-  in the working directory changes or refuses that. Only explicit flags or `--direct` bypass a
-  context file (`managed/data.rs:320-375`).
-- The token is chosen by the request URL's longest prefix match against `servers:` entries, not
-  by name (`operator.rs:174-192`). The order is `OMNIGRAPH_TOKEN_<NAME>`, then `credentials`
+  in the working directory changed or refused that. Only explicit flags or `--direct` bypassed a
+  context file (`managed/data.rs:320-375`). `defaults.target` does this since #1090.
+- The token was chosen by the request URL's longest prefix match against `servers:` entries, not
+  by name (`operator.rs:174-192`). The order was `OMNIGRAPH_TOKEN_<NAME>`, then `credentials`
   `[<name>] token =`, then `OMNIGRAPH_BEARER_TOKEN` (`helpers.rs:286-306`). A `credentials`
-  file with any group or other permission bit is a hard error (`operator.rs:516-531`).
+  file with any group or other permission bit was a hard error (`operator.rs:516-531`). Since
+  #1126 a server target's one `auth` provider names its token.
 - Every data request is preceded by `HEAD {root}/healthz`, sent with no bearer and no contract
-  header, bounded to 5 s. The response must be 2xx with exactly one `omnigraph-http-api: 0.13`.
+  header, bounded to 5 s. The response must be 2xx with exactly one `omnigraph-http-api` naming
+  the CLI's own contract (`0.13` there; `0.14` for the CLI Studio drives now).
   Data requests carry the header, and every response is checked for it
   (`graph_http.rs:10, 133-170`).
 - Remote data requests have no total, connect or read timeout, follow no redirects and are never
@@ -67,12 +72,13 @@ OmniGraph at `d8d2e3a8` (main), and the released 0.13.0 binaries at `~/.local/bi
 - Since OmniGraph main `2c9eb1e0` (#1090, 2026-10-20), after 0.14's edge build: `--server`,
   `--store`, `--cluster`, `--profile`, `--managed`, `--direct`, `--api`, `--organization`, graph
   `--uri` and `use` are removed. `--target NAME|ADDRESS`, or `defaults.target`, selects one
-  backend, and the resolved target is printed to stderr. The operator file is
-  `target_config_version: 1` with `targets`; a server target has an `endpoint`, a
-  `default_graph` and one `credential` owner, whose token is `OMNIGRAPH_TOKEN_<OWNER>` or what
-  `omnigraph login --target` stored in `credentials`, bound to the endpoint. No command reads
-  `OMNIGRAPH_BEARER_TOKEN` (#1030). `version --json` reports `protocols.target`. A `unix:///…`
-  endpoint is a server (E24, #988), and a refused write is reported as not started (E22, #981).
+  backend, and the resolved target is printed to stderr. The operator file was then
+  `target_config_version: 1` with `targets`, a server target with an `endpoint`, a
+  `default_graph` and one `credential` owner, whose token was `OMNIGRAPH_TOKEN_<OWNER>` or what
+  `omnigraph login --target` stored in `credentials`, bound to the endpoint, until #1115 (next
+  item). No command reads `OMNIGRAPH_BEARER_TOKEN` (#1030). `version --json` reports
+  `protocols.target`. A `unix:///…` endpoint is a server (E24, #988), and a refused write is
+  reported as not started (E22, #981).
 - Since OmniGraph main `f7db38da` (#1115) and `ff542202` (#1126), both 2026-10-21, checked at
   main `97788d37`: the operator file is `version: 1` (`operator_schema.rs`). A document holding
   `target_config_version` is refused ("legacy target_config_version is unsupported"), and the
@@ -95,21 +101,25 @@ OmniGraph at `d8d2e3a8` (main), and the released 0.13.0 binaries at `~/.local/bi
   resolved): it parses and validates the whole file and reads no token, CA or helper. A command
   that uses a token keeps `auth-state/<sha256>.json` and a lock under `OMNIGRAPH_HOME`, whose
   folder must be the user's own and closed to others (`operator_routing.rs` `lock_state`).
-  `version --json` still reports `protocols.target: 1` (filed as #1127, to report 2). The
-  installed `~/.local/bin/omnigraph` is `0.14.0-edge+50283ce`, from before #1115: `config
-  validate` is "unrecognized subcommand 'config'" (run here). `edge-20261021-888223b` (published
-  2026-10-22 00:21 UTC) has #1115 but not #1126: its server target takes `auth` as a map of named
-  entries with `default_auth`, so it refuses the single `auth` Studio writes (read in the diff
-  `888223b7..ff542202` of `operator_schema.rs`). No build with `ff542202` was published when this
-  was written.
+  `version --json` still reports `protocols.target: 1` (filed as #1127, to report 2).
+  `0.14.0-edge+50283ce`, the build installed when this was first checked, is from before #1115:
+  `config validate` is "unrecognized subcommand 'config'" (run here). `edge-20261021-888223b`
+  (published 2026-10-22 00:21 UTC) has #1115 but not #1126: its server target takes `auth` as a
+  map of named entries with `default_auth`, so it refuses the single `auth` Studio writes (read
+  in the diff `888223b7..ff542202` of `operator_schema.rs`). `edge-20261022-7fff9df`
+  (`0.14.0-edge+7fff9df`, main `7fff9dfd`, with `ff542202`) reads it, and is the CLI installed
+  at `~/.local/bin` now (checked 2026-10-22: `version --json` reports contract 0.14 and
+  protocols target, credential and access 1).
 - Policy branch scopes are `any`, `protected`, `unprotected`
   (`crates/omnigraph-policy/src/lib.rs:213-217`). A commit records the actor resolved from the
   bearer token (`handlers.rs:415-437`).
-- `omnigraph --version` and `omnigraph version` report the package and storage versions, never
-  the HTTP contract, and have no JSON form (`main.rs:152-158, 612-620`; `cli.rs:428`).
-- On this Mac, `~/.local/bin/omnigraph` is 0.13.0 (contract 0.13) and
-  `/opt/homebrew/bin/omnigraph` is 0.11.0, which sends no contract header. The personal server
-  and the dev server answer `omnigraph-http-api: 0.13`.
+- In 0.13.0, `omnigraph --version` and `omnigraph version` report the package and storage
+  versions, never the HTTP contract, and have no JSON form (`main.rs:152-158, 612-620`;
+  `cli.rs:428`). `version --json`, with the contract and the protocols, came with #987 (E23).
+- On this Mac, when first checked, `~/.local/bin/omnigraph` was 0.13.0 (contract 0.13) and
+  `/opt/homebrew/bin/omnigraph` 0.11.0, which sends no contract header, and the personal server
+  and the dev server answered `omnigraph-http-api: 0.13`. On 2026-10-22 `~/.local/bin` holds
+  `0.14.0-edge+7fff9df` and `/opt/homebrew/bin` 0.13.0.
 
 Studio at `3df9307`:
 
@@ -149,7 +159,8 @@ Agents (claude-agent-acp 0.89.1 with Claude Agent SDK 0.3.293; codex-acp 2.2.2 w
 | Forwarding | `GraphClient::forward` (`crates/graph_client/src/client.rs`) | Sends a request on as it came, with the person's token and the contract header. Bodies stream both ways, no total timeout, never retried, and a path that would leave the server root is refused. The one client crate keeps every request (I) |
 | Rules | `crates/agent_panel/src/gateway_rules.rs` | `classify(request, sandbox) -> Verdict`: read, read with a rewritten body, a write for the agent's branch, or a refusal. The health probe never reaches them: the gateway answers it |
 | Gateway | `crates/agent_panel/src/gateway.rs`, `gateway_tls.rs`, `requester.rs` | A loopback HTTPS (HTTP/1.1 over TLS) server per conversation (`127.0.0.1:0`, one request per connection), with a certificate it makes when it starts. Checks the session token and contract header, applies the rules, forwards, and reports writes to the panel. On Windows it holds the processes a write's CLI was started under while the write waits |
-| CLI home | `crates/agent_panel/src/cli_home.rs` | The conversation's directory, config, token, certificate and wrapper; the shared `AGENTS.md`; finding a CLI that reads the home |
+| CLI finder | `graph_store::cli` (`crates/graph_store/src/cli_tokens.rs`) | Shared with Studio's own servers (spec 003): where Studio looks for the CLI (`cli::candidates`, the `omnigraph_cli` setting first), the probe and what it remembers (`cli::probe`, `cli_probes.json`), Studio's one turn at the CLI (`cli::take_turn`, `cli::run`), and the OmniGraph variables no process Studio starts inherits (`cli::omnigraph_variables`) |
+| CLI home | `crates/agent_panel/src/cli_home.rs` | The conversation's directory, config, token, certificate and wrapper; the shared `AGENTS.md`; choosing, of the CLIs the finder takes, the first whose `config validate` passes the home |
 | Panel | `crates/agent_panel/src/panel.rs` | Starts the gateway and home with the conversation, shows each write as a card, and records outcomes in the session's write log (`GraphSession::note_write`) |
 | Agent launch | `crates/agent_panel/src/host.rs`, `launch.rs`; `omnigraph-studio launch-agent` in `crates/studio/src/main.rs` | Starts the agent without OmniGraph credentials in its environment: through `env -u` on Unix, always through Studio's own launcher on Windows |
 
@@ -188,7 +199,7 @@ defaults:
 - `ca.pem` (`0600`): the certificate the gateway serves, the only one the CLI trusts for the
   target (`mode: replace`, so neither the system's roots nor any other certificate apply).
 - Both files are removed when the conversation ends, unless a later conversation on the branch
-  wrote its own. A `credentials` file an older Studio left is removed: its gateway is gone.
+  wrote its own.
 - `auth-state/` is the CLI's own: at its first command with the token it records the target's
   credential binding there (identifiers, no secret), in a folder it makes `0700` and refuses
   when anyone else could enter it.
@@ -201,11 +212,11 @@ Studio writes only this form: a CLI that cannot read it is not chosen (below). O
 files are private as the home's other files are: the folder is under the person's profile
 (`%LOCALAPPDATA%`, below), and Windows has no mode bits.
 
-`omnigraph` (`0700`) is a wrapper: it unsets every `OMNIGRAPH_*` variable (`scrub::PREFIX`), as
-`omnigraph_run` removes them, then sets `OMNIGRAPH_HOME` to
-the directory, puts `127.0.0.1,localhost` in `NO_PROXY`, and runs the chosen CLI. The agent runs
-it by absolute path, so neither an environment filter nor a shell snapshot that reorders PATH
-can change what the CLI reads.
+`omnigraph` (`0700`) is a wrapper: it unsets every `OMNIGRAPH_*` variable, the prefix
+(`graph_store::cli::VARIABLE_PREFIX`) matched in any ASCII case, as `omnigraph_run` removes
+them, then sets `OMNIGRAPH_HOME` to the directory, puts `127.0.0.1,localhost` in `NO_PROXY`, and
+runs the chosen CLI. The agent runs it by absolute path, so neither an environment filter nor a
+shell snapshot that reorders PATH can change what the CLI reads.
 
 Known first-run cost on macOS: the wrapper is a newly written executable, so its first run
 waits for Gatekeeper's scan of it before the shell starts it. `syspolicyd` logs
@@ -295,11 +306,12 @@ The ACP crate can add variables to the agent's process but not remove them, and 
 `spawn_process` cannot be replaced, so the agent starts through a command that removes them. It
 removes every `OMNIGRAPH_*` variable Studio holds, unless `agent.env` sets it: the CLI's
 tokens and addressing, and tokens kept for other servers (`OMNIGRAPH_MR_BEARER_TOKEN`) or a local
-server's token list alike (in any case on Windows). The prefix is matched in one place,
-`agent_panel::scrub` (since 2026-10-21), which the agent's launch, `omnigraph_run` and the
-wrapper use; a variable OmniGraph
-adds later is removed without a list to keep. Cloud variables (`AWS_*`, `AZURE_*`, Google's) stay: the
-agent may need them for its model, as Claude Code on Bedrock does. This closes the gap where the
+server's token list alike, the prefix matched in any ASCII case on every system. The prefix is
+matched in one place, `graph_store::cli` (`omnigraph_variables`, since 2026-10-22; before,
+`agent_panel::scrub`, which matched any case on Windows alone), which the agent's launch,
+`omnigraph_run`, the wrapper and Studio's own CLI (spec 003) use; a variable OmniGraph adds later
+is removed without a list to keep. Cloud variables (`AWS_*`, `AZURE_*`, Google's) stay: the agent
+may need them for its model, as Claude Code on Bedrock does. This closes the gap where the
 agent inherited the person's graph tokens. With none of these variables set, the agent starts as
 it is.
 
@@ -320,8 +332,8 @@ it is.
   `npx.cmd`. An empty or relative PATH entry (`a;;b`, a trailing `;`, `bin`) names a folder
   under the working directory and is passed over; the standard library's own search reads such
   entries too, so a name on no absolute entry does not start ("could not find … on PATH").
-  Windows reads a variable by its name in any case, so there names are matched in any ASCII
-  case.
+  Windows reads a variable by its name in any case, which is why names are matched in any ASCII
+  case, there as on every other system.
 - Studio's files in the agent's working directory are written by handle on both
   (`agent_panel::confined`): Unix opens each name relative to its folder's descriptor; Windows
   holds each folder open without sharing deletion, so it cannot be renamed, removed or swapped
@@ -332,37 +344,52 @@ it is.
 
 ### Choosing the CLI
 
-1. `agent.omnigraph_cli` (Settings → Agent → OmniGraph CLI), then each `omnigraph` on PATH, then
-   `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`, without duplicates.
-2. Each says which HTTP contract it speaks and which target protocol, without a server,
-   bounded to 5 s: `omnigraph version --json` reports `http_contract` (OmniGraph #987, E23) and
-   `protocols.target` (#1090). An older release, or one that does not answer, fits nothing.
-3. A CLI that speaks Studio's contract (0.14) with target protocol 1 or 2 then checks the home
-   itself: `omnigraph config validate --operator-config <private home>/config.yaml`, run as
-   `omnigraph_run` runs the CLI (that home as `OMNIGRAPH_HOME`, no other `OMNIGRAPH_*` variable),
-   bounded to 5 s, off the main thread. It must exit 0. Protocol 1 alone proves nothing: CLIs
-   before and after the version-1 configuration both report it. Protocol 2, which #1127 asks a
-   later CLI to report, is taken too, and still validated. The first that passes goes in the
-   wrapper, so a slow or unavailable server never decides which CLI a conversation gets. The
-   first OmniGraph build that passes is the edge build made from main at `ff542202` or later;
-   `edge-20261021-888223b` has the version-1 configuration without one `auth` per server target
-   and refuses the home.
-4. If none fits, the wrapper runs nothing and prints why, so `omnigraph_run` and the agent's
-   shell refuse rather than run a CLI that cannot reach the gateway. A notice in the thread names
-   what the graph and the home need, and each CLI found with its release and why it does not fit:
-   it did not answer `version --json`, speaks another contract, has no CLI targets, reads a
-   target protocol Studio does not know, predates the version-1 configuration ("it has no
-   `config validate`", from its parser's refusal of `config` or `--operator-config`), or its
-   `config validate` refused the home (its first line of error). It ends with what to install:
-   an OmniGraph edge build made from main at `ff542202` or later (`edge-20261021-888223b` is older
-   and refuses it), with the installer's edge-channel command, or `agent.omnigraph_cli`. The
-   `omnigraph_cli` tool and the conversation's instructions say the CLI is unavailable and name
-   the same commit. A configured `agent.omnigraph_cli` that does not fit is passed over with a
-   notice naming the one used.
+The agent's CLI is found with Studio's own finder (`graph_store::cli`, spec 003), so the two
+look in the same places, probe alike, and share one turn at the CLI.
 
-`0.14.0-edge+50283ce` is refused (it has no `config validate`), as decided. The first build of
-the version-1 line installed here, `0.14.0-edge+7fff9df` (2026-10-21, OmniGraph main with
-`ff542202`), is taken: the ignored `gateway` test
+1. `omnigraph_cli` (Settings → Connection → OmniGraph CLI, one setting for Studio's CLI and the
+   agent's; a leading `~` is the home folder), then each `omnigraph` on PATH, then
+   `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin` (`cli::candidates`), each program
+   once: a place that links to a program listed before it is that program (`cli::installed`).
+2. Each is probed as Studio probes its own CLI (`cli::probe`), without a server: `omnigraph
+   version --json` must report `http_contract` 0.14 (OmniGraph #987, E23) and the target,
+   credential and access protocols Studio drives (1 or 2, 1 or 2, and 1), and `target list`,
+   `target inspect`, `credentials status` and `credentials export` must each answer `--help`.
+   Each command is bounded to 10 s. What a program was found to be is kept in
+   `cli_probes.json` until its file changes, so a later conversation, or a launch, runs no
+   probe of it again; a program that could not be run or did not answer in time is asked again
+   at the next look. An older release, or one that reports another number or none, fits
+   nothing.
+3. A CLI the probe takes then checks the home itself: `omnigraph config validate
+   --operator-config <private home>/config.yaml`, run as `omnigraph_run` runs the CLI (that home
+   as `OMNIGRAPH_HOME`, no other `OMNIGRAPH_*` variable), bounded to 10 s, off the main thread.
+   It must exit 0. Protocol 1 alone proves nothing: CLIs before and after the version-1
+   configuration both report it. Protocol 2, which #1127 asks a later CLI to report, is taken
+   too, and still validated. The first that passes goes in the wrapper, so a slow or unavailable
+   server never decides which CLI a conversation gets. The first OmniGraph build that passes is
+   the edge build made from main at `ff542202` or later; `edge-20261021-888223b` has the
+   version-1 configuration without one `auth` per server target and refuses the home.
+4. The look waits for Studio's turn at the CLI up to 120 s, ahead of the asks no window waits
+   on, since a person waits on the conversation. When Studio's other commands hold the CLI past
+   that (a token's export waiting on its credential helper), no CLI is asked: the wrapper runs
+   nothing and says the CLI was busy with another of Studio's commands, and to start a new
+   conversation to try again.
+5. If none fits, the wrapper runs nothing and prints why, so `omnigraph_run` and the agent's
+   shell refuse rather than run a CLI that cannot reach the gateway. A notice in the thread names
+   what the graph and the home need, and each CLI found with why it does not fit, naming its
+   release where it reported one: it answers no `version --json`, speaks another contract,
+   reports no target, credential or access protocol, or one Studio does not know, lacks a command
+   Studio runs, could not be run or did not answer in time, or its `config validate` refused the
+   home (its first line of error, the parser's refusal of `config` included). It ends with what to
+   install: an OmniGraph edge build made from main at `ff542202` or later
+   (`edge-20261021-888223b` is older and refuses it), with the installer's edge-channel command,
+   or `omnigraph_cli` set to such a CLI. The `omnigraph_cli` tool and the conversation's
+   instructions say the CLI is unavailable and name the same commit. A configured `omnigraph_cli`
+   that does not fit is passed over with a notice naming the one used.
+
+`0.14.0-edge+50283ce` is refused: it reports no access protocol (and has no `config validate`),
+as decided. The first build of the version-1 line installed here, `0.14.0-edge+7fff9df`
+(2026-10-21, OmniGraph main with `ff542202`), is taken: the ignored `gateway` test
 `a_live_cli_reaches_the_gateway_with_what_its_home_holds`, run with `OMNIGRAPH_STUDIO_LIVE_CLI`
 pointing at it, passes (validation log). The ignored
 `the_stock_cli_reads_and_writes_its_branch_through_the_gateway` also needs a server and has not
@@ -580,7 +607,7 @@ same write would split the cards and the rules.
 | Studio tests each CLI once against the gateway | Map package versions to contracts | The package version does not determine the contract; a real request does, until E23. Superseded by `version --json` (see "Choosing the CLI") |
 | The agent's CLI must have targets; Studio writes only the target home and adds `--target studio` | Write a `servers` home for a CLI before targets, chosen by `protocols.target` | OmniGraph main refuses a `servers` file (#1090). Two forms meant two homes, two flag sets, and instructions written before the choice that could name neither; Studio supports one CLI line, 0.14 with targets. Superseded 2026-10-21 by the version-1 operator configuration (next rows) |
 | Studio writes only OmniGraph's version-1 operator configuration and refuses a CLI that cannot read it, the installed edge `0.14.0-edge+50283ce` included (Ragnor, 2026-10-21) | Keep the `target_config_version` home for CLIs before #1115; write both forms and choose by CLI | OmniGraph main refuses the former form, and its keyed `credentials` file is gone. Two forms would mean two homes and two token files again, for a CLI line that is ending. The cost: no agent CLI until an edge build with `ff542202` is installed, which the refusal says, naming the commit |
-| A CLI is taken when its own `config validate` passes the file Studio wrote, after `version --json` says contract 0.14 and target protocol 1 or 2 | Choose by `protocols.target`; by release name or date | `protocols.target` is 1 before and after the change (#1127 asks for 2), and builds of one date differ (`edge-20261021-888223b` has #1115 and refuses the home; the first that reads it is from `ff542202`). Only the CLI's parser knows what it reads, and the check is offline |
+| A CLI is taken when its own `config validate` passes the file Studio wrote, after Studio's own probe takes it (`version --json` says contract 0.14, target and credential protocols 1 or 2 and access protocol 1, and the commands Studio runs answer `--help`) | Choose by `protocols.target`; by release name or date | `protocols.target` is 1 before and after the change (#1127 asks for 2), and builds of one date differ (`edge-20261021-888223b` has #1115 and refuses the home; the first that reads it is from `ff542202`). Only the CLI's parser knows what it reads, and the check is offline |
 | The gateway serves HTTPS on loopback with a certificate of its own, which the home trusts alone (`mode: replace`); the session token stays on every request | Plain HTTP with `auth: anonymous`; the system's roots; a Unix socket | A token over HTTP is refused by the version-1 configuration, and anonymous would drop the per-request token, so any local process could use the gateway. `replace` keeps every other CA out. A Unix socket (E24) is not a version-1 target transport |
 | One certificate per gateway, made when it starts and valid for a year, its key in memory only; never renewed (Ragnor, 2026-10-21) | A short validity, renewed at half-life with both certificates in `ca.pem` | The key never leaves the process and dies with it, and a gateway started again makes a new one, so a shorter validity protects nothing, and renewal is machinery carried forever (a bundle rewritten under a running CLI, and a CLI that read the old one). A gateway that outlived its certificate, which a conversation does not in practice, would let the CLI's TLS error reach the agent |
 | Token and certificate in files named by absolute paths in each home | Relative paths beside the config; the certificate inline | The CLI resolves either; absolute paths read the same in both homes' files and in an error. The version-1 configuration takes a CA only as a file |
@@ -694,6 +721,22 @@ CLI is the one they trust).
 | 2026-10-22 | `.studio` is refused by an NTFS stream's name | `agent_panel` `the_studio_folder_is_refused_by_any_name_that_opens_it`, extended: `.studio::$INDEX_ALLOCATION`, `.Studio:$I30:$INDEX_ALLOCATION` and `.studio. :stream` | Refused on every platform, the name read up to its first `:`. Before, each passed, and NTFS opens the folder itself by the first two. Not covered still: an 8.3 short name (`STUDIO~1`) |
 
 ## Corrections
+
+- 2026-10-22 · The agent's CLI is now found by Studio's own finder (`graph_store::cli`), and this
+  plan described the agent panel's own. "Choosing the CLI" named `agent.omnigraph_cli` under
+  Settings → Agent; the one setting is `omnigraph_cli`, under Connection, which an older
+  `agent.omnigraph_cli` no longer sets. It said each CLI reported its contract and target
+  protocol within 5 s and was validated within 5 s; it takes the shared probe (the credential
+  and access protocols and the four commands too, kept in `cli_probes.json`), and both bounds
+  are 10 s. It gave "predates the version-1 configuration (it has no `config validate`)" as a
+  reason of its own; a CLI without `config validate` is refused with its parser's words, and
+  `0.14.0-edge+50283ce` is refused first for reporting no access protocol. It had no case for a
+  choice Studio's other commands held back past its 120 s wait. The variables were matched by
+  `agent_panel::scrub` (`scrub::PREFIX`, removed), in any case on Windows alone; they are matched
+  by `graph_store::cli`, in any case on every system, the shell wrapper included. A home no longer
+  removes a `credentials` file an older Studio left. "What exists today" gave the CLI's operator
+  file and token rules from before #1090 and #1115, and the installed CLI as `50283ce` and
+  0.13.0, as current.
 
 - 2026-10-21 · The gateway answered the health probe without its token but read the probe's body
   first, up to 64 MiB, though the plan said a body is read only after the token check: any local

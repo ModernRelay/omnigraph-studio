@@ -236,19 +236,22 @@ and Delta's sidebar.
 
 - **Studio's own index.** Like Zed's metadata store, Studio keeps the list itself
   (`agent/sessions.json` in the data directory, owner-only, format 2): per conversation, the
-  agent's session id, the graph (its one key, `<server url>/<graph id>`, since 2026-10-20; a
-  record a build before then filed under its server's name stays under it, and no graph's
-  list shows it), the agent command, its
-  title, when it started, the last
-  message the person sent, the agent branch its changes go to, and whether it is pinned or
-  archived. Ids and titles only; the conversation stays with the agent. The agent's own
-  `session/list` is not the source: every graph's agent works in the same directory, so it
-  cannot tell graphs apart. Each record is read on its own: one Studio cannot read is skipped
-  and the file set aside first, so the next save loses nothing. A file in another shape, or one
-  Studio cannot read at all (not text, or held by another program), is set aside whole. One it
-  cannot set aside (on Windows, another program holds it open without letting it be renamed)
-  is never saved over: the list lasts until Studio quits, and the Conversations panel says so
-  above its rows, naming the file. (The first format, one session per graph and agent,
+  agent's session id, the graph (its one key, `<target>/<graph id>`, its CLI target's name and
+  its id, since 2026-10-22; a record filed under `<server url>/<graph id>`, as builds from
+  2026-10-20 did, stays under it, and no graph's list shows it; one filed under
+  `<server name>/<graph id>`, as builds before then did, is the graph's again where that name is
+  its target's), the agent command, its title, when it started, the last message the person
+  sent, the agent branch its changes go to, and whether it is pinned or archived. Ids and titles
+  only; the conversation stays with the agent. The agent's own `session/list` is not the source:
+  every graph's agent works in the same directory, so it cannot tell graphs apart. The file is
+  read whole: one that does not parse as this build writes it (a record Studio cannot read, a
+  field missing or of another type, makes the whole file so), one of another format, or one
+  Studio cannot read at all (not text, or held by another program) is set aside whole, renamed
+  beside itself, and none of its records is read, so the next save loses nothing (since
+  2026-10-22; before, each record was read on its own and one Studio could not read was
+  skipped). One it cannot set aside (on Windows, another program holds it open without letting
+  it be renamed) is never saved over: the list lasts until Studio quits, and the Conversations
+  panel says so above its rows, naming the file. (The first format, one session per graph and agent,
   predates v0.1.0 and is not read.)
 - **The launcher.** The Conversations panel ends with "Ask the agent", an outlined pill with
   its icon and `studio_agent::OpenAgent`'s keys as caps (⌘⇧A), as the reference sidebar ends with
@@ -414,6 +417,11 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 | 2026-10-20 | Conversations follow the graph's key, and an old one resumes where it ran | `agent_panel` `conversations_filed_by_server_name_move_to_the_graphs_key` (records written as a build before wrote them, loaded with the server list `dev` → `http://127.0.0.1:8787`); `graph_store` `a_name_resolves_only_to_a_known_server`; the panel's working directory now `sessions::working_dir` (`panel.rs`, `start`), the record's own `cwd` when resuming | `dev/crm` became `http://127.0.0.1:8787/crm`, its `cwd` still `graph_cwd("dev/crm")`, and `latest` found it under the key; a new conversation gets `graph_cwd` of the key, another directory; `gone/crm`, a name no server has, stayed; the next load read the record under the key. Import lists only the key's directory, so a conversation the agent has in the old directory and the list lacks is not offered. Not yet seen in the running app |
 
 ## Corrections
+
+- 2026-10-22 · "Conversations" gave a conversation's graph key as `<server url>/<graph id>`; it is
+  `<target>/<graph id>` since `1b5a110`. It said each record of the index is read on its own and
+  one Studio cannot read is skipped; the file is read whole, and one that does not parse is set
+  aside whole with none of its records read.
 
 - 2026-10-21 · The approval section named the second button "Always for this branch"; the card
   says "Always on this branch", as the permission section and spec 013 do, and now so does this

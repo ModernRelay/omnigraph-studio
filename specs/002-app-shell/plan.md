@@ -47,7 +47,7 @@ Steps:
 1. Fork the files above at `v1.23.2` with a header naming the source commit. Strip until it
    builds against Studio's crates only.
 2. Persistence: window bounds, dock sizes and open tabs saved as JSON under the app's data
-   directory, keyed by server and graph. No SQLite.
+   directory, keyed by the graph's CLI target and id. No SQLite.
 3. One window can hold several graph sessions as tabs; a second window is "New Window" (⌘⇧N).
 
 Built (`studio_workspace::pane`): the document area is a tree of panes (`Member`, splits with
@@ -82,9 +82,10 @@ the request was ignored, since only the shown graph's panes were searched). A pa
 branch list, and its server's health is checked only while something else shows that server
 (a graph of it shown in a window, or the Open dialog) (since 2026-10-21); shown again, it asks
 at once when a poll came meanwhile. A graph a start reopens behind the shown one is opened
-parked and sends nothing, its first reads included (schema, branch list, counts, stored
-queries, access), until first shown. A 503's recheck due while it is parked waits for the
-show, and refreshes what is held rather than blanking it (since 2026-10-21). Each window's graphs (their CLI target
+parked and sends nothing, its first reads included (schema, branch list, counts, access, and
+the stored queries once a view wants them), until first shown. A 503's recheck due while it is
+parked waits for the show, and refreshes what is held rather than blanking it (since
+2026-10-21). Each window's graphs (their CLI target
 by name, graph, branch, and the one shown) and bounds are written to the owner-only
 `session.json` as they change, in the order the windows opened; a graph's tabs and drafts are
 kept by its target's name and its id too (since 2026-10-22; before, by its server's address,
@@ -306,9 +307,9 @@ its branch when the graph opens and when the branch changes, and again after a 4
 or a new token, which the client counts apart; a branch's menu reads it for that branch as it
 opens, and a review for its branch and target (`AccessScope::branch_into`) as it opens. Each is
 read once until the credential may have changed, and views draw again when an answer lands
-(`SessionEvent::AccessChanged`). A new token (typed in, or `omnigraph login` changing the CLI's
-files) reads it at once, with no write to bring it about, and forgets every answer the session
-kept with the old token (spec 003 says which, and what is read again); a 403 on the session's
+(`SessionEvent::AccessChanged`). A new token (typed in, or one the CLI gives on Refresh or for a
+changed target, spec 003) reads it at once, with no write to bring it about, and forgets every
+answer the session kept with the old token (spec 003 says which, and what is read again); a 403 on the session's
 graph reads it again and keeps them. An answer that lands after either was read for the
 credential before, and lands nowhere. The client counts 403s per graph, by the id in the
 request's path (since 2026-10-21): one connection serves every window on an address, and a 403
@@ -384,14 +385,17 @@ Its action is not registered, so the palette and the keyboard button's list leav
     field hears it lost focus), and the scope switch writes it to the scope it was typed in
     before showing the other. A
     doc comment's lines read as one paragraph. Only `agent.env` (a map) and `graphs` stay in
-    `settings.json` alone. The nav counts changed settings per section;
+    `settings.json` alone. The OmniGraph CLI (`omnigraph_cli`), the CLI Studio and the agent
+    look for first (specs 003 and 013), is under Connection (since 2026-10-22; before,
+    `agent.omnigraph_cli` under Agent, which no longer sets anything). The nav counts changed settings per section;
     search spans every section; the search box has focus when the tab opens.
-  - Per-graph overrides: `graphs."<server url>/<graph id>"`, the graph's one key, which also
-    files its saved queries (spec 007) and agent conversations (spec 011) (since 2026-10-20;
-    before, the server's name, which a rename in the CLI's config lost; what builds before
-    2026-10-20 filed under a server's name is not read, and no conversion moves it, decided
-    2026-10-21) holds a graph's own values for
-    the settings marked `x-per-graph` (table and relationship page sizes, canvas node limit).
+  - Per-graph overrides: `graphs."<target>/<graph id>"`, the graph's one key (its CLI target's
+    name and its id), which also files its saved queries (spec 007), agent conversations (spec
+    011), tabs and drafts, as saved windows name the graph (since 2026-10-22; from 2026-10-20,
+    `<server url>/<graph id>`, which Studio no longer reads, and no conversion moves it; before
+    then, `<server name>/<graph id>`, the graph's again where that name is its target's), holds
+    a graph's own values for the settings marked `x-per-graph` (table and relationship page
+    sizes, canvas node limit).
     With a graph open, the tab's scope switch ("All graphs" | the graph) shows only those,
     writes the graph's own value, and Reset removes it; an own value's description names the
     shared one. Views read the values in effect through `GraphSession::options`.
@@ -399,7 +403,7 @@ Its action is not registered, so the palette and the keyboard button's list leav
     Studio shows it: a canvas chip, a tree row, the inspector's title, a table's relationship
     cell, the palette. By default that is `name`, `title`, `display_name` or `label`, else the
     key (`NodeType::default_label_property`); a graph may choose another of the type's single
-    text properties, kept in `graphs."<server url>/<graph>".labels` (`{"Person": "title"}`). The
+    text properties, kept in `graphs."<target>/<graph>".labels` (`{"Person": "title"}`). The
     choice lives on the schema model (`NodeType::label`, applied by
     `SchemaModel::with_labels`), so every caller of `NodeType::label_property` follows it:
     the session applies the graph's choices when it takes a schema and again when the
@@ -566,7 +570,7 @@ than styling one-off elements.
   hints; the agent its restart, agent pill and send. A pane's header holds its Back and Forward
   and its tabs.
   - The connection's state reads with the server's round trip, from the last health check
-    (`Connection::latency`, no extra request): "contract 0.13 · 42 ms". It is timed on the
+    (`Connection::latency`, no extra request): "contract 0.14 · 42 ms". It is timed on the
     background executor, so a busy main thread does not lengthen it.
   - With `studio.show_performance` on (the default since 2026-10-14), the status bar ends with
     Studio's memory and CPU, muted, in the warning colour past 2 GB or half a core:
@@ -1035,6 +1039,15 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 | 2026-10-21 | The palette, the agent's composer and the type table follow the three reference frames on the design system | Offscreen snapshots (1440×900 at 2×) against a scratch dev server, light, dark and glass, before and after, cropped at 2× beside the references; `studio_ui` `key_caps_are_one_box_per_key`, `a_row_knows_its_place_in_its_panel`, `controls_draw_at_their_sizes` (a tile, a segment and the grid's cells at their tokens), `values_pick_their_kind_icon`; `command_palette` `rows_are_grouped_by_kind_until_text_is_typed`; `agent_panel` `a_querys_rows_are_read_from_what_its_call_returned`, `a_tool_call_keeps_the_result_its_agent_reported`, `a_turn_ends_at_its_last_reply` | The palette is a tray of inset panels, its groups named while nothing is typed and counted once text is, rows led by tiles with their keys as caps; the inset panels' corners stayed square until each end was drawn as tall as its corner (GPUI clamps a corner to half its box). The type table's header was 42 px under Zed's padding; Studio's own header row is 30. In a dark theme a darker header fill did not show, so the header takes the well's ink |
 
 ## Corrections
+
+- 2026-10-22 · The settings section still gave a graph's key as `<server url>/<graph id>` for its
+  overrides and node names, and said what builds before 2026-10-20 filed under a server's name is
+  not read; the key is `<target>/<graph id>`, which such a name, when it is the target's, matches
+  again; persistence was said to be keyed by server. The status bar's example said "contract
+  0.13", and a new token was said to come from `omnigraph login` changing the CLI's files, which
+  is managed sign-in only. The OmniGraph CLI setting moved from `agent.omnigraph_cli` (Agent) to
+  `omnigraph_cli` (Connection), which the settings section now says. A parked graph's first
+  reads were said to include the stored queries, which are read once a view wants them.
 
 - 2026-10-22 · The palette's Queries scope no longer lists the CLI's aliases under the stored
   queries they run. Studio no longer reads the CLI's config file, where they were declared, and

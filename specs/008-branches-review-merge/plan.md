@@ -42,7 +42,12 @@ place), X (designed on 0.13; the better routes are deferred).
   opens, so a graph of thousands of branches costs a frame a screenful of rows (since
   2026-10-21; before, every branch's row and menu were built at every frame). Each branch's
   head, actor and time are the shown graph's: a switch of graph drops the details and the reads
-  still out for the previous one (since 2026-10-21).
+  still out for the previous one (since 2026-10-21). A head is read only for a row a shown list
+  draws, once the frame that drew it is out, as History's panel does (spec 009): a list hidden
+  in its dock reads none, and each row's is read once until a commit lands on its branch or the
+  branch list changes; one that changes while the list is hidden is read when it is shown again
+  (since 2026-10-22; before, the first 20 heads were read as the list was made and again at
+  every commit or change of the list, shown or not).
 - Built (start at a commit, E21, 2026-10-20): History's "New branch here…" (spec 009)
   dispatches `CreateBranchAt`, which opens the same new-branch dialog started at that commit:
   "New branch at <short id>", then who made it and when, read by its id as the dialog opens
@@ -295,3 +300,6 @@ place), X (designed on 0.13; the better routes are deferred).
   showed the merged-in changes too, each with Revert, which would undo the target's own change
   on merge. Since 2026-10-18 such a review folds the net diff from the merge base (E6) and says
   "Since main was last merged in at …".
+- 2026-10-22: "Branches" did not say when a row's head is read, which `26129fd` changed: the
+  list read the first 20 heads whether it was shown or not, and now reads only those of the rows
+  a shown list draws.

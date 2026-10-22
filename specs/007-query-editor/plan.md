@@ -47,10 +47,12 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   the query.
 - **Files:** `.gq` files on disk can be opened; queries can be saved per graph.
   Built: ⌘S saves a query tab to its file; a new query goes to the graph's queries folder
-  (`<data dir>/queries/<graph key>/`, the graph's one key `<server url>/<graph id>` made safe,
-  `http_~~127.0.0.1_8787~knowledge`; since 2026-10-20, before which the folder was the server's
-  name, `<server>~<graph>`, which Studio no longer reads: its files stay there, and ⌘O opens
-  one), named after its first declaration
+  (`<data dir>/queries/<graph key>/`, the graph's one key `<target>/<graph id>` made safe,
+  `personal~knowledge`; since 2026-10-22, before which the folder was the server's address and
+  the graph's id, `http_~~127.0.0.1_8787~knowledge`, which Studio no longer reads: its files stay
+  there, and ⌘O opens one; a folder from before 2026-10-20, named `<server>~<graph>` after the
+  server's name, is the graph's again where that name is its target's), named after its first
+  declaration
   (`list_company.gq`, then `-2`, …). ⌘⇧S picks any path in the system dialog; ⌘O opens a file
   (or `studio_graph::OpenQueryFile { path }`). A file tab is titled by the file, keyed by its
   path so it opens once, and shows the changed dot while its text differs from the file; its
@@ -317,6 +319,10 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 
 
 ## Corrections
+
+- 2026-10-22 · "Files" gave the queries folder as the graph's key `<server url>/<graph id>` made
+  safe; the key is `<target>/<graph id>` since `1b5a110`, so the folder is `<target>~<graph>`,
+  which a folder from before 2026-10-20 matches again where its server's name is the target's.
 
 - 2026-10-22 · The Queries panel no longer lists the CLI's aliases under their stored queries
   or folds the ones a graph does not serve under Not served, and a stored query's tab no longer
