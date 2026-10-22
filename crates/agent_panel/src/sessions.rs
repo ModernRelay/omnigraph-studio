@@ -21,7 +21,7 @@ use serde_json::{Map, Value};
 pub struct SessionRecord {
     /// The agent's session id.
     pub session: String,
-    /// The graph, as its key (`<server url>/<graph id>`, `GraphSession::overrides_key`).
+    /// The graph, as its key (`<target>/<graph id>`, `GraphSession::overrides_key`).
     pub graph: String,
     /// The agent command, joined with spaces: a session belongs to the agent that made it.
     pub agent: String,
@@ -428,9 +428,16 @@ fn provisional_title(message: &str) -> Option<String> {
 /// aside whole: serde passes over fields it does not know, so a record a newer build wrote
 /// with one more field would read here and be written back without it. It changes when a build
 /// reading the other's records would drop or misread what they hold; a form that only accepts
-/// less (every field required, which Studio always wrote) keeps it, since a record of the
-/// older form that no longer reads sets its file aside on its own.
+/// less (every field required, which Studio always wrote) keeps it, since a file holding a
+/// record of the older form no longer parses, and is set aside on its own.
 const VERSION: u64 = 2;
+
+/// The sessions file as Studio writes it ([`AgentSessions::save`]).
+#[derive(Deserialize)]
+struct SessionsFile {
+    version: u64,
+    sessions: Vec<SessionRecord>,
+}
 
 /// What Studio read of one of its state files, and whether it may write the file again.
 struct Stored<T> {
@@ -458,44 +465,30 @@ fn set_aside(path: &Path) -> bool {
     studio_settings::set_aside(path).is_some()
 }
 
-/// The records on disk, each read on its own: one Studio cannot read (damaged, or written by an
-/// older build without a field this one requires) leaves the others. A file with any it cannot
-/// read, of another [`VERSION`], or that cannot be read at all, is set aside first, renamed
-/// beside itself, so the next save, which writes only the ones read, loses nothing. One that
-/// cannot be set aside is never saved over.
+/// The records on disk. A file that does not parse as this build's form ([`SessionsFile`]), one
+/// of another [`VERSION`], or one that cannot be read at all, is set aside whole, renamed beside
+/// itself, as Studio's other state files are, so the next save, which writes only what this run
+/// holds, loses nothing. One that cannot be set aside is never saved over.
 fn read_records(path: &Path) -> Stored<Vec<SessionRecord>> {
-    let unusable = || Stored {
-        value: Vec::new(),
-        saving: set_aside(path),
-    };
-    let text = match read_text(path) {
-        Ok(Some(text)) => text,
+    let file = match read_text(path) {
+        Ok(Some(text)) => serde_json::from_str::<SessionsFile>(&text).ok(),
         Ok(None) => {
             return Stored {
                 value: Vec::new(),
                 saving: true,
             };
         }
-        Err(()) => return unusable(),
+        Err(()) => None,
     };
-    let records = serde_json::from_str::<Value>(&text)
-        .ok()
-        .filter(|value| value.get("version").and_then(Value::as_u64) == Some(VERSION))
-        .and_then(|value| match value.get("sessions") {
-            Some(Value::Array(records)) => Some(records.clone()),
-            _ => None,
-        });
-    let Some(records) = records else {
-        return unusable();
-    };
-    let read: Vec<SessionRecord> = records
-        .iter()
-        .filter_map(|record| serde_json::from_value(record.clone()).ok())
-        .collect();
-    let saving = read.len() == records.len() || set_aside(path);
-    Stored {
-        value: read,
-        saving,
+    match file.filter(|file| file.version == VERSION) {
+        Some(file) => Stored {
+            value: file.sessions,
+            saving: true,
+        },
+        None => Stored {
+            value: Vec::new(),
+            saving: set_aside(path),
+        },
     }
 }
 
@@ -790,12 +783,12 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// One record Studio cannot read leaves the others, and the file is set aside before the
-    /// next save writes only those. A record an older build wrote without a field this one
-    /// requires is such a record, and a file of another version is set aside whole: in both,
-    /// the file is renamed beside itself, not lost.
+    /// A file that does not parse as this build writes it is set aside whole, renamed beside
+    /// itself byte for byte, and nothing in it is read: one holding a record Studio cannot read
+    /// (a field missing or of another type) as one of another version. A file that parses is
+    /// read whole.
     #[test]
-    fn a_record_that_cannot_be_read_leaves_the_others() {
+    fn a_file_that_does_not_parse_is_set_aside_whole() {
         let dir = std::env::temp_dir().join(format!("studio-agent-records-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
@@ -815,54 +808,67 @@ mod tests {
             archived: false,
             cwd: graph_cwd("server/crm"),
         };
-        // As an older build wrote it: no working directory, and no marks.
-        let mut older = serde_json::to_value(&record).unwrap();
-        let older_fields = older.as_object_mut().unwrap();
-        older_fields.insert("session".into(), json!("s-2"));
-        older_fields.insert("cwd".into(), Value::Null);
-        let mut oldest = older.clone();
-        let oldest_fields = oldest.as_object_mut().unwrap();
-        oldest_fields.insert("session".into(), json!("s-3"));
-        for field in ["cwd", "pinned", "archived", "branch_created"] {
-            oldest_fields.remove(field);
-        }
-        let file = json!({
-            "version": VERSION,
-            "sessions": [record, { "session": 3 }, older, oldest],
-        });
-        std::fs::write(&path, file.to_string()).unwrap();
-        let Stored {
-            value: records,
-            saving,
-        } = read_records(&path);
-        assert!(saving, "set aside, so saved again");
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].session, "s-1");
-        assert!(!path.exists(), "set aside before it is written again");
+        let fresh = || {
+            std::fs::remove_dir_all(&dir).ok();
+            std::fs::create_dir_all(&dir).unwrap();
+        };
         let aside = || -> Vec<std::path::PathBuf> {
             std::fs::read_dir(&dir)
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
                 .collect()
         };
-        assert_eq!(aside().len(), 1);
-        assert_eq!(
-            std::fs::read_to_string(&aside()[0]).unwrap(),
-            file.to_string(),
-            "the file set aside is the file as it was"
-        );
+
+        // A file as Studio writes it is read whole, and stays.
+        let file = json!({ "version": VERSION, "sessions": [record] });
+        std::fs::write(&path, file.to_string()).unwrap();
+        let Stored {
+            value: records,
+            saving,
+        } = read_records(&path);
+        assert!(saving);
+        assert_eq!(records, std::slice::from_ref(&record));
+        assert!(path.exists());
+
+        // A record without its working directory, with none, without its marks, or of another
+        // shape sets the whole file aside, and nothing in it is read.
+        let mut without = serde_json::to_value(&record).unwrap();
+        without.as_object_mut().unwrap().remove("cwd");
+        let mut null = serde_json::to_value(&record).unwrap();
+        null.as_object_mut()
+            .unwrap()
+            .insert("cwd".into(), Value::Null);
+        let mut unmarked = serde_json::to_value(&record).unwrap();
+        for field in ["pinned", "archived", "branch_created"] {
+            unmarked.as_object_mut().unwrap().remove(field);
+        }
+        for unread in [without, null, unmarked, json!({ "session": 3 })] {
+            fresh();
+            let file = json!({ "version": VERSION, "sessions": [record, unread] });
+            std::fs::write(&path, file.to_string()).unwrap();
+            let Stored {
+                value: records,
+                saving,
+            } = read_records(&path);
+            assert!(saving, "set aside, so saved again: {unread}");
+            assert!(records.is_empty(), "{unread}");
+            assert!(!path.exists(), "set aside before it is written again");
+            assert_eq!(aside().len(), 1);
+            assert_eq!(
+                std::fs::read_to_string(&aside()[0]).unwrap(),
+                file.to_string(),
+                "the file set aside is the file as it was"
+            );
+        }
 
         // Every record readable, but the file of another version, or of none: nothing is read,
         // and the file is set aside.
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
         for version in [json!(VERSION + 1), json!(1), Value::Null] {
+            fresh();
             let file = json!({ "version": version, "sessions": [record] });
             std::fs::write(&path, file.to_string()).unwrap();
             assert!(read_records(&path).value.is_empty(), "version {version}");
             assert!(!path.exists(), "version {version}");
-            std::fs::remove_dir_all(&dir).ok();
-            std::fs::create_dir_all(&dir).unwrap();
         }
         std::fs::remove_dir_all(&dir).ok();
     }
