@@ -215,7 +215,9 @@ what was last saved at most every 250 ms rather than serializing every tab on ev
   didn't find an action named …") while the rest apply; a file that does not parse keeps the
   bindings in effect. The settings tab's keyboard button shows the file, writing it first when
   there is none: an empty `Workspace` section and Studio's bindings as a commented reference.
-  Every binding comes from these three files; no crate binds keys in code.
+  One that cannot be written is said in a toast with its path and why (since 2026-10-21;
+  before, only the log said so). Every binding comes from these three files; no crate binds
+  keys in code.
 
 ### Command palette (`command_palette`, forked from Zed's `picker` + `command_palette`)
 
@@ -476,7 +478,9 @@ and a 97 % fill let the text behind show through.
   thread and location, its message stripped of quoted text, and that line is all it prints:
   Studio's panic hook replaces Rust's, which printed the message whole to standard error (and
   a backtrace when one was asked for), and writes the line there itself when the log does not
-  go to the terminal (since 2026-10-21). Help → Reveal Log File shows it.
+  go to the terminal (since 2026-10-21). Help → Reveal Log File shows it, or for a run that
+  logs to a terminal its folder, made first; a folder that cannot be made is said in a toast
+  with its path and why (since 2026-10-21; before, nothing happened).
 - A transport failure reads as its cause ("Could not reach the server: the connection was
   refused", "… the request timed out"), never with the request URL, which can hold a Blob
   row's key.
@@ -934,6 +938,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | A log folder or `keymap.json` that cannot be made is said | `studio` `a_log_folder_that_cannot_be_made_is_said` (a log file present, absent, and under a file where its folder would be); the keymap button's error path by reading `settings_view.rs` `show_keymap_file` | The blocked folder reads "The log folder could not be made at …/blocker/logs: " and the system's reason, and goes to a toast, deferred past the window's dispatch as a link's notice is; a `keymap.json` write that fails is logged and toasted with its path. Before, the first did nothing and the second only logged. The keymap toast is not driven by a test |
 | 2026-10-21 | The saved recent list is read as it was written | `command_palette` `saved_keys_follow_those_run` (it replaces `saved_keys_follow_those_run_and_drop_found_nodes`: a list saved after a key was run, then 55 more keys) | The saved keys followed `type:Person` in their own order, each once, up to the 50 kept. No key is dropped on reading: Studio records no `node:` key, and the filter for the ones an earlier build saved is gone with `found::is_node_key` |
 | 2026-10-21 | A full toast stack keeps an Undo and an error | `studio_workspace` `an_undo_and_an_error_stay_when_toasts_overflow` (an error, a delete with Undo, an info toast, then four commits; then two more errors and two commits); run again with the oldest toast taken away, as before | The info went first, then the oldest commits: the error, the Undo and the two newest commits showed. With four kept toasts the stack grew to five, the newest commit taking the place of the one before it. Taking the oldest away left only the four commits, the error and the Undo gone |
 | 2026-10-21 | A full toast stack folds its errors, so an Undo stays within it | `studio_workspace` `a_dozen_errors_fold_and_leave_an_undo_within_the_stack` (six refused writes, a delete with Undo, six more refusals; then Open activity pressed) and `an_undo_and_an_error_stay_when_toasts_overflow`, its second half updated (an error, the Undo and two more errors up, then two commits); both run again with the fold taken out | Four toasts: "10 earlier errors" with Open activity, the Undo, and the two newest refusals; Open activity showed the bottom dock on the activity log, and the folded toast went. In the other test the two oldest errors became "2 earlier errors" and the newest commit took the place of the one before it. Without the fold the first test showed thirteen toasts, the Undo seventh, and the other five |
