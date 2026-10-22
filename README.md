@@ -30,19 +30,27 @@ Requirements:
   Vulkan development packages listed in `.github/workflows/ci.yml`.
 - An OmniGraph server that speaks HTTP contract 0.14: the edge build `edge-20261020-7fd9cc9`
   or later. Studio refuses a server that speaks another contract, OmniGraph 0.13 and the
-  earlier 0.14 edge builds included, and its query checks follow that build. For the sample
-  graph, the `omnigraph` and `omnigraph-server` binaries of that build or later
-  (`VERSION=edge-20261020-7fd9cc9` with OmniGraph's `scripts/install.sh`), on `PATH` or named by
-  `OMNIGRAPH_BIN` and `OMNIGRAPH_SERVER_BIN`.
+  earlier 0.14 edge builds included, and its query checks follow that build.
+- For the servers of the CLI's targets, the agent panel and the sample graph, the `omnigraph`
+  CLI of an edge build made from OmniGraph main `ff542202` or later, such as
+  `edge-20261022-7fff9df` (`VERSION=edge-20261022-7fff9df` with OmniGraph's
+  `scripts/install.sh`), which reads OmniGraph's version-1 operator configuration. Studio looks
+  for it on `PATH`, then in `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`.
 
-Run against the sample graph (200 people, 25 companies, 40 projects):
+Run against the sample graph (200 people, 25 companies, 40 projects), with that build's
+`omnigraph` and `omnigraph-server` on `PATH` or named by `OMNIGRAPH_BIN` and
+`OMNIGRAPH_SERVER_BIN`:
 
 ```bash
 script/dev-server    # serves knowledge and notes on 127.0.0.1:8787, token dev-token
 ```
 
-It stops, saying which, when either binary speaks another contract: the CLI by its
-`version --json`, the started server by the contract header its `/healthz` answers with.
+The first run applies `dev/cluster/` and loads the seeds through a direct target in an operator
+home of the script's own, before the server starts; your `~/.omnigraph` takes no part. It stops,
+saying which, when a binary is one Studio cannot use: the CLI by its `version --json` and its
+check of that home's operator file, the started server by the contract header its `/healthz`
+answers with. `STUDIO_DEV_DATA` and `STUDIO_DEV_BIND` move its data (default `dev/.data`) and
+address, and `--reset` starts again from empty graphs.
 
 ```bash
 OMNIGRAPH_STUDIO_SERVER=http://127.0.0.1:8787 OMNIGRAPH_STUDIO_TOKEN=dev-token \
@@ -52,8 +60,10 @@ OMNIGRAPH_STUDIO_SERVER=http://127.0.0.1:8787 OMNIGRAPH_STUDIO_TOKEN=dev-token \
 A clean debug build takes about 2.5 minutes on an Apple M5 Pro and about 8 GB of `target/`; a
 release build (`cargo run --release`) about 10 minutes.
 
-Without the environment variables, Studio reads servers and tokens from the `omnigraph` CLI's
-`~/.omnigraph/config.yaml` and `credentials`, and File → Open Graph… adds a server by URL.
+Without the environment variables, Studio takes its servers from the `omnigraph` CLI's targets
+(`omnigraph target list`) and each server's token from `omnigraph credentials export`; it reads
+no operator configuration or credential itself. File → Open Graph… adds a server through the
+CLI too (`omnigraph target add`, and `credentials set` for its token).
 
 | Variable | Effect |
 |---|---|

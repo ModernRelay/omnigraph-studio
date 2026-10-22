@@ -8,7 +8,7 @@ it goes through OmniGraph's own RFC process.
 
 | ID | Change | Waiting spec | Studio does today |
 |---|---|---|---|
-| E1 | `omnigraph studio` CLI command: resolve the target, serve locally on loopback, single-use code handoff ([#980](https://github.com/ModernRelay/omnigraph/issues/980)) | 003, 013 | Connects to running servers from `~/.omnigraph/config.yaml` or added by URL; local graphs served with `omnigraph-server --cluster <dir>` first |
+| E1 | `omnigraph studio` CLI command: resolve the target, serve locally on loopback, single-use code handoff ([#980](https://github.com/ModernRelay/omnigraph/issues/980)) | 003, 013 | Connects to running servers the CLI's targets name (`omnigraph target list`) or added by URL through `omnigraph target add`; local graphs served with `omnigraph-server --cluster <dir>` first |
 | E2 | Supported local embedding API in `omnigraph-server`, with a read-only mode | E1 | — |
 | E3 | Loopback guard (Host allowlist, Origin check, no CORS) in the launcher | E1 | — |
 | E4 | Owner discovery for a graph root (discovery, not fencing) | E1 | — |
@@ -51,5 +51,8 @@ Every server Studio supports serves these (checked at `7fd9cc9`, 2026-10-20):
 
 Also served: unattached snapshots (`as unattached branch`; `CommitOutput.kind`,
 `GET /commits?unattached=`) and `ReadOutput.page` for a paged `branch diff` read. The CLI
-selects a backend with `--target` and reads an operator file of `targets` (#1090); Studio's
-agent CLI and its reading of the person's operator file follow it (specs 013 and 003).
+selects a backend with `--target` and reads an operator file of `targets` (#1090), since #1115
+and #1126 only in its version-1 form. Studio's agent CLI follows it (spec 013), from an edge
+build made from main `ff542202` on. Since 2026-10-22 Studio reads no operator file for the
+person's servers: it takes them and their tokens from the CLI's own commands (`target list`,
+`target inspect`, `credentials status`, `credentials export`; spec 003).

@@ -170,7 +170,9 @@ target, pass the server through. Mint a per-launch token tied to `operator.actor
 generated policy granting that actor the graph actions. Open Studio with a single-use code
 through `omnigraph-studio://connect?code=…`; Studio redeems it once at the loopback server for
 its token. Print the URL; `--no-open --json` for agents and SSH. Never put a token in argv.
-*Waits:* 003. *Today:* Studio connects to running servers from the CLI's config.
+*Waits:* 003. *Today:* Studio connects to running servers the CLI's targets name
+(`omnigraph target list`, each token from `credentials export`), or one added by URL through
+`omnigraph target add`.
 
 **E2. A supported local embedding API in `omnigraph-server`.**
 Bless one constructor (for example `AppState::local(uri, LocalOptions)`) instead of the
@@ -338,8 +340,11 @@ Studio's own work first, for what landed:
 
 1. CLI targets in the agent's CLI and in reading the person's operator file (specs 013, 003):
    the next CLI build refuses Studio's `--server` and `defaults.server`. Then the version-1
-   operator configuration (#1115, #1126): done for the agent's CLI on 2026-10-21 (013), which waits
-   for an edge build made from `ff542202` or later; open for the person's operator file (003).
+   operator configuration (#1115, #1126): done for the agent's CLI on 2026-10-21 (013), which
+   needs an edge build made from `ff542202` or later (the first published is
+   `edge-20261022-7fff9df`); done for the person's servers on 2026-10-22 (003), which Studio takes
+   from the CLI's own commands (`target list`, `target inspect`, `credentials status`,
+   `credentials export`) and no longer reads from the operator file.
 2. With the next minimum-server bump: E10 paged history (009), E15 access (002), E21 a branch
    from a commit (008, 009), `full_text_index_required` and the compiler's new codes (007), then
    `executed` and `pipelines` (007).
@@ -365,6 +370,7 @@ Then engine changes still open:
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-22 | The first published build whose CLI reads Studio's home is `edge-20261022-7fff9df` | `git ls-remote --tags` of ModernRelay/omnigraph (`edge-20261021-888223b`, then `edge-20261022-7fff9df` at `7fff9dfd`); `git merge-base --is-ancestor ff542202 7fff9dfd`; the installed `0.14.0-edge+7fff9df`'s `version --json` and `config validate --operator-config` on a file with a loopback server target of `auth: {provider: anonymous}`, beside `0.14.0-edge+888223b`'s | `7fff9dfd` contains `ff542202`. `7fff9df` reports protocols `target` 1, `credential` 1, `access` 1 and passes the file; `888223b` reports the same protocols and refuses it (`invalid type: string "anonymous", expected internally tagged enum StrictAuthProfile`) |
 | 2026-10-21 | The CLI reads only the version-1 operator configuration, and no published build reads Studio's home yet | OmniGraph main `97788d37`: `operator_schema.rs` (`target_config_version` refused), the diff `888223b7..ff542202` of `operator_schema.rs` (server `auth` from a map to one provider), `commands/targets/args.rs` (`config validate`); `gh release list` (newest `edge-20261021-888223b`, 2026-10-22 00:21 UTC); `~/.local/bin/omnigraph version --json` and `config validate --operator-config /dev/null` | `0.14.0-edge+50283ce` reports `http_contract` 0.14 and `protocols.target` 1, and answers "unrecognized subcommand 'config'" (exit 2). `888223b` has #1115 without #1126. E34 filed as #1127 |
 | 2026-10-21 | The server's version fields are wider than its contract says (E30) | `omnigraph-api-types/src/lib.rs` at `7fd9cc9` (`CommitOutput`, `SnapshotOutput`, `SnapshotDatasetOutput`, `SchemaApplyOutput`, `PublishedDatasetVersionConflictOutput`: `u64`; its own test decodes `9_223_372_036_854_775_809u64`); `crates/graph_client/openapi/omnigraph-0.14.0-edge.json` (`int64`, `minimum: 0`); what the running app was answered by the edge server; `graph_client` `a_detached_manifest_version_decodes` | A write `as commit` was answered with `graph_manifest_version: 10415222161995537841`, which Studio's `i64` refused to decode, so the write read as unknown; as `u64` it decodes, and the query editor says it is held |
 | 2026-10-20 | What OmniGraph main serves that Studio's minimum server does not | `openapi.json` at main `4ba904d3` diffed with `crates/graph_client/openapi/omnigraph-0.14.0-edge.json` by operation, parameter and schema property; the `changelog.d` notes added since `d883c49e`; the CLI reference and targets guide at `4ba904d3` | New: `GET /graphs/{id}/access`; `limit`, `page_token`, `head_commit_id`, `next_page_token` on commits; `from_commit` and `from_commit_id` on branch creation; `ChangeOutput.executed`; error details `branch_start_refusal` and `full_text_index_required`. Contract header still `0.13`. The CLI drops `--server` and profiles for targets (#1090) |
