@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,7 +18,9 @@ use gq_language::builder::Depends;
 use gq_language::input::edit_text;
 use gq_language::{BuiltQuery, Direction, RelationshipGroup, SchemaModel, builder};
 use graph_store::scope::{ReadScope, ScopeSince};
-use graph_store::{DraftEntry, DraftKey, GraphSession, Loadable, SessionEvent};
+use graph_store::{
+    DraftEntry, DraftKey, GraphSession, HeldAs, Loadable, OutcomeKind, SessionEvent,
+};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use serde_json::{Map, Value};
 use studio_actions::graph::{OpenBlob, OpenNodePage, PeekNode};
@@ -29,18 +32,19 @@ use ui::prelude::*;
 use ui::{Indicator, PopoverMenu, ToggleState, Tooltip};
 
 use crate::blob::{
-    IMAGE_MAX, PREVIEW_PREFIX, Preview, bytes_wanted, preview, read_range, save_folder, save_value,
-    suggested_file_name,
+    IMAGE_MAX, KIND_PREFIX, PREVIEW_PREFIX, Preview, bytes_wanted, preview, read_range,
+    save_folder, save_value, suggested_file_name,
 };
 use crate::blob_write::{self, BlobChange, BlobEdit, BlobWritten};
 use crate::model::{
     BlobsAt, FROM_COLUMN, Notice, SaveResult, TO_COLUMN, Tone, changed_elsewhere, count_of,
     display_value, edited, field_rows, node_label, node_rows, reads_as_markdown, save_result,
 };
+use crate::offers::Offers;
 use crate::suggest;
 use gq_language::input::same_value;
-use graph_client::api::ReadOutput;
-use graph_client::{BlobCell, BlobMeta, HistoricalGap, PropertyThen, ReadError};
+use graph_client::api::{ChangeOutput, ReadOutput};
+use graph_client::{BlobCell, BlobMeta, HistoricalGap, PropertyThen, ReadError, WriteOutcome};
 
 /// First neighbours shown under an expanded relationship group.
 pub const NEIGHBOUR_LIMIT: u32 = 8;
@@ -193,6 +197,17 @@ struct Group {
     _task: Option<Task<()>>,
 }
 
+/// How a read of a group's first edges lands ([`NodePeek::read_group`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupRead {
+    /// The group read whole: its count says nothing until the read lands, when it opens if it
+    /// has any after the person's own write to it (`open`), or else if it is small.
+    Whole { open: bool },
+    /// The neighbours of a group open with its count shown (a table's), which stays until the
+    /// read gives its own.
+    Neighbours,
+}
+
 /// The reads of a group's first edges: its first neighbours, one row an edge and one more than
 /// the view shows (`limit`), and its edges counted, for when they do not fit.
 struct EdgeReads {
@@ -212,8 +227,14 @@ struct BlobSlot {
     property: String,
     meta: Loadable<BlobMeta>,
     preview: Loadable<Preview>,
-    /// The value's first bytes, to name a saved file for its kind.
+    /// The value's first bytes, as many as judge its kind ([`KIND_PREFIX`]), to name a saved
+    /// file for it.
     head: Vec<u8>,
+    /// Where the value it shows is held, which Save reads: the commit it was read at (`Some(None)`
+    /// for the branch head), or the commit of the write that put it there; `None` when no commit
+    /// the view knows holds it (a value its table shows where the table's own Blob write went
+    /// past another writer's commit), which Save then says.
+    bytes_at: Option<Option<String>>,
     save: Option<SaveState>,
     /// A file being stored in it or a clear, while out, or why it did not land.
     edit: Option<BlobEdit>,
@@ -280,10 +301,13 @@ struct AddEdge {
     /// The relationship group it adds to.
     index: usize,
     editor: Entity<Editor>,
-    found: Loadable<Vec<Neighbour>>,
-    /// The text `found` answers: what was typed when they were read.
+    /// The nodes the search found, offered as a field that names a node offers them, the first
+    /// highlighted.
+    offers: Offers,
+    /// How the search for `answers` went: out, read (its nodes in `offers`) or failed.
+    found: Loadable<()>,
+    /// The text `offers` answers: what was typed when they were read.
     answers: Option<String>,
-    highlighted: usize,
     _search: Option<Task<()>>,
     _changed: Subscription,
 }
@@ -294,6 +318,71 @@ enum EdgeChange {
     Add(String),
     /// The edge with this id.
     Remove(String),
+}
+
+/// One write of a relationship change ([`NodePeek::write_edge`]): a replace is the removal of
+/// the one there, then the addition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EdgeStep {
+    Add,
+    Remove,
+    ReplaceRemove,
+    ReplaceAdd,
+}
+
+impl EdgeStep {
+    /// How the write's outcome names it.
+    fn verb(self) -> &'static str {
+        match self {
+            EdgeStep::Add | EdgeStep::ReplaceAdd => "Add",
+            EdgeStep::Remove => "Remove",
+            EdgeStep::ReplaceRemove => "Replace",
+        }
+    }
+
+    /// The write, as the subject of a sentence.
+    fn doing(self) -> &'static str {
+        match self {
+            EdgeStep::Add => "Adding it",
+            EdgeStep::Remove => "Removing it",
+            EdgeStep::ReplaceRemove => "Removing the relationship it replaces",
+            EdgeStep::ReplaceAdd => "Adding the new one",
+        }
+    }
+
+    /// What landing would have done, as a clause.
+    fn done(self) -> &'static str {
+        match self {
+            EdgeStep::Add => "it was added",
+            EdgeStep::Remove => "it was removed",
+            EdgeStep::ReplaceRemove => "the relationship it replaces was removed",
+            EdgeStep::ReplaceAdd => "the new one was added",
+        }
+    }
+
+    /// What it leaves unsent when it does not land: a replace's addition waits for its removal.
+    fn leaves(self) -> &'static str {
+        match self {
+            EdgeStep::ReplaceRemove => ", and the new one was not sent",
+            _ => "",
+        }
+    }
+}
+
+/// How one relationship write ended ([`edge_written`]).
+#[derive(Debug, Clone, PartialEq)]
+enum EdgeWritten {
+    /// Published on the branch as `commit`, on top of `parent`.
+    Saved {
+        commit: String,
+        parent: Option<String>,
+    },
+    /// Nothing was written: refused, or it matched nothing.
+    NotWritten(Notice),
+    /// It is not on the branch as far as Studio can tell, though it may have been written:
+    /// held as a proposal or a snapshot, of a commit kind this build does not know, or its
+    /// answer lost.
+    Unsettled(Notice),
 }
 
 /// Saving a value to a file: how far it got, or how it ended.
@@ -625,6 +714,18 @@ impl NodePeek {
                 this.values = Loadable::Loaded(values);
                 this.load_groups(cx);
                 this.load_blobs(debounce, blobs.shown, cx);
+                // The caller's commit may be behind the head the session has seen (a table
+                // behind its branch): it is compared as a head move is, once the caller has set
+                // the view up, holding its commit or telling it of its saves out.
+                let view = cx.weak_entity();
+                cx.defer(move |cx| {
+                    view.update(cx, |this, cx| {
+                        if !this.writes_out() {
+                            this.compare_head(cx);
+                        }
+                    })
+                    .ok();
+                });
             }
             None => this.load_node(cx),
         }
@@ -1051,6 +1152,8 @@ impl NodePeek {
                 self.blobs[index].preview = Loadable::NotLoaded;
                 self.blobs[index].head.clear();
                 self.read_blob(index, false, Some(meta), cx);
+                // The table's commit holds the value it wrote, which Save reads there.
+                self.blobs[index].bytes_at = Some(Some(wrote.commit.clone()));
             }
             // The head the session saw land may be this commit, compared before it was told
             // of; with nothing else out, it is compared again now.
@@ -1116,6 +1219,7 @@ impl NodePeek {
                     meta: Loadable::Loading,
                     preview: Loadable::NotLoaded,
                     head: Vec::new(),
+                    bytes_at: None,
                     save,
                     edit,
                     _task: None,
@@ -1177,6 +1281,7 @@ impl NodePeek {
             (Some(_), false) => Some(held_at),
             (None, _) => Some(snapshot.clone()),
         };
+        self.blobs[index].bytes_at = preview_at.clone();
         let scope = self.scope.clone();
         self.blobs[index]._task = Some(cx.spawn(async move |this, cx| {
             if debounce {
@@ -1234,7 +1339,9 @@ impl NodePeek {
                     wanted = bytes_wanted(&bytes, size).min(IMAGE_MAX);
                 }
             }
-            let head = bytes.iter().take(16).copied().collect();
+            // As many bytes as judge a value's kind, so a saved file is named as the preview
+            // shows it: an SVG's root can come after a declaration and comments.
+            let head = bytes.iter().take(KIND_PREFIX).copied().collect();
             let svg = cx.update(|cx| cx.svg_renderer());
             let shown = cx
                 .background_spawn(async move { preview(bytes, size, &svg) })
@@ -1438,16 +1545,16 @@ impl NodePeek {
             self.blobs[index].edit = BlobEdit::ended(written, change, property);
         }
         if let Some((commit, parent, meta, bound)) = saved {
-            if let Some(commit) = commit {
+            if let Some(commit) = &commit {
                 let before = self
                     .blobs_at
                     .commit(self.snapshot.as_deref())
                     .map(str::to_owned);
-                if !self.follow_own_commit(parent.as_deref(), &commit)
+                if !self.follow_own_commit(parent.as_deref(), commit)
                     && let Some(at) = bound_at.as_deref().filter(|_| bound)
                 {
                     self.blobs_at
-                        .after_bound_write(at, before.as_deref(), &commit);
+                        .after_bound_write(at, before.as_deref(), commit);
                 }
             }
             if let Some(index) = index {
@@ -1463,6 +1570,10 @@ impl NodePeek {
                     self.blobs[index]._task = None;
                 } else {
                     self.read_blob(index, false, Some(meta), cx);
+                }
+                // The write's own commit holds the value written, which Save reads there.
+                if commit.is_some() {
+                    self.blobs[index].bytes_at = Some(commit);
                 }
             }
         }
@@ -1489,14 +1600,27 @@ impl NodePeek {
         self.send_blob_write(&property, change, Some(now), cx);
     }
 
-    /// Saves a managed value to a file the person picks: read in ranges at the peek's commit and
-    /// written to a file beside it, renamed into place when complete, so memory holds one range
-    /// and a stopped save leaves no partial file under the chosen name.
+    /// Why slot `index`'s Save is not offered, or `None` when it is: no commit the view knows
+    /// holds the value it shows, so a read could only bring another value's bytes.
+    fn save_refusal(&self, index: usize) -> Option<&'static str> {
+        let slot = self.blobs.get(index)?;
+        slot.bytes_at
+            .is_none()
+            .then_some("Studio knows no commit that holds this value. Refresh, then save it.")
+    }
+
+    /// Saves a managed value to a file the person picks: read in ranges where the value the
+    /// slot shows is held (its size is that value's), and written to a file beside it, renamed
+    /// into place when complete, so memory holds one range and a stopped save leaves no partial
+    /// file under the chosen name.
     fn save_blob(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(slot) = self.blobs.get(index) else {
             return;
         };
         let Loadable::Loaded(BlobMeta::Managed { size, .. }) = slot.meta else {
+            return;
+        };
+        let Some(snapshot) = slot.bytes_at.clone() else {
             return;
         };
         let id = self.subject.id().to_owned();
@@ -1510,7 +1634,6 @@ impl NodePeek {
             property: property.clone(),
         };
         let session = self.session.downgrade();
-        let snapshot = self.snapshot.clone();
         self.blobs[index]._save = Some(cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(path))) = chosen.await else {
                 return;
@@ -1685,15 +1808,19 @@ impl NodePeek {
                                             window.dispatch_action(Box::new(open.clone()), cx)
                                         })
                                 })
-                                .child(
+                                .child({
+                                    let refused = self.save_refusal(index);
                                     studio_ui::ds::button(("save-blob", index), "Save…")
                                         .style(ButtonStyle::Subtle)
                                         .color(Color::Muted)
-                                        .tooltip(Tooltip::text("Save the whole value to a file"))
+                                        .disabled(refused.is_some())
+                                        .tooltip(Tooltip::text(
+                                            refused.unwrap_or("Save the whole value to a file"),
+                                        ))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.save_blob(index, cx)
-                                        })),
-                                )
+                                        }))
+                                })
                                 .into_any_element(),
                         ),
                         None => None,
@@ -1907,16 +2034,19 @@ impl NodePeek {
     /// person's own write to it, where otherwise only a small one opens by itself.
     fn load_group(&mut self, index: usize, debounce: bool, open: bool, cx: &mut Context<Self>) {
         let snapshot = self.snapshot.clone();
-        self.load_group_at(index, snapshot, debounce, open, cx);
+        self.read_group(index, snapshot, debounce, GroupRead::Whole { open }, cx);
     }
 
-    /// [`Self::load_group`] at `snapshot` rather than the view's commit.
-    fn load_group_at(
+    /// Reads group `index`'s first edges at `snapshot` ([`read_first_edges`]), landing them as
+    /// `read` says: the whole group, or the neighbours of one whose count is shown already. At
+    /// a commit made before what the read names existed, it lands as [`Self::group_refused`]
+    /// says, so the group and its neighbours are read alike.
+    fn read_group(
         &mut self,
         index: usize,
         snapshot: Option<String>,
         debounce: bool,
-        open: bool,
+        read: GroupRead,
         cx: &mut Context<Self>,
     ) {
         let Some(reads) = self.edge_reads(index) else {
@@ -1928,17 +2058,27 @@ impl NodePeek {
         let Some(group) = self.groups.get_mut(index) else {
             return;
         };
-        group.expanded = false;
+        let whole = matches!(read, GroupRead::Whole { .. });
+        // A page being read after the first neighbours goes: they are read again.
         group.more = None;
+        if whole {
+            group.expanded = false;
+        }
         let reads = match reads {
             Ok(reads) => reads,
-            Err(error) => {
+            Err(error) if whole => {
                 group.count = Loadable::Failed(error);
                 group.neighbours = Loadable::NotLoaded;
                 return;
             }
+            Err(error) => {
+                group.neighbours = Loadable::Failed(error);
+                return;
+            }
         };
-        group.count = Loadable::Loading;
+        if whole {
+            group.count = Loadable::Loading;
+        }
         group.neighbours = Loadable::Loading;
         group.read_at = snapshot.clone();
         let relationship = group.group.clone();
@@ -1946,23 +2086,31 @@ impl NodePeek {
             if debounce {
                 cx.background_executor().timer(COUNT_DELAY).await;
             }
-            let read = read_first_edges(&session, scope.as_ref(), reads, snapshot.clone(), cx);
-            let Some(read) = read.await else {
+            let first = read_first_edges(&session, scope.as_ref(), reads, snapshot.clone(), cx);
+            let Some(first) = first.await else {
                 return;
             };
             this.update(cx, |this, cx| {
-                match read {
+                match first {
                     Ok(FirstEdges { shown, count }) => {
-                        let opens = match count {
-                            Loadable::Loaded(n) if open => n > 0,
-                            Loadable::Loaded(n) => this.opens_by_itself(n),
-                            _ => false,
+                        // A group read whole opens once it has any after the person's write to
+                        // it, and otherwise when small; one already open stays so.
+                        let opens = match (read, &count) {
+                            (GroupRead::Whole { open: true }, Loadable::Loaded(n)) => Some(*n > 0),
+                            (GroupRead::Whole { .. }, Loadable::Loaded(n)) => {
+                                Some(this.opens_by_itself(*n))
+                            }
+                            (GroupRead::Whole { .. }, _) => Some(false),
+                            (GroupRead::Neighbours, _) => None,
                         };
                         if let Some(group) = this.groups.get_mut(index) {
+                            // The view lists each edge: its count is the edges this read
+                            // counts, where a table's counts each neighbour once.
                             group.count = count;
                             group.neighbours = Loadable::Loaded(shown);
-                            // A small group shows its neighbours without a click.
-                            group.expanded = opens;
+                            if let Some(opens) = opens {
+                                group.expanded = opens;
+                            }
                         }
                     }
                     Err(error) => this.group_refused(
@@ -1971,7 +2119,7 @@ impl NodePeek {
                         &read_without,
                         error,
                         snapshot,
-                        open,
+                        read,
                         cx,
                     ),
                 }
@@ -2010,11 +2158,12 @@ impl NodePeek {
         }))
     }
 
-    /// A group's read was refused. At a commit made before its edge type or the type at its
-    /// other end existed, it had no neighbours; one made before a property it reads (the
+    /// A group's read (`read`) was refused. At a commit made before its edge type or the type
+    /// at its other end existed, it had no neighbours; one made before a property it reads (the
     /// neighbour's label, an edge property) was added or renamed is read again without it at
     /// the same commit (`snapshot`), once per property: `read_without` is what this read left
-    /// out already.
+    /// out already. Otherwise a group read whole says why on its count, and one whose count was
+    /// shown says why under it.
     #[allow(clippy::too_many_arguments)]
     fn group_refused(
         &mut self,
@@ -2023,7 +2172,7 @@ impl NodePeek {
         read_without: &[(String, String)],
         error: ReadError,
         snapshot: Option<String>,
-        open: bool,
+        read: GroupRead,
         cx: &mut Context<Self>,
     ) {
         let gap = match &error {
@@ -2054,12 +2203,19 @@ impl NodePeek {
                 {
                     self.groups_absent.push((owner, property));
                 }
-                self.load_group_at(index, snapshot, false, open, cx);
+                self.read_group(index, snapshot, false, read, cx);
             }
             _ => {
                 if let Some(group) = self.groups.get_mut(index) {
-                    group.count = Loadable::Failed(error.to_string());
-                    group.neighbours = Loadable::NotLoaded;
+                    match read {
+                        GroupRead::Whole { .. } => {
+                            group.count = Loadable::Failed(error.to_string());
+                            group.neighbours = Loadable::NotLoaded;
+                        }
+                        GroupRead::Neighbours => {
+                            group.neighbours = Loadable::Failed(error.to_string());
+                        }
+                    }
                 }
             }
         }
@@ -2082,45 +2238,8 @@ impl NodePeek {
     /// however many edges reach it. `debounce` waits first, for a peek that follows a moving
     /// cursor: the rows it passes read nothing.
     fn read_neighbours(&mut self, index: usize, debounce: bool, cx: &mut Context<Self>) {
-        let Some(reads) = self.edge_reads(index) else {
-            return;
-        };
-        let session = self.session.downgrade();
-        let (snapshot, scope) = (self.snapshot.clone(), self.scope.clone());
-        let Some(group) = self.groups.get_mut(index) else {
-            return;
-        };
-        let reads = match reads {
-            Ok(reads) => reads,
-            Err(error) => {
-                group.neighbours = Loadable::Failed(error);
-                return;
-            }
-        };
-        group.neighbours = Loadable::Loading;
-        group.read_at = snapshot.clone();
-        group._task = Some(cx.spawn(async move |this, cx| {
-            if debounce {
-                cx.background_executor().timer(COUNT_DELAY).await;
-            }
-            let read = read_first_edges(&session, scope.as_ref(), reads, snapshot, cx);
-            let Some(read) = read.await else {
-                return;
-            };
-            this.update(cx, |this, cx| {
-                if let Some(group) = this.groups.get_mut(index) {
-                    match read {
-                        Ok(edges) => {
-                            group.count = edges.count;
-                            group.neighbours = Loadable::Loaded(edges.shown);
-                        }
-                        Err(error) => group.neighbours = Loadable::Failed(error.to_string()),
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
+        let snapshot = self.snapshot.clone();
+        self.read_group(index, snapshot, debounce, GroupRead::Neighbours, cx);
     }
 
     /// Reads a group's next page of neighbours, after the last one shown.
@@ -2608,9 +2727,14 @@ impl NodePeek {
             SaveResult::Saved { commit, parent } => {
                 let branch = self.branch.clone();
                 self.settle_draft_on(&branch, &name, sent.as_ref(), None, cx);
-                // Made on the commit shown, the view holds the new commit's state; otherwise
-                // someone else committed in between and the view is behind.
-                self.follow_own_commit(parent.as_deref(), &commit);
+                // Made on the commit shown, the view holds the new commit's state, the value
+                // written included: shown again, since a read of the node that landed while the
+                // write was out (a Refresh's, another field's conflict's) put back the value it
+                // replaced. Otherwise someone else committed in between and the view is behind,
+                // showing what it read.
+                if self.follow_own_commit(parent.as_deref(), &commit) {
+                    self.restore(&name, new);
+                }
             }
             SaveResult::NoMatch => {
                 self.put_back(&name, &new, shown);
@@ -2975,6 +3099,7 @@ impl NodePeek {
             .as_ref()
             .is_some_and(|adding| adding.index == index)
             || self.change_refusal(cx).is_some()
+            || self.replace_refusal(index).is_some()
         {
             return;
         }
@@ -2999,9 +3124,9 @@ impl NodePeek {
         self.adding = Some(AddEdge {
             index,
             editor,
+            offers: Offers::default(),
             found: Loadable::NotLoaded,
             answers: None,
-            highlighted: 0,
             _search: None,
             _changed: changed,
         });
@@ -3032,12 +3157,18 @@ impl NodePeek {
             let result = search.await;
             this.update(cx, |this, cx| {
                 if let Some(adding) = this.adding.as_mut() {
-                    adding.found = match result {
-                        Ok(rows) => Loadable::Loaded(neighbours_from(&rows)),
-                        Err(error) => Loadable::Failed(error),
-                    };
+                    // A failed search offers nothing, not what an earlier one found.
+                    match result {
+                        Ok(rows) => {
+                            adding.offers.set(suggest::from_node_rows(&rows), true);
+                            adding.found = Loadable::Loaded(());
+                        }
+                        Err(error) => {
+                            adding.offers.clear();
+                            adding.found = Loadable::Failed(error);
+                        }
+                    }
                     adding.answers = Some(text);
-                    adding.highlighted = 0;
                 }
                 cx.notify();
             })
@@ -3045,13 +3176,11 @@ impl NodePeek {
         }));
     }
 
+    /// ↑/↓ in the search: highlights another node, around the ends.
     fn move_match(&mut self, step: isize, cx: &mut Context<Self>) {
         if let Some(adding) = self.adding.as_mut()
-            && let Loadable::Loaded(found) = &adding.found
-            && !found.is_empty()
+            && adding.offers.step(step)
         {
-            let last = found.len() as isize - 1;
-            adding.highlighted = (adding.highlighted as isize + step).clamp(0, last) as usize;
             cx.notify();
         }
     }
@@ -3073,23 +3202,38 @@ impl NodePeek {
         }
     }
 
-    /// Adds the relationship to the highlighted node; on a group that holds one, it replaces
-    /// the one there, which is removed first so the limit holds (rule D2 makes that two
-    /// commits). Until the edge it replaces is known, nothing is written and the group is read
-    /// with its edges: a lone addition would be refused for the limit.
+    /// Adds the relationship to the highlighted node ([`Self::add_offered`]).
     fn add_highlighted(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let highlighted = self
+            .adding
+            .as_ref()
+            .and_then(|adding| adding.offers.highlighted());
+        if let Some(highlighted) = highlighted {
+            self.add_offered(highlighted, window, cx);
+        }
+    }
+
+    /// Adds the relationship to the node the search offers at `offer`. On a group that holds
+    /// one, it replaces the one there, removed first so the limit holds: the server takes a
+    /// removal and an addition only in separate mutations (one mutation either adds or removes),
+    /// so a replace is two commits. Until the edge it replaces is known, nothing is written and
+    /// the group is read with its edges: a lone addition would be refused for the limit. A
+    /// group that cannot be replaced so ([`Self::replace_refusal`]) sends nothing, and says why.
+    fn add_offered(&mut self, offer: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(adding) = self.adding.as_ref() else {
             return;
         };
-        let Some(picked) = adding
-            .found
-            .loaded()
-            .and_then(|found| found.get(adding.highlighted))
-            .cloned()
-        else {
+        let Some(picked) = adding.offers.get(offer).map(|offer| offer.value.clone()) else {
             return;
         };
         let index = adding.index;
+        if let Some(reason) = self.replace_refusal(index) {
+            self.adding = None;
+            self.group_notices
+                .insert(index, Notice::new(Tone::Invalid, reason));
+            cx.notify();
+            return;
+        }
         let replaced = if self.holds_one(index) {
             match self.replaced_edge(index) {
                 Some(replaced) => replaced,
@@ -3105,7 +3249,25 @@ impl NodePeek {
             None
         };
         self.adding = None;
-        self.write_edge(index, EdgeChange::Add(picked.id), replaced, window, cx);
+        self.write_edge(index, EdgeChange::Add(picked), replaced, window, cx);
+    }
+
+    /// Why a new relationship of group `index` cannot replace the one it holds, or `None` when
+    /// it can (or it holds none): each node at its source needs exactly one (`@card(1..1)`), so
+    /// the removal alone is refused, as is a second one added first, and no one mutation takes
+    /// both.
+    fn replace_refusal(&self, index: usize) -> Option<String> {
+        let (schema, group) = (self.schema.as_ref()?, self.groups.get(index)?);
+        let edge = schema.edge(&group.group.edge)?;
+        let replaces = self.holds_one(index) && matches!(group.count, Loadable::Loaded(n) if n > 0);
+        (replaces && edge.min >= 1).then(|| {
+            format!(
+                "Each {from} has exactly one {name}, so Studio cannot replace it: the server takes \
+                 its removal and the new one only as two commits, and each alone breaks that rule.",
+                from = edge.from,
+                name = edge.name,
+            )
+        })
     }
 
     /// The edge a new relationship of a group that holds one replaces: `Some(None)` when the
@@ -3139,9 +3301,12 @@ impl NodePeek {
         }
     }
 
-    /// Writes one relationship change, after removing `first` when it is given, each as its
-    /// own commit; the group is read again where the writes landed, at the view's commit when
-    /// it follows them.
+    /// Writes one relationship change, after removing `first` when it is given (a replace),
+    /// each as its own commit: one mutation either adds or removes, so the server takes the two
+    /// only apart. The addition is sent only once the removal is on the branch, and how each
+    /// ended is said as it is ([`edge_written`]): the addition's after what the removal did.
+    /// The group is read again where the writes landed, at the view's commit when it follows
+    /// them.
     fn write_edge(
         &mut self,
         index: usize,
@@ -3170,7 +3335,7 @@ impl NodePeek {
         if let Some(edge_id) = &first {
             queries.push((
                 builder::delete_edge(&schema, &group.edge, edge_id),
-                "Replace",
+                EdgeStep::ReplaceRemove,
             ));
         }
         queries.push(match &change {
@@ -3179,20 +3344,25 @@ impl NodePeek {
                     Direction::Outgoing => (id.as_str(), other.as_str()),
                     Direction::Incoming => (other.as_str(), id.as_str()),
                 };
+                let step = if first.is_some() {
+                    EdgeStep::ReplaceAdd
+                } else {
+                    EdgeStep::Add
+                };
                 (
                     builder::insert_edge(&schema, &group.edge, from, to, &[]),
-                    "Add",
+                    step,
                 )
             }
             EdgeChange::Remove(edge_id) => (
                 builder::delete_edge(&schema, &group.edge, edge_id),
-                "Remove",
+                EdgeStep::Remove,
             ),
         });
         let mut built = Vec::new();
-        for (query, verb) in queries {
+        for (query, step) in queries {
             match query {
-                Ok(query) => built.push((query, verb)),
+                Ok(query) => built.push((query, step)),
                 Err(error) => {
                     self.group_notices
                         .insert(index, Notice::new(Tone::Invalid, error.to_string()));
@@ -3216,34 +3386,31 @@ impl NodePeek {
             // commits while each is on top of the one before, and the first is on top of the
             // commit the page shows when they land: another write of the page's, started with
             // this one, may have moved it there meanwhile.
-            let mut outcome = None;
+            let mut ended = None;
             let mut first_parent: Option<String> = None;
             let mut reached: Option<String> = None;
             let mut chained = true;
             let mut landed = 0;
-            for (query, verb) in built {
-                let description = format!("{verb} {edge} of {id} · {other}");
+            for (query, step) in built {
+                let description = format!("{} {edge} of {id} · {other}", step.verb());
                 let write = session.update(cx, |session, cx| {
                     session.write_on(&branch, &query, None, description, None, cx)
                 });
-                let result = save_result(&write.await, &branch);
-                let saved = match &result {
-                    SaveResult::Saved { commit, parent } => {
+                match edge_written(&write.await, &branch, step) {
+                    EdgeWritten::Saved { commit, parent } => {
                         if landed == 0 {
                             first_parent = parent.clone();
                             chained &= parent.is_some();
                         } else {
-                            chained &= parent.is_some() && *parent == reached;
+                            chained &= parent.is_some() && parent == reached;
                         }
-                        reached = Some(commit.clone());
+                        reached = Some(commit);
                         landed += 1;
-                        true
                     }
-                    _ => false,
-                };
-                outcome = Some(result);
-                if !saved {
-                    break;
+                    written => {
+                        ended = Some(written);
+                        break;
+                    }
                 }
             }
             this.update(cx, |this, cx| {
@@ -3275,35 +3442,34 @@ impl NodePeek {
                         read_at = reached;
                     }
                 }
-                // After the removal landed, a failed addition leaves the group without the
-                // relationship it replaced: said so, not "nothing was written".
-                let partly = |message: &str| {
-                    format!(
-                        "The relationship it replaces was removed, but the new one was not \
-                         added. {message}"
-                    )
+                // After the removal landed, an addition that did not leaves the group without
+                // the relationship it replaced: said first, never "nothing was written".
+                let notice = match ended {
+                    None | Some(EdgeWritten::Saved { .. }) => None,
+                    Some(EdgeWritten::NotWritten(mut notice)) if landed > 0 => {
+                        notice.message = format!(
+                            "The relationship it replaces was removed, but the new one was not \
+                             added. {}",
+                            notice.message
+                        );
+                        Some(notice)
+                    }
+                    Some(EdgeWritten::Unsettled(mut notice)) if landed > 0 => {
+                        notice.message = format!(
+                            "The relationship it replaces was removed. {}",
+                            notice.message
+                        );
+                        Some(notice)
+                    }
+                    Some(EdgeWritten::NotWritten(notice) | EdgeWritten::Unsettled(notice)) => {
+                        Some(notice)
+                    }
                 };
-                match outcome {
-                    Some(SaveResult::Saved { .. }) | None => {}
-                    Some(SaveResult::NoMatch) => {
-                        let message = "Nothing changed: it was already so, or changed elsewhere";
-                        let message = if landed > 0 {
-                            partly(message)
-                        } else {
-                            message.to_owned()
-                        };
-                        this.group_notices
-                            .insert(index, Notice::new(Tone::Conflict, message));
-                    }
-                    Some(SaveResult::Refused(mut notice) | SaveResult::Unknown(mut notice)) => {
-                        if landed > 0 {
-                            notice.message = partly(&notice.message);
-                        }
-                        this.group_notices.insert(index, notice);
-                    }
+                if let Some(notice) = notice {
+                    this.group_notices.insert(index, notice);
                 }
                 this.reload_group(index, read_at, cx);
-                if this.saving.is_empty() && this.edge_writes.is_empty() {
+                if !this.writes_out() {
                     this.compare_head(cx);
                 }
                 cx.notify();
@@ -3318,7 +3484,7 @@ impl NodePeek {
     /// it when it has any.
     fn reload_group(&mut self, index: usize, at: Option<String>, cx: &mut Context<Self>) {
         let snapshot = at.or_else(|| self.snapshot.clone());
-        self.load_group_at(index, snapshot, false, true, cx);
+        self.read_group(index, snapshot, false, GroupRead::Whole { open: true }, cx);
     }
 
     /// ⌘S: the node's drafts as one mutation, each bound to the value it was typed over, so one
@@ -4147,12 +4313,13 @@ impl NodePeek {
             .as_ref()
             .filter(|adding| adding.index == index)
             .map(|adding| self.render_add_row(adding, cx));
+        // An unknown outcome offers History, where it is settled.
         let notice = self.group_notices.get(&index).map(|notice| {
-            h_flex()
-                .pl(px(CHILD_INDENT))
-                .gap(px(space::SM))
-                .child(Indicator::dot().color(notice.tone.color()))
-                .child(studio_ui::ds::text::meta(notice.message.clone()).color(notice.tone.color()))
+            div().pl(px(CHILD_INDENT)).child(blob_write::notice_row(
+                format!("peek-group-notice-{index}"),
+                notice,
+                None,
+            ))
         });
         let body = group
             .expanded
@@ -4176,7 +4343,9 @@ impl NodePeek {
         let required = self.required_edge_properties(index);
         let replaces = self.holds_one(index)
             && matches!(self.groups[index].count, Loadable::Loaded(n) if n > 0);
-        let refused = self.change_refusal(cx);
+        let refused = self
+            .change_refusal(cx)
+            .or_else(|| self.replace_refusal(index));
         let tooltip = if let Some(reason) = refused.clone() {
             reason
         } else if !required.is_empty() {
@@ -4220,46 +4389,26 @@ impl NodePeek {
     /// the relationship is written to.
     fn render_add_row(&self, adding: &AddEdge, cx: &mut Context<Self>) -> AnyElement {
         let index = adding.index;
-        let other = self.groups[index].group.other_type.clone();
-        let hover = studio_ui::ds::surface::highlight(cx);
-        let selected = studio_ui::ds::surface::highlight(cx);
         let branch = self.session.read(cx).branch.clone();
         let replaces = self.holds_one(index)
             && matches!(self.groups[index].count, Loadable::Loaded(n) if n > 0);
         let found = match &adding.found {
-            Loadable::Loaded(found) if found.is_empty() => {
+            Loadable::Loaded(()) if adding.offers.is_empty() => {
                 studio_ui::ds::text::meta("No match").into_any_element()
             }
-            Loadable::Loaded(found) => v_flex()
-                .children(found.iter().enumerate().map(|(n, node)| {
-                    let highlighted = n == adding.highlighted;
-                    h_flex()
-                        .id(SharedString::from(format!("peek-found-{index}-{n}")))
-                        .px(px(space::XS))
-                        .py(px(space::XXS))
-                        .gap(px(space::MD))
-                        .rounded(px(studio_ui::ds::radii(cx).sm))
-                        .cursor_pointer()
-                        .when(highlighted, |row| row.bg(selected))
-                        .when(!highlighted, |row| row.hover(move |s| s.bg(hover)))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            if let Some(adding) = this.adding.as_mut() {
-                                adding.highlighted = n;
-                            }
-                            this.add_highlighted(window, cx);
-                        }))
-                        .child(studio_ui::type_swatch(&other, cx))
-                        .child(
-                            studio_ui::ds::text::body(
-                                node.label.clone().unwrap_or_else(|| node.id.clone()),
-                            )
-                            .truncate(),
-                        )
-                        .when(node.label.is_some(), |row| {
-                            row.child(studio_ui::ds::text::meta(node.id.clone()).truncate())
-                        })
-                }))
-                .into_any_element(),
+            Loadable::Loaded(()) => {
+                let pick = cx.listener(move |this, picked: &usize, window, cx| {
+                    this.add_offered(*picked, window, cx)
+                });
+                studio_ui::ds::row_list(cx)
+                    .id(("peek-found", index))
+                    .children(adding.offers.rows(
+                        "peek-found-node",
+                        Rc::new(move |picked, window, cx| pick(&picked, window, cx)),
+                        cx,
+                    ))
+                    .into_any_element()
+            }
             Loadable::Failed(error) => {
                 studio_ui::ds::text::error_note(error.clone()).into_any_element()
             }
@@ -4547,6 +4696,60 @@ fn value_style(window: &Window, cx: &App) -> MarkdownStyle {
     style.base_text_style.line_height = gpui::relative(1.5);
     style.soft_break_as_hard_break = true;
     style
+}
+
+/// How relationship write `step` to `branch` ended, by the kind of commit its answer names as
+/// the session logs it ([`OutcomeKind::written`]): only a published commit moved the branch. A
+/// proposal or a snapshot moved none, and of a kind this build does not know, whether one moved
+/// is not known; neither is told as written, nor is an answer lost.
+fn edge_written(outcome: &WriteOutcome<ChangeOutput>, branch: &str, step: EdgeStep) -> EdgeWritten {
+    let (doing, done, leaves) = (step.doing(), step.done(), step.leaves());
+    if let WriteOutcome::Committed(output) = outcome
+        && let Some(commit) = &output.commit
+    {
+        let kind = OutcomeKind::written(Some((commit.graph_commit_id.clone(), commit.kind)));
+        let held = match kind {
+            OutcomeKind::Held {
+                commit,
+                held: HeldAs::Proposal,
+            } => Some(format!(
+                "{doing} was held as commit {}, on no branch until it is published to {branch}: \
+                 {branch} did not change{leaves}.",
+                studio_ui::short_commit_id(&commit)
+            )),
+            OutcomeKind::Held {
+                commit,
+                held: HeldAs::Snapshot,
+            } => Some(format!(
+                "{doing} was saved as snapshot {}, on no branch: {branch} did not change{leaves}.",
+                studio_ui::short_commit_id(&commit)
+            )),
+            OutcomeKind::Unknown { reason } => {
+                let message = format!("{reason}{leaves}. Check History before trying again.");
+                return EdgeWritten::Unsettled(Notice::new(Tone::Unknown, message));
+            }
+            OutcomeKind::Committed { .. } | OutcomeKind::Refused { .. } => None,
+        };
+        if let Some(message) = held {
+            return EdgeWritten::Unsettled(Notice::new(Tone::Conflict, message));
+        }
+    }
+    match save_result(outcome, branch) {
+        SaveResult::Saved { commit, parent } => EdgeWritten::Saved { commit, parent },
+        SaveResult::NoMatch => EdgeWritten::NotWritten(Notice::new(
+            Tone::Conflict,
+            "Nothing changed: it was already so, or changed elsewhere",
+        )),
+        SaveResult::Refused(notice) => EdgeWritten::NotWritten(notice),
+        // A relationship keeps no draft: what may have landed is in the branch's history.
+        SaveResult::Unknown(_) => EdgeWritten::Unsettled(Notice::new(
+            Tone::Unknown,
+            format!(
+                "The server's answer was lost, so whether {done} is not known{leaves}. Check \
+                 History before trying again."
+            ),
+        )),
+    }
 }
 
 /// Reads a group's first edges (`reads`) at `snapshot` through `scope`: one more than the view
@@ -4976,6 +5179,19 @@ mod tests {
         (view, cx)
     }
 
+    /// The add search as it is once its read found the nodes `ids`, the first highlighted.
+    fn found(adding: &mut AddEdge, ids: &[&str]) {
+        let offers = ids
+            .iter()
+            .map(|id| crate::suggest::Suggestion {
+                value: (*id).to_owned(),
+                label: None,
+            })
+            .collect();
+        adding.offers.set(offers, true);
+        adding.found = Loadable::Loaded(());
+    }
+
     fn edit_name(view: &Entity<NodePeek>, to: &str, cx: &mut VisualTestContext) {
         view.update_in(cx, |view, window, cx| {
             let name = view.schema.as_ref().unwrap().node("Person").unwrap();
@@ -5122,6 +5338,25 @@ mod tests {
             let open = view.open_blob_action("doc");
             assert_eq!(open.at_commit.as_deref(), Some("c1"));
             assert!(open.held);
+        });
+    }
+
+    /// A slot keeps as many of its value's first bytes as judge its kind, so a Save names an SVG
+    /// whose root comes after its declaration and a comment as the preview shows it.
+    #[gpui::test]
+    async fn a_slot_names_a_saved_value_by_the_bytes_that_judge_its_kind(cx: &mut TestAppContext) {
+        let svg = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!-- a square -->\n<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"4\" height=\"4\"/>\n";
+        let (view, _session, _blobs, cx) = page_with_doc(Some(svg), None, cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.blobs[0].head,
+                svg.to_vec(),
+                "the whole of a short value"
+            );
+            assert_eq!(
+                suggested_file_name("p1", "doc", &view.blobs[0].head),
+                "p1-doc.svg"
+            );
         });
     }
 
@@ -5713,6 +5948,62 @@ mod tests {
                 [("Likes".to_owned(), "since".to_owned())]
             );
         });
+
+        // A peek of a table held at that commit, given the counts it read: the groups it opens
+        // read their neighbours the same way.
+        let session = view.read_with(cx, |view, _| view.session.clone());
+        let schema = session.read_with(cx, |session, _| session.schema_model().unwrap());
+        let known: HashMap<String, KnownRelation> = schema
+            .relationships_of("Person")
+            .iter()
+            .map(|group| {
+                let count = if group.edge == "Knows" { 0 } else { 1 };
+                let known = KnownRelation { count, first: None };
+                (builder::relationship_key(group), known)
+            })
+            .collect();
+        let values: Map<String, Value> =
+            serde_json::from_value(json!({ "@id": "p1", "slug": "p1", "name": "Ada" })).unwrap();
+        let peek = cx.update(|_, cx| {
+            cx.new(|cx| {
+                let subject = PeekSubject::Node {
+                    type_name: "Person".into(),
+                    id: "p1".into(),
+                };
+                let mut peek = NodePeek::new(
+                    session,
+                    subject,
+                    Some(values),
+                    Some("c0".into()),
+                    known,
+                    false,
+                    cx,
+                );
+                peek.hold_commit();
+                peek
+            })
+        });
+        let likes = peek.read_with(cx, |peek, _| {
+            peek.groups
+                .iter()
+                .position(|group| group.group.edge == "Likes")
+                .unwrap()
+        });
+        peek.update(cx, |peek, cx| peek.toggle_group(likes, cx));
+        cx.run_until_parked();
+        peek.read_with(cx, |peek, _| {
+            let group = &peek.groups[likes];
+            assert_eq!(
+                group.neighbours.loaded().map(Vec::len),
+                Some(1),
+                "read without since"
+            );
+            assert_eq!(group.count, Loadable::Loaded(1));
+            assert_eq!(
+                peek.groups_absent,
+                [("Likes".to_owned(), "since".to_owned())]
+            );
+        });
     }
 
     /// Another writer's commit that changed nothing the page shows moves the page to it without
@@ -5898,6 +6189,60 @@ mod tests {
         });
     }
 
+    /// A peek of a row of a table behind its branch compares the head the session has seen as
+    /// it opens, as a head move is compared: one whose node changed since offers Refresh at
+    /// once, rather than showing the table's older values as current, and one whose node did
+    /// not moves to the head.
+    #[gpui::test]
+    async fn a_peek_of_a_table_behind_its_branch_compares_the_head_as_it_opens(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, writer) = session_followed(
+            PEOPLE,
+            |_| {
+                json!([
+                    { "n": { "@id": "p1", "slug": "p1", "name": "Ada" } },
+                    { "n": { "@id": "p2", "slug": "p2", "name": "Grace" } },
+                ])
+            },
+            cx,
+        );
+        let (table, cx) = cx.add_window_view({
+            let session = session.clone();
+            move |window, cx| {
+                crate::TypeTable::new(
+                    gpui::WeakEntity::new_invalid(),
+                    session,
+                    "Person".into(),
+                    None,
+                    window,
+                    cx,
+                )
+            }
+        });
+        cx.run_until_parked();
+        // Another writer changes p1: the table stays at c1, behind.
+        writer.commit("c2", vec![changed("node", "Person", "p1", None)]);
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        let peek = table.update(cx, |table, cx| table.peek_row(0, cx));
+        cx.run_until_parked();
+        peek.read_with(cx, |peek, _| {
+            assert_eq!(peek.reads_at(), Some("c1"), "the table's commit");
+            assert!(peek.is_newer(), "its node changed since");
+        });
+        let peek = table.update(cx, |table, cx| table.peek_row(1, cx));
+        cx.run_until_parked();
+        peek.read_with(cx, |peek, _| {
+            assert_eq!(peek.reads_at(), Some("c2"), "nothing it shows changed");
+            assert!(!peek.is_newer());
+        });
+    }
+
     /// Refresh after another writer's commit reads again only the relationship groups it
     /// changed: the others are answered from the commit the page showed (spec 015).
     #[gpui::test]
@@ -6024,20 +6369,60 @@ mod tests {
         });
     }
 
-    /// A replace is two commits: the page follows both, and when the addition fails after the
-    /// removal landed it says the old relationship is gone rather than that nothing was written.
+    /// A replace is two commits, since one mutation either adds or removes: the page follows
+    /// both. When the addition does not land after the removal did, it says the old
+    /// relationship is gone, never that nothing was written: refused, it was not added; its
+    /// answer lost, whether it was added is not known, and History is where that is settled. A
+    /// removal whose answer is lost sends no addition, and says so.
     #[gpui::test]
     async fn a_replaced_relationship_follows_both_commits_and_reports_a_half(
         cx: &mut TestAppContext,
     ) {
         use crate::test_support::{committed, session_writing};
         let refused = json!({ "error": "__dst 'p9' not found in Person", "code": "bad_request" });
-        for (second, both) in [
-            ((200, committed("c3", "c2")), true),
-            ((400, refused), false),
-        ] {
-            let session = session_writing(KNOWS, vec![(200, committed("c2", "c1")), second], cx);
-            let (view, cx) = page(session, cx);
+        let lost = (500, json!({}));
+        let cases = [
+            // The second write's answer; the first's, which lands, comes first.
+            (Some((200, committed("c3", "c2"))), "c3", None),
+            (
+                Some((400, refused)),
+                "c2",
+                Some((
+                    Tone::Refused,
+                    "The relationship it replaces was removed, but the new one was not added. \
+                     Nothing was written. __dst 'p9' not found in Person",
+                )),
+            ),
+            (
+                Some(lost.clone()),
+                "c2",
+                Some((
+                    Tone::Unknown,
+                    "The relationship it replaces was removed. The server's answer was lost, so \
+                     whether the new one was added is not known. Check History before trying \
+                     again.",
+                )),
+            ),
+            // The removal's answer lost: nothing more is sent.
+            (
+                None,
+                "c1",
+                Some((
+                    Tone::Unknown,
+                    "The server's answer was lost, so whether the relationship it replaces was \
+                     removed is not known, and the new one was not sent. Check History before \
+                     trying again.",
+                )),
+            ),
+        ];
+        for (second, at, said) in cases {
+            let answers = match second {
+                Some(second) => vec![(200, committed("c2", "c1")), second],
+                None => vec![lost.clone(), (200, committed("c2", "c1"))],
+            };
+            let session = session_writing(KNOWS, answers, cx);
+            let (view, cx) = page(session.clone(), cx);
+            let before = session.read_with(cx, |session, _| session.outcomes.len());
             view.update_in(cx, |view, window, cx| {
                 view.snapshot = Some("c1".into());
                 view.write_edge(
@@ -6049,26 +6434,125 @@ mod tests {
                 );
             });
             cx.run_until_parked();
+            let sent = session.read_with(cx, |session, _| session.outcomes.len()) - before;
+            assert_eq!(sent, if at == "c1" { 1 } else { 2 }, "writes sent");
             view.read_with(cx, |view, _| {
-                if both {
-                    assert_eq!(
-                        view.snapshot.as_deref(),
-                        Some("c3"),
-                        "followed both commits"
-                    );
+                assert_eq!(view.snapshot.as_deref(), Some(at), "followed what landed");
+                let notice = view
+                    .group_notices
+                    .get(&0)
+                    .map(|n| (n.tone, n.message.as_str()));
+                assert_eq!(notice, said);
+                if said.is_none() {
                     assert!(!view.newer);
-                    assert!(!view.group_notices.contains_key(&0));
-                } else {
-                    assert_eq!(view.snapshot.as_deref(), Some("c2"), "the removal landed");
-                    let notice = view.group_notices.get(&0).expect("the half is reported");
-                    assert!(
-                        notice
-                            .message
-                            .starts_with("The relationship it replaces was removed"),
-                        "{}",
-                        notice.message
-                    );
                 }
+            });
+        }
+    }
+
+    /// A relationship each node needs exactly one of (`@card(1..1)`) cannot be replaced: its
+    /// removal alone is refused, as is a second one added first, and the server takes the two
+    /// in no one mutation. Its "+" says so, and a choice sends nothing. One that may hold none
+    /// is still added to while it has none.
+    #[gpui::test]
+    async fn a_relationship_that_needs_its_one_neighbour_is_not_replaced_and_says_why(
+        cx: &mut TestAppContext,
+    ) {
+        const MENTOR: &str = "node Person {\n  slug: String @key\n  name: String\n}\nedge Mentor: Person -> Person @card(1..1)\n";
+        let (session, _) = session_routing(
+            MENTOR,
+            |request| match request["name"].as_str() {
+                Some("studio_node") => {
+                    json!([{ "n": { "@id": "p1", "slug": "p1", "name": "Ada" } }])
+                }
+                Some("studio_neighbours") => json!([{ "id": "p2", "edge_id": "e1" }]),
+                _ => json!([]),
+            },
+            cx,
+        );
+        let (view, cx) = page(session.clone(), cx);
+        let refusal = "Each Person has exactly one Mentor, so Studio cannot replace it: the \
+                       server takes its removal and the new one only as two commits, and each \
+                       alone breaks that rule.";
+        let before = session.read_with(cx, |session, _| session.outcomes.len());
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.holds_one(0));
+            assert_eq!(view.groups[0].count, Loadable::Loaded(1));
+            assert_eq!(view.replace_refusal(0).as_deref(), Some(refusal));
+            view.start_add(0, window, cx);
+            assert!(view.adding.is_none(), "the search does not open");
+            // A search opened before the group was counted: the choice sends nothing.
+            view.groups[0].count = Loadable::NotLoaded;
+            view.start_add(0, window, cx);
+            view.groups[0].count = Loadable::Loaded(1);
+            found(view.adding.as_mut().unwrap(), &["p3"]);
+            view.add_highlighted(window, cx);
+            assert!(view.adding.is_none());
+            assert!(view.edge_writes.is_empty(), "nothing is written");
+            let notice = view.group_notices.get(&0).expect("why");
+            assert_eq!(
+                (notice.tone, notice.message.as_str()),
+                (Tone::Invalid, refusal)
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            session.read_with(cx, |session, _| session.outcomes.len()),
+            before,
+            "nothing was sent"
+        );
+
+        // A node without its mentor yet takes one.
+        view.update(cx, |view, _| {
+            view.groups[0].count = Loadable::Loaded(0);
+            assert_eq!(view.replace_refusal(0), None);
+        });
+    }
+
+    /// A relationship write whose commit is on no branch (a proposal or a snapshot), or of a
+    /// kind this build does not know, is told as it is, as the session logs it: the view does not
+    /// move to that commit, and says the branch did not change, or that whether it did is not
+    /// known.
+    #[gpui::test]
+    async fn a_relationship_written_to_no_branch_is_told_as_it_is(cx: &mut TestAppContext) {
+        use crate::test_support::{committed, session_writing};
+        let of_kind = |kind: &str| {
+            let mut answer = committed("c2", "c1");
+            answer["commit"]["kind"] = json!(kind);
+            answer
+        };
+        for (kind, tone, said) in [
+            (
+                "unpublished",
+                Tone::Conflict,
+                "Adding it was held as commit c2, on no branch until it is published to main: \
+                 main did not change.",
+            ),
+            (
+                "unattached",
+                Tone::Conflict,
+                "Adding it was saved as snapshot c2, on no branch: main did not change.",
+            ),
+            (
+                "rebased",
+                Tone::Unknown,
+                "The server wrote commit c2, of a kind Studio does not know, so whether a branch \
+                 moved is not known. Check History before trying again.",
+            ),
+        ] {
+            let session = session_writing(KNOWS, vec![(200, of_kind(kind))], cx);
+            let (view, cx) = page(session, cx);
+            view.update_in(cx, |view, window, cx| {
+                view.write_edge(0, EdgeChange::Add("p9".into()), None, window, cx);
+            });
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.snapshot.as_deref(), Some("c1"), "{kind}: did not move");
+                let notice = view
+                    .group_notices
+                    .get(&0)
+                    .map(|n| (n.tone, n.message.as_str()));
+                assert_eq!(notice, Some((tone, said)), "{kind}");
             });
         }
     }
@@ -6109,12 +6593,13 @@ mod tests {
             adding
                 .editor
                 .update(cx, |editor, cx| editor.set_text("grace", window, cx));
-            adding.found = Loadable::Loaded(vec![Neighbour {
-                id: "p1".into(),
-                label: None,
-                edge_id: None,
-            }]);
+            found(adding, &["p1", "p2"]);
             adding.answers = Some("gr".into());
+            // ↑ from the first goes around to the last, and ↓ back, as every offer list moves.
+            view.move_match(-1, cx);
+            assert_eq!(view.adding.as_ref().unwrap().offers.highlighted(), Some(1));
+            view.move_match(1, cx);
+            assert_eq!(view.adding.as_ref().unwrap().offers.highlighted(), Some(0));
             view.confirm_add(window, cx);
             assert!(
                 view.adding.is_some(),
@@ -6134,12 +6619,7 @@ mod tests {
         let (view, cx) = page(session_answering(KNOWS, 400, refused, cx), cx);
         view.update_in(cx, |view, window, cx| {
             view.start_add(0, window, cx);
-            let adding = view.adding.as_mut().unwrap();
-            adding.found = Loadable::Loaded(vec![Neighbour {
-                id: "p9".into(),
-                label: None,
-                edge_id: None,
-            }]);
+            found(view.adding.as_mut().unwrap(), &["p9"]);
             view.add_highlighted(window, cx);
             assert!(view.adding.is_none(), "the search closes on a choice");
         });
@@ -6296,6 +6776,63 @@ mod tests {
             assert_eq!(view.value_of("name"), json!("Ada"), "read");
             let tone = view.drafts_notice.as_ref().map(|notice| notice.tone);
             assert_eq!(tone, Some(Tone::Refused), "why it did not land");
+        });
+    }
+
+    /// A field's write that lands after the node was read again while it was out (a Refresh,
+    /// another field's conflict) shows the value written at its commit, not the value the read
+    /// found before the write; one that lands past another writer's commit leaves the view at
+    /// its own, showing what it read there.
+    #[gpui::test]
+    async fn a_field_saved_after_its_node_was_read_again_shows_the_value_written(
+        cx: &mut TestAppContext,
+    ) {
+        let session = session(PEOPLE, cx);
+        let (view, cx) = page(session.clone(), cx);
+        let name = view.read_with(cx, |view, _| view.property_named("name").cloned().unwrap());
+        let saved = |parent: &str, commit: &str, cx: &mut VisualTestContext| {
+            view.update_in(cx, |view, window, cx| {
+                view.saving.insert("name".into());
+                let field = FieldWrite {
+                    property: name.clone(),
+                    old: json!("Ada"),
+                    new: json!("Ada Lovelace"),
+                    text: "Ada Lovelace".into(),
+                    shown: json!("Ada"),
+                    sent: None,
+                };
+                let result = SaveResult::Saved {
+                    commit: commit.into(),
+                    parent: Some(parent.into()),
+                };
+                view.finish_write(field, result, window, cx);
+            });
+        };
+        // Refresh read the node at c1 while the write was out: it found "Ada".
+        view.update(cx, |view, cx| view.reload(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.snapshot.as_deref(), Some("c1"));
+            assert_eq!(view.value_of("name"), json!("Ada"));
+        });
+        saved("c1", "c2", cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.snapshot.as_deref(), Some("c2"), "its own commit");
+            assert_eq!(
+                view.value_of("name"),
+                json!("Ada Lovelace"),
+                "as written there"
+            );
+        });
+
+        // Read again at c1, and the write lands past another writer's commit: the view stays at
+        // c1, with what c1 holds.
+        view.update(cx, |view, cx| view.reload(cx));
+        cx.run_until_parked();
+        saved("c5", "c6", cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.snapshot.as_deref(), Some("c1"));
+            assert_eq!(view.value_of("name"), json!("Ada"), "what c1 holds");
         });
     }
 
@@ -6609,15 +7146,9 @@ mod tests {
             cx,
         );
         let (view, cx) = page(session, cx);
-        let found = || {
-            Loadable::Loaded(vec![Neighbour {
-                id: "p3".into(),
-                label: None,
-                edge_id: None,
-            }])
-        };
         view.update_in(cx, |view, window, cx| {
             assert!(view.holds_one(0), "a person has one mentor");
+            assert_eq!(view.replace_refusal(0), None, "one that may have none");
             // As a table hands its chips: the neighbour, not its edge.
             view.groups[0].neighbours = Loadable::Loaded(vec![Neighbour {
                 id: "p2".into(),
@@ -6625,7 +7156,7 @@ mod tests {
                 edge_id: None,
             }]);
             view.start_add(0, window, cx);
-            view.adding.as_mut().unwrap().found = found();
+            found(view.adding.as_mut().unwrap(), &["p3"]);
             view.add_highlighted(window, cx);
             assert!(view.adding.is_some(), "the search stays open");
             assert!(view.edge_writes.is_empty(), "nothing is written");
@@ -6633,7 +7164,7 @@ mod tests {
         cx.run_until_parked();
         view.update_in(cx, |view, window, cx| {
             assert_eq!(view.replaced_edge(0), Some(Some("e1".to_owned())));
-            view.adding.as_mut().unwrap().found = found();
+            found(view.adding.as_mut().unwrap(), &["p3"]);
             view.add_highlighted(window, cx);
             assert!(view.adding.is_none());
             assert!(view.edge_writes.contains(&0), "the replace is written");
@@ -6799,6 +7330,125 @@ mod tests {
         });
         cx.run_until_parked();
         (view, session, blobs, cx)
+    }
+
+    /// Save… reads the value a slot shows where it is held, the value its size is: a file
+    /// stored from a view behind its branch is read at the write's own commit, not at the view's,
+    /// which holds the value it replaced. A value no commit the view knows holds (its table's
+    /// own write past another writer's commit) is not offered to Save, which says why.
+    #[gpui::test]
+    async fn a_value_stored_from_a_view_behind_is_saved_from_where_it_is_held(
+        cx: &mut TestAppContext,
+    ) {
+        const DOCS_AND_NOTES: &str = "node Person {\n  slug: String @key\n  name: String\n  doc: Blob?\n}\nnode Note {\n  slug: String @key\n  file: Blob?\n}\n";
+        let (session, blobs) = crate::test_support::session_with_blobs(DOCS_AND_NOTES, cx);
+        blobs
+            .versioned
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (view, cx) = cx.add_window_view({
+            let session = session.clone();
+            move |_, cx| NodePeek::page(session, "Person".into(), "p1".into(), None, cx)
+        });
+        cx.run_until_parked();
+        // The view's own value, at c2, which it follows.
+        let file = crate::test_support::upload_file("first.txt", b"first", None);
+        view.update(cx, |view, cx| view.upload_blob("doc", file, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.reads_at(), Some("c2")));
+        // Another writer's commit, c3, to another type; the view stays at c2, behind it.
+        let note = BlobCell {
+            edge: false,
+            type_name: "Note".into(),
+            id: "n1".into(),
+            property: "file".into(),
+        };
+        session
+            .update(cx, |session, cx| {
+                session.blob_put_on("main", note, None, b"note".to_vec(), "Note".into(), cx)
+            })
+            .detach();
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            view.snapshot = Some("c2".into());
+            view.newer = true;
+        });
+        // Stored from behind: "second" lands at c4, past c3.
+        let file = crate::test_support::upload_file("second.txt", b"second", None);
+        view.update(cx, |view, cx| view.upload_blob("doc", file, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.reads_at(), Some("c2"), "behind");
+            assert_eq!(view.blob_size("doc"), Some(6));
+            assert_eq!(view.save_refusal(0), None);
+        });
+        let target = std::env::temp_dir()
+            .join(format!("studio-peek-save-{}", std::process::id()))
+            .join("p1-doc.txt");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::remove_file(&target).ok();
+        view.update(cx, |view, cx| view.save_blob(0, cx));
+        cx.run_until_parked();
+        cx.simulate_new_path_selection(|_| Some(target.clone()));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(
+                matches!(&view.blobs[0].save, Some(SaveState::Saved(path)) if *path == target),
+                "{:?}",
+                view.blobs[0].save
+            );
+        });
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"second",
+            "the value shown"
+        );
+
+        // A peek of a table whose own Blob write went past another writer's commit: the value
+        // its cell shows is held at no commit the peek knows.
+        let values: Map<String, Value> =
+            serde_json::from_value(json!({ "@id": "p1", "slug": "p1", "name": "Ada" })).unwrap();
+        let shown = blobs.get("Person/p1/doc").unwrap();
+        let blobs_shown = TableBlobs {
+            at: BlobsAt::Unknown,
+            shown: HashMap::from([(
+                "doc".to_owned(),
+                BlobMeta::Managed {
+                    size: shown.0.len() as u64,
+                    etag: Some(shown.1),
+                },
+            )]),
+        };
+        let peek = cx.update(|_, cx| {
+            cx.new(|cx| {
+                NodePeek::from_table(
+                    session.clone(),
+                    PeekSubject::Node {
+                        type_name: "Person".into(),
+                        id: "p1".into(),
+                    },
+                    values,
+                    Some("c2".into()),
+                    HashMap::new(),
+                    blobs_shown,
+                    false,
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+        peek.update(cx, |peek, cx| {
+            assert_eq!(peek.blob_size("doc"), Some(6), "as the table shows it");
+            assert_eq!(
+                peek.save_refusal(0),
+                Some("Studio knows no commit that holds this value. Refresh, then save it.")
+            );
+            peek.save_blob(0, cx);
+            assert!(peek.blobs[0]._save.is_none(), "nothing is read");
+        });
     }
 
     /// A file still being stored when the view moves to another branch goes on to the branch

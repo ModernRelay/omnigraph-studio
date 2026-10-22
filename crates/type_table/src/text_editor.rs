@@ -1,6 +1,7 @@
 //! A text property in an editor of its own (spec 014): Zed's editor beside the markdown it
 //! renders, as Zed's markdown preview to the side. ⌘S saves it bound to the value it was read
-//! at, as every node property saves, so a value changed elsewhere meanwhile is not overwritten.
+//! at, or a draft opened here to the value it was typed over, as every node property saves, so
+//! a value changed elsewhere meanwhile is not overwritten.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,8 +54,8 @@ pub struct TextEditor {
     type_name: String,
     id: String,
     property: String,
-    /// What saves are bound to: the value as it was read, or as it was last saved; set
-    /// through [`Self::set_old`] only.
+    /// What saves are bound to: the value as it was read (for a draft, the value it was typed
+    /// over), or as it was last saved; set through [`Self::set_old`] only.
     old: Loadable<Value>,
     /// `old` as the editor shows it, made once per value rather than at each keystroke.
     old_text: Option<String>,
@@ -64,6 +65,10 @@ pub struct TextEditor {
     read_at: Option<String>,
     /// Text typed in a field before it was opened here, kept over the value read.
     typed: Option<String>,
+    /// The value `typed` was typed over, when it is the property's draft: what the first save is
+    /// bound to, whatever the read finds at `read_at`, which a Refresh since may have moved past
+    /// a change made elsewhere.
+    typed_over: Option<Value>,
     label: Option<String>,
     editor: Entity<Editor>,
     preview: Entity<Markdown>,
@@ -81,7 +86,8 @@ pub struct TextEditor {
 impl TextEditor {
     /// The editor for `property` of a node, read at `read_at` (the commit a field was being
     /// edited at, so saves stay bound to what was read) or the branch head, showing `typed`
-    /// when text was typed before it was opened here.
+    /// when text was typed before it was opened here. Typed text that is the property's draft
+    /// on the session's branch is bound, as the draft is, to the value it was typed over.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         session: Entity<GraphSession>,
@@ -131,6 +137,18 @@ impl TextEditor {
         ];
         let schema = session.read(cx).schema_model();
         let branch = session.read(cx).branch.clone();
+        // A draft opened here keeps the value it was typed over, which the session holds with
+        // it: the value read now may be one changed elsewhere since, which a save bound to it
+        // would overwrite.
+        let key = DraftKey {
+            type_name: type_name.clone(),
+            id: id.clone(),
+            property: property.clone(),
+        };
+        let typed_over = typed.as_ref().and_then(|text| {
+            let draft = session.read(cx).draft_on(&branch, &key)?;
+            (draft.text == *text).then(|| draft.old.clone())
+        });
         // On another branch, an editor with nothing unsaved reads the property there; one
         // with unsaved text keeps writing to the branch it was read on, and says so.
         let follow = cx.subscribe_in(&session, window, |this, _, event, window, cx| {
@@ -169,6 +187,7 @@ impl TextEditor {
             unsaved: false,
             read_at,
             typed,
+            typed_over,
             label: None,
             editor,
             preview,
@@ -278,8 +297,11 @@ impl TextEditor {
                 match result {
                     Ok(output) => match node_rows(&output.rows).into_iter().next() {
                         Some(row) => {
-                            let value = row.values.get(&property).cloned().unwrap_or(Value::Null);
+                            let read = row.values.get(&property).cloned().unwrap_or(Value::Null);
                             this.label = this.label_from(&row.values);
+                            // A draft's text stays bound to the value it was typed over: a
+                            // change made since shows as a conflict when it is saved.
+                            let value = this.typed_over.take().unwrap_or(read);
                             this.set_old(Loadable::Loaded(value));
                             let old = this.old_text.clone().unwrap_or_default();
                             let text = this.typed.take().unwrap_or(old);
@@ -411,6 +433,7 @@ impl TextEditor {
     fn take_theirs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.state = State::Idle;
         self.read_at = None;
+        self.typed_over = None;
         self.read(window, cx);
     }
 
@@ -420,6 +443,7 @@ impl TextEditor {
         self.state = State::Idle;
         self.read_at = None;
         self.typed = Some(self.text(cx));
+        self.typed_over = None;
         self.read(window, cx);
     }
 
@@ -853,6 +877,65 @@ mod tests {
             assert_eq!(view.text(cx), "Ada Lovelace");
             assert!(view.is_dirty(cx));
         });
+    }
+
+    /// A draft opened here (⌘⇧↵ on a peek's field) after its node was read again, another
+    /// writer's change in between, stays bound to the value it was typed over, not to the one
+    /// read now: its save finds the change rather than overwriting it. Without a draft, typed
+    /// text is bound to the value read, as before.
+    #[gpui::test]
+    async fn a_draft_opened_here_is_bound_to_the_value_it_was_typed_over(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, sent) = crate::test_support::session_recording_writes(PEOPLE, cx);
+        cx.run_until_parked();
+        let key = DraftKey {
+            type_name: "Person".into(),
+            id: "p1".into(),
+            property: "name".into(),
+        };
+        // Typed over "Ada Byron", which another writer has made "Ada" since: the read finds
+        // "Ada".
+        session.update(cx, |session, cx| {
+            let draft = DraftEntry {
+                old: json!("Ada Byron"),
+                text: "Ada Lovelace".into(),
+            };
+            session.set_draft(key, draft, cx);
+        });
+        let (view, cx) = cx.add_window_view({
+            let session = session.clone();
+            move |window, cx| {
+                TextEditor::new(
+                    session,
+                    "Person".into(),
+                    "p1".into(),
+                    "name".into(),
+                    Some("c1".into()),
+                    Some("Ada Lovelace".into()),
+                    window,
+                    cx,
+                )
+            }
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(
+                matches!(&view.old, Loadable::Loaded(old) if old == "Ada Byron"),
+                "the draft's value, not the one read: {:?}",
+                view.old
+            );
+            assert_eq!(view.text(cx), "Ada Lovelace");
+            assert!(view.is_dirty(cx));
+        });
+        save(&view, cx);
+        let sent = sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let params: Vec<&Value> = sent[0]["params"].as_object().unwrap().values().collect();
+        assert!(params.contains(&&json!("Ada Byron")), "{params:?}");
+        assert!(!params.contains(&&json!("Ada")), "{params:?}");
     }
 
     /// Typing finds the tab dirty or clean against the value read, a text typed back to it
