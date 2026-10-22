@@ -12,7 +12,7 @@ use graph_client::api::ChangeOutput;
 use graph_store::{AccessAction, AccessScope, GraphSession};
 use serde_json::{Map, Value};
 
-use crate::model::{Notice, SaveResult, Tone, save_result};
+use crate::model::{Notice, SaveResult, Tone, published, save_result};
 
 /// Why the credential may not change `branch`, once the access route refused it (spec 002):
 /// every control that writes there is disabled with this as its reason. `None` while it may,
@@ -50,13 +50,16 @@ impl Bound {
         }
     }
 
-    /// Whether it committed, setting every one of the `rows` nodes it was sent for.
+    /// Whether it published a commit on its branch, setting every one of the `rows` nodes it
+    /// was sent for: a commit held off every branch, or of a kind not known, did not land.
     pub(crate) fn landed(&self, rows: usize) -> bool {
-        matches!(
-            self,
-            Bound::Sent(WriteOutcome::Committed(output))
-                if output.commit.is_some() && output.affected_nodes as usize == rows
-        )
+        match self {
+            Bound::Sent(WriteOutcome::Committed(output)) => {
+                output.affected_nodes as usize == rows
+                    && published(output.commit.as_ref(), "").is_ok_and(|commit| commit.is_some())
+            }
+            _ => false,
+        }
     }
 }
 
@@ -221,6 +224,7 @@ fn send_bound(
     cx: &mut App,
 ) -> Result<Task<Bound>, String> {
     let branch = branch.to_owned();
+    let written = read.len();
     let is_list = |property: &str| {
         schema
             .node(type_name)
@@ -278,7 +282,12 @@ fn send_bound(
         let Some(head) = output.graph_commit_id.clone() else {
             return Bound::Changed;
         };
-        if !holds(&output.rows, &lists) {
+        // Every node the write sets gone: nothing to send.
+        let found = found(&output.rows);
+        if lists.len() == written && lists.iter().all(|(id, _)| !found.contains_key(id.as_str())) {
+            return Bound::Changed;
+        }
+        if !holds(&found, &lists) {
             return Bound::Changed;
         }
         let write = session.update(cx, |session, cx| {
@@ -288,20 +297,25 @@ fn send_bound(
     }))
 }
 
-/// Whether the nodes a `nodes_fields_by_id` read found hold each value as `read` says, every
-/// node there.
-fn holds(rows: &Value, read: &[Read]) -> bool {
-    let found: HashMap<&str, &Map<String, Value>> = rows
-        .as_array()
+/// The nodes a `nodes_fields_by_id` read found, by id.
+fn found(rows: &Value) -> HashMap<&str, &Map<String, Value>> {
+    rows.as_array()
         .into_iter()
         .flatten()
         .filter_map(|row| {
             let row = row.as_object()?;
             Some((row.get("id")?.as_str()?, row))
         })
-        .collect();
+        .collect()
+}
+
+/// Whether each node `found` holds each value as `read` says. A node not found is gone: its
+/// statement sets nothing, so it fails only its own part of the write, which the commit's
+/// `affected_nodes` comes back short by and the caller reads again, finding the row gone; the
+/// other nodes are written.
+fn holds(found: &HashMap<&str, &Map<String, Value>>, read: &[Read]) -> bool {
     read.iter().all(|(id, values)| {
-        found.get(id.as_str()).is_some_and(|row| {
+        found.get(id.as_str()).is_none_or(|row| {
             values.iter().all(|(property, old)| {
                 let held = row.get(&builder::field_column(property));
                 same_value(held.unwrap_or(&Value::Null), old)
@@ -323,13 +337,18 @@ mod tests {
 
     const TAGGED: &str = "node Person {\n  slug: String @key\n  tags: [String]?\n}\n";
 
-    /// A list cannot be compared in a write's `where`: its write is sent only when the value
-    /// at the branch's head is the one read, and bound to that head. A bulk set reads every
-    /// row there in one read before it is sent.
-    #[gpui::test]
-    async fn a_list_write_is_bound_to_the_head_it_found_the_value_at(cx: &mut TestAppContext) {
+    /// Every write sent, by path and the commit it was bound to.
+    type Sent = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+    /// A server whose head `c5` holds `a, b` in the tags of every node asked for but those in
+    /// `gone`, and commits `c6` on it: the session, the writes sent, and the snapshot of every
+    /// read.
+    fn tagged_session(
+        gone: &'static [&'static str],
+        cx: &mut TestAppContext,
+    ) -> (Entity<GraphSession>, Sent, Arc<Mutex<Vec<Value>>>) {
         use futures::AsyncReadExt as _;
-        let writes = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
+        let writes: Sent = Arc::default();
         let reads = Arc::new(Mutex::new(Vec::<Value>::new()));
         let (sent, read) = (writes.clone(), reads.clone());
         let http = FakeHttpClient::create(move |request| {
@@ -353,6 +372,7 @@ mod tests {
                         .unwrap_or_default();
                     let rows: Vec<Value> = ids
                         .iter()
+                        .filter(|id| !gone.contains(&id.as_str().unwrap_or_default()))
                         .map(|id| json!({ "id": id, "v_tags": ["a", "b"] }))
                         .collect();
                     json!({
@@ -385,6 +405,15 @@ mod tests {
         let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
         let session =
             cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        (session, writes, reads)
+    }
+
+    /// A list cannot be compared in a write's `where`: its write is sent only when the value
+    /// at the branch's head is the one read, and bound to that head. A bulk set reads every
+    /// row there in one read before it is sent.
+    #[gpui::test]
+    async fn a_list_write_is_bound_to_the_head_it_found_the_value_at(cx: &mut TestAppContext) {
+        let (session, writes, reads) = tagged_session(&[], cx);
         let schema = gq_language::SchemaModel::parse(TAGGED).unwrap();
         let save = |old: Value, cx: &mut TestAppContext| {
             let task = cx.update(|cx| {
@@ -448,5 +477,50 @@ mod tests {
         let writes = writes.lock().unwrap();
         assert_eq!(writes.len(), 2);
         assert_eq!(writes[1].1.as_deref(), Some("c5"));
+    }
+
+    /// A node gone at the head fails only its own part of a list write: its statement sets
+    /// nothing, the other nodes are written, bound to that head, and the commit's count comes
+    /// back short by it. A write whose every node is gone sends nothing.
+    #[gpui::test]
+    async fn a_node_gone_elsewhere_fails_only_its_own_part_of_a_list_write(
+        cx: &mut TestAppContext,
+    ) {
+        let (session, writes, _) = tagged_session(&["gone"], cx);
+        let schema = gq_language::SchemaModel::parse(TAGGED).unwrap();
+        let rows = vec![
+            ("q1".to_owned(), json!(["a", "b"])),
+            ("gone".to_owned(), json!(["a", "b"])),
+        ];
+        let set = |rows: &[(String, Value)], cx: &mut TestAppContext| {
+            let task = cx.update(|cx| {
+                write_cells(
+                    &session,
+                    "main",
+                    &schema,
+                    "Person",
+                    "tags",
+                    rows,
+                    &json!(["c"]),
+                    None,
+                    "Set tags".into(),
+                    cx,
+                )
+                .unwrap()
+            });
+            cx.run_until_parked();
+            cx.foreground_executor().block_on(task)
+        };
+        assert!(matches!(
+            set(&rows, cx),
+            Bound::Sent(WriteOutcome::Committed(_))
+        ));
+        {
+            let writes = writes.lock().unwrap();
+            assert_eq!(writes.len(), 1);
+            assert_eq!(writes[0].1.as_deref(), Some("c5"), "bound to the head read");
+        }
+        assert!(matches!(set(&rows[1..], cx), Bound::Changed));
+        assert_eq!(writes.lock().unwrap().len(), 1, "nothing more sent");
     }
 }

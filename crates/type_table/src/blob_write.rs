@@ -18,10 +18,10 @@ use gpui::{App, AsyncApp, Entity, PathPromptOptions, Task};
 use gq_language::{ScalarKind, SchemaModel};
 use graph_client::api::{BLOB_PUT_MAX, BlobWriteOutput, BlobWriteState};
 use graph_client::{BlobCell, BlobMeta, WriteOutcome};
-use graph_store::GraphSession;
+use graph_store::{GraphSession, OutcomeKind};
 use ui::prelude::*;
 
-use crate::model::{Notice, Tone};
+use crate::model::{Notice, Tone, held_notice};
 
 /// What a Blob write does to its cell.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,16 +291,40 @@ pub(crate) fn read_upload(path: &Path) -> Result<Upload, String> {
     Ok(Upload { name, bytes })
 }
 
-/// Stores the file at `path` in `cell` on `branch`, bound to `shown`, the value the view shows,
-/// read at `read_at`, the commit it shows (`None`: the branch head). The file is read off the
-/// main thread, and refused over [`BLOB_PUT_MAX`] before anything is sent. This is the whole of
-/// an upload but the picker, so a test can drive it.
+/// What a Blob write is bound to ([`bind`]): `shown`, the value the view shows, as read at
+/// `read_at`, the commit it shows (`None`: the branch head).
+pub(crate) struct Binding {
+    pub shown: BlobMeta,
+    pub read_at: Option<String>,
+}
+
+/// Stores the file at `path` in `cell` on `branch`, bound to `shown` read at `read_at`, as the
+/// view held them when the file was chosen ([`upload_bound`]).
 pub(crate) fn upload(
     session: &Entity<GraphSession>,
     branch: &str,
     cell: BlobCell,
     shown: BlobMeta,
     read_at: Option<String>,
+    path: PathBuf,
+    cx: &mut App,
+) -> Task<BlobWritten> {
+    let binding = move |_: &mut App| Binding { shown, read_at };
+    upload_bound(session, branch, cell, binding, path, cx)
+}
+
+/// Stores the file at `path` in `cell` on `branch`, bound to what `binding` gives when the write
+/// is sent. It is asked once, after the file is read off the main thread, so a view gives what
+/// it shows then: one of its own writes landing while the file is read moves the commit its
+/// values hold at, and every validator of the type with it, so a binding taken when the file
+/// was chosen would name the one before and be refused as changed elsewhere. A file over
+/// [`BLOB_PUT_MAX`] is refused before anything is sent. This is the whole of an upload but the
+/// picker, so a test can drive it.
+pub(crate) fn upload_bound(
+    session: &Entity<GraphSession>,
+    branch: &str,
+    cell: BlobCell,
+    binding: impl FnOnce(&mut App) -> Binding + 'static,
     path: PathBuf,
     cx: &mut App,
 ) -> Task<BlobWritten> {
@@ -311,6 +335,7 @@ pub(crate) fn upload(
             Ok(upload) => upload,
             Err(message) => return BlobWritten::Refused(Notice::new(Tone::Invalid, message)),
         };
+        let Binding { shown, read_at } = cx.update(binding);
         let if_match = match bind(&session, &branch, &cell, &shown, read_at.as_deref(), cx).await {
             Ok(if_match) => if_match,
             Err(unsent) => return unsent,
@@ -474,11 +499,31 @@ async fn written(
                     etag: output.etag,
                 },
             };
-            BlobWritten::Saved {
-                commit: output.commit.as_ref().map(|c| c.graph_commit_id.clone()),
-                parent: output.commit.and_then(|c| c.parent_commit_id),
-                meta,
-                bound,
+            // By the commit's kind, as the session logs it: only a published commit is the
+            // branch's. A proposal or a snapshot left the branch as it was, and of a kind this
+            // build does not know, whether it moved is not known.
+            let made = output.commit.as_ref();
+            match OutcomeKind::written(made.map(|c| (c.graph_commit_id.clone(), c.kind))) {
+                OutcomeKind::Committed { commit } => BlobWritten::Saved {
+                    parent: commit
+                        .as_ref()
+                        .and(made)
+                        .and_then(|c| c.parent_commit_id.clone()),
+                    commit,
+                    meta,
+                    bound,
+                },
+                OutcomeKind::Held { commit, held } => {
+                    BlobWritten::Refused(held_notice(&commit, held, branch))
+                }
+                OutcomeKind::Unknown { reason } => BlobWritten::Unknown(Notice::new(
+                    Tone::Unknown,
+                    format!("{reason}. Check History before trying again."),
+                )),
+                OutcomeKind::Refused { message } => BlobWritten::Refused(Notice::new(
+                    Tone::Refused,
+                    format!("Nothing was written. {message}"),
+                )),
             }
         }
         WriteOutcome::Refused(error)
@@ -713,5 +758,98 @@ mod tests {
         assert!(dropped_file(&[]).is_err());
         assert!(dropped_file(&["a".into(), "b".into()]).is_err());
         assert_eq!(dropped_file(&["a".into()]), Ok(PathBuf::from("a")));
+    }
+
+    /// An upload is bound to what the view shows as the write is sent, after the file is read:
+    /// the view's own write landing meanwhile gave the value a new ETag, which the write carries,
+    /// and it is stored rather than refused as changed elsewhere.
+    #[gpui::test]
+    async fn an_upload_is_bound_to_what_the_view_shows_as_it_is_sent(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::{cell::RefCell, rc::Rc};
+        let (session, blobs) = crate::test_support::session_with_blobs(NOTES, cx);
+        let chosen = blobs.set("Note/n1/attachment", b"one");
+        let file = crate::test_support::upload_file("bound.txt", b"bound", None);
+        let managed = |etag: &str| BlobMeta::Managed {
+            size: 3,
+            etag: Some(etag.to_owned()),
+        };
+        let shown = Rc::new(RefCell::new(managed(&chosen)));
+        let asked = shown.clone();
+        let write = cx.update(|cx| {
+            let binding = move |_: &mut App| Binding {
+                shown: asked.borrow().clone(),
+                read_at: None,
+            };
+            upload_bound(&session, "main", cell(false), binding, file, cx)
+        });
+        // While the file is read, the view's own write stores a value of the same size.
+        let now = blobs.set("Note/n1/attachment", b"two");
+        *shown.borrow_mut() = managed(&now);
+        cx.run_until_parked();
+        let written = futures::executor::block_on(write);
+        assert!(matches!(written, BlobWritten::Saved { .. }), "{written:?}");
+        let writes = blobs.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].if_match.as_deref(), Some(now.as_str()));
+    }
+
+    /// A write's receipt is judged by its commit's kind: a proposal or a snapshot left the
+    /// branch as it was, so the view does not move to it, and of a kind not known, whether the
+    /// branch moved is not known.
+    #[gpui::test]
+    async fn a_blob_write_held_off_its_branch_is_not_saved(cx: &mut gpui::TestAppContext) {
+        let (session, _) = crate::test_support::session_with_blobs(NOTES, cx);
+        let receipt = |kind: &str| -> BlobWriteOutput {
+            serde_json::from_value(serde_json::json!({
+                "selector": {"entity": "node", "type": "Note", "id": "n1", "property": "attachment"},
+                "branch": "main",
+                "kind": "managed",
+                "size": 3,
+                "etag": "\"e9\"",
+                "commit": {
+                    "graph_commit_id": "c9",
+                    "graph_manifest_version": 2,
+                    "created_at": 0,
+                    "parent_commit_id": "c8",
+                    "kind": kind,
+                },
+            }))
+            .unwrap()
+        };
+        let ended = |kind: &str, cx: &mut gpui::TestAppContext| {
+            let (session, receipt) = (session.clone(), receipt(kind));
+            let task = cx.update(|cx| {
+                cx.spawn(async move |cx| {
+                    let outcome = WriteOutcome::Committed(receipt);
+                    written(outcome, &session, "main", &cell(false), true, cx).await
+                })
+            });
+            cx.run_until_parked();
+            futures::executor::block_on(task)
+        };
+        let BlobWritten::Refused(notice) = ended("unpublished", cx) else {
+            panic!("a proposal is not saved");
+        };
+        assert!(
+            notice.message.starts_with("main did not change"),
+            "{}",
+            notice.message
+        );
+        assert!(matches!(ended("unattached", cx), BlobWritten::Refused(_)));
+        assert!(matches!(ended("a_new_kind", cx), BlobWritten::Unknown(_)));
+        assert_eq!(
+            ended("published", cx),
+            BlobWritten::Saved {
+                commit: Some("c9".into()),
+                parent: Some("c8".into()),
+                meta: BlobMeta::Managed {
+                    size: 3,
+                    etag: Some("\"e9\"".into()),
+                },
+                bound: true,
+            }
+        );
     }
 }

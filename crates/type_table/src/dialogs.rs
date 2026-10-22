@@ -13,11 +13,11 @@ use gpui::{
 };
 use gq_language::{BuiltQuery, Property, ScalarKind, SchemaModel, builder};
 use graph_store::deletes::{self, DeletePlan};
-use graph_store::{DraftKey, FollowUp, GraphSession, Loadable};
+use graph_store::{DraftKey, FollowUp, GraphSession, Loadable, REVIEW_CHANGE_CAP};
 use serde_json::{Map, Value};
 use ui::prelude::*;
 
-use crate::model::{Notice, SaveResult, Tone, parse_input, save_result};
+use crate::model::{Notice, SaveResult, TableKind, Tone, parse_input, save_result};
 use crate::offers::Offers;
 use crate::suggest;
 use crate::table::TypeTable;
@@ -906,13 +906,16 @@ impl DeleteRowModal {
         session: Entity<GraphSession>,
         schema: Arc<SchemaModel>,
         type_name: String,
+        kind: TableKind,
         targets: Vec<DeleteTarget>,
         if_commit: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let branch = session.read(cx).branch.clone();
-        let edges = schema.edge(&type_name).is_some();
+        // The table's kind, not the schema's first match: a node type and an edge type may
+        // share a name, and the table shows the one it was opened on.
+        let edges = kind == TableKind::Edge;
         let phrase = Self::phrase_for(&targets);
         let confirm = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
@@ -950,7 +953,18 @@ impl DeleteRowModal {
             _subscription: subscription,
         };
         if edges {
-            this.undo_unavailable = this.schema.edge(&this.type_name).and_then(|edge| {
+            // A relationship delete removes the relationships picked and nothing else, so what
+            // Undo would put back is counted here: no more than it puts back in one commit, the
+            // most a review folds.
+            let picked = this.targets.len();
+            let past_cap = (picked > REVIEW_CHANGE_CAP).then(|| {
+                format!(
+                    "It removes {} relationships, more than the {} Undo puts back in one commit.",
+                    studio_ui::group_digits(picked),
+                    studio_ui::group_digits(REVIEW_CHANGE_CAP)
+                )
+            });
+            let unrestorable = this.schema.edge(&this.type_name).and_then(|edge| {
                 edge.properties.iter().find(|p| !p.projectable()).map(|p| {
                     format!(
                         "{}.{} holds {} values, which Undo cannot restore.",
@@ -958,6 +972,7 @@ impl DeleteRowModal {
                     )
                 })
             });
+            this.undo_unavailable = unrestorable.or(past_cap);
         } else {
             this.start_plan(window, cx);
         }
@@ -1520,5 +1535,108 @@ mod tests {
         modal.update_in(cx, |modal, window, cx| {
             assert!(modal.to.editor.focus_handle(cx).is_focused(window));
         });
+    }
+
+    /// A node type and an edge type may share a name. The dialog deletes what the table shows:
+    /// a `Review` node, with what depends on it read first and Undo judged for nodes, not a
+    /// `Review` relationship.
+    #[gpui::test]
+    async fn a_delete_takes_the_kind_its_table_shows(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let schema = Arc::new(
+            SchemaModel::parse(
+                "node Person {\n  slug: String @key\n}\n\
+                 node Review {\n  slug: String @key\n}\n\
+                 edge Review: Person -> Person\n",
+            )
+            .unwrap(),
+        );
+        assert!(schema.node("Review").is_some() && schema.edge("Review").is_some());
+        let target = DeleteTarget {
+            id: "r1".into(),
+            label: None,
+            endpoints: None,
+        };
+        for (kind, edges) in [(TableKind::Node, false), (TableKind::Edge, true)] {
+            let (session, schema, target) = (session(cx), schema.clone(), target.clone());
+            let (modal, cx) = cx.add_window_view(|window, cx| {
+                DeleteRowModal::new(
+                    WeakEntity::new_invalid(),
+                    session,
+                    schema,
+                    "Review".into(),
+                    kind,
+                    vec![target],
+                    Some("c1".into()),
+                    window,
+                    cx,
+                )
+            });
+            modal.read_with(cx, |modal, _| {
+                assert_eq!(modal.edges, edges, "{kind:?}");
+                // A node delete reads what depends on it; a relationship's has nothing to read.
+                assert_eq!(matches!(modal.plan, Loadable::NotLoaded), edges, "{kind:?}");
+            });
+        }
+    }
+
+    /// More relationships picked than Undo puts back in one commit are deleted only once typed
+    /// for, and the toast offers no Undo; as many as it puts back are confirmed with ↵.
+    #[gpui::test]
+    async fn an_edge_delete_past_what_undo_puts_back_is_confirmed_by_typing(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let schema = Arc::new(
+            SchemaModel::parse(
+                "node Person {\n  slug: String @key\n}\nedge Knows: Person -> Person\n",
+            )
+            .unwrap(),
+        );
+        for (picked, typed) in [(REVIEW_CHANGE_CAP, false), (REVIEW_CHANGE_CAP + 1, true)] {
+            let targets: Vec<DeleteTarget> = (0..picked)
+                .map(|i| DeleteTarget {
+                    id: format!("e{i}"),
+                    label: None,
+                    endpoints: Some(("a".into(), "b".into())),
+                })
+                .collect();
+            let (session, schema) = (session(cx), schema.clone());
+            let (modal, cx) = cx.add_window_view(|window, cx| {
+                DeleteRowModal::new(
+                    WeakEntity::new_invalid(),
+                    session,
+                    schema,
+                    "Knows".into(),
+                    TableKind::Edge,
+                    targets,
+                    Some("c1".into()),
+                    window,
+                    cx,
+                )
+            });
+            modal.read_with(cx, |modal, cx| {
+                assert_eq!(modal.undo_unavailable.is_some(), typed, "{picked}");
+                assert_eq!(!modal.confirmed(cx), typed, "{picked}");
+                if typed {
+                    let reason = modal.undo_unavailable.as_deref().unwrap();
+                    assert!(
+                        reason.contains("20,001") && reason.contains("20,000"),
+                        "{reason}"
+                    );
+                    assert!(
+                        modal
+                            .description()
+                            .contains("Type delete 20001 to confirm.")
+                    );
+                }
+            });
+        }
     }
 }

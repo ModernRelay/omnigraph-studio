@@ -11,7 +11,8 @@ use gq_language::{
     EdgeType, Filter, FilterOp, NodeType, PageStart, Property, RelationshipGroup, ScalarKind,
 };
 use graph_client::WriteOutcome;
-use graph_client::api::ChangeOutput;
+use graph_client::api::{ChangeOutput, CommitOutput};
+use graph_store::{HeldAs, OutcomeKind};
 use serde_json::{Map, Value};
 
 /// The system column holding a node's or edge's `@id`.
@@ -900,14 +901,15 @@ pub const UNKNOWN_MESSAGE: &str = "Check History before trying again; your chang
 /// Classifies a write's outcome. `branch` names the write target in a denial.
 pub fn save_result(outcome: &WriteOutcome<ChangeOutput>, branch: &str) -> SaveResult {
     match outcome {
-        WriteOutcome::Committed(output) => match &output.commit {
-            Some(commit) if output.affected_nodes + output.affected_edges > 0 => {
+        WriteOutcome::Committed(output) => match published(output.commit.as_ref(), branch) {
+            Ok(Some(commit)) if output.affected_nodes + output.affected_edges > 0 => {
                 SaveResult::Saved {
                     commit: commit.graph_commit_id.clone(),
                     parent: commit.parent_commit_id.clone(),
                 }
             }
-            _ => SaveResult::NoMatch,
+            Ok(_) => SaveResult::NoMatch,
+            Err(unsettled) => unsettled,
         },
         WriteOutcome::Refused(error) => SaveResult::Refused(refusal(
             error.status,
@@ -919,6 +921,51 @@ pub fn save_result(outcome: &WriteOutcome<ChangeOutput>, branch: &str) -> SaveRe
             SaveResult::Unknown(Notice::new(Tone::Unknown, UNKNOWN_MESSAGE))
         }
     }
+}
+
+/// The commit a write that went through published on `branch`, by its kind as the session
+/// logs it ([`OutcomeKind::written`]): `Ok(None)` for none. Only a published commit moved the
+/// branch. A proposal or a snapshot is on no branch, so the write is not saved there, its draft
+/// stays and nothing moves to it; of a kind this build does not know, whether the branch moved is
+/// not known. Either is the save's outcome, `Err`.
+pub fn published<'a>(
+    commit: Option<&'a CommitOutput>,
+    branch: &str,
+) -> Result<Option<&'a CommitOutput>, SaveResult> {
+    let Some(commit) = commit else {
+        return Ok(None);
+    };
+    match OutcomeKind::written(Some((commit.graph_commit_id.clone(), commit.kind))) {
+        OutcomeKind::Committed { commit: None } => Ok(None),
+        OutcomeKind::Committed { commit: Some(_) } => Ok(Some(commit)),
+        OutcomeKind::Held { commit, held } => {
+            Err(SaveResult::Refused(held_notice(&commit, held, branch)))
+        }
+        OutcomeKind::Unknown { reason } => Err(SaveResult::Unknown(Notice::new(
+            Tone::Unknown,
+            format!("{reason}. {UNKNOWN_MESSAGE}."),
+        ))),
+        OutcomeKind::Refused { message } => Err(SaveResult::Refused(Notice::new(
+            Tone::Refused,
+            format!("Nothing was written. {message}"),
+        ))),
+    }
+}
+
+/// What a write held off every branch says: it is not on `branch`, which did not change.
+pub fn held_notice(commit: &str, held: HeldAs, branch: &str) -> Notice {
+    let commit = studio_ui::short_commit_id(commit);
+    let message = match held {
+        HeldAs::Proposal => format!(
+            "{branch} did not change: the server held the write as commit {commit}, on no \
+             branch until it is published to {branch}."
+        ),
+        HeldAs::Snapshot => format!(
+            "{branch} did not change: the server saved the write as snapshot {commit}, on no \
+             branch."
+        ),
+    };
+    Notice::new(Tone::Conflict, message)
 }
 
 fn refusal(status: u16, reason: &str, precondition: bool, branch: &str) -> Notice {
@@ -1561,6 +1608,45 @@ mod tests {
             changed_elsewhere(None, Some(&json!("CEO"))).message,
             "Changed elsewhere to “CEO” while you were editing"
         );
+    }
+
+    /// A commit no branch moved to is not a save: a proposal or a snapshot leaves the branch as
+    /// it was and the draft kept, and a kind this build does not know is an outcome not known.
+    #[test]
+    fn a_commit_on_no_branch_is_not_a_save() {
+        use graph_client::api::CommitKind;
+        let of_kind = |kind: CommitKind| {
+            let mut outcome = committed(1, Some("c1"));
+            if let WriteOutcome::Committed(output) = &mut outcome
+                && let Some(commit) = &mut output.commit
+            {
+                commit.kind = kind;
+            }
+            save_result(&outcome, "main")
+        };
+        let SaveResult::Refused(notice) = of_kind(CommitKind::Unpublished) else {
+            panic!("a proposal is not saved")
+        };
+        assert_eq!(notice.tone, Tone::Conflict);
+        assert!(
+            notice
+                .message
+                .starts_with("main did not change: the server held"),
+            "{}",
+            notice.message
+        );
+        let SaveResult::Refused(notice) = of_kind(CommitKind::Unattached) else {
+            panic!("a snapshot is not saved")
+        };
+        assert!(notice.message.contains("snapshot c2"), "{}", notice.message);
+        let SaveResult::Unknown(notice) = of_kind(CommitKind::Other) else {
+            panic!("a kind not known is an outcome not known")
+        };
+        assert!(notice.message.ends_with(&format!("{UNKNOWN_MESSAGE}.")));
+        assert!(matches!(
+            of_kind(CommitKind::Published),
+            SaveResult::Saved { .. }
+        ));
     }
 
     #[test]
