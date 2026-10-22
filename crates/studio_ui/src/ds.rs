@@ -258,6 +258,10 @@ pub mod size {
     /// A new window's size when none was remembered.
     pub const WINDOW_WIDTH: f32 = 1440.;
     pub const WINDOW_HEIGHT: f32 = 900.;
+    /// The About window, and the app icon it shows (spec 002, "About").
+    pub const ABOUT_WIDTH: f32 = 300.;
+    pub const ABOUT_HEIGHT: f32 = 240.;
+    pub const ABOUT_ICON: f32 = 64.;
     /// The least a code editor shrinks to when results share its column.
     pub const EDITOR_MIN_HEIGHT: f32 = 120.;
     /// A small gauge or spinner beside small text, and its stroke.

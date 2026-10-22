@@ -1,5 +1,12 @@
 [
   {
+    "context": "AboutWindow",
+    "bindings": {
+      "escape": "menu::Cancel",
+      "ctrl-w": "studio::CloseActiveItem"
+    }
+  },
+  {
     "bindings": {
       "ctrl-shift-p": "studio::ToggleCommandPalette",
       "ctrl-k": "studio::ToggleCommandPalette",
