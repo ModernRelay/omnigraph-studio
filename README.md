@@ -19,6 +19,12 @@ silicon), Linux tarballs (x86_64, arm64) and a Windows zip (x86_64, Windows 10 1
 macOS builds are not notarized and the Windows build is not signed yet; the release notes say
 how to open them. To build from source instead, see below.
 
+Studio checks for a newer version half a minute after launch and every hour (Settings →
+Updates, or Check for Updates in the app menu). On macOS it downloads the update, checks its
+signature and installs it, ready at the next restart; on Linux and Windows it says a newer
+version is out and links to it ([spec 017](specs/017-auto-update/plan.md)). Installing needs
+releases signed with the Developer ID and the update key, which 0.2.1 and earlier are not.
+
 ## Quick start
 
 Requirements:
@@ -155,7 +161,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 python3 script/check-layers.py
 python3 script/check-brand.py
+python3 script/test_release_files.py
 ```
+
+A release's updates are signed with an update key (spec 017). Make it once with `cargo packager
+signer generate` (cargo-packager 0.11.8): its public half goes in
+`crates/studio_update/update-key.pub`, the private half and its password in the release
+workflow's `STUDIO_UPDATER_KEY` and `STUDIO_UPDATER_KEY_PASSWORD` secrets.
 
 CI runs these checks on macOS, Linux and Windows for each pull request that changes more than
 documentation, and not again on merge. `crates/studio/examples/snapshot.rs` renders Studio
@@ -179,14 +191,15 @@ what is deferred, and a dated validation log of the checks behind each claim.
 | `crates/` | The workspace; `crates/studio` is the binary |
 | `grammars/` | Tree-sitter grammars for `.gq` and `.pg` |
 | `assets/` | Default keymaps and settings |
-| `script/` | Dev server, sample data, bundling, layer check |
+| `script/` | Dev server, sample data, bundling, release files, layer and spelling checks |
 
 ## Status
 
 Built against Omnigraph 0.14 (`edge-20261020-7fd9cc9`, HTTP contract 0.14); macOS is the primary platform, and Linux and Windows build and
 test in CI. Not implemented:
 
-- Signed and notarized releases, a Windows installer, auto-update.
+- Signed and notarized releases, which installing updates waits on; a Windows installer;
+  updates installed in place on Linux and Windows.
 - OIDC sign-in; Studio authenticates with bearer tokens.
 - Approvals and comments on reviews.
 - Features that depend on deferred engine changes ([spec 012](specs/012-omnigraph-engine-changes/plan.md)).
