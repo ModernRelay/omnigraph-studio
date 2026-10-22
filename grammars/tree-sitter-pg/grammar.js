@@ -1,5 +1,5 @@
 /**
- * Tree-sitter grammar for OmniGraph schemas (`.pg`), at OmniGraph v0.13.0.
+ * Tree-sitter grammar for Omnigraph schemas (`.pg`), at Omnigraph v0.13.0.
  *
  * Written from `crates/omnigraph-compiler/src/schema/schema.pest` at that tag, for colour and
  * outline in Studio's read-only schema view. A body constraint (`@unique(a, b)`) and an

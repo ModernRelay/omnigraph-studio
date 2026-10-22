@@ -16,7 +16,7 @@ Copy `.specify/templates/plan-template.md`. Sections, in order:
 1. **Status**: draft, accepted, in progress, implemented (with date), or superseded.
 2. **Problem**: what is wrong or missing, in the user's terms.
 3. **Principles**: the constitution principles this touches.
-4. **What exists today (checked)**: facts about Studio, Zed and OmniGraph that the design rests
+4. **What exists today (checked)**: facts about Studio, Zed and Omnigraph that the design rests
    on, each with a path or command.
 5. **Design**: what changes, with exact keys, states, copy, limits and timings.
 6. **Decisions**: each choice and the alternatives rejected, with reasons.
@@ -42,11 +42,11 @@ Add tasks, contracts or data-model files only for large features.
 | 009 | [History](009-history/plan.md) | built on 0.13 |
 | 010 | [Inspectors](010-inspectors/plan.md) | built on 0.13 |
 | 011 | [Agent panel](011-agent-panel/plan.md) | implemented |
-| 012 | [OmniGraph engine changes](012-omnigraph-engine-changes/plan.md) | deferred |
-| 013 | [The agent uses the OmniGraph CLI](013-agent-cli/plan.md) | implemented |
+| 012 | [Omnigraph engine changes](012-omnigraph-engine-changes/plan.md) | deferred |
+| 013 | [The agent uses the Omnigraph CLI](013-agent-cli/plan.md) | implemented |
 | 014 | [Node pages, editing in place, and long text](014-node-pages/plan.md) | part 1 built |
 | 015 | [One read model](015-read-model/plan.md) | draft |
 | 016 | [Studio as an OAuth client](016-oauth-client/plan.md) | draft |
 
-Each plan's first line holds its full status. 012 is not scheduled: it records every OmniGraph change Studio would use, what Studio does
+Each plan's first line holds its full status. 012 is not scheduled: it records every Omnigraph change Studio would use, what Studio does
 without it, and which plan waits on it. Each feature plan's Deferred section names its IDs.

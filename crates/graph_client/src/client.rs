@@ -1,4 +1,4 @@
-//! The HTTP client for one OmniGraph server (spec 003).
+//! The HTTP client for one Omnigraph server (spec 003).
 //!
 //! Reads return `Result<T, ReadError>`. Writes return a [`WriteOutcome`] and are never retried
 //! here (constitution III).
@@ -93,7 +93,7 @@ pub enum PropertyThen {
     Absent,
     /// It had this name; a historical read does not follow a rename.
     Named(String),
-    /// Its column carries no property identity (data written before OmniGraph 0.10), so the
+    /// Its column carries no property identity (data written before Omnigraph 0.10), so the
     /// server cannot tell which property it was.
     Unwitnessed,
 }
@@ -198,7 +198,7 @@ impl ServerHealth {
 struct RawResponse {
     status: StatusCode,
     contract: Option<String>,
-    /// `Retry-After` in seconds; the HTTP-date form is not used by OmniGraph.
+    /// `Retry-After` in seconds; the HTTP-date form is not used by Omnigraph.
     retry_after: Option<Duration>,
     headers: HeaderMap,
     body: Vec<u8>,
@@ -1332,7 +1332,7 @@ fn json<T: Serialize>(value: &T) -> Vec<u8> {
     serde_json::to_vec(value).expect("request types serialize")
 }
 
-/// Whether a read's answer is the server's: it carries the contract Studio speaks. OmniGraph
+/// Whether a read's answer is the server's: it carries the contract Studio speaks. Omnigraph
 /// stamps the header on every response it sends, errors included, as [`judge_write`] relies on
 /// too. A success without it is a server that does not say which contract it speaks. An error
 /// without it came from something between Studio and the server (a proxy, a gateway): it says
@@ -1388,7 +1388,7 @@ fn summary(status: StatusCode, body: &[u8]) -> ApiErrorSummary {
 ///
 /// - 2xx with the contract header: committed, with the body.
 /// - 4xx, 503 and 429 with the contract header and the server's error body: refused; the server
-///   did not admit or did not apply the write. OmniGraph stamps the header on every response
+///   did not admit or did not apply the write. Omnigraph stamps the header on every response
 ///   it sends, errors included, so an error without it came from something in between (a
 ///   proxy, a gateway), which cannot say whether the server applied the write.
 /// - Anything else (a lost contract header, an error without the server's body, other 5xx):

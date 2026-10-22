@@ -832,7 +832,7 @@ fn same(left: &[u8], right: &[u8]) -> bool {
             == 0
 }
 
-/// A refusal or error the gateway makes itself, as OmniGraph's `ErrorOutput` with the contract
+/// A refusal or error the gateway makes itself, as Omnigraph's `ErrorOutput` with the contract
 /// header, so the CLI shows it as a typed error.
 async fn answer(stream: &mut (impl AsyncWrite + Unpin), status: u16, code: &str, message: &str) {
     let body = serde_json::to_vec(&json!({ "error": message, "code": code })).unwrap_or_default();
@@ -1798,13 +1798,13 @@ mod tests {
         });
     }
 
-    /// A real omnigraph CLI that reads OmniGraph's version-1 operator configuration is chosen
+    /// A real omnigraph CLI that reads Omnigraph's version-1 operator configuration is chosen
     /// for the home Studio writes, and reaches the gateway over HTTPS with that home's token and
     /// certificate, both as the agent's shell runs it (the wrapper) and as `omnigraph_run` does
     /// (the private home): each request reaches the server with the person's token. The fake
     /// server's answer need not be one the CLI reads; what reached it is what is checked.
     #[test]
-    #[ignore = "needs: OMNIGRAPH_STUDIO_LIVE_CLI, an omnigraph CLI built from OmniGraph main at \
+    #[ignore = "needs: OMNIGRAPH_STUDIO_LIVE_CLI, an omnigraph CLI built from Omnigraph main at \
                 ff542202 or later"]
     fn a_live_cli_reaches_the_gateway_with_what_its_home_holds() {
         let cli = std::env::var_os("OMNIGRAPH_STUDIO_LIVE_CLI")
@@ -1894,7 +1894,7 @@ mod end_to_end {
     }
 
     #[test]
-    #[ignore = "needs a running OmniGraph server and an omnigraph CLI: set STUDIO_GATEWAY_E2E_*"]
+    #[ignore = "needs a running Omnigraph server and an omnigraph CLI: set STUDIO_GATEWAY_E2E_*"]
     fn the_stock_cli_reads_and_writes_its_branch_through_the_gateway() {
         let (Some(server), Some(token), Some(graph)) = (
             env("STUDIO_GATEWAY_E2E_SERVER"),

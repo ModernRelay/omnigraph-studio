@@ -632,7 +632,7 @@ mod tests {
         );
         let redirected = PathBuf::from(r"\\server\share\ada\AppData\Roaming");
         for roaming in [roaming, redirected] {
-            for name in ["OmniGraph Studio", "OmniGraph Studio Dev"] {
+            for name in ["Omnigraph Studio", "Omnigraph Studio Dev"] {
                 assert_eq!(
                     local_counterpart(
                         &roaming.join(name),
@@ -652,7 +652,7 @@ mod tests {
             );
             assert_eq!(
                 local_counterpart(
-                    &roaming.join("OmniGraph Studio"),
+                    &roaming.join("Omnigraph Studio"),
                     Some(roaming.as_path()),
                     None
                 ),

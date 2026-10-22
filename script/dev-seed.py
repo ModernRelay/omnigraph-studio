@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write Studio's development graph as OmniGraph NDJSON load envelopes.
+"""Write Studio's development graph as Omnigraph NDJSON load envelopes.
 
 Deterministic for a given size, so screenshots and tests see the same rows.
 

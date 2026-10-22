@@ -163,14 +163,14 @@ jobs:
           if [[ "$SIGNED" == "true" ]]; then
             mac="The macOS app is signed with a Developer ID and notarized."
           else
-            mac="The macOS app is signed ad hoc, not notarized. macOS blocks it the first time: open System Settings → Privacy & Security and choose Open Anyway, or run \`xattr -dr com.apple.quarantine \"/Applications/OmniGraph Studio.app\"\` after moving it to Applications."
+            mac="The macOS app is signed ad hoc, not notarized. macOS blocks it the first time: open System Settings → Privacy & Security and choose Open Anyway, or run \`xattr -dr com.apple.quarantine \"/Applications/Omnigraph Studio.app\"\` after moving it to Applications."
           fi
           cat > notes.md <<NOTES
-          OmniGraph Studio $version, built from ${GITHUB_SHA::7} by the release workflow.
+          Omnigraph Studio $version, built from ${GITHUB_SHA::7} by the release workflow.
 
           | File | Platform |
           |---|---|
-          | \`OmniGraph-Studio-$version-arm64.dmg\` | macOS 11 or later, Apple silicon |
+          | \`Omnigraph-Studio-$version-arm64.dmg\` | macOS 11 or later, Apple silicon |
           | \`omnigraph-studio-$version-linux-x86_64.tar.gz\` | Linux x86_64, glibc 2.35 or later (Ubuntu 22.04, Debian 12 and later); Wayland or X11, Vulkan |
           | \`omnigraph-studio-$version-linux-aarch64.tar.gz\` | Linux arm64, glibc 2.35 or later; Wayland or X11, Vulkan |
           | \`omnigraph-studio-$version-windows-x86_64.zip\` | Windows 10 (1809) or later, x86_64 |
@@ -183,9 +183,9 @@ jobs:
 
           On Windows, unzip anywhere and run \`omnigraph-studio.exe\`. It is not signed, so SmartScreen may ask first: choose More info, then Run anyway.
 
-          Studio connects to an OmniGraph server that speaks HTTP contract 0.14 (edge-20261020-7fd9cc9 or later); see the README for connecting and for a sample graph.
+          Studio connects to an Omnigraph server that speaks HTTP contract 0.14 (edge-20261020-7fd9cc9 or later); see the README for connecting and for a sample graph.
           NOTES
           flags=()
           [[ "$version" == 0.* ]] && flags+=(--prerelease)
           gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
-            --title "OmniGraph Studio $version" --notes-file notes.md "${flags[@]}"
+            --title "Omnigraph Studio $version" --notes-file notes.md "${flags[@]}"

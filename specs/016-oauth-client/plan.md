@@ -7,11 +7,11 @@ the open questions below · 2026-10-21
 
 A server that admits people through OIDC asks for a short-lived access token issued for it,
 and Studio has no way to get one. Studio connects with no credential, with a static token the
-OmniGraph CLI exports for a server target, or with a token typed into Studio. Against an OIDC
+Omnigraph CLI exports for a server target, or with a token typed into Studio. Against an OIDC
 server it gets a 401 and can only say so. A managed target gets no token (spec 003), and the
 change that moves targets onto the CLI's commands refuses it: the CLI's managed data credential
 is not Studio's to borrow (RFC #1017, Appendix A2). This plan
-makes Studio a standard OAuth public client of any OIDC-enabled OmniGraph server, self-hosted or
+makes Studio a standard OAuth public client of any OIDC-enabled Omnigraph server, self-hosted or
 managed, signing a person in through their browser. It is a spec only; nothing is implemented.
 
 ## Principles
@@ -26,7 +26,7 @@ managed, signing a person in through their browser. It is a spec only; nothing i
 - VII: loudness matches cost. A browser opens only when the person asks; refreshes are silent.
 - IX: work is bounded. Every fetch, the sign-in wait and refresh retries have limits; one
   refresh runs at a time per sign-in.
-- XII: evidence over assumption. Every server fact below is checked against OmniGraph main.
+- XII: evidence over assumption. Every server fact below is checked against Omnigraph main.
 
 ## What exists today (checked)
 
@@ -46,7 +46,7 @@ managed, signing a person in through their browser. It is a spec only; nothing i
     (`target list`/`inspect --json`, `credentials export` over a pipe), direct targets are
     refused, and managed targets are refused until this plan is built (spec 003).
   - Studio already binds a loopback listener for the agent gateway (spec 011, `a56532b`).
-- OmniGraph (main at `7fff9dfd`):
+- Omnigraph (main at `7fff9dfd`):
   - Every 401 carries `WWW-Authenticate: Bearer`, adding `error="invalid_token"` when a
     presented bearer was refused and, with OIDC configured,
     `resource_metadata="<url>"` (`crates/omnigraph-server/src/challenge.rs`;
@@ -124,7 +124,7 @@ Studio restarts; they hold no secrets.
 - Studio's `client_id` is the URL of its Client ID Metadata Document, an HTTPS JSON document
   ModernRelay publishes at a stable address (open question 1), used with an authorization
   server whose metadata says `client_id_metadata_document_supported: true`:
-  `{"client_id": <its URL>, "client_name": "OmniGraph Studio", "redirect_uris":
+  `{"client_id": <its URL>, "client_name": "Omnigraph Studio", "redirect_uris":
   ["http://127.0.0.1/callback"], "grant_types": ["authorization_code", "refresh_token"],
   "response_types": ["code"], "token_endpoint_auth_method": "none"}`. The loopback redirect is
   listed without a port; the authorization server must accept any port on it (RFC 8252 §7.3).
@@ -132,7 +132,7 @@ Studio restarts; they hold no secrets.
   pre-registered as a public client with loopback redirects. Its ID is kept in Studio per
   issuer, as data shipped with Studio, not typed by the person.
 - With neither, sign-in is refused: "The sign-in service at <issuer host> does not accept
-  OmniGraph Studio." Studio never registers itself dynamically.
+  Omnigraph Studio." Studio never registers itself dynamically.
 
 ### Signing in
 
@@ -242,7 +242,7 @@ Studio restarts; they hold no secrets.
   Its authorization server is AuthKit. Studio must not depend on `/openapi.json` being
   reachable through every deployment's proxy.
 - **ModernRelay**: publish Studio's Client ID Metadata Document at a stable HTTPS address.
-- **OmniGraph**: nothing beyond what main serves (A1 is implemented); tracked in #1025.
+- **Omnigraph**: nothing beyond what main serves (A1 is implemented); tracked in #1025.
 
 ## Decisions
 
@@ -290,11 +290,11 @@ Studio restarts; they hold no secrets.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
-| 2026-10-21 | The server's challenge, metadata and token rules are as stated | OmniGraph main `7fff9dfd`: `crates/omnigraph-server/src/challenge.rs` (tests render `Bearer resource_metadata="…/.well-known/oauth-protected-resource/mcp"` and the `error="invalid_token"` form), `src/oidc_identity.rs` `resource_metadata`, `src/handlers.rs` (the two well-known routes), `docs/user/operations/server.md` and `mcp.md` | As written under What exists today; the metadata names one issuer and only `header` bearer use |
+| 2026-10-21 | The server's challenge, metadata and token rules are as stated | Omnigraph main `7fff9dfd`: `crates/omnigraph-server/src/challenge.rs` (tests render `Bearer resource_metadata="…/.well-known/oauth-protected-resource/mcp"` and the `error="invalid_token"` form), `src/oidc_identity.rs` `resource_metadata`, `src/handlers.rs` (the two well-known routes), `docs/user/operations/server.md` and `mcp.md` | As written under What exists today; the metadata names one issuer and only `header` bearer use |
 | 2026-10-21 | GPUI keeps one keychain item per key string | Zed `v1.23.2` `crates/gpui/src/platform.rs` (`write_credentials(url, username, password)`, `read_credentials(url)`), `crates/gpui_macos/src/platform.rs` (`kSecAttrServer` = the key, `kSecAttrAccount` = the user) | A write replaces the item for its key; a read returns that one item's user and secret |
-| 2026-10-21 | The challenge's metadata URL follows the resource, and the server checks the claims Studio reads | OmniGraph main `7fff9dfd`: `crates/omnigraph-server/src/mcp.rs` (`advertised_metadata_url`: the well-known prefix before the resource's path, on the resource's origin), `src/oidc_identity.rs` (required `iss`, `sub`, `aud`, `iat`, `exp`; `aud` one string equal to the audience, `org_id` equal to the binding's organization, a bounded `client_id`) | A resource on another origin moves the metadata there; an `aud` array is refused, so Studio requires a string |
+| 2026-10-21 | The challenge's metadata URL follows the resource, and the server checks the claims Studio reads | Omnigraph main `7fff9dfd`: `crates/omnigraph-server/src/mcp.rs` (`advertised_metadata_url`: the well-known prefix before the resource's path, on the resource's origin), `src/oidc_identity.rs` (required `iss`, `sub`, `aud`, `iat`, `exp`; `aud` one string equal to the audience, `org_id` equal to the binding's organization, a bounded `client_id`) | A resource on another origin moves the metadata there; an `aud` array is refused, so Studio requires a string |
 | 2026-10-21 | The managed control plane's own design agrees with this plan | Its identity and client specifications, read at their current head (a private repository, not cited here) | It publishes each managed cluster's resource and metadata itself, on its own origin, not on the data host; it prefers metadata-document clients; refresh tokens rotate and must repeat the resource; a client never silently opens a browser or replays a write; OAuth access needs a public route to the data host. Its OAuth profile is built, off by default and enabled per deployment |
-| 2026-10-21 | A managed target can name its data endpoint without network access | OmniGraph main `docs/user/cli/targets.md` ("Configure destinations", `target inspect`) | `endpoint` is optional on a managed target and required for data operations |
+| 2026-10-21 | A managed target can name its data endpoint without network access | Omnigraph main `docs/user/cli/targets.md` ("Configure destinations", `target inspect`) | `endpoint` is optional on a managed target and required for data operations |
 
 ## Corrections
 

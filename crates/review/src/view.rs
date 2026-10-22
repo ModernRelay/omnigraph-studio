@@ -5622,7 +5622,7 @@ pub(crate) mod tests {
             .collect()
     }
 
-    /// A page of `chain` as OmniGraph pages a listing: `limit` commits from the place a
+    /// A page of `chain` as Omnigraph pages a listing: `limit` commits from the place a
     /// `page_token` names, and a token for the next page while more follow. Without `limit`,
     /// the whole chain.
     fn page_of(chain: &[Value], query: &str) -> Value {

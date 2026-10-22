@@ -17,12 +17,12 @@ use studio_actions::workspace::{
 
 pub fn set(cx: &mut App) {
     cx.set_menus([
-        Menu::new("OmniGraph Studio").items([
+        Menu::new("Omnigraph Studio").items([
             MenuItem::action("Settings…", OpenSettings),
             MenuItem::separator(),
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),
-            MenuItem::action("Quit OmniGraph Studio", Quit),
+            MenuItem::action("Quit Omnigraph Studio", Quit),
         ]),
         Menu::new("File").items([
             MenuItem::action("Open Graph…", OpenGraph),

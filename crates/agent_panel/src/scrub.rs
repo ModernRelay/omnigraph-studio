@@ -1,13 +1,13 @@
-//! OmniGraph's environment variables, which no process Studio starts for the agent inherits
+//! Omnigraph's environment variables, which no process Studio starts for the agent inherits
 //! (spec 013): neither the agent nor the CLI that `omnigraph_run` starts. Every variable whose
 //! name starts with `OMNIGRAPH_` is one: the CLI's tokens and addressing, tokens kept for other
 //! servers (`OMNIGRAPH_MR_BEARER_TOKEN`) and a local server's token list alike. Matching the
-//! prefix rather than a list of names removes a variable OmniGraph adds later too.
+//! prefix rather than a list of names removes a variable Omnigraph adds later too.
 
-/// What the name of every OmniGraph variable starts with.
+/// What the name of every Omnigraph variable starts with.
 pub(crate) const PREFIX: &str = "OMNIGRAPH_";
 
-/// Whether `name` is one of OmniGraph's variables: it starts with [`PREFIX`], in any ASCII case
+/// Whether `name` is one of Omnigraph's variables: it starts with [`PREFIX`], in any ASCII case
 /// when `fold_case`, as Windows reads names (there `omnigraph_profile` is the profile the CLI
 /// reads).
 pub(crate) fn is_omnigraph_variable(name: &str, fold_case: bool) -> bool {
@@ -20,10 +20,10 @@ pub(crate) fn is_omnigraph_variable(name: &str, fold_case: bool) -> bool {
     })
 }
 
-/// The OmniGraph variables among `names` that a process Studio starts for the agent must not
+/// The Omnigraph variables among `names` that a process Studio starts for the agent must not
 /// inherit, sorted: every one but those `kept` names, which the person set for the agent
 /// themselves (matched in any ASCII case when `fold_case`). A name that is not Unicode is left:
-/// it cannot be named on a command line here, and no program reads it by an OmniGraph name,
+/// it cannot be named on a command line here, and no program reads it by an Omnigraph name,
 /// which is.
 pub(crate) fn removed(
     names: impl IntoIterator<Item = std::ffi::OsString>,

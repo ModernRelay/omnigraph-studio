@@ -81,7 +81,7 @@ zlog = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 theme_settings = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 assets = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 
-# OmniGraph's parser and type checker. MIT; no Lance dependency.
+# Omnigraph's parser and type checker. MIT; no Lance dependency.
 omnigraph-compiler = { git = "https://github.com/ModernRelay/omnigraph", tag = "edge-20261020-7fd9cc9" }
 
 # Third party
@@ -101,7 +101,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # 013): rustls, which Studio's HTTP client already builds, over smol, with ring as its provider.
 futures-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
-# The patterns of OmniGraph's operator-config schema, which the agent's CLI home is tested against.
+# The patterns of Omnigraph's operator-config schema, which the agent's CLI home is tested against.
 regex = "1"
 smol = "2"
 schemars = "1"

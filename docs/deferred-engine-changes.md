@@ -1,10 +1,10 @@
-# Deferred OmniGraph engine changes
+# Deferred Omnigraph engine changes
 
-Studio's oldest supported server is the OmniGraph edge build `edge-20261020-7fd9cc9`, the first
-that speaks HTTP contract 0.14, and Studio changes nothing in the OmniGraph repository
+Studio's oldest supported server is the Omnigraph edge build `edge-20261020-7fd9cc9`, the first
+that speaks HTTP contract 0.14, and Studio changes nothing in the Omnigraph repository
 (constitution X). This is the index; the design of each change, its engine rules and its
 evidence are in [spec 012](../specs/012-omnigraph-engine-changes/plan.md). When one is picked up
-it goes through OmniGraph's own RFC process.
+it goes through Omnigraph's own RFC process.
 
 | ID | Change | Waiting spec | Studio does today |
 |---|---|---|---|
@@ -20,7 +20,7 @@ it goes through OmniGraph's own RFC process.
 | E14 | Read-only schema plan | later | Schema changes stay with `omnigraph cluster apply` |
 | E16 | Neighbourhood counts per node | 005, 006 | One count query per edge type, concurrent, cached per pinned commit |
 | E17 | `omnigraph lsp` language server | 007 | `gq_language` calls `omnigraph-compiler` in-process |
-| E18 | Tree-sitter grammars and a Zed extension in the OmniGraph repository | E17 | Grammars in this repository under `grammars/` |
+| E18 | Tree-sitter grammars and a Zed extension in the Omnigraph repository | E17 | Grammars in this repository under `grammars/` |
 | E19 | Publish `omnigraph-compiler` to crates.io again (stops at 0.8.0) | 001 | Git dependency on tag `edge-20261020-7fd9cc9` |
 | E20 | Delegated, branch-scoped credentials for agents, recorded in history beside the actor ([#978](https://github.com/ModernRelay/omnigraph/issues/978)) | 011, 013 | Agent commits are recorded under the person's actor, on a branch named `agent/<stamp>`; Studio's gateway keeps the agent's writes on that branch |
 | E25 | One mutation that both adds and removes (lift rule D2 for one write) | 014 | A relationship replacement saves as two ordered commits, or through a branch and a merge |

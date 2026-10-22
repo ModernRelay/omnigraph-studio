@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build "OmniGraph Studio.app" and a DMG in target/bundle (spec 001, "Shipping").
+# Build "Omnigraph Studio.app" and a DMG in target/bundle (spec 001, "Shipping").
 #
 #   script/bundle-mac            # release build
 #   script/bundle-mac --fast     # optimized without LTO (`release-fast`), to run day to day:
@@ -37,7 +37,7 @@ fi
 
 version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
 bundle_id=${STUDIO_BUNDLE_ID:-com.modernrelay.omnigraph-studio}
-name="OmniGraph Studio"
+name="Omnigraph Studio"
 arch=$(uname -m)
 
 if [[ "$profile" == release ]]; then
@@ -132,7 +132,7 @@ else
 fi
 /usr/bin/codesign --verify --strict --verbose=2 "$app"
 
-dmg="$out/OmniGraph-Studio-$version-$arch.dmg"
+dmg="$out/Omnigraph-Studio-$version-$arch.dmg"
 staging=$(mktemp -d)
 trap 'rm -rf "$staging"' EXIT
 cp -R "$app" "$staging/"

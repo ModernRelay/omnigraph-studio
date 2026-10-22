@@ -1,4 +1,4 @@
-//! Servers and tokens from the OmniGraph CLI's target files (spec 003).
+//! Servers and tokens from the Omnigraph CLI's target files (spec 003).
 //!
 //! Studio reads `$OMNIGRAPH_HOME` (else `~/.omnigraph`) the way the CLI does
 //! (`crates/omnigraph-cli/src/operator.rs` and `targets.rs`): `config.yaml` is
@@ -9,7 +9,7 @@
 //! `OMNIGRAPH_TOKEN_<OWNER>` for its credential owner, else `[<owner>] token = …` in
 //! `credentials` when that section's `endpoint` covers the target's. A token is sent only to the
 //! server it is keyed to: the untargeted `OMNIGRAPH_BEARER_TOKEN` goes to none, as the CLI
-//! dropped it (OmniGraph #1030). Studio never writes these files; it reads them again when they
+//! dropped it (Omnigraph #1030). Studio never writes these files; it reads them again when they
 //! change ([`stamp`]), their permissions included.
 
 use std::collections::BTreeMap;

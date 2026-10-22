@@ -1,6 +1,6 @@
-# The OmniGraph guide in Studio's agent skill
+# The Omnigraph guide in Studio's agent skill
 
-`upstream/` is a copy of the OmniGraph skill, unmodified: `skills/omnigraph/` and `LICENSE`
+`upstream/` is a copy of the Omnigraph skill, unmodified: `skills/omnigraph/` and `LICENSE`
 from [ModernRelay/omnigraph](https://github.com/ModernRelay/omnigraph) at tag
 `edge-20261020-7fd9cc9` (commit `7fd9cc9037c634e2f3284f1ede55a85a6f7b28e8`), the first build
 that speaks HTTP contract 0.14, as Studio does; its CLI has targets, which the agent's CLI must

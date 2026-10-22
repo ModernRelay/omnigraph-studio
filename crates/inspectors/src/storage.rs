@@ -696,7 +696,7 @@ impl Render for StorageInspector {
                         div()
                             .id("index-status")
                             .tooltip(ui::Tooltip::text(
-                                "OmniGraph does not serve index status yet; `explain` in the query editor shows a type's index facts",
+                                "Omnigraph does not serve index status yet; `explain` in the query editor shows a type's index facts",
                             ))
                             .child(studio_ui::ds::meta(IconName::Info, "Index status not served")),
                     ),
