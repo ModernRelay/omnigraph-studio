@@ -193,6 +193,19 @@ what was last saved at most every 250 ms rather than serializing every tab on ev
   graph"), not a chip of its own, so the bar stays as it was.
 - Not built: a `write · <branch>` chip whenever the active item can write.
 
+### About
+
+- About Omnigraph Studio, first in the app menu (`studio::About`, palette-only like Zed's),
+  opens one small window, 300 × 240, that cannot be resized or minimized, and brings it
+  forward when it is open. It shows, centred, the icon the Linux bundle installs (64 px), the
+  name as a title, "Version <workspace version>", then "Copyright © 2026 Modern Relay" and
+  "Free software under the GNU GPL, version 3 or later." in metadata type: a Mac app's About
+  panel, without "All rights reserved", which the GPL contradicts.
+- Escape closes it (its own keymap context, `AboutWindow`), and so do Cmd-W and Ctrl-W:
+  Cmd-W is File → Close Tab's key, whose action macOS sends before the keymap sees the key,
+  so the window closes on `CloseActiveItem` too.
+- Its sizes are design-system tokens (`ds::size::ABOUT_WIDTH`, `ABOUT_HEIGHT`, `ABOUT_ICON`).
+
 ### Actions and keys
 
 - Actions in `studio_actions`, one module per surface. Doc comments are the palette text.
@@ -1042,6 +1055,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 | 2026-10-21 | A property's value is a pill and a relationship's neighbours are rows | `studio_ui` `property_and_control_parts_draw_at_their_sizes` (a fold row and a flush row 26 px, on one edge, one under the other); offscreen snapshots of the Design system tab (1440 × 2400 at 2×) and of person-000001's peek, at rest and with the pointer on a neighbour and on a group's header | Values in pills beside muted labels; "knows → Person ⌄ … 4" over four rows of a mark and a name; the × over a row's end and the "+" before the count only under the pointer |
 | 2026-10-21 | Property rows and control chips are design-system parts | `studio_ui` `property_and_control_parts_draw_at_their_sizes` (a property row 32 px, its boxed value 22, a switch and a wrapping list's first line level with the label, a chip 26 with its button centred, the "+" a value's height); clippy `-D warnings`; design tokens; offscreen snapshots of the Design system tab (1440 px wide at 2×, light and dark) | The gallery's inspector card shows boxed values, a long email cut at its box's end, a switch, a list of tags wrapping under its first line with its "+", a relationship's neighbours with their type marks, and a fold; its chips row reads Views, "Columns 3 hidden ×", "Sort name ×", "Filters 2 ×" and Row beside a filter pill, the value in the accent in both themes. The switch first sat 7 px high, outside a property value |
 | 2026-10-21 | The palette, the agent's composer and the type table follow the three reference frames on the design system | Offscreen snapshots (1440×900 at 2×) against a scratch dev server, light, dark and glass, before and after, cropped at 2× beside the references; `studio_ui` `key_caps_are_one_box_per_key`, `a_row_knows_its_place_in_its_panel`, `controls_draw_at_their_sizes` (a tile, a segment and the grid's cells at their tokens), `values_pick_their_kind_icon`; `command_palette` `rows_are_grouped_by_kind_until_text_is_typed`; `agent_panel` `a_querys_rows_are_read_from_what_its_call_returned`, `a_tool_call_keeps_the_result_its_agent_reported`, `a_turn_ends_at_its_last_reply` | The palette is a tray of inset panels, its groups named while nothing is typed and counted once text is, rows led by tiles with their keys as caps; the inset panels' corners stayed square until each end was drawn as tall as its corner (GPUI clamps a corner to half its box). The type table's header was 42 px under Zed's padding; Studio's own header row is 30. In a dark theme a darker header fill did not show, so the header takes the well's ink |
+| 2026-10-22 | About shows Studio's icon, name, version and licence, once, and closes as a Mac panel does | `studio` `about::tests` (the version line, one window however often asked, the four parts drawn, `menu::Cancel` and `CloseActiveItem` closing it) and the keymap test; the debug build opened from its app menu with System Events, captured with `screencapture -l`, then Escape, Cmd-W and File → Close Tab sent, and its windows listed through Accessibility | 5 passed. The window showed the icon, "Omnigraph Studio", "Version 0.2.1" and the two notice lines, minimize and zoom greyed; each of Escape, Cmd-W and Close Tab left only the main window. A first check counted the closed window still open: `CGWindowListCopyWindowInfo` with `optionAll` lists windows off screen too |
 
 ## Corrections
 

@@ -1,6 +1,7 @@
 //! Omnigraph Studio's composition root: every crate is initialised here, in layer order
 //! (`docs/architecture.md`). `main.rs` runs it; the snapshot example renders it offscreen.
 
+mod about;
 mod activity;
 pub mod deep_link;
 mod design_gallery;
@@ -20,7 +21,9 @@ use gpui::{
 };
 use graph_store::{ConnectionRegistry, open_session, open_session_behind};
 use studio_actions::update::{CheckForUpdates, DownloadUpdate, RestartToUpdate, ViewReleaseNotes};
-use studio_actions::workspace::{NewWindow, OpenGraph, OpenLink, OpenSettings, Quit, RevealLog};
+use studio_actions::workspace::{
+    About, NewWindow, OpenGraph, OpenLink, OpenSettings, Quit, RevealLog,
+};
 use studio_update::{UpdateState, Updater};
 use studio_workspace::{SavedGraph, SavedWindow, ToastKind, Workspace};
 
@@ -83,6 +86,7 @@ pub fn init(cx: &mut App) {
         })
         .ok();
     });
+    cx.on_action(|_: &About, cx| about::open_about(cx));
     cx.on_action(|_: &CheckForUpdates, cx| {
         if let Some(updater) = Updater::global(cx) {
             updater.update(cx, |updater, cx| updater.check(cx));
