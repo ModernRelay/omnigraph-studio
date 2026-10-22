@@ -387,6 +387,126 @@ impl Render for DesignGallery {
                     ),
             );
 
+        // An object's properties, as an inspector shows a node, after the reference meeting
+        // card's body: rows of boxed values, a list with its "+", a relationship's neighbours,
+        // then a long text under a fold.
+        let label = size::FIELD_LABEL;
+        let properties = ds::card(cx).child(
+            ds::card_body()
+                .gap(px(space::XS))
+                .child(
+                    ds::property_row(IconName::CaseSensitive, "name", label)
+                        .child(ds::property_value().child(ds::value_text("Donald Dijkstra", cx))),
+                )
+                .child(
+                    ds::property_row(IconName::CaseSensitive, "email", label).child(
+                        ds::property_value()
+                            .child(ds::value_text("donald.dijkstra1@research.example.com", cx)),
+                    ),
+                )
+                .child(
+                    ds::property_row(IconName::Clock, "born", label)
+                        .child(ds::property_value().child(ds::value_text("1985-01-11", cx))),
+                )
+                .child(
+                    ds::property_row(IconName::ListTodo, "status", label)
+                        .child(ds::property_value().child(ds::value_text("confirmed", cx))),
+                )
+                .child(ds::property_row(IconName::Check, "active", label).child(
+                    ds::property_value().child(ds::switch("g-active", ToggleState::Selected, cx)),
+                ))
+                .child(
+                    ds::property_row(IconName::CaseSensitive, "tags", label).child(
+                        ds::property_value().child(
+                            ds::value_list()
+                                .child(ds::value_text("databases", cx))
+                                .child(ds::value_text("security", cx))
+                                .child(ds::value_text("graphs", cx))
+                                .child(ds::value_add("g-add-tag")),
+                        ),
+                    ),
+                )
+                .child(div().py(px(space::MD)).flex().child(ds::rule_h(cx)))
+                .child(text::muted("knows → Person · 4"))
+                .child(
+                    ds::value_list()
+                        .child(ds::node_value("Person", "Shafi Wirth", cx))
+                        .child(ds::node_value("Person", "Barbara Dahl", cx))
+                        .child(ds::node_value("Person", "Yukihiro Knuth", cx))
+                        .child(ds::node_value("Person", "Frances Lamarr", cx))
+                        .child(ds::value_add("g-add-knows")),
+                )
+                .child(
+                    div()
+                        .pt(px(space::MD))
+                        .child(ds::fold("g-fold", "about", true)),
+                )
+                .child(text::body(
+                    "Works on storage engines and query planning; reviews the graph's \
+                     schema changes and keeps its release notes.",
+                )),
+        );
+
+        // A toolbar's controls as chips: unset, its button alone; set, what it is set to and
+        // a clear button. An applied filter's pill beside them is the same family.
+        let chips = h_flex()
+            .gap(px(space::SM))
+            .items_center()
+            .flex_wrap()
+            .child(ds::control_chip(
+                "g-views",
+                ds::chip_button("g-views-button", IconName::Star, "Views", None),
+            ))
+            .child(
+                ds::control_chip(
+                    "g-columns",
+                    ds::chip_button(
+                        "g-columns-button",
+                        IconName::Eye,
+                        "Columns",
+                        Some("3 hidden".into()),
+                    ),
+                )
+                .on_clear("Show every column", |_, _, _| {}),
+            )
+            .child(
+                ds::control_chip(
+                    "g-sort",
+                    ds::chip_button(
+                        "g-sort-button",
+                        IconName::ArrowDown,
+                        "Sort",
+                        Some("name".into()),
+                    ),
+                )
+                .on_clear("Clear the sort", |_, _, _| {}),
+            )
+            .child(
+                ds::control_chip(
+                    "g-filters",
+                    ds::chip_button(
+                        "g-filters-button",
+                        IconName::Filter,
+                        "Filters",
+                        Some("2".into()),
+                    ),
+                )
+                .on_clear("Clear the filters", |_, _, _| {}),
+            )
+            .child(ds::control_chip(
+                "g-row",
+                ds::chip_button("g-row-button", IconName::Plus, "Row", None),
+            ))
+            .child(ds::filter_pill(
+                "g-filter",
+                IconName::CaseSensitive,
+                "title",
+                "is",
+                Some("Founder".into()),
+                |_, _, _| {},
+                cx,
+            ));
+
         let card = ds::card(cx)
             .child(
                 ds::card_header(cx)
@@ -755,6 +875,14 @@ impl Render for DesignGallery {
             .child(section(
                 "Command palette · tray, inset groups, tiles, key caps",
                 palette,
+            ))
+            .child(section(
+                "Control chips · a toolbar's controls, set and not",
+                chips,
+            ))
+            .child(section(
+                "Property rows · boxed values, lists, neighbours, folds",
+                div().w(px(size::INSPECTOR_WIDTH)).child(properties),
             ))
             .child(section("Buttons", buttons))
             .child(

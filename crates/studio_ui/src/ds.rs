@@ -207,6 +207,12 @@ pub mod size {
     pub const PALETTE_ROW: f32 = 32.;
     /// A row of an activity feed: taller than a data row, as a feed is read, not scanned.
     pub const FEED_ROW: f32 = 36.;
+    /// A property row ([`super::property_row`]): a boxed value and room above and below it,
+    /// as a palette row holds its tile.
+    pub const PROPERTY_ROW: f32 = PALETTE_ROW;
+    /// A boxed value ([`super::value_box`]): a bar button's height, so a value and the button
+    /// beside it that adds or edits one line up.
+    pub const VALUE: f32 = BAR_BUTTON;
     pub const SIDEBAR_WIDTH: f32 = 264.;
     pub const INSPECTOR_WIDTH: f32 = 340.;
     /// The widest a state's detail line runs before it wraps (`state_detail`).
@@ -1727,9 +1733,6 @@ pub fn filter_pill(
     on_remove: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> Stateful<Div> {
-    let id: ElementId = id.into();
-    let rule = surface::rule(cx);
-    let divider = move || div().w(px(size::HAIRLINE)).h_full().flex_none().bg(rule);
     let segment = || {
         h_flex()
             .h_full()
@@ -1738,25 +1741,16 @@ pub fn filter_pill(
             .items_center()
             .flex_none()
     };
-    h_flex()
-        .id(id)
-        .h(px(size::PILL))
-        .flex_none()
-        .rounded_full()
-        .bg(surface::document(cx))
-        .border_1()
-        .border_color(gpui::transparent_black())
-        .shadow(elevation::custom(cx))
-        .overflow_hidden()
+    pill_frame(id, cx)
         .child(
             segment()
                 .child(icon::meta(icon))
                 .child(Label::new(field.into()).size(LabelSize::Small)),
         )
-        .child(divider())
+        .child(pill_rule(cx))
         .child(segment().child(text::muted(test).size(LabelSize::Small)))
         .when_some(value, |pill, value| {
-            pill.child(divider()).child(
+            pill.child(pill_rule(cx)).child(
                 segment().max_w(px(size::FIELD)).child(
                     Label::new(value)
                         .size(LabelSize::Small)
@@ -1765,21 +1759,119 @@ pub fn filter_pill(
                 ),
             )
         })
-        .child(divider())
-        .child(
-            div()
-                .h_full()
-                .pl(px(space::XS))
-                // The pill's border is the rest of the gap.
-                .pr(px(PILL_BUTTON_GAP - 1.))
-                .flex()
-                .items_center()
-                .child(
-                    pill_button("remove", IconName::Close, Color::Muted, cx)
-                        .tooltip(Tooltip::text("Remove this filter"))
-                        .on_click(on_remove),
-                ),
-        )
+        .child(pill_rule(cx))
+        .child(pill_end(
+            pill_button("remove", IconName::Close, Color::Muted, cx)
+                .tooltip(Tooltip::text("Remove this filter"))
+                .on_click(on_remove),
+        ))
+}
+
+/// A raised pill of segments ([`filter_pill`], [`control_chip`]): the document's fill, a clear
+/// border and `shadow-custom`, [`size::PILL`] tall, its segments clipped to its round ends.
+fn pill_frame(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
+    h_flex()
+        .id(id.into())
+        .h(px(size::PILL))
+        .flex_none()
+        .items_center()
+        .rounded_full()
+        .bg(surface::document(cx))
+        .border_1()
+        .border_color(gpui::transparent_black())
+        .shadow(elevation::custom(cx))
+        .overflow_hidden()
+}
+
+/// The hairline between a pill's segments, the pill's full height.
+fn pill_rule(cx: &App) -> Div {
+    div()
+        .w(px(size::HAIRLINE))
+        .h_full()
+        .flex_none()
+        .bg(surface::rule(cx))
+}
+
+/// A pill's last segment: its round button ([`pill_button`]), [`PILL_BUTTON_GAP`] inside the
+/// pill's end, the pill's border the rest of the gap.
+fn pill_end(button: impl IntoElement) -> Div {
+    div()
+        .h_full()
+        .pl(px(space::XS))
+        .pr(px(PILL_BUTTON_GAP - size::HAIRLINE))
+        .flex()
+        .items_center()
+        .child(button)
+}
+
+/// A control's button in a toolbar's [`control_chip`]: its icon, its label and, when the
+/// control is set, what it is set to in the accent ("Sort Status", "Filters 2"). Quiet, as the
+/// chip is its surface; it may be a menu's trigger.
+pub fn chip_button(
+    id: impl Into<ElementId>,
+    icon: IconName,
+    label: impl Into<SharedString>,
+    value: Option<SharedString>,
+) -> Button {
+    toolbar_button(id, label)
+        .start_icon(Icon::new(icon))
+        .value(value)
+        .shape(crate::button::Shape::Pill)
+}
+
+/// A control in a toolbar, as the reference toolbar's chips (spec 002, "Control chips"): one
+/// raised pill holding its [`chip_button`] and, while the control is set and can be cleared, a
+/// hairline and a clear button ("Sort Status ×"). The same pill set or not, so setting a
+/// control adds to its chip rather than changing what it is.
+pub fn control_chip(id: impl Into<ElementId>, button: impl IntoElement) -> ControlChip {
+    ControlChip {
+        id: id.into(),
+        button: button.into_any_element(),
+        clear: None,
+    }
+}
+
+/// See [`control_chip`].
+#[derive(IntoElement)]
+pub struct ControlChip {
+    id: ElementId,
+    button: AnyElement,
+    clear: Option<(SharedString, ClickHandler)>,
+}
+
+impl ControlChip {
+    /// The clear button, after a hairline, and what it says it clears ("Clear the sort").
+    pub fn on_clear(
+        mut self,
+        tooltip: impl Into<SharedString>,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.clear = Some((tooltip.into(), Box::new(handler)));
+        self
+    }
+}
+
+impl RenderOnce for ControlChip {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        // The button's quiet pill a hairline in from the chip's round end, the chip's border
+        // the rest; without a clear button, the same at its other end.
+        let inset = PILL_BUTTON_GAP / 2. - size::HAIRLINE;
+        let cleared = self.clear.is_some();
+        pill_frame(self.id, cx)
+            .child(
+                div()
+                    .pl(px(inset))
+                    .when(!cleared, |button| button.pr(px(inset)))
+                    .child(self.button),
+            )
+            .when_some(self.clear, |chip, (tooltip, on_clear)| {
+                chip.child(pill_rule(cx)).child(pill_end(
+                    pill_button("clear", IconName::Close, Color::Muted, cx)
+                        .tooltip(Tooltip::text(tooltip))
+                        .on_click(move |event, window, cx| on_clear(event, window, cx)),
+                ))
+            })
+    }
 }
 
 /// How far a [`pill_button`] sits inside its pill's edge, its border included: the pill's end
@@ -2477,6 +2569,115 @@ pub fn field(label: impl Into<SharedString>, value: impl IntoElement) -> Div {
                 .child(text::muted(label).single_line().truncate()),
         )
         .child(div().flex_1().min_w_0().child(value))
+}
+
+// After the reference meeting card's body: a row per property, the property's kind and name
+// in a label column and its value boxed, then the values of a list or a relationship side by
+// side, and a long text under a section that folds.
+
+/// A row of an object's properties (spec 002, "Property rows"): the property's kind as an icon
+/// and its name, muted, in a label column `label_width` wide ([`size::FIELD_LABEL`], or
+/// [`size::FIELD_LABEL_WIDE`] on a page) and [`size::PROPERTY_ROW`] tall. Its value goes in a
+/// [`property_value`], and whatever follows it (a row's action, its state) after that, as the
+/// caller's children. A value that wraps (a list) keeps its first line level with the label.
+pub fn property_row(icon: IconName, label: impl Into<SharedString>, label_width: f32) -> Div {
+    h_flex().w_full().gap(px(space::LG)).items_start().child(
+        h_flex()
+            .w(px(label_width))
+            .h(px(size::PROPERTY_ROW))
+            .flex_none()
+            .gap(px(space::SM))
+            .items_center()
+            .child(icon::meta(icon))
+            .child(
+                div()
+                    .min_w_0()
+                    .child(text::muted(label).single_line().truncate()),
+            ),
+    )
+}
+
+/// Where a [`property_row`]'s value goes: the rest of the row, its first line centred in the
+/// row's height, so a boxed value sits level with the label and a list wraps below it.
+pub fn property_value() -> Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .min_h(px(size::PROPERTY_ROW))
+        .py(px((size::PROPERTY_ROW - size::VALUE) / 2.))
+        .flex()
+        .items_center()
+}
+
+/// A boxed value in a [`property_row`]: the document's fill inside the controls' hairline
+/// (`surface::control_border`), the extra-small corner as a tag's, [`size::VALUE`] tall and
+/// no wider than its row. What it holds is the caller's ([`value_text`], [`node_value`]).
+pub fn value_box(cx: &App) -> Div {
+    h_flex()
+        .flex_none()
+        .max_w_full()
+        .min_w_0()
+        .h(px(size::VALUE))
+        .px(px(space::SM))
+        .gap(px(space::XS))
+        .items_center()
+        .rounded(px(radii(cx).xs))
+        .bg(surface::document(cx))
+        .border_1()
+        .border_color(surface::control_border(cx))
+        .overflow_hidden()
+}
+
+/// A value as text in a [`value_box`]: one line, cut at the box's end, so a long one (an
+/// email, an id) shortens rather than breaking mid-word.
+pub fn value_text(value: impl Into<SharedString>, cx: &App) -> Div {
+    value_box(cx).child(
+        div()
+            .min_w_0()
+            .child(text::body(value).single_line().truncate()),
+    )
+}
+
+/// A neighbour as a value: its type's mark and its name in a [`value_box`].
+pub fn node_value(type_name: &str, label: impl Into<SharedString>, cx: &App) -> Div {
+    let label = label.into();
+    value_box(cx)
+        .child(crate::type_mark(type_name, &label, cx))
+        .child(
+            div()
+                .min_w_0()
+                .child(text::body(label).single_line().truncate()),
+        )
+}
+
+/// Values side by side, wrapping onto more lines: a list's items, a relationship's neighbours,
+/// and the [`value_add`] after them.
+pub fn value_list() -> Div {
+    h_flex().w_full().flex_wrap().gap(px(space::XS))
+}
+
+/// The button after a [`value_list`] that adds a value: a "+" raised as the values are boxed,
+/// at their height.
+pub fn value_add(id: impl Into<ElementId>) -> IconButton {
+    IconButton::new(id, IconName::Plus)
+        .size(ButtonSize::Default)
+        .variant(crate::button::Variant::Outline)
+}
+
+/// A section of an object that folds (a long text, a long list): its name, muted, and a
+/// chevron, down while it is open.
+pub fn fold(id: impl Into<ElementId>, title: impl Into<SharedString>, open: bool) -> Stateful<Div> {
+    h_flex()
+        .id(id.into())
+        .gap(px(space::XS))
+        .items_center()
+        .cursor_pointer()
+        .child(text::muted(title))
+        .child(icon::meta(if open {
+            IconName::ChevronDown
+        } else {
+            IconName::ChevronRight
+        }))
 }
 
 /// A card, as Zed draws a tool call: a tinted header, a body and a footer of actions. Compose

@@ -297,6 +297,7 @@ pub struct Button {
     end_icon: Option<Icon>,
     key_binding: Option<KeyBinding>,
     key_caps: Option<ds::KeyCaps>,
+    value: Option<SharedString>,
 }
 
 impl Button {
@@ -312,6 +313,7 @@ impl Button {
             end_icon: None,
             key_binding: None,
             key_caps: None,
+            value: None,
         }
     }
 
@@ -352,6 +354,13 @@ impl Button {
     /// part of what it says (the Conversations panel's "Ask the agent ⌘⇧A").
     pub fn key_caps(mut self, key_caps: ds::KeyCaps) -> Self {
         self.key_caps = Some(key_caps);
+        self
+    }
+
+    /// What a control is set to, after its label in the accent ("Sort Status", "Filters 2"):
+    /// a toolbar's control chip (`ds::chip_button`).
+    pub fn value(mut self, value: impl Into<Option<SharedString>>) -> Self {
+        self.value = value.into();
         self
     }
 }
@@ -485,6 +494,12 @@ impl RenderOnce for Button {
                                 .weight(ds::text::weight::BODY)
                                 .size(label_size(size)),
                         )
+                        .children(self.value.map(|value| {
+                            Label::new(value)
+                                .color(Color::Accent)
+                                .weight(ds::text::weight::BODY)
+                                .size(label_size(size))
+                        }))
                         .children(self.key_binding.map(|key| match key_ink {
                             Some(ink) => key.color(ink),
                             None => key,
@@ -743,6 +758,145 @@ mod tests {
                         .child(ds::data_cell().child(ds::text::body("12"))),
                 )
         }
+    }
+
+    /// The property and control parts, apart from `Probe`: a chip's button is a `Button`,
+    /// whose label carries the selector `Probe`'s button is measured by.
+    struct PartsProbe;
+
+    impl gpui::Render for PartsProbe {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            use ui::prelude::*;
+            div()
+                .child(
+                    div().w(gpui::px(240.)).child(
+                        ds::property_row(ui::IconName::Clock, "born", ds::size::FIELD_LABEL)
+                            .debug_selector(|| "property-row".into())
+                            .child(
+                                ds::property_value().child(
+                                    div()
+                                        .debug_selector(|| "value-box".into())
+                                        .child(ds::value_text("1985-01-11", cx)),
+                                ),
+                            ),
+                    ),
+                )
+                .child(
+                    div().debug_selector(|| "control-chip".into()).child(
+                        ds::control_chip(
+                            "chip",
+                            div()
+                                .debug_selector(|| "chip-button".into())
+                                .child(ds::chip_button(
+                                    "chip-button",
+                                    ui::IconName::Filter,
+                                    "Filters",
+                                    Some("2".into()),
+                                )),
+                        )
+                        .on_clear("Clear the filters", |_, _, _| {}),
+                    ),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "value-add".into())
+                        .child(ds::value_add("add")),
+                )
+                .child(
+                    div().w(gpui::px(240.)).child(
+                        ds::property_row(ui::IconName::Check, "active", ds::size::FIELD_LABEL)
+                            .debug_selector(|| "switch-row".into())
+                            .child(ds::property_value().child(
+                                div().debug_selector(|| "switch".into()).child(ds::switch(
+                                    "s",
+                                    ui::ToggleState::Selected,
+                                    cx,
+                                )),
+                            )),
+                    ),
+                )
+                // A list that wraps keeps its first line level with its label.
+                .child(
+                    div().w(gpui::px(200.)).child(
+                        ds::property_row(
+                            ui::IconName::CaseSensitive,
+                            "tags",
+                            ds::size::FIELD_LABEL,
+                        )
+                        .debug_selector(|| "list-row".into())
+                        .child(
+                            ds::property_value().child(
+                                ds::value_list()
+                                    .child(
+                                        div()
+                                            .debug_selector(|| "first-tag".into())
+                                            .child(ds::value_text("databases", cx)),
+                                    )
+                                    .child(ds::value_text("security", cx))
+                                    .child(ds::value_text("graphs", cx)),
+                            ),
+                        ),
+                    ),
+                )
+        }
+    }
+
+    /// A property row holds its boxed value with room above and below; a control chip is a
+    /// filter pill's height with its button centred in it, and the "+" after a list of values
+    /// is a value's height.
+    #[gpui::test]
+    fn property_and_control_parts_draw_at_their_sizes(cx: &mut TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let (_, cx): (_, &mut VisualTestContext) = cx.add_window_view(|_, _| PartsProbe);
+        cx.run_until_parked();
+        let bounds = |cx: &mut VisualTestContext, selector| {
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} was not drawn"))
+        };
+        assert_eq!(
+            f32::from(bounds(cx, "property-row").size.height),
+            ds::size::PROPERTY_ROW
+        );
+        assert_eq!(
+            f32::from(bounds(cx, "value-box").size.height),
+            ds::size::VALUE
+        );
+        let chip = bounds(cx, "control-chip");
+        let chip_button = bounds(cx, "chip-button");
+        assert_eq!(f32::from(chip.size.height), ds::size::PILL);
+        assert_eq!(f32::from(chip_button.size.height), ds::size::BAR_BUTTON);
+        assert_eq!(
+            f32::from(chip_button.top() - chip.top()),
+            f32::from(chip.bottom() - chip_button.bottom()),
+            "the button centred in its chip"
+        );
+        assert_eq!(
+            f32::from(bounds(cx, "value-add").size.height),
+            ds::size::VALUE
+        );
+        // A switch, shorter than a boxed value, sits level with its label too.
+        let row = bounds(cx, "switch-row");
+        let switch = bounds(cx, "switch");
+        assert_eq!(
+            f32::from(switch.top() - row.top()),
+            f32::from(row.bottom() - switch.bottom()),
+            "a switch centred in its row"
+        );
+        let list = bounds(cx, "list-row");
+        let first = bounds(cx, "first-tag");
+        assert!(
+            f32::from(list.size.height) > ds::size::PROPERTY_ROW,
+            "the list wraps"
+        );
+        assert_eq!(
+            f32::from(first.top() - list.top()),
+            (ds::size::PROPERTY_ROW - ds::size::VALUE) / 2.,
+            "its first line level with the label"
+        );
     }
 
     struct PillProbe {
