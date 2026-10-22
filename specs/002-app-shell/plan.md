@@ -590,9 +590,9 @@ than styling one-off elements.
   corner's radius above the edge (`SheetFloor`), since a view's own fill (an editor's) would
   square the corner again.
 - **Quiet things.** A row a filter dims, a card for a side not written yet and a merged
-  branch's lane recede by one opacity, `ds::opacity::DIMMED`; what lies away from the
-  canvas's focus, its chips and their lines' labels alike, by `ds::opacity::FAR` (they were
-  0.3 and 0.25). Colours a view used to derive
+  branch's lane recede by one opacity, `ds::opacity::DIMMED` (a second, `FAR`, for what lay
+  away from the canvas's focus, went on 2026-10-21: nothing used it once the canvas painted
+  its own fades). Colours a view used to derive
   itself are surface roles: the canvas's here-ring and its halo (a pointed chip is lifted by
   its shadow, `elevation::Lift::Hover`, not a hairline), the dot grid, the marquee, a highlighted span of query text, rows picked beside the cursor's,
   a card's hairline (also its footer's rule).
@@ -647,9 +647,11 @@ than styling one-off elements.
   `surface::tile` grey with a dark glyph, 6 px in from a 32 px row's fill on every side,
   `MenuRow::inset`); colour stays for what is data, as a type's dot in the tile
   (`ds::tile`). Keys show as caps, one box per key (`ds::KeyCaps`, `size::KEY_CAP`): the
-  binding that wins in a focus's context, Zed's glyphs on macOS (⌘ ⇧ ⌥ ⌃ ↵ ⇥ ⌫, arrows), words
-  elsewhere, "Esc" on both; a faint ink on a white panel or a document, raised (the solid fill
-  and `shadow-custom`) on a tray. A key hint is caps and a word (`ds::key_hint`, `.and` for a
+  binding that wins in a focus's context, Zed's glyphs on macOS (⌘ ⇧ ⌥ ⌃ ↵ ⇥ ⌫, arrows; ⌦ for
+  the forward delete, which Zed draws as ⌫), words elsewhere, "Esc" on both; a faint ink on a
+  white panel or a document, raised (the solid fill and `shadow-custom`) on a tray. Text that
+  names a shortcut (`studio_ui::shortcut_text`) reads the same table (`ds::key_names`), so it
+  writes Escape as "Esc" too, where it wrote ⎋ until 2026-10-21. A key hint is caps and a word (`ds::key_hint`, `.and` for a
   second action, `.raised`), a row of them `ds::key_hints`; a full-width button with caps
   (`Button::key_caps`) reads as a launcher, its label at the start and its keys at the end.
 - **Text tabs and segments.** A choice (the palette's scope tabs, a setting's options, a
@@ -903,6 +905,8 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 | 2026-10-21 | What the credential may do follows a new token at once | `graph_store` `a_new_token_reads_access_and_every_answer_again` (spec 003's log has the detail) | A read-only token replaced by a write-capable one allowed changing main at once, without a write; the old token's late answer was dropped |
 | 2026-10-21 | A parked graph polls nothing | `studio_workspace` `a_graph_reopened_behind_opens_its_tabs_when_first_shown` (shown state of a graph opened behind, then shown, and of the one it replaced); `graph_store` `the_head_watch_sees_other_writers_commits_while_a_window_is_active` | Behind or switched from: not shown, no head probe, branch list or health check of its own; shown again: asks at once |
 | 2026-10-21 | ⌘K opens on its first row, found nodes stay out of Recent, and ⌘P and ⌘⇧B keep the palette's text | `command_palette` `only_the_branch_picker_starts_on_the_current_branch` (branches feature and main, on main), `a_found_node_opened_is_not_remembered`, `saved_keys_follow_those_run_and_drop_found_nodes`, `go_to_and_switch_branch_in_the_picker_keep_the_text` (an app-level listener counting what passes the palette) | All on `type:Person`, Branches on `branch:main`, All again on its first row; opening Ada left the recent list empty and opening Person kept `type:Person`; a saved list lost its `node:` keys and kept the order of what was run first; GoTo then SwitchBranch with "mai" typed showed Nodes then Branches (`branch:main` alone) with the text kept, and nothing passed the palette. Run with each fix taken out, the three GPUI tests failed (All on `branch:main` at 2; still All after GoTo; the node recorded): every scope started on the current branch, a found node was recorded among the 50 but never ranked, and both actions reached the workspace, whose toggle closed the palette |
+| 2026-10-21 | Text and key caps name keys from one table | `studio_ui` `shortcuts_are_written_as_the_platform_writes_them`, `ds` `key_caps_are_one_box_per_key` | `keystroke_text` joins `ds::key_names`: Escape is "Esc" in text on macOS too (it was ⎋ there, "Esc" on caps), the forward delete ⌦ on a cap (it was backspace's ⌫), Backspace and Delete words on Linux and Windows, "Win" for Windows' platform key |
+| 2026-10-21 | Design-system parts no surface uses are gone; the rest is named here | Workspace `grep` for each | No caller: `surface::outline_hover` and `outline_pressed`, `opacity::FAR`, `Button::label_size`, `IconButton::shape` and `selected_icon_color`, and `ds::pill`, which only the gallery's composer drew (the agent panel's picker is a ghost button, as the gallery's now is). `Variant::Secondary` and `Variant::Glass` stay: "Buttons" names them among the six variants |
 | 2026-10-21 | The palette's descriptions say what each action does now | Each action's handler read against its doc comment | 30 rewritten, among them GoTo (it finds a node; types are a scope away), SwitchBranch (the window's graph, not a tab), Refresh (the view in focus too), OpenCanvas and OpenOntology (no "graph explorer", no single map), OpenInspector (storage, not the dock), OpenAgent (a tab), NewQuery (a new tab), DeleteRow (marked rows, after asking), the splits (the active pane) and the review's steps (by card) |
 | 2026-10-20 | A write's toast acts on the graph and branch written to | `studio_workspace` `a_toasts_follow_up_acts_on_the_graph_and_branch_written_to` (two graphs on fakes answering 404, each with a tab that holds its focus); run once with the window's focus left on the shown graph's undrawn tab | Open history for an unknown outcome on notes/fix, pressed with people shown, showed notes on fix and ran there, notes' tab with the keyboard; pressed after notes moved to main, back on fix; Undo for a delete in parked people ran in people on main, people's tab with the keyboard; with people closed, nothing ran and the toast read "Nothing was done: people is no longer open in this window…". With the focus left on the undrawn tab the action reached no handler (`left: None`), which the fix dispatches from the window to avoid |
 | 2026-10-20 | The zoom buttons hand the keyboard over as ⇧⎋ does | `studio_workspace` `a_hidden_or_covered_dock_gives_the_keyboard_back_from_any_field_of_its_panel`, extended with clicks (`simulate_click`) on `zoom-pane-0` and `zoom-dock-Bottom` | The pane's button zoomed out, then zoomed in with the keyboard in the activity panel's field and gave it to the tab; the bottom dock's button took it from the tab to the dock's panel. Before, both buttons set the zoom alone |

@@ -534,11 +534,13 @@ impl Render for DesignGallery {
                     .child(text::muted("Ask about the graph, or ask for a change…"))
                     .child(
                         ds::composer_controls()
+                            // The model picker, as the agent panel draws it: a ghost button,
+                            // a pill since it is labelled.
                             .child(
-                                ds::pill("g-agent", cx)
-                                    .child(ui::Indicator::dot().color(Color::Success))
-                                    .child(text::body("Claude Agent"))
-                                    .child(studio_ui::ds::icon::meta(IconName::ChevronDown)),
+                                ds::button("g-agent", "Claude Opus")
+                                    .style(ButtonStyle::Subtle)
+                                    .color(Color::Muted)
+                                    .start_icon(Icon::new(IconName::ZedAssistant)),
                             )
                             .child(ds::composer_button("g-send", IconName::ArrowUp, true, cx)),
                     ),

@@ -251,47 +251,18 @@ pub fn shortcut_text(action: &dyn gpui::Action, cx: &App) -> Option<String> {
     )
 }
 
+/// One keystroke as text, its keys named as the key caps name them (`ds::key_names`): run
+/// together on macOS, joined by "+" elsewhere.
 fn keystroke_text(modifiers: &gpui::Modifiers, key: &str, style: ui::PlatformStyle) -> String {
-    let mac = style == ui::PlatformStyle::Mac;
-    let platform = match style {
-        ui::PlatformStyle::Mac => "⌘",
-        ui::PlatformStyle::Linux => "Super",
-        ui::PlatformStyle::Windows => "Win",
-    };
-    let held = [
-        (modifiers.function, "Fn", "Fn"),
-        (modifiers.control, "⌃", "Ctrl"),
-        (modifiers.alt, "⌥", "Alt"),
-        (modifiers.platform, platform, platform),
-        (modifiers.shift, "⇧", "Shift"),
-    ];
-    let key = match (key, mac) {
-        ("enter" | "return", true) => "↵".to_owned(),
-        ("backspace", true) => "⌫".to_owned(),
-        ("delete", true) => "⌦".to_owned(),
-        ("escape", true) => "⎋".to_owned(),
-        ("tab", true) => "⇥".to_owned(),
-        ("up", _) => "↑".to_owned(),
-        ("down", _) => "↓".to_owned(),
-        ("left", _) => "←".to_owned(),
-        ("right", _) => "→".to_owned(),
-        ("escape", false) => "Esc".to_owned(),
-        ("pageup", _) => "PageUp".to_owned(),
-        ("pagedown", _) => "PageDown".to_owned(),
-        (key, _) => {
-            let mut chars = key.chars();
-            chars.next().map_or(String::new(), |first| {
-                first.to_uppercase().chain(chars).collect()
-            })
-        }
-    };
-    let mut parts: Vec<&str> = held
-        .iter()
-        .filter(|(on, _, _)| *on)
-        .map(|(_, symbol, word)| if mac { *symbol } else { *word })
+    let names: Vec<String> = ds::key_names(modifiers, key, style)
+        .into_iter()
+        .map(|name| name.text.to_string())
         .collect();
-    parts.push(&key);
-    parts.join(if mac { "" } else { "+" })
+    names.join(if style == ui::PlatformStyle::Mac {
+        ""
+    } else {
+        "+"
+    })
 }
 
 #[cfg(test)]
@@ -340,6 +311,29 @@ mod tests {
         assert_eq!(
             keystroke_text(&held(false, false, false, false), "escape", linux),
             "Esc"
+        );
+        // Text names the keys as the key caps do: Escape is "Esc" on macOS too, and the
+        // forward delete is ⌦, not backspace's ⌫.
+        assert_eq!(
+            keystroke_text(&held(false, false, false, false), "escape", mac),
+            "Esc"
+        );
+        assert_eq!(
+            keystroke_text(&held(false, false, true, false), "backspace", mac),
+            "⌘⌫"
+        );
+        assert_eq!(
+            keystroke_text(&held(false, false, false, false), "delete", mac),
+            "⌦"
+        );
+        assert_eq!(
+            keystroke_text(&held(false, false, false, false), "delete", linux),
+            "Delete"
+        );
+        let windows = ui::PlatformStyle::Windows;
+        assert_eq!(
+            keystroke_text(&held(true, true, false, false), "backspace", windows),
+            "Ctrl+Alt+Backspace"
         );
     }
 

@@ -293,7 +293,6 @@ pub struct Button {
     base: Base,
     label: SharedString,
     label_color: Option<Color>,
-    label_size: Option<LabelSize>,
     start_icon: Option<Icon>,
     end_icon: Option<Icon>,
     key_binding: Option<KeyBinding>,
@@ -309,7 +308,6 @@ impl Button {
             base,
             label,
             label_color: None,
-            label_size: None,
             start_icon: None,
             end_icon: None,
             key_binding: None,
@@ -331,11 +329,6 @@ impl Button {
 
     pub fn color(mut self, color: impl Into<Option<Color>>) -> Self {
         self.label_color = color.into();
-        self
-    }
-
-    pub fn label_size(mut self, size: impl Into<Option<LabelSize>>) -> Self {
-        self.label_size = size.into();
         self
     }
 
@@ -490,7 +483,7 @@ impl RenderOnce for Button {
                             Label::new(self.label)
                                 .color(ink)
                                 .weight(ds::text::weight::BODY)
-                                .size(self.label_size.unwrap_or(label_size(size))),
+                                .size(label_size(size)),
                         )
                         .children(self.key_binding.map(|key| match key_ink {
                             Some(ink) => key.color(ink),
@@ -514,7 +507,6 @@ pub struct IconButton {
     icon_size: Option<IconSize>,
     icon_color: Option<Color>,
     selected_icon: Option<IconName>,
-    selected_icon_color: Option<Color>,
 }
 
 impl IconButton {
@@ -530,18 +522,11 @@ impl IconButton {
             icon_size: None,
             icon_color: None,
             selected_icon: None,
-            selected_icon_color: None,
         }
     }
 
     pub fn variant(mut self, variant: Variant) -> Self {
         self.base.variant = variant;
-        self
-    }
-
-    /// The outline: the radius scale's corner unless asked to be round.
-    pub fn shape(mut self, shape: Shape) -> Self {
-        self.base.shape = shape;
         self
     }
 
@@ -560,11 +545,6 @@ impl IconButton {
     /// The icon shown while toggled on.
     pub fn selected_icon(mut self, icon: impl Into<Option<IconName>>) -> Self {
         self.selected_icon = icon.into();
-        self
-    }
-
-    pub fn selected_icon_color(mut self, color: impl Into<Option<Color>>) -> Self {
-        self.selected_icon_color = color.into();
         self
     }
 
@@ -650,10 +630,7 @@ impl RenderOnce for IconButton {
         let painted = paint.ink;
         let color = match self.base.variant {
             Variant::Primary | Variant::Destructive => painted,
-            _ if selected => self
-                .selected_icon_color
-                .or(self.icon_color)
-                .unwrap_or(painted),
+            _ if selected => self.icon_color.unwrap_or(painted),
             _ => self.icon_color.unwrap_or(Color::Muted),
         };
         let icon = match (selected, self.selected_icon) {

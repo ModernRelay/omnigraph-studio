@@ -303,9 +303,6 @@ pub mod opacity {
     /// A row a filter dims, a card for a side not written yet, a merged branch's lane: one
     /// value, so every quiet thing is equally quiet.
     pub const DIMMED: f32 = 0.5;
-    /// What lies away from the canvas's focus (its chips and their lines' labels): fainter than
-    /// a dimmed row, since a crowded canvas has to let the near part stand out.
-    pub const FAR: f32 = 0.3;
 }
 
 /// Whether the window is drawn in the glass style (setting `studio.window_style`).
@@ -368,21 +365,9 @@ pub mod surface {
 
     /// The hairline around a surface (a button, a card, a field, a menu), drawn as its 1 px
     /// border: interfaces.dev's `--shadow-border` ring, `#0000000f` in a light theme and
-    /// `#ffffff14` in a dark one. Its hovered and pressed steps are [`outline_hover`] and
-    /// [`outline_pressed`]; the drops that go with it are [`super::elevation::custom`].
+    /// `#ffffff14` in a dark one. The drops that go with it are [`super::elevation::custom`].
     pub fn outline(cx: &App) -> Hsla {
         super::elevation::layers(super::elevation::Lift::Rest, cx)[0].color
-    }
-
-    /// The hovered [`outline`] (`--shadow-custom-hover`'s ring): `#00000014` / `#ffffff21`.
-    pub fn outline_hover(cx: &App) -> Hsla {
-        super::elevation::layers(super::elevation::Lift::Hover, cx)[0].color
-    }
-
-    /// The pressed or focused [`outline`] (`--shadow-custom-active`'s ring): `#0000001f` /
-    /// `#ffffff33`.
-    pub fn outline_pressed(cx: &App) -> Hsla {
-        super::elevation::layers(super::elevation::Lift::Pressed, cx)[0].color
     }
 
     /// A line that divides (rows in a list, a toolbar's edge, a checkbox's or an outlined
@@ -2210,75 +2195,83 @@ pub fn setting_row(
         .child(div().flex_none().child(control))
 }
 
-/// What one key cap shows: a glyph Zed draws (⌘, ⇧, ↵, an arrow) or a word ("Esc", "Ctrl").
+/// One key of a shortcut as Studio names it: what text that names the shortcut writes, and
+/// the glyph of Zed's a key cap draws in its place, when there is one.
 #[derive(Debug, Clone, PartialEq)]
-enum KeyFace {
-    Icon(IconName),
-    Text(SharedString),
+pub(crate) struct KeyName {
+    pub text: SharedString,
+    pub glyph: Option<IconName>,
 }
 
-/// The caps of one keystroke, modifiers first in the order Zed's key hints draw them. On
-/// macOS a modifier, an arrow, ↵, ⌫ and ⇥ are Zed's glyphs; elsewhere words, as the platform
-/// writes them ("Ctrl", "Shift"). Escape is "Esc" everywhere: its glyph reads as a stray mark
-/// at a cap's size.
-fn key_faces(modifiers: &gpui::Modifiers, key: &str, style: ui::PlatformStyle) -> Vec<KeyFace> {
+/// Every key display's one table: the keys of one keystroke, modifiers first in the order
+/// Zed's key hints draw them. On macOS the symbols the system writes in its menus (⌃ ⌥ ⌘ ⇧,
+/// ↵, ⇥, ⌫ for backspace and ⌦ for the forward delete), each drawn on a cap as Zed's glyph
+/// where Zed has one; elsewhere the words the platform writes ("Ctrl", "Super" or "Win",
+/// "Enter", "Backspace", "Delete"). Arrows are symbols everywhere. Escape is "Esc" everywhere:
+/// its symbol reads as a stray mark at a cap's size and in a line of text.
+pub(crate) fn key_names(
+    modifiers: &gpui::Modifiers,
+    key: &str,
+    style: ui::PlatformStyle,
+) -> Vec<KeyName> {
     let mac = style == ui::PlatformStyle::Mac;
+    let named = |text: &str, glyph| KeyName {
+        text: SharedString::from(text.to_owned()),
+        glyph,
+    };
     let platform = match style {
         ui::PlatformStyle::Mac => "⌘",
         ui::PlatformStyle::Linux => "Super",
         ui::PlatformStyle::Windows => "Win",
     };
     let held = [
-        (modifiers.function, None, "Fn"),
-        (modifiers.control, Some(IconName::Control), "Ctrl"),
-        (modifiers.alt, Some(IconName::Option), "Alt"),
-        (modifiers.platform, Some(IconName::Command), platform),
-        (modifiers.shift, Some(IconName::Shift), "Shift"),
+        (modifiers.function, "Fn", None, "Fn"),
+        (modifiers.control, "⌃", Some(IconName::Control), "Ctrl"),
+        (modifiers.alt, "⌥", Some(IconName::Option), "Alt"),
+        (modifiers.platform, "⌘", Some(IconName::Command), platform),
+        (modifiers.shift, "⇧", Some(IconName::Shift), "Shift"),
     ];
-    let mut faces: Vec<KeyFace> = held
+    let mut names: Vec<KeyName> = held
         .into_iter()
-        .filter(|(on, _, _)| *on)
-        .map(|(_, glyph, word)| match glyph.filter(|_| mac) {
-            Some(glyph) => KeyFace::Icon(glyph),
-            None => KeyFace::Text(word.into()),
+        .filter(|(on, ..)| *on)
+        .map(|(_, symbol, glyph, word)| {
+            if mac {
+                named(symbol, glyph)
+            } else {
+                named(word, None)
+            }
         })
         .collect();
-    let glyph = match key {
-        "up" => Some(IconName::ArrowUp),
-        "down" => Some(IconName::ArrowDown),
-        "left" => Some(IconName::ArrowLeft),
-        "right" => Some(IconName::ArrowRight),
-        "enter" | "return" if mac => Some(IconName::Return),
-        "backspace" | "delete" if mac => Some(IconName::Backspace),
-        "tab" if mac => Some(IconName::Tab),
-        _ => None,
-    };
-    faces.push(match glyph {
-        Some(glyph) => KeyFace::Icon(glyph),
-        None => KeyFace::Text(
-            match key {
-                "escape" => "Esc".to_owned(),
-                "enter" | "return" => "Enter".to_owned(),
-                "pageup" => "PageUp".to_owned(),
-                "pagedown" => "PageDown".to_owned(),
-                key => {
-                    let mut chars = key.chars();
-                    chars.next().map_or(String::new(), |first| {
-                        first.to_uppercase().chain(chars).collect()
-                    })
-                }
-            }
-            .into(),
-        ),
+    names.push(match (key, mac) {
+        ("up", _) => named("↑", Some(IconName::ArrowUp)),
+        ("down", _) => named("↓", Some(IconName::ArrowDown)),
+        ("left", _) => named("←", Some(IconName::ArrowLeft)),
+        ("right", _) => named("→", Some(IconName::ArrowRight)),
+        ("escape", _) => named("Esc", None),
+        ("enter" | "return", true) => named("↵", Some(IconName::Return)),
+        ("enter" | "return", false) => named("Enter", None),
+        ("tab", true) => named("⇥", Some(IconName::Tab)),
+        ("backspace", true) => named("⌫", Some(IconName::Backspace)),
+        // Zed draws the forward delete with backspace's glyph; the key deletes the other way.
+        ("delete", true) => named("⌦", None),
+        ("pageup", _) => named("PageUp", None),
+        ("pagedown", _) => named("PageDown", None),
+        (key, _) => {
+            let mut chars = key.chars();
+            let word: String = chars.next().map_or(String::new(), |first| {
+                first.to_uppercase().chain(chars).collect()
+            });
+            named(&word, None)
+        }
     });
-    faces
+    names
 }
 
 /// One key cap: a [`size::KEY_CAP`] box at the scale's extra-small corner holding a glyph or
 /// a word at the metadata size, muted. Inset, on a white panel or a document, it is a faint
 /// ink ([`surface::tag`]); raised, on a [`surface::tray`], the solid fill with
 /// `shadow-custom` ([`lifted`]), as the reference palette's footer draws its keys.
-fn key_cap(face: KeyFace, raised: bool, cx: &App) -> Div {
+fn key_cap(name: KeyName, raised: bool, cx: &App) -> Div {
     let cap = div()
         .flex_none()
         .h(px(size::KEY_CAP))
@@ -2293,9 +2286,9 @@ fn key_cap(face: KeyFace, raised: bool, cx: &App) -> Div {
     } else {
         cap.bg(surface::tag(cx))
     };
-    cap.child(match face {
-        KeyFace::Icon(glyph) => icon::meta(glyph).into_any_element(),
-        KeyFace::Text(word) => text::meta(word).single_line().into_any_element(),
+    cap.child(match name.glyph {
+        Some(glyph) => icon::meta(glyph).into_any_element(),
+        None => text::meta(name.text).single_line().into_any_element(),
     })
 }
 
@@ -2356,9 +2349,9 @@ impl RenderOnce for KeyCaps {
             .items_center()
             .children(binding.keystrokes().iter().map(|stroke| {
                 h_flex().gap(px(space::XXS)).children(
-                    key_faces(stroke.modifiers(), stroke.key(), style)
+                    key_names(stroke.modifiers(), stroke.key(), style)
                         .into_iter()
-                        .map(|face| key_cap(face, raised, cx)),
+                        .map(|name| key_cap(name, raised, cx)),
                 )
             }))
             .into_any_element()
@@ -2796,22 +2789,6 @@ pub fn meta_row(items: impl IntoIterator<Item = AnyElement>) -> Div {
     row
 }
 
-/// A rounded-full control with a hairline: a picker in a composer ("Claude ▾").
-pub fn pill(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
-    let hover = surface::highlight(cx);
-    h_flex()
-        .id(id.into())
-        .h(px(size::PILL))
-        .px(px(space::MD))
-        .gap(px(space::XS))
-        .items_center()
-        .rounded_full()
-        .border_1()
-        .border_color(surface::control_border(cx))
-        .cursor_pointer()
-        .hover(move |style| style.bg(hover))
-}
-
 /// A composer's icon action (send, stop): a control-sized square at the scale's corner, solid
 /// ink when it is the action to take.
 pub fn composer_button(
@@ -3218,7 +3195,8 @@ mod tests {
     }
 
     /// A binding is one cap per key, modifiers first in Zed's order: glyphs on macOS, the
-    /// platform's words elsewhere, and "Esc" for Escape on both.
+    /// platform's words elsewhere, and "Esc" for Escape on both. Backspace and the forward
+    /// delete are two keys with two names.
     #[test]
     fn key_caps_are_one_box_per_key() {
         let held = |control, alt, platform, shift| gpui::Modifiers {
@@ -3228,36 +3206,49 @@ mod tests {
             shift,
             function: false,
         };
-        let word = |text: &str| KeyFace::Text(text.into());
+        let none = held(false, false, false, false);
+        let caps = |modifiers: &gpui::Modifiers, key: &str, style| -> Vec<(String, _)> {
+            key_names(modifiers, key, style)
+                .into_iter()
+                .map(|name| (name.text.to_string(), name.glyph))
+                .collect()
+        };
+        let word = |text: &str| (text.to_owned(), None);
+        let glyph = |text: &str, glyph| (text.to_owned(), Some(glyph));
         let mac = ui::PlatformStyle::Mac;
         assert_eq!(
-            key_faces(&held(false, false, true, true), "a", mac),
+            caps(&held(false, false, true, true), "a", mac),
             [
-                KeyFace::Icon(IconName::Command),
-                KeyFace::Icon(IconName::Shift),
+                glyph("⌘", IconName::Command),
+                glyph("⇧", IconName::Shift),
                 word("A")
             ]
         );
+        assert_eq!(caps(&none, "escape", mac), [word("Esc")]);
+        assert_eq!(caps(&none, "enter", mac), [glyph("↵", IconName::Return)]);
         assert_eq!(
-            key_faces(&held(false, false, false, false), "escape", mac),
-            [word("Esc")]
+            caps(&none, "backspace", mac),
+            [glyph("⌫", IconName::Backspace)]
         );
+        assert_eq!(caps(&none, "delete", mac), [word("⌦")]);
+        assert_eq!(caps(&none, "/", mac), [word("/")]);
+        for style in [ui::PlatformStyle::Linux, ui::PlatformStyle::Windows] {
+            assert_eq!(
+                caps(&held(true, false, false, true), "enter", style),
+                [word("Ctrl"), word("Shift"), word("Enter")]
+            );
+            assert_eq!(caps(&none, "up", style), [glyph("↑", IconName::ArrowUp)]);
+            assert_eq!(caps(&none, "escape", style), [word("Esc")]);
+            assert_eq!(caps(&none, "backspace", style), [word("Backspace")]);
+            assert_eq!(caps(&none, "delete", style), [word("Delete")]);
+        }
         assert_eq!(
-            key_faces(&held(false, false, false, false), "enter", mac),
-            [KeyFace::Icon(IconName::Return)]
-        );
-        assert_eq!(
-            key_faces(&held(false, false, false, false), "/", mac),
-            [word("/")]
-        );
-        let linux = ui::PlatformStyle::Linux;
-        assert_eq!(
-            key_faces(&held(true, false, false, true), "enter", linux),
-            [word("Ctrl"), word("Shift"), word("Enter")]
-        );
-        assert_eq!(
-            key_faces(&held(false, false, false, false), "up", linux),
-            [KeyFace::Icon(IconName::ArrowUp)]
+            caps(
+                &held(false, false, true, false),
+                "k",
+                ui::PlatformStyle::Windows
+            ),
+            [word("Win"), word("K")]
         );
     }
 
