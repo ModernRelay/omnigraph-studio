@@ -82,6 +82,22 @@ enum Zoom {
     Scale(f32),
 }
 
+/// Whether the session's branch list answers for the tab's branch, which Choose File and Clear
+/// follow ([`BlobView::branch_refusal`]). A list read before the branch was made, by Studio a
+/// moment ago or elsewhere, does not hold it: one that lacks it is read again before the tab
+/// says the branch is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchListed {
+    /// The list held may be older than the branch.
+    Unseen,
+    /// The list held lacks the branch, and the tab asked for it again: until a list comes in,
+    /// the server decides.
+    Asked,
+    /// A list taken since the tab asked, or one holding the branch: a later one that lacks it
+    /// was read after the branch was gone.
+    Answered,
+}
+
 /// Saving the value, or opening it elsewhere.
 enum Export {
     Busy(&'static str),
@@ -104,6 +120,7 @@ pub struct BlobView {
     /// `branch` was given rather than taken from the session: a tab that comes back on the
     /// branch it was saved on reads that branch's head, not the one the window shows.
     branch_given: bool,
+    branch_listed: BranchListed,
     /// For a tab opened at the branch head, the commit the head was when it first read: the
     /// value is read there, every range of it and a save, so nothing that lands on the branch
     /// meanwhile, and no other branch the window moves to, comes into what it shows or saves.
@@ -150,13 +167,16 @@ impl BlobView {
         cx.on_release(|this: &mut Self, cx| this.release_images(cx))
             .detach();
         let branch = session.read(cx).branch.clone();
-        let events = cx.subscribe(&session, |_, _, event: &SessionEvent, cx| {
-            if let SessionEvent::AccessChanged
-            | SessionEvent::BranchesChanged
-            | SessionEvent::SchemaChanged = event
-            {
+        let events = cx.subscribe(&session, |this, _, event: &SessionEvent, cx| match event {
+            SessionEvent::BranchesChanged => {
+                if this.branch_listed == BranchListed::Asked {
+                    this.branch_listed = BranchListed::Answered;
+                }
+                this.follow_branch_list(cx);
                 cx.notify();
             }
+            SessionEvent::AccessChanged | SessionEvent::SchemaChanged => cx.notify(),
+            _ => {}
         });
         Self {
             session,
@@ -165,6 +185,7 @@ impl BlobView {
             snapshot,
             branch,
             branch_given: false,
+            branch_listed: BranchListed::Unseen,
             opened_at: None,
             own_commit: None,
             meta: None,
@@ -553,11 +574,31 @@ impl BlobView {
         })
     }
 
+    /// Follows the session's branch list for the tab's branch, which writes there: a list that
+    /// holds it answers for it, and one that lacks it is read again, once, before it answers.
+    fn follow_branch_list(&mut self, cx: &mut Context<Self>) {
+        if self.held {
+            return;
+        }
+        let Loadable::Loaded(branches) = &self.session.read(cx).branches else {
+            return;
+        };
+        if branches.contains(&self.branch) {
+            self.branch_listed = BranchListed::Answered;
+        } else if self.branch_listed == BranchListed::Unseen {
+            self.branch_listed = BranchListed::Asked;
+            self.session
+                .update(cx, |session, cx| session.reload_branches(cx));
+        }
+    }
+
     /// Why nothing can be written on the tab's branch, or `None` while it can or the server
-    /// decides: the branch list the session read last no longer holds it (deleted since the
-    /// tab was saved, or elsewhere since it opened), or the credential may not change it.
+    /// decides: a branch list that answers for it ([`BranchListed::Answered`]) does not hold it
+    /// (deleted since the tab was saved, or elsewhere since it opened), or the credential may
+    /// not change it.
     fn branch_refusal(&self, cx: &App) -> Option<String> {
-        if let Loadable::Loaded(branches) = &self.session.read(cx).branches
+        if self.branch_listed == BranchListed::Answered
+            && let Loadable::Loaded(branches) = &self.session.read(cx).branches
             && !branches.contains(&self.branch)
         {
             return Some(format!(
@@ -1335,6 +1376,11 @@ impl Render for BlobView {
                 }
             }
         }
+        // The branch the tab writes to is known once it is first drawn; a list held then may
+        // be older than it.
+        if self.branch_listed == BranchListed::Unseen {
+            self.follow_branch_list(cx);
+        }
         let body = match &self.content {
             Loadable::Loading | Loadable::NotLoaded => {
                 studio_ui::ds::loading_state(match self.size {
@@ -2059,9 +2105,10 @@ mod tests {
     /// A restored tab writes to the branch it was saved on, whichever branch the window shows
     /// then: it reads that branch's commit, and a write bound to a value read there belongs on
     /// it. Before, it took the session's branch, so it read main's value and stored the file on
-    /// fix. A branch gone since says so, and nothing is sent; a tab that writes and was saved
-    /// without its branch does not come back, while one held at a commit, which writes nowhere,
-    /// does.
+    /// fix. A branch gone since says so, and nothing is sent; one made since the session's list
+    /// was read is not taken for gone, as the list is read again first; a tab that writes and
+    /// was saved without its branch does not come back, while one held at a commit, which
+    /// writes nowhere, does.
     #[gpui::test]
     async fn a_restored_tab_writes_only_to_the_branch_it_was_saved_on(
         cx: &mut gpui::TestAppContext,
@@ -2131,6 +2178,44 @@ mod tests {
                     if notice.message.starts_with("gone no longer exists")
             ));
         });
+
+        // Fix was made after the session's list was read: the list is read again before the
+        // tab says fix is gone, and the file is stored there.
+        session.update(cx, |session, _| {
+            session.branches = Loadable::Loaded(vec!["main".into()]);
+        });
+        let mut made = saved.data.clone();
+        made["branch"] = "fix".into();
+        let back = crate::saved_blob(&made).expect("the tab comes back");
+        let held = session.clone();
+        let (restored, restored_cx) = cx.add_window_view(|window, cx| {
+            crate::blob_view(held, &back.open, back.branch, window, cx)
+        });
+        restored.update(restored_cx, |view, cx| {
+            assert_eq!(
+                view.write_refusal(cx),
+                None,
+                "not gone while the list is read"
+            );
+        });
+        restored_cx.run_until_parked();
+        let file = crate::test_support::upload_file("restored-made.txt", b"made", None);
+        restored.update(restored_cx, |view, cx| {
+            assert!(
+                session
+                    .read(cx)
+                    .branches
+                    .loaded()
+                    .is_some_and(|branches| branches.iter().any(|b| b == "fix")),
+                "the list was read again"
+            );
+            assert_eq!(view.write_refusal(cx), None);
+            view.upload(file, cx);
+        });
+        restored_cx.run_until_parked();
+        let writes = blobs.writes.lock().unwrap().clone();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[1].branch, "fix");
 
         let mut unsaid = saved.data.clone();
         unsaid.as_object_mut().unwrap().remove("branch");

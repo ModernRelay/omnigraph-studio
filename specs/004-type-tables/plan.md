@@ -119,8 +119,12 @@ stay put), IX (paged, virtualized).
   whichever the window shows, and one tab writes to one branch; a branch gone since disables
   Choose File and Clear, saying so, and nothing is sent; one saved before it named its branch
   does not come back (since 2026-10-21; before, a restored tab wrote to the window's branch,
-  bound to a value read on the branch it was saved on). Elsewhere than macOS, a PDF opens in
-  the system's viewer.
+  bound to a value read on the branch it was saved on). A list read before the branch was made
+  lacks it as well, so a tab that finds its branch missing has the list read again before it
+  says the branch is gone, the server deciding meanwhile (since 2026-10-22; before, a tab on a
+  branch made after the list was read, by Studio a moment before or elsewhere, said it no
+  longer existed until the list was next read). Elsewhere than macOS, a PDF opens in the
+  system's viewer.
 - A Blob value takes a file (R1, `PUT`/`DELETE /graphs/{id}/blob`): "Choose File…" opens the
   system's picker, and a file dropped from the file manager does the same, on the Blob tab
   (its status bar, the whole tab as the drop target, and "Choose File…" in an empty value's
@@ -173,12 +177,13 @@ stay put), IX (paged, virtualized).
 - A page holds `studio.type_table_page_size` rows (100 by default; a graph can have its own,
   spec 002), the `limit` above.
 - The first page records `graph_commit_id`; later pages pass it as `snapshot` (constitution II).
-  Every page, section and group count is tagged with the pin it was sent at; one that lands
-  after the table's own write moved the pin is read again at the new pin, never shown under it
-  (since 2026-10-21; before, a page read before a save landed showed the old value, a deleted
-  row came back and an inserted one never showed). A pin carried forward to a head that changed
-  nothing the table reads (spec 015) leaves a read out as it was, and it lands (since
-  2026-10-21; before, it was sent again at every such move).
+  Every page, section and group count is sent with how many of the table's own writes had
+  moved its pin by then (`own_writes`); one that lands after another of them is read again at
+  the new pin, never shown under it (since 2026-10-21; before, a page read before a save landed
+  showed the old value, a deleted row came back and an inserted one never showed). A pin
+  carried forward to a head that changed nothing the table reads (spec 015) is no such write,
+  so a read out then lands as it was (since 2026-10-21; before, each read was tagged with the
+  pin it was sent at, and sent again at every move of it).
 - Sorted, a read that shows no row and is not the last (the rows with a value ran out) reads
   the rows without one at once (since 2026-10-21; before, a table whose rows all lacked the
   sort's value said it had none).
@@ -453,6 +458,9 @@ kept answers.
 | Date | Claim | Check | Result |
 |---|---|---|---|
 | 2026-10-22 | A page read from the start names no row to come after | `gq_language` `node_pages_compile_with_and_without_filters`, `sorted_pages_read_values_then_nulls_and_compile`, `a_page_without_a_property_sorts_and_filters_as_if_no_row_held_it`, `edge_pages_and_counts_compile` and `relationship_queries_compile_in_both_directions`, extended: the first page of a node type (filtered, sorted, and as fields at an older commit), of an edge type and of a node's neighbours, and the rows without a value from their start; each failing with `@id > ""` sent | No `@id >` clause and no `after` parameter, the order and limit unchanged, and each type-checks; a later page keeps `@id > $after` (with a sort, inside the keyset pair; for the peek, with the edge). A section reads its first page through the same builder. Measured through the CLI on a type of 70,702 rows: 4.09 s with `$n.@id > ""`, 0.69 s without, 3.0 s for the ids alone with it, 0.61 s after cursor `"m"`. Before, every first page, section and neighbour page sent `@id > ""` |
+| 2026-10-22 | A Blob tab on a branch made after the session's list was read is not refused as gone | `type_table` `a_restored_tab_writes_only_to_the_branch_it_was_saved_on`, extended: the session's list set to main alone, as read before fix was made, then a tab saved on fix restored; failing with the list's answer taken as it is held | Choose File and Clear were not refused while the list was read again, nor after it came back holding fix, and the file went to fix. `gone` is still refused once the list read again lacks it, and nothing is sent. Undone, fix read "fix no longer exists" and nothing was read to correct it |
+| 2026-10-22 | A dropped "Show more" is the read Show more sends | `type_table` `a_show_more_dropped_away_from_the_view_reads_again_when_its_line_returns`, rewritten: `load_section` sends the page, as the button does, and the view scrolls to the end in the same turn, so the frame drawn as it ends drops the read before it is answered (30 seeds) | Dropped with its 100 rows noted, nothing read while away, one `limit 100` read for its value back at the top. Before, the test built the read and the section's state by hand, so a change to what `load_section` notes would not have failed it |
+| 2026-10-22 | A table's upload is not refused, on either branch | `type_table` `a_tables_upload_is_bound_where_its_values_hold_as_it_goes`: the outcome its toast tells is now checked, a commit on main, beside the cell's notice | Before, the check was the cell's notice alone, which a table moved to fix clears whatever the outcome, so it could not fail there |
 | 2026-10-21 | Folding a section reads the cells of the rows it moves into the lines drawn | `type_table` `folding_a_section_reads_the_cells_of_the_rows_it_brings_into_view` (two open sections of 300 rows, a Blob column and two relationship columns; the first folded), failing with the fold's reset undone | The lines drawn were the same before and after; the second section's first row had its Blob and relationships read. Undone, neither was |
 | 2026-10-21 | A read out when the pin moves to a head that changed nothing it reads lands | `type_table` `a_read_out_when_a_commit_to_another_type_moves_the_pin_lands` (another writer's Note at c2 while a Person page is read at c1), failing with every pin move counted as the table's own; `a_read_sent_before_the_tables_own_write_landed_is_read_again_at_its_commit`, extended (one read sent again) | The page landed once, the pin at c2, one request. Undone, the table sent it again, which the session answered without a request from c1's kept answer (`GraphSession::read`, carry-forward), so the test counts the table's sends: the request is sent again only where the session no longer keeps that answer or cannot tell every commit since |
 | 2026-10-21 | A "Show more" dropped away from the view reads again when its line returns | `type_table` `a_show_more_dropped_away_from_the_view_reads_again_when_its_line_returns` (section 0 with 2 of 12 rows and a page out, 150 folded sections after it, scrolled to the end and back), failing with the dropped read's size undone | Dropped at the end with its 100 rows noted; back at the top, one read of `limit 100` for its value. Undone, nothing was read: only a section with no rows read again |

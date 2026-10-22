@@ -5458,9 +5458,6 @@ mod tests {
         });
     }
 
-    /// A page at the branch head follows the window to another branch and reads its node there.
-    /// A write sent before the move lets go of the draft of the branch it was sent on, never
-    /// the one of the branch shown now, and leaves what the page shows alone.
     /// A long text's controls sit in its head row, beside its name: "Open in the editor" adds
     /// no line under the text, and a folded text shows its draft's dot there (spec 014).
     #[gpui::test]
@@ -5510,6 +5507,9 @@ mod tests {
         );
     }
 
+    /// A page at the branch head follows the window to another branch and reads its node there.
+    /// A write sent before the move lets go of the draft of the branch it was sent on, never
+    /// the one of the branch shown now, and leaves what the page shows alone.
     #[gpui::test]
     async fn a_page_follows_its_branch_and_a_write_from_the_one_left_stays_there(
         cx: &mut TestAppContext,

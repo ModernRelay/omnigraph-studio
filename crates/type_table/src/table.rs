@@ -11945,9 +11945,26 @@ mod tests {
             let bound = if moves_branch { &chosen } else { &now };
             assert_eq!(writes[0].if_match.as_deref(), Some(bound.as_str()));
             assert_eq!(blobs.get("Person/p1/doc").unwrap().0, b"bound", "stored");
+            // Not refused: what its toast tells is a commit on main, which a table moved to
+            // fix shows nothing of; a table still on main shows no notice on the cell either.
+            session.read_with(cx, |session, _| {
+                let told = session
+                    .outcomes
+                    .last()
+                    .expect("the upload's outcome is logged");
+                assert_eq!(told.branch, "main");
+                assert!(
+                    matches!(told.outcome, graph_store::OutcomeKind::Committed { .. }),
+                    "{:?}",
+                    told.outcome
+                );
+            });
             table.read_with(cx, |table, _| {
                 let key = ("p1".to_owned(), "doc".to_owned());
-                assert!(!table.blob_edits.contains_key(&key), "not refused");
+                assert!(
+                    !table.blob_edits.contains_key(&key),
+                    "no notice on the cell"
+                );
             });
         }
     }
@@ -12096,7 +12113,8 @@ mod tests {
 
     /// A section's "Show more" read dropped while its line was a screen away is asked for again
     /// when its line is drawn, for as many rows as it asked for, as a section's first read is.
-    /// Before, only a section with no rows read again, and the dropped page never came.
+    /// Before, only a section with no rows read again, and the dropped page never came. The
+    /// read is the one Show more sends, and the view moves away before it is answered.
     #[gpui::test]
     async fn a_show_more_dropped_away_from_the_view_reads_again_when_its_line_returns(
         cx: &mut TestAppContext,
@@ -12141,35 +12159,31 @@ mod tests {
             for index in 1..151 {
                 grouping.section_mut(index).unwrap().expanded = false;
             }
-            let first = grouping.section_mut(0).unwrap();
-            first.range = 0..2;
-            // "Show more" asked for a page, and the read is out.
-            first.loading = true;
+            grouping.section_mut(0).unwrap().range = 0..2;
             table.grouping = Some(grouping);
-            let read = SectionRead {
-                rows: page,
-                _task: Task::ready(()),
-            };
-            table.section_tasks.insert(0, read);
             table.lines_moved();
             cx.notify();
         });
         cx.run_until_parked();
         pages.lock().unwrap().clear();
-        let scroll_to = |line: f32, table: &Entity<TypeTable>, cx: &mut VisualTestContext| {
-            table.update(cx, |table, cx| {
-                let height = table.line_height(cx);
-                {
-                    let state = table.table_state.read(cx).scroll_handle.0.borrow();
-                    state.base_handle.set_offset(point(px(0.), height * -line));
-                }
-                cx.notify();
-            });
-            cx.run_until_parked();
+        let scroll = |line: f32, table: &mut TypeTable, cx: &mut Context<TypeTable>| {
+            let height = table.line_height(cx);
+            {
+                let state = table.table_state.read(cx).scroll_handle.0.borrow();
+                state.base_handle.set_offset(point(px(0.), height * -line));
+            }
+            cx.notify();
         };
 
-        // Scrolled to the end, the read line (line 3) is far above the lines drawn: dropped.
-        scroll_to(150., &table, cx);
+        // Show more asks for a page, as its button does; before it is answered the view
+        // scrolls to the end, where the read line (line 3) is far above the lines drawn. The
+        // frame drawn as the update ends drops the read.
+        table.update(cx, |table, cx| {
+            table.load_section(0, page, cx);
+            assert!(table.section_tasks.contains_key(&0), "the read is out");
+            assert!(table.grouping.as_ref().unwrap().sections()[0].loading);
+            scroll(150., table, cx);
+        });
         table.read_with(cx, |table, _| {
             let drawn = &table.lines_drawn;
             assert!(
@@ -12180,10 +12194,20 @@ mod tests {
             assert_eq!(table.dropped_sections.get(&0), Some(&page));
             assert!(!table.grouping.as_ref().unwrap().sections()[0].loading);
         });
+        // The dropped read may have reached the server before it stopped; a frame away from
+        // the line asks for nothing more.
+        cx.run_until_parked();
+        pages.lock().unwrap().clear();
+        table.update(cx, |table, cx| scroll(149., table, cx));
+        cx.run_until_parked();
         assert!(pages.lock().unwrap().is_empty());
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.dropped_sections.get(&0), Some(&page))
+        });
 
         // Scrolled back, its line is drawn and the page is asked for again.
-        scroll_to(0., &table, cx);
+        table.update(cx, |table, cx| scroll(0., table, cx));
+        cx.run_until_parked();
         let pages = pages.lock().unwrap().clone();
         assert_eq!(pages.len(), 1, "{pages:?}");
         let query = pages[0]["query"].as_str().unwrap_or_default();

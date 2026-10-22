@@ -400,18 +400,29 @@ struct DiskChange {
 
 /// Where a save goes.
 enum SaveTarget {
-    /// The file `path`, written only while it still holds `expected`, the text Studio last
-    /// read or wrote there; `None` writes whatever it holds (a file chosen in the save dialog,
-    /// or one the person said to save over).
+    /// The file `path`, written only while it holds what is `expected` of it.
     File {
         path: std::path::PathBuf,
-        expected: Option<String>,
+        expected: Expected,
     },
     /// A new file in `dir`, named after `name`, over none already there.
     New {
         dir: std::path::PathBuf,
         name: String,
     },
+}
+
+/// What a file must hold for a save to write over it.
+enum Expected {
+    /// Whatever it holds: a file chosen in the save dialog, or one the person said to save
+    /// over.
+    Anything,
+    /// The text Studio last read or wrote there.
+    Text(String),
+    /// No file, as it was gone when the tab last read it. One back is compared with what the
+    /// tab knew of it before anything is written ([`QueryEditor::file_back`]), even empty: an
+    /// empty file is not the tab's text.
+    NoFile,
 }
 
 /// What a save did, off the main thread.
@@ -1361,7 +1372,7 @@ impl QueryEditor {
         self.write_to(
             SaveTarget::File {
                 path,
-                expected: None,
+                expected: Expected::Anything,
             },
             window,
             cx,
@@ -1434,7 +1445,11 @@ impl QueryEditor {
         let target = match &self.path {
             Some(path) => SaveTarget::File {
                 path: path.clone(),
-                expected: self.saved_text.clone(),
+                expected: match (&self.file_gone, &self.saved_text) {
+                    (Some(_), _) => Expected::NoFile,
+                    (None, Some(saved)) => Expected::Text(saved.clone()),
+                    (None, None) => Expected::Anything,
+                },
             },
             None => {
                 let graph = self.session.read(cx).overrides_key(cx);
@@ -1493,7 +1508,7 @@ impl QueryEditor {
             // The dialog asked before replacing a file: whatever it holds is written over.
             let target = SaveTarget::File {
                 path,
-                expected: None,
+                expected: Expected::Anything,
             };
             this.update_in(cx, |this, window, cx| this.write_to(target, window, cx))
                 .ok();
@@ -1512,7 +1527,7 @@ impl QueryEditor {
             match target {
                 SaveTarget::File {
                     path,
-                    expected: None,
+                    expected: Expected::Anything,
                 } => self.save_next = Some(Some(path)),
                 _ => {
                     self.save_next.get_or_insert(None);
@@ -1529,12 +1544,17 @@ impl QueryEditor {
             let path = match target {
                 SaveTarget::File { path, expected } => {
                     // A file gone since is written again; one holding other text is not
-                    // written over.
-                    if let Some(expected) = expected
-                        && let Ok(now) = std::fs::read_to_string(&path)
-                        && now != expected
-                    {
-                        return Ok(Saved::Changed(now));
+                    // written over, nor one back where there was none, whatever it holds.
+                    let now = match expected {
+                        Expected::Anything => None,
+                        Expected::Text(_) | Expected::NoFile => std::fs::read_to_string(&path).ok(),
+                    };
+                    match (expected, now) {
+                        (Expected::Text(expected), Some(now)) if now != expected => {
+                            return Ok(Saved::Changed(now));
+                        }
+                        (Expected::NoFile, Some(now)) => return Ok(Saved::Changed(now)),
+                        _ => {}
                     }
                     path
                 }
@@ -1594,7 +1614,7 @@ impl QueryEditor {
                     Some(Some(path)) => this.write_to(
                         SaveTarget::File {
                             path,
-                            expected: None,
+                            expected: Expected::Anything,
                         },
                         window,
                         cx,
@@ -6645,7 +6665,8 @@ mod tests {
         /// says the file is gone and offers Save As, and Save writes it back. A file that comes
         /// back holding the tab's text, or the text the tab's was typed over, is taken with no
         /// bar, whether the editor taking the keyboard or ⌘S finds it, and ⌘S writes; one
-        /// that comes back holding other text keeps the tab's, and the bar says it changed.
+        /// that comes back holding other text, or none, keeps the tab's, and the bar says it
+        /// changed: an empty file is not the tab's text either.
         /// One whose file reads shows the file, whatever it remembered; a text past the bound
         /// is not kept.
         #[gpui::test]
@@ -6725,12 +6746,12 @@ mod tests {
                 assert!(!editor.is_dirty(cx));
             });
 
-            // Back holding other text, found either way: the tab's text stays, the bar says
-            // the file changed, and ⌘S writes nothing until the person says.
-            for found_by_save in [false, true] {
+            // Back holding other text, or empty, found either way: the tab's text stays, the
+            // bar says the file changed, and ⌘S writes nothing until the person says.
+            for (back, found_by_save) in [(other, false), (other, true), ("", false), ("", true)] {
                 std::fs::remove_file(&path).unwrap();
                 editor.update_in(cx, |editor, window, cx| restart_gone(editor, window, cx));
-                std::fs::write(&path, other).unwrap();
+                std::fs::write(&path, back).unwrap();
                 editor.update_in(cx, |editor, window, cx| match found_by_save {
                     false => editor.check_disk(window, cx),
                     true => editor.save_now(window, cx),
@@ -6756,7 +6777,7 @@ mod tests {
                     );
                 });
                 cx.run_until_parked();
-                assert_eq!(file(), other, "⌘S wrote nothing");
+                assert_eq!(file(), back, "⌘S wrote nothing");
             }
 
             editor.update_in(cx, |editor, window, cx| {
