@@ -969,11 +969,21 @@ impl Render for SettingsView {
     }
 }
 
-/// Shows `keymap.json`, written first with a starting point when the person has none.
+/// Shows `keymap.json`, written first with a starting point when the person has none. One
+/// that cannot be written is said in a toast with its path and why, as the button would
+/// otherwise do nothing.
 fn show_keymap_file(cx: &mut App) {
     match crate::keymaps::user_keymap_file() {
         Ok(path) => cx.reveal_path(&path),
-        Err(error) => log::error!("keymap.json could not be written: {error}"),
+        Err(error) => {
+            let message = format!(
+                "keymap.json could not be written at {}: {error}",
+                studio_settings::keymap_path().display()
+            );
+            log::error!("{message}");
+            // Deferred: the click's window is held for dispatch, and the toast goes there.
+            cx.defer(move |cx| crate::tell(cx, studio_workspace::ToastKind::Error, message));
+        }
     }
 }
 

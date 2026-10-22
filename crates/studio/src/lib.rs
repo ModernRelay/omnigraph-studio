@@ -51,16 +51,17 @@ pub fn init(cx: &mut App) {
     // action came from is held for dispatch, and could not be asked.
     cx.on_action(|_: &Quit, cx| cx.defer(|cx| studio_workspace::quit(false, cx)));
     // The file when it exists; a run from a terminal logs to its output, so then the folder.
-    cx.on_action(|_: &RevealLog, cx| {
-        let file = logging::log_file();
-        if file.exists() {
-            cx.reveal_path(&file);
-        } else if let Some(dir) = file.parent()
-            && std::fs::create_dir_all(dir).is_ok()
-        {
-            cx.open_with_system(dir);
-        }
-    });
+    // A folder that cannot be made is said, with its path and why: the menu item would
+    // otherwise do nothing at all.
+    cx.on_action(
+        |_: &RevealLog, cx| match log_to_reveal(&logging::log_file()) {
+            Ok(LogPlace::File(file)) => cx.reveal_path(&file),
+            Ok(LogPlace::Folder(dir)) => cx.open_with_system(&dir),
+            // Deferred: the window the action came from is held for dispatch, and the toast
+            // goes there.
+            Err(message) => cx.defer(move |cx| tell(cx, ToastKind::Error, message)),
+        },
+    );
     // Deferred: an action reaches here while its window is held for dispatch, and opening the
     // link updates that window.
     cx.on_action(|action: &OpenLink, cx| {
@@ -509,8 +510,33 @@ fn link_window(cx: &App) -> Option<gpui::AnyWindowHandle> {
         .or_else(|| cx.windows().into_iter().find(is_workspace))
 }
 
-/// Says why a link did not open, in a window if there is one.
-fn tell(cx: &mut App, kind: ToastKind, message: String) {
+/// Where Reveal Log File goes.
+#[derive(Debug, PartialEq, Eq)]
+enum LogPlace {
+    File(std::path::PathBuf),
+    /// A run from a terminal logs to its output: the folder the file would be in, made.
+    Folder(std::path::PathBuf),
+}
+
+/// The log `file` when it exists, else its folder, made first; or why the folder could not be
+/// made, naming it.
+fn log_to_reveal(file: &std::path::Path) -> Result<LogPlace, String> {
+    if file.exists() {
+        return Ok(LogPlace::File(file.to_owned()));
+    }
+    let dir = file.parent().unwrap_or(file);
+    match std::fs::create_dir_all(dir) {
+        Ok(()) => Ok(LogPlace::Folder(dir.to_owned())),
+        Err(error) => Err(format!(
+            "The log folder could not be made at {}: {error}",
+            dir.display()
+        )),
+    }
+}
+
+/// Says what did not happen (a link that did not open, a file not written), in a window if
+/// there is one. Deferred by a caller in a window's dispatch, which holds that window.
+pub(crate) fn tell(cx: &mut App, kind: ToastKind, message: String) {
     match link_window(cx) {
         Some(handle) => {
             cx.update_window(handle, |root, _, cx| {
@@ -580,6 +606,37 @@ mod reopen_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reveal Log File shows the file, else its folder made first; a folder that cannot be made
+    /// is said with its path and why, rather than nothing happening.
+    #[test]
+    fn a_log_folder_that_cannot_be_made_is_said() {
+        let root = std::env::temp_dir().join(format!("studio-reveal-log-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("logs").join("Studio.log");
+        assert_eq!(
+            log_to_reveal(&file),
+            Ok(LogPlace::Folder(root.join("logs"))),
+            "the folder, made"
+        );
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(log_to_reveal(&file), Ok(LogPlace::File(file.clone())));
+        // A file where the folder would be.
+        let blocker = root.join("blocker");
+        std::fs::write(&blocker, "").unwrap();
+        let blocked = blocker.join("logs").join("Studio.log");
+        let said = log_to_reveal(&blocked).unwrap_err();
+        let folder = blocker.join("logs");
+        assert!(
+            said.starts_with(&format!(
+                "The log folder could not be made at {}: ",
+                folder.display()
+            )),
+            "{said}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     /// Studio's header strips are where a title bar would be, and the workspace moves the window
     /// from them itself. Were AppKit to own that band, a press on a tab would drag the window.
