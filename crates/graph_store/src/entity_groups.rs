@@ -10,7 +10,9 @@
 //! A relationship whose ends moved ([`FoldedChange::moved_ends`]: one edge, upserted with
 //! another end) is reviewed with the end it stayed at, as a relationship moved to another end
 //! is, its line naming the old end and the new; the old end's group mirrors it too. With both
-//! ends moved, it is reviewed where it is now, and its line names both old ends.
+//! ends moved, it is reviewed with an end that holds the other's place, which stayed joined to
+//! it, and the end that left that entity mirrors it; else where it is now. Its line names both
+//! old ends.
 
 use std::collections::{HashMap, HashSet};
 
@@ -252,6 +254,9 @@ impl EntityGroups {
                 // Moved: with the end it stayed at, which tells it as one change.
                 Some((was_from, _)) if *was_from == from => true,
                 Some((_, was_to)) if *was_to == to => false,
+                // Both moved, one end now in the other's place: with it, as it stayed joined.
+                Some((_, was_to)) if *was_to == from => true,
+                Some((was_from, _)) if *was_from == to => false,
                 _ if added(&from) => true,
                 _ if added(&to) => false,
                 _ => node(&from).is_some() || node(&to).is_none(),
@@ -411,13 +416,38 @@ impl EntityGroups {
                 let other_was = relationship.other_was.as_ref().and_then(group_of);
                 let here_was = relationship.here_was.as_ref().and_then(group_of);
                 earlier.push((ix, at, other_was, here_was));
-                // The end it moved from was joined to this entity: that end's card tells it too.
-                // With both ends moved, the old ends were joined to each other, not to this one,
-                // and the line names them.
-                if relationship.here_was.is_none()
-                    && let Some(was) = other_was.filter(|was| *was != ix)
-                {
-                    mirrors.push((was, mirror()));
+                // The end it moved from was joined to this entity, so that end's card tells it
+                // too, pointing as that end did: the end that held the other end's place, when
+                // only that one moved; when both moved and this entity held the other end's
+                // place, the end that held this one, unless it is the other end now, whose
+                // card mirrors it anyway. With both ends moved to others, the old ends were
+                // joined to each other, not to this one, and the line names them.
+                let is = |end: &EarlierEnd, (type_name, id): (&str, &str)| {
+                    end.type_name == type_name && end.id == id
+                };
+                let there = (
+                    relationship.other_type.as_str(),
+                    relationship.other_id.as_str(),
+                );
+                let left = match (&relationship.here_was, &relationship.other_was) {
+                    (None, Some(_)) => {
+                        other_was.map(|was| (was, relationship.direction.reversed()))
+                    }
+                    (Some(left), Some(held_here))
+                        if is(held_here, (&group.type_name, &group.id)) && !is(left, there) =>
+                    {
+                        here_was.map(|was| (was, relationship.direction))
+                    }
+                    _ => None,
+                };
+                if let Some((was, direction)) = left.filter(|(was, _)| *was != ix) {
+                    mirrors.push((
+                        was,
+                        GroupRelationship {
+                            direction,
+                            ..mirror()
+                        },
+                    ));
                 }
             }
         }
@@ -977,8 +1007,10 @@ mod tests {
     /// One edge upserted with another end is reviewed with the end it stayed at, its line
     /// naming the old end and the new, and mirrored on the old end's card, which it left. With
     /// both ends moved it is reviewed where it is now, its line naming both old ends, and the
-    /// old ends, joined to each other rather than to it, mirror nothing. The ends it had are
-    /// read from the graph when the review knows them only by id.
+    /// old ends, joined to each other rather than to it, mirror nothing; unless one end now
+    /// holds the other's place: it stayed joined to the edge, which is reviewed with it
+    /// whichever ends the review changed, and the end that left it mirrors it, pointing as it
+    /// did. The ends it had are read from the graph when the review knows them only by id.
     #[test]
     fn a_relationship_whose_end_moved_names_the_end_it_had() {
         let schema = SchemaModel::parse(SCHEMA).unwrap();
@@ -993,6 +1025,10 @@ mod tests {
             moved("e1", ("ana", "maya"), ("bob", "maya")),
             // Both ends moved.
             moved("e2", ("cleo", "dan"), ("eve", "finn")),
+            node("Person", "gus", NetChange::Changed),
+            node("Person", "ivy", NetChange::Changed),
+            // Both moved, Hal from its target to its source: Gus, its source, left Hal.
+            moved("e3", ("gus", "hal"), ("hal", "ivy")),
         ]);
         assert_eq!(folded.changes[2].net(), Some(NetChange::Changed));
         let groups = EntityGroups::new(&folded, Some(&schema));
@@ -1001,8 +1037,11 @@ mod tests {
             [
                 "Existing Person:ana | mirror Knows -> Person:maya",
                 "Existing Person:dan",
+                "Existing Person:gus | mirror Knows -> Person:hal",
+                "Existing Person:ivy | mirror Knows <- Person:hal",
                 "Existing Person:maya (unchanged) | Knows <- Person:bob",
                 "Existing Person:eve (unchanged) | Knows -> Person:finn",
+                "Existing Person:hal (unchanged) | Knows -> Person:ivy",
             ]
         );
         let reviewed: usize = groups.groups.iter().map(|g| g.changes().count()).sum();
@@ -1019,7 +1058,8 @@ mod tests {
                 "Person:bob",
                 "Person:eve",
                 "Person:finn",
-                "Person:cleo"
+                "Person:cleo",
+                "Person:hal"
             ],
             "Ana and Dan are named by the review"
         );
@@ -1033,7 +1073,7 @@ mod tests {
                 .entries
                 .remove(0)
         };
-        let maya = line(2);
+        let maya = line(4);
         assert_eq!(
             (
                 maya.net,
@@ -1043,7 +1083,7 @@ mod tests {
             ),
             (Some(NetChange::Changed), "Bob Brown", Some("ana"), None)
         );
-        let eve = line(3);
+        let eve = line(5);
         assert_eq!(
             (
                 eve.other.as_str(),
@@ -1056,9 +1096,25 @@ mod tests {
         assert_eq!((ana.net, ana.other.as_str()), (None, "maya"), "a mirror");
         assert_eq!(
             groups
-                .lines(&folded, 2, Some(&schema), &names, usize::MAX)
+                .lines(&folded, 4, Some(&schema), &names, usize::MAX)
                 .changed,
             1
+        );
+        let hal = line(6);
+        assert_eq!(
+            (
+                hal.net,
+                hal.other.as_str(),
+                hal.other_was.as_deref(),
+                hal.here_was.as_deref()
+            ),
+            (Some(NetChange::Changed), "ivy", Some("hal"), Some("gus"))
+        );
+        let gus = line(2);
+        assert_eq!(
+            (gus.net, gus.other.as_str(), gus.outgoing),
+            (None, "hal", true),
+            "a mirror, pointing at Hal as the edge did"
         );
     }
 

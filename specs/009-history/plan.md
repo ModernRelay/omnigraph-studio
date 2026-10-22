@@ -43,7 +43,10 @@ from Zed with notices).
   mirrored on the old end's card; with both ends moved, on its card where it is now, naming
   who held that end ("moved from Cleo"); one whose type the schema lacks shows a `from` or
   `to` row. A review shows it alike (since 2026-10-21; before, "~ knows Bob" with no rows, the
-  old end never named). A commit
+  old end never named). When both moved and one end took the other's place (Cleo knows Dan
+  becomes Dan knows Eve), it is on that end's card, which it stayed joined to, whichever ends
+  the commit changed, and mirrored on the card of the end that left it, pointing as it did
+  (since 2026-10-22; before, Cleo's card said nothing, and the edge could sit on Eve's). A commit
   held off every branch names what it is in the branch's place ("Unpublished, on no branch
   until published to main", "Unattached snapshot, on no branch"), and a commit still being read
   names no branch until its kind is known (since 2026-10-21). The graph's first commit has no
@@ -73,7 +76,11 @@ from Zed with notices).
   read when it is next drawn, once for all of them, keeping the pages read after commits. A
   dock draws only the panel it shows, so its view reads them from its own draw, after the
   frame (since 2026-10-21; before, a panel shown once read its first page at every commit to
-  its branch, about twenty an hour on the personal graph, for the rest of the run).
+  its branch, about twenty an hour on the personal graph, for the rest of the run). A read of
+  the branch left that is still out when the window's branch changes ends there, and the
+  panel is being read until the new branch is, so neither the old branch's commits nor why
+  they could not be read show under the new one's name (since 2026-10-22; before, a read out
+  then landed on the emptied panel).
 - Built (paging, E10, 2026-10-20): History reads its branch's newest 200 commits, and the
   next page when the rows drawn come within a screen of the list's end; every later page
   answers for the head the first page resolved (`head_commit_id`), so the pages stay one
@@ -100,7 +107,10 @@ from Zed with notices).
   and its Try again asks for them again as the Refresh was to. A read that takes the place of
   one still under way, as a commit landing during a Refresh does, does what both were to: it
   keeps the pages read only when both would, and asks again for those commits when either
-  would (since 2026-10-21; before, the commit's read dropped the Refresh's ask). Once the
+  would (since 2026-10-21; before, the commit's read dropped the Refresh's ask). A commit
+  landing after a Refresh's read failed reads the page as Try again would, keeping the pages
+  read and asking again for what the Refresh was to (since 2026-10-22; before, it dropped that
+  ask too). Once the
   server refused the listing's continuation, Try again reads the listing from its first page
   rather than keep the pages going on from that continuation (since 2026-10-21; before, a
   failed Refresh had forgotten why the stubs were stubs, and Try again kept the refused
@@ -164,6 +174,9 @@ away are dropped.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-22 | An edge whose end took the other's place is mirrored on the end it left | `graph_store` `entity_groups::a_relationship_whose_end_moved_names_the_end_it_had`, extended: Knows from Gus to Hal upserted from Hal to Ivy, Gus and Ivy changed in the review, Hal not; failing with the mirror undone | On Hal's card, "hal → ivy", "moved from gus", mirrored on Gus's pointing at Hal as it did and on Ivy's as the other end; each change reviewed once. Undone, Gus's card had no mirror; placed as before, the edge sat on Ivy's card, whose mirror on Gus would have named Ivy, whom Gus never knew |
+| 2026-10-22 | The panel shows nothing of the branch left under the new one's name | `history` `a_panel_shows_nothing_of_the_branch_left_under_the_new_ones_name` (main's first page out, the panel hidden and the window moved to feature; then again with that page failing), failing with `forget_branch` leaving the read running | Both times no commit showed under feature and the history was being read; shown again, it read feature's two commits. Undone, main's three commits showed under feature, and the failure took the list's place under feature's name |
+| 2026-10-22 | A commit after a failed Refresh keeps the Refresh's ask | `history` `merged_in_commits_are_read_by_their_ids`, extended: a Refresh's page fails, then a commit lands; failing with only a read under way carried | The commit's read kept the pages and asked again for the merged commit the server did not have, a fifth read of it. Undone, the read was `KEEP` alone and the stub was not asked for again |
 | 2026-10-21 | An edge moved to another end names both | `graph_store` `changes::an_edge_with_another_end_is_changed_and_names_both`, `entity_groups::a_relationship_whose_end_moved_names_the_end_it_had` (Knows from Ana to Maya upserted from Bob, and from Cleo to Dan upserted from Eve to Finn, Ana and Dan changed in the review); `change_cards` `a_moved_relationship_names_the_end_it_had`; `carry.rs` `Logged::add`, which already took both images' ends | The first is on Maya's card, "Ana → Bob", "moved", and mirrored on Ana's; the second on Eve's, "Dan → Finn", "moved from Cleo", with no mirror on Dan's, whose Dan was joined to Cleo; each change is reviewed once, and Maya, Bob, Eve, Finn and Cleo are read for their names. Before, both were homed by their new ends alone, read "~ knows Bob" and "~ knows Finn" with no rows, and the old ends were neither named nor read. Not yet seen in the running app |
 | 2026-10-21 | A commit landing during a Refresh keeps the Refresh's ask | `history` `merged_in_commits_are_read_by_their_ids`, extended: a Refresh, then a commit to the branch before the Refresh's page is read | The read in its place is `State::Loading { read: FirstPage::REFRESH }`, and the merged commit the server does not have is asked for once more. Before, `committed` sent `load(FirstPage::KEEP)`, which replaced the Refresh's task and its `ask_missing`, so the stub was not asked for again until the next Refresh (found in review of `0ecb3a0`) |
 | 2026-10-21 | A hidden History panel reads nothing until shown | `history` `a_hidden_panel_reads_nothing_until_shown_again` (the panel drawn cached by a stand-in dock, as `studio_workspace` `panel_body` draws a bottom panel; hidden, two commits land; shown; then a third) | One listing as first drawn; none for the two commits while hidden; one when shown again, the five commits in order; one more for the third, while shown. Before, `HistoryView::panel` read the first page at each `Committed` whether drawn or not. Not yet seen in the running app |

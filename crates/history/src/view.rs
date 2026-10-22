@@ -604,8 +604,15 @@ impl HistoryView {
     }
 
     /// Lets go of what was shown and read for the branch left, so its commits never show under
-    /// the new one's name while that is read; the branch left is one of the others now.
+    /// the new one's name while that is read; the branch left is one of the others now. A read
+    /// of the branch left still under way ends here (`_task` is dropped): landing, it would lay
+    /// out that branch's commits under the new one's name, or say why they could not be read.
+    /// Until the new branch is read, the history is being read.
     fn forget_branch(&mut self) {
+        self._task = None;
+        self.state = State::Loading {
+            read: FirstPage::REPLACE,
+        };
         self.read = Arc::default();
         self.next_page = None;
         self.listing_head = None;
@@ -682,19 +689,10 @@ impl HistoryView {
     /// Try again, after the first page could not be read again while commits were shown: reads
     /// it again from the branch's head as the read that failed was to (a Refresh's asks again
     /// for the merged-in commits the server did not have), and the pages read stay below it
-    /// when it reaches the head they were read from, as for a commit landing.
+    /// when it reaches the head they were read from, as for a commit landing. [`Self::load`]
+    /// takes what the failed read was to from [`State::Stale`].
     fn retry(&mut self, cx: &mut Context<Self>) {
-        let failed = match self.state {
-            State::Stale { read, .. } => read,
-            _ => FirstPage::KEEP,
-        };
-        self.load(
-            FirstPage {
-                keep: true,
-                ..failed
-            },
-            cx,
-        );
+        self.load(FirstPage::KEEP, cx);
     }
 
     /// Whether the commits read are shown and go on being read: the first page was read, or
@@ -714,8 +712,18 @@ impl HistoryView {
             read.keep = false;
         }
         // A read of it under way ends here (`_task` is replaced): this one does what it was to.
-        if let State::Loading { read: pending } = self.state {
-            read = read.with(pending);
+        // So does one that failed while commits were shown, as Try again would: the pages read
+        // stay below it, and a Refresh's ask for the merged-in commits the server did not have
+        // is not lost to a commit landing after it.
+        match self.state {
+            State::Loading { read: pending } => read = read.with(pending),
+            State::Stale { read: failed, .. } => {
+                read = read.with(FirstPage {
+                    keep: true,
+                    ..failed
+                })
+            }
+            State::Ready | State::Failed(_) => {}
         }
         self.state = State::Loading { read };
         // A next page or a walk of merged-in commits under way ends here (`_task` is
@@ -2980,6 +2988,40 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, _| check(view));
         assert_eq!(reads(&served), [1, 1, 4], "asked for again");
+        // So does a commit landing after a Refresh's page failed: it reads the page as Try
+        // again would, keeping the commits read, and asks again for what the Refresh was to.
+        served
+            .lock()
+            .unwrap()
+            .fail_listings
+            .insert("branch=main&limit=200".into(), 1);
+        view.update(cx, |view, cx| view.refresh(cx));
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert!(matches!(
+                view.state,
+                State::Stale {
+                    read: FirstPage::REFRESH,
+                    ..
+                }
+            ));
+            view.committed("main", cx);
+            assert!(matches!(
+                view.state,
+                State::Loading {
+                    read: FirstPage {
+                        keep: true,
+                        ask_missing: true
+                    }
+                }
+            ));
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.state, State::Ready));
+            check(view);
+        });
+        assert_eq!(reads(&served), [1, 1, 5], "asked for again");
     }
 
     /// A merge whose branch goes on below the oldest commit of the pages read is read as far
@@ -3675,6 +3717,82 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert_eq!(view.commits[0].graph_commit_id, "m5")
         });
+    }
+
+    /// The panel follows the window's branch. A read of the branch left that is still out when
+    /// the branch changes lands on nothing: neither its commits nor its failure show under the
+    /// new branch's name while the panel waits, hidden, to read that branch.
+    #[gpui::test]
+    async fn a_panel_shows_nothing_of_the_branch_left_under_the_new_ones_name(
+        cx: &mut TestAppContext,
+    ) {
+        let (session, served) = serve(
+            Served {
+                branches: vec![
+                    ("main".into(), chain("m", 3)),
+                    ("feature".into(), chain("f", 2)),
+                ],
+                ..Default::default()
+            },
+            cx,
+        );
+        let held = session.clone();
+        let (dock, cx) = cx.add_window_view(move |window, cx| {
+            let panel = cx.new(|cx| {
+                crate::panel::HistoryPanel::new(WeakEntity::new_invalid(), Some(held), window, cx)
+            });
+            DockStandIn { panel, shown: true }
+        });
+        cx.run_until_parked();
+        let view = dock.read_with(cx, |dock, cx| dock.panel.read(cx).view().cloned());
+        let view = view.expect("made when first drawn");
+        view.read_with(cx, |view, _| assert_eq!(ids(view), ["m2", "m1", "m0"]));
+        for fails in [false, true] {
+            if fails {
+                session.update(cx, |session, cx| session.set_branch("main".into(), cx));
+                dock.update(cx, |dock, cx| {
+                    dock.shown = true;
+                    cx.notify();
+                });
+                cx.run_until_parked();
+                view.read_with(cx, |view, _| assert_eq!(ids(view), ["m2", "m1", "m0"]));
+                served
+                    .lock()
+                    .unwrap()
+                    .fail_listings
+                    .insert("branch=main&limit=200".into(), 1);
+            }
+            // `main`'s first page is out when the window moves to `feature`, with the panel
+            // hidden.
+            view.update(cx, |view, cx| view.load(FirstPage::KEEP, cx));
+            dock.update(cx, |dock, cx| {
+                dock.shown = false;
+                cx.notify();
+            });
+            session.update(cx, |session, cx| session.set_branch("feature".into(), cx));
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.branch, "feature");
+                assert!(
+                    ids(view).is_empty(),
+                    "main's commits showed under feature's name"
+                );
+                assert!(
+                    matches!(view.state, State::Loading { .. }),
+                    "main's page landed on feature's history"
+                );
+            });
+            // Shown again, it reads `feature`.
+            dock.update(cx, |dock, cx| {
+                dock.shown = true;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert!(matches!(view.state, State::Ready));
+                assert_eq!(ids(view), ["f1", "f0"]);
+            });
+        }
     }
 
     /// The commit shown beside the list draws on its own: a change there (a scroll, a page of
