@@ -1,8 +1,8 @@
 # Omnigraph Studio constitution
 
-Version 1.2.1 · ratified 2026-10-11 · amended 2026-10-17 (IV: ↵ and Undo for what Studio can
-put back) · amended 2026-10-18 (IV: ↵ for what loses no data) · amended 2026-10-24 (X: Omnigraph
-`v0.14.0` and later)
+Version 1.2.2 · ratified 2026-10-11 · amended 2026-10-17 (IV: ↵ and Undo for what Studio can
+put back) · amended 2026-10-18 (IV: ↵ for what loses no data) · amended 2026-10-22 (I: the
+updater's requests) · amended 2026-10-24 (X: Omnigraph `v0.14.0` and later)
 
 Omnigraph Studio is a native desktop app for exploring and changing Omnigraph graphs: type
 tables, a relationship tree, a graph canvas, a `.gq` query editor, branches, review, merge and
@@ -16,8 +16,9 @@ graph storage, never links the engine, and never keeps a copy of graph data that
 true. The one engine crate it links is `omnigraph-compiler`, for parsing schemas and queries
 offline; parsing is language intelligence, not data access.
 
-*In practice:* one client crate owns every request. Every request sends the
-`omnigraph-http-api` contract header and every response is checked for it. A response without
+*In practice:* one client crate owns every request to a server. Every request sends the
+`omnigraph-http-api` contract header and every response is checked for it. `studio_update`
+alone fetches Studio's own releases (spec 017). A response without
 it has an unknown effect.
 
 ## II. One snapshot per view

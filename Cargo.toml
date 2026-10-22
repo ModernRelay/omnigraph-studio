@@ -20,6 +20,7 @@ members = [
     "crates/history",
     "crates/inspectors",
     "crates/agent_panel",
+    "crates/studio_update",
     "grammars/tree-sitter-gq",
     "grammars/tree-sitter-pg",
 ]
@@ -51,6 +52,7 @@ studio_workspace = { path = "crates/studio_workspace" }
 change_cards = { path = "crates/change_cards" }
 graph_client = { path = "crates/graph_client" }
 graph_store = { path = "crates/graph_store" }
+studio_update = { path = "crates/studio_update" }
 gq_language = { path = "crates/gq_language" }
 command_palette = { path = "crates/command_palette" }
 type_table = { path = "crates/type_table" }
