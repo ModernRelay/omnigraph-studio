@@ -43,6 +43,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo deny check
 python3 script/check-layers.py   # crate layer rule; keep its table in step with docs/architecture.md
+python3 script/check-brand.py    # the name is written Omnigraph
 ```
 
 - macOS needs the Command Line Tools: the default `runtime-shaders` feature compiles GPUI's Metal
@@ -70,6 +71,8 @@ python3 script/check-layers.py   # crate layer rule; keep its table in step with
   appears in the palette.
 - Copying from Zed is allowed (GPL). Keep the file's copyright notice and add a
   `// Forked from zed-industries/zed <path> @ <commit>` line. Keep forks small.
+- Write the product's name Omnigraph: one word, a lower-case g (`omnigraph` in identifiers and
+  paths). Copies of upstream files stay as upstream wrote them.
 - No OmniGraph engine changes from this repo. Add the need to spec 012 with an ID, list it in
   `docs/deferred-engine-changes.md`, and design against today's API.
 - Never add a second copy of GPUI (GPUI Kit, `gpui-pre`, `gpui-ce`, crates.io `gpui`).
