@@ -3520,11 +3520,26 @@ impl TypeTable {
     }
 
     /// Counts the rows the first read showed, by reads at the pin ([`Self::read_counts`]).
-    /// While the count of every row is out, the session's snapshot's shows in its place when it
-    /// may be the pin's ([`Self::snapshot_count`]), so the rows are counted as the first page
-    /// shows; the read replaces it as it lands, so a snapshot of another commit shows only
-    /// until then, and never past a Refresh.
+    /// When the session's snapshot counts the pin's commit ([`Self::pinned_snapshot_count`]),
+    /// its count of every row is the count, and only the count through the filters is read.
+    /// Otherwise, while the count of every row is out, the session's snapshot's shows in its
+    /// place when it may be the pin's ([`Self::snapshot_count`]), so the rows are counted as the
+    /// first page shows; the read replaces it as it lands, so a snapshot of another commit shows
+    /// only until then, and never past a Refresh.
     fn load_counts(&mut self, cx: &mut Context<Self>) {
+        if let Some(n) = self.pinned_snapshot_count(cx) {
+            if self.filters.is_empty() {
+                self.count = Loadable::Loaded(n);
+                self.count_task = None;
+            } else {
+                self.total = Loadable::Loaded(n);
+                self.total_task = None;
+                let query = self.count_query(true);
+                let snapshot = self.paging.pinned.clone();
+                self.count_task = self.spawn_count(query, snapshot, true, cx);
+            }
+            return;
+        }
         let provisional = self.snapshot_count(cx);
         self.read_counts(cx);
         let Some(n) = provisional else {
@@ -3563,11 +3578,10 @@ impl TypeTable {
     /// be the count at the pin: the snapshot counts the branch head, so only while the pin is
     /// the head the session holds. `None` for a table held at a commit, for a pin the
     /// session's head moved past, while the table's own writes past its pin are counted
-    /// ([`Self::count_shift`]), and while the session holds no count for the type. The snapshot
-    /// is not bound to a commit the table can compare with its pin (the session keeps none of
-    /// its manifest version, and a read's answer names no version), so a commit between the
-    /// session's snapshot and its head read makes it another commit's: it only stands in until
-    /// the read at the pin lands ([`Self::load_counts`]).
+    /// ([`Self::count_shift`]), and while the session holds no count for the type. Unless the
+    /// session found the snapshot's commit to be the pin ([`Self::pinned_snapshot_count`]), a
+    /// commit between the session's snapshot and its head read can make it another commit's:
+    /// it only stands in until the read at the pin lands ([`Self::load_counts`]).
     fn snapshot_count(&self, cx: &App) -> Option<i64> {
         if self.at_commit.is_some() || self.count_shift.is_some() {
             return None;
@@ -3577,11 +3591,32 @@ impl TypeTable {
         if session.branch != self.branch || session.head(&self.branch) != Some(pin) {
             return None;
         }
-        let kind = match self.kind {
+        session.count_of(self.entity_kind(), &self.type_name)
+    }
+
+    /// How many rows the session's snapshot counts for the type when it counts the pin itself:
+    /// the session found the commit at the snapshot's manifest version
+    /// ([`GraphSession::counts_commit`]), and it is the pin, whatever branch or commit the table
+    /// is held at. `None` while the table's own writes past its pin are counted
+    /// ([`Self::count_shift`]) and while the session holds no count for the type.
+    fn pinned_snapshot_count(&self, cx: &App) -> Option<i64> {
+        if self.count_shift.is_some() {
+            return None;
+        }
+        let pin = self.paging.pinned.as_deref()?;
+        let session = self.session.read(cx);
+        if session.counts_commit() != Some(pin) {
+            return None;
+        }
+        session.count_of(self.entity_kind(), &self.type_name)
+    }
+
+    /// The snapshot's kind for the table's.
+    fn entity_kind(&self) -> graph_store::EntityKind {
+        match self.kind {
             TableKind::Node => graph_store::EntityKind::Node,
             TableKind::Edge => graph_store::EntityKind::Edge,
-        };
-        session.count_of(kind, &self.type_name)
+        }
     }
 
     fn spawn_count(
@@ -10577,12 +10612,13 @@ mod tests {
     }
 
     /// A table at the head the session holds shows the session's snapshot count of every row
-    /// with its first page, until the read at its pin lands and replaces it: the snapshot is
-    /// bound to no commit the table can compare with its pin. Here another writer's commit
-    /// lands between the session's snapshot and its first head read, so the snapshot counts the
-    /// commit before the pin; the read at the pin corrects it, and Refresh reads it there
-    /// again. Filtered, the count through the filter is read too. A table held at a commit
-    /// shows no snapshot count while its read is out.
+    /// with its first page, until the read at its pin lands and replaces it, when the session
+    /// could not bind the snapshot to a commit. Here another writer's commit lands between the
+    /// session's snapshot and its reads of the head, so the snapshot counts the commit before
+    /// the pin and the newest commit is at another manifest version: the snapshot names no
+    /// commit, the read at the pin corrects its count, and Refresh reads it there again.
+    /// Filtered, the count through the filter is read too. A table held at a commit shows no
+    /// snapshot count while its read is out.
     #[gpui::test]
     async fn a_tables_snapshot_count_stands_in_until_the_read_at_its_pin(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -10628,18 +10664,23 @@ mod tests {
             cx.run_until_parked();
             (table, cx)
         }
-        // The session's first head read waits while another writer adds a person: the
-        // snapshot, read meanwhile, counts c1, and the head the session holds is c2.
+        // The session's first head read, and its read of the newest commit after the
+        // snapshot, wait while another writer adds a person: the snapshot, read meanwhile,
+        // counts c1 at manifest version 1, and the head the session holds is c2, at 2.
         let head = served.hold(|read| read["name"] == "studio_head");
+        let newest = served.hold(|read| read["route"] == "commits");
         cx.run_until_parked();
         writer.commit("c2", vec![changed("node", "Person", "p3", None)]);
         head.send(()).unwrap();
+        newest.send(()).unwrap();
         cx.run_until_parked();
         session.read_with(cx, |session, _| {
             assert_eq!(session.head("main"), Some("c2"));
             let counted = session.count_of(graph_store::EntityKind::Node, "Person");
             assert_eq!(counted, Some(70_702), "the commit before");
+            assert_eq!(session.counts_commit(), None, "the versions differ");
         });
+        assert_eq!(served.commit_pages(), ["branch=main&limit=1"]);
 
         // The snapshot's count shows with the first page while the read at the pin is out.
         let count = served.hold(|read| read["name"] == "studio_count");
@@ -10687,6 +10728,114 @@ mod tests {
         held.read_with(held_cx, |held, _| {
             assert_eq!(held.count, Loadable::Loaded(70_702))
         });
+    }
+
+    /// When the branch's newest commit, read after the session's snapshot, is at the snapshot's
+    /// manifest version, the snapshot counts that commit: a table pinned there counts every row
+    /// from it and sends no count read, at the head or held at that commit. The newest commit
+    /// is read once, and shared with a list of branches that asks for it. After another
+    /// writer's commit the snapshot and the newest commit are read again, and a Refresh at the
+    /// new head reads no count either; filtered, only the count through the filter is read.
+    #[gpui::test]
+    async fn a_table_at_the_commit_the_snapshot_counts_reads_no_count(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, writer, served) = crate::test_support::session_served(
+            PEOPLE,
+            |request| {
+                let filtered = request["params"].as_object().is_some_and(|p| !p.is_empty());
+                match request["name"].as_str() {
+                    Some("studio_count") if filtered => serde_json::json!([{"n": 1}]),
+                    Some("studio_count") => serde_json::json!([{"n": 70_702}]),
+                    _ => serde_json::json!([
+                        {"n": {"@id": "p1", "slug": "p1", "name": "Ada"}},
+                        {"n": {"@id": "p2", "slug": "p2", "name": "Grace"}},
+                    ]),
+                }
+            },
+            cx,
+        );
+        served.count_nodes("Person", 70_702);
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.head("main"), Some("c1"));
+            assert_eq!(session.counts_commit(), Some("c1"), "both at version 1");
+        });
+        assert_eq!(served.commit_pages(), ["branch=main&limit=1"]);
+
+        // A list of branches showing main's newest commit takes the read the counts made.
+        let newest = session.update(cx, |session, cx| session.head_commit("main", false, cx));
+        cx.run_until_parked();
+        let newest = futures::executor::block_on(newest).unwrap().unwrap();
+        assert_eq!(newest.graph_commit_id, "c1");
+        assert_eq!(served.commit_pages().len(), 1, "shared");
+
+        let open = |at_commit: Option<&str>, cx: &mut TestAppContext| {
+            let (session, at_commit) = (session.clone(), at_commit.map(str::to_owned));
+            let (table, cx) = cx.add_window_view(|window, cx| {
+                TypeTable::new(
+                    WeakEntity::new_invalid(),
+                    session,
+                    "Person".into(),
+                    at_commit,
+                    window,
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+            (table, cx.clone())
+        };
+        let (table, mut table_cx) = open(None, cx);
+        table.read_with(&table_cx, |table, _| {
+            assert_eq!(table.paging.pinned.as_deref(), Some("c1"));
+            assert_eq!(table.count, Loadable::Loaded(70_702));
+        });
+        assert!(served.sent("studio_count").is_empty(), "no count read");
+
+        // Held at the commit the snapshot counts, a table reads no count either.
+        let (held, held_cx) = open(Some("c1"), cx);
+        held.read_with(&held_cx, |held, _| {
+            assert_eq!(held.count, Loadable::Loaded(70_702))
+        });
+        assert!(served.sent("studio_count").is_empty(), "no count read");
+
+        // Another writer adds a person: once the session sees it, the snapshot and the newest
+        // commit are read again, both at version 2, and a Refresh counts the new head from it.
+        writer.commit("c2", vec![changed("node", "Person", "p3", None)]);
+        served.count_nodes("Person", 70_703);
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.counts_commit(), Some("c2"));
+        });
+        assert_eq!(served.commit_pages().len(), 2);
+        table.update_in(&mut table_cx, |table, window, cx| table.refresh(window, cx));
+        table_cx.run_until_parked();
+        table.read_with(&table_cx, |table, _| {
+            assert_eq!(table.paging.pinned.as_deref(), Some("c2"));
+            assert_eq!(table.count, Loadable::Loaded(70_703));
+        });
+        assert!(served.sent("studio_count").is_empty(), "no count read");
+
+        // Filtered, only the count through the filter is read.
+        let only_ada = Filter {
+            property: "name".into(),
+            op: FilterOp::Eq,
+            value: "Ada".into(),
+        };
+        table.update(&mut table_cx, |table, cx| table.show_only(only_ada, cx));
+        table_cx.run_until_parked();
+        table.read_with(&table_cx, |table, _| {
+            assert_eq!(table.count, Loadable::Loaded(1));
+            assert_eq!(table.total, Loadable::Loaded(70_703));
+        });
+        let counts = served.sent("studio_count");
+        assert_eq!(counts.len(), 1, "{counts:?}");
+        let through_filter = counts[0]["params"].as_object();
+        assert!(through_filter.is_some_and(|p| !p.is_empty()), "{counts:?}");
+        assert_eq!(counts[0]["at"], "c2");
     }
 
     /// The next page is asked for as soon as a page is in while no more than a page is left

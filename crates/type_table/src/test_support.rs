@@ -136,6 +136,12 @@ impl Writer {
             .map(|(id, ..)| id.clone())
     }
 
+    /// The `__manifest` version holding the newest commit: `c1`'s is 1, and each commit
+    /// publishes the next.
+    fn version(&self) -> u64 {
+        1 + self.commits.lock().unwrap().len() as u64
+    }
+
     fn feed(&self, query: &str) -> Value {
         self.feeds.lock().unwrap().push(query.to_owned());
         // Type names and commit ids need no decoding past the `:` of `after:`.
@@ -189,7 +195,8 @@ pub(crate) fn changed(kind: &str, ty: &str, id: &str, ends: Option<(&str, &str)>
 
 /// What a fake server is sent and answers in steps: every read's request body in order, as
 /// the rows see it (with `at`, the commit it is answered at), reads held until a test lets them
-/// go, and the row counts `/snapshot` answers with.
+/// go, and the row counts `/snapshot` answers with. A read of a branch's commits (`/commits`)
+/// is noted as `{"route": "commits", "query": …}`, and answers the branch's newest commit.
 #[derive(Default)]
 pub(crate) struct Served {
     reads: Mutex<Vec<Value>>,
@@ -229,6 +236,17 @@ impl Served {
             .collect()
     }
 
+    /// The reads of a branch's commits sent so far, in order: each one's query string.
+    pub(crate) fn commit_pages(&self) -> Vec<String> {
+        self.reads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|read| read["route"] == "commits")
+            .map(|read| read["query"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    }
+
     /// Has the snapshot count `count` rows of node type `type_name`, at every branch's head.
     pub(crate) fn count_nodes(&self, type_name: &str, count: i64) {
         let mut counts = self.counts.lock().unwrap();
@@ -244,8 +262,8 @@ impl Served {
         Some(holds.remove(at).until)
     }
 
-    /// What `/snapshot` answers, once a count is set.
-    fn snapshot(&self, branch: &str) -> Option<Value> {
+    /// What `/snapshot` answers, once a count is set: the counts at manifest `version`.
+    fn snapshot(&self, branch: &str, version: u64) -> Option<Value> {
         let counts = self.counts.lock().unwrap();
         if counts.is_empty() {
             return None;
@@ -260,7 +278,7 @@ impl Served {
             })
             .collect();
         Some(json!({
-            "graph_branch": branch, "graph_manifest_version": 1, "internal_schema_version": 16,
+            "graph_branch": branch, "graph_manifest_version": version, "internal_schema_version": 16,
             "datasets": datasets,
         }))
     }
@@ -808,10 +826,24 @@ fn serve_blobs(
                         .split('&')
                         .find_map(|pair| pair.strip_prefix("branch="))
                         .unwrap_or("main");
-                    served.snapshot(branch)
+                    let version = writer.as_ref().map_or(1, |writer| writer.version());
+                    served.snapshot(branch, version)
                 })
             {
                 (200, snapshot)
+            } else if let Some(served) = served.as_ref().filter(|_| path.ends_with("/commits")) {
+                // The branch's newest commit, as the server has it once a held read goes.
+                let asked = json!({ "route": "commits", "query": query });
+                if let Some(held) = served.take(&asked) {
+                    held.await.ok();
+                }
+                let head = writer.as_ref().and_then(|writer| writer.head());
+                let version = writer.as_ref().map_or(1, |writer| writer.version());
+                let commit = json!({
+                    "graph_commit_id": head.unwrap_or_else(|| "c1".to_owned()),
+                    "graph_manifest_version": version, "kind": "published", "created_at": 0,
+                });
+                (200, json!({ "commits": [commit] }))
             } else if path.ends_with("/query") {
                 let mut bytes = Vec::new();
                 request.into_body().read_to_end(&mut bytes).await.ok();
