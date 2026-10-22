@@ -3439,9 +3439,10 @@ mod tests {
         });
     }
 
-    /// A relationship read ahead and left before its neighbours answered shows nothing: another
-    /// writer's change to a node of the type at its other end leaves the exploration as it is,
-    /// and its pin follows the head.
+    /// A relationship read ahead and left before its neighbours answered shows nothing, nor
+    /// does a node's count read ahead and left before it answered: another writer's change to
+    /// a node of the type at the relationship's other end, and to an edge at that node, leaves
+    /// the exploration as it is, and its pin follows the head.
     #[gpui::test]
     async fn a_relationship_left_before_it_answered_changes_nothing_shown(
         cx: &mut gpui::TestAppContext,
@@ -3459,12 +3460,11 @@ mod tests {
         let exploration = cx.update(|cx| Exploration::for_session(&session, cx));
         exploration.update(cx, |exploration, cx| exploration.root_at(person("p1"), cx));
         cx.run_until_parked();
-        // Its neighbours never answer before the pointer moves on.
+        // Its neighbours, and a Company's counts, never answer before the pointer moves on.
         served.lock().unwrap().hold = Box::new(|asked| {
-            asked["name"] == "studio_neighbours"
-                && asked["query"]
-                    .as_str()
-                    .is_some_and(|text| text.contains("orksAt"))
+            let text = asked["query"].as_str().unwrap_or_default();
+            (asked["name"] == "studio_neighbours" && text.contains("orksAt"))
+                || (asked["name"] == "studio_page_degrees" && text.contains("$n: Company"))
         });
         let schema = schema();
         let works_at = group(&schema, "Person", "WorksAt", Direction::Outgoing);
@@ -3476,11 +3476,30 @@ mod tests {
         cx.run_until_parked();
         exploration.update(cx, |exploration, cx| exploration.end_prefetch(&path, cx));
         cx.run_until_parked();
+        // A Company under it, whose one relationship is counted when read ahead.
+        let k1 = path.child_node(&NodeRef::new("Company", "k1"));
+        exploration.update(cx, |exploration, cx| {
+            exploration.prefetch(&k1, cx);
+            assert_eq!(exploration.tasks.len(), 1, "its count");
+        });
+        cx.run_until_parked();
+        exploration.update(cx, |exploration, cx| {
+            exploration.end_prefetch(&k1, cx);
+            assert!(exploration.tasks.is_empty(), "the count stopped");
+        });
+        cx.run_until_parked();
 
+        let works_at_k1 = json!({
+            "kind": "edge",
+            "type": { "id": "WorksAt", "name": "WorksAt" },
+            "id": "e9",
+            "op": "insert",
+            "after": { "properties": {}, "endpoints": { "from": "p5", "to": "k1" } },
+        });
         served
             .lock()
             .unwrap()
-            .commit("c2", vec![node_change("Company", "k9")]);
+            .commit("c2", vec![node_change("Company", "k9"), works_at_k1]);
         session.update(cx, |session, cx| session.check_heads(cx));
         cx.run_until_parked();
         let (pin, newer) = exploration.read_with(cx, |exploration, _| {

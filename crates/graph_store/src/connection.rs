@@ -26,7 +26,8 @@ pub struct ServerEntry {
     pub name: String,
     pub url: String,
     pub source: ServerSource,
-    /// Graph ids known without listing: CLI profiles and ids opened before.
+    /// Graph ids known without listing: the default graphs of the CLI targets on the server,
+    /// and ids opened before.
     pub known_graphs: Vec<String>,
 }
 
@@ -39,7 +40,8 @@ pub enum ConnectionState {
         served: Option<String>,
     },
     /// The server answered 401: the token sent was refused, or none was sent
-    /// ([`Connection::token_unread`] says why when the keychain did not give one).
+    /// ([`Connection::refused_with_token`] says which, and [`Connection::token_unread`] why
+    /// when the keychain did not give one).
     Unauthorized,
     Unreachable(String),
 }
@@ -114,6 +116,13 @@ pub struct Connection {
     /// access denied, no keychain service): Studio connects without one, which a server that
     /// asks for none accepts. `None` once a token is set.
     pub token_unread: Option<String>,
+    /// Whether the request the server refused with 401 ([`ConnectionState::Unauthorized`])
+    /// carried a token. None is sent to a server with none configured: a managed CLI target,
+    /// whose data token the CLI gets from the control plane, or a CLI target whose saved token
+    /// is bound to another endpoint. Such a server asks for one rather than refusing it.
+    pub refused_with_token: bool,
+    /// Whether the client holds a token, so the next request sends one.
+    has_token: bool,
     _task: Option<Task<()>>,
     /// The graph list read again after it could not be read ([`Connection::list_graphs_again`]).
     _listing: Option<Task<()>>,
@@ -140,11 +149,15 @@ const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 impl EventEmitter<ConnectionEvent> for Connection {}
 
 impl Connection {
-    /// The status-bar text for its state: a token refused because none could be read from the
-    /// keychain says so, rather than that a token was refused.
+    /// The status-bar text for its state: a 401 to a request that carried no token says the
+    /// server asks for one (and that the keychain gave none, when it could not), rather than
+    /// that a token was refused.
     pub fn label(&self) -> String {
         match (&self.state, &self.token_unread) {
             (ConnectionState::Unauthorized, Some(_)) => "Token not read from the keychain".into(),
+            (ConnectionState::Unauthorized, None) if !self.refused_with_token => {
+                "Asks for a token".into()
+            }
             (state, _) => state.label(),
         }
     }
@@ -154,6 +167,7 @@ impl Connection {
         token: Option<String>,
         http: Arc<dyn HttpClient>,
     ) -> anyhow::Result<Self> {
+        let has_token = token.is_some();
         let client = GraphClient::new(&server.url, token, http)?;
         Ok(Self {
             server,
@@ -164,6 +178,8 @@ impl Connection {
             graphs: GraphListing::Unknown,
             token_unsaved: None,
             token_unread: None,
+            refused_with_token: false,
+            has_token,
             _task: None,
             _listing: None,
             _health_check: None,
@@ -273,6 +289,7 @@ impl Connection {
     ) {
         self.token_pending = false;
         self.tokens_set += 1;
+        self.has_token = token.is_some();
         if self.client.set_token(token) {
             cx.emit(ConnectionEvent::CredentialChanged);
         }
@@ -337,6 +354,7 @@ impl Connection {
             return;
         }
         let client = self.client.clone();
+        let token_sent = self.has_token;
         self._listing = Some(cx.spawn(async move |this, cx| {
             let listed = cx
                 .background_executor()
@@ -346,7 +364,7 @@ impl Connection {
                 this._listing = None;
                 match listed {
                     Ok(graphs) => this.graphs = graphs,
-                    Err(state) => this.state = state,
+                    Err(state) => this.refused(state, token_sent),
                 }
                 cx.emit(ConnectionEvent::StateChanged);
                 cx.notify();
@@ -368,6 +386,9 @@ impl Connection {
             return;
         }
         let client = self.client.clone();
+        // A new token connects again, replacing this probe: the probe's requests carry the
+        // token held now.
+        let token_sent = self.has_token;
         self._task = Some(cx.spawn(async move |this, cx| {
             // Off the main thread, so its round trip is not lengthened by a busy frame.
             let outcome = cx
@@ -386,7 +407,7 @@ impl Connection {
                         this.graphs = graphs;
                         this.state = ConnectionState::Ready;
                     }
-                    Probe::Failed(state) => this.state = state,
+                    Probe::Failed(state) => this.refused(state, token_sent),
                 }
                 cx.emit(ConnectionEvent::StateChanged);
                 cx.notify();
@@ -394,6 +415,15 @@ impl Connection {
             })
             .ok();
         }));
+    }
+
+    /// Takes the state a failed read left, noting for a 401 whether that read carried a token
+    /// ([`Self::refused_with_token`]).
+    fn refused(&mut self, state: ConnectionState, token_sent: bool) {
+        if state == ConnectionState::Unauthorized {
+            self.refused_with_token = token_sent;
+        }
+        self.state = state;
     }
 
     /// Checks `/healthz` again after the settings' interval while the server is ready, and
@@ -825,6 +855,55 @@ mod tests {
             });
         }
         assert_eq!(listed.load(std::sync::atomic::Ordering::SeqCst), asked);
+    }
+
+    /// A 401 says whether the request carried a token: a server sent none (a managed CLI
+    /// target, a saved token bound to another endpoint) asks for one, and one sent a token
+    /// refused it. Each new token connects again and says so anew.
+    #[gpui::test]
+    async fn a_401_says_whether_a_token_was_sent(cx: &mut TestAppContext) {
+        let http = FakeHttpClient::create(move |request| {
+            let health = request.uri().path().ends_with("/healthz");
+            async move {
+                let (status, body) = if health {
+                    (
+                        200,
+                        r#"{"status":"ok","version":"0.14.0","internal_schema_version":16}"#,
+                    )
+                } else {
+                    (401, r#"{"error":"unauthorized","code":"unauthorized"}"#)
+                };
+                Ok(Response::builder()
+                    .status(status)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "cloud".into(),
+            url: "https://cluster.test".into(),
+            source: ServerSource::Cli,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, None, http).unwrap());
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        cx.run_until_parked();
+        let said = |cx: &mut TestAppContext| {
+            connection.read_with(cx, |connection, _| {
+                assert_eq!(connection.state, ConnectionState::Unauthorized);
+                (connection.refused_with_token, connection.label())
+            })
+        };
+        assert_eq!(said(cx), (false, "Asks for a token".to_owned()));
+        connection.update(cx, |connection, cx| {
+            connection.set_token(Some("typed".into()), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(said(cx), (true, "Token refused".to_owned()));
+        connection.update(cx, |connection, cx| connection.set_token(None, cx));
+        cx.run_until_parked();
+        assert_eq!(said(cx), (false, "Asks for a token".to_owned()));
     }
 
     /// A graph list that could not be read is read again when something next shows the server,

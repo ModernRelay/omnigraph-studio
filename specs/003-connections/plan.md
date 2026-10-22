@@ -62,9 +62,10 @@ dialog by keyboard), X (capabilities from the served document).
    then forgets every answer its read memo kept with the old one, which may have seen more, and
    the old token's type counts, stored-query catalog and branch list; a shown one reads what
    the new token may do and those three again at once, a parked one when it is shown again,
-   since a parked graph asks the server nothing (since 2026-10-21); neither shows any of the
-   old token's meanwhile (spec 002, "What the credential may do"; `docs/architecture.md` says
-   what is kept and why). A token typed into
+   since a parked graph asks the server nothing (since 2026-10-21), and its views hear of its
+   branch list only then, since History reads on it; neither shows any of the old token's
+   meanwhile (spec 002, "What the credential may do"; `docs/architecture.md` says what is kept
+   and why). A token typed into
    Studio for a CLI server lasts until the files change that server's token. Files that cannot be read
    keep every server as it was and are named in a toast that stays until dismissed, as a
    settings file's are. A token from `OMNIGRAPH_TOKEN_<OWNER>` is the one Studio started with,
@@ -172,9 +173,18 @@ it does.
 | connecting | grey, "Connecting…" | wait; cancel |
 | ready | green, "contract 0.14" | everything the token allows |
 | contract mismatch | amber | open in the CLI; nothing else |
-| unauthorized (401) | red | update token |
+| unauthorized (401) | red, "Token refused"; "Asks for a token" when the request carried none | update token |
 | unreachable | red, last error | retry; requests in flight are marked unknown, never resent |
 | graph unavailable (503) | amber, graph state from `/graphs` | wait; reads resume when ready |
+
+A 401 says what it answered. A request that carried no token, to a server Studio has none
+configured for (a managed CLI target, whose data token the CLI gets from the control plane, or
+a CLI target whose saved token is bound to another endpoint), reads "This server asks for a
+token; none is configured for it."; one that carried a token, "The server refused the token."
+Update token keeps a Studio server's token in the keychain; a CLI server's lasts the run, and
+its tooltip names `omnigraph credentials set --target <name> --stdin`, which keeps one for the
+CLI and Studio (since 2026-10-21; before, a server sent no token was said to have refused it,
+and the tooltip named `omnigraph login`, which is managed sign-in only now).
 
 ### Requests (`graph_client`)
 
@@ -199,10 +209,10 @@ it does.
   refused for some of them. A read waiting out a 429 does so without its slot.
 - A read at a commit is answered once per session: the answer is kept (up to 4,096 answered
   reads and 2,048 Blob cells, least recently used out first) and an identical read under way is
-  shared, since a commit never changes. Failures are not kept, and reads at the branch head
-  always go out. A
-  new token forgets every answer kept, and a read still out when it changed keeps nothing: the
-  new token may see less, and its refusals are shown (constitution IV). The type counts, the
+  shared, since a commit never changes. A read under way is let go only for the count, once
+  no answer is left to, never for the answers' bytes (spec 015). Failures are not kept, and
+  reads at the branch head always go out. A new token forgets every answer kept, and a read
+  still out when it changed keeps nothing: the new token may see less, and its refusals are shown (constitution IV). The type counts, the
   stored-query catalog and the branch list are read again under it; the schema, the heads and
   the change logs stay (the schema is answered alike to every credential that may read the
   graph; heads and logs describe commits, and carry forward only answers read since).
@@ -255,6 +265,8 @@ it does.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | A 401 to a request with no token says the server asks for one | `graph_store` `connection::a_401_says_whether_a_token_was_sent` (a server answering 401 to every read; connected with no token, then a token, then none); `studio` `open_graph::a_server_sent_no_token_is_said_to_ask_for_one`; `omnigraph` main `7fff9dfd` `crates/omnigraph-cli/src/cli.rs` (`credentials` subcommand) and `helpers.rs` (`omnigraph credentials set --target {name} --stdin` in the CLI's own hint) | No token: "Asks for a token" on the chip, "This server asks for a token; none is configured for it." in the dialog; a token: "Token refused", "The server refused the token."; each new token's connect says so anew. A CLI server's Update token tooltip names `omnigraph credentials set --target cloud --stdin` and no `login`. Before, every 401 read as a refused token, a managed target's included |
+| 2026-10-21 | A parked graph's views hear of a new token's branch list only when shown | `graph_store` `a_new_token_reads_access_and_every_answer_again`, extended: `BranchesChanged` and `CredentialChanged` recorded from the token change while parked to after it is shown | Parked: neither event. Shown: `BranchesChanged` first, then `CredentialChanged`. Before, `read_again_for_credential` emitted `BranchesChanged` to a parked session, and a History tab of it whose last read failed read its first page (`history` `branches_changed`) |
 | 2026-10-21 | A read takes an error for the server's only with the contract header | `graph_client` at `abe09ad`: `an_error_is_the_servers_refusal_only_with_its_contract_header` (all 20 reads: a 404 and a 502 without the header, a 403 with it, a 404 naming 0.13), `a_blob_cell_is_null_only_by_the_servers_answer`, `a_refusal_on_a_graph_is_counted_for_that_graph_alone` (a 403 naming 0.13); `check_contract` and `refusal` in `client.rs` | Without the header every read fails as `Transport` naming the status; with it, `Refused`; naming 0.13, `ContractMismatch` |
 | 2026-10-21 | The contract the plan names is the one Studio speaks | `graph_client::CONTRACT` (`0.14`) and `ConnectionState::label` (`contract 0.14`, "Server speaks …; Studio speaks 0.14") | The request header, the comparison and the ready chip said 0.13; corrected. The facts about OmniGraph `v0.13.0` above and the older rows stay as checked then |
 | 2026-10-21 | The saved list, a renamed target, a `chmod`, a failed graph list and the branch lists' order | `graph_store` at `43ad4f3`: `an_unreadable_server_list_is_set_aside_and_said`, `a_renamed_cli_target_keeps_its_connection`, `reads_servers_with_their_tokens_and_stamps_the_files` (a permissions change alone changes the stamp), `a_graph_list_that_failed_is_read_again_when_next_shown`, `an_older_branch_list_landing_last_does_not_replace_a_newer_one`; `studio_workspace` `a_start_notice_says_only_what_happened` | Written here from that commit and its tests, read against `registry.rs`, `cli_config.rs` and `connection.rs`. The saved list's notice reached the toast as "A server could not be added: Studio's saved servers could not be read …"; it reads "Servers at start: …" now, as every start problem does |

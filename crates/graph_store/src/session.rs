@@ -1081,8 +1081,11 @@ impl GraphSession {
         }
         cx.emit(SessionEvent::CountsChanged);
         cx.emit(SessionEvent::StoredQueriesChanged);
-        cx.emit(SessionEvent::BranchesChanged);
+        // Views read on these, and a parked graph asks the server nothing: History reads its
+        // first page for a changed branch list when its last read failed. Shown again, the
+        // reads owed run this again, and views hear them then.
         if self.shown {
+            cx.emit(SessionEvent::BranchesChanged);
             cx.emit(SessionEvent::CredentialChanged);
         }
         cx.notify();
@@ -6948,11 +6951,24 @@ mod tests {
         assert_eq!(read_at_c1(cx), 0, "kept through a 403");
 
         // A graph its window parked asks the server nothing for a new token: the old token's
-        // answers go at once, and the new token's are read when the graph is shown again.
+        // answers go at once, and the new token's are read when the graph is shown again. Its
+        // views hear of the branch list then too, not while parked, since they read on it.
         session.update(cx, |session, cx| session.set_shown(false, cx));
         cx.run_until_parked();
         shown.lock().unwrap().clear();
         accesses.store(0, Ordering::SeqCst);
+        let heard: Rc<std::cell::RefCell<Vec<SessionEvent>>> = Rc::default();
+        let hears = heard.clone();
+        let _heard = cx.update(|cx| {
+            cx.subscribe(&session, move |_, event: &SessionEvent, _| {
+                if matches!(
+                    event,
+                    SessionEvent::BranchesChanged | SessionEvent::CredentialChanged
+                ) {
+                    hears.borrow_mut().push(event.clone());
+                }
+            })
+        });
         connection.update(cx, |connection, cx| {
             connection.set_token(Some("rw".into()), cx)
         });
@@ -6963,6 +6979,10 @@ mod tests {
             shown.lock().unwrap()
         );
         assert_eq!(accesses.load(Ordering::SeqCst), 0, "nor what it may do");
+        assert!(
+            heard.take().is_empty(),
+            "nothing a view reads on while parked"
+        );
         session.read_with(cx, |session, _| {
             assert_eq!(session.count_of(EntityKind::Node, "Person"), None);
             assert!(session.branches.is_loading());
@@ -6975,6 +6995,13 @@ mod tests {
         assert_eq!(asked_again, ["/branches", "/queries", "/snapshot"]);
         assert_eq!(accesses.load(Ordering::SeqCst), 1);
         assert_eq!(change(cx), Allowed::Yes, "the new token's own answer");
+        let heard = heard.take();
+        assert_eq!(
+            heard.first(),
+            Some(&SessionEvent::BranchesChanged),
+            "shown, the branch list read again: {heard:?}"
+        );
+        assert!(heard.contains(&SessionEvent::CredentialChanged));
         session.read_with(cx, |session, _| {
             assert_eq!(session.count_of(EntityKind::Node, "Person"), Some(7));
         });

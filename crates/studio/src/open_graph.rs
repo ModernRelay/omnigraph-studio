@@ -550,17 +550,7 @@ impl OpenGraphModal {
             return v_flex().child(studio_ui::ds::text::state("Add a server to start."));
         };
         let c = connection.read(cx);
-        let status = match (&c.state, &c.token_unread) {
-            (ConnectionState::Unreachable(error), _) => {
-                format!("Could not reach the server: {error}")
-            }
-            (ConnectionState::Unauthorized, Some(reason)) => format!(
-                "The server asks for a token, and Studio could not read it from the keychain: \
-                 {reason}"
-            ),
-            (ConnectionState::Unauthorized, None) => "The server refused the token.".into(),
-            (state, _) => state.label(),
-        };
+        let status = server_status(c);
         let state = c.state.clone();
         // A token typed in replaces one the server refused, or one the keychain would not give
         // to a server that asks for one.
@@ -571,7 +561,7 @@ impl OpenGraphModal {
             .clone()
             .filter(|_| state != ConnectionState::Unauthorized);
         let unsaved = c.token_unsaved.clone();
-        let cli = c.server.source == ServerSource::Cli;
+        let token_tooltip = token_tooltip(c);
         let selected = connection.clone();
         let listing_note = match &c.graphs {
             GraphListing::NotAllowed => Some("This token may not list graphs. Enter a graph id."),
@@ -651,12 +641,7 @@ impl OpenGraphModal {
                         .child(
                             studio_ui::ds::button("update-token", "Update token")
                                 .style(ButtonStyle::Filled)
-                                .tooltip(ui::Tooltip::text(if cli {
-                                    "Used until Studio quits. Run `omnigraph login` to keep it \
-                                     for the CLI and Studio."
-                                } else {
-                                    "Stored in the keychain and used from now on."
-                                }))
+                                .tooltip(ui::Tooltip::text(token_tooltip))
                                 .on_click(
                                     cx.listener(|this, _, window, cx| {
                                         this.update_token(window, cx)
@@ -752,6 +737,41 @@ impl OpenGraphModal {
                         ),
                     ),
             )
+    }
+}
+
+/// What the chosen server's line says of its state. A 401 says what it was an answer to: a
+/// token the keychain would not give, no token at all (a server Studio has none configured
+/// for, such as a managed CLI target, asks for one), or the token sent.
+fn server_status(c: &Connection) -> String {
+    match (&c.state, &c.token_unread) {
+        (ConnectionState::Unreachable(error), _) => {
+            format!("Could not reach the server: {error}")
+        }
+        (ConnectionState::Unauthorized, Some(reason)) => format!(
+            "The server asks for a token, and Studio could not read it from the keychain: \
+             {reason}"
+        ),
+        (ConnectionState::Unauthorized, None) if !c.refused_with_token => {
+            "This server asks for a token; none is configured for it.".into()
+        }
+        (ConnectionState::Unauthorized, None) => "The server refused the token.".into(),
+        (state, _) => state.label(),
+    }
+}
+
+/// What Update token does with the token typed: a server added in Studio keeps it in the
+/// keychain; a CLI server's lasts this run, and the CLI's own command keeps one for both, as
+/// one from the environment lasts this run.
+fn token_tooltip(c: &Connection) -> String {
+    match c.server.source {
+        ServerSource::Studio => "Stored in the keychain and used from now on.".into(),
+        ServerSource::Cli => format!(
+            "Used until Studio quits. To keep one for the CLI and Studio, pipe it to `omnigraph \
+             credentials set --target {} --stdin`.",
+            c.server.name
+        ),
+        ServerSource::Environment => "Used until Studio quits.".into(),
     }
 }
 
@@ -1001,6 +1021,52 @@ mod tests {
             modal.select(beta.clone(), window, cx)
         });
         assert_eq!(typed(cx), "beta-kept");
+    }
+
+    /// A 401 to a request that carried no token says the server asks for one, not that it
+    /// refused one; Update token names no command the CLI lacks, and keeps a Studio server's
+    /// token in the keychain.
+    #[gpui::test]
+    fn a_server_sent_no_token_is_said_to_ask_for_one(cx: &mut TestAppContext) {
+        let connection = server(&[], cx);
+        let said = |refused_with_token: bool, cx: &mut TestAppContext| {
+            connection.update(cx, |connection, _| {
+                connection.state = ConnectionState::Unauthorized;
+                connection.refused_with_token = refused_with_token;
+                (server_status(connection), connection.label())
+            })
+        };
+        assert_eq!(
+            said(false, cx),
+            (
+                "This server asks for a token; none is configured for it.".to_owned(),
+                "Asks for a token".to_owned()
+            )
+        );
+        assert_eq!(
+            said(true, cx),
+            (
+                "The server refused the token.".to_owned(),
+                "Token refused".to_owned()
+            )
+        );
+        let tooltip = |source: ServerSource, cx: &mut TestAppContext| {
+            connection.update(cx, |connection, _| {
+                connection.server.source = source;
+                connection.server.name = "cloud".into();
+                token_tooltip(connection)
+            })
+        };
+        let cli = tooltip(ServerSource::Cli, cx);
+        assert!(
+            cli.contains("`omnigraph credentials set --target cloud --stdin`"),
+            "{cli}"
+        );
+        assert!(!cli.contains("login"), "{cli}");
+        assert_eq!(
+            tooltip(ServerSource::Studio, cx),
+            "Stored in the keychain and used from now on."
+        );
     }
 
     /// A reload that replaces a server (a new address in the CLI config) is followed: the new

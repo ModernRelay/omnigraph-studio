@@ -157,21 +157,44 @@ impl<K: Hash + Eq + Clone, V: Clone, P: Clone> Memo<K, V, P> {
         }
         self.bytes += weight;
         self.order.insert(used, key);
-        // The least recently used go first; the answer just kept stays, whatever it weighs.
+        // The least recently used answers go first; the entry just kept stays, whatever it
+        // weighs. A read under way weighs nothing, so letting it go frees no bytes and loses
+        // what it shares: the next identical ask would send it again, and its answer would be
+        // kept for nobody. Only the entry cap lets one go, once no answer is left to.
         let over_budget = |memo: &Self| memo.budget.is_some_and(|(budget, _)| memo.bytes > budget);
-        while self.entries.len() > self.capacity || over_budget(self) {
-            let Some((&oldest, _)) = self.order.first_key_value() else {
-                break;
-            };
-            if oldest == used {
+        loop {
+            let over_count = self.entries.len() > self.capacity;
+            if !over_count && !over_budget(self) {
                 break;
             }
+            let Some(oldest) = self.oldest(used, !over_count) else {
+                break;
+            };
             if let Some(gone) = self.order.remove(&oldest)
                 && let Some(slot) = self.entries.remove(&gone)
             {
                 self.bytes -= slot.weight;
             }
         }
+    }
+
+    /// When the least recently used entry other than the one used at `kept` was used: the
+    /// oldest answer, else, unless `answers_only`, the oldest read under way.
+    fn oldest(&self, kept: u64, answers_only: bool) -> Option<u64> {
+        let mut pending = None;
+        for (&used, key) in &self.order {
+            if used == kept {
+                continue;
+            }
+            match self.entries.get(key).map(|slot| &slot.held) {
+                Some(Held::Done(_)) => return Some(used),
+                Some(Held::Pending(_)) => {
+                    pending.get_or_insert(used);
+                }
+                None => {}
+            }
+        }
+        pending.filter(|_| !answers_only)
     }
 
     fn touch(&mut self, key: &K) {
@@ -254,6 +277,53 @@ mod tests {
         assert_eq!(memo.bytes(), 0);
         memo.finish::<()>(&"e", &Ok(3), ours);
         assert_eq!(memo.bytes(), 3);
+    }
+
+    /// A read under way weighs nothing, so the byte budget never lets it go: answers kept
+    /// after it, however heavy, push out older answers, and the read stays to be shared and
+    /// to keep its answer. The entry cap counts it, letting an answer go first, and it only
+    /// once no answer is left to.
+    #[test]
+    fn the_byte_budget_never_lets_a_read_under_way_go() {
+        let mut memo: Memo<&'static str, u32, ()> = Memo::weighed(4, 10, |value| *value as usize);
+        memo.insert("old", 2);
+        memo.start("slow", ());
+        // Heavier together than the budget: the answers before go, the read under way stays.
+        memo.insert("a", 6);
+        memo.insert("b", 6);
+        assert!(matches!(memo.held(&"slow"), Some(Held::Pending(()))));
+        assert!(
+            !memo.holds(&"old") && !memo.holds(&"a"),
+            "the older answers went"
+        );
+        assert_eq!(memo.bytes(), 6);
+        // An answer heavier than the budget alone keeps the read beside it.
+        memo.insert("c", 30);
+        assert!(matches!(memo.held(&"slow"), Some(Held::Pending(()))));
+        assert_eq!(memo.len(), 2);
+        assert!(
+            memo.finish::<()>(&"slow", &Ok(1), ours),
+            "its answer is kept"
+        );
+        assert_eq!(done(&mut memo, "slow"), Some(1));
+
+        // Four entries at most: an answer goes before a read under way, even a newer answer.
+        let mut memo: Memo<&'static str, u32, ()> = Memo::weighed(4, 100, |value| *value as usize);
+        memo.start("first", ());
+        memo.start("second", ());
+        memo.insert("a", 1);
+        memo.insert("b", 1);
+        memo.insert("c", 1);
+        assert_eq!(memo.len(), 4);
+        assert!(memo.holds(&"first") && memo.holds(&"second"));
+        assert!(!memo.holds(&"a"));
+        // With only reads under way to let go, the oldest goes.
+        let mut memo: Memo<&'static str, u32, ()> = Memo::new(2);
+        memo.start("first", ());
+        memo.start("second", ());
+        memo.start("third", ());
+        assert!(!memo.holds(&"first"));
+        assert!(memo.holds(&"second") && memo.holds(&"third"));
     }
 
     /// An answer is kept for the read it answers only: a key read again, or forgotten, since
