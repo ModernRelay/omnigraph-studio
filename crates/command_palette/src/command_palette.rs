@@ -1257,7 +1257,6 @@ fn add_stored_rows(
 ) {
     let open = |name: &str| OpenStoredQuery {
         name: name.to_owned(),
-        alias: None,
     };
     if !window.is_action_available(&open(""), cx) {
         return;
@@ -1889,7 +1888,6 @@ mod tests {
                 action.as_any().downcast_ref::<OpenStoredQuery>(),
                 Some(&OpenStoredQuery {
                     name: "people_titled".into(),
-                    alias: None,
                 })
             );
             assert_eq!(

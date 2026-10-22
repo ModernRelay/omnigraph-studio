@@ -17,7 +17,6 @@ use std::path::PathBuf;
 
 use gpui::{App, AppContext as _, Context, Entity, Global, PathPromptOptions, Window};
 use graph_client::api::QueryCatalogEntry;
-use graph_store::ConnectionRegistry;
 use serde_json::{Map, Value};
 use studio_actions::graph::{
     NewQuery, NewQueryWithText, OpenQueryAt, OpenQueryFile, OpenSchema, OpenStoredQuery,
@@ -89,14 +88,12 @@ fn open_file(
     Some(editor)
 }
 
-/// Opens the tab running the stored query `name`, or the one already open (spec 007). `values`
-/// fill the parameters (a remembered tab's, `alias` naming where they came from); without them
-/// an alias's values from the CLI config do. A query the catalog has not been read for yet opens
+/// Opens the tab running the stored query `name`, or the one already open (spec 007). `values`,
+/// a remembered tab's, fill the parameters. A query the catalog has not been read for yet opens
 /// and takes its parameters when it is.
 fn open_stored(
     workspace: &mut Workspace,
     name: String,
-    alias: Option<String>,
     values: Option<Map<String, Value>>,
     at_commit: Option<String>,
     window: &mut Window,
@@ -121,17 +118,6 @@ fn open_stored(
             mutation: false,
             params: Vec::new(),
         });
-    let values = values.or_else(|| {
-        let alias = alias.as_ref()?;
-        let session = session.read(cx);
-        let (server, graph) = (session.server_name(cx), session.graph_id.clone());
-        ConnectionRegistry::try_global(cx)?
-            .read(cx)
-            .aliases_for(&server, &graph)
-            .into_iter()
-            .find(|candidate| candidate.name == *alias && candidate.query == name)
-            .map(|alias| alias.params)
-    });
     let number = view::next_number();
     let opened = workspace.open_item(view::stored_key(&name), window, cx, |window, cx| {
         let mut editor = QueryEditor::new_stored(number, session, entry, window, cx);
@@ -142,9 +128,7 @@ fn open_stored(
     });
     let editor = opened?;
     if let Some(values) = values {
-        editor.update(cx, |editor, cx| {
-            editor.fill_params(alias, &values, window, cx)
-        });
+        editor.update(cx, |editor, cx| editor.fill_params(&values, window, cx));
     }
     Some(editor)
 }
@@ -243,7 +227,6 @@ pub fn init(cx: &mut App) {
         let opened = open_stored(
             workspace,
             name.to_owned(),
-            text("alias"),
             values,
             text("at_commit"),
             window,
@@ -335,15 +318,7 @@ pub fn init(cx: &mut App) {
             });
         });
         workspace.register_action(|workspace, action: &OpenStoredQuery, window, cx| {
-            open_stored(
-                workspace,
-                action.name.clone(),
-                action.alias.clone(),
-                None,
-                None,
-                window,
-                cx,
-            );
+            open_stored(workspace, action.name.clone(), None, None, window, cx);
         });
         workspace.register_action(|workspace, action: &OpenSchema, window, cx| {
             open_schema(workspace, action.type_name.clone(), window, cx);

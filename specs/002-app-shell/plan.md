@@ -235,10 +235,8 @@ what was last saved at most every 250 ms rather than serializing every tab on ev
   closing it (since 2026-10-21); from the key sheet (`?`), which has no tabs, they open that
   picker in its place. Queries
   lists the open query tabs with their first line, then the graph's saved query files that no
-  tab has open, and the stored queries the graph serves, each followed by the CLI config's
-  aliases for it (spec 007); ↵ opens one as the Queries panel does
-  (`studio_graph::OpenStoredQuery`). An alias whose query the graph does not serve cannot
-  open and is not listed. Tab
+  tab has open, and the stored queries the graph serves (spec 007); ↵ opens one as the Queries
+  panel does (`studio_graph::OpenStoredQuery`). Tab
   (bound under `CommandPalette > Editor`, so it outranks the editor's) dismisses the palette
   and sends `studio_agent::Ask`; with no agent chosen, the agent tab says the question waits.
   Node search tries the text as typed, lowercase and capitalized, because `contains` is
@@ -288,7 +286,7 @@ what was last saved at most every 250 ms rather than serializing every tab on ev
   come, as the footer's count was). The list is virtualized, so each row draws its slice of its
   panel and the first and last draw the panel's ends (`ds::inset_slice`, `ds::inset_label`, a
   row high). A row is led by a neutral tile (`ds::icon_tile`: a command by its area's icon, a
-  branch, a query, a stored query, an alias; a node type or a node by the type's dot in the
+  branch, a query, a stored query; a node type or a node by the type's dot in the
   tile, since the row names the type) and ends in its keys as caps (`ds::KeyCaps`, one box per
   key) or what it is, muted. The footer keeps the highlighted row's description and adds the
   keys that work as raised caps: ↑ ↓ Navigate, ↵ Select, Esc Close, and Tab Ask once text is
@@ -941,6 +939,10 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-22 | What Studio saves of a graph has one key, its CLI target's name and its id | `studio_settings` `a_graph_takes_its_own_limits_then_the_shared_ones`, `a_graph_scope_writes_and_clears_its_own_override`, `query_folders_are_safe_names_per_graph`; `studio_workspace` `persistence::tests::keys_are_stable_and_distinct`; `GraphSession::overrides_key` and `options`, which `type_table`, `query_editor`, `command_palette` and `agent_panel` read | Settings (`graphs."<target>/<graph>"`), saved queries' folders, agent conversations and the workspace files are under `<target>/<graph>`. Before, settings, saved queries and conversations were under `<server url>/<graph id>` and tabs and drafts under the target, so a graph had two keys. What was saved under an address stays there, unread (no conversion). In memory an open graph is still found by its server's address, as a link and the Open dialog name it (`address_of`) |
+| 2026-10-22 | A `session.json` from before windows named their graphs' targets is set aside | `studio_workspace` `saved_windows_read_back_and_a_file_without_them_is_none` (a window whose graph names `server_url` and no `target`); `studio` `a_graph_two_windows_listed_reopens_in_the_first`, its `server_url` window removed | The file does not parse and is set aside; `SavedGraph.target` has no default. Supersedes the earlier 2026-10-22 row in its `server_url` window |
+| 2026-10-22 | Errors fold by graph | `studio_workspace` `errors_fold_by_graph_and_open_their_graphs_activity` (two graphs' errors on a full stack, one an outcome nobody knows; then five notices about no graph), `a_dozen_errors_fold_and_leave_an_undo_within_the_stack`, `an_undo_and_an_error_stay_when_toasts_overflow` | "notes: 2 earlier errors" and "people: 3 earlier errors" apart; the notes fold's Open activity showed notes on its branch, whose log held the refusal and the outcome nobody knows it counts, the latter's row saying to check History; the notices folded into "2 earlier errors" with no button, being in no log. Before, one fold took every graph's errors and its Open activity showed the graph shown, so a folded outcome nobody knows had no way to its own graph's log |
+| 2026-10-22 | A start shows its windows at once and fills them when the CLI's targets are listed | `studio` `a_link_at_a_start_connects_its_server_alone` (a window asking for a graph and a link both waiting for the listing); `studio::open_windows` and `fill_reopened` by reading (a saved window left with no graph closes, unless none has one: the first then asks) | The link's graph opened in the window once listed, and no dialog was shown over it. Before, the start waited on the main thread for the listing (spec 003) before opening any window |
 | 2026-10-22 | Saved windows reopen by CLI target | `studio` `a_graph_two_windows_listed_reopens_in_the_first`, extended: a window with a graph on a target no longer listed and one saved by its server's address (`server_url`); `studio_workspace` `persistence` tests with `target` | The listed target's graphs reopen as before; the other window is not reopened. `SavedGraph` holds `target`, and the workspace files are keyed by target and graph |
 | 2026-10-21 | A log folder or `keymap.json` that cannot be made is said | `studio` `a_log_folder_that_cannot_be_made_is_said` (a log file present, absent, and under a file where its folder would be); the keymap button's error path by reading `settings_view.rs` `show_keymap_file` | The blocked folder reads "The log folder could not be made at …/blocker/logs: " and the system's reason, and goes to a toast, deferred past the window's dispatch as a link's notice is; a `keymap.json` write that fails is logged and toasted with its path. Before, the first did nothing and the second only logged. The keymap toast is not driven by a test |
 | 2026-10-21 | The saved recent list is read as it was written | `command_palette` `saved_keys_follow_those_run` (it replaces `saved_keys_follow_those_run_and_drop_found_nodes`: a list saved after a key was run, then 55 more keys) | The saved keys followed `type:Person` in their own order, each once, up to the 50 kept. No key is dropped on reading: Studio records no `node:` key, and the filter for the ones an earlier build saved is gone with `found::is_node_key` |
@@ -1032,6 +1034,11 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 | 2026-10-21 | The palette, the agent's composer and the type table follow the three reference frames on the design system | Offscreen snapshots (1440×900 at 2×) against a scratch dev server, light, dark and glass, before and after, cropped at 2× beside the references; `studio_ui` `key_caps_are_one_box_per_key`, `a_row_knows_its_place_in_its_panel`, `controls_draw_at_their_sizes` (a tile, a segment and the grid's cells at their tokens), `values_pick_their_kind_icon`; `command_palette` `rows_are_grouped_by_kind_until_text_is_typed`; `agent_panel` `a_querys_rows_are_read_from_what_its_call_returned`, `a_tool_call_keeps_the_result_its_agent_reported`, `a_turn_ends_at_its_last_reply` | The palette is a tray of inset panels, its groups named while nothing is typed and counted once text is, rows led by tiles with their keys as caps; the inset panels' corners stayed square until each end was drawn as tall as its corner (GPUI clamps a corner to half its box). The type table's header was 42 px under Zed's padding; Studio's own header row is 30. In a dark theme a darker header fill did not show, so the header takes the well's ink |
 
 ## Corrections
+
+- 2026-10-22 · The palette's Queries scope no longer lists the CLI's aliases under the stored
+  queries they run. Studio no longer reads the CLI's config file, where they were declared, and
+  the CLI has no command that lists them, so Studio knows none and `OpenStoredQuery` names only
+  a query.
 
 - 2026-10-22 · Saved windows and each graph's saved tabs were keyed by the server's address,
   from Studio's own server list. Studio keeps no server list now (spec 003): a graph is kept by

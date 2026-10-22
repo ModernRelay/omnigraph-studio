@@ -117,8 +117,6 @@ impl ReadAt {
 /// tab shows its description and parameters where a query tab shows its text.
 struct Stored {
     entry: QueryCatalogEntry,
-    /// The CLI alias whose values filled the parameters.
-    alias: Option<String>,
     /// The graph's catalog no longer lists it.
     gone: bool,
     /// Values for parameters the tab has no input for yet: it opened before the catalog was
@@ -737,7 +735,6 @@ impl Item for QueryEditor {
                 kind: "stored_query".into(),
                 data: serde_json::json!({
                     "name": stored.entry.name,
-                    "alias": stored.alias,
                     "at_commit": self.at_commit,
                     "values": values,
                     "widths": self.column_widths,
@@ -846,7 +843,6 @@ impl QueryEditor {
     ) -> Self {
         let stored = Stored {
             entry,
-            alias: None,
             gone: false,
             pending: Map::new(),
         };
@@ -2024,17 +2020,17 @@ impl QueryEditor {
             let text = stored
                 .pending
                 .remove(&param.name)
-                .map(|value| value_text(&value));
+                .map(|value| gq_language::input::edit_text(&value));
             let input = param_input(placeholder, text, window, cx);
             self.params.insert(param.name, input);
         }
     }
 
-    /// Fills parameters from `values`: an alias's from the CLI config, or the text a remembered
-    /// tab held. A string goes in as it is, anything else as JSON, which the inputs read back.
+    /// Fills parameters from `values`, a remembered tab's. An input shows its value as the text
+    /// a field edits it with (a string as it is), which the input reads back. A parameter with
+    /// no input yet, as before the catalog is read, takes its value when its input is made.
     pub fn fill_params(
         &mut self,
-        alias: Option<String>,
         values: &Map<String, Value>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2042,7 +2038,7 @@ impl QueryEditor {
         for (name, value) in values {
             match self.params.get(name) {
                 Some(input) => {
-                    let text = value_text(value);
+                    let text = gq_language::input::edit_text(value);
                     input.update(cx, |input, cx| input.set_text(text, window, cx));
                 }
                 None => {
@@ -2051,9 +2047,6 @@ impl QueryEditor {
                     }
                 }
             }
-        }
-        if let Some(stored) = &mut self.stored {
-            stored.alias = alias;
         }
         cx.notify();
     }
@@ -2154,17 +2147,12 @@ impl QueryEditor {
     }
 
     /// What the catalog says about a stored query, under the toolbar that names it: its
-    /// description, its instruction, and where its values came from. Nothing when it says
-    /// nothing.
+    /// description, its instruction, and whether the graph still serves it. Nothing when it
+    /// says nothing.
     fn render_stored_about(&self, stored: &Stored, cx: &mut Context<Self>) -> Option<AnyElement> {
         use studio_ui::ds::{self, space};
         let entry = &stored.entry;
         let mut facts = Vec::new();
-        if let Some(alias) = &stored.alias {
-            facts.push(
-                ds::meta(IconName::Link, format!("values from alias {alias}")).into_any_element(),
-            );
-        }
         if stored.gone {
             facts.push(
                 h_flex()
@@ -5035,21 +5023,21 @@ mod tests {
         assert_eq!(sent(&optional, "  "), Ok(None));
     }
 
-    /// What an input shows for a value from an alias or a remembered tab, and reads back.
+    /// What an input shows for a value from a remembered tab, and reads back.
     #[test]
     fn values_show_as_text_the_inputs_read_back() {
-        assert_eq!(value_text(&json!("Ada")), "Ada");
-        assert_eq!(value_text(&json!(5)), "5");
-        assert_eq!(value_text(&json!(["a", "b"])), r#"["a","b"]"#);
-        assert_eq!(value_text(&Value::Null), "");
+        let shown = gq_language::input::edit_text;
+        assert_eq!(shown(&json!("Ada")), "Ada");
+        assert_eq!(shown(&json!(5)), "5");
+        assert_eq!(shown(&json!(["a", "b"])), "a, b");
+        assert_eq!(shown(&Value::Null), "");
         let list = ParamDescriptor {
             item_kind: Some(ParamKind::String),
             ..param(ParamKind::List)
         };
-        assert_eq!(
-            sent(&list, &value_text(&json!(["a", "b"]))),
-            Ok(Some(json!(["a", "b"])))
-        );
+        for value in [json!(["a", "b"]), json!(["Smith, John", "x"]), json!([])] {
+            assert_eq!(sent(&list, &shown(&value)), Ok(Some(value.clone())));
+        }
     }
 
     /// The confirm bar says where a write's result goes: a declaration `as commit` is held and
@@ -6246,7 +6234,7 @@ mod tests {
             });
             editor.update_in(cx, |editor, window, cx| {
                 let values = json!({"title": "Founder", "limit": 5});
-                editor.fill_params(None, values.as_object().unwrap(), window, cx);
+                editor.fill_params(values.as_object().unwrap(), window, cx);
                 assert!(editor.params.is_empty(), "no input before the catalog");
                 let saved = editor.serialize(cx).unwrap();
                 assert_eq!(saved.data["values"], values);

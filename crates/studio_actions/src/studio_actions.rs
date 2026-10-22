@@ -317,14 +317,12 @@ pub mod graph {
         pub commit_id: String,
     }
 
-    /// Open a stored query, one the server serves by name, in a tab with its parameters; with
-    /// an alias from the CLI config, its values filled in (spec 007).
+    /// Open a stored query, one the server serves by name, in a tab with its parameters (spec
+    /// 007).
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph)]
     pub struct OpenStoredQuery {
         pub name: String,
-        #[serde(default)]
-        pub alias: Option<String>,
     }
 
     /// Show one node on the graph canvas.

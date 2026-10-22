@@ -77,27 +77,26 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   again. The left dock's Queries panel lists the folder,
   newest first; New query, Open a file… and Show the folder are icon buttons in its title
   line. Its rows take the keyboard as Studio's other lists do: shown from its button or key,
-  the panel has it; ↑ and ↓ move among the rows that open a query (saved files, stored queries,
-  aliases), passing over headers and notes and stopping at either end; ↵ opens the one selected
+  the panel has it; ↑ and ↓ move among the rows that open a query (saved files, stored
+  queries), passing over headers and notes and stopping at either end; ↵ opens the one selected
   as a click does (`studio_queries::SelectNext`, `SelectPrevious`, `OpenSelected`, bound in the
   `QueriesPanel` context). The selection keeps to its query as rows come and go and shows
   while the panel has the keyboard. The palette's Queries scope lists saved files no tab has
-  open, and the stored queries with their aliases, which ↵ opens (spec 002).
+  open, and the stored queries, which ↵ opens (spec 002).
 - **Stored queries:** the queries a server runs by name for the graph (declared in
   `cluster.yaml`, applied with `omnigraph cluster apply`; `GET /graphs/{id}/queries` lists them
   with typed parameters and never their text). The session reads the catalog with the graph (a
   404 is an empty catalog) and again from the panel's refresh. The Queries panel's Stored
-  section lists them, "writes" marking a mutation, each with the CLI config's aliases for it
-  indented under it; aliases whose query the graph does not serve fold under Not served. A
-  stored query opens in a query tab without the editor: the toolbar names it and what it does,
-  the catalog's `@description` and `@instruction` sit under it, and its parameters are fields
+  section lists them, "writes" marking a mutation. A stored query opens in a query tab without
+  the editor: the toolbar names it and what it does, the catalog's `@description` and
+  `@instruction` sit under it, and its parameters are fields
   typed by the catalog's kinds (a 64-bit integer is sent as typed text, so values past 2^53
   stay exact; an unknown kind is sent as text). Run invokes it by name at the branch head or the
   picked commit, saying it expects a read, so the server refuses one that writes; a stored
   mutation is confirmed against the branch first, written once and logged like any write, and
-  its commit is the branch head. Explain is not offered: a plan needs the text. An alias fills
-  the parameters with its values; the tab's values come back after a restart, and a tab
-  opened before the catalog arrives takes its parameters when it does.
+  its commit is the branch head. Explain is not offered: a plan needs the text. The tab's
+  values come back after a restart, and a tab opened before the catalog arrives takes its
+  parameters when it does.
 - **Page layout:** as the table's (spec 004). The toolbar names what the page runs on the
   leading side and holds the commit picker, Explain and Run on the trailing side; parameters
   are a field grid under the editor; the result's facts (rows, time, commit, and the branch
@@ -319,6 +318,13 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 
 ## Corrections
 
+- 2026-10-22 · The Queries panel no longer lists the CLI's aliases under their stored queries
+  or folds the ones a graph does not serve under Not served, and a stored query's tab no longer
+  fills its parameters from one. Studio no longer reads the CLI's config file, where aliases
+  were declared, and the CLI has no command that lists them, so Studio knows none. A parameter
+  input shows a value as the text a field edits it with (`gq_language::input::edit_text`, a
+  list as its items separated by commas), which `param_value` reads back; before, it showed a
+  list as JSON.
 - 2026-10-21 · Fixes to the fixes of the same day: a server suggestion's Apply did not check
   the text where it went, so `()` typed there became `()()`; switching branches cleared the
   rows' "Newer data" for good; and a saved file tab was remembered without its text, so a
