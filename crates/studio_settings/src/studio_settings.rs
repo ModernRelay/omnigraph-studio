@@ -306,10 +306,6 @@ pub struct AgentSettings {
     /// go through, each shown as a card.
     #[schemars(title = "Ask before writes")]
     pub ask_before_writes: bool,
-    /// The omnigraph program the agent runs. Empty: Studio finds it on PATH or in the usual
-    /// install folders.
-    #[schemars(title = "OmniGraph CLI")]
-    pub omnigraph_cli: Option<String>,
 }
 
 /// The whole settings document. Each field's doc comment is its row's description in the
@@ -351,6 +347,11 @@ pub struct StudioSettings {
     #[schemars(title = "Density", extend("x-section" = "Appearance"))]
     pub ui_density: Density,
     pub studio: StudioOptions,
+    /// The omnigraph program Studio runs to list its servers and read their tokens, and that the
+    /// agent runs to reach the graph. Studio tries it first, then each omnigraph on PATH and in
+    /// the usual install folders, and runs the first that fits.
+    #[schemars(title = "OmniGraph CLI", extend("x-section" = "Connection"))]
+    pub omnigraph_cli: Option<String>,
     #[schemars(extend("x-section" = "Agent"))]
     pub agent: AgentSettings,
     /// Per-graph overrides, keyed by [`overrides_key`]; edited in the settings tab's graph
@@ -375,6 +376,7 @@ impl Default for StudioSettings {
             buffer_font_size: 14.,
             ui_density: Density::default(),
             studio: StudioOptions::default(),
+            omnigraph_cli: None,
             agent: AgentSettings::default(),
             graphs: BTreeMap::new(),
             panels: BTreeMap::new(),
@@ -1167,6 +1169,25 @@ mod tests {
         assert_eq!(settings.studio.tree_page_size, 20);
         assert_eq!(settings.studio.type_table_page_size, 100);
         assert_eq!(settings.theme, ThemeChoice::default());
+    }
+
+    /// The CLI Studio and the agent run is one setting at the top of the document. A file that
+    /// still names it under `agent`, where it was, holds a key that does nothing, and is told so
+    /// as any other.
+    #[test]
+    fn the_cli_is_one_setting_and_its_old_place_is_not_a_setting() {
+        let settings = read_clean(r#"{"omnigraph_cli": "/opt/omnigraph/bin/omnigraph"}"#);
+        assert_eq!(
+            settings.omnigraph_cli.as_deref(),
+            Some("/opt/omnigraph/bin/omnigraph")
+        );
+        let reading =
+            StudioSettings::read("{\n  \"agent\": {\"omnigraph_cli\": \"/opt/og\"}\n}").unwrap();
+        assert_eq!(reading.settings, StudioSettings::default());
+        assert_eq!(
+            reading.problems,
+            ["`agent.omnigraph_cli` (line 2) is not a setting, so it does nothing."]
+        );
     }
 
     #[test]

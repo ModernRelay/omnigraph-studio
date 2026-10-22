@@ -2083,9 +2083,9 @@ mod tests {
             .unwrap();
             let (events_tx, _events) = mpsc::unbounded();
             let _serve = smol::spawn(gateway.serve(client, sandbox(), events_tx));
-            let chosen = crate::cli_home::choose_cli(&home, vec![cli], CONTRACT).await;
-            if let crate::cli_home::CliChoice::NoMatch { found } = &chosen {
-                panic!("{}", crate::cli_home::no_cli_text(CONTRACT, found));
+            let chosen = crate::cli_home::choose_cli(&home, vec![cli]).await;
+            if let Some(why) = chosen.refusal() {
+                panic!("{why}");
             }
             let args = ["branch", "list", "--json"];
             let plan = crate::cli_home::check_run_args(&args.map(str::to_owned), &cwd, "knowledge")
@@ -2207,13 +2207,9 @@ mod end_to_end {
 
         let candidates = match env("STUDIO_GATEWAY_E2E_CLI") {
             Some(cli) => vec![PathBuf::from(cli)],
-            None => cli_home::candidates(None),
+            None => graph_store::cli::candidates(),
         };
-        let chosen = smol::block_on(cli_home::choose_cli(
-            &home,
-            candidates,
-            graph_client::CONTRACT,
-        ));
+        let chosen = smol::block_on(cli_home::choose_cli(&home, candidates));
         assert!(
             matches!(chosen, cli_home::CliChoice::Chosen { .. }),
             "no omnigraph CLI speaks the graph's contract: {chosen:?}"

@@ -56,6 +56,9 @@ windows-sys = { workspace = true, features = [
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+# The CLI choice's stand-ins are scripts each test writes, whose first run can wait for macOS's
+# scan of it: `test-support` lifts the bound on the CLI's answers (`graph_store::cli::READ_TIMEOUT`).
+graph_store = { workspace = true, features = ["test-support"] }
 http_client = { workspace = true }
 # The CLI home's config checked against OmniGraph's operator-config JSON Schema.
 regex = { workspace = true }

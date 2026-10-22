@@ -18,7 +18,6 @@ mod launch;
 mod mcp;
 mod panel;
 mod requester;
-mod scrub;
 mod sessions;
 mod sessions_panel;
 mod skill;

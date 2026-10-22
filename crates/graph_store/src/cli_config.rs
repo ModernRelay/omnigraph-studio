@@ -87,33 +87,24 @@ pub struct ManagedTarget {
     pub default_graph: Option<String>,
 }
 
-/// A personal alias in the CLI's config: a name bound to a stored query on a target and graph,
-/// with default parameter values (spec 007). The CLI has no command that lists its aliases, so
-/// Studio knows none ([`crate::ConnectionRegistry::aliases_for`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CliAlias {
-    pub name: String,
-    pub server: String,
-    pub graph: String,
-    /// The stored query's name.
-    pub query: String,
-    /// Fixed parameter values.
-    pub params: serde_json::Map<String, Value>,
-}
-
 /// `$OMNIGRAPH_HOME`, else `~/.omnigraph`: the operator home the CLI reads from the environment
 /// Studio passes on to it.
 pub fn operator_dir() -> Option<PathBuf> {
     if let Ok(home) = std::env::var("OMNIGRAPH_HOME")
         && !home.is_empty()
     {
-        return Some(expand_tilde(&home));
+        return Some(expand_home(&home));
     }
     std::env::home_dir().map(|home| home.join(".omnigraph"))
 }
 
-fn expand_tilde(path: &str) -> PathBuf {
-    match (path.strip_prefix("~/"), std::env::home_dir()) {
+/// `path` with a leading `~/` (or `~\` on Windows) as the person's home folder: how Studio reads
+/// a path the person wrote, the operator home and the CLI its settings name alike.
+pub fn expand_home(path: &str) -> PathBuf {
+    let rest = path
+        .strip_prefix("~/")
+        .or_else(|| path.strip_prefix("~\\").filter(|_| cfg!(windows)));
+    match (rest, std::env::home_dir()) {
         (Some(rest), Some(home)) => home.join(rest),
         _ => PathBuf::from(path),
     }

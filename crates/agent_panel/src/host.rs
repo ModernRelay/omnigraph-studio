@@ -381,11 +381,7 @@ async fn connect(
     // settings set them. The process API can add variables but not remove them, so the agent
     // starts through `env -u`, or on Windows through Studio's own launcher. Model providers'
     // variables (AWS, Azure, Google) stay: the agent may need them for its model.
-    let removed = credential_variables(
-        std::env::vars_os().map(|(name, _)| name),
-        &launch.env,
-        cfg!(windows),
-    );
+    let removed = credential_variables(std::env::vars_os().map(|(name, _)| name), &launch.env);
     let (program, args) = without_variables(&removed, program, args).map_err(|error| {
         agent_client_protocol::Error::internal_error()
             .data(format!("Studio could not find its own executable: {error}"))
@@ -1617,16 +1613,15 @@ fn without_variables(
     Ok(("/usr/bin/env".into(), wrapped))
 }
 
-/// OmniGraph's variables among `names`, every `OMNIGRAPH_*` one ([`crate::scrub`]), except
-/// those the agent's own settings set. Windows reads a variable by its name in any case, so
-/// there `fold_case` matches names in any ASCII case.
+/// OmniGraph's variables among `names`, every `OMNIGRAPH_*` one in any ASCII case
+/// ([`graph_store::cli::omnigraph_variables`], the one rule Studio's own CLI follows too),
+/// except those the agent's own settings set.
 fn credential_variables(
     names: impl Iterator<Item = std::ffi::OsString>,
     configured: &std::collections::BTreeMap<String, String>,
-    fold_case: bool,
 ) -> Vec<String> {
     let kept: Vec<&str> = configured.keys().map(String::as_str).collect();
-    crate::scrub::removed(names, &kept, fold_case)
+    graph_store::cli::omnigraph_variables(names, &kept)
 }
 
 #[cfg(test)]
@@ -1788,7 +1783,7 @@ mod credential_tests {
         let mut configured = std::collections::BTreeMap::new();
         configured.insert("OMNIGRAPH_HOME".to_owned(), "/x".to_owned());
         assert_eq!(
-            credential_variables(names.into_iter(), &configured, false),
+            credential_variables(names.into_iter(), &configured),
             [
                 "OMNIGRAPH_BEARER_TOKEN",
                 "OMNIGRAPH_MR_BEARER_TOKEN",
@@ -1799,7 +1794,8 @@ mod credential_tests {
             ]
         );
 
-        // Windows reads a variable by its name in any case, and settings set it in any case.
+        // Windows reads a variable by its name in any case, and settings set it in any case;
+        // names are matched so on every system, as Studio's own CLI matches them.
         let names = [
             "omnigraph_profile",
             "Omnigraph_Token_Work",
@@ -1808,9 +1804,8 @@ mod credential_tests {
         ]
         .map(std::ffi::OsString::from);
         assert_eq!(
-            credential_variables(names.clone().into_iter(), &configured, true),
+            credential_variables(names.into_iter(), &configured),
             ["Omnigraph_Token_Work", "omnigraph_profile"]
         );
-        assert!(credential_variables(names.into_iter(), &configured, false).is_empty());
     }
 }

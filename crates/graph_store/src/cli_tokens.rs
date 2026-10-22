@@ -1,4 +1,6 @@
-//! The OmniGraph CLI, as Studio runs it for the CLI's targets and their tokens (spec 003).
+//! The OmniGraph CLI, as Studio finds, checks and runs it: for the CLI's targets and their tokens
+//! (spec 003), and for the agent, whose CLI the agent panel chooses with the same finder, probe
+//! and runner, checking only the home it writes for the agent on top (spec 013).
 //!
 //! Studio parses no operator configuration and no credential source: what the person's CLI
 //! targets are comes from `omnigraph target list --json` and `target inspect NAME --json`, which
@@ -10,14 +12,17 @@
 //! (OmniGraph RFC 1017, "Static tokens for clients"). Studio keeps a token in memory only, never
 //! logs or writes it, and sends it only to the endpoint of the target it was exported for.
 //!
-//! The CLI is chosen by what `version --json` reports ([`PROTOCOLS`]) and by the commands Studio
-//! runs being there ([`COMMANDS`]); what a program was found to be is remembered across launches
-//! until its file changes ([`Probes`]). It runs off the main thread with a timeout, one sequence
-//! of commands at a time ([`TURN`]: the CLI refuses a second command on a home whose lock
-//! another holds), its standard input empty, and none of OmniGraph's variables but
-//! `OMNIGRAPH_HOME` and the one a target's own token source names ([`scrubbed`]). A token is
-//! asked for when its server connects, once more after a 401, and on Refresh (`Connection`), not
-//! on a timer: the secure store cannot be watched.
+//! Studio looks for the CLI where [`candidates`] says: first the one Studio's settings name
+//! (`omnigraph_cli`, [`configured`]), then on `PATH` and in the install folders. A program is the
+//! CLI Studio runs when what `version --json` reports is Studio's HTTP contract and
+//! [`PROTOCOLS`], and the commands Studio runs are there ([`COMMANDS`]); what a program was found
+//! to be is remembered across launches until its file changes ([`Probes`], [`probe`]). It runs
+//! off the main thread with a timeout, one sequence of commands at a time ([`TURN`]: the CLI
+//! refuses a second command on a home whose lock another holds; [`run`]), its standard input
+//! empty, and none of OmniGraph's variables ([`omnigraph_variables`]) but `OMNIGRAPH_HOME` and
+//! the one a target's own token source names ([`scrubbed`]). A token is asked for when its
+//! server connects, once more after a 401, and on Refresh (`Connection`), not on a timer: the
+//! secure store cannot be watched.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -40,18 +45,28 @@ const CLI_NAME: &str = if cfg!(windows) {
     "omnigraph"
 };
 
-/// What the name of every OmniGraph variable starts with.
-const VARIABLE_PREFIX: &str = "OMNIGRAPH_";
+/// What the name of every OmniGraph variable starts with, in any ASCII case
+/// ([`is_omnigraph_variable`]).
+pub const VARIABLE_PREFIX: &str = "OMNIGRAPH_";
 
 /// The protocols `version --json` reports, and the numbers of each that Studio drives: the
 /// target, credential and access protocols of OmniGraph main `7fff9dfd` (all 1), and the bump of
 /// the first two that ModernRelay/omnigraph#1127 asks for, which marks the same commands. A CLI
-/// that reports another number, or none, speaks commands Studio does not know.
-pub(crate) const PROTOCOLS: &[(&str, &[u64])] = &[
+/// that reports another number, or none, speaks commands Studio does not know. CLIs from before
+/// and after OmniGraph's version-1 operator configuration both report target protocol 1, so
+/// the agent's CLI is also asked to check the home Studio writes for it (spec 013).
+const PROTOCOLS: &[(&str, &[u64])] = &[
     ("target", &[1, 2]),
     ("credential", &[1, 2]),
     ("access", &[1]),
 ];
+
+/// The OmniGraph main commit whose CLI is the first Studio drives: the version-1 operator
+/// configuration with one `auth` per server target (ModernRelay/omnigraph#1126), in which the
+/// agent's CLI home is written, and every command [`COMMANDS`] names. An earlier build with that
+/// configuration (`edge-20261021-888223b`) reads a server target's `auth` as a map of named
+/// entries.
+pub const FIRST_CLI_COMMIT: &str = "ff542202";
 
 /// The commands Studio runs, which must be there too: builds before OmniGraph main `f7db38da`
 /// report the same protocol numbers without them (ModernRelay/omnigraph#1127).
@@ -66,14 +81,16 @@ const COMMANDS: &[&[&str]] = &[
 const MAX_TOKEN_BYTES: usize = 64 * 1024;
 
 /// How much of a JSON answer, or of what the CLI writes to standard error, is read.
-const MAX_ANSWER_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_ANSWER_BYTES: usize = 4 * 1024 * 1024;
 
 /// How long a CLI may take to answer a command that reads only its configuration, and how long a
-/// listing waits for its turn at the CLI. In tests, an hour: a stand-in is a shell script, which
-/// a loaded machine can take seconds to start and which waits for its turn behind every other
-/// test's, so no bound is reached by the machine being busy. Only a test that sets a short
-/// timeout of its own, on a stand-in that never answers, reaches one.
-pub(crate) const READ_TIMEOUT: Duration = if cfg!(test) {
+/// listing waits for its turn at the CLI. In tests (this crate's, and those of a crate built with
+/// `test-support`, as the agent panel's are), an hour: a stand-in is a shell script written by
+/// the test, whose first run macOS scans before it starts (seconds while builds run, spec 013)
+/// and which waits for its turn behind every other test's, so no bound is reached by the machine
+/// being busy. Only a test that sets a short timeout of its own, on a stand-in that never
+/// answers, reaches one.
+pub const READ_TIMEOUT: Duration = if cfg!(any(test, feature = "test-support")) {
     Duration::from_secs(3600)
 } else {
     Duration::from_secs(10)
@@ -121,22 +138,47 @@ pub trait TokenSource: Send + Sync + 'static {
 
 /// The CLI Studio runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct FoundCli {
+pub struct FoundCli {
     pub path: PathBuf,
     /// Its release, as `version --json` reports it.
     pub version: String,
 }
 
-/// Where Studio looks for the CLI, in order: each directory on `PATH`, then `~/.local/bin`,
-/// `/opt/homebrew/bin` and `/usr/local/bin`, where its installers put it. Every place is listed
-/// whether or not a program is there, so a stamp of them sees one installed later.
-pub(crate) fn candidates() -> Vec<PathBuf> {
+/// The CLI Studio's settings name (`omnigraph_cli`), kept in step with them by the registry
+/// (`ConnectionRegistry`): where Studio looks first, for its servers and for the agent alike.
+static CONFIGURED: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// The CLI Studio's settings name (`omnigraph_cli`), its `~` taken as the home folder; `None`
+/// when the setting is empty.
+pub fn configured() -> Option<PathBuf> {
+    CONFIGURED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+/// Takes `setting`, the value of `omnigraph_cli`, as the CLI Studio looks for first.
+pub(crate) fn set_configured(setting: Option<&str>) {
+    let path = setting
+        .filter(|path| !path.is_empty())
+        .map(crate::cli_config::expand_home);
+    *CONFIGURED.lock().unwrap_or_else(PoisonError::into_inner) = path;
+}
+
+/// Where Studio looks for the CLI, in order: the one its settings name ([`configured`]), each
+/// directory on `PATH`, then `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`, where its
+/// installers put it. Every place is listed whether or not a program is there, so a stamp of
+/// them sees one installed later; [`installed`] takes the programs there.
+pub fn candidates() -> Vec<PathBuf> {
     let mut places: Vec<PathBuf> = Vec::new();
     let mut push = |path: PathBuf| {
         if !places.contains(&path) {
             places.push(path);
         }
     };
+    if let Some(path) = configured() {
+        push(path);
+    }
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
             push(dir.join(CLI_NAME));
@@ -151,6 +193,25 @@ pub(crate) fn candidates() -> Vec<PathBuf> {
         }
     }
     places
+}
+
+/// The programs among `places` that can be run, in their order, each file once: a place that
+/// links to a program listed before it is that program.
+pub fn installed(places: &[PathBuf]) -> Vec<PathBuf> {
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut programs = Vec::new();
+    for program in places {
+        if !is_executable(program) {
+            continue;
+        }
+        let canonical = std::fs::canonicalize(program).unwrap_or_else(|_| program.clone());
+        if seen.contains(&canonical) {
+            continue;
+        }
+        seen.push(canonical);
+        programs.push(program.clone());
+    }
+    programs
 }
 
 /// What a program Studio looked at was found to be, and its file's stamp then.
@@ -244,9 +305,8 @@ impl Unfit {
     }
 }
 
-/// The first of `programs` that is an OmniGraph CLI Studio can drive: one that reports
-/// [`PROTOCOLS`] and has [`COMMANDS`]. Otherwise why none is, naming each program found. A
-/// program is probed in the turn held, only when what it was found to be is not remembered.
+/// The first of `programs` that is an OmniGraph CLI Studio can drive for its servers
+/// ([`probe`]). Otherwise why none is, naming each program found.
 pub(crate) async fn find_cli(programs: &[PathBuf], turn: &Held) -> Result<FoundCli, String> {
     if !cfg!(unix) {
         return Err(
@@ -255,35 +315,11 @@ pub(crate) async fn find_cli(programs: &[PathBuf], turn: &Held) -> Result<FoundC
                 .to_owned(),
         );
     }
-    let stamp_of = |path: &Path| crate::cli_config::stamp(&[path.to_owned()]).pop().flatten();
     let mut unfit: Vec<String> = Vec::new();
-    let mut seen: Vec<PathBuf> = Vec::new();
-    for program in programs {
-        if !is_executable(program) {
-            continue;
-        }
-        let canonical = std::fs::canonicalize(program).unwrap_or_else(|_| program.clone());
-        if seen.contains(&canonical) {
-            continue;
-        }
-        seen.push(canonical);
-        let stamp = stamp_of(program);
-        let held = stamp.and_then(|stamp| Probes::lock().find(program, stamp));
-        let probed = match held {
-            Some(probed) => probed,
-            None => {
-                let probed = probe(program, turn).await;
-                let lasting = probed.as_ref().err().is_none_or(|unfit| unfit.lasting);
-                let probed = probed.map_err(|unfit| unfit.why);
-                if lasting && let Some(stamp) = stamp {
-                    Probes::lock().keep(program, stamp, probed.clone());
-                }
-                probed
-            }
-        };
-        match probed {
+    for program in installed(programs) {
+        match probe(&program, turn).await {
             Ok(found) => return Ok(found),
-            Err(why) => unfit.push(format!("{} {why}", shown(program))),
+            Err(why) => unfit.push(format!("{} {why}", shown(&program))),
         }
     }
     let looked = if unfit.is_empty() {
@@ -293,13 +329,35 @@ pub(crate) async fn find_cli(programs: &[PathBuf], turn: &Held) -> Result<FoundC
         unfit.join("; ")
     };
     Err(format!(
-        "Studio found no OmniGraph CLI it can drive (an OmniGraph build from main ff542202 on, \
-         reporting target, credential and access protocols it knows): {looked}"
+        "Studio found no OmniGraph CLI it can drive (an OmniGraph build from main \
+         {FIRST_CLI_COMMIT} on, speaking HTTP contract {} and reporting target, credential and \
+         access protocols it knows): {looked}",
+        graph_client::CONTRACT
     ))
 }
 
-/// `program` as the CLI Studio runs, or why it is not one: its commands run in the turn held.
-async fn probe(program: &Path, turn: &Held) -> Result<FoundCli, Unfit> {
+/// `program` as the CLI Studio runs: one whose `version --json` reports Studio's HTTP contract
+/// and [`PROTOCOLS`], and which has [`COMMANDS`]. Otherwise why not, in words that follow its
+/// path ("is 0.15.0, whose target protocol 3 Studio does not know"). What it was found to be is
+/// remembered while its file is unchanged ([`Probes`]); otherwise it is probed in the turn held.
+pub async fn probe(program: &Path, turn: &Held) -> Result<FoundCli, String> {
+    let stamp = crate::cli_config::stamp(&[program.to_owned()])
+        .pop()
+        .flatten();
+    if let Some(found) = stamp.and_then(|stamp| Probes::lock().find(program, stamp)) {
+        return found;
+    }
+    let probed = probe_now(program, turn).await;
+    let lasting = probed.as_ref().err().is_none_or(|unfit| unfit.lasting);
+    let probed = probed.map_err(|unfit| unfit.why);
+    if lasting && let Some(stamp) = stamp {
+        Probes::lock().keep(program, stamp, probed.clone());
+    }
+    probed
+}
+
+/// [`probe`], run now: its commands run in the turn held.
+async fn probe_now(program: &Path, turn: &Held) -> Result<FoundCli, Unfit> {
     let transient = |unrun: Unrun| Unfit {
         why: match unrun {
             Unrun::Timeout => {
@@ -330,6 +388,20 @@ async fn probe(program: &Path, turn: &Held) -> Result<FoundCli, Unfit> {
         .and_then(Value::as_str)
         .unwrap_or("a build that names no version")
         .to_owned();
+    match json.get("http_contract").and_then(Value::as_str) {
+        Some(contract) if contract == graph_client::CONTRACT => {}
+        Some(contract) => {
+            return Err(Unfit::lasting(format!(
+                "is {version}, which speaks HTTP contract {contract}, not Studio's {}",
+                graph_client::CONTRACT
+            )));
+        }
+        None => {
+            return Err(Unfit::lasting(format!(
+                "is {version}, which reports no HTTP contract"
+            )));
+        }
+    }
     for (protocol, known) in PROTOCOLS {
         let reported = json.pointer(&format!("/protocols/{protocol}"));
         match reported.and_then(Value::as_u64) {
@@ -513,7 +585,7 @@ pub struct CliTokenSource {
     pub credential: CliCredential,
     /// How long the export may take.
     pub timeout: Duration,
-    /// Where to look for the CLI; `None` for the usual places ([`candidates`]).
+    /// Where to look for the CLI; `None` for where Studio looks ([`candidates`]).
     pub programs: Option<Vec<PathBuf>>,
 }
 
@@ -679,31 +751,59 @@ fn scrubbed(
     names: impl IntoIterator<Item = std::ffi::OsString>,
 ) -> std::process::Command {
     let mut command = std::process::Command::new(program);
-    for name in names {
-        let Some(text) = name.to_str() else {
-            continue;
-        };
-        let omnigraph = text
-            .get(..VARIABLE_PREFIX.len())
-            .is_some_and(|start| start.eq_ignore_ascii_case(VARIABLE_PREFIX));
-        if omnigraph && text != "OMNIGRAPH_HOME" && !kept.iter().any(|kept| kept == text) {
-            command.env_remove(&name);
-        }
+    let mut keep = vec!["OMNIGRAPH_HOME"];
+    keep.extend(kept.iter().map(String::as_str));
+    for name in omnigraph_variables(names, &keep) {
+        command.env_remove(name);
     }
     command.env("NO_COLOR", "1");
     command
 }
 
-/// What a finished run printed.
-struct Ran {
-    status: std::process::ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+/// Whether `name` is one of OmniGraph's variables: it starts with [`VARIABLE_PREFIX`], in any
+/// ASCII case. That takes in the CLI's tokens and addressing, tokens kept for other servers
+/// (`OMNIGRAPH_MR_BEARER_TOKEN`) and a local server's token list alike, and a variable OmniGraph
+/// adds later without a list to keep. Windows reads a name in any case (there
+/// `omnigraph_profile` is the profile); elsewhere such a name is taken in too, which removes
+/// nothing a program needs.
+fn is_omnigraph_variable(name: &str) -> bool {
+    name.get(..VARIABLE_PREFIX.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(VARIABLE_PREFIX))
 }
 
-/// Why a run gave no output.
-enum Unrun {
+/// The OmniGraph variables among `names` that a process Studio starts must not inherit, sorted
+/// and each once ([`is_omnigraph_variable`]): every one but those `kept`, matched in any ASCII
+/// case too, as Windows reads names. Studio's own CLI keeps its operator home and the variable a
+/// target's token source names; the agent keeps those its settings set. A name that is not
+/// Unicode is left: it cannot be named on a command line here, and no program reads it by an
+/// OmniGraph name, which is.
+pub fn omnigraph_variables(
+    names: impl IntoIterator<Item = std::ffi::OsString>,
+    kept: &[&str],
+) -> Vec<String> {
+    let mut found: Vec<String> = names
+        .into_iter()
+        .filter_map(|name| name.into_string().ok())
+        .filter(|name| is_omnigraph_variable(name))
+        .filter(|name| !kept.iter().any(|kept| kept.eq_ignore_ascii_case(name)))
+        .collect();
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// What a finished run printed ([`run`]).
+pub struct Ran {
+    pub status: std::process::ExitStatus,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// Why a run gave no output ([`run`]).
+pub enum Unrun {
+    /// It did not end within its timeout, and was stopped.
     Timeout,
+    /// It could not be started, or its output read.
     Failed(String),
 }
 
@@ -756,7 +856,7 @@ struct Waiter {
 
 /// Studio's turn at the CLI, held by one sequence of commands: [`run`] runs a command only in
 /// it, and dropped it passes to the next sequence waiting.
-pub(crate) struct Held(&'static Turn);
+pub struct Held(&'static Turn);
 
 impl Drop for Held {
     fn drop(&mut self) {
@@ -892,7 +992,7 @@ fn forget_probes() {
 /// back past it by another of Studio's (a credential helper that takes long) is not run, and
 /// says so, naming what it would have run (`asked`). While `hurry` is raised the sequence goes
 /// before those waiting that nobody hurries.
-pub(crate) async fn take_turn(
+pub async fn take_turn(
     hurry: &Arc<AtomicBool>,
     bound: Duration,
     asked: &str,
@@ -918,8 +1018,10 @@ const LOCK_PAUSE: Duration = Duration::from_millis(250);
 /// Runs the command `make` builds, in the turn its sequence holds at the CLI ([`TURN`]), with
 /// its standard input empty and its output read from pipes, at most `limit` bytes of standard
 /// output and [`MAX_ANSWER_BYTES`] of standard error. Past `timeout` the process is stopped. A
-/// run refused for another program's lock is made again, [`LOCK_RETRIES`] times at most.
-async fn run(
+/// run refused for another program's lock is made again, [`LOCK_RETRIES`] times at most. Every
+/// command Studio runs to find, check or ask the CLI runs here; the agent's own commands
+/// (`omnigraph_run`) do not.
+pub async fn run(
     turn: &Held,
     make: impl Fn() -> std::process::Command,
     timeout: Duration,
@@ -1297,13 +1399,24 @@ exit 64
         smol::block_on(source.token(Arc::default()))
     }
 
-    /// A CLI is chosen only when it reports the target, credential and access protocols Studio
-    /// drives (those of OmniGraph main `7fff9dfd`, and the bump #1127 asks for) and has every
-    /// command Studio runs; each one passed over is named with why.
+    /// A CLI is chosen only when it speaks Studio's HTTP contract, reports the target,
+    /// credential and access protocols Studio drives (those of OmniGraph main `7fff9dfd`, and the
+    /// bump #1127 asks for) and has every command Studio runs; each one passed over is named with
+    /// why.
     #[test]
-    fn a_cli_is_chosen_by_its_protocols_and_commands() {
+    fn a_cli_is_chosen_by_its_contract_protocols_and_commands() {
         let old = StandIn::new("old");
         old.write("version.json", "not json");
+        let other_contract = StandIn::new("other-contract");
+        other_contract.write(
+            "version.json",
+            r#"{"version":"0.15.0","http_contract":"0.15","protocols":{"target":2,"credential":2,"access":1}}"#,
+        );
+        let no_contract = StandIn::new("no-contract");
+        no_contract.write(
+            "version.json",
+            r#"{"version":"0.14.0-dev","protocols":{"target":1,"credential":1,"access":1}}"#,
+        );
         let pre_access = StandIn::new("pre-access");
         pre_access.write(
             "version.json",
@@ -1326,22 +1439,37 @@ exit 64
         let not_executable = old.dir.join("plain");
         std::fs::write(&not_executable, "#!/bin/sh\n").unwrap();
 
-        let unfit = [&old, &pre_access, &unknown, &no_status];
+        let unfit = [
+            &old,
+            &other_contract,
+            &no_contract,
+            &pre_access,
+            &unknown,
+            &no_status,
+        ];
         let mut programs: Vec<PathBuf> = vec![missing, not_executable];
         programs.extend(unfit.iter().map(|stand_in| stand_in.program.clone()));
+        // A place that links to a program listed before it is that program, probed once.
+        let linked = old.dir.join("linked");
+        std::os::unix::fs::symlink(&no_status.program, &linked).unwrap();
+        programs.push(linked);
         let why = found(&programs).unwrap_err();
         for said in [
             "answers no `version --json`",
+            "is 0.15.0, which speaks HTTP contract 0.15, not Studio's 0.14",
+            "is 0.14.0-dev, which reports no HTTP contract",
             "is 0.14.0-edge+50283ce, which reports no access protocol",
             "is 0.15.0, whose target protocol 3 Studio does not know",
             "is 0.14.0-edge+7fff9df, which has no `credentials status`",
+            "from main ff542202 on",
         ] {
             assert!(why.contains(said), "{said}: {why}");
         }
         assert!(
-            !why.contains("not-there") && !why.contains("plain"),
+            !why.contains("not-there") && !why.contains("plain") && !why.contains("linked"),
             "{why}"
         );
+        assert_eq!(why.matches("which has no `credentials status`").count(), 1);
 
         programs.push(current.program.clone());
         programs.push(bumped.program.clone());
@@ -2252,6 +2380,72 @@ exit 64
             assert!(!connection.refused_with_token);
             assert_eq!(connection.label(), "Asks for a token");
         });
+    }
+}
+
+/// The one rule for OmniGraph's variables, which Studio's CLI, the agent, the agent's
+/// `omnigraph_run` and its wrapper follow alike: on every system, as Windows reads names.
+#[cfg(test)]
+mod variable_tests {
+    use super::*;
+
+    /// The prefix alone decides, whole and at the start of the name, in any ASCII case.
+    #[test]
+    fn every_name_with_omnigraphs_prefix_is_omnigraphs() {
+        for name in [
+            "OMNIGRAPH_TOKEN_PERSONAL",
+            "OMNIGRAPH_BEARER_TOKEN",
+            "OMNIGRAPH_CONTROL_TOKEN",
+            "OMNIGRAPH_A_VARIABLE_ADDED_LATER",
+            "OMNIGRAPH_",
+            "omnigraph_profile",
+            "Omnigraph_Token_Work",
+        ] {
+            assert!(is_omnigraph_variable(name), "{name}");
+        }
+        for name in [
+            "OMNIGRAPH",
+            "OMNIGRAPHX",
+            "XOMNIGRAPH_TOKEN",
+            "MY_OMNIGRAPH_TOKEN",
+            "OMNIGRAPHé_",
+            "",
+            "PATH",
+        ] {
+            assert!(!is_omnigraph_variable(name), "{name}");
+        }
+    }
+
+    /// Every OmniGraph variable is removed but those kept, which are matched in any ASCII case
+    /// too; each once, sorted.
+    #[test]
+    fn what_is_removed_is_every_omnigraph_variable_but_those_kept() {
+        let names = [
+            "PATH",
+            "OMNIGRAPH_TOKEN_PERSONAL",
+            "OMNIGRAPH_HOME",
+            "AWS_PROFILE",
+            "OMNIGRAPH_PROFILE",
+            "OMNIGRAPH_PROFILE",
+        ]
+        .map(std::ffi::OsString::from);
+        assert_eq!(
+            omnigraph_variables(names.clone(), &["OMNIGRAPH_HOME"]),
+            ["OMNIGRAPH_PROFILE", "OMNIGRAPH_TOKEN_PERSONAL"]
+        );
+        assert_eq!(
+            omnigraph_variables(names, &[]),
+            [
+                "OMNIGRAPH_HOME",
+                "OMNIGRAPH_PROFILE",
+                "OMNIGRAPH_TOKEN_PERSONAL"
+            ]
+        );
+        let names = ["omnigraph_home", "Omnigraph_Token_Work"].map(std::ffi::OsString::from);
+        assert_eq!(
+            omnigraph_variables(names, &["OMNIGRAPH_HOME"]),
+            ["Omnigraph_Token_Work"]
+        );
     }
 }
 

@@ -1055,7 +1055,7 @@ mod tests {
     fn cli_field(view: &SettingsView) -> usize {
         view.text_inputs
             .iter()
-            .position(|input| input.field.path.join(".") == "agent.omnigraph_cli")
+            .position(|input| input.field.path.join(".") == "omnigraph_cli")
             .expect("the CLI path is a text setting")
     }
 
@@ -1074,11 +1074,13 @@ mod tests {
         });
         let index = view.read_with(cx, |view, _| cli_field(view));
         let editor = view.read_with(cx, |view, _| view.text_inputs[index].editor.clone());
-        // The Agent section of an active window, where the field is drawn and hears its focus
-        // come and go.
+        let section = view.read_with(cx, |view, _| view.text_inputs[index].field.section.clone());
+        assert_eq!(section, "Connection", "one CLI, for Studio and the agent");
+        // The Connection section of an active window, where the field is drawn and hears its
+        // focus come and go.
         cx.update(|window, _| window.activate_window());
         view.update(cx, |view, cx| {
-            view.section = Some("Agent");
+            view.section = Some("Connection");
             cx.notify();
         });
         cx.run_until_parked();
@@ -1086,9 +1088,11 @@ mod tests {
 
         // Focused without typing: a change elsewhere shows.
         cx.update(|window, cx| window.focus(&editor.focus_handle(cx), cx));
-        let mut settings = StudioSettings::default();
-        settings.agent.omnigraph_cli = Some("/usr/local/bin/omnigraph".into());
-        cx.update(|_, cx| cx.set_global(settings.clone()));
+        let settings = StudioSettings {
+            omnigraph_cli: Some("/usr/local/bin/omnigraph".into()),
+            ..StudioSettings::default()
+        };
+        cx.update(|_, cx| cx.set_global(settings));
         cx.run_until_parked();
         assert_eq!(text(cx), "/usr/local/bin/omnigraph");
 

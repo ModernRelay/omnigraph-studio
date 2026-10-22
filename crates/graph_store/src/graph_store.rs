@@ -44,6 +44,19 @@ pub use exploration::*;
 pub use fixes::{RevertUnavailable, revert_query};
 pub use graph_client::api::{AccessAction, EntityKind};
 pub use registry::ConnectionRegistry;
+
+/// The OmniGraph CLI as Studio finds, checks and runs it, for its own servers and tokens
+/// (spec 003) and for the agent's CLI (spec 013): where Studio looks ([`cli::candidates`]),
+/// which program it runs ([`cli::probe`]), how it runs one, one sequence at a time
+/// ([`cli::take_turn`], [`cli::run`]), and which variables none of them inherits
+/// ([`cli::omnigraph_variables`]).
+pub mod cli {
+    pub use crate::cli_tokens::{
+        FIRST_CLI_COMMIT, FoundCli, Held, MAX_ANSWER_BYTES, READ_TIMEOUT, Ran, Unrun,
+        VARIABLE_PREFIX, candidates, configured, installed, omnigraph_variables, probe, run,
+        take_turn,
+    };
+}
 pub use session::{
     BranchStart, DraftEntry, DraftKey, ExternalWrite, FollowUp, GraphSession, HeadWatch, HeldAs,
     Loadable, MergeEntry, MergeSent, MergeSettled, OutcomeEntry, OutcomeKind, ServerState,

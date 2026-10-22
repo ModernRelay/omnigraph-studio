@@ -1271,14 +1271,13 @@ impl AgentPanel {
             }
         }));
         if let Some(home) = cli_home.clone() {
-            let configured = settings.omnigraph_cli;
+            // Where Studio looks for its own CLI, the one the settings name first
+            // (`omnigraph_cli`), so the agent and Studio take the same CLI.
+            let configured = graph_store::cli::configured();
             tasks.push(cx.spawn(async move |this, cx| {
-                let wanted = configured.clone();
                 let chosen = cx
                     .background_spawn(async move {
-                        let candidates = cli_home::candidates(wanted.as_deref());
-                        let contract = graph_client::CONTRACT;
-                        cli_home::choose_cli(&home, candidates, contract).await
+                        cli_home::choose_cli(&home, graph_store::cli::candidates()).await
                     })
                     .await;
                 this.update(cx, |this, cx| this.cli_chosen(chosen, configured, cx))
@@ -2212,7 +2211,7 @@ impl AgentPanel {
     fn cli_chosen(
         &mut self,
         choice: cli_home::CliChoice,
-        configured: Option<String>,
+        configured: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) {
         let contract = graph_client::CONTRACT;
@@ -2234,20 +2233,16 @@ impl AgentPanel {
                 version,
                 wrapper,
             } => {
-                let configured = configured
-                    .filter(|path| !path.is_empty())
-                    .map(|path| cli_home::expand_home(&path));
                 if let Some(configured) = configured
                     && std::fs::canonicalize(&configured).ok() != std::fs::canonicalize(&cli).ok()
                 {
                     self.say(
                         format!(
-                            "`agent.omnigraph_cli` ({}) does not speak this graph's HTTP API \
+                            "`omnigraph_cli` ({}) does not speak this graph's HTTP API \
                              ({contract}) with OmniGraph's version-1 operator configuration, so \
-                             the agent uses {}{}.",
+                             the agent uses {} ({version}).",
                             configured.display(),
                             cli.display(),
-                            version.map(|v| format!(" ({v})")).unwrap_or_default()
                         ),
                         false,
                     );
@@ -2257,20 +2252,18 @@ impl AgentPanel {
                         format!(
                             "The agent's shell cannot run {}: its path is not plain ASCII, \
                              which a batch file cannot hold. The agent runs it with \
-                             omnigraph_run instead; set `agent.omnigraph_cli` to a CLI at a \
-                             plain ASCII path to give its shell the CLI too.",
+                             omnigraph_run instead; set `omnigraph_cli` in Studio's settings \
+                             to a CLI at a plain ASCII path to give its shell the CLI too.",
                             cli.display()
                         ),
                         false,
                     );
                 }
             }
-            cli_home::CliChoice::NoMatch { found } => {
+            refused => {
+                let why = refused.refusal().unwrap_or_default();
                 self.say(
-                    format!(
-                        "{} The agent cannot reach the graph until one is.",
-                        cli_home::no_cli_text(contract, &found)
-                    ),
+                    format!("{why} The agent cannot reach the graph until one is."),
                     false,
                 );
             }

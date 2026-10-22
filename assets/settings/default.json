@@ -19,11 +19,11 @@
     "health_check_seconds": 30,
     "show_performance": true
   },
+  "omnigraph_cli": null,
   "agent": {
     "command": [],
     "env": {},
-    "ask_before_writes": false,
-    "omnigraph_cli": null
+    "ask_before_writes": false
   },
   "graphs": {},
   "panels": {}

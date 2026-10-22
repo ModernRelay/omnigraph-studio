@@ -25,11 +25,14 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-
-use crate::confined::Confined;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use futures::FutureExt as _;
+use graph_store::cli;
+
+use crate::confined::Confined;
 
 /// One conversation's CLI home. Dropping it removes the session token.
 pub struct CliHome {
@@ -144,9 +147,6 @@ impl CliHome {
             home.write("config.yaml", config.as_bytes(), 0o600)?;
             home.write(TOKEN_FILE, gateway.token.as_bytes(), 0o600)?;
             home.write(CA_FILE, gateway.certificate.as_bytes(), 0o600)?;
-            // An older Studio kept its token in the CLI's former `credentials` file; that
-            // gateway is gone, and the CLI no longer reads the file.
-            home.remove("credentials".as_ref()).ok();
             Ok(())
         };
         // Private: the token is the gateway's.
@@ -197,14 +197,12 @@ impl CliHome {
 
     /// The chosen CLI as `omnigraph_run` starts it, in `dir`: the private home, loopback
     /// outside any proxy, and none of Studio's own OmniGraph variables (its tokens, profile or
-    /// home; [`crate::scrub`]), so it speaks only to this conversation's gateway.
+    /// home; [`cli::omnigraph_variables`]), so it speaks only to this conversation's gateway.
     fn command(&self, cli: &Path, dir: &Path) -> std::process::Command {
         let mut command = std::process::Command::new(cli);
-        for (name, _) in std::env::vars_os() {
-            // Windows reads a variable by its name in any case.
-            if crate::scrub::is_omnigraph_variable(&name.to_string_lossy(), cfg!(windows)) {
-                command.env_remove(name);
-            }
+        let names = std::env::vars_os().map(|(name, _)| name);
+        for name in cli::omnigraph_variables(names, &[]) {
+            command.env_remove(name);
         }
         let no_proxy = match std::env::var("NO_PROXY") {
             Ok(also) if !also.is_empty() => format!("{LOOPBACK},{also}"),
@@ -290,8 +288,9 @@ impl CliHome {
                 "Studio found no omnigraph CLI that speaks this graph's HTTP API and reads \
                  OmniGraph's version-1 operator configuration, so the graph is not available in \
                  this conversation. Tell the person: they can install an OmniGraph edge build \
-                 made from main at {FIRST_CLI_COMMIT} or later, or set `agent.omnigraph_cli`. \
-                 Your branch would be {branch}.",
+                 made from main at {commit} or later, or set `omnigraph_cli` in Studio's \
+                 settings. Your branch would be {branch}.",
+                commit = cli::FIRST_CLI_COMMIT,
                 branch = self.branch
             ),
             _ if !wrapper_runs => format!(
@@ -375,63 +374,6 @@ pub fn write_agents_md(cwd: &Path, graph: &str) -> std::io::Result<()> {
     Confined::open(cwd)?.write("AGENTS.md", text.as_bytes(), 0o644)
 }
 
-/// The CLIs to try, in order: the configured one, `omnigraph` on PATH, then the usual places.
-pub fn candidates(configured: Option<&str>) -> Vec<PathBuf> {
-    let mut found: Vec<PathBuf> = Vec::new();
-    let mut push = |path: PathBuf| {
-        let canonical = std::fs::canonicalize(&path).unwrap_or(path.clone());
-        if is_executable(&path)
-            && !found
-                .iter()
-                .any(|known| std::fs::canonicalize(known).unwrap_or(known.clone()) == canonical)
-        {
-            found.push(path);
-        }
-    };
-    if let Some(configured) = configured.filter(|path| !path.is_empty()) {
-        push(expand_home(configured));
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            push(dir.join(CLI_NAME));
-        }
-    }
-    if let Some(home) = std::env::home_dir() {
-        push(home.join(".local/bin").join(CLI_NAME));
-    }
-    if cfg!(unix) {
-        for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
-            push(Path::new(dir).join(CLI_NAME));
-        }
-    }
-    found
-}
-
-/// What a CLI says about itself, read without a server: its release and the HTTP contract it
-/// speaks (the `Omnigraph-Http-Api` value, which a server takes only when it is its own).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CliFacts {
-    /// Its release, as it reports it ("0.14.0").
-    pub version: Option<String>,
-    /// `None` for a CLI that did not answer `version --json`: one older than 0.14, or not
-    /// OmniGraph's.
-    pub contract: Option<String>,
-    /// The target protocol it reports (`protocols.target`); `None` for a CLI without targets.
-    pub target_protocol: Option<u64>,
-}
-
-/// The target protocols (`protocols.target`) of a CLI that may read the home Studio writes. CLIs
-/// from before and after OmniGraph's version-1 operator configuration both report 1, and a later
-/// one reports 2 for that configuration; either way only the CLI's own check of the config
-/// Studio wrote ([`validate`]) tells.
-const TARGET_PROTOCOLS: &[u64] = &[1, 2];
-
-/// The OmniGraph main commit whose CLI first reads the home Studio writes: its version-1
-/// operator configuration with one `auth` per server target. An earlier build with that
-/// configuration (`edge-20261021-888223b`) reads a server target's `auth` as a map of named
-/// entries, and refuses Studio's.
-pub const FIRST_CLI_COMMIT: &str = "ff542202";
-
 /// How to install the newest edge build of OmniGraph, as its install guide gives it.
 const INSTALL_EDGE: &str = if cfg!(windows) {
     "iwr -UseBasicParsing https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.ps1 \
@@ -442,126 +384,61 @@ const INSTALL_EDGE: &str = if cfg!(windows) {
      | RELEASE_CHANNEL=edge bash"
 };
 
-/// How long a CLI may take to print its version or check a config. The tests' stand-ins are
-/// shell scripts that a loaded machine can take seconds to start, and the choice, not the limit,
-/// is what they check.
-const VERSION_TIMEOUT: Duration = if cfg!(test) {
-    Duration::from_secs(60)
-} else {
-    Duration::from_secs(5)
-};
-
-/// Reads a CLI's release, contract and target protocol by running it, never a server:
-/// `version --json` reports them (`http_contract` in every OmniGraph Studio supports,
-/// `protocols.target` in one with targets).
-pub async fn cli_facts(cli: &Path) -> CliFacts {
-    let mut command = std::process::Command::new(cli);
-    command.args(["version", "--json"]);
-    let json = bounded(command)
-        .await
-        .filter(|output| output.status.success())
-        .and_then(|output| serde_json::from_slice::<serde_json::Value>(&output.stdout).ok());
-    let field = |name: &str| {
-        json.as_ref()?
-            .get(name)
-            .and_then(|value| value.as_str())
-            .map(str::to_owned)
-    };
-    CliFacts {
-        version: field("version"),
-        contract: field("http_contract"),
-        target_protocol: json
-            .as_ref()
-            .and_then(|json| json.pointer("/protocols/target"))
-            .and_then(serde_json::Value::as_u64),
-    }
-}
-
-/// `command`'s exit and output when it ends within [`VERSION_TIMEOUT`], its standard input
-/// empty; past it, the process is stopped and there is none.
-async fn bounded(command: std::process::Command) -> Option<std::process::Output> {
-    let run = smol::process::Command::from(command)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .output()
-        .fuse();
-    let timeout = smol::Timer::after(VERSION_TIMEOUT).fuse();
-    futures::pin_mut!(run, timeout);
-    futures::select! {
-        output = run => output.ok(),
-        _ = timeout => None,
-    }
-}
+/// How long the choice of a conversation's CLI waits for its turn at the CLI, which Studio's own
+/// commands may hold (a token's export waits for its credential helper). The choice goes before
+/// the asks nobody waits on.
+const CHOICE_WAIT: Duration = Duration::from_secs(120);
 
 /// Why a CLI Studio found is not the conversation's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unfit {
-    /// It did not answer `version --json`: older than 0.14, or not OmniGraph's.
-    Silent,
-    /// It speaks this other HTTP contract.
-    Contract(String),
-    /// It reports no target protocol (it has no CLI targets), or one Studio does not know.
-    TargetProtocol(Option<u64>),
-    /// It has no `config validate`: it predates OmniGraph's version-1 operator configuration.
-    NoValidate,
-    /// Its `config validate` refused the config Studio wrote, saying this.
-    Refused(String),
-    /// Studio could not write the wrapper that runs it.
-    Wrapper(String),
+    /// Studio does not run it at all ([`cli::probe`], which Studio's own CLI passes too): its
+    /// words, which follow the CLI's path ("is 0.15.0, whose target protocol 3 Studio does not
+    /// know").
+    Probe(String),
+    /// It is `version`, whose `config validate` refused the config Studio wrote, saying `said`:
+    /// a CLI from before OmniGraph's version-1 operator configuration with one `auth` per
+    /// server target reads it otherwise.
+    Refused { version: String, said: String },
+    /// It is `version`, whose wrapper Studio could not write.
+    Wrapper { version: String, error: String },
 }
 
-/// Whether `cli` can be the conversation's: its `version --json` says it speaks `contract` with
-/// a target protocol Studio knows, and its own check of the config Studio wrote in `home`
-/// passes ([`validate`]).
-async fn probe(home: &CliHome, cli: &Path, contract: &str) -> (CliFacts, Result<(), Unfit>) {
-    let facts = cli_facts(cli).await;
-    let fit = match (&facts.contract, facts.target_protocol) {
-        (None, _) => Err(Unfit::Silent),
-        (Some(speaks), _) if speaks != contract => Err(Unfit::Contract(speaks.clone())),
-        (_, protocol) if !protocol.is_some_and(|known| TARGET_PROTOCOLS.contains(&known)) => {
-            Err(Unfit::TargetProtocol(protocol))
+/// Runs `program config validate --operator-config` on the config of `home`'s private home, as
+/// `omnigraph_run` starts the CLI (that home as `OMNIGRAPH_HOME`, no other OmniGraph variable),
+/// in the turn held. The CLI reads the whole file as it would for a command, offline: no token,
+/// certificate, server or credential helper. Its refusal is its first line.
+async fn validate(home: &CliHome, program: &Path, turn: &cli::Held) -> Result<(), String> {
+    let config = home.private.join("config.yaml");
+    let make = || {
+        let mut command = home.command(program, &home.private);
+        command
+            .args(["config", "validate", "--operator-config"])
+            .arg(&config);
+        command
+    };
+    let ran = match cli::run(turn, make, cli::READ_TIMEOUT, cli::MAX_ANSWER_BYTES).await {
+        Ok(ran) => ran,
+        Err(cli::Unrun::Timeout) => {
+            return Err(format!(
+                "it did not answer within {} s",
+                cli::READ_TIMEOUT.as_secs()
+            ));
         }
-        _ => validate(home, cli).await,
+        Err(cli::Unrun::Failed(error)) => return Err(format!("Studio could not run it ({error})")),
     };
-    (facts, fit)
-}
-
-/// Runs `cli config validate --operator-config` on the config of `home`'s private home, as
-/// `omnigraph_run` starts the CLI (that home as `OMNIGRAPH_HOME`, no other OmniGraph variable).
-/// The CLI reads the whole file as it would for a command, offline: no token, certificate,
-/// server or credential helper. A CLI from before the version-1 configuration has no such
-/// command, which its parser says.
-async fn validate(home: &CliHome, cli: &Path) -> Result<(), Unfit> {
-    let mut command = home.command(cli, &home.private);
-    command
-        .args(["config", "validate", "--operator-config"])
-        .arg(home.private.join("config.yaml"));
-    let Some(output) = bounded(command).await else {
-        return Err(Unfit::Refused(format!(
-            "it did not answer within {} s",
-            VERSION_TIMEOUT.as_secs()
-        )));
-    };
-    if output.status.success() {
+    if ran.status.success() {
         return Ok(());
     }
-    let said = String::from_utf8_lossy(&output.stderr);
-    if said.contains("unrecognized subcommand 'config'")
-        || said.contains("unexpected argument '--operator-config'")
-    {
-        return Err(Unfit::NoValidate);
-    }
-    Err(Unfit::Refused(first_line(&said).unwrap_or_else(|| {
+    let said = String::from_utf8_lossy(&ran.stderr);
+    Err(first_line(&said).unwrap_or_else(|| {
         format!(
             "it exited with {}",
-            output
-                .status
+            ran.status
                 .code()
                 .map_or("a signal".to_owned(), |code| code.to_string())
         )
-    })))
+    }))
 }
 
 /// The first line of `text` that says something, without an `error:` label or control
@@ -589,96 +466,115 @@ fn first_line(text: &str) -> Option<String> {
 pub enum CliChoice {
     Chosen {
         cli: PathBuf,
-        version: Option<String>,
+        version: String,
         /// Whether the agent's shell can run it through the wrapper, which on Windows names
         /// the CLI only by a path a batch file can hold; `omnigraph_run` runs it either way.
         wrapper: bool,
     },
-    /// No candidate fits: each one found, with what it said and why it does not.
-    NoMatch {
-        found: Vec<(PathBuf, CliFacts, Unfit)>,
-    },
+    /// No candidate fits: each one found, with why it does not ([`no_cli_text`]).
+    NoMatch { found: Vec<(PathBuf, Unfit)> },
+    /// Studio's other commands held the CLI past [`CHOICE_WAIT`], so none was asked: why.
+    Busy(String),
 }
 
-/// Chooses the conversation's CLI from `candidates`, in their order: the first that speaks
-/// `contract` and takes the config Studio wrote, as the CLI itself reports and checks, so a slow
-/// or unavailable server never decides it. With no match the wrapper runs nothing and says why,
-/// rather than pointing at a CLI the server or the home would refuse.
-pub async fn choose_cli(home: &CliHome, candidates: Vec<PathBuf>, contract: &str) -> CliChoice {
-    // Every candidate is asked at once and heard in order: the first that fits is chosen as soon
-    // as those before it have answered, and the probes after it are dropped, which stops their
-    // processes. A hung wrapper later on the path delays nothing.
-    let mut probes: futures::stream::FuturesOrdered<_> = candidates
-        .iter()
-        .cloned()
-        .map(|cli| async move { probe(home, &cli, contract).await })
-        .collect();
-    let mut found = Vec::new();
-    for cli in candidates {
-        let Some((facts, fit)) = futures::StreamExt::next(&mut probes).await else {
-            break;
-        };
-        let unfit = match fit.map(|()| home.use_cli(&cli)) {
-            Ok(Ok(wrapper)) => {
-                return CliChoice::Chosen {
-                    cli,
-                    version: facts.version,
-                    wrapper,
-                };
-            }
-            Ok(Err(error)) => Unfit::Wrapper(error.to_string()),
-            Err(unfit) => unfit,
-        };
-        found.push((cli, facts, unfit));
+impl CliChoice {
+    /// Why the conversation has no CLI, as its wrapper says it; `None` for one chosen.
+    pub fn refusal(&self) -> Option<String> {
+        match self {
+            CliChoice::Chosen { .. } => None,
+            CliChoice::NoMatch { found } => Some(no_cli_text(found)),
+            CliChoice::Busy(why) => Some(why.clone()),
+        }
     }
-    home.refuse(&no_cli_text(contract, &found)).ok();
+}
+
+/// Chooses the conversation's CLI from `candidates` ([`cli::candidates`] in Studio), in their
+/// order, with Studio's own finder: the first program there that Studio runs ([`cli::probe`],
+/// remembered while its file is unchanged) and whose own check of the config Studio wrote
+/// passes ([`validate`]), as the CLI itself reports and checks, so a slow or unavailable server
+/// never decides it. The commands run one at a time with Studio's others ([`cli::take_turn`]).
+/// With no match the wrapper runs nothing and says why, rather than pointing at a CLI the server
+/// or the home would refuse.
+pub async fn choose_cli(home: &CliHome, candidates: Vec<PathBuf>) -> CliChoice {
+    let asked = "the look for the agent's omnigraph CLI";
+    // A person waits on the conversation.
+    let hurry = Arc::new(AtomicBool::new(true));
+    let turn = match cli::take_turn(&hurry, CHOICE_WAIT, asked).await {
+        Ok(turn) => turn,
+        Err(busy) => {
+            let why = format!(
+                "Studio could not choose an omnigraph CLI for this conversation: {busy}. Start \
+                 a new conversation to try again."
+            );
+            home.refuse(&why).ok();
+            return CliChoice::Busy(why);
+        }
+    };
+    let mut found = Vec::new();
+    for program in cli::installed(&candidates) {
+        let unfit = match cli::probe(&program, &turn).await {
+            Err(why) => Unfit::Probe(why),
+            Ok(fit) => match validate(home, &fit.path, &turn).await {
+                Err(said) => Unfit::Refused {
+                    version: fit.version,
+                    said,
+                },
+                Ok(()) => match home.use_cli(&fit.path) {
+                    Ok(wrapper) => {
+                        return CliChoice::Chosen {
+                            cli: fit.path,
+                            version: fit.version,
+                            wrapper,
+                        };
+                    }
+                    Err(error) => Unfit::Wrapper {
+                        version: fit.version,
+                        error: error.to_string(),
+                    },
+                },
+            },
+        };
+        found.push((program, unfit));
+    }
+    home.refuse(&no_cli_text(&found)).ok();
     CliChoice::NoMatch { found }
 }
 
 /// Why a conversation has no CLI: what the graph and the home need, each CLI found with why it
 /// does not fit, and what to install.
-pub fn no_cli_text(contract: &str, found: &[(PathBuf, CliFacts, Unfit)]) -> String {
+fn no_cli_text(found: &[(PathBuf, Unfit)]) -> String {
     let mut text = format!(
-        "No omnigraph CLI here speaks this graph's HTTP API ({contract}) and reads OmniGraph's \
-         version-1 operator configuration, which Studio writes for the agent's CLI"
+        "No omnigraph CLI here speaks this graph's HTTP API ({}) and reads OmniGraph's \
+         version-1 operator configuration, which Studio writes for the agent's CLI",
+        graph_client::CONTRACT
     );
     if found.is_empty() {
         text.push_str(": Studio found none");
     } else {
         let each: Vec<String> = found
             .iter()
-            .map(|(cli, facts, unfit)| {
-                let it = facts.version.as_deref().unwrap_or("a CLI");
-                let what = match unfit {
-                    Unfit::Silent => "older than 0.14, or not OmniGraph's: it did not answer \
-                                      `version --json`"
-                        .to_owned(),
-                    Unfit::Contract(speaks) => format!("{it}, which speaks {speaks}"),
-                    Unfit::TargetProtocol(None) => format!("{it}, which has no CLI targets"),
-                    Unfit::TargetProtocol(Some(protocol)) => {
-                        format!("{it}, which reads target protocol {protocol}")
-                    }
-                    Unfit::NoValidate => format!(
-                        "{it}, which predates that configuration: it has no `config validate`"
+            .map(|(program, unfit)| {
+                let program = program.display();
+                match unfit {
+                    Unfit::Probe(why) => format!("{program} {why}"),
+                    Unfit::Refused { version, said } => format!(
+                        "{program} is {version}, whose `config validate` refused the \
+                         configuration Studio wrote ({said})"
                     ),
-                    Unfit::Refused(said) => format!(
-                        "{it}, whose `config validate` refused the configuration Studio wrote \
-                         ({said})"
+                    Unfit::Wrapper { version, error } => format!(
+                        "{program} is {version}, whose wrapper Studio could not write ({error})"
                     ),
-                    Unfit::Wrapper(error) => {
-                        format!("{it}, whose wrapper Studio could not write ({error})")
-                    }
-                };
-                format!("{} is {what}", cli.display())
+                }
             })
             .collect();
         text.push_str(": ");
         text.push_str(&each.join("; "));
     }
     text.push_str(&format!(
-        ". Install an OmniGraph edge build made from main at {FIRST_CLI_COMMIT} or later \
+        ". Install an OmniGraph edge build made from main at {} or later \
          (edge-20261021-888223b is older and refuses it), for the newest: `{INSTALL_EDGE}`. Or \
-         set `agent.omnigraph_cli` to such a CLI."
+         set `omnigraph_cli` in Studio's settings to such a CLI.",
+        cli::FIRST_CLI_COMMIT
     ));
     text
 }
@@ -1589,37 +1485,6 @@ pub async fn run(home: &CliHome, cwd: &Path, plan: RunPlan) -> (String, bool) {
     (text, failed)
 }
 
-/// The CLI's file name: `omnigraph`, or `omnigraph.exe` on Windows.
-const CLI_NAME: &str = if cfg!(windows) {
-    "omnigraph.exe"
-} else {
-    "omnigraph"
-};
-
-#[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::metadata(path)
-        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-}
-
-/// On Windows a program is a file; its name says what runs it.
-#[cfg(not(unix))]
-fn is_executable(path: &Path) -> bool {
-    std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
-}
-
-/// `path` with a leading `~/` (or `~\` on Windows) as the person's home folder.
-pub fn expand_home(path: &str) -> PathBuf {
-    let rest = path
-        .strip_prefix("~/")
-        .or_else(|| path.strip_prefix("~\\").filter(|_| cfg!(windows)));
-    match (rest, std::env::home_dir()) {
-        (Some(rest), Some(home)) => home.join(rest),
-        _ => PathBuf::from(path),
-    }
-}
-
 fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
@@ -1641,9 +1506,10 @@ const LOOPBACK: &str = "127.0.0.1,localhost";
 /// What the agent's `omnigraph` wrapper does, the one account both scripts are written from
 /// ([`posix_script`], [`cmd_script`]), so only their syntax differs. Run, it removes every
 /// OmniGraph variable from the CLI's environment, each whose name starts with
-/// [`crate::scrub::PREFIX`], as `omnigraph_run` and the agent's launch do, so no token kept for
-/// another target, profile, home or control-plane address the agent's environment holds reaches
-/// the conversation's CLI. Then it sets `OMNIGRAPH_HOME` to `home`, its own folder, puts
+/// [`cli::VARIABLE_PREFIX`] in any ASCII case, as `omnigraph_run`, the agent's launch and
+/// Studio's own CLI do ([`cli::omnigraph_variables`]), so no token kept for another target,
+/// profile, home or control-plane address the agent's environment holds reaches the
+/// conversation's CLI. Then it sets `OMNIGRAPH_HOME` to `home`, its own folder, puts
 /// [`LOOPBACK`] first in `NO_PROXY` (and
 /// `no_proxy`), and runs `cli` with the agent's arguments as they came. Refusing, it runs
 /// nothing and says `why`.
@@ -1689,7 +1555,16 @@ fn posix_script(wrapper: &Wrapper<'_>) -> String {
          # CLI, pointed at Studio's gateway for this conversation.\n",
     );
     // Only names a shell can hold match: `unset` of any other would end the script, and the CLI
-    // reads none.
+    // reads none. The prefix matches in any ASCII case, as everywhere Studio removes it.
+    let prefix: String = cli::VARIABLE_PREFIX
+        .chars()
+        .map(|c| match c {
+            c if c.is_ascii_alphabetic() => {
+                format!("[{}{}]", c.to_ascii_uppercase(), c.to_ascii_lowercase())
+            }
+            c => c.to_string(),
+        })
+        .collect();
     script.push_str(&format!(
         "for name in $(env | sed -n 's/^\\({prefix}[A-Za-z0-9_]*\\)=.*/\\1/p'); do \
          unset \"$name\"; done\n\
@@ -1698,7 +1573,6 @@ fn posix_script(wrapper: &Wrapper<'_>) -> String {
          no_proxy=\"$NO_PROXY\"\n\
          export OMNIGRAPH_HOME NO_PROXY no_proxy\n\
          exec {cli} \"$@\"\n",
-        prefix = crate::scrub::PREFIX,
         home = shell_quote(&home.to_string_lossy()),
         cli = shell_quote(&cli.to_string_lossy()),
     ));
@@ -1744,7 +1618,7 @@ fn cmd_script(wrapper: &Wrapper<'_>) -> String {
         return cmd_refusal(&format!(
             "The omnigraph CLI Studio chose for this conversation, {}, is in a folder whose \
              name a batch file cannot hold. Run the same commands with the omnigraph_run tool, \
-             or set agent.omnigraph_cli to a CLI whose path is in plain ASCII.",
+             or set omnigraph_cli in Studio's settings to a CLI whose path is in plain ASCII.",
             cli.display()
         ));
     };
@@ -1759,7 +1633,7 @@ fn cmd_script(wrapper: &Wrapper<'_>) -> String {
     // reads names.
     lines.push(format!(
         "for /f \"delims==\" %%N in ('set {prefix} 2^>nul') do set \"%%N=\"",
-        prefix = crate::scrub::PREFIX,
+        prefix = cli::VARIABLE_PREFIX,
     ));
     lines.extend([
         // The batch file's own folder, without its last `\`.
@@ -1874,21 +1748,33 @@ mod tests {
         }
     }
 
-    /// A fake CLI in `dir` that answers `version --json` with `version` (when given) and, when
-    /// `validates`, `config validate` on the private home's config, as written in the OmniGraph
-    /// format version 1, run with that home; every other command fails, as one would with no
-    /// server behind the gateway. `config` is what it does with `config …` otherwise.
+    /// A fake CLI in `dir`. Given `version`, it answers `version --json` with it and the `--help`
+    /// of every command, as a CLI Studio drives does; `config` is what it does otherwise, with
+    /// `config …` among others. Every other command fails, as one would with no server behind
+    /// the gateway.
     #[cfg(unix)]
     fn fake_cli(dir: &Path, name: &str, version: Option<&str>, config: &str) -> PathBuf {
         let path = dir.join(name);
-        let version = version
+        let answers = version
             .map(|json| {
-                format!("[ \"$1 $2\" = \"version --json\" ] && {{ echo '{json}'; exit 0; }}\n")
+                format!(
+                    "[ \"$1 $2\" = \"version --json\" ] && {{ echo '{json}'; exit 0; }}\n\
+                     [ \"$3\" = \"--help\" ] && {{ echo \"Usage: omnigraph $1 $2\"; exit 0; }}\n"
+                )
             })
             .unwrap_or_default();
-        std::fs::write(&path, format!("#!/bin/sh\n{version}{config}\nexit 2\n")).unwrap();
+        std::fs::write(&path, format!("#!/bin/sh\n{answers}{config}\nexit 2\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    /// What `version --json` reports for a CLI of `version` that speaks `contract`, reads target
+    /// protocol `target` and the credential and access protocols Studio drives.
+    #[cfg(unix)]
+    fn reports(version: &str, contract: &str, target: u64) -> String {
+        format!(
+            r#"{{"version":"{version}","http_contract":"{contract}","protocols":{{"target":{target},"credential":1,"access":1}}}}"#
+        )
     }
 
     /// What a CLI that reads OmniGraph's version-1 operator configuration does with
@@ -1901,20 +1787,21 @@ mod tests {
   echo "Error: target_config_invalid: operator config '$4' is not one" >&2; exit 1
 fi"#;
 
-    /// The first candidate that speaks the graph's contract with a target protocol Studio knows,
-    /// and whose own `config validate` takes the home Studio wrote, is chosen, with no server
-    /// behind the gateway. A CLI from before OmniGraph's version-1 operator configuration (it has
-    /// no `config validate`, as the installed edge build `0.14.0-edge+50283ce` has none), one that
-    /// refuses the home, one that reports a target protocol Studio does not know, and one
-    /// without targets are passed over; with none left, the wrapper runs nothing and its refusal
-    /// names each CLI found, why, and the first build that works.
+    /// The first candidate that Studio's own finder takes (it speaks the graph's contract and
+    /// the protocols Studio drives, and has the commands Studio runs) and whose own
+    /// `config validate` takes the home Studio wrote is chosen, with no server behind the
+    /// gateway. A CLI from before OmniGraph's version-1 operator configuration (as the edge
+    /// build `0.14.0-edge+50283ce`, which reports no access protocol), one that refuses the
+    /// home, one that reports a target protocol Studio does not know, one that speaks another
+    /// contract and one without targets are passed over; with none left, the wrapper runs nothing
+    /// and its refusal names each CLI found, why, and the first build that works.
     #[cfg(unix)]
     #[test]
     fn the_cli_that_reads_the_home_studio_writes_is_chosen_without_a_server() {
         let dir = std::env::temp_dir().join(format!("studio-cli-choice-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
-        let fake = |name, version, config| fake_cli(&dir, name, version, config);
+        let fake = |name, version: Option<&str>, config| fake_cli(&dir, name, version, config);
         // 0.13.0 predates `version --json`.
         let old = fake(
             "omnigraph-0.13",
@@ -1927,7 +1814,8 @@ fi"#;
             Some(r#"{"version":"0.14.0","http_contract":"0.14"}"#),
             "",
         );
-        // The edge build before the version-1 configuration: its parser knows no `config`.
+        // The edge build before the version-1 configuration: no access protocol, and its parser
+        // knows no `config`.
         let before = fake(
             "omnigraph-50283ce",
             Some(
@@ -1938,40 +1826,36 @@ fi"#;
         // A build with the version-1 configuration that reads it otherwise.
         let early = fake(
             "omnigraph-888223b",
-            Some(
-                r#"{"version":"0.14.0-edge+888223b","http_contract":"0.14","protocols":{"target":1,"credential":1}}"#,
-            ),
+            Some(&reports("0.14.0-edge+888223b", "0.14", 1)),
             r#"[ "$1 $2" = "config validate" ] && { printf 'Error: invalid operator configuration: targets.studio: invalid type: map\n\nLocation:\n  x\n' >&2; exit 1; }"#,
         );
         let current = fake(
             "omnigraph-ff54220",
-            Some(
-                r#"{"version":"0.14.0-edge+ff54220","http_contract":"0.14","protocols":{"target":1,"credential":1}}"#,
-            ),
+            Some(&reports("0.14.0-edge+ff54220", "0.14", 1)),
             VALIDATES,
         );
         // A later CLI that says it reads the version-1 configuration by its target protocol is
         // still asked to check the home.
         let later = fake(
             "omnigraph-later",
-            Some(r#"{"version":"0.15.0","http_contract":"0.14","protocols":{"target":2}}"#),
+            Some(&reports("0.15.0", "0.14", 2)),
             VALIDATES,
         );
         let later_refusing = fake(
             "omnigraph-later-refusing",
-            Some(r#"{"version":"0.15.1","http_contract":"0.14","protocols":{"target":2}}"#),
+            Some(&reports("0.15.1", "0.14", 2)),
             r#"[ "$1 $2" = "config validate" ] && exit 3"#,
         );
         let unknown_protocol = fake(
             "omnigraph-target-3",
-            Some(r#"{"version":"0.16.0","http_contract":"0.14","protocols":{"target":3}}"#),
+            Some(&reports("0.16.0", "0.14", 3)),
             VALIDATES,
         );
         // A wrapper that hangs: a match before it is chosen without waiting for it.
         let hung = fake("omnigraph-hung", None, "sleep 30");
         let other = fake(
             "omnigraph-0.15",
-            Some(r#"{"version":"0.15.0","http_contract":"0.15","protocols":{"target":2}}"#),
+            Some(&reports("0.15.0", "0.15", 2)),
             VALIDATES,
         );
         let home = CliHome::write(
@@ -1984,9 +1868,7 @@ fi"#;
         )
         .unwrap();
         let wrapper = || std::fs::read_to_string(&home.command).unwrap();
-        let choose = |candidates: Vec<PathBuf>| {
-            smol::block_on(choose_cli(&home, candidates, graph_client::CONTRACT))
-        };
+        let choose = |candidates: Vec<PathBuf>| smol::block_on(choose_cli(&home, candidates));
         let chosen = |candidates: Vec<PathBuf>| match choose(candidates) {
             CliChoice::Chosen { cli, .. } => cli,
             other => panic!("{other:?}"),
@@ -2005,7 +1887,7 @@ fi"#;
                 wrapper,
             } => {
                 assert_eq!(cli, current);
-                assert_eq!(version.as_deref(), Some("0.14.0-edge+ff54220"));
+                assert_eq!(version, "0.14.0-edge+ff54220");
                 assert!(wrapper, "a shell script names any path");
             }
             other => panic!("{other:?}"),
@@ -2038,46 +1920,58 @@ fi"#;
             unknown_protocol.clone(),
             other.clone(),
         ];
-        match choose(refused) {
+        let choice = choose(refused.clone());
+        let why = choice.refusal().unwrap_or_default();
+        match choice {
             CliChoice::NoMatch { found } => {
-                let unfit: Vec<&Unfit> = found.iter().map(|(_, _, unfit)| unfit).collect();
+                let probe = |why: &str| Unfit::Probe(why.to_owned());
+                let refusal = |version: &str, said: &str| Unfit::Refused {
+                    version: version.to_owned(),
+                    said: said.to_owned(),
+                };
                 assert_eq!(
-                    unfit,
-                    [
-                        &Unfit::Silent,
-                        &Unfit::TargetProtocol(None),
-                        &Unfit::NoValidate,
-                        &Unfit::Refused(
-                            "invalid operator configuration: targets.studio: invalid type: map"
-                                .into()
-                        ),
-                        &Unfit::Refused("it exited with 3".into()),
-                        &Unfit::TargetProtocol(Some(3)),
-                        &Unfit::Contract("0.15".into()),
-                    ]
+                    found,
+                    refused
+                        .iter()
+                        .cloned()
+                        .zip([
+                            probe(
+                                "answers no `version --json` (older than OmniGraph 0.14, or not \
+                                 its CLI)"
+                            ),
+                            probe("is 0.14.0, which reports no target protocol"),
+                            probe("is 0.14.0-edge+50283ce, which reports no access protocol"),
+                            refusal(
+                                "0.14.0-edge+888223b",
+                                "invalid operator configuration: targets.studio: invalid type: \
+                                 map"
+                            ),
+                            refusal("0.15.1", "it exited with 3"),
+                            probe("is 0.16.0, whose target protocol 3 Studio does not know"),
+                            probe("is 0.15.0, which speaks HTTP contract 0.15, not Studio's 0.14"),
+                        ])
+                        .collect::<Vec<_>>()
                 );
-                let text = no_cli_text(graph_client::CONTRACT, &found);
                 for says in [
                     "speaks this graph's HTTP API (0.14) and reads OmniGraph's version-1 operator \
                      configuration",
-                    "omnigraph-0.13 is older than 0.14",
-                    "0.14.0, which has no CLI targets",
+                    "omnigraph-0.13 answers no `version --json`",
+                    "0.14.0, which reports no target protocol",
                     &format!(
-                        "{} is 0.14.0-edge+50283ce, which predates that configuration: it has no \
-                         `config validate`",
+                        "{} is 0.14.0-edge+50283ce, which reports no access protocol",
                         before.display()
                     ),
                     "0.14.0-edge+888223b, whose `config validate` refused the configuration \
                      Studio wrote (invalid operator configuration: targets.studio: invalid type: \
                      map)",
-                    "0.16.0, which reads target protocol 3",
-                    "0.15.0, which speaks 0.15",
+                    "0.16.0, whose target protocol 3",
+                    "0.15.0, which speaks HTTP contract 0.15",
                     "edge build made from main at ff542202 or later",
                     "edge-20261021-888223b is older",
                     "RELEASE_CHANNEL=edge",
-                    "`agent.omnigraph_cli`",
+                    "set `omnigraph_cli` in Studio's settings",
                 ] {
-                    assert!(text.contains(says), "{says}: {text}");
+                    assert!(why.contains(says), "{says}: {why}");
                 }
             }
             other => panic!("{other:?}"),
@@ -2090,22 +1984,75 @@ fi"#;
             .unwrap();
         assert!(!run.status.success());
         let said = String::from_utf8_lossy(&run.stderr);
-        assert!(
-            said.contains("No omnigraph CLI here speaks") && said.contains("ff542202"),
-            "{said}"
+        assert_eq!(said.trim_end(), why, "the wrapper says what the choice did");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The agent's choice uses Studio's own finder: a CLI is probed once (`version --json` and
+    /// the `--help` of the commands Studio runs), what it was found to be is remembered while
+    /// its file is unchanged, and each later conversation asks it only to check its own home.
+    #[cfg(unix)]
+    #[test]
+    fn a_cli_is_probed_once_and_then_only_checks_each_home() {
+        let dir = std::env::temp_dir().join(format!("studio-cli-probed-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("calls");
+        let cli = dir.join("omnigraph");
+        let script = format!(
+            "#!/bin/sh\n\
+             echo \"$*\" >> '{log}'\n\
+             [ \"$1 $2\" = \"version --json\" ] && {{ echo '{json}'; exit 0; }}\n\
+             [ \"$3\" = \"--help\" ] && {{ echo \"Usage: omnigraph $1 $2\"; exit 0; }}\n\
+             {VALIDATES}\n\
+             exit 2\n",
+            log = log.display(),
+            json = reports("0.14.0-edge+ff54220", "0.14", 1),
         );
-        // The installed CLI is the one from before the version-1 configuration: it is passed
-        // over in the same words, when it is there.
-        let installed = std::env::home_dir().map(|home| home.join(".local/bin/omnigraph"));
-        if let Some(installed) = installed.filter(|cli| is_executable(cli)) {
-            let facts = smol::block_on(cli_facts(&installed));
-            if facts.version.as_deref() == Some("0.14.0-edge+50283ce") {
-                match choose(vec![installed]) {
-                    CliChoice::NoMatch { found } => assert_eq!(found[0].2, Unfit::NoValidate),
-                    other => panic!("{other:?}"),
-                }
-            }
-        }
+        std::fs::write(&cli, script).unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let calls = || {
+            let calls = std::fs::read_to_string(&log).unwrap_or_default();
+            std::fs::remove_file(&log).ok();
+            calls.lines().map(str::to_owned).collect::<Vec<_>>()
+        };
+        let conversation = |branch: &str| {
+            CliHome::write(
+                &dir,
+                &dir.join("private"),
+                access(1, "t"),
+                "knowledge",
+                branch,
+                "main",
+            )
+            .unwrap()
+        };
+        let checks = |home: &CliHome| {
+            format!(
+                "config validate --operator-config {}",
+                home.private.join("config.yaml").display()
+            )
+        };
+
+        let first = conversation("agent/one");
+        let chosen = smol::block_on(choose_cli(&first, vec![cli.clone()]));
+        assert!(matches!(chosen, CliChoice::Chosen { .. }), "{chosen:?}");
+        assert_eq!(
+            calls(),
+            [
+                "version --json".to_owned(),
+                "target list --help".to_owned(),
+                "target inspect --help".to_owned(),
+                "credentials status --help".to_owned(),
+                "credentials export --help".to_owned(),
+                checks(&first),
+            ]
+        );
+        let second = conversation("agent/two");
+        let chosen = smol::block_on(choose_cli(&second, vec![cli.clone()]));
+        assert!(matches!(chosen, CliChoice::Chosen { .. }), "{chosen:?}");
+        assert_eq!(calls(), [checks(&second)], "probed once");
+        drop((first, second));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2195,7 +2142,6 @@ fi"#;
                 std::fs::read_to_string(dir.join("ca.pem")).unwrap(),
                 certificate
             );
-            assert!(!dir.join("credentials").exists());
             #[cfg(unix)]
             for name in ["config.yaml", "token", "ca.pem"] {
                 let mode = std::fs::metadata(dir.join(name))
@@ -2835,10 +2781,7 @@ fi"#;
     fn a_conversation_home_holds_its_config_token_and_wrapper() {
         let cwd = std::env::temp_dir().join(format!("studio-cli-home-{}", std::process::id()));
         std::fs::remove_dir_all(&cwd).ok();
-        // A home an older Studio wrote, with the token file the CLI no longer reads.
-        let older = cwd.join(".studio/agent-20261013-101500");
-        std::fs::create_dir_all(&older).unwrap();
-        std::fs::write(older.join("credentials"), "[studio]\ntoken = old\n").unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
         let home = CliHome::write(
             &cwd,
             &cwd.join("private"),
@@ -2872,7 +2815,6 @@ fi"#;
             std::fs::read_to_string(home.dir.join(CA_FILE)).unwrap(),
             CERTIFICATE
         );
-        assert!(!home.dir.join("credentials").exists());
 
         home.use_cli(Path::new("/opt/it's here/omnigraph")).unwrap();
         assert_eq!(mode(&home.command), 0o700);
@@ -2884,12 +2826,13 @@ fi"#;
         assert!(script.contains(&format!("OMNIGRAPH_HOME='{}'", home.dir.display())));
 
         // The wrapper runs with its own home, loopback outside any proxy, and no other OmniGraph
-        // variable, one the CLI does not read today included.
+        // variable, one the CLI does not read today and one in another case included.
         home.use_cli(Path::new("/usr/bin/env")).unwrap();
         let output = std::process::Command::new(&home.command)
             .env("OMNIGRAPH_TOKEN_PERSONAL", "secret")
             .env("OMNIGRAPH_BEARER_TOKEN", "secret")
             .env("OMNIGRAPH_FOO", "secret")
+            .env("Omnigraph_Token_Work", "secret")
             .env("OMNIGRAPH_HOME", "/elsewhere")
             .env("NO_PROXY", "corp.example")
             .env("STUDIO_TEST_KEPT", "kept")
@@ -2992,7 +2935,7 @@ fi"#;
             "#!/bin/sh\n\
              # Written by OmniGraph Studio for one agent conversation (spec 013): the omnigraph\n\
              # CLI, pointed at Studio's gateway for this conversation.\n\
-             for name in $(env | sed -n 's/^\\(OMNIGRAPH_[A-Za-z0-9_]*\\)=.*/\\1/p'); do unset \"$name\"; done\n\
+             for name in $(env | sed -n 's/^\\([Oo][Mm][Nn][Ii][Gg][Rr][Aa][Pp][Hh]_[A-Za-z0-9_]*\\)=.*/\\1/p'); do unset \"$name\"; done\n\
              OMNIGRAPH_HOME='/data/agent/graphs/g/.studio/agent-x'\n\
              NO_PROXY=\"127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}\"\n\
              no_proxy=\"$NO_PROXY\"\n\

@@ -18,7 +18,7 @@ use gpui::{App, AppContext as _, Context, Entity, Global, Task};
 use http_client::HttpClient;
 use serde::{Deserialize, Serialize};
 
-use crate::cli_config::{self, CliAlias, CliAuth, CliServer, CliTargets, FileStamp};
+use crate::cli_config::{self, CliAuth, CliServer, CliTargets, FileStamp};
 use crate::cli_tokens::{self, CliTokenSource, Token, TokenSource};
 use crate::connection::{Connection, ServerEntry, ServerSource};
 
@@ -74,9 +74,13 @@ pub struct ConnectionRegistry {
     watched: Vec<PathBuf>,
     operator_stamp: Vec<Option<FileStamp>>,
     /// The places Studio looks for the CLI, and their stamp: a CLI installed, upgraded or
-    /// removed lists the targets and asks every CLI server's token again.
+    /// removed, or another named in the settings, lists the targets and asks every CLI server's
+    /// token again.
     cli_places: Vec<PathBuf>,
     cli_stamp: Vec<Option<FileStamp>>,
+    /// Follows the settings' `omnigraph_cli`, the CLI Studio looks for first
+    /// ([`Self::follow_cli_setting`]).
+    _cli_setting: Option<gpui::Subscription>,
     /// Each CLI server as last listed, by its address.
     cli_kept: HashMap<String, CliKept>,
     /// The CLI's targets have been listed once since Studio started; until then the CLI's
@@ -273,9 +277,28 @@ impl ConnectionRegistry {
         }
 
         this.token_sources = Arc::new(cli_token_source);
-        this.cli_places = cli_tokens::candidates();
+        this.follow_cli_setting(cx);
         this.start_listing(cx);
         this
+    }
+
+    /// Takes the CLI the settings name (`omnigraph_cli`) as the one Studio looks for first, for
+    /// its servers and for the agent ([`cli_tokens::candidates`]), now and whenever the
+    /// settings change. A change moves the places Studio looks, which the next check of the
+    /// CLI's files sees: it lists the targets with that CLI and asks every token again.
+    fn follow_cli_setting(&mut self, cx: &mut Context<Self>) {
+        self.take_cli_setting(cx);
+        self._cli_setting = Some(cx.observe_global::<studio_settings::StudioSettings>(
+            |this, cx| this.take_cli_setting(cx),
+        ));
+    }
+
+    fn take_cli_setting(&mut self, cx: &mut Context<Self>) {
+        let named = cx
+            .try_global::<studio_settings::StudioSettings>()
+            .and_then(|settings| settings.omnigraph_cli.clone());
+        cli_tokens::set_configured(named.as_deref());
+        self.cli_places = cli_tokens::candidates();
     }
 
     fn empty(http: Arc<dyn HttpClient>, operator_dir: Option<PathBuf>) -> Self {
@@ -293,6 +316,7 @@ impl ConnectionRegistry {
             operator_stamp: Vec::new(),
             cli_places: Vec::new(),
             cli_stamp: Vec::new(),
+            _cli_setting: None,
             cli_kept: HashMap::new(),
             listed: true,
             listing_waiters: Vec::new(),
@@ -309,13 +333,6 @@ impl ConnectionRegistry {
     /// each new one in a toast.
     pub fn notices(&self) -> &[String] {
         &self.notices
-    }
-
-    /// The CLI's aliases bound to `graph` on the CLI server named `server`: none, since the CLI
-    /// has no command that lists its aliases and Studio reads no operator configuration itself
-    /// (spec 003).
-    pub fn aliases_for(&self, _server: &str, _graph: &str) -> Vec<CliAlias> {
-        Vec::new()
     }
 
     /// Whether the CLI's targets have been listed since Studio started, so its servers are
@@ -894,7 +911,7 @@ mod tests {
     /// token typed into Studio stays until then; a new address is a new connection, servers
     /// come and go, and targets that cannot be listed keep every server and say why. An address
     /// is one connection: a CLI target at the address of the environment's server is said, not
-    /// connected. The CLI lists no aliases, so none is offered.
+    /// connected.
     #[gpui::test]
     async fn cli_servers_follow_the_cli_files(cx: &mut TestAppContext) {
         let (http, sent) = answering();
@@ -1066,10 +1083,6 @@ mod tests {
                 .collect();
             assert_eq!(said.len(), 1, "{:?}", registry.notices());
             assert!(said[0].contains("'mine'"));
-        });
-
-        registry.read_with(cx, |registry, _| {
-            assert!(registry.aliases_for("c", "g").is_empty())
         });
     }
 
@@ -1388,6 +1401,53 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(listing.asked(), 2);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The CLI the settings name (`omnigraph_cli`) is where Studio looks first, its `~` taken
+    /// as the home folder, for its servers and for the agent alike (`cli_tokens::candidates`).
+    /// Naming another lists the targets again at the next check; an empty setting names none.
+    #[gpui::test]
+    async fn the_cli_setting_is_where_studio_looks_first(cx: &mut TestAppContext) {
+        let (http, _) = answering();
+        let listing = HeldListing::default();
+        let set = |named: Option<&str>, cx: &mut TestAppContext| {
+            let settings = studio_settings::StudioSettings {
+                omnigraph_cli: named.map(str::to_owned),
+                ..Default::default()
+            };
+            cx.update(|cx| cx.set_global(settings));
+            cx.run_until_parked();
+        };
+        set(None, cx);
+        let dir = std::env::temp_dir().join(format!("studio-cli-setting-{}", std::process::id()));
+        let registry = cx.new(|cx| {
+            let mut registry = ConnectionRegistry::empty(http, Some(dir.clone()));
+            registry.lister = listing.lister();
+            registry.follow_cli_setting(cx);
+            registry.start_listing(cx);
+            registry
+        });
+        cx.run_until_parked();
+        assert_eq!(listing.asked(), 1);
+        let places = |cx: &mut TestAppContext| {
+            registry.read_with(cx, |registry, _| registry.cli_places.clone())
+        };
+        assert_eq!(places(cx), cli_tokens::candidates());
+        assert_eq!(cli_tokens::configured(), None);
+
+        set(Some("~/tools/omnigraph"), cx);
+        let named = std::env::home_dir().unwrap().join("tools/omnigraph");
+        assert_eq!(cli_tokens::configured(), Some(named.clone()));
+        let looked = places(cx);
+        assert_eq!(looked[0], named);
+        assert_eq!(looked.iter().filter(|place| **place == named).count(), 1);
+        cx.executor().advance_clock(OPERATOR_POLL);
+        cx.run_until_parked();
+        assert_eq!(listing.asked(), 2, "listed again with the CLI named");
+
+        set(Some(""), cx);
+        assert_eq!(cli_tokens::configured(), None);
+        assert!(!places(cx).contains(&named));
     }
 
     /// What the person is told about the servers is one list, each notice saying what

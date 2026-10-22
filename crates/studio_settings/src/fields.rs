@@ -384,9 +384,9 @@ mod tests {
                 "studio.canvas_max_nodes",
                 "studio.health_check_seconds",
                 "studio.show_performance",
+                "omnigraph_cli",
                 "agent.command",
                 "agent.ask_before_writes",
-                "agent.omnigraph_cli",
             ],
             "agent.env, a map, and panels are edited in settings.json or elsewhere"
         );
@@ -435,10 +435,12 @@ mod tests {
         assert_eq!(field("agent.ask_before_writes").kind, FieldKind::Toggle);
         // A doc comment's lines are one paragraph.
         assert!(!field("agent.ask_before_writes").description.contains('\n'));
-        assert_eq!(field("agent.omnigraph_cli").title, "OmniGraph CLI");
+        let cli = field("omnigraph_cli");
+        assert_eq!(cli.title, "OmniGraph CLI");
+        assert_eq!(cli.kind, FieldKind::Text { nullable: true });
         assert_eq!(
-            field("agent.omnigraph_cli").kind,
-            FieldKind::Text { nullable: true }
+            cli.section, "Connection",
+            "Studio's CLI and the agent's alike"
         );
     }
 
