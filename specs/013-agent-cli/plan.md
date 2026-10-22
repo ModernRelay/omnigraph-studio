@@ -195,6 +195,10 @@ its absolute path, or use `omnigraph_run`, which reads relative paths itself.
 
 The agent learns the path two ways: the conversation's MCP server adds it to its `initialize`
 instructions, and a new `omnigraph_cli` tool returns it with the branch, its base and the rules.
+Both say what Studio chose, so both wait for the choice (since 2026-10-21): the instructions are
+made when `initialize` arrives, from the CLI chosen by then, which the panel sends the socket
+(`socket::Instructions`); past 5 s still choosing, they say so and to call `omnigraph_cli`, and
+name no CLI. An `omnigraph_cli` call made before the choice is answered once it is made.
 The config makes the gateway and the graph the default, so they tell the agent to give no
 `--target` or `--graph`.
 `<cwd>/AGENTS.md`, shared by the graph's conversations, gives the rules and says where to find
@@ -206,7 +210,9 @@ The ACP crate can add variables to the agent's process but not remove them, and 
 `spawn_process` cannot be replaced, so the agent starts through a command that removes them. It
 removes every `OMNIGRAPH_*` variable Studio holds, unless `agent.env` sets it: the CLI's
 tokens and addressing, and tokens kept for other servers (`OMNIGRAPH_MR_BEARER_TOKEN`) or a local
-server's token list alike (in any case on Windows). Cloud variables (`AWS_*`, `AZURE_*`, Google's) stay: the
+server's token list alike (in any case on Windows). The prefix is matched in one place,
+`agent_panel::scrub` (since 2026-10-21), which the agent's launch calls; a variable OmniGraph
+adds later is removed without a list to keep. Cloud variables (`AWS_*`, `AZURE_*`, Google's) stay: the
 agent may need them for its model, as Claude Code on Bedrock does. This closes the gap where the
 agent inherited the person's graph tokens. With none of these variables set, the agent starts as
 it is.
@@ -278,7 +284,7 @@ server never sees, and a repeated key could be judged by one value and read as a
 | `POST /branches` | Only `{name: <agent branch>, from: <base>}`; one with `from_commit` is refused, since a branch started at a commit holds what that commit held |
 | `DELETE /branches/{name}` | Only the agent branch |
 | `POST /branches/merge` | Only into the agent branch, and never with `delete_branch: true` or `as_commit`. A `dry_run` is a read, on any graph, as the other reads are |
-| `POST /queries/{name}` | On the agent branch, a write; elsewhere forwarded with `expect_mutation: false`. Its text is not in the request and the catalog (`GET /queries`) says only whether it writes, so one held as an unpublished commit is known from its answer alone |
+| `POST /queries/{name}` | Sent with `expect_mutation: false` (`omnigraph query <name>`), a read anywhere, the agent's branch and other graphs included: the server refuses it if it writes (since 2026-10-21). Otherwise, on the agent branch, a write, whose answer says whether it wrote: a read's rows (`ReadOutput`) are "Read; nothing written", never a commit; elsewhere forwarded with `expect_mutation: false`. Its text is not in the request and the catalog (`GET /queries`) says only whether it writes, so one held as an unpublished commit is known from its answer alone |
 | `POST /commits/{id}/publish`, `DELETE /commits/{id}`, non-`GET` `/cluster/…`, anything else | Refused |
 
 Writes are checked on the conversation's graph only. A refusal is a 403 `ErrorOutput` with
@@ -297,7 +303,13 @@ into …", "Create … from main"), the query when there is one, the branch, and
 Committed with the commit and the change count, Done or "Branch created" for a write without a
 commit, Not on the branch for one the server held as a commit no branch shows (`kind`
 `unpublished` or `unattached`), Refused with the server's message, or Outcome unknown, which a
-success whose body cannot be read is too, as Studio's own writes judge it. A load given `from`
+success whose body cannot be read is too, as Studio's own writes judge it. A success is a write's
+receipt only in the write's own shape (a `commit` key, null or the commit; a branch's `name` for
+a create or delete); a commit there of a kind this build does not know is Outcome unknown,
+"whether the branch moved is not known", and is logged so (since 2026-10-21; before, a kind not
+said held was taken as committed). A write already sent when the agent stops keeps running on its
+card until its outcome comes, through what records it, which the gateway calls however the write
+ends; the agent's branch then learns whether it exists. A load given `from`
 is tagged new only when its answer says it created the branch. A committed write is logged in the
 session (the workspace's "Agent CLI: … committed" notice) and the agent branch banner counts it.
 A write the server held as a proposal or a snapshot is logged as held, with its commit, by the
@@ -306,7 +318,8 @@ commit's kind, as Studio's own writes are (since 2026-10-21; before, as committe
 - **Sandbox** (default): writes to the agent branch go through at once.
 - **Ask before writes** (Settings → Agent, `agent.ask_before_writes`): each write waits on its
   card with Allow (⌘Y), Always on this branch (⌘⌥Y) and Reject (⌘⌥N). The CLI waits, since it has
-  no timeout. Reject answers 403 and nothing is sent.
+  no timeout. Reject answers 403 and nothing is sent. The keys answer the write card waiting
+  longest, which alone shows them, never an agent's own permission request (spec 011).
 
 A write still waiting is given up unsent, and its card says so, once nobody waits for it: when
 the CLI closes its connection (its command timed out or was stopped), since the person could
@@ -513,9 +526,22 @@ CLI is the one they trust).
 | 2026-10-20 | A junction in the skill folder is removed as a link, and later skill writes go on | `agent_panel` `a_link_left_in_the_skill_folder_is_removed_and_not_followed` (a symbolic link on macOS, run here; a junction on Windows, not run here), `a_held_folder_cannot_be_swapped_and_a_junction_is_not_followed` (Windows only, now removing its junctions through `Confined::remove`) | On macOS the link is removed and its target kept. On Windows `std::fs::remove_file` fails on a junction (`DeleteFileW`, then a reopen without backup semantics, in the 1.98 standard library's `sys/fs/windows.rs` `unlink`), which failed every later skill write; `remove` now takes a link to a folder away with `remove_dir` (`RemoveDirectoryW` removes the junction, not its target) |
 | 2026-10-20 | On Windows a write whose command was stopped by the wrapper's process id is not sent | `agent_panel` `the_client_is_the_owner_of_the_connections_client_end` (the TCP table read as Windows writes it; run on macOS); `a_command_stopped_by_its_id_is_seen_though_the_cli_waits_on` and `gateway` `a_write_whose_command_was_stopped_is_not_sent` (Windows only: this test binary as the CLI under the real `omnigraph.cmd`, the wrapper killed by its id; not run here) | The launcher's job ends the CLI only when the agent ends, so it does not cover this. Expected on Windows: the CLI keeps its connection after `cmd` ends, the held `cmd` is seen to end within a poll, and the gateway sends `Abandoned` and nothing upstream |
 | 2026-10-20 | The Windows code builds | `cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -A dead_code -D warnings` on macOS over a scratch crate that includes the real `cli_home`, `confined`, `host`, `launch`, `mcp`, `requester`, `skill`, `socket` and `tools` files (`dead_code` allowed only because the panel and gateway that use them are not in it) | Clean, once a Windows-only test's missing `mut` and a `chunks_exact` lint were fixed. `gateway.rs` and `sessions.rs` need `graph_client` and `gpui` and were checked by reading; CI builds them on `windows-2025` |
+| 2026-10-21 | A stored read on the agent's branch is a read, and only a write's receipt is a commit | `gateway_rules` `a_stored_read_is_a_read_anywhere_and_commits_are_never_published`; `gateway` `a_writes_success_answer_says_what_it_did` (now per write kind), `the_gateway_checks_the_session_then_forwards_reads_and_approved_writes` (a stored read on the agent's branch streams back with no card); the receipts' shapes in `crates/graph_client/openapi/omnigraph-0.14.0-edge.json` (`ChangeOutput`, `IngestOutput`, `GraphBatchLoadOutput`, `BlobWriteOutput`, `BranchMergeOutput` carry `commit`; `BranchCreateOutput`, `BranchDeleteOutput` carry `name`; `ReadOutput` carries `rows` and the `graph_commit_id` it read at) | Before, `omnigraph query people --branch agent/x` (`expect_mutation: false`) was a write: Ask mode waited for Allow, and the read's `graph_commit_id` was taken for a commit, so the card said Committed, ✎ rose and the session logged "committed". Now it is forwarded as a read, and a write's answer is a commit only as its own receipt; a stored query sent without `expect_mutation` that reads is "Read; nothing written", logged as writing nothing |
+| 2026-10-21 | A commit of a kind Studio does not know leaves the outcome unknown | `gateway` `a_writes_success_answer_says_what_it_did`; `agent_panel` `an_agents_held_write_is_logged_as_held` | Supersedes the earlier 2026-10-21 row's "an unknown kind not said to be held is on the branch": the gateway keeps the commit's kind (`Seen::Written`), so every kind goes through `OutcomeKind::written` as Studio's own writes do, and the card says Outcome unknown with the commit. A receipt naming a commit without its id is unknown too |
+| 2026-10-21 | `initialize` says what Studio chose, not what it guessed at launch | `socket` `initialize_answers_with_what_studio_chose_when_it_asks` (instructions sent before and after the agent asked, none within the wait, and a conversation that ended); `mcp` `initialize_echoes_a_known_revision_and_offers_the_newest_otherwise` | Before, the instructions were made at launch as `instructions(None)`, before the CLI was chosen, so with no CLI found, or on Windows with a CLI at a path the batch file cannot hold, the agent was told the wrapper was its CLI. Now they are made when `initialize` arrives, from the choice (`instructions(Some(chosen))`), and while Studio is still choosing past 5 s they say so |
+| 2026-10-21 | An approval the gateway never took says nothing was sent | `gateway` `an_approval_the_gateway_never_took_records_that_nothing_was_sent` | An approval handed to a gateway that stopped before reading it was dropped with it, and recorded as unknown. The gateway's `Decision` now records "nothing was sent" for it, and for one taken as the CLI gave up, once |
+| 2026-10-21 | The agent's launch removes OmniGraph's variables through one shared match | `agent_panel` `scrub::every_name_with_omnigraphs_prefix_is_omnigraphs`, `scrub::what_is_removed_is_every_omnigraph_variable_but_those_kept`, `the_agent_starts_without_omnigraph_credentials` | `OMNIGRAPH_` matched whole at the start of the name, in any ASCII case only on Windows (`OMNIGRAPHX`, `XOMNIGRAPH_TOKEN` and `OMNIGRAPHé_` are not); `omnigraph_run` (`cli_home`) still reads it through `host::is_omnigraph_variable`, a re-export of `scrub`'s |
 
 ## Corrections
 
+- 2026-10-21 · A stored read on the agent's branch (`omnigraph query <name> --branch agent/…`,
+  `expect_mutation: false`) was taken for a write, and its answer's `graph_commit_id`, the commit
+  it read at, for a commit it made: the card said Committed and the session logged it. It is now a
+  read, and only a write's receipt names a commit. A commit of a kind Studio does not know, taken
+  as committed unless said held, now leaves the outcome unknown.
+- 2026-10-21 · The MCP instructions were made at launch, before the CLI was chosen, and told the
+  agent the wrapper was its CLI when none fit or its shell could not run the one chosen. They are
+  now made when the agent asks, from the choice.
 - 2026-10-20 · The launcher's search for a program read every PATH entry, and an empty or
   relative one (`a;;b`, a trailing `;`) resolved against its working directory, which the doc
   said was never searched. It now reads only absolute entries, and a name found on none does
