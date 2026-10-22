@@ -69,7 +69,8 @@ impl DegreeBatches {
 
 /// `id → n` from a `builder::page_degrees` answer; a node with no neighbours has no row.
 /// `None` when a row does not say both, so an answer that cannot be read is no count of 0.
-pub(crate) fn page_counts(rows: &Value) -> Option<HashMap<String, u64>> {
+/// The one reader of that answer, for every view that reads one.
+pub fn page_counts(rows: &Value) -> Option<HashMap<String, u64>> {
     rows.as_array()?
         .iter()
         .map(|row| Some((row.get("id")?.as_str()?.to_owned(), row.get("n")?.as_u64()?)))

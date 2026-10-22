@@ -390,7 +390,9 @@ impl FoldedChanges {
     }
 }
 
-fn plural(count: usize, one: &str, many: &str) -> String {
+/// "1 draft", "3 drafts", "1,200 rows": a count, its digits grouped, and the word for it, as
+/// Studio writes every count.
+pub fn plural(count: usize, one: &str, many: &str) -> String {
     let word = if count == 1 { one } else { many };
     format!("{} {word}", studio_ui::group_digits(count))
 }
