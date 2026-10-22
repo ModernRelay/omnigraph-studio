@@ -14,6 +14,7 @@ pub struct Page {
 /// The most pixels one page is drawn with, a tall letter page's at 1,600 wide: a page far
 /// taller than it is wide (a web page saved as one) is drawn narrower, not tens of thousands of
 /// pixels tall.
+#[cfg(target_os = "macos")]
 const PAGE_PIXELS: f64 = 1600. * 2400.;
 
 /// A document's pages drawn `width` pixels wide (narrower for a page that would pass
