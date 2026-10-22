@@ -646,6 +646,14 @@ pub struct GraphSession {
     /// frame.
     /// Row counts by kind and type: a node type and an edge type may share a name.
     dataset_counts: HashMap<(EntityKind, String), i64>,
+    /// The `__manifest` version of the snapshot `dataset_counts` came from (its
+    /// `graph_manifest_version`), held and let go with them.
+    counts_version: Option<u64>,
+    /// The commit the counts are for ([`Self::counts_commit`]): the branch's newest commit, once
+    /// a read of it found it at `counts_version`. Let go with the counts.
+    counts_commit: Option<String>,
+    /// That read of the branch's newest commit, while under way.
+    _counts_commit_task: Option<Task<()>>,
     /// The queries the server serves by name for this graph (spec 007): `NotLoaded` until a view
     /// first wants them ([`Self::want_stored_queries`]), since the first screen shows none.
     pub stored_queries: Loadable<Arc<Vec<QueryCatalogEntry>>>,
@@ -837,6 +845,9 @@ impl GraphSession {
             branches: Loadable::NotLoaded,
             datasets: Loadable::NotLoaded,
             dataset_counts: HashMap::new(),
+            counts_version: None,
+            counts_commit: None,
+            _counts_commit_task: None,
             stored_queries: Loadable::NotLoaded,
             stored_queries_wanted: false,
             outcomes: Vec::new(),
@@ -1095,7 +1106,7 @@ impl GraphSession {
             self.read_branches(None, cx);
         } else {
             self.datasets = Loadable::Loading;
-            self.dataset_counts.clear();
+            self.clear_counts();
             if self.stored_queries_wanted {
                 self.stored_queries = Loadable::Loading;
             }
@@ -1686,8 +1697,17 @@ impl GraphSession {
 
     fn reload_counts(&mut self, cx: &mut Context<Self>) {
         self.datasets = Loadable::Loading;
-        self.dataset_counts.clear();
+        self.clear_counts();
         self.read_counts(cx);
+    }
+
+    /// Lets go of the type counts, with the snapshot version they came from and their commit,
+    /// and of a read of that commit under way: it would name the commit of counts not held.
+    fn clear_counts(&mut self) {
+        self.dataset_counts.clear();
+        self.counts_version = None;
+        self.counts_commit = None;
+        self._counts_commit_task = None;
     }
 
     /// Reads the counts again after a commit on the session's branch: the ones shown stay until
@@ -1711,7 +1731,10 @@ impl GraphSession {
         let client = self.client(cx);
         let graph = self.graph_id.clone();
         let branch = self.branch.clone();
-        let read = cx.background_spawn(async move { client.snapshot(&graph, &branch).await });
+        let read = {
+            let branch = branch.clone();
+            cx.background_spawn(async move { client.snapshot(&graph, &branch).await })
+        };
         self._datasets_task = Some(cx.spawn(async move |this, cx| {
             let read = read.await;
             this.update(cx, |this, cx| this.note_read(&read, cx)).ok();
@@ -1728,13 +1751,14 @@ impl GraphSession {
                             })
                             .collect();
                         this.datasets = Loadable::Loaded(output.datasets);
+                        this.find_counts_commit(branch, output.graph_manifest_version, cx);
                         cx.emit(SessionEvent::CountsChanged);
                         cx.notify();
                     }
                     // A refresh: the counts held are the branch's until new ones are read.
                     Err(_) if matches!(this.datasets, Loadable::Loaded(_)) => {}
                     Err(error) => {
-                        this.dataset_counts.clear();
+                        this.clear_counts();
                         this.datasets = Loadable::Failed(error.to_string());
                         cx.emit(SessionEvent::CountsChanged);
                         cx.notify();
@@ -1743,6 +1767,42 @@ impl GraphSession {
                 if this.counts_again {
                     this.refresh_counts(cx);
                 }
+            })
+            .ok();
+        }));
+    }
+
+    /// The counts just taken came from the snapshot of `branch` at manifest `version`: finds
+    /// the commit they are for. A snapshot names no commit, but each commit names the
+    /// `__manifest` version that holds it, and one version of a branch's manifest holds one
+    /// commit. So the branch's newest commit is read ([`Self::head_commit`], shared with every
+    /// view that read it already), and when it is at `version` it is the counts' commit. A
+    /// commit that landed between the two reads, or a manifest that moved without a commit,
+    /// leaves the versions apart, and the counts are for no commit known
+    /// ([`Self::counts_commit`]). A snapshot at the version held is of the same commit, which
+    /// stays.
+    fn find_counts_commit(&mut self, branch: String, version: u64, cx: &mut Context<Self>) {
+        if self.counts_version != Some(version) {
+            self.counts_commit = None;
+        }
+        self.counts_version = Some(version);
+        if self.counts_commit.is_some() {
+            return;
+        }
+        let read = self.head_commit(&branch, false, cx);
+        self._counts_commit_task = Some(cx.spawn(async move |this, cx| {
+            let Ok(Some(commit)) = read.await else {
+                return;
+            };
+            this.update(cx, |this, _| {
+                // The counts held since may be another snapshot's, or another branch's.
+                if this.branch == branch
+                    && this.counts_version == Some(version)
+                    && commit.graph_manifest_version == version
+                {
+                    this.counts_commit = Some(commit.graph_commit_id);
+                }
+                this._counts_commit_task = None;
             })
             .ok();
         }));
@@ -1770,6 +1830,14 @@ impl GraphSession {
         self.dataset_counts
             .get(&(kind, type_name.to_owned()))
             .copied()
+    }
+
+    /// The commit the counts of [`Self::count_of`] are for, once known: the branch's newest
+    /// commit read after the snapshot, when it is at the snapshot's manifest version. `None`
+    /// while it is read, and when it is at another version (a commit landed between the two
+    /// reads, or the manifest moved without one): the counts are then for no commit known.
+    pub fn counts_commit(&self) -> Option<&str> {
+        self.counts_commit.as_deref()
     }
 
     pub fn set_branch(&mut self, branch: String, cx: &mut Context<Self>) {
@@ -4725,6 +4793,93 @@ mod tests {
             assert!(matches!(session.datasets, Loadable::Loaded(_)));
             assert_eq!(session.count_of(EntityKind::Node, "Person"), Some(3));
         });
+    }
+
+    /// The counts name their commit once the branch's newest commit, read after the snapshot,
+    /// is at the snapshot's manifest version. A branch numbers its own versions: moved to a
+    /// branch whose snapshot is at the version main's was, the counts name no commit until that
+    /// branch's newest is read, and never main's.
+    #[gpui::test]
+    async fn the_counts_commit_is_the_branchs_newest_at_the_snapshots_version(
+        cx: &mut TestAppContext,
+    ) {
+        // Feature's first read of its newest commit waits until let go.
+        let (release, wait) = oneshot::channel::<()>();
+        let gate = Arc::new(std::sync::Mutex::new(Some(wait)));
+        let pages: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let asked = pages.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let query = request.uri().query().unwrap_or_default().to_owned();
+            let main = query.contains("branch=main");
+            let commits = path.ends_with("/commits");
+            if commits {
+                asked.lock().unwrap().push(query.clone());
+            }
+            let wait = (commits && !main)
+                .then(|| gate.lock().unwrap().take())
+                .flatten();
+            async move {
+                if let Some(wait) = wait {
+                    wait.await.ok();
+                }
+                // Both branches' manifests are at version 5.
+                let body = if path.ends_with("/snapshot") {
+                    serde_json::json!({ "graph_branch": "main", "graph_manifest_version": 5,
+                        "internal_schema_version": 16, "datasets": [] })
+                } else if commits {
+                    let id = if main { "c5" } else { "f1" };
+                    let commit = serde_json::json!({ "graph_commit_id": id,
+                        "graph_manifest_version": 5, "kind": "published", "created_at": 0 });
+                    serde_json::json!({ "commits": [commit] })
+                } else {
+                    serde_json::json!({ "branches": ["main", "feature"] })
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        let counts_commit = |cx: &mut TestAppContext| {
+            session.read_with(cx, |session, _| session.counts_commit().map(str::to_owned))
+        };
+        assert_eq!(counts_commit(cx).as_deref(), Some("c5"));
+
+        session.update(cx, |session, cx| session.set_branch("feature".into(), cx));
+        cx.run_until_parked();
+        assert_eq!(
+            counts_commit(cx),
+            None,
+            "not main's c5, at the same version"
+        );
+        release.send(()).ok();
+        cx.run_until_parked();
+        assert_eq!(counts_commit(cx).as_deref(), Some("f1"));
+
+        session.update(cx, |session, cx| session.set_branch("main".into(), cx));
+        cx.run_until_parked();
+        assert_eq!(counts_commit(cx).as_deref(), Some("c5"));
+        assert_eq!(
+            *pages.lock().unwrap(),
+            [
+                "branch=main&limit=1",
+                "branch=feature&limit=1",
+                "branch=main&limit=1"
+            ],
+            "one newest commit for each snapshot"
+        );
     }
 
     /// A write sent outside the session's own calls counts as running until its outcome is
