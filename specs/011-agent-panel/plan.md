@@ -111,7 +111,7 @@ can fix its query.
 
 A proposal shows a card: the summary, the query text, the parameters, and the target branch,
 with "creates `agent/<stamp>` from `<base>`" before the first write. Buttons: **Allow**
-(⌘Y), **Always for this branch** (⌘⌥Y), **Reject** (⌘⌥N), each showing its binding; see
+(⌘Y), **Always on this branch** (⌘⌥Y), **Reject** (⌘⌥N), each showing its binding; see
 Actions for why ⌘↩ (Send) and ⎋ are not used. On Allow, Studio creates the branch if
 needed, then sends the mutation to it. The card and the tool result show the outcome:
 
@@ -120,7 +120,7 @@ needed, then sends the mutation to it. The card and the tool result show the out
 - Unknown: "The server did not confirm this change. It was not retried; check the branch
   history before proposing it again."
 
-Reject returns "The person rejected this change." "Always for this branch" runs later
+Reject returns "The person rejected this change." "Always on this branch" runs later
 proposals without asking, still as cards, until the agent session ends.
 
 The agent branch is `agent/<YYYYMMDD-HHMMSS>` (local time when the session starts), created
@@ -415,6 +415,9 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 
 ## Corrections
 
+- 2026-10-21 · The approval section named the second button "Always for this branch"; the card
+  says "Always on this branch", as the permission section and spec 013 do, and now so does this
+  plan.
 - 2026-10-12 · A tool call the agent never closed kept its spinner turning after the turn
   ended, which redrew the window at the display's rate while idle. When a turn ends, tools still
   shown pending or running take Completed (the turn finished) or Failed (it was stopped, failed

@@ -1366,12 +1366,22 @@ pub fn inside(cwd: &Path, value: &str) -> Result<Vec<String>, String> {
     if parts.is_empty() {
         return Err(format!("{value}: name a file"));
     }
-    if parts[0] == ".studio" {
+    if names_studio_folder(&parts[0]) {
         return Err(format!(
             "{value}: the .studio folder holds Studio's own files for the conversation."
         ));
     }
     Ok(parts)
+}
+
+/// Whether `part`, a path's first part in the working directory, opens the `.studio` folder.
+/// macOS and Windows find a name in any case (`.Studio` opens `.studio`), and so can a Linux
+/// folder that folds case; Windows also drops a name's trailing dots and spaces (`.studio.`).
+/// Matched so everywhere, by Unicode's case mappings both ways, since a file system folds case
+/// by its own table (`.ſtudio` is `.STUDIO` upper-cased).
+fn names_studio_folder(part: &str) -> bool {
+    let part = part.trim_end_matches(['.', ' ']);
+    part.to_lowercase() == ".studio" || part.to_uppercase() == ".STUDIO"
 }
 
 /// Reads `from` into `into` until its end, or until it holds more than `cap` bytes: whether it
@@ -2213,6 +2223,42 @@ fi"#;
         std::fs::remove_dir_all(&cwd).ok();
     }
 
+    /// `omnigraph_run` touches no file in the `.studio` folder, under any name a file system may
+    /// open it by: in another case, as macOS and Windows find names, or with the trailing dots
+    /// and spaces Windows drops. A folder only named like it is the agent's.
+    #[test]
+    fn the_studio_folder_is_refused_by_any_name_that_opens_it() {
+        let cwd = std::env::temp_dir().join("studio-run-studio-folder");
+        for value in [
+            ".studio/agent-x/token",
+            ".Studio/agent-x/ca.pem",
+            ".STUDIO/agent-x/omnigraph",
+            "./.sTuDiO/agent-x/config.yaml",
+            ".studio./agent-x/token",
+            ".Studio . /agent-x/token",
+            ".ſtudio/agent-x/token",
+            ".studıo/agent-x/token",
+        ] {
+            let refused = inside(&cwd, value);
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|error| error.contains(".studio folder")),
+                "{value}: {refused:?}"
+            );
+        }
+        let absolute = cwd.join(".Studio").join("agent-x").join("token");
+        assert!(inside(&cwd, &absolute.to_string_lossy()).is_err());
+        for value in [
+            ".studios/x.json",
+            "studio/x.json",
+            "data/.studio/x.json",
+            "_studio",
+        ] {
+            assert!(inside(&cwd, value).is_ok(), "{value}");
+        }
+    }
+
     /// `omnigraph_run` runs outside the agent's sandbox: it speaks only to the conversation's
     /// gateway and touches files only in the conversation's working directory.
     #[cfg(unix)]
@@ -2568,6 +2614,10 @@ fi"#;
         std::fs::remove_dir_all(&outside).ok();
     }
 
+    /// An OmniGraph variable in Studio's environment, as a person's shell exports a token, set
+    /// in the process [`a_run_starts_the_chosen_cli_with_its_private_home`] runs itself in.
+    const STUDIOS_OWN: (&str, &str) = ("OMNIGRAPH_TOKEN_STUDIO_TEST", "studios-own-token");
+
     /// The agent can rewrite its wrapper and its home's config, but `omnigraph_run` runs outside
     /// its sandbox: it starts the chosen CLI itself, with the private home, in a private folder,
     /// and without Studio's own OmniGraph variables. Ending the conversation leaves a later one's
@@ -2575,6 +2625,30 @@ fi"#;
     #[cfg(unix)]
     #[test]
     fn a_run_starts_the_chosen_cli_with_its_private_home() {
+        // Studio's environment must hold an OmniGraph variable for the run to have one to
+        // remove. Setting it here would change the environment every other test of this process
+        // reads and spawns from, so the test runs again in a process of its own, started with
+        // the variable, and passes when that run does.
+        let (name, value) = STUDIOS_OWN;
+        if std::env::var(name).as_deref() != Ok(value) {
+            let test = "cli_home::tests::a_run_starts_the_chosen_cli_with_its_private_home";
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([test, "--exact", "--nocapture", "--test-threads=1"])
+                .env(name, value)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            let report = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                output.status.success() && report.contains("1 passed"),
+                "{report}"
+            );
+            return;
+        }
         let cwd = std::env::temp_dir().join(format!("studio-run-private-{}", std::process::id()));
         std::fs::remove_dir_all(&cwd).ok();
         std::fs::create_dir_all(&cwd).unwrap();
@@ -2630,6 +2704,7 @@ fi"#;
         for line in text.lines().filter(|line| line.starts_with("OMNIGRAPH_")) {
             assert!(line.starts_with("OMNIGRAPH_HOME="), "{line}");
         }
+        assert!(!text.contains(name) && !text.contains(value), "{text}");
         // The private home's config names the private home's own token and certificate.
         let private_config = std::fs::read_to_string(home.private.join("config.yaml")).unwrap();
         assert!(

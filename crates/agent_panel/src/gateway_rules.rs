@@ -475,8 +475,11 @@ mod tests {
 
     const AGENT: &str = "agent/20261013-101500";
 
+    /// A read goes through on any graph, branch or snapshot. The health probe never reaches the
+    /// rules: the gateway answers it itself (`gateway`'s
+    /// `the_gateway_checks_the_session_then_forwards_reads_and_approved_writes`).
     #[test]
-    fn reads_go_anywhere_and_health_is_answered_here() {
+    fn reads_go_anywhere() {
         for (method, path) in [
             ("GET", "/graphs"),
             ("GET", "/graphs/other/schema"),

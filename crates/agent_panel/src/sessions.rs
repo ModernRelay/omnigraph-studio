@@ -370,6 +370,15 @@ pub fn graph_cwd(graph: &str) -> PathBuf {
     let hash = graph.bytes().fold(0x811c_9dc5_u32, |hash, byte| {
         (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
     });
+    agent_dir()
+        .join("graphs")
+        .join(format!("{slug}-{hash:08x}"))
+}
+
+/// The folder of what agents keep on this machine, their working directories and their
+/// conversations' private CLI homes: `agent` in Studio's data folder, or on Windows in its
+/// local counterpart ([`local_counterpart`]).
+fn agent_dir() -> PathBuf {
     let data = studio_settings::data_dir();
     let local = if cfg!(windows) {
         let folder = |name: &str| std::env::var_os(name).map(PathBuf::from);
@@ -381,30 +390,28 @@ pub fn graph_cwd(graph: &str) -> PathBuf {
     } else {
         None
     };
-    local
-        .unwrap_or(data)
-        .join("agent")
-        .join("graphs")
-        .join(format!("{slug}-{hash:08x}"))
+    local.unwrap_or(data).join("agent")
 }
 
-/// Where agents work on Windows. Studio's data folder there is the roaming one (`%APPDATA%`),
-/// which folder redirection can make a network path (`\\server\share\…`), and cmd cannot work
-/// in a network folder: it starts in the Windows folder instead, so every batch file the agent
-/// runs from its working directory, its `omnigraph.cmd` and npm's shims alike, would read
-/// relative paths from there. The local application folder (`%LOCALAPPDATA%`) is never
-/// redirected, and an agent keeps its own sessions on this machine anyway. So `data`'s
-/// counterpart in `local`, when `data` is a folder of `roaming`; a data folder set elsewhere
-/// (`OMNIGRAPH_STUDIO_DATA`) keeps its agents.
+/// Where agents work, and their conversations' CLI homes are kept, on Windows. Studio's data
+/// folder there is the roaming one (`%APPDATA%`), which folder redirection can make a network
+/// path (`\\server\share\…`) and a roaming profile copies to a server. cmd cannot work in a
+/// network folder: it starts in the Windows folder instead, so every batch file the agent runs
+/// from its working directory, its `omnigraph.cmd` and npm's shims alike, would read relative
+/// paths from there. And each CLI home holds a gateway's session token and certificate, which
+/// would travel to the share and stay there. The local application folder (`%LOCALAPPDATA%`)
+/// is never redirected or roamed, and an agent keeps its own sessions on this machine anyway.
+/// So `data`'s counterpart in `local`, when `data` is a folder of `roaming`; a data folder set
+/// elsewhere (`OMNIGRAPH_STUDIO_DATA`) keeps its agents.
 fn local_counterpart(data: &Path, roaming: Option<&Path>, local: Option<&Path>) -> Option<PathBuf> {
     let (roaming, local, name) = (roaming?, local?, data.file_name()?);
     (data.parent() == Some(roaming)).then(|| local.join(name))
 }
 
 /// Where each conversation's private CLI home is made: outside every working directory, so
-/// an agent cannot change what `omnigraph_run` runs.
+/// an agent cannot change what `omnigraph_run` runs, and beside them on this machine.
 pub fn private_homes() -> PathBuf {
-    studio_settings::data_dir().join("agent").join("homes")
+    agent_dir().join("homes")
 }
 
 /// The first line of a message, cut to a title's length on a character.
@@ -620,11 +627,17 @@ mod tests {
         assert!(a.to_string_lossy().contains("server-crm-"));
     }
 
-    /// On Windows agents work in the local application folder, never the roaming one, which
+    /// On Windows agents work, and their conversations' CLI homes with a session token and a
+    /// certificate are kept, in the local application folder, never the roaming one, which
     /// folder redirection can put on a network share where cmd cannot work. A data folder set
     /// elsewhere keeps its agents.
     #[test]
     fn agents_work_in_the_local_folder_of_studios_roaming_data() {
+        // The homes and the working directories are found in one folder.
+        assert_eq!(
+            private_homes().parent(),
+            graph_cwd("g").parent().and_then(Path::parent)
+        );
         let profile = std::env::temp_dir().join("profile");
         let (roaming, local) = (
             profile.join("AppData").join("Roaming"),
