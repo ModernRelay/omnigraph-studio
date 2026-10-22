@@ -1,6 +1,8 @@
-//! Blob cells (spec 004): what a cell says ("Blob · 2.1 KB · Preview"), and the preview the peek
-//! draws from a value's first bytes. A Blob is never projected by a query; each cell is read on
-//! its own through the server's Blob route, at the commit the row was read at.
+//! Blob cells (spec 004): what a cell says ("Blob · 2.1 KB · Preview"), what a value is
+//! ([`value_kind`], the one judgement the peek, the Blob tab and a saved file's name share), and
+//! the preview the peek draws from a value's first bytes. A Blob is never projected by a query;
+//! each cell is read on its own through the server's Blob route, at the commit the row was read
+//! at.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,13 +17,19 @@ use graph_store::GraphSession;
 /// How much of a value the peek reads to decide how to show it: the text it shows, and the
 /// rest of a character that text may cut.
 pub const PREVIEW_PREFIX: u64 = TEXT_SHOWN as u64 + 3;
-/// The largest image the peek reads whole to draw it.
+/// How many of a value's first bytes say what it is ([`value_kind`]): the peek's prefix, so a
+/// value is judged by the same bytes wherever it is shown or named.
+pub const KIND_PREFIX: usize = PREVIEW_PREFIX as usize;
+/// The largest value the peek reads whole to draw it: an image, an SVG or a PDF.
 pub const IMAGE_MAX: u64 = 8 * 1024 * 1024;
 /// How much text the peek shows.
 const TEXT_SHOWN: usize = 4 * 1024;
 /// How many bytes a hex preview shows, eight a line so a line fits the inspector.
 const HEX_SHOWN: usize = 128;
 const HEX_LINE: usize = 8;
+/// How wide the peek draws a PDF's first page, in pixels: twice the inspector's width, for a
+/// sharp page; about 2.4 MB of pixels for a letter page.
+const PDF_PREVIEW_WIDTH: u32 = (studio_ui::ds::size::INSPECTOR_WIDTH * 2.) as u32;
 
 /// A decoded image Studio holds, so it can free it. GPUI keeps an `Image` it decoded in its
 /// asset cache until asked, and its textures in every window that drew it: a peek moving
@@ -133,8 +141,74 @@ pub fn text_prefix(bytes: &[u8]) -> Option<&str> {
     (!text.contains('\0')).then_some(text)
 }
 
+/// What a value is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueKind {
+    /// A raster image GPUI decodes: PNG, JPEG, GIF or WebP.
+    Image(ImageFormat),
+    /// Text that is an SVG document: drawn where it parses as one, shown as text where not.
+    Svg,
+    Pdf,
+    Text,
+    Binary,
+}
+
+/// What a value is, judged by its first [`KIND_PREFIX`] bytes alone (more may be given): the
+/// image format its first bytes announce, a PDF's header in its first kilobyte, else text
+/// ([`text_prefix`]) whose first element is `<svg`, other text, or bytes. The peek, the Blob tab
+/// and a saved file's name all ask this, so a value is one kind wherever it shows.
+pub fn value_kind(bytes: &[u8]) -> ValueKind {
+    let prefix = &bytes[..bytes.len().min(KIND_PREFIX)];
+    if let Some(format) = sniff_image(prefix) {
+        return ValueKind::Image(format);
+    }
+    if crate::pdf::is_pdf(prefix) {
+        return ValueKind::Pdf;
+    }
+    match text_prefix(prefix) {
+        Some(text) if svg_root(text) => ValueKind::Svg,
+        Some(_) => ValueKind::Text,
+        None => ValueKind::Binary,
+    }
+}
+
+/// Whether text is an SVG document: its first element is `<svg`, past a byte-order mark,
+/// white space, an XML declaration or other processing instruction, comments and a doctype.
+/// A page or a source file holding an icon's markup further in is text.
+fn svg_root(text: &str) -> bool {
+    let mut rest = text.trim_start_matches('\u{feff}');
+    loop {
+        rest = rest.trim_start();
+        let skipped = if let Some(after) = rest.strip_prefix("<?") {
+            after.find("?>").map(|end| &after[end + 2..])
+        } else if let Some(after) = rest.strip_prefix("<!--") {
+            after.find("-->").map(|end| &after[end + 3..])
+        } else if let Some(after) = rest.strip_prefix("<!") {
+            // A doctype ends at its `>`, past the internal subset in brackets when it has one.
+            let from = match (after.find('['), after.find('>')) {
+                (Some(open), Some(close)) if open < close => {
+                    after[open..].find(']').map(|end| open + end)
+                }
+                _ => Some(0),
+            };
+            from.and_then(|from| after[from..].find('>').map(|end| &after[from + end + 1..]))
+        } else {
+            break;
+        };
+        match skipped {
+            Some(after) => rest = after,
+            // Cut before it ends: the first element is not in the bytes judged.
+            None => return false,
+        }
+    }
+    rest.strip_prefix("<svg").is_some_and(|after| {
+        after.starts_with(|c: char| c.is_whitespace() || matches!(c, '>' | '/' | ':'))
+    })
+}
+
 /// The file name a saved value is offered under: the row and the property, and the extension
-/// its first bytes announce (`.txt` for text, `.pdf`, `.bin` otherwise).
+/// of what its first bytes say it is ([`value_kind`]: `.png`, `.svg`, `.pdf`, `.txt` for text,
+/// `.bin` otherwise).
 pub fn suggested_file_name(id: &str, property: &str, prefix: &[u8]) -> String {
     let safe = |part: &str| -> String {
         part.chars()
@@ -147,14 +221,15 @@ pub fn suggested_file_name(id: &str, property: &str, prefix: &[u8]) -> String {
             })
             .collect()
     };
-    let extension = match sniff_image(prefix) {
-        Some(ImageFormat::Png) => "png",
-        Some(ImageFormat::Jpeg) => "jpg",
-        Some(ImageFormat::Gif) => "gif",
-        Some(ImageFormat::Webp) => "webp",
-        _ if crate::pdf::is_pdf(prefix) => "pdf",
-        _ if text_prefix(prefix).is_some_and(|text| !text.is_empty()) => "txt",
-        _ => "bin",
+    let extension = match value_kind(prefix) {
+        ValueKind::Image(ImageFormat::Png) => "png",
+        ValueKind::Image(ImageFormat::Jpeg) => "jpg",
+        ValueKind::Image(ImageFormat::Gif) => "gif",
+        ValueKind::Image(ImageFormat::Webp) => "webp",
+        ValueKind::Svg => "svg",
+        ValueKind::Pdf => "pdf",
+        ValueKind::Text if !prefix.is_empty() => "txt",
+        ValueKind::Image(_) | ValueKind::Text | ValueKind::Binary => "bin",
     };
     format!("{}-{}.{extension}", safe(id), safe(property))
 }
@@ -318,28 +393,47 @@ pub async fn save_value(
 }
 
 /// How many bytes to read for a preview of a value of `size` bytes whose first bytes are
-/// `prefix`: the whole value for an image that fits, else nothing more.
+/// `prefix`: the whole value for one the peek draws (an image, an SVG, a PDF's first page)
+/// that fits [`IMAGE_MAX`], else nothing more.
 pub fn bytes_wanted(prefix: &[u8], size: u64) -> u64 {
-    if sniff_image(prefix).is_some() && size <= IMAGE_MAX {
+    let drawn = matches!(
+        value_kind(prefix),
+        ValueKind::Image(_) | ValueKind::Svg | ValueKind::Pdf
+    );
+    if drawn && size <= IMAGE_MAX {
         size
     } else {
         prefix.len() as u64
     }
 }
 
-/// The preview of a value of `size` bytes, from its first `bytes` (all of them for an image).
-/// An image is decoded here, so call it from a background task.
+/// The preview of a value of `size` bytes, from its first `bytes` (all of them for one drawn),
+/// shown for what [`value_kind`] says it is: an image, an SVG or a PDF's first page drawn when
+/// the whole value is here and draws, the start of text, else the first bytes as hex. Images
+/// are decoded and pages drawn here, so call it from a background task.
 pub fn preview(bytes: Vec<u8>, size: u64, svg: &SvgRenderer) -> Preview {
     if size == 0 {
         return Preview::Empty;
     }
-    if let Some(format) = sniff_image(&bytes)
-        && bytes.len() as u64 == size
-        && let Some(image) = ShownImage::decode(format, bytes.clone(), svg)
-    {
+    let kind = value_kind(&bytes);
+    let whole = bytes.len() as u64 == size;
+    let drawn = match kind {
+        ValueKind::Image(format) if whole => ShownImage::decode(format, bytes.clone(), svg),
+        ValueKind::Svg if whole => ShownImage::decode(ImageFormat::Svg, bytes.clone(), svg),
+        ValueKind::Pdf if whole => crate::pdf::render(&bytes, PDF_PREVIEW_WIDTH, 1)
+            .ok()
+            .and_then(|(pages, _)| pages.into_iter().next())
+            .and_then(|page| ShownImage::from_rgba(page.width, page.height, page.rgba)),
+        _ => None,
+    };
+    if let Some(image) = drawn {
         return Preview::Image(image);
     }
-    if let Some(text) = text_prefix(&bytes) {
+    let text = match kind {
+        ValueKind::Text | ValueKind::Svg => text_prefix(&bytes[..bytes.len().min(KIND_PREFIX)]),
+        ValueKind::Image(_) | ValueKind::Pdf | ValueKind::Binary => None,
+    };
+    if let Some(text) = text {
         let mut end = text.len().min(TEXT_SHOWN);
         while !text.is_char_boundary(end) {
             end -= 1;
@@ -474,6 +568,28 @@ mod tests {
             suggested_file_name("n1", "scan", b"%PDF-1.7\n%"),
             "n1-scan.pdf"
         );
+    }
+
+    /// An SVG is text whose first element is `<svg`, past what may come before it; markup
+    /// further in, a cut-off comment, or an element that only starts with the letters is not.
+    #[test]
+    fn an_svg_is_told_by_its_first_element() {
+        let svg = |text: &str| value_kind(text.as_bytes()) == ValueKind::Svg;
+        assert!(svg("<svg xmlns=\"http://www.w3.org/2000/svg\"/>"));
+        assert!(svg("\u{feff}\n  <svg>"));
+        assert!(svg(
+            "<?xml version=\"1.0\"?><!-- a -- b --><svg\nviewBox=\"0 0 1 1\"/>"
+        ));
+        assert!(svg(
+            "<!DOCTYPE svg [ <!ENTITY a \"<x>\"> ]>\n<?pi?><svg:svg xmlns:svg=\"…\"/>"
+        ));
+        assert!(!svg("<!DOCTYPE html>\n<html><body><svg/></body></html>"));
+        assert!(!svg("<svgx/>"));
+        assert!(!svg("<!-- never closed <svg/>"));
+        assert!(!svg("query q() { <svg> }"));
+        // Judged by its first bytes alone: an SVG past them is text.
+        let late = format!("<!--{}--><svg/>", " ".repeat(KIND_PREFIX));
+        assert_eq!(value_kind(late.as_bytes()), ValueKind::Text);
     }
 
     /// Text that holds an SVG's markup is no SVG unless it parses as one.

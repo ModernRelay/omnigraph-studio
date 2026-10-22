@@ -1,8 +1,9 @@
 //! A Blob value in a tab of its own (spec 004), shown for what it is: an image to fit, zoom and
 //! pan, as Zed's image viewer does; a PDF's pages; text in a read-only editor that can be
-//! searched; anything else as a hex dump. Read whole at the commit it was opened at, up to
-//! [`VIEW_MAX`]; a larger value, or one the tab cannot show, can still be saved or opened in the
-//! system's own application.
+//! searched; anything else as a hex dump, as [`value_kind`] judges it for the peek too. Read
+//! whole at the commit it was opened at (one opened at the branch head, at the head it found
+//! then), up to [`VIEW_MAX`]; a larger value, or one the tab cannot show, can still be saved or
+//! opened in the system's own application.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,6 +15,7 @@ use gpui::{
     ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled,
     Subscription, SvgRenderer, Task, Window, canvas, checkerboard, div, img, point,
 };
+use gq_language::{BuiltQuery, builder};
 use graph_client::{BlobCell, BlobMeta};
 use graph_store::{GraphSession, Loadable, SessionEvent};
 use serde_json::json;
@@ -25,8 +27,8 @@ use ui::Tooltip;
 use ui::prelude::*;
 
 use crate::blob::{
-    ShownImage, hex_dump_lines, read_value, save_folder, save_value, sniff_image,
-    suggested_file_name, text_prefix,
+    KIND_PREFIX, ShownImage, ValueKind, hex_dump_lines, read_value, save_folder, save_value,
+    suggested_file_name, value_kind,
 };
 use crate::blob_write::{self, BlobChange, BlobEdit, BlobWritten};
 use crate::model::{Notice, Tone};
@@ -41,8 +43,9 @@ const PDF_PAGES: usize = 20;
 const PDF_DRAW_WIDTH: u32 = 1600;
 /// How much of a binary value the hex dump shows.
 const HEX_MAX: usize = 64 * 1024;
-/// The first bytes of a value kept to say what it is, which Save and Open name the file by.
-const HEAD_BYTES: u64 = 1024;
+/// The first bytes of a value kept to say what it is, which Save and Open name the file by:
+/// those [`value_kind`] judges, as the peek names it.
+const HEAD_BYTES: u64 = KIND_PREFIX as u64;
 /// How much of a text value the tab shows: an editor of a whole 64 MiB value would take seconds
 /// to make on the main thread.
 const TEXT_SHOWN: usize = 4 * 1024 * 1024;
@@ -89,13 +92,18 @@ enum Export {
 pub struct BlobView {
     session: Entity<GraphSession>,
     cell: BlobCell,
-    /// The commit the tab was opened at; `None` reads the branch head.
+    /// The commit the tab was opened at; `None` when it was opened at the branch head, whose
+    /// commit it reads first ([`Self::opened_at`]).
     snapshot: Option<String>,
     /// The tab holds `snapshot`, read-only (opened from a view held at a commit). Otherwise it
     /// reads the value there and writes on its branch, bound to the value it read.
     held: bool,
     /// The branch the tab read the value on, which a file chosen or dropped is stored on.
     branch: String,
+    /// For a tab opened at the branch head, the commit the head was when it first read: the
+    /// value is read there, every range of it and a save, so nothing that lands on the branch
+    /// meanwhile, and no other branch the window moves to, comes into what it shows or saves.
+    opened_at: Option<String>,
     /// The commit of the tab's own last write, which it reads the value at since: the head it
     /// made, whichever branch the window shows now.
     own_commit: Option<String>,
@@ -120,9 +128,9 @@ pub struct BlobView {
     /// nothing until they are shown.
     _load: Option<Task<()>>,
     _export: Option<Task<()>>,
-    /// Draws the tab again when what the credential may do is read: Choose File and Clear
-    /// follow it.
-    _access: Subscription,
+    /// Draws the tab again when what the credential may do is read, which Choose File and Clear
+    /// follow, and when the schema is, which a tab opened at the head reads the head with.
+    _session: Subscription,
 }
 
 impl BlobView {
@@ -137,8 +145,8 @@ impl BlobView {
         cx.on_release(|this: &mut Self, cx| this.release_images(cx))
             .detach();
         let branch = session.read(cx).branch.clone();
-        let access = cx.subscribe(&session, |_, _, event: &SessionEvent, cx| {
-            if let SessionEvent::AccessChanged = event {
+        let events = cx.subscribe(&session, |_, _, event: &SessionEvent, cx| {
+            if let SessionEvent::AccessChanged | SessionEvent::SchemaChanged = event {
                 cx.notify();
             }
         });
@@ -148,6 +156,7 @@ impl BlobView {
             held: held && snapshot.is_some(),
             snapshot,
             branch,
+            opened_at: None,
             own_commit: None,
             meta: None,
             edit: None,
@@ -163,7 +172,7 @@ impl BlobView {
             focus_handle: cx.focus_handle(),
             _load: None,
             _export: None,
-            _access: access,
+            _session: events,
         }
     }
 
@@ -189,18 +198,25 @@ impl BlobView {
         self.snapshot.as_deref().filter(|_| self.held)
     }
 
-    /// Reads what the cell holds, then the value, then what it is.
+    /// Reads what the cell holds, then the value, then what it is, all at `at`; with no `at`,
+    /// at the commit `head` (the head probe, read on `branch`) finds the branch's head is now,
+    /// which the tab holds to since ([`Self::opened_at`]).
     fn load(
         session: &Entity<GraphSession>,
         cell: &BlobCell,
-        snapshot: &Option<String>,
+        branch: &str,
+        at: Option<String>,
+        head: Option<BuiltQuery>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<()> {
-        let meta = session.update(cx, |session, cx| {
-            session.blob_meta(cell.clone(), snapshot.clone(), cx)
-        });
-        let (session, cell, snapshot) = (session.downgrade(), cell.clone(), snapshot.clone());
+        let head = match (&at, head) {
+            (None, Some(probe)) => {
+                Some(session.update(cx, |session, cx| session.read_on(branch, &probe, cx)))
+            }
+            _ => None,
+        };
+        let (session, cell) = (session.downgrade(), cell.clone());
         cx.spawn_in(window, async move |this, cx| {
             let fail = |error: String, cx: &mut gpui::AsyncWindowContext| {
                 this.update(cx, |this, cx| {
@@ -209,7 +225,42 @@ impl BlobView {
                 })
                 .ok();
             };
-            let meta = match meta.await {
+            let at = match (at, head) {
+                (Some(at), _) => at,
+                (None, Some(head)) => match head.await {
+                    Ok(read) => match read.graph_commit_id.clone() {
+                        Some(commit) => {
+                            this.update(cx, |this, _| this.opened_at = Some(commit.clone()))
+                                .ok();
+                            commit
+                        }
+                        None => {
+                            return fail(
+                                "The server did not say which commit the branch is at, so the \
+                                 value was not read."
+                                    .into(),
+                                cx,
+                            );
+                        }
+                    },
+                    Err(error) => return fail(error.to_string(), cx),
+                },
+                (None, None) => {
+                    return fail(
+                        "The schema has no node type to read the branch's head with.".into(),
+                        cx,
+                    );
+                }
+            };
+            let snapshot = Some(at);
+            let meta = session.update(cx, |session, cx| {
+                session.blob_meta(cell.clone(), snapshot.clone(), cx)
+            });
+            let meta = match meta {
+                Ok(meta) => meta.await,
+                Err(_) => return,
+            };
+            let meta = match meta {
                 Ok(meta) => meta,
                 Err(error) => return fail(error.to_string(), cx),
             };
@@ -465,10 +516,13 @@ impl BlobView {
 
     // ---- a file stored in the value, or the value cleared ----
 
-    /// The commit the value is read at: the tab's own write's, else the one it was opened at;
-    /// `None` reads the branch head.
+    /// The commit the value is read at: the tab's own write's, else the one it was opened at,
+    /// or the head it found when opened at the head; `None` only before that head is read.
     fn reading_at(&self) -> Option<String> {
-        self.own_commit.clone().or_else(|| self.snapshot.clone())
+        self.own_commit
+            .clone()
+            .or_else(|| self.snapshot.clone())
+            .or_else(|| self.opened_at.clone())
     }
 
     /// Why the value cannot take a file here, or `None` when it can.
@@ -919,7 +973,7 @@ enum Kind {
         pages: Vec<(ShownImage, u32, u32)>,
         count: usize,
     },
-    /// The text, cut at [`TEXT_SHOWN`] on a character's boundary, and whether it was.
+    /// The text the value starts with ([`text_shown`]), and whether some of the value is not.
     Text(String, bool),
     Bytes(String),
     Unreadable(String),
@@ -935,28 +989,28 @@ fn read_only(text: String, window: &mut Window, cx: &mut App) -> Entity<Editor> 
     })
 }
 
-/// What a value is, with its images decoded; call it from a background task.
+/// What a value is ([`value_kind`], as the peek and a saved file's name judge it), with its
+/// images decoded and its pages drawn; call it from a background task.
 fn classify(bytes: &[u8], svg: &SvgRenderer) -> Kind {
-    let unreadable = || Kind::Unreadable("The image could not be decoded.".into());
-    if let Some(format) = sniff_image(bytes) {
-        let size = image::ImageReader::new(std::io::Cursor::new(bytes))
-            .with_guessed_format()
-            .ok()
-            .and_then(|reader| reader.into_dimensions().ok());
-        let name = match format {
-            ImageFormat::Png => "PNG",
-            ImageFormat::Jpeg => "JPEG",
-            ImageFormat::Gif => "GIF",
-            ImageFormat::Webp => "WebP",
-            _ => "Image",
-        };
-        return match ShownImage::decode(format, bytes.to_vec(), svg) {
-            Some(image) => Kind::Image { image, size, name },
-            None => unreadable(),
-        };
-    }
-    if pdf::is_pdf(&bytes[..bytes.len().min(1024)]) {
-        return match pdf::render(bytes, PDF_DRAW_WIDTH, PDF_PAGES) {
+    match value_kind(bytes) {
+        ValueKind::Image(format) => {
+            let size = image::ImageReader::new(std::io::Cursor::new(bytes))
+                .with_guessed_format()
+                .ok()
+                .and_then(|reader| reader.into_dimensions().ok());
+            let name = match format {
+                ImageFormat::Png => "PNG",
+                ImageFormat::Jpeg => "JPEG",
+                ImageFormat::Gif => "GIF",
+                ImageFormat::Webp => "WebP",
+                _ => "Image",
+            };
+            match ShownImage::decode(format, bytes.to_vec(), svg) {
+                Some(image) => Kind::Image { image, size, name },
+                None => Kind::Unreadable("The image could not be decoded.".into()),
+            }
+        }
+        ValueKind::Pdf => match pdf::render(bytes, PDF_DRAW_WIDTH, PDF_PAGES) {
             Ok((pages, count)) => Kind::Pdf {
                 pages: pages
                     .into_iter()
@@ -968,30 +1022,32 @@ fn classify(bytes: &[u8], svg: &SvgRenderer) -> Kind {
                 count,
             },
             Err(reason) => Kind::Unreadable(reason),
-        };
-    }
-    // Judged by what is shown, and the rest of a character it may cut.
-    if let Some(text) = text_prefix(&bytes[..bytes.len().min(TEXT_SHOWN + 3)]) {
-        // An SVG only if it parses as one: a page or a source file may hold an icon's markup.
-        // Looked for in the bytes: a character may straddle the 4,096th.
-        if bytes[..bytes.len().min(4096)]
-            .windows(4)
-            .any(|window| window == b"<svg")
-            && let Some(image) = ShownImage::decode(ImageFormat::Svg, bytes.to_vec(), svg)
-        {
-            return Kind::Image {
+        },
+        // An SVG that does not parse is shown as the text it is.
+        ValueKind::Svg => match ShownImage::decode(ImageFormat::Svg, bytes.to_vec(), svg) {
+            Some(image) => Kind::Image {
                 image,
                 size: None,
                 name: "SVG",
-            };
-        }
-        let mut end = text.len().min(TEXT_SHOWN);
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        return Kind::Text(text[..end].to_owned(), end < bytes.len());
+            },
+            None => text_shown(bytes),
+        },
+        ValueKind::Text => text_shown(bytes),
+        ValueKind::Binary => Kind::Bytes(hex_dump_lines(&bytes[..bytes.len().min(HEX_MAX)], 16)),
     }
-    Kind::Bytes(hex_dump_lines(&bytes[..bytes.len().min(HEX_MAX)], 16))
+}
+
+/// The text a value starts with: at most [`TEXT_SHOWN`] bytes of it, cut on a character's
+/// boundary and before the first byte that is no text (a NUL, or one no character is made of),
+/// and whether that leaves some of the value out.
+fn text_shown(bytes: &[u8]) -> Kind {
+    let window = &bytes[..bytes.len().min(TEXT_SHOWN)];
+    let valid = match std::str::from_utf8(window) {
+        Ok(text) => text,
+        Err(error) => std::str::from_utf8(&window[..error.valid_up_to()]).unwrap_or_default(),
+    };
+    let text = valid.split('\0').next().unwrap_or_default();
+    Kind::Text(text.to_owned(), text.len() < bytes.len())
 }
 
 impl EventEmitter<ItemEvent> for BlobView {}
@@ -1033,7 +1089,9 @@ impl Item for BlobView {
                 "id": self.cell.id,
                 "property": self.cell.property,
                 "edge": self.cell.edge,
-                "at_commit": self.snapshot,
+                // Where it reads now, past its own writes, so it comes back showing that value
+                // and binds a write to it, not to the one its write replaced.
+                "at_commit": self.reading_at(),
                 "held": self.held,
             }),
         })
@@ -1174,12 +1232,45 @@ impl Item for BlobView {
 impl Render for BlobView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self._load.is_none() {
-            let at = self.reading_at();
-            // Read at the head, the value is the session's branch's, which a write goes to.
-            if at.is_none() {
-                self.branch = self.session.read(cx).branch.clone();
+            match self.reading_at() {
+                Some(at) => {
+                    let load = Self::load(
+                        &self.session,
+                        &self.cell,
+                        &self.branch,
+                        Some(at),
+                        None,
+                        window,
+                        cx,
+                    );
+                    self._load = Some(load);
+                }
+                // Opened at the head, the value is the session's branch's, which a write goes
+                // to: the head is read first with the schema's probe, so this waits for the
+                // schema, and is drawn again when it comes.
+                None => {
+                    let session = self.session.read(cx);
+                    self.branch = session.branch.clone();
+                    match &session.schema {
+                        Loadable::Loaded(schema) => {
+                            let probe = builder::head_probe(schema);
+                            self.content = Loadable::Loading;
+                            let load = Self::load(
+                                &self.session,
+                                &self.cell,
+                                &self.branch,
+                                None,
+                                probe,
+                                window,
+                                cx,
+                            );
+                            self._load = Some(load);
+                        }
+                        Loadable::Failed(error) => self.content = Loadable::Failed(error.clone()),
+                        Loadable::NotLoaded | Loadable::Loading => {}
+                    }
+                }
             }
-            self._load = Some(Self::load(&self.session, &self.cell, &at, window, cx));
         }
         let body = match &self.content {
             Loadable::Loading | Loadable::NotLoaded => {
@@ -1379,14 +1470,18 @@ mod tests {
             id: "n1".into(),
             property: "scan".into(),
         };
-        let (view, cx) =
-            cx.add_window_view(|window, cx| BlobView::new(session, cell, None, false, window, cx));
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            BlobView::new(session, cell, Some("c1".into()), false, window, cx)
+        });
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert!(matches!(view.content, Loadable::Loaded(Content::TooLarge)));
             assert!(view.file_name().ends_with(".png"), "{}", view.file_name());
         });
-        assert_eq!(*ranges.lock().unwrap(), ["bytes=0-1023"]);
+        assert_eq!(
+            *ranges.lock().unwrap(),
+            [format!("bytes=0-{}", HEAD_BYTES - 1)]
+        );
     }
 
     const DOCS: &str = "node Person {\n  slug: String @key\n  name: String\n  doc: Blob?\n}\n";
@@ -1555,6 +1650,359 @@ mod tests {
                 Some(BlobEdit::Failed { notice, .. }) if notice.message == refused
             ));
         });
+    }
+
+    /// The value of main at `c1` spans two of the client's ranges; once the first range is
+    /// served, another writer's commit `c2` puts other bytes of the same size there. `fix` holds
+    /// ten bytes. A read names its commit, or the branch's head.
+    const TWO_RANGES: usize = 16 * 1024 * 1024 + 10;
+
+    /// A server whose main moves while a value is read ([`TWO_RANGES`]); every Blob request's
+    /// query is kept.
+    #[derive(Default)]
+    struct MovingHead {
+        moved: std::sync::atomic::AtomicBool,
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl MovingHead {
+        fn main(&self) -> &'static str {
+            if self.moved.load(std::sync::atomic::Ordering::SeqCst) {
+                "c2"
+            } else {
+                "c1"
+            }
+        }
+
+        /// The commit a read names: its snapshot, else its branch's head.
+        fn at(&self, snapshot: Option<&str>, branch: Option<&str>) -> String {
+            match (snapshot, branch) {
+                (Some(commit), _) => commit.to_owned(),
+                (None, Some("fix")) => "f1".to_owned(),
+                _ => self.main().to_owned(),
+            }
+        }
+    }
+
+    fn moving_head_session(
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<GraphSession>, Arc<MovingHead>) {
+        use futures::AsyncReadExt as _;
+        use http_client::{AsyncBody, FakeHttpClient, Response, http::Method};
+
+        let server = Arc::new(MovingHead::default());
+        let state = server.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let state = state.clone();
+            async move {
+                let ok = || {
+                    Response::builder()
+                        .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                };
+                let path = request.uri().path().to_owned();
+                let query = request.uri().query().unwrap_or_default().to_owned();
+                if path.ends_with("/blob") {
+                    state.asked.lock().unwrap().push(query.clone());
+                    let param = |name: &str| {
+                        query
+                            .split('&')
+                            .filter_map(|pair| pair.split_once('='))
+                            .find(|(key, _)| *key == name)
+                            .map(|(_, value)| value.to_owned())
+                    };
+                    let at = state.at(param("snapshot").as_deref(), param("branch").as_deref());
+                    let (byte, len) = match at.as_str() {
+                        "c1" => (0xfe, TWO_RANGES),
+                        "c2" => (0xff, TWO_RANGES),
+                        _ => (0xfd, 10),
+                    };
+                    let etag = format!("\"{at}\"");
+                    if request.method() == Method::HEAD {
+                        return Ok(ok()
+                            .status(200)
+                            .header("etag", etag)
+                            .header("content-length", len.to_string())
+                            .body(AsyncBody::empty())
+                            .unwrap());
+                    }
+                    let (from, to) = request
+                        .headers()
+                        .get("range")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|range| range.strip_prefix("bytes="))
+                        .and_then(|range| range.split_once('-'))
+                        .and_then(|(from, to)| Some((from.parse().ok()?, to.parse().ok()?)))
+                        .unwrap_or((0usize, len - 1));
+                    if from >= len {
+                        return Ok(ok()
+                            .status(416)
+                            .header("content-range", format!("bytes */{len}"))
+                            .body(AsyncBody::empty())
+                            .unwrap());
+                    }
+                    let to = to.min(len - 1);
+                    // The first range served, the other writer's commit lands on main.
+                    state.moved.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Ok(ok()
+                        .status(206)
+                        .header("etag", etag)
+                        .header("content-range", format!("bytes {from}-{to}/{len}"))
+                        .body(AsyncBody::from(vec![byte; to + 1 - from]))
+                        .unwrap());
+                }
+                let mut bytes = Vec::new();
+                request.into_body().read_to_end(&mut bytes).await.ok();
+                let body = if path.ends_with("/schema") {
+                    json!({ "schema_source": DOCS })
+                } else if path.ends_with("/query") {
+                    let asked: serde_json::Value =
+                        serde_json::from_slice(&bytes).unwrap_or_default();
+                    let at = state.at(asked["snapshot"].as_str(), asked["branch"].as_str());
+                    json!({
+                        "query_name": "q",
+                        "target": {"branch": "main", "snapshot": null},
+                        "row_count": 0,
+                        "columns": ["n"],
+                        "rows": [],
+                        "graph_commit_id": at,
+                    })
+                } else {
+                    json!({ "branches": ["main", "fix"] })
+                };
+                Ok(ok()
+                    .status(200)
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let entry = graph_store::ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: graph_store::ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection =
+            cx.new(|_| graph_store::Connection::new(entry, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        (session, server)
+    }
+
+    /// A tab opened at the branch head reads which commit the head is, and holds to it: every
+    /// range of the value, and a save, read that commit. Another writer's commit landing between
+    /// two ranges splices nothing in, and a save after the window moved to another branch
+    /// writes the value shown, whole. Before, each range and the save read the session's head,
+    /// whichever branch and commit that was by then.
+    #[gpui::test]
+    async fn a_tab_opened_at_the_head_reads_and_saves_at_the_head_it_found(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, server) = moving_head_session(cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            BlobView::new(session.clone(), doc(), None, false, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(server.main(), "c2", "main moved between the two ranges");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.opened_at.as_deref(), Some("c1"));
+            assert_eq!(view.size, Some(TWO_RANGES as u64));
+            assert!(matches!(view.content, Loadable::Loaded(Content::Bytes(_))));
+            assert!(view.facts().ends_with("at c1"), "{}", view.facts());
+        });
+
+        session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        cx.run_until_parked();
+        let dir = std::env::temp_dir().join(format!("studio-blob-head-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p1-doc.bin");
+        std::fs::remove_file(&path).ok();
+        view.update(cx, |view, cx| view.write_to(path.clone(), false, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.export, Some(Export::Saved(_))), "saved");
+            assert_eq!(view.branch, "main", "it writes where it read");
+        });
+        let saved = std::fs::read(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(saved.len(), TWO_RANGES);
+        assert!(saved.iter().all(|byte| *byte == 0xfe), "one value, not two");
+        // What the cell holds, the two ranges shown, and the two saved: all at c1.
+        let asked = server.asked.lock().unwrap().clone();
+        assert_eq!(asked.len(), 5, "{asked:?}");
+        assert!(
+            asked
+                .iter()
+                .all(|query| query.contains("snapshot=c1") && !query.contains("branch=")),
+            "{asked:?}"
+        );
+    }
+
+    /// A tab saved after its own write comes back reading where that write left it, so it
+    /// shows the value it stored and binds its next write to that. Saved at the commit it was
+    /// opened at, it came back showing the value its write replaced, and its next write was
+    /// refused as changed elsewhere. A tab saved without saying whether it holds its commit
+    /// does not come back.
+    #[gpui::test]
+    async fn a_restored_tab_reads_and_binds_where_its_own_write_left_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, blobs) = crate::test_support::session_with_blobs(DOCS, cx);
+        blobs
+            .versioned
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        blobs.set("Person/p1/doc", b"old");
+        cx.run_until_parked();
+        // Another view's write publishes c2, and a view at the head that read it opens the tab.
+        let seed = session.update(cx, |session, cx| {
+            session.blob_put_on("main", doc(), None, b"mid".to_vec(), "seed".into(), cx)
+        });
+        cx.run_until_parked();
+        seed.await;
+        let (view, view_cx) = cx.add_window_view(|window, cx| {
+            BlobView::new(session.clone(), doc(), Some("c2".into()), false, window, cx)
+        });
+        view_cx.run_until_parked();
+        let file = crate::test_support::upload_file("restored-first.txt", b"new", None);
+        view.update(view_cx, |view, cx| view.upload(file, cx));
+        view_cx.run_until_parked();
+        let saved = view.read_with(view_cx, |view, cx| {
+            assert_eq!(view.own_commit.as_deref(), Some("c3"));
+            view.serialize(cx).unwrap()
+        });
+        assert_eq!(saved.data["at_commit"], "c3");
+        assert_eq!(saved.data["held"], false);
+
+        let action = crate::saved_blob(&saved.data).expect("the tab comes back");
+        let cell = BlobCell {
+            edge: action.edge,
+            type_name: action.type_name.clone(),
+            id: action.id.clone(),
+            property: action.property.clone(),
+        };
+        let (restored, cx) = cx.add_window_view(|window, cx| {
+            BlobView::new(
+                session,
+                cell,
+                action.at_commit.clone(),
+                action.held,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let stored = blobs.get("Person/p1/doc").unwrap();
+        restored.read_with(cx, |view, _| {
+            assert_eq!(
+                view.meta,
+                Some(BlobMeta::Managed {
+                    size: 3,
+                    etag: Some(stored.1.clone())
+                })
+            );
+        });
+        let file = crate::test_support::upload_file("restored-second.txt", b"newer", None);
+        restored.update(cx, |view, cx| view.upload(file, cx));
+        cx.run_until_parked();
+        let writes = blobs.writes.lock().unwrap().clone();
+        assert_eq!(
+            writes.last().unwrap().if_match.as_deref(),
+            Some(stored.1.as_str())
+        );
+        restored.read_with(cx, |view, _| {
+            assert_eq!(view.edit, None, "stored, not refused as changed elsewhere");
+            assert_eq!(view.own_commit.as_deref(), Some("c4"));
+        });
+
+        let mut old = saved.data.clone();
+        old.as_object_mut().unwrap().remove("held");
+        assert!(
+            crate::saved_blob(&old).is_none(),
+            "the old shape stays closed"
+        );
+    }
+
+    /// One judgement of what a value is, which the peek, the tab and a saved file's name share:
+    /// a PNG, an SVG (past its declaration, a comment and a doctype), a PDF, text and other
+    /// bytes each show and save as the same kind in all three. Before, an SVG was an image in
+    /// the tab but text in the peek, saved as `.txt`, and a PDF was text or a hex dump in the
+    /// peek. A page holding an icon's markup is text.
+    #[test]
+    fn the_peek_the_tab_and_a_saved_name_tell_a_value_alike() {
+        use crate::blob::{Preview, bytes_wanted, preview};
+
+        let renderer = svg();
+        let png = {
+            let mut png = Vec::new();
+            image::RgbaImage::new(3, 2)
+                .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                .unwrap();
+            png
+        };
+        let icon = b"<?xml version=\"1.0\"?>\n<!-- drawn by hand -->\n<!DOCTYPE svg PUBLIC \
+            \"-//W3C//DTD SVG 1.1//EN\" \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">\n\
+            <svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 1 1\"/>"
+            .to_vec();
+        let page = b"<html><body><svg viewBox=\"0 0 1 1\"></svg><p>hi</p></body></html>".to_vec();
+        let pdf = crate::pdf::tests::one_page_pdf();
+        let text = b"plain notes".to_vec();
+        let binary = vec![0xff, 0x00, 0x13];
+        let peek = |bytes: &[u8]| preview(bytes.to_vec(), bytes.len() as u64, &renderer);
+        let name = |bytes: &[u8]| suggested_file_name("n1", "v", bytes);
+
+        assert_eq!(value_kind(&png), ValueKind::Image(ImageFormat::Png));
+        assert!(matches!(peek(&png), Preview::Image(ShownImage::Raster(_))));
+        assert!(matches!(
+            classify(&png, &renderer),
+            Kind::Image { name: "PNG", .. }
+        ));
+        assert_eq!(name(&png), "n1-v.png");
+
+        assert_eq!(value_kind(&icon), ValueKind::Svg);
+        assert_eq!(bytes_wanted(&icon, 5_000), 5_000, "read whole to draw");
+        assert!(matches!(peek(&icon), Preview::Image(ShownImage::Svg(_))));
+        assert!(matches!(
+            classify(&icon, &renderer),
+            Kind::Image { name: "SVG", .. }
+        ));
+        assert_eq!(name(&icon), "n1-v.svg");
+
+        assert_eq!(value_kind(&page), ValueKind::Text);
+        assert!(matches!(peek(&page), Preview::Text { .. }));
+        assert!(matches!(classify(&page, &renderer), Kind::Text(..)));
+        assert_eq!(name(&page), "n1-v.txt");
+
+        assert_eq!(value_kind(&pdf), ValueKind::Pdf);
+        assert_eq!(bytes_wanted(&pdf[..16], 5_000), 5_000, "read whole to draw");
+        assert_eq!(name(&pdf), "n1-v.pdf");
+        if cfg!(target_os = "macos") {
+            assert!(matches!(peek(&pdf), Preview::Image(ShownImage::Raster(_))));
+            assert!(matches!(
+                classify(&pdf, &renderer),
+                Kind::Pdf { count: 1, .. }
+            ));
+        } else {
+            // Where the system draws no PDF, neither does Studio: never its source as text.
+            assert!(matches!(peek(&pdf), Preview::Bytes { .. }));
+            assert!(matches!(classify(&pdf, &renderer), Kind::Unreadable(_)));
+        }
+
+        assert_eq!(value_kind(&text), ValueKind::Text);
+        assert!(matches!(peek(&text), Preview::Text { text, more: 0 } if text == "plain notes"));
+        assert!(matches!(classify(&text, &renderer), Kind::Text(..)));
+        assert_eq!(name(&text), "n1-v.txt");
+
+        assert_eq!(value_kind(&binary), ValueKind::Binary);
+        assert!(matches!(peek(&binary), Preview::Bytes { .. }));
+        assert!(matches!(classify(&binary, &renderer), Kind::Bytes(_)));
+        assert_eq!(name(&binary), "n1-v.bin");
     }
 
     #[test]

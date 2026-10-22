@@ -49,9 +49,13 @@ stay put), IX (paged, virtualized).
   right-aligned with tabular digits, dates relative with exact value on hover, enums as chips,
   lists truncated with "+N", Blob as "Blob · size · Preview", Vector hidden.
 - Peek in the right dock (in flow, not modal; focus stays in the table): all properties, the
-  relationship tree rooted at the row (spec 005), and Blob previews. A stored Blob value has
-  "Save…": the person picks a file (named `<id>-<property>` with the extension its first bytes
-  announce), the value is read in ranges at the peek's commit into `<file>.part` beside it, off
+  relationship tree rooted at the row (spec 005), and Blob previews: an image, an SVG or a
+  PDF's first page drawn when the whole value is at most 8 MiB, else the start of its text or
+  its first bytes in hex, the value's kind judged by its first 4 KiB as the Blob tab and a saved
+  file's name judge it (`blob::value_kind`; since 2026-10-21, before which an SVG showed as
+  text and saved as `.txt`, and a PDF showed as text or hex). A stored Blob value has
+  "Save…": the person picks a file (named `<id>-<property>` with the extension of its kind),
+  the value is read in ranges at the peek's commit into `<file>.part` beside it, off
   the main thread, and renamed into place only when whole; the line shows how far it got, then
   "Show in Finder". The peek reads at one commit; once the session sees its branch's head
   elsewhere (spec 003, Studio's commit or another writer's), a node's peek shows "Newer data ·
@@ -73,7 +77,10 @@ stay put), IX (paged, virtualized).
   shows changed and offering Refresh when something did; the peek of a deleted row closes. A peek opened from the table shows its Blob values as the
   cells show them, where they hold (`TableBlobs`: past the pin after the table's own Blob write
   over another writer's commit), binds its Blob writes there, and a tab it opens for a value
-  reads there; where they hold at no known commit, the tab reads the branch head. A peek opened from the table reads no
+  reads there; where they hold at no known commit, the tab reads which commit the branch head
+  is when it opens and holds to it, every range and a Save read there (since 2026-10-21;
+  before, each range and a Save read the session's head as it was by then, another branch's
+  once the window moved). A peek opened from the table reads no
   relationship the table already read at the same commit: the table's relationship columns
   read every row's count and, for rows of up to 200 neighbours, the whole list (keeping the
   first eight, the cell showing two), so the peek takes the count and its first neighbours from
@@ -85,16 +92,20 @@ stay put), IX (paged, virtualized).
   2026-10-21; before, every tab opened from a peek was read-only). The value is shown for what
   its bytes are, as Zed shows an image: an image fitted to the tab (never past its
   own size) on a checkerboard with a hairline, ⌘-scroll or `=`/`-` zooming about the pointer,
-  `1` its actual size, `0` fit again, a drag to pan; an SVG fitted; a PDF's pages drawn by the
+  `1` its actual size, `0` fit again, a drag to pan; an SVG (text whose first element is
+  `<svg`, shown as text when it does not parse) fitted; a PDF's pages drawn by the
   system (CoreGraphics on macOS, twice the width shown, the first 20 pages: a page's pixels are
-  about 13 MB, held while the tab is open) and stacked to scroll; UTF-8 text, its first 4 MiB, in
-  a read-only editor (⌘F searches it); anything else as a hex dump of its
+  about 13 MB, held while the tab is open) and stacked to scroll; UTF-8 text, its first 4 MiB or
+  up to its first byte that is no text, in a read-only editor (⌘F searches it); anything else as
+  a hex dump of its
   first 64 KB, sixteen bytes a line. The footer gives the kind, the pixel size or page count,
   the size and the commit; zoom (−, the percentage, +, Fit) for an image or a PDF; Save…; and
   "Open in default app", which writes the value to an owner-only folder in Studio's data
   directory, emptied of anything a day old, and hands it to the system. The tab comes back after
-  a restart with the same value at the same commit. Elsewhere than macOS, a PDF opens in the
-  system's viewer.
+  a restart reading where it read: past its own write, at that write's commit (since
+  2026-10-21; before, at the commit it opened at, showing the value its write replaced and
+  refusing its next write as changed elsewhere). A tab saved before it said whether it holds its
+  commit does not come back. Elsewhere than macOS, a PDF opens in the system's viewer.
 - A Blob value takes a file (R1, `PUT`/`DELETE /graphs/{id}/blob`): "Choose File…" opens the
   system's picker, and a file dropped from the file manager does the same, on the Blob tab
   (its status bar, the whole tab as the drop target, and "Choose File…" in an empty value's
@@ -376,6 +387,9 @@ kept answers.
 | Date | Claim | Check | Result |
 |---|---|---|---|
 | 2026-10-21 | A delete larger than Undo puts back is confirmed by typing | `graph_store` `a_delete_past_what_undo_puts_back_is_planned_without_undo` (⌘⌫ on a Tag on 25,000 documents; the same on ten; an unkeyed Note), `relationships_between_deleted_nodes_count_once` (the counts per relationship type and end, each type-checked); the first run again with the count undone; `dialogs.rs` read: a plan's `undo_unavailable` already asks for the key and leaves Undo off the toast | The Tag's plan named 25,005 changes (1 node, 25,000 Tagged, Broader 3 + 2 − 1) past 20,000, four count reads all held at c1; ten documents offered Undo; the Note read no count. Undone, the plan offered Undo, which then restored nothing. `DeletePlan.requested`, which nothing read, is gone |
+| 2026-10-21 | A Blob tab opened at the head reads and saves one commit | `type_table` `a_tab_opened_at_the_head_reads_and_saves_at_the_head_it_found` (a 16 MiB + 10 value at c1, main moving to c2 with other bytes once the first range is served, then the window moved to `fix` and the value saved), failing with every read at the branch again | The tab read the head probe's c1, its HEAD, both ranges and both saved ranges at `snapshot=c1` and none at a branch; the file held c1's bytes whole and the footer read "at c1". Before, the second range was c2's and the save read fix's ten bytes |
+| 2026-10-21 | A restored Blob tab reads where its own write left it | `type_table` `a_restored_tab_reads_and_binds_where_its_own_write_left_it` (a tab at c2 stores a file at c3; its saved form read back through `saved_blob` and opened), failing with the commit it opened at saved | Saved `at_commit` c3, `held` false; the restored tab showed the 3 bytes stored with their ETag, and its next file landed at c4 bound to it. Before, it came back at c2 with the value replaced and its write was refused (412). A saved form without `held` opens nothing |
+| 2026-10-21 | The peek, the Blob tab and a saved name tell a value alike | `type_table` `the_peek_the_tab_and_a_saved_name_tell_a_value_alike` (a PNG, an SVG past its declaration, a comment and a doctype, a page holding an icon's markup, a one-page PDF, text, bytes), `blob` `an_svg_is_told_by_its_first_element` | One `blob::value_kind`: the SVG drew in both and named `.svg`, the page was text in both; the PDF drew its page in the tab and its first page in the peek and named `.pdf`; PNG, text and bytes agreed. The peek names a saved file from the first 16 bytes it keeps (`peek.rs`), too few to see an SVG's root past its declaration |
 | 2026-10-21 | The grid sits flush in the document and ends at its last column | Offscreen snapshots (1440×900 at 2×) against a scratch dev server, light and dark, before and after: Person, Project, Company, and Person at 2400×700 | Before, the grid was a card inset 16 px in the page, and the thin strip after `tags` was the next column's (`contributes`) first 12 px, its cell inset, cut at the card's edge. After, the header and rows start at the document's edge under the toolbar, the key's text at the toolbar title's 16 px, every column but the last ruled on its right; Project, narrower than the page, ends at its last column with no fill or hairline past it |
 | 2026-10-21 | Which of the table's writes tell its peek | `table.rs` `tell_peek_wrote`'s callers: a saved cell, drafts saved together, a bulk set, `row_inserted`, a Blob stored or cleared; not `rows_deleted`, nor `undo_delete`, which writes through `GraphSession::write_on` | The doc said the peek hears every write; it now names these and says why a delete and its Undo are not told (they change relationships, which `TableWrote` cannot carry) and what the peek does instead |
 | 2026-10-21 | A Blob tab or a peek shows Blob values where they hold, not at the pin | `type_table` `a_views_own_blob_write_leaves_its_next_one_bound_where_it_holds`, extended (after the page's bound write over another writer's commit, `BlobsAt::Own("c2")` and Open's `at_commit` `c2`), and `a_peek_opened_after_its_tables_blob_write_shows_it_where_it_holds` (a table behind its branch stores a Blob: a peek opened then reads at the table's pin `c1`, shows the 6-byte value written, and holds its Blobs at `c3`) | Before, Open read at the view's commit (`c0`), the value replaced, and that tab's first upload was refused as changed; a peek opened from a table got the pin alone and read the value replaced there |

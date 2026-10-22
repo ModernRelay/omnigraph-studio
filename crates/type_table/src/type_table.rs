@@ -44,26 +44,9 @@ use types_list::TypesList;
 /// `PeekNode`, `OpenBlob`, `OpenTextEditor`, `UndoDelete`). Its keys are in `assets/keymaps/`
 /// (`TypeTable`, `TypeTable && editing`).
 pub fn init(cx: &mut App) {
-    // A Blob tab comes back with the value it showed, at the same commit. One saved before a
-    // tab said whether it holds its commit held it.
+    // A Blob tab comes back with the value it showed, at the commit it read it at.
     studio_workspace::register_item_kind(cx, "blob", |data, workspace, window, cx| {
-        let text = |key: &str| data.get(key).and_then(|v| v.as_str()).map(str::to_owned);
-        if let (Some(type_name), Some(id), Some(property)) =
-            (text("type_name"), text("id"), text("property"))
-        {
-            let at_commit = text("at_commit");
-            let held = data
-                .get("held")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(at_commit.is_some());
-            let action = OpenBlob {
-                type_name,
-                id,
-                property,
-                edge: data.get("edge").and_then(|v| v.as_bool()).unwrap_or(false),
-                at_commit,
-                held,
-            };
+        if let Some(action) = saved_blob(data) {
             open_blob(workspace, &action, window, cx);
         }
     });
@@ -369,6 +352,21 @@ fn open_node_page(
     workspace.open_item(key, window, cx, move |_window, cx| {
         NodePage::new(session, type_name, id, at_commit, cx)
     });
+}
+
+/// The Blob tab a saved one names ([`BlobView`]'s `serialize`): its value, the commit it read
+/// at, and whether it holds that commit. One saved without saying whether it holds its commit
+/// does not come back.
+fn saved_blob(data: &Value) -> Option<OpenBlob> {
+    let text = |key: &str| data.get(key).and_then(Value::as_str).map(str::to_owned);
+    Some(OpenBlob {
+        type_name: text("type_name")?,
+        id: text("id")?,
+        property: text("property")?,
+        edge: data.get("edge").and_then(Value::as_bool).unwrap_or(false),
+        at_commit: text("at_commit"),
+        held: data.get("held")?.as_bool()?,
+    })
 }
 
 /// Opens a Blob value in a tab of its own, or shows the tab it is in.
