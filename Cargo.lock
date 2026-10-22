@@ -4217,7 +4217,7 @@ dependencies = [
  "reqwest_client",
  "serde",
  "serde_json",
- "serde_norway",
+ "smol",
  "studio_settings",
  "studio_ui",
  "url",

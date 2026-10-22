@@ -10,10 +10,12 @@ use graph_client::{GraphClient, ReadError};
 use http_client::HttpClient;
 use studio_settings::StudioSettings;
 
+use crate::cli_tokens::{Token, TokenSource};
+
 /// Where Studio learned about a server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerSource {
-    /// `~/.omnigraph/config.yaml`; the token is resolved as the CLI resolves it.
+    /// A server target the OmniGraph CLI lists; its token, if any, is the CLI's to give.
     Cli,
     /// Added in Studio; the token is in the OS keychain.
     Studio,
@@ -41,7 +43,8 @@ pub enum ConnectionState {
     },
     /// The server answered 401: the token sent was refused, or none was sent
     /// ([`Connection::refused_with_token`] says which, and [`Connection::token_unread`] why
-    /// when the keychain did not give one).
+    /// when the keychain did not give one). Also a server whose token source gave none, which
+    /// is asked nothing without one.
     Unauthorized,
     Unreachable(String),
 }
@@ -114,15 +117,29 @@ pub struct Connection {
     pub token_unsaved: Option<String>,
     /// Why the token saved for this server could not be read from the OS keychain (locked,
     /// access denied, no keychain service): Studio connects without one, which a server that
-    /// asks for none accepts. `None` once a token is set.
+    /// asks for none accepts. For a server with a token source, why the source gave none:
+    /// Studio then sends it nothing. `None` once a token is set.
     pub token_unread: Option<String>,
-    /// Whether the request the server refused with 401 ([`ConnectionState::Unauthorized`])
-    /// carried a token. None is sent to a server with none configured: a managed CLI target,
-    /// whose data token the CLI gets from the control plane, or a CLI target whose saved token
-    /// is bound to another endpoint. Such a server asks for one rather than refusing it.
+    /// Whether the server refused the token of the request it answered with 401
+    /// ([`ConnectionState::Unauthorized`]): its challenge says `error="invalid_token"`, or, from
+    /// a server that sends no challenge, the request carried one. Otherwise the server asks for
+    /// a token rather than refusing one.
     pub refused_with_token: bool,
     /// Whether the client holds a token, so the next request sends one.
     has_token: bool,
+    /// Where the token comes from each time it is asked ([`Connection::with_token_source`]): a
+    /// CLI server's is the CLI's `credentials export`. `None` for a server given its token.
+    token_source: Option<Arc<dyn TokenSource>>,
+    /// The token held was given (typed in), so the source is not asked until
+    /// [`Connection::refresh_token`].
+    token_given: bool,
+    /// The token held is the one the source just gave for the connect under way.
+    token_fresh: bool,
+    /// The source was asked again after a 401, which it is once until a connect is ready.
+    asked_after_refusal: bool,
+    /// The source asked again while the connection stands (after a 401, on Refresh, for a
+    /// changed target).
+    _asking: Option<Task<()>>,
     _task: Option<Task<()>>,
     /// The graph list read again after it could not be read ([`Connection::list_graphs_again`]).
     _listing: Option<Task<()>>,
@@ -154,6 +171,9 @@ impl Connection {
     /// that a token was refused.
     pub fn label(&self) -> String {
         match (&self.state, &self.token_unread) {
+            (ConnectionState::Unauthorized, Some(_)) if self.token_source.is_some() => {
+                "No token from the CLI".into()
+            }
             (ConnectionState::Unauthorized, Some(_)) => "Token not read from the keychain".into(),
             (ConnectionState::Unauthorized, None) if !self.refused_with_token => {
                 "Asks for a token".into()
@@ -180,6 +200,11 @@ impl Connection {
             token_unread: None,
             refused_with_token: false,
             has_token,
+            token_source: None,
+            token_given: false,
+            token_fresh: false,
+            asked_after_refusal: false,
+            _asking: None,
             _task: None,
             _listing: None,
             _health_check: None,
@@ -188,6 +213,120 @@ impl Connection {
             watchers: Rc::new(()),
             check_missed: false,
         })
+    }
+
+    /// Takes its token from `source` each time it is asked: on each connect, before anything is
+    /// sent; once more after a 401; and on Refresh ([`Connection::refresh_token`]). A server
+    /// with a source is sent nothing without a token from it.
+    pub(crate) fn with_token_source(mut self, source: Option<Arc<dyn TokenSource>>) -> Self {
+        self.token_source = source;
+        self
+    }
+
+    /// Replaces where the token comes from (the CLI target changed) and asks it at once; with
+    /// none, the token is dropped (the target is anonymous now).
+    pub(crate) fn take_token_from(
+        &mut self,
+        source: Option<Arc<dyn TokenSource>>,
+        cx: &mut Context<Self>,
+    ) {
+        let had = self.token_source.is_some();
+        self.token_source = source;
+        if self.token_source.is_some() {
+            self.refresh_token(cx);
+        } else if had {
+            self.token_given = false;
+            self.replace_token(None, None, cx);
+        }
+    }
+
+    /// Whether its token comes from the OmniGraph CLI (`credentials export`).
+    pub fn token_from_cli(&self) -> bool {
+        self.token_source.is_some()
+    }
+
+    /// Asks the token source again, as the person's Refresh does: a token typed in no longer
+    /// stands, and a token that changed connects again. A connection not yet used asks when it
+    /// connects.
+    pub fn refresh_token(&mut self, cx: &mut Context<Self>) {
+        if self.token_source.is_none() {
+            return;
+        }
+        self.token_given = false;
+        self.asked_after_refusal = false;
+        if self.state != ConnectionState::Idle {
+            self.ask_for_token(false, cx);
+        }
+    }
+
+    /// The person's Refresh of a graph on this server: its token is asked for again, and a graph
+    /// list that could not be read is read again.
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.refresh_token(cx);
+        self.list_graphs_again(cx);
+    }
+
+    /// Asks the token source for a token. For a connect (`connecting`), the connect goes on with
+    /// it; asked again, only a token that changed connects again.
+    fn ask_for_token(&mut self, connecting: bool, cx: &mut Context<Self>) {
+        let Some(source) = self.token_source.clone() else {
+            return;
+        };
+        let asking = cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(source.token()).await;
+            this.update(cx, |this, cx| this.token_answered(answer, connecting, cx))
+                .ok();
+        });
+        if connecting {
+            self._task = Some(asking);
+        } else {
+            self._asking = Some(asking);
+        }
+    }
+
+    /// Takes the source's answer. A token connects (for a connect under way, or when it changed);
+    /// no token sends nothing more, the connection refused with why.
+    fn token_answered(
+        &mut self,
+        answer: Result<Token, String>,
+        connecting: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !connecting {
+            self._asking = None;
+        }
+        match answer {
+            Ok(token) => {
+                self.has_token = true;
+                let changed = self.client.set_token(Some(token.into_string()));
+                if changed {
+                    cx.emit(ConnectionEvent::CredentialChanged);
+                }
+                let unread_changed = self.token_unread.take().is_some();
+                if connecting || (changed && self.state != ConnectionState::Idle) {
+                    self.token_fresh = true;
+                    self.connect(cx);
+                } else if unread_changed {
+                    cx.emit(ConnectionEvent::StateChanged);
+                    cx.notify();
+                }
+            }
+            Err(reason) => {
+                self.has_token = false;
+                if self.client.set_token(None) {
+                    cx.emit(ConnectionEvent::CredentialChanged);
+                }
+                self.token_unread = Some(reason);
+                if connecting || self.state != ConnectionState::Idle {
+                    self._task = None;
+                    self.refused_with_token = false;
+                    self.state = ConnectionState::Unauthorized;
+                    self.schedule_health_check(cx);
+                }
+                cx.emit(ConnectionEvent::StateChanged);
+                cx.notify();
+            }
+        }
     }
 
     /// Notes that the token is being read; [`Connection::token_read`] or
@@ -273,10 +412,11 @@ impl Connection {
         }
     }
 
-    /// Replaces the token: typed in after the server refused the old one, or changed in the
-    /// CLI's files (spec 003). Requests made after this use it, and a connection in use checks
-    /// again; one not yet used connects when it is.
+    /// Replaces the token with one given to it, typed in after the server refused the old one
+    /// (spec 003): a token source is not asked over it until Refresh. Requests made after this
+    /// use it, and a connection in use checks again; one not yet used connects when it is.
     pub fn set_token(&mut self, token: Option<String>, cx: &mut Context<Self>) {
+        self.token_given = true;
         self.replace_token(token, None, cx);
     }
 
@@ -364,7 +504,7 @@ impl Connection {
                 this._listing = None;
                 match listed {
                     Ok(graphs) => this.graphs = graphs,
-                    Err(state) => this.refused(state, token_sent),
+                    Err(failed) => this.refused(failed, token_sent, cx),
                 }
                 cx.emit(ConnectionEvent::StateChanged);
                 cx.notify();
@@ -383,6 +523,11 @@ impl Connection {
         cx.emit(ConnectionEvent::StateChanged);
         cx.notify();
         if self.token_pending {
+            return;
+        }
+        // A server with a token source is asked nothing before the source answers.
+        if !std::mem::take(&mut self.token_fresh) && self.asks_token_source() {
+            self.ask_for_token(true, cx);
             return;
         }
         let client = self.client.clone();
@@ -406,8 +551,9 @@ impl Connection {
                         this.latency = Some(latency);
                         this.graphs = graphs;
                         this.state = ConnectionState::Ready;
+                        this.asked_after_refusal = false;
                     }
-                    Probe::Failed(state) => this.refused(state, token_sent),
+                    Probe::Failed(failed) => this.refused(failed, token_sent, cx),
                 }
                 cx.emit(ConnectionEvent::StateChanged);
                 cx.notify();
@@ -417,13 +563,24 @@ impl Connection {
         }));
     }
 
-    /// Takes the state a failed read left, noting for a 401 whether that read carried a token
-    /// ([`Self::refused_with_token`]).
-    fn refused(&mut self, state: ConnectionState, token_sent: bool) {
-        if state == ConnectionState::Unauthorized {
-            self.refused_with_token = token_sent;
+    /// Whether a connect asks its token source first: it has one, and no token was given.
+    fn asks_token_source(&self) -> bool {
+        self.token_source.is_some() && !self.token_given
+    }
+
+    /// Takes the state a failed read left, noting for a 401 whether the server refused the
+    /// token sent ([`Self::refused_with_token`]). A token from the source that the server
+    /// refused is asked for once more: a rotated one connects again, the same one stays
+    /// refused, and nothing is asked again until a connect is ready or the person refreshes.
+    fn refused(&mut self, failed: Failed, token_sent: bool, cx: &mut Context<Self>) {
+        if failed.state == ConnectionState::Unauthorized {
+            self.refused_with_token = failed.token_refused.unwrap_or(token_sent);
+            if token_sent && !self.asked_after_refusal && self.asks_token_source() {
+                self.asked_after_refusal = true;
+                self.ask_for_token(false, cx);
+            }
         }
-        self.state = state;
+        self.state = failed.state;
     }
 
     /// Checks `/healthz` again after the settings' interval while the server is ready, and
@@ -509,7 +666,24 @@ enum Probe {
         latency: Duration,
         graphs: GraphListing,
     },
-    Failed(ConnectionState),
+    Failed(Failed),
+}
+
+/// A read that left the connection unusable: the state it leaves, and for a 401 whether the
+/// server's challenge says it refused the token sent (`None` from a server that sends none,
+/// one before OmniGraph #1122).
+struct Failed {
+    state: ConnectionState,
+    token_refused: Option<bool>,
+}
+
+impl From<ConnectionState> for Failed {
+    fn from(state: ConnectionState) -> Self {
+        Self {
+            state,
+            token_refused: None,
+        }
+    }
 }
 
 /// A health answer as the server's state: one Studio can use, or why not.
@@ -537,11 +711,11 @@ async fn probe(client: &GraphClient) -> Probe {
     let ((health, latency), graphs) = futures::join!(timed_health, list_graphs(client));
     let health = match served(health) {
         Ok(health) => health,
-        Err(state) => return Probe::Failed(state),
+        Err(state) => return Probe::Failed(state.into()),
     };
     let graphs = match graphs {
         Ok(graphs) => graphs,
-        Err(state) => return Probe::Failed(state),
+        Err(failed) => return Probe::Failed(failed),
     };
     Probe::Ready {
         health: health.health,
@@ -552,11 +726,14 @@ async fn probe(client: &GraphClient) -> Probe {
 
 /// What the server says about its graphs, or the state a refused token leaves the
 /// connection in.
-async fn list_graphs(client: &GraphClient) -> Result<GraphListing, ConnectionState> {
+async fn list_graphs(client: &GraphClient) -> Result<GraphListing, Failed> {
     Ok(match client.graphs().await {
         Ok(list) => GraphListing::Listed(list.graphs),
         Err(ReadError::Refused(summary)) if summary.status == 401 => {
-            return Err(ConnectionState::Unauthorized);
+            return Err(Failed {
+                state: ConnectionState::Unauthorized,
+                token_refused: summary.challenge.as_deref().map(|c| c.token_refused()),
+            });
         }
         // A credential that may not list the server's graphs may still discover its own.
         Err(ReadError::Refused(summary)) if summary.status == 403 => {

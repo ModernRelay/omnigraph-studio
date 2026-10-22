@@ -7,6 +7,7 @@ mod access;
 pub mod carry;
 mod changes;
 pub mod cli_config;
+mod cli_tokens;
 mod connection;
 mod degrees;
 pub mod deletes;
@@ -49,14 +50,13 @@ pub use session::{
     SessionEvent, open_session, open_session_behind,
 };
 
+/// The user agent of Studio's requests.
+pub(crate) const USER_AGENT: &str = concat!("OmniGraph-Studio/", env!("CARGO_PKG_VERSION"));
+
 /// Sets up the HTTP client and loads every known server. Call once at startup.
 pub fn init(cx: &mut App) {
     let http: Arc<dyn http_client::HttpClient> = Arc::new(
-        reqwest_client::ReqwestClient::user_agent(concat!(
-            "OmniGraph-Studio/",
-            env!("CARGO_PKG_VERSION")
-        ))
-        .expect("the HTTP client starts"),
+        reqwest_client::ReqwestClient::user_agent(USER_AGENT).expect("the HTTP client starts"),
     );
     cx.set_http_client(http.clone());
     ConnectionRegistry::init(http, cx);

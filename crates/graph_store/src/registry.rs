@@ -9,7 +9,8 @@ use gpui::{App, AppContext as _, Context, Entity, Global, Task};
 use http_client::HttpClient;
 use serde::{Deserialize, Serialize};
 
-use crate::cli_config::{self, CliAlias, CliServer, OperatorFiles};
+use crate::cli_config::{self, CliAlias, CliAuth, CliServer, CliTargets, FileStamp, ManagedTarget};
+use crate::cli_tokens::{self, CliTokenSource, TokenSource};
 use crate::connection::{Connection, ServerEntry, ServerSource};
 
 /// The keychain user name Studio stores server tokens under.
@@ -17,6 +18,12 @@ const KEYCHAIN_USER: &str = "omnigraph-studio";
 
 /// How often the CLI's files are checked for a change, as Studio's settings file is.
 const OPERATOR_POLL: Duration = Duration::from_secs(2);
+
+/// Makes the HTTP client for a CLI target whose `transport.proxy` names a proxy URL.
+type ProxiedHttp = Arc<dyn Fn(&str) -> anyhow::Result<Arc<dyn HttpClient>> + Send + Sync>;
+
+/// Makes the token source of a CLI server whose token the CLI gives; none for an anonymous one.
+type TokenSources = Arc<dyn Fn(&CliServer) -> Option<Arc<dyn TokenSource>> + Send + Sync>;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct SavedServers {
@@ -34,23 +41,38 @@ struct SavedServer {
     graphs: Vec<String>,
 }
 
+/// What a CLI server was when the CLI's targets were last listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CliKept {
+    /// Its revision ([`CliServer::revision`]): one that changes asks the CLI for its token again.
+    revision: String,
+    /// The proxy its requests go through, which its connection's client was made with.
+    proxy: Option<String>,
+}
+
 pub struct ConnectionRegistry {
     pub connections: Vec<Entity<Connection>>,
     /// Servers named in the environment or saved by Studio that could not be added at start.
     start_errors: Vec<String>,
     http: Arc<dyn HttpClient>,
-    /// Where the CLI's files are (`$OMNIGRAPH_HOME`, else `~/.omnigraph`), and their stamp
-    /// when last read.
+    proxied: ProxiedHttp,
+    token_sources: TokenSources,
+    /// The operator home the CLI reads (`$OMNIGRAPH_HOME`, else `~/.omnigraph`).
     operator_dir: Option<PathBuf>,
-    operator_stamp: Vec<Option<cli_config::FileStamp>>,
-    /// The token each CLI server took from the CLI's files when they were last read, by its
-    /// address. Only a token changed there replaces the connection's, so one typed into Studio
-    /// for this run stays until then.
-    cli_tokens: HashMap<String, Option<String>>,
-    /// What the CLI's files could not give when last read.
+    /// The files whose change lists the targets again (the operator file and the token files
+    /// the targets name), and their stamp before the last listing.
+    watched: Vec<PathBuf>,
+    operator_stamp: Vec<Option<FileStamp>>,
+    /// The places Studio looks for the CLI, and their stamp: a CLI installed, upgraded or
+    /// removed lists the targets and asks every CLI server's token again.
+    cli_places: Vec<PathBuf>,
+    cli_stamp: Vec<Option<FileStamp>>,
+    /// Each CLI server as last listed, by its address.
+    cli_kept: HashMap<String, CliKept>,
+    /// What the CLI's targets could not give when last listed.
     cli_errors: Vec<String>,
-    /// The CLI config's aliases, as last read.
-    aliases: Vec<CliAlias>,
+    /// The managed targets the CLI last listed, refused until Studio has its own sign-in.
+    managed: Vec<ManagedTarget>,
     /// Servers saved by Studio and not connected this run, since another connection has their
     /// address (the environment's): they stay in the saved list.
     kept_saved: Vec<SavedServer>,
@@ -130,6 +152,26 @@ fn load_saved_at(path: &Path) -> LoadedServers {
     }
 }
 
+/// The HTTP client for a CLI target whose requests go through the proxy at `url`
+/// (`transport.proxy`, `mode: url`). Zed's client also leaves out the hosts in `NO_PROXY`.
+fn proxied_client(url: &str) -> anyhow::Result<Arc<dyn HttpClient>> {
+    let proxy = http_client::Url::parse(url)?;
+    Ok(Arc::new(
+        reqwest_client::ReqwestClient::proxy_and_user_agent(Some(proxy), crate::USER_AGENT)?,
+    ))
+}
+
+/// The token source of a CLI server: `credentials export` for its target, with the CLI Studio
+/// finds where it looks for one.
+fn cli_token_source(server: &CliServer) -> Option<Arc<dyn TokenSource>> {
+    match &server.auth {
+        CliAuth::Anonymous => None,
+        CliAuth::Token(credential) => {
+            Some(Arc::new(CliTokenSource::for_server(server, credential)))
+        }
+    }
+}
+
 impl ConnectionRegistry {
     pub fn global(cx: &App) -> Entity<Self> {
         cx.global::<GlobalRegistry>().0.clone()
@@ -149,6 +191,7 @@ impl ConnectionRegistry {
     fn load(http: Arc<dyn HttpClient>, cx: &mut Context<Self>) -> Self {
         let operator_dir = cli_config::operator_dir();
         let mut this = Self::empty(http, operator_dir.clone());
+        this.proxied = Arc::new(proxied_client);
         let LoadedServers {
             saved,
             saving,
@@ -219,13 +262,24 @@ impl ConnectionRegistry {
             .detach();
         }
 
-        this.operator_stamp = cli_config::stamp(operator_dir.as_deref());
-        this.apply_operator_files(
-            cli_config::read_operator(operator_dir.as_deref()),
-            &saved,
-            cx,
-        );
-        this.watch_operator_files(cx);
+        // Listed before the windows a start reopens look for the CLI's servers, within
+        // `START_TIMEOUT`; each asks the CLI for its token when it connects. The stamp is taken
+        // before the listing.
+        this.token_sources = Arc::new(cli_token_source);
+        this.watched = operator_dir
+            .iter()
+            .map(|dir| cli_config::config_path(dir))
+            .collect();
+        let stamp = cli_config::stamp(&this.watched);
+        this.cli_places = cli_tokens::candidates();
+        this.cli_stamp = cli_config::stamp(&this.cli_places);
+        let targets = smol::block_on(cli_config::read_targets_at_start(
+            operator_dir.as_deref(),
+            &this.cli_places,
+        ));
+        this.keep_stamp(stamp, &targets.watched);
+        this.apply_cli_targets(targets, &saved, cx);
+        this.watch_cli_targets(cx);
         this
     }
 
@@ -238,23 +292,30 @@ impl ConnectionRegistry {
     }
 
     fn empty(http: Arc<dyn HttpClient>, operator_dir: Option<PathBuf>) -> Self {
+        let same = http.clone();
         Self {
             connections: Vec::new(),
             start_errors: Vec::new(),
             http,
+            proxied: Arc::new(move |_| Ok(same.clone())),
+            token_sources: Arc::new(|_| None),
             operator_dir,
+            watched: Vec::new(),
             operator_stamp: Vec::new(),
-            cli_tokens: HashMap::new(),
+            cli_places: Vec::new(),
+            cli_stamp: Vec::new(),
+            cli_kept: HashMap::new(),
             cli_errors: Vec::new(),
-            aliases: Vec::new(),
+            managed: Vec::new(),
             kept_saved: Vec::new(),
             saving: true,
             _watch: None,
         }
     }
 
-    /// What the CLI's files could not give when last read: a config that does not parse, or
-    /// credentials other users can read.
+    /// What the CLI's targets could not give when last listed: no CLI Studio can drive, a
+    /// configuration the CLI refuses, a target Studio does not connect to, and the alternatives
+    /// on an address.
     pub fn cli_errors(&self) -> &[String] {
         &self.cli_errors
     }
@@ -265,43 +326,81 @@ impl ConnectionRegistry {
         &self.start_errors
     }
 
-    /// The CLI config's aliases bound to `graph` on the CLI server named `server`, by name.
-    pub fn aliases_for(&self, server: &str, graph: &str) -> Vec<CliAlias> {
-        self.aliases
-            .iter()
-            .filter(|alias| alias.server == server && alias.graph.as_deref() == Some(graph))
-            .cloned()
-            .collect()
+    /// The managed targets the CLI lists, as `target inspect --resolved` describes them: refused
+    /// (each said in [`Self::cli_errors`]) until Studio has its own sign-in, which spec 016 builds
+    /// from these. Studio holds no token for them.
+    pub fn managed_targets(&self) -> &[ManagedTarget] {
+        &self.managed
     }
 
-    /// Reads the CLI's files again whenever their stamp changes, so a server added there, a
-    /// changed address or a token from `omnigraph login` reaches Studio without a restart.
-    fn watch_operator_files(&mut self, cx: &mut Context<Self>) {
+    /// The CLI's aliases bound to `graph` on the CLI server named `server`: none, since the CLI
+    /// has no command that lists its aliases and Studio reads no operator configuration itself
+    /// (spec 003).
+    pub fn aliases_for(&self, _server: &str, _graph: &str) -> Vec<CliAlias> {
+        Vec::new()
+    }
+
+    /// Keeps `stamp`, taken of the watched files before the listing, as the stamp of the files
+    /// the listing names (`watched`). A file named for the first time (a new token file) was
+    /// not stamped: the next check finds the stamp changed and lists once more, which changes
+    /// nothing unless that file changed meanwhile.
+    fn keep_stamp(&mut self, stamp: Vec<Option<FileStamp>>, watched: &[PathBuf]) {
+        if self.watched == watched {
+            self.operator_stamp = stamp;
+        } else {
+            self.watched = watched.to_vec();
+            self.operator_stamp = Vec::new();
+        }
+    }
+
+    /// Lists the CLI's targets again whenever the operator file, a token file a target names, or
+    /// the CLI where Studio looks for it changes, so a target added there, a changed address or
+    /// a rotated token reaches Studio without a restart; a CLI installed, upgraded or removed
+    /// also asks every CLI server's token again. The CLI's secure store cannot be watched: a
+    /// token kept there is asked for again on connect, after a 401 and on Refresh.
+    fn watch_cli_targets(&mut self, cx: &mut Context<Self>) {
         let dir = self.operator_dir.clone();
         self._watch = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(OPERATOR_POLL).await;
-                let at = dir.clone();
-                let stamp = cx
-                    .background_executor()
-                    .spawn(async move { cli_config::stamp(at.as_deref()) })
-                    .await;
-                let Ok(unchanged) = this.update(cx, |this, _| this.operator_stamp == stamp) else {
+                let Ok((watched, places)) = this.update(cx, |this, _| {
+                    (this.watched.clone(), this.cli_places.clone())
+                }) else {
                     break;
                 };
-                if unchanged {
+                let (stamp, cli_stamp, places) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        (
+                            cli_config::stamp(&watched),
+                            cli_config::stamp(&places),
+                            places,
+                        )
+                    })
+                    .await;
+                let Ok((listed_files, cli_moved)) = this.update(cx, |this, _| {
+                    (this.operator_stamp != stamp, this.cli_stamp != cli_stamp)
+                }) else {
+                    break;
+                };
+                if !listed_files && !cli_moved {
                     continue;
                 }
-                // The stamp is taken before the read: a write during it changes the next one.
+                // The stamp is taken before the listing: a write during it changes the next one.
                 let at = dir.clone();
-                let files = cx
+                let targets = cx
                     .background_executor()
-                    .spawn(async move { cli_config::read_operator(at.as_deref()) })
+                    .spawn(async move { cli_config::read_targets(at.as_deref(), &places).await })
                     .await;
                 let alive = this
                     .update(cx, |this, cx| {
-                        this.operator_stamp = stamp;
-                        if this.apply_operator_files(files, &SavedServers::default(), cx) {
+                        this.cli_stamp = cli_stamp;
+                        this.keep_stamp(stamp, &targets.watched);
+                        let changed = this.apply_cli_targets(targets, &SavedServers::default(), cx);
+                        if cli_moved {
+                            this.ask_cli_tokens_again(cx);
+                        }
+                        if changed {
                             this.save(cx);
                             cx.notify();
                         }
@@ -314,59 +413,69 @@ impl ConnectionRegistry {
         }));
     }
 
-    /// Brings the CLI's servers in line with what its files say, and says whether anything
-    /// changed. An address is one server (spec 003), so a CLI server is its address: a target
-    /// renamed on the same endpoint renames the connection in place, which the windows open on
-    /// it keep, and a token changed in the files later reaches it. A new address is a new
-    /// connection, with the graphs Studio remembered for it (`saved`, by address, else by
-    /// name) or for the name at the address it left; an address no longer named leaves the
-    /// list (a window open on it keeps its connection); a token changed in the files replaces
-    /// the connection's; a profile's graph is added. Files that could not be read change no
-    /// server. What they could not give, a server they name that cannot be added included, is
-    /// a change only when it differs from what was kept.
-    fn apply_operator_files(
+    /// Asks every connection whose token the CLI gives for it again.
+    fn ask_cli_tokens_again(&mut self, cx: &mut Context<Self>) {
+        for connection in &self.connections {
+            connection.update(cx, |connection, cx| connection.refresh_token(cx));
+        }
+    }
+
+    /// Brings the CLI's servers in line with the targets the CLI lists, and says whether
+    /// anything changed. An address is one server (spec 003), so a CLI server is its address: a
+    /// target renamed on the same endpoint renames the connection in place, which the windows
+    /// open on it keep. A new address is a new connection, with the graphs Studio remembered for
+    /// it (`saved`, by address, else by name) or for the name at the address it left; an
+    /// address no longer listed leaves the list (a window open on it keeps its connection); a
+    /// target whose entry or token file changed asks the CLI for its token again; a target's
+    /// graph is added. Targets that could not be listed change no server. What could not be
+    /// listed or used, a server that cannot be added included, is a change only when it differs
+    /// from what was kept.
+    fn apply_cli_targets(
         &mut self,
-        files: OperatorFiles,
+        targets: CliTargets,
         saved: &SavedServers,
         cx: &mut Context<Self>,
     ) -> bool {
-        let OperatorFiles {
+        let CliTargets {
             servers,
-            aliases,
             mut errors,
-        } = files;
+            watched: _,
+            managed,
+        } = targets;
         let Some(servers) = servers else {
             return self.keep_cli_errors(errors);
         };
-        let mut changed = false;
-        if aliases != self.aliases {
-            self.aliases = aliases;
-            changed = true;
-        }
-        let servers: Vec<(CliServer, Option<String>, String)> = servers
-            .into_iter()
-            .map(|(server, token)| {
-                let url = graph_client::server_root(&server.url).unwrap_or(server.url.clone());
-                (server, token, url)
-            })
+        let mut changed = managed != self.managed;
+        self.managed = managed;
+        // An address that keeps its server keeps its connection only with the same proxy: the
+        // client was made with it.
+        let named: Vec<(&String, &Option<String>)> = servers
+            .iter()
+            .map(|server| (&server.url, &server.proxy))
             .collect();
-        let named: Vec<&String> = servers.iter().map(|(_, _, url)| url).collect();
-        // The CLI connections at addresses the files no longer name leave; a target that moved
-        // takes the graphs remembered for its name to its new address.
+        let kept = &self.cli_kept;
         let mut left: Vec<ServerEntry> = Vec::new();
         self.connections.retain(|connection| {
             let server = &connection.read(cx).server;
-            let stays = server.source != ServerSource::Cli || named.contains(&&server.url);
+            let stays = server.source != ServerSource::Cli
+                || named.iter().any(|(url, proxy)| {
+                    **url == server.url
+                        && kept
+                            .get(&server.url)
+                            .is_none_or(|kept| kept.proxy == **proxy)
+                });
             if !stays {
                 left.push(server.clone());
             }
             stays
         });
         changed |= !left.is_empty();
-        self.cli_tokens.retain(|url, _| named.contains(&url));
-        // Each address the files land a server on, and the target it was taken as.
-        let mut taken: Vec<(String, String)> = Vec::new();
-        for (server, token, url) in servers {
+        self.cli_kept
+            .retain(|url, _| left.iter().all(|entry| entry.url != *url));
+        self.cli_kept
+            .retain(|url, _| named.iter().any(|(named, _)| *named == url));
+        for server in servers {
+            let url = server.url.clone();
             // An address Studio reaches already as a server of its own (added in Studio, or the
             // environment's) is that connection: a second would open its graphs twice, and the
             // graph keys, window restore and links would each find either.
@@ -374,11 +483,7 @@ impl ConnectionRegistry {
                 let entry = &connection.read(cx).server;
                 (entry.url == url && entry.source != ServerSource::Cli).then(|| entry.name.clone())
             });
-            let first = taken
-                .iter()
-                .find(|(at, _)| *at == url)
-                .map(|(_, name)| name.clone());
-            if let Some(other) = other.or(first) {
+            if let Some(other) = other {
                 errors.push(format!(
                     "CLI target '{}' is at {url}, which Studio connects to already as \
                      '{other}'; Studio keeps one connection per address",
@@ -386,7 +491,10 @@ impl ConnectionRegistry {
                 ));
                 continue;
             }
-            taken.push((url.clone(), server.name.clone()));
+            let kept = CliKept {
+                revision: server.revision.clone(),
+                proxy: server.proxy.clone(),
+            };
             let existing = self.connections.iter().find(|connection| {
                 let entry = &connection.read(cx).server;
                 entry.source == ServerSource::Cli && entry.url == url
@@ -405,9 +513,10 @@ impl ConnectionRegistry {
                         }
                     }
                 });
-                if self.cli_tokens.get(&url) != Some(&token) {
-                    self.cli_tokens.insert(url, token.clone());
-                    connection.update(cx, |connection, cx| connection.set_token(token, cx));
+                if self.cli_kept.get(&url) != Some(&kept) {
+                    let source = (self.token_sources)(&server);
+                    connection.update(cx, |connection, cx| connection.take_token_from(source, cx));
+                    self.cli_kept.insert(url, kept);
                     changed = true;
                 }
                 continue;
@@ -437,10 +546,26 @@ impl ConnectionRegistry {
                 source: ServerSource::Cli,
                 known_graphs: graphs,
             };
-            match Connection::new(entry, token.clone(), self.http.clone()) {
+            let http = match &server.proxy {
+                Some(proxy) => match (self.proxied)(proxy) {
+                    Ok(http) => http,
+                    Err(error) => {
+                        errors.push(format!(
+                            "CLI target '{}' names the proxy {proxy}, which Studio cannot use: \
+                             {error}",
+                            server.name
+                        ));
+                        continue;
+                    }
+                },
+                None => self.http.clone(),
+            };
+            let source = (self.token_sources)(&server);
+            match Connection::new(entry, None, http) {
                 Ok(connection) => {
+                    let connection = connection.with_token_source(source);
                     self.connections.push(cx.new(|_| connection));
-                    self.cli_tokens.insert(url, token);
+                    self.cli_kept.insert(url, kept);
                     changed = true;
                 }
                 Err(error) => errors.push(error.to_string()),
@@ -450,7 +575,7 @@ impl ConnectionRegistry {
         changed || errors_changed
     }
 
-    /// Keeps `errors` as what the CLI's files could not give, and says whether they changed.
+    /// Keeps `errors` as what the CLI's targets could not give, and says whether they changed.
     fn keep_cli_errors(&mut self, errors: Vec<String>) -> bool {
         let changed = errors != self.cli_errors;
         self.cli_errors = errors;
@@ -512,7 +637,8 @@ impl ConnectionRegistry {
     }
 
     /// Replaces a server's token and reconnects. A server Studio added keeps it in the keychain;
-    /// for a CLI server it lasts this run, since Studio never writes the CLI's files.
+    /// for a CLI server it lasts until Refresh or a change to its target asks the CLI again,
+    /// since Studio never writes the CLI's files.
     pub fn update_token(
         &mut self,
         connection: &Entity<Connection>,
@@ -592,39 +718,58 @@ impl ConnectionRegistry {
 mod tests {
     use std::sync::Mutex;
 
+    use futures::FutureExt as _;
+    use futures::future::BoxFuture;
     use gpui::TestAppContext;
     use http_client::http::Response;
     use http_client::{AsyncBody, FakeHttpClient};
 
     use super::*;
+    use crate::cli_config::CliCredential;
+    use crate::cli_tokens::Token;
 
-    fn files(servers: &[(&str, &str, Option<&str>)]) -> OperatorFiles {
-        OperatorFiles {
-            servers: Some(
-                servers
-                    .iter()
-                    .map(|(name, url, token)| {
-                        let server = CliServer {
-                            name: (*name).into(),
-                            url: (*url).into(),
-                            graphs: Vec::new(),
-                        };
-                        (server, token.map(str::to_owned))
-                    })
-                    .collect(),
-            ),
-            aliases: Vec::new(),
-            errors: Vec::new(),
+    /// The CLI as the tests' token sources stand in for it: the token each target's export
+    /// gives, and every target asked, in order.
+    #[derive(Default)]
+    struct FakeCli {
+        tokens: Mutex<HashMap<String, String>>,
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl FakeCli {
+        fn give(&self, target: &str, token: &str) {
+            self.tokens
+                .lock()
+                .unwrap()
+                .insert(target.into(), token.into());
+        }
+
+        fn asked(&self) -> Vec<String> {
+            std::mem::take(&mut self.asked.lock().unwrap())
         }
     }
 
-    /// The CLI's servers follow its files without a restart: a token changed there reaches the
-    /// same connection, a token typed into Studio stays until the files change theirs, a new
-    /// address is a new connection, servers come and go, and files that cannot be read keep
-    /// every server and say why. An address is one connection: a CLI target at the address of
-    /// a server added in Studio is said, not connected.
-    #[gpui::test]
-    async fn cli_servers_follow_the_cli_files(cx: &mut TestAppContext) {
+    struct FakeExport {
+        target: String,
+        cli: Arc<FakeCli>,
+    }
+
+    impl TokenSource for FakeExport {
+        fn token(&self) -> BoxFuture<'static, Result<Token, String>> {
+            self.cli.asked.lock().unwrap().push(self.target.clone());
+            let token = self.cli.tokens.lock().unwrap().get(&self.target).cloned();
+            let target = self.target.clone();
+            async move {
+                token
+                    .map(|token| Token::new(&token))
+                    .ok_or_else(|| format!("no token for '{target}'"))
+            }
+            .boxed()
+        }
+    }
+
+    /// A server answering every request, and every authorization header it was sent.
+    fn answering() -> (Arc<dyn HttpClient>, Arc<Mutex<Vec<String>>>) {
         let sent: Arc<Mutex<Vec<String>>> = Arc::default();
         let seen = sent.clone();
         let http = FakeHttpClient::create(move |request| {
@@ -635,67 +780,159 @@ mod tests {
                 .unwrap_or_default()
                 .to_owned();
             seen.lock().unwrap().push(authorization);
+            let body = if request.uri().path().ends_with("/healthz") {
+                r#"{"status":"ok","version":"0.14.0","internal_schema_version":16}"#
+            } else {
+                r#"{"graphs":[]}"#
+            };
             async move {
                 Ok(Response::builder()
                     .status(200)
                     .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
-                    .body(AsyncBody::from(r#"{"status":"ok","version":"0.14.0"}"#))
+                    .body(AsyncBody::from(body))
                     .unwrap())
             }
         });
-        let registry = cx.new(|_| ConnectionRegistry::empty(http, None));
-        let apply = |cx: &mut TestAppContext, files: OperatorFiles| {
-            registry.update(cx, |registry, cx| {
-                registry.apply_operator_files(files, &SavedServers::default(), cx)
-            })
-        };
-        let find = |cx: &mut TestAppContext, name: &str| {
-            registry.read_with(cx, |registry, cx| registry.find(name, cx))
-        };
-        let token_sent = |cx: &mut TestAppContext, connection: &Entity<Connection>| {
-            let client = connection.read_with(cx, |connection, _| connection.client().clone());
-            let health = cx
-                .background_executor
-                .spawn(async move { client.health().await });
-            cx.run_until_parked();
-            drop(health);
-            sent.lock().unwrap().pop()
-        };
+        (http, sent)
+    }
 
+    /// A registry whose CLI servers take their tokens from `cli`.
+    fn registry_with(
+        http: Arc<dyn HttpClient>,
+        cli: &Arc<FakeCli>,
+        cx: &mut TestAppContext,
+    ) -> Entity<ConnectionRegistry> {
+        let cli = cli.clone();
+        cx.new(|_| {
+            let mut registry = ConnectionRegistry::empty(http, None);
+            registry.token_sources = Arc::new(move |server: &CliServer| match server.auth {
+                CliAuth::Anonymous => None,
+                CliAuth::Token(_) => Some(Arc::new(FakeExport {
+                    target: server.name.clone(),
+                    cli: cli.clone(),
+                }) as Arc<dyn TokenSource>),
+            });
+            registry
+        })
+    }
+
+    /// A server whose token the CLI gives, at `url`, of revision `revision`.
+    fn server(name: &str, url: &str, revision: &str) -> CliServer {
+        CliServer {
+            name: name.into(),
+            url: url.into(),
+            endpoint: format!("{url}/"),
+            graphs: Vec::new(),
+            auth: CliAuth::Token(CliCredential::Store),
+            proxy: None,
+            alternatives: Vec::new(),
+            revision: revision.into(),
+        }
+    }
+
+    fn files(servers: Vec<CliServer>) -> CliTargets {
+        CliTargets {
+            servers: Some(servers),
+            ..CliTargets::default()
+        }
+    }
+
+    fn apply(
+        registry: &Entity<ConnectionRegistry>,
+        files: CliTargets,
+        cx: &mut TestAppContext,
+    ) -> bool {
+        registry.update(cx, |registry, cx| {
+            registry.apply_cli_targets(files, &SavedServers::default(), cx)
+        })
+    }
+
+    fn find(
+        registry: &Entity<ConnectionRegistry>,
+        name: &str,
+        cx: &mut TestAppContext,
+    ) -> Option<Entity<Connection>> {
+        registry.read_with(cx, |registry, cx| registry.find(name, cx))
+    }
+
+    /// The authorization a health read on `connection` sends now.
+    fn token_sent(
+        connection: &Entity<Connection>,
+        sent: &Arc<Mutex<Vec<String>>>,
+        cx: &mut TestAppContext,
+    ) -> Option<String> {
+        let client = connection.read_with(cx, |connection, _| connection.client().clone());
+        let health = cx
+            .background_executor
+            .spawn(async move { client.health().await });
+        cx.run_until_parked();
+        drop(health);
+        sent.lock().unwrap().pop()
+    }
+
+    /// The CLI's servers follow its target list without a restart: a server's token is asked of
+    /// the CLI when it connects, not when it is listed, and again when its target changes; a
+    /// token typed into Studio stays until then; a new address is a new connection, servers
+    /// come and go, and targets that cannot be listed keep every server and say why. An address
+    /// is one connection: a CLI target at the address of a server added in Studio is said, not
+    /// connected. The CLI lists no aliases, so none is offered.
+    #[gpui::test]
+    async fn cli_servers_follow_the_cli_files(cx: &mut TestAppContext) {
+        let (http, sent) = answering();
+        let cli = Arc::new(FakeCli::default());
+        cli.give("a", "one");
+        let registry = registry_with(http, &cli, cx);
+
+        let both = || {
+            files(vec![
+                server("a", "http://a.test", "1"),
+                server("b", "http://b.test", "1"),
+            ])
+        };
+        assert!(apply(&registry, both(), cx));
+        let a = find(&registry, "a", cx).unwrap();
+        assert!(find(&registry, "b", cx).is_some());
+        assert!(!apply(&registry, both(), cx));
+        assert_eq!(
+            cli.asked(),
+            Vec::<String>::new(),
+            "nothing asked until connected"
+        );
+
+        a.update(cx, |connection, cx| connection.connect(cx));
+        cx.run_until_parked();
+        assert_eq!(cli.asked(), ["a"]);
+        assert_eq!(token_sent(&a, &sent, cx).as_deref(), Some("Bearer one"));
+
+        // A changed target (its token file rewritten, say) asks again; the same connection
+        // sends the new token.
+        cli.give("a", "two");
         assert!(apply(
-            cx,
-            files(&[
-                ("a", "http://a.test", Some("one")),
-                ("b", "http://b.test", None)
-            ])
+            &registry,
+            files(vec![
+                server("a", "http://a.test", "2"),
+                server("b", "http://b.test", "1"),
+            ]),
+            cx
         ));
-        let a = find(cx, "a").unwrap();
-        assert!(find(cx, "b").is_some());
-        assert!(!apply(
-            cx,
-            files(&[
-                ("a", "http://a.test", Some("one")),
-                ("b", "http://b.test", None)
-            ])
-        ));
+        cx.run_until_parked();
+        assert_eq!(cli.asked(), ["a"]);
+        assert_eq!(find(&registry, "a", cx), Some(a.clone()));
+        assert_eq!(token_sent(&a, &sent, cx).as_deref(), Some("Bearer two"));
 
-        // A token changed in the files: the same connection sends it.
-        assert!(apply(
-            cx,
-            files(&[
-                ("a", "http://a.test", Some("two")),
-                ("b", "http://b.test", None)
-            ])
-        ));
-        assert_eq!(find(cx, "a"), Some(a.clone()));
-        assert_eq!(token_sent(cx, &a).as_deref(), Some("Bearer two"));
-
-        // A token typed into Studio stays while the files keep theirs.
+        // A token typed into Studio stays while the target does not change.
         registry.update(cx, |registry, cx| {
             registry.update_token(&a, "typed".into(), cx)
         });
-        apply(cx, files(&[("a", "http://a.test", Some("two"))]));
-        assert_eq!(token_sent(cx, &a).as_deref(), Some("Bearer typed"));
+        cx.run_until_parked();
+        apply(
+            &registry,
+            files(vec![server("a", "http://a.test", "2")]),
+            cx,
+        );
+        cx.run_until_parked();
+        assert_eq!(token_sent(&a, &sent, cx).as_deref(), Some("Bearer typed"));
+        assert!(cli.asked().is_empty());
 
         // Adding an address listed already is that server again, not a second connection.
         let count = registry.read_with(cx, |registry, _| registry.connections.len());
@@ -712,48 +949,49 @@ mod tests {
 
         // A new address is a new connection; a server no longer named leaves; a new one joins.
         assert!(apply(
-            cx,
-            files(&[
-                ("a", "http://a2.test", Some("two")),
-                ("c", "http://c.test", None)
-            ])
+            &registry,
+            files(vec![
+                server("a", "http://a2.test", "2"),
+                server("c", "http://c.test", "1"),
+            ]),
+            cx
         ));
-        let moved = find(cx, "a").unwrap();
+        let moved = find(&registry, "a", cx).unwrap();
         assert_ne!(moved, a);
         assert_eq!(
             moved.read_with(cx, |connection, _| connection.server.url.clone()),
             "http://a2.test"
         );
-        assert!(find(cx, "b").is_none());
-        assert!(find(cx, "c").is_some());
+        assert!(find(&registry, "b", cx).is_none());
+        assert!(find(&registry, "c", cx).is_some());
 
-        // A config that does not parse keeps every server and says why.
+        // Targets that cannot be listed keep every server and say why.
         assert!(apply(
-            cx,
-            OperatorFiles {
+            &registry,
+            CliTargets {
                 servers: None,
-                aliases: Vec::new(),
-                errors: vec!["could not parse config.yaml".into()],
-            }
+                errors: vec!["the CLI refuses its configuration".into()],
+                ..CliTargets::default()
+            },
+            cx
         ));
-        assert!(find(cx, "a").is_some() && find(cx, "c").is_some());
+        assert!(find(&registry, "a", cx).is_some() && find(&registry, "c", cx).is_some());
         registry.read_with(cx, |registry, _| {
-            assert_eq!(registry.cli_errors(), ["could not parse config.yaml"])
+            assert_eq!(registry.cli_errors(), ["the CLI refuses its configuration"])
         });
 
-        // A server at an address that cannot be one is said once; the same files read again
-        // change nothing.
+        // A server Studio cannot reach is said once; the same file read again changes nothing.
         let with_bad = || {
-            files(&[
-                ("a", "http://a2.test", Some("two")),
-                ("bad", "http://bad host", None),
-                ("c", "http://c.test", None),
+            files(vec![
+                server("a", "http://a2.test", "2"),
+                server("bad", "http://bad host", "1"),
+                server("c", "http://c.test", "1"),
             ])
         };
-        assert!(apply(cx, with_bad()));
-        assert!(find(cx, "bad").is_none());
+        assert!(apply(&registry, with_bad(), cx));
+        assert!(find(&registry, "bad", cx).is_none());
         registry.read_with(cx, |registry, _| assert_eq!(registry.cli_errors().len(), 1));
-        assert!(!apply(cx, with_bad()), "nothing else changed");
+        assert!(!apply(&registry, with_bad(), cx), "nothing else changed");
 
         // A server added in Studio keeps its address: a CLI target naming it later is not a
         // second connection, and is said; one whose CLI server moved there drops its old one.
@@ -772,78 +1010,42 @@ mod tests {
             })
         };
         assert!(apply(
-            cx,
-            files(&[
-                ("a", "http://d.test", Some("two")),
-                ("c", "http://c.test", None),
-                ("d", "http://d.test/", None),
-            ])
+            &registry,
+            files(vec![
+                server("a", "http://d.test", "2"),
+                server("c", "http://c.test", "1"),
+            ]),
+            cx
         ));
         assert_eq!(at_d(cx), 1);
-        assert!(find(cx, "a").is_none() && find(cx, "d").is_none());
-        assert_eq!(find(cx, "mine"), Some(mine));
+        assert!(find(&registry, "a", cx).is_none());
+        assert_eq!(find(&registry, "mine", cx), Some(mine));
         registry.read_with(cx, |registry, _| {
             let said: Vec<_> = registry
                 .cli_errors()
                 .iter()
                 .filter(|error| error.contains("one connection per address"))
                 .collect();
-            assert_eq!(said.len(), 2, "{:?}", registry.cli_errors());
-            assert!(said.iter().all(|error| error.contains("'mine'")));
+            assert_eq!(said.len(), 1, "{:?}", registry.cli_errors());
+            assert!(said[0].contains("'mine'"));
         });
 
-        // Aliases are found by server and graph; one that names no graph is under none.
-        let alias = |name: &str, graph: Option<&str>| CliAlias {
-            name: name.into(),
-            server: "c".into(),
-            graph: graph.map(str::to_owned),
-            query: "find".into(),
-            args: Vec::new(),
-            params: Default::default(),
-        };
-        let mut with_aliases = files(&[("c", "http://c.test", None)]);
-        with_aliases.aliases = vec![alias("bare", None), alias("mine", Some("g"))];
-        assert!(apply(cx, with_aliases));
         registry.read_with(cx, |registry, _| {
-            let names: Vec<_> = registry
-                .aliases_for("c", "g")
-                .into_iter()
-                .map(|alias| alias.name)
-                .collect();
-            assert_eq!(names, ["mine"]);
-            assert!(registry.aliases_for("c", "other").is_empty());
+            assert!(registry.aliases_for("c", "g").is_empty())
         });
     }
 
     /// A CLI target renamed on the same endpoint is the same server: its connection, which
-    /// open windows hold, takes the new name, and a token `omnigraph login` writes later
-    /// reaches it. A target moved to a new address takes the graphs remembered for its name.
+    /// open windows hold, takes the new name and asks the CLI as the new target. A target moved
+    /// to a new address takes the graphs remembered for its name. One that names another proxy
+    /// is a new connection, since its client is made with it.
     #[gpui::test]
     async fn a_renamed_cli_target_keeps_its_connection(cx: &mut TestAppContext) {
-        let sent: Arc<Mutex<Vec<String>>> = Arc::default();
-        let seen = sent.clone();
-        let http = FakeHttpClient::create(move |request| {
-            let authorization = request
-                .headers()
-                .get("authorization")
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or_default()
-                .to_owned();
-            seen.lock().unwrap().push(authorization);
-            async move {
-                Ok(Response::builder()
-                    .status(200)
-                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
-                    .body(AsyncBody::from(r#"{"status":"ok","version":"0.14.0"}"#))
-                    .unwrap())
-            }
-        });
-        let registry = cx.new(|_| ConnectionRegistry::empty(http, None));
-        let apply = |cx: &mut TestAppContext, files: OperatorFiles| {
-            registry.update(cx, |registry, cx| {
-                registry.apply_operator_files(files, &SavedServers::default(), cx)
-            })
-        };
+        let (http, sent) = answering();
+        let cli = Arc::new(FakeCli::default());
+        cli.give("old", "one");
+        cli.give("new", "two");
+        let registry = registry_with(http, &cli, cx);
         let at_a = |cx: &mut TestAppContext| {
             registry.read_with(cx, |registry, cx| {
                 registry
@@ -854,36 +1056,93 @@ mod tests {
                     .collect::<Vec<_>>()
             })
         };
-        apply(cx, files(&[("old", "http://a.test", Some("one"))]));
+        apply(
+            &registry,
+            files(vec![server("old", "http://a.test", "1")]),
+            cx,
+        );
         let open = at_a(cx).pop().unwrap();
-        open.update(cx, |connection, _| connection.remember_graph("knowledge"));
+        open.update(cx, |connection, cx| {
+            connection.remember_graph("knowledge");
+            connection.connect(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(token_sent(&open, &sent, cx).as_deref(), Some("Bearer one"));
 
-        assert!(apply(cx, files(&[("new", "http://a.test", Some("one"))])));
+        let renamed = || files(vec![server("new", "http://a.test", "renamed")]);
+        assert!(apply(&registry, renamed(), cx));
+        cx.run_until_parked();
         assert_eq!(at_a(cx), vec![open.clone()], "one connection, the one held");
         open.read_with(cx, |connection, _| {
             assert_eq!(connection.server.name, "new");
             assert_eq!(connection.server.known_graphs, ["knowledge"]);
         });
-        assert!(!apply(cx, files(&[("new", "http://a.test", Some("one"))])));
-
-        // `omnigraph login` under the new name reaches the connection the windows hold.
-        assert!(apply(cx, files(&[("new", "http://a.test", Some("two"))])));
-        let client = open.read_with(cx, |connection, _| connection.client().clone());
-        let health = cx
-            .background_executor
-            .spawn(async move { client.health().await });
-        cx.run_until_parked();
-        drop(health);
-        assert_eq!(sent.lock().unwrap().pop().as_deref(), Some("Bearer two"));
+        assert_eq!(cli.asked(), ["old", "new"]);
+        assert_eq!(token_sent(&open, &sent, cx).as_deref(), Some("Bearer two"));
+        assert!(!apply(&registry, renamed(), cx));
 
         // Moved to another address, it is a new connection with the graphs it had.
-        assert!(apply(cx, files(&[("new", "http://b.test", Some("two"))])));
+        assert!(apply(
+            &registry,
+            files(vec![server("new", "http://b.test", "renamed")]),
+            cx
+        ));
         assert!(at_a(cx).is_empty());
-        let moved = registry.read_with(cx, |registry, cx| registry.find("new", cx).unwrap());
+        let moved = find(&registry, "new", cx).unwrap();
         moved.read_with(cx, |connection, _| {
             assert_eq!(connection.server.url, "http://b.test");
             assert_eq!(connection.server.known_graphs, ["knowledge"]);
         });
+
+        // Through a proxy now: a connection of its own.
+        let mut proxied = server("new", "http://b.test", "renamed");
+        proxied.proxy = Some("http://proxy.test:8080".into());
+        assert!(apply(&registry, files(vec![proxied]), cx));
+        let through = find(&registry, "new", cx).unwrap();
+        assert_ne!(through, moved);
+        through.read_with(cx, |connection, _| {
+            assert_eq!(connection.server.known_graphs, ["knowledge"]);
+        });
+    }
+
+    /// A server whose target is anonymous asks the CLI nothing and sends no token; one that
+    /// turns anonymous drops its token, and one that turns to a token asks the CLI.
+    #[gpui::test]
+    async fn an_anonymous_cli_target_asks_the_cli_nothing(cx: &mut TestAppContext) {
+        let (http, sent) = answering();
+        let cli = Arc::new(FakeCli::default());
+        let registry = registry_with(http, &cli, cx);
+        let mut open = server("open", "http://127.0.0.1:8787", "1");
+        open.auth = CliAuth::Anonymous;
+        apply(&registry, files(vec![open]), cx);
+        let connection = find(&registry, "open", cx).unwrap();
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        cx.run_until_parked();
+        connection.read_with(cx, |connection, _| {
+            assert_eq!(connection.state, crate::ConnectionState::Ready);
+            assert!(!connection.token_from_cli());
+        });
+        assert!(cli.asked().is_empty());
+        assert_eq!(token_sent(&connection, &sent, cx).as_deref(), Some(""));
+
+        cli.give("open", "now-keyed");
+        apply(
+            &registry,
+            files(vec![server("open", "http://127.0.0.1:8787", "2")]),
+            cx,
+        );
+        cx.run_until_parked();
+        assert_eq!(cli.asked(), ["open"]);
+        assert_eq!(
+            token_sent(&connection, &sent, cx).as_deref(),
+            Some("Bearer now-keyed")
+        );
+        let mut anonymous = server("open", "http://127.0.0.1:8787", "3");
+        anonymous.auth = CliAuth::Anonymous;
+        apply(&registry, files(vec![anonymous]), cx);
+        cx.run_until_parked();
+        assert!(cli.asked().is_empty());
+        assert_eq!(token_sent(&connection, &sent, cx).as_deref(), Some(""));
     }
 
     /// A `servers.json` that cannot be parsed is set aside before anything replaces it, and the

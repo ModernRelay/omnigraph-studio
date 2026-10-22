@@ -742,11 +742,15 @@ impl OpenGraphModal {
 
 /// What the chosen server's line says of its state. A 401 says what it was an answer to: a
 /// token the keychain would not give, no token at all (a server Studio has none configured
-/// for, such as a managed CLI target, asks for one), or the token sent.
+/// for asks for one), or the token sent. A CLI server the CLI gave no token is asked nothing,
+/// and says why.
 fn server_status(c: &Connection) -> String {
     match (&c.state, &c.token_unread) {
         (ConnectionState::Unreachable(error), _) => {
             format!("Could not reach the server: {error}")
+        }
+        (ConnectionState::Unauthorized, Some(reason)) if c.token_from_cli() => {
+            format!("The OmniGraph CLI gave no token for this server: {reason}")
         }
         (ConnectionState::Unauthorized, Some(reason)) => format!(
             "The server asks for a token, and Studio could not read it from the keychain: \

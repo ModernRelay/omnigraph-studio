@@ -1177,15 +1177,16 @@ impl GraphSession {
         self.read_stored_queries(true, cx);
     }
 
-    /// Reloads the schema, the branch list, the type counts and the stored queries, and reads
-    /// the server's graph list again if it could not be read before.
+    /// Reloads the schema, the branch list, the type counts and the stored queries, asks the
+    /// CLI for a CLI server's token again, and reads the server's graph list again if it could
+    /// not be read before ([`Connection::refresh`]).
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.reload_schema(cx);
         self.reload_branches(cx);
         self.reload_counts(cx);
         self.reload_stored_queries(cx);
         self.connection
-            .update(cx, |connection, cx| connection.list_graphs_again(cx));
+            .update(cx, |connection, cx| connection.refresh(cx));
     }
 
     /// Reads the graph's stored-query catalog. A graph without stored queries answers an empty
