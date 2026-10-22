@@ -103,6 +103,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # app. Exact: Studio relies on how 0.2.3 installs (specs/017-auto-update/plan.md).
 cargo-packager-updater = "=0.2.3"
 # Reading the bundle's version out of a downloaded update before it is installed.
+# The update key and signature are base64 of minisign's files, as Tauri writes them (spec 017).
+base64 = "0.22"
 flate2 = "1"
 tar = "0.4"
 tempfile = "3"
