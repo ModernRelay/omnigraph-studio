@@ -3,10 +3,13 @@
 //! agent's environment or in one instructions file. Each conversation gets a directory of its
 //! own, `<cwd>/.studio/<branch>/`:
 //!
-//! - `config.yaml` names this conversation's gateway as the target `studio`, its default, with the
-//!   graph;
-//! - `credentials` (`0600`) holds the gateway's session token, never the person's, bound to the
-//!   gateway's address;
+//! - `config.yaml`, OmniGraph's version-1 operator configuration, names this conversation's
+//!   gateway as the server target `studio`, its default, with the graph, at
+//!   `https://127.0.0.1:<port>`;
+//! - `token` (`0600`) holds the gateway's session token, never the person's, which the target
+//!   reads as its token (`auth: {provider: token, source: {file: …}}`);
+//! - `ca.pem` (`0600`) holds the certificate the gateway serves, the only one the target trusts
+//!   (`transport.tls.ca`, `mode: replace`);
 //! - `omnigraph` (`0700`) runs the CLI Studio found with that directory as `OMNIGRAPH_HOME`,
 //!   loopback outside any proxy, and no other OmniGraph variable in its environment: a shell
 //!   script on Unix, a batch file `omnigraph.cmd` on Windows ([`Wrapper`]).
@@ -40,9 +43,10 @@ pub struct CliHome {
     /// so each write opens the folder again by handle (`confined`).
     cwd: PathBuf,
     folder: String,
-    /// The credentials file as written, so a later conversation's file in the same folder is
-    /// left alone when this one ends.
-    credentials: String,
+    /// The token and certificate as written, so a later conversation's files in the same folder
+    /// are left alone when this one ends.
+    token: String,
+    certificate: String,
     /// The home `omnigraph_run` uses, outside the working directory; its runs stage there too.
     private: PathBuf,
     /// The CLI chosen for the conversation, which `omnigraph_run` starts itself, or why there
@@ -54,59 +58,103 @@ pub struct CliHome {
     wrapper_runs: std::sync::atomic::AtomicBool,
 }
 
-/// The target protocol of the home Studio writes (`target_config_version: 1`). A CLI is chosen
-/// only when its `version --json` reports it.
-const TARGET_PROTOCOL: u64 = 1;
+/// What a conversation's CLI home needs to reach its gateway ([`crate::gateway::Gateway::access`]).
+#[derive(Debug, Clone, Copy)]
+pub struct GatewayAccess<'a> {
+    pub port: u16,
+    /// The session token the gateway checks on every request but its health probe.
+    pub token: &'a str,
+    /// The certificate the gateway serves (PEM), which the CLI trusts alone.
+    pub certificate: &'a str,
+}
 
-/// The CLI config naming the gateway on `port` as the target `studio`, its default, with `graph`.
-fn config(port: u16, graph: &str) -> String {
-    format!(
-        "# Written by OmniGraph Studio for one agent conversation (spec 013).\n\
-         target_config_version: 1\n\
-         targets:\n  studio: {{ kind: server, endpoint: \"http://127.0.0.1:{port}\", \
-         credential: studio, default_graph: {} }}\n\
-         defaults:\n  target: studio\n",
-        yaml_string(graph)
-    )
+/// The files of a home besides its config: the session token and the gateway's certificate.
+const TOKEN_FILE: &str = "token";
+const CA_FILE: &str = "ca.pem";
+
+/// The CLI config for the home in `home`, OmniGraph's version-1 operator configuration: the
+/// gateway on `port` as the server target `studio`, its default, with `graph`, reached over HTTPS
+/// with the token in `home`'s `token`, trusting only the certificate in its `ca.pem`, and never
+/// through a proxy. Written by hand, in the plain YAML the CLI reads strictly (no null, tag,
+/// anchor or key it does not know), each file by its absolute path.
+fn config(home: &Path, port: u16, graph: &str) -> String {
+    let home = std::path::absolute(home).unwrap_or_else(|_| home.to_owned());
+    let file = |name: &str| yaml_string(&home.join(name).to_string_lossy());
+    [
+        "# Written by OmniGraph Studio for one agent conversation (spec 013).".to_owned(),
+        "version: 1".into(),
+        "targets:".into(),
+        "  studio:".into(),
+        "    kind: server".into(),
+        format!(
+            "    endpoint: {}",
+            yaml_string(&format!("https://127.0.0.1:{port}"))
+        ),
+        "    auth:".into(),
+        "      provider: token".into(),
+        "      source:".into(),
+        format!("        file: {}", file(TOKEN_FILE)),
+        "    transport:".into(),
+        "      tls:".into(),
+        "        ca:".into(),
+        "          mode: replace".into(),
+        format!("          file: {}", file(CA_FILE)),
+        "      proxy:".into(),
+        "        mode: direct".into(),
+        format!("    default_graph: {}", yaml_string(graph)),
+        "defaults:".into(),
+        "  target: studio".into(),
+    ]
+    .map(|line| format!("{line}\n"))
+    .concat()
 }
 
 impl Drop for CliHome {
     fn drop(&mut self) {
         // Opened, not made: a folder removed meanwhile is not made again to be cleaned.
         if let Ok(home) = Confined::open(&self.cwd).and_then(|cwd| cwd.existing_dirs(&self.folder))
-            && home.holds("credentials", self.credentials.as_bytes())
         {
-            home.remove("credentials".as_ref()).ok();
+            for (name, written) in [(TOKEN_FILE, &self.token), (CA_FILE, &self.certificate)] {
+                if home.holds(name, written.as_bytes()) {
+                    home.remove(name.as_ref()).ok();
+                }
+            }
         }
         std::fs::remove_dir_all(&self.private).ok();
     }
 }
 
 impl CliHome {
-    /// Writes the conversation's directory, config and credentials, and the private home
+    /// Writes the conversation's directory, config, token and certificate, and the private home
     /// `omnigraph_run` uses, in a folder of its own under `private_root`. The wrapper is written
     /// by [`CliHome::use_cli`] once a CLI is chosen.
     pub fn write(
         cwd: &Path,
         private_root: &Path,
-        port: u16,
-        token: &str,
+        gateway: GatewayAccess<'_>,
         graph: &str,
         branch: &str,
         base: &str,
     ) -> std::io::Result<Self> {
         let name = branch.replace('/', "-");
-        let config = config(port, graph);
-        // The CLI sends a saved token only under the address it was saved for.
-        let credentials =
-            format!("[studio]\ntoken = {token}\nendpoint = http://127.0.0.1:{port}\n");
-        // Private: the credentials hold the gateway's token.
+        let dir = cwd.join(".studio").join(&name);
+        // Each home names its own files, by their absolute paths.
+        let fill = |home: &Confined, at: &Path| -> std::io::Result<()> {
+            let config = config(at, gateway.port, graph);
+            home.write("config.yaml", config.as_bytes(), 0o600)?;
+            home.write(TOKEN_FILE, gateway.token.as_bytes(), 0o600)?;
+            home.write(CA_FILE, gateway.certificate.as_bytes(), 0o600)?;
+            // An older Studio kept its token in the CLI's former `credentials` file; that
+            // gateway is gone, and the CLI no longer reads the file.
+            home.remove("credentials".as_ref()).ok();
+            Ok(())
+        };
+        // Private: the token is the gateway's.
         let studio = Confined::open(cwd)?.dir(".studio")?;
         studio.set_mode(0o700)?;
         let home = studio.dir(&name)?;
         home.set_mode(0o700)?;
-        home.write("config.yaml", config.as_bytes(), 0o600)?;
-        home.write("credentials", credentials.as_bytes(), 0o600)?;
+        fill(&home, &dir)?;
 
         std::fs::create_dir_all(private_root)?;
         let root = Confined::open(private_root)?;
@@ -114,10 +162,9 @@ impl CliHome {
         let folder = format!("{name}-{}", crate::confined::random_hex(8)?);
         let own = root.dir(&folder)?;
         own.set_mode(0o700)?;
-        own.write("config.yaml", config.as_bytes(), 0o600)?;
-        own.write("credentials", credentials.as_bytes(), 0o600)?;
+        let private = private_root.join(folder);
+        fill(&own, &private)?;
 
-        let dir = cwd.join(".studio").join(&name);
         Ok(Self {
             command: dir.join(WRAPPER_NAME),
             dir,
@@ -126,8 +173,9 @@ impl CliHome {
             base: base.to_owned(),
             cwd: cwd.to_owned(),
             folder: format!(".studio/{name}"),
-            credentials,
-            private: private_root.join(folder),
+            token: gateway.token.to_owned(),
+            certificate: gateway.certificate.to_owned(),
+            private,
             cli: std::sync::Mutex::new(Err("Studio has not chosen an omnigraph CLI yet.".into())),
             wrapper_runs: std::sync::atomic::AtomicBool::new(true),
         })
@@ -239,10 +287,11 @@ impl CliHome {
         let wrapper_runs = self.wrapper_runs.load(std::sync::atomic::Ordering::Relaxed);
         match cli_ready {
             Some(false) => format!(
-                "Studio found no omnigraph CLI that speaks this graph's HTTP API, so the graph is \
-                 not available in this conversation. Tell the person: they can install a \
-                 matching omnigraph CLI or set `agent.omnigraph_cli`. Your branch would be \
-                 {branch}.",
+                "Studio found no omnigraph CLI that speaks this graph's HTTP API and reads \
+                 OmniGraph's version-1 operator configuration, so the graph is not available in \
+                 this conversation. Tell the person: they can install an OmniGraph edge build \
+                 made from main at {FIRST_CLI_COMMIT} or later, or set `agent.omnigraph_cli`. \
+                 Your branch would be {branch}.",
                 branch = self.branch
             ),
             _ if !wrapper_runs => format!(
@@ -371,8 +420,31 @@ pub struct CliFacts {
     pub target_protocol: Option<u64>,
 }
 
-/// How long a CLI may take to print its version. The tests' stand-ins are shell scripts that a
-/// loaded machine can take seconds to start, and the choice, not the limit, is what they check.
+/// The target protocols (`protocols.target`) of a CLI that may read the home Studio writes. CLIs
+/// from before and after OmniGraph's version-1 operator configuration both report 1, and a later
+/// one reports 2 for that configuration; either way only the CLI's own check of the config
+/// Studio wrote ([`validate`]) tells.
+const TARGET_PROTOCOLS: &[u64] = &[1, 2];
+
+/// The OmniGraph main commit whose CLI first reads the home Studio writes: its version-1
+/// operator configuration with one `auth` per server target. An earlier build with that
+/// configuration (`edge-20261021-888223b`) reads a server target's `auth` as a map of named
+/// entries, and refuses Studio's.
+pub const FIRST_CLI_COMMIT: &str = "ff542202";
+
+/// How to install the newest edge build of OmniGraph, as its install guide gives it.
+const INSTALL_EDGE: &str = if cfg!(windows) {
+    "iwr -UseBasicParsing https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.ps1 \
+     -OutFile install.ps1; powershell -NoProfile -ExecutionPolicy Bypass -File .\\install.ps1 \
+     -ReleaseChannel edge"
+} else {
+    "curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh \
+     | RELEASE_CHANNEL=edge bash"
+};
+
+/// How long a CLI may take to print its version or check a config. The tests' stand-ins are
+/// shell scripts that a loaded machine can take seconds to start, and the choice, not the limit,
+/// is what they check.
 const VERSION_TIMEOUT: Duration = if cfg!(test) {
     Duration::from_secs(60)
 } else {
@@ -383,9 +455,12 @@ const VERSION_TIMEOUT: Duration = if cfg!(test) {
 /// `version --json` reports them (`http_contract` in every OmniGraph Studio supports,
 /// `protocols.target` in one with targets).
 pub async fn cli_facts(cli: &Path) -> CliFacts {
-    let json = output(cli, &["version", "--json"])
+    let mut command = std::process::Command::new(cli);
+    command.args(["version", "--json"]);
+    let json = bounded(command)
         .await
-        .and_then(|json| serde_json::from_slice::<serde_json::Value>(&json).ok());
+        .filter(|output| output.status.success())
+        .and_then(|output| serde_json::from_slice::<serde_json::Value>(&output.stdout).ok());
     let field = |name: &str| {
         json.as_ref()?
             .get(name)
@@ -402,21 +477,111 @@ pub async fn cli_facts(cli: &Path) -> CliFacts {
     }
 }
 
-/// A CLI's standard output when it exits with success within [`VERSION_TIMEOUT`].
-async fn output(cli: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let run = smol::process::Command::new(cli)
-        .args(args)
+/// `command`'s exit and output when it ends within [`VERSION_TIMEOUT`], its standard input
+/// empty; past it, the process is stopped and there is none.
+async fn bounded(command: std::process::Command) -> Option<std::process::Output> {
+    let run = smol::process::Command::from(command)
         .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .output()
         .fuse();
     let timeout = smol::Timer::after(VERSION_TIMEOUT).fuse();
     futures::pin_mut!(run, timeout);
     futures::select! {
-        output = run => output.ok().filter(|output| output.status.success()).map(|output| output.stdout),
+        output = run => output.ok(),
         _ = timeout => None,
     }
+}
+
+/// Why a CLI Studio found is not the conversation's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unfit {
+    /// It did not answer `version --json`: older than 0.14, or not OmniGraph's.
+    Silent,
+    /// It speaks this other HTTP contract.
+    Contract(String),
+    /// It reports no target protocol (it has no CLI targets), or one Studio does not know.
+    TargetProtocol(Option<u64>),
+    /// It has no `config validate`: it predates OmniGraph's version-1 operator configuration.
+    NoValidate,
+    /// Its `config validate` refused the config Studio wrote, saying this.
+    Refused(String),
+    /// Studio could not write the wrapper that runs it.
+    Wrapper(String),
+}
+
+/// Whether `cli` can be the conversation's: its `version --json` says it speaks `contract` with
+/// a target protocol Studio knows, and its own check of the config Studio wrote in `home`
+/// passes ([`validate`]).
+async fn probe(home: &CliHome, cli: &Path, contract: &str) -> (CliFacts, Result<(), Unfit>) {
+    let facts = cli_facts(cli).await;
+    let fit = match (&facts.contract, facts.target_protocol) {
+        (None, _) => Err(Unfit::Silent),
+        (Some(speaks), _) if speaks != contract => Err(Unfit::Contract(speaks.clone())),
+        (_, protocol) if !protocol.is_some_and(|known| TARGET_PROTOCOLS.contains(&known)) => {
+            Err(Unfit::TargetProtocol(protocol))
+        }
+        _ => validate(home, cli).await,
+    };
+    (facts, fit)
+}
+
+/// Runs `cli config validate --operator-config` on the config of `home`'s private home, as
+/// `omnigraph_run` starts the CLI (that home as `OMNIGRAPH_HOME`, no other OmniGraph variable).
+/// The CLI reads the whole file as it would for a command, offline: no token, certificate,
+/// server or credential helper. A CLI from before the version-1 configuration has no such
+/// command, which its parser says.
+async fn validate(home: &CliHome, cli: &Path) -> Result<(), Unfit> {
+    let mut command = home.command(cli, &home.private);
+    command
+        .args(["config", "validate", "--operator-config"])
+        .arg(home.private.join("config.yaml"));
+    let Some(output) = bounded(command).await else {
+        return Err(Unfit::Refused(format!(
+            "it did not answer within {} s",
+            VERSION_TIMEOUT.as_secs()
+        )));
+    };
+    if output.status.success() {
+        return Ok(());
+    }
+    let said = String::from_utf8_lossy(&output.stderr);
+    if said.contains("unrecognized subcommand 'config'")
+        || said.contains("unexpected argument '--operator-config'")
+    {
+        return Err(Unfit::NoValidate);
+    }
+    Err(Unfit::Refused(first_line(&said).unwrap_or_else(|| {
+        format!(
+            "it exited with {}",
+            output
+                .status
+                .code()
+                .map_or("a signal".to_owned(), |code| code.to_string())
+        )
+    })))
+}
+
+/// The first line of `text` that says something, without an `error:` label or control
+/// characters, cut short of a notice's length.
+fn first_line(text: &str) -> Option<String> {
+    const MOST: usize = 240;
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let line = ["Error: ", "error: "]
+        .iter()
+        .find_map(|label| line.strip_prefix(label))
+        .unwrap_or(line);
+    let mut said: String = line
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MOST)
+        .collect();
+    if line.chars().count() > MOST {
+        said.push('…');
+    }
+    Some(said)
 }
 
 /// The conversation's CLI, or why it has none.
@@ -429,65 +594,79 @@ pub enum CliChoice {
         /// the CLI only by a path a batch file can hold; `omnigraph_run` runs it either way.
         wrapper: bool,
     },
-    /// No candidate speaks the graph's contract: each one found, with what it said.
-    NoMatch { found: Vec<(PathBuf, CliFacts)> },
+    /// No candidate fits: each one found, with what it said and why it does not.
+    NoMatch {
+        found: Vec<(PathBuf, CliFacts, Unfit)>,
+    },
 }
 
 /// Chooses the conversation's CLI from `candidates`, in their order: the first that speaks
-/// `contract`, as the CLI itself reports it, so a slow or unavailable server never decides it.
-/// With no match the wrapper runs nothing and says why, rather than pointing at a CLI the server
-/// would refuse.
+/// `contract` and takes the config Studio wrote, as the CLI itself reports and checks, so a slow
+/// or unavailable server never decides it. With no match the wrapper runs nothing and says why,
+/// rather than pointing at a CLI the server or the home would refuse.
 pub async fn choose_cli(home: &CliHome, candidates: Vec<PathBuf>, contract: &str) -> CliChoice {
-    // Every candidate is asked at once and heard in order: the first that speaks the contract
-    // is chosen as soon as those before it have answered, and the probes after it are dropped,
-    // which stops their processes. A hung wrapper later on the path delays nothing.
+    // Every candidate is asked at once and heard in order: the first that fits is chosen as soon
+    // as those before it have answered, and the probes after it are dropped, which stops their
+    // processes. A hung wrapper later on the path delays nothing.
     let mut probes: futures::stream::FuturesOrdered<_> = candidates
         .iter()
         .cloned()
-        .map(|cli| async move { cli_facts(&cli).await })
+        .map(|cli| async move { probe(home, &cli, contract).await })
         .collect();
     let mut found = Vec::new();
     for cli in candidates {
-        let Some(facts) = futures::StreamExt::next(&mut probes).await else {
+        let Some((facts, fit)) = futures::StreamExt::next(&mut probes).await else {
             break;
         };
-        if facts.contract.as_deref() == Some(contract)
-            && facts.target_protocol == Some(TARGET_PROTOCOL)
-            && let Ok(wrapper) = home.use_cli(&cli)
-        {
-            return CliChoice::Chosen {
-                cli,
-                version: facts.version,
-                wrapper,
-            };
-        }
-        found.push((cli, facts));
+        let unfit = match fit.map(|()| home.use_cli(&cli)) {
+            Ok(Ok(wrapper)) => {
+                return CliChoice::Chosen {
+                    cli,
+                    version: facts.version,
+                    wrapper,
+                };
+            }
+            Ok(Err(error)) => Unfit::Wrapper(error.to_string()),
+            Err(unfit) => unfit,
+        };
+        found.push((cli, facts, unfit));
     }
     home.refuse(&no_cli_text(contract, &found)).ok();
     CliChoice::NoMatch { found }
 }
 
-/// Why a conversation has no CLI: the contract the graph needs, CLI targets, and each CLI found.
-pub fn no_cli_text(contract: &str, found: &[(PathBuf, CliFacts)]) -> String {
-    let mut text =
-        format!("No omnigraph CLI here speaks this graph's HTTP API ({contract}) with CLI targets");
+/// Why a conversation has no CLI: what the graph and the home need, each CLI found with why it
+/// does not fit, and what to install.
+pub fn no_cli_text(contract: &str, found: &[(PathBuf, CliFacts, Unfit)]) -> String {
+    let mut text = format!(
+        "No omnigraph CLI here speaks this graph's HTTP API ({contract}) and reads OmniGraph's \
+         version-1 operator configuration, which Studio writes for the agent's CLI"
+    );
     if found.is_empty() {
         text.push_str(": Studio found none");
     } else {
         let each: Vec<String> = found
             .iter()
-            .map(|(cli, facts)| {
+            .map(|(cli, facts, unfit)| {
                 let it = facts.version.as_deref().unwrap_or("a CLI");
-                let what = match (&facts.contract, facts.target_protocol) {
-                    (None, _) => "older than 0.14, or not OmniGraph's: it did not answer \
-                                  `version --json`"
+                let what = match unfit {
+                    Unfit::Silent => "older than 0.14, or not OmniGraph's: it did not answer \
+                                      `version --json`"
                         .to_owned(),
-                    (Some(speaks), _) if speaks != contract => {
-                        format!("{it}, which speaks {speaks}")
-                    }
-                    (Some(_), None) => format!("{it}, which has no CLI targets"),
-                    (Some(_), Some(protocol)) => {
+                    Unfit::Contract(speaks) => format!("{it}, which speaks {speaks}"),
+                    Unfit::TargetProtocol(None) => format!("{it}, which has no CLI targets"),
+                    Unfit::TargetProtocol(Some(protocol)) => {
                         format!("{it}, which reads target protocol {protocol}")
+                    }
+                    Unfit::NoValidate => format!(
+                        "{it}, which predates that configuration: it has no `config validate`"
+                    ),
+                    Unfit::Refused(said) => format!(
+                        "{it}, whose `config validate` refused the configuration Studio wrote \
+                         ({said})"
+                    ),
+                    Unfit::Wrapper(error) => {
+                        format!("{it}, whose wrapper Studio could not write ({error})")
                     }
                 };
                 format!("{} is {what}", cli.display())
@@ -497,8 +676,9 @@ pub fn no_cli_text(contract: &str, found: &[(PathBuf, CliFacts)]) -> String {
         text.push_str(&each.join("; "));
     }
     text.push_str(&format!(
-        ". Install an omnigraph that speaks {contract} with CLI targets (OmniGraph \
-         edge-20261020-7fd9cc9 or later), or set `agent.omnigraph_cli` to one."
+        ". Install an OmniGraph edge build made from main at {FIRST_CLI_COMMIT} or later \
+         (edge-20261021-888223b is older and refuses it), for the newest: `{INSTALL_EDGE}`. Or \
+         set `agent.omnigraph_cli` to such a CLI."
     ));
     text
 }
@@ -584,10 +764,11 @@ impl RunCommand {
 /// CLI connects, which configuration, profile, home or credentials it uses, or a program it
 /// runs. An operator file can name a credential command the CLI runs before any request, so
 /// `--operator-config` and the like would run the agent's program outside its sandbox, and a
-/// flag a later CLI adds stays refused until it is listed here. `--page-token` stays out with
-/// every flag named for a token: the commands that take it read every page without it. `--yes`
-/// passes where the CLI asks before a destructive write, which it refuses with no terminal,
-/// and `omnigraph_run` gives it none. The gateway still decides each write.
+/// flag a later CLI adds stays refused until it is listed here. `--page-token` passes where a
+/// command pages (`commit list`, `branch diff`, `commit changes`): it is the opaque cursor of
+/// the server's next page, which the CLI sends as a query parameter to the gateway, never a
+/// credential. `--yes` passes where the CLI asks before a destructive write, which it refuses
+/// with no terminal, and `omnigraph_run` gives it none. The gateway still decides each write.
 const RUN_TABLE: &[RunCommand] = &[
     RunCommand {
         words: &["query"],
@@ -678,6 +859,7 @@ const RUN_TABLE: &[RunCommand] = &[
         flags: &[
             ("--into", Takes::Value),
             ("--limit", Takes::Value),
+            ("--page-token", Takes::Value),
             ("--kind", Takes::Value),
             ("--type", Takes::Value),
             ("--op", Takes::Value),
@@ -754,6 +936,7 @@ const RUN_TABLE: &[RunCommand] = &[
             ("--unpublished", Takes::Nothing),
             ("--unattached", Takes::Nothing),
             ("--limit", Takes::Value),
+            ("--page-token", Takes::Value),
             ("--json", Takes::Nothing),
         ],
         reach: Reach::Graph,
@@ -769,6 +952,7 @@ const RUN_TABLE: &[RunCommand] = &[
         positionals: 1,
         flags: &[
             ("--limit", Takes::Value),
+            ("--page-token", Takes::Value),
             ("--kind", Takes::Value),
             ("--type", Takes::Value),
             ("--op", Takes::Value),
@@ -1665,47 +1849,122 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
 
-    /// The first candidate that speaks the graph's contract is chosen, as the CLI reports it and
-    /// with no server behind the gateway; with none, the wrapper runs nothing and names each CLI
-    /// found.
+    /// A stand-in for a gateway's certificate, where no gateway runs.
+    const CERTIFICATE: &str = "-----BEGIN CERTIFICATE-----\nstand-in\n-----END CERTIFICATE-----\n";
+
+    /// A gateway on `port` with `token`, as a home's tests write it.
+    fn access(port: u16, token: &str) -> GatewayAccess<'_> {
+        GatewayAccess {
+            port,
+            token,
+            certificate: CERTIFICATE,
+        }
+    }
+
+    /// A fake CLI in `dir` that answers `version --json` with `version` (when given) and, when
+    /// `validates`, `config validate` on the private home's config, as written in the OmniGraph
+    /// format version 1, run with that home; every other command fails, as one would with no
+    /// server behind the gateway. `config` is what it does with `config …` otherwise.
+    #[cfg(unix)]
+    fn fake_cli(dir: &Path, name: &str, version: Option<&str>, config: &str) -> PathBuf {
+        let path = dir.join(name);
+        let version = version
+            .map(|json| {
+                format!("[ \"$1 $2\" = \"version --json\" ] && {{ echo '{json}'; exit 0; }}\n")
+            })
+            .unwrap_or_default();
+        std::fs::write(&path, format!("#!/bin/sh\n{version}{config}\nexit 2\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// What a CLI that reads OmniGraph's version-1 operator configuration does with
+    /// `config validate --operator-config FILE`: exits 0 for the private home's file in that
+    /// form, run with that home, and refuses anything else.
+    const VALIDATES: &str = r#"if [ "$1 $2 $3" = "config validate --operator-config" ]; then
+  if [ "$4" = "$OMNIGRAPH_HOME/config.yaml" ] && grep -qx 'version: 1' "$4" && ! grep -q target_config_version "$4"; then
+    echo "operator configuration is valid"; exit 0
+  fi
+  echo "Error: target_config_invalid: operator config '$4' is not one" >&2; exit 1
+fi"#;
+
+    /// The first candidate that speaks the graph's contract with a target protocol Studio knows,
+    /// and whose own `config validate` takes the home Studio wrote, is chosen, with no server
+    /// behind the gateway. A CLI from before OmniGraph's version-1 operator configuration (it has
+    /// no `config validate`, as the installed edge build `0.14.0-edge+50283ce` has none), one that
+    /// refuses the home, one that reports a target protocol Studio does not know, and one
+    /// without targets are passed over; with none left, the wrapper runs nothing and its refusal
+    /// names each CLI found, why, and the first build that works.
     #[cfg(unix)]
     #[test]
-    fn the_cli_that_speaks_the_contract_is_chosen_without_a_server() {
+    fn the_cli_that_reads_the_home_studio_writes_is_chosen_without_a_server() {
         let dir = std::env::temp_dir().join(format!("studio-cli-choice-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
-        let fake = |name: &str, body: &str| {
-            let path = dir.join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            path
-        };
-        // 0.13.0 predates `version --json`; every other command fails, as one would with no
-        // server behind the gateway.
+        let fake = |name, version, config| fake_cli(&dir, name, version, config);
+        // 0.13.0 predates `version --json`.
         let old = fake(
             "omnigraph-0.13",
-            r#"[ "$1" = --version ] && { echo "omnigraph 0.13.0"; exit 0; }; exit 2"#,
+            None,
+            r#"[ "$1" = --version ] && { echo "omnigraph 0.13.0"; exit 0; }"#,
         );
-        // Speaks the contract but has no targets, so it would refuse the home's config.
+        // Speaks the contract but has no targets.
         let untargeted = fake(
             "omnigraph-0.14",
-            r#"[ "$1 $2" = "version --json" ] && { echo '{"version":"0.14.0","http_contract":"0.14"}'; exit 0; }; exit 2"#,
+            Some(r#"{"version":"0.14.0","http_contract":"0.14"}"#),
+            "",
+        );
+        // The edge build before the version-1 configuration: its parser knows no `config`.
+        let before = fake(
+            "omnigraph-50283ce",
+            Some(
+                r#"{"version":"0.14.0-edge+50283ce","http_contract":"0.14","protocols":{"target":1,"credential":1}}"#,
+            ),
+            r#"[ "$1" = config ] && { echo "error: unrecognized subcommand 'config'" >&2; exit 2; }"#,
+        );
+        // A build with the version-1 configuration that reads it otherwise.
+        let early = fake(
+            "omnigraph-888223b",
+            Some(
+                r#"{"version":"0.14.0-edge+888223b","http_contract":"0.14","protocols":{"target":1,"credential":1}}"#,
+            ),
+            r#"[ "$1 $2" = "config validate" ] && { printf 'Error: invalid operator configuration: targets.studio: invalid type: map\n\nLocation:\n  x\n' >&2; exit 1; }"#,
         );
         let current = fake(
-            "omnigraph-targets",
-            r#"[ "$1 $2" = "version --json" ] && { echo '{"version":"0.14.0-edge+7fd9cc9","http_contract":"0.14","protocols":{"target":1,"credential":1}}'; exit 0; }; exit 2"#,
+            "omnigraph-ff54220",
+            Some(
+                r#"{"version":"0.14.0-edge+ff54220","http_contract":"0.14","protocols":{"target":1,"credential":1}}"#,
+            ),
+            VALIDATES,
+        );
+        // A later CLI that says it reads the version-1 configuration by its target protocol is
+        // still asked to check the home.
+        let later = fake(
+            "omnigraph-later",
+            Some(r#"{"version":"0.15.0","http_contract":"0.14","protocols":{"target":2}}"#),
+            VALIDATES,
+        );
+        let later_refusing = fake(
+            "omnigraph-later-refusing",
+            Some(r#"{"version":"0.15.1","http_contract":"0.14","protocols":{"target":2}}"#),
+            r#"[ "$1 $2" = "config validate" ] && exit 3"#,
+        );
+        let unknown_protocol = fake(
+            "omnigraph-target-3",
+            Some(r#"{"version":"0.16.0","http_contract":"0.14","protocols":{"target":3}}"#),
+            VALIDATES,
         );
         // A wrapper that hangs: a match before it is chosen without waiting for it.
-        let hung = fake("omnigraph-hung", "sleep 30");
+        let hung = fake("omnigraph-hung", None, "sleep 30");
         let other = fake(
             "omnigraph-0.15",
-            r#"[ "$1 $2" = "version --json" ] && { echo '{"version":"0.15.0","http_contract":"0.15","protocols":{"target":1}}'; exit 0; }; exit 2"#,
+            Some(r#"{"version":"0.15.0","http_contract":"0.15","protocols":{"target":2}}"#),
+            VALIDATES,
         );
         let home = CliHome::write(
             &dir,
             &dir.join("private"),
-            1,
-            "t",
+            access(1, "t"),
             "knowledge",
             "agent-x",
             "main",
@@ -1715,68 +1974,98 @@ mod tests {
         let choose = |candidates: Vec<PathBuf>| {
             smol::block_on(choose_cli(&home, candidates, graph_client::CONTRACT))
         };
+        let chosen = |candidates: Vec<PathBuf>| match choose(candidates) {
+            CliChoice::Chosen { cli, .. } => cli,
+            other => panic!("{other:?}"),
+        };
 
-        match choose(vec![old.clone(), untargeted.clone(), current.clone()]) {
+        match choose(vec![
+            old.clone(),
+            untargeted.clone(),
+            before.clone(),
+            early.clone(),
+            current.clone(),
+        ]) {
             CliChoice::Chosen {
                 cli,
                 version,
                 wrapper,
             } => {
                 assert_eq!(cli, current);
-                assert_eq!(version.as_deref(), Some("0.14.0-edge+7fd9cc9"));
+                assert_eq!(version.as_deref(), Some("0.14.0-edge+ff54220"));
                 assert!(wrapper, "a shell script names any path");
             }
             other => panic!("{other:?}"),
         }
         assert!(wrapper().contains(&*current.to_string_lossy()));
-        // Both homes name the gateway as the target `studio`, the default.
-        for path in [
-            home.dir.join("config.yaml"),
-            home.private.join("config.yaml"),
-        ] {
-            let config = std::fs::read_to_string(path).unwrap();
-            assert!(config.contains("target_config_version: 1\n"), "{config}");
-            assert!(
-                config.contains(
-                    "studio: { kind: server, endpoint: \"http://127.0.0.1:1\", credential: studio, default_graph: \"knowledge\" }"
-                ),
-                "{config}"
-            );
-            assert!(config.contains("defaults:\n  target: studio\n"), "{config}");
-        }
-        // Studio's own reading of the CLI's files sends the token to the gateway: the endpoint
-        // it is saved for covers the target's.
-        let files = graph_store::cli_config::read_operator(Some(&home.private));
-        assert!(files.errors.is_empty(), "{:?}", files.errors);
-        let servers = files.servers.unwrap();
-        assert_eq!(servers.len(), 1);
+        assert_eq!(chosen(vec![other.clone(), later.clone()]), later);
         assert_eq!(
-            (servers[0].0.name.as_str(), servers[0].1.as_deref()),
-            ("studio", Some("t"))
+            chosen(vec![
+                unknown_protocol.clone(),
+                later_refusing.clone(),
+                current.clone()
+            ]),
+            current
         );
 
-        match choose(vec![other.clone(), current.clone()]) {
-            CliChoice::Chosen { cli, .. } => assert_eq!(cli, current),
-            other => panic!("{other:?}"),
-        }
-
         let started = std::time::Instant::now();
-        match choose(vec![current.clone(), hung.clone()]) {
-            CliChoice::Chosen { cli, .. } => assert_eq!(cli, current),
-            other => panic!("{other:?}"),
-        }
+        assert_eq!(chosen(vec![current.clone(), hung.clone()]), current);
         assert!(
             started.elapsed() < Duration::from_secs(15),
             "waited for the hung CLI after the match: {:?}",
             started.elapsed()
         );
 
-        match choose(vec![old.clone(), untargeted.clone(), other.clone()]) {
+        let refused = vec![
+            old.clone(),
+            untargeted.clone(),
+            before.clone(),
+            early.clone(),
+            later_refusing.clone(),
+            unknown_protocol.clone(),
+            other.clone(),
+        ];
+        match choose(refused) {
             CliChoice::NoMatch { found } => {
+                let unfit: Vec<&Unfit> = found.iter().map(|(_, _, unfit)| unfit).collect();
+                assert_eq!(
+                    unfit,
+                    [
+                        &Unfit::Silent,
+                        &Unfit::TargetProtocol(None),
+                        &Unfit::NoValidate,
+                        &Unfit::Refused(
+                            "invalid operator configuration: targets.studio: invalid type: map"
+                                .into()
+                        ),
+                        &Unfit::Refused("it exited with 3".into()),
+                        &Unfit::TargetProtocol(Some(3)),
+                        &Unfit::Contract("0.15".into()),
+                    ]
+                );
                 let text = no_cli_text(graph_client::CONTRACT, &found);
-                assert!(text.contains("older than 0.14"), "{text}");
-                assert!(text.contains("0.14.0, which has no CLI targets"), "{text}");
-                assert!(text.contains("0.15.0, which speaks 0.15"), "{text}");
+                for says in [
+                    "speaks this graph's HTTP API (0.14) and reads OmniGraph's version-1 operator \
+                     configuration",
+                    "omnigraph-0.13 is older than 0.14",
+                    "0.14.0, which has no CLI targets",
+                    &format!(
+                        "{} is 0.14.0-edge+50283ce, which predates that configuration: it has no \
+                         `config validate`",
+                        before.display()
+                    ),
+                    "0.14.0-edge+888223b, whose `config validate` refused the configuration \
+                     Studio wrote (invalid operator configuration: targets.studio: invalid type: \
+                     map)",
+                    "0.16.0, which reads target protocol 3",
+                    "0.15.0, which speaks 0.15",
+                    "edge build made from main at ff542202 or later",
+                    "edge-20261021-888223b is older",
+                    "RELEASE_CHANNEL=edge",
+                    "`agent.omnigraph_cli`",
+                ] {
+                    assert!(text.contains(says), "{says}: {text}");
+                }
             }
             other => panic!("{other:?}"),
         }
@@ -1787,8 +2076,141 @@ mod tests {
             .output()
             .unwrap();
         assert!(!run.status.success());
-        assert!(String::from_utf8_lossy(&run.stderr).contains("No omnigraph CLI here speaks"));
+        let said = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            said.contains("No omnigraph CLI here speaks") && said.contains("ff542202"),
+            "{said}"
+        );
+        // The installed CLI is the one from before the version-1 configuration: it is passed
+        // over in the same words, when it is there.
+        let installed = std::env::home_dir().map(|home| home.join(".local/bin/omnigraph"));
+        if let Some(installed) = installed.filter(|cli| is_executable(cli)) {
+            let facts = smol::block_on(cli_facts(&installed));
+            if facts.version.as_deref() == Some("0.14.0-edge+50283ce") {
+                match choose(vec![installed]) {
+                    CliChoice::NoMatch { found } => assert_eq!(found[0].2, Unfit::NoValidate),
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Both homes hold OmniGraph's version-1 operator configuration as its own schema and
+    /// parser require it: `version: 1` and no `target_config_version`; the gateway as the server
+    /// target `studio` at `https://127.0.0.1:<port>`, the default target, with the graph; its
+    /// token read from the home's `token` file (the session token, a bearer token as the CLI
+    /// reads one) and only the home's `ca.pem` trusted, both by absolute path and private; no
+    /// proxy; and none of what the CLI refuses (a null, a key it does not know). The schema
+    /// refuses the former form and a token sent over plain HTTP, so the check is not empty.
+    #[test]
+    fn the_home_is_omnigraphs_version_1_operator_configuration() {
+        let cwd = std::env::temp_dir().join(format!("studio-cli-format-{}", std::process::id()));
+        std::fs::remove_dir_all(&cwd).ok();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let certificate = crate::gateway_tls::identity().unwrap().certificate;
+        let token = crate::confined::random_hex(32).unwrap();
+        let home = CliHome::write(
+            &cwd,
+            &cwd.join("private"),
+            GatewayAccess {
+                port: 49152,
+                token: &token,
+                certificate: &certificate,
+            },
+            "knowledge",
+            "agent/20261021-101500",
+            "main",
+        )
+        .unwrap();
+        let schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../fixtures/omnigraph-operator-config.schema.json"
+        ))
+        .unwrap();
+        // Plain block mappings alone, each value a lower-case word or a JSON-quoted string: no
+        // anchor, alias, tag, flow collection or block scalar.
+        let plain = regex::Regex::new(r#"\A( *)[a-z_]+:( [a-z0-9]+| ".*")?\z"#).unwrap();
+        let bearer = regex::Regex::new(r"\A[A-Za-z0-9._~+/-]+=*\z").unwrap();
+        fn no_null(value: &serde_json::Value) -> bool {
+            match value {
+                serde_json::Value::Null => false,
+                serde_json::Value::Array(items) => items.iter().all(no_null),
+                serde_json::Value::Object(fields) => fields.values().all(no_null),
+                _ => true,
+            }
+        }
+        for dir in [home.dir.clone(), home.private.clone()] {
+            let text = std::fs::read_to_string(dir.join("config.yaml")).unwrap();
+            assert!(!text.contains("target_config_version"), "{text}");
+            for line in text.lines().filter(|line| !line.starts_with('#')) {
+                assert!(plain.is_match(line), "{line}");
+            }
+            let config: serde_json::Value = serde_norway::from_str(&text).unwrap();
+            let errors = crate::json_schema::errors(&schema, &config);
+            assert!(errors.is_empty(), "{errors:?}\n{text}");
+            assert!(no_null(&config), "{text}");
+            let path = |name: &str| {
+                let path = std::path::absolute(dir.join(name)).unwrap();
+                serde_json::Value::String(path.to_string_lossy().into_owned())
+            };
+            assert_eq!(
+                config,
+                serde_json::json!({
+                    "version": 1,
+                    "targets": {
+                        "studio": {
+                            "kind": "server",
+                            "endpoint": "https://127.0.0.1:49152",
+                            "auth": { "provider": "token", "source": { "file": path("token") } },
+                            "transport": {
+                                "tls": { "ca": { "mode": "replace", "file": path("ca.pem") } },
+                                "proxy": { "mode": "direct" },
+                            },
+                            "default_graph": "knowledge",
+                        },
+                    },
+                    "defaults": { "target": "studio" },
+                })
+            );
+            let saved = std::fs::read_to_string(dir.join("token")).unwrap();
+            assert_eq!(saved, token);
+            assert!(
+                bearer.is_match(&saved),
+                "a bearer token as the CLI reads one"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.join("ca.pem")).unwrap(),
+                certificate
+            );
+            assert!(!dir.join("credentials").exists());
+            #[cfg(unix)]
+            for name in ["config.yaml", "token", "ca.pem"] {
+                let mode = std::fs::metadata(dir.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o600, "{name}");
+            }
+        }
+        for refused in [
+            serde_json::json!({ "target_config_version": 1, "targets": {} }),
+            serde_json::json!({
+                "version": 1,
+                "targets": { "studio": {
+                    "kind": "server",
+                    "endpoint": "http://127.0.0.1:49152",
+                    "auth": { "provider": "token", "source": { "file": "/t" } },
+                } },
+            }),
+            serde_json::json!({ "version": 1, "defaults": { "target": "studio", "server": "x" } }),
+        ] {
+            assert!(
+                !crate::json_schema::errors(&schema, &refused).is_empty(),
+                "{refused}"
+            );
+        }
+        drop(home);
+        std::fs::remove_dir_all(&cwd).ok();
     }
 
     /// `omnigraph_run` runs outside the agent's sandbox: it speaks only to the conversation's
@@ -1957,12 +2379,13 @@ mod tests {
             (words(&["query", "--frobnicate=1"]), "--frobnicate"),
             (words(&["query", "-x"]), "-x"),
             (words(&["query", "--help"]), "--help"),
-            // Another command's flag, a global one where the CLI refuses it, a token.
+            // Another command's flag (`changes poll` follows every page itself), a global one where
+            // the CLI refuses it.
             (words(&["export", "--json"]), "--json"),
             (words(&["version", "--graph", "g"]), "--graph"),
             (words(&["graphs", "list", "--graph", "g"]), "--graph"),
             (
-                words(&["commit", "list", "--page-token", "t"]),
+                words(&["changes", "poll", "--page-token", "t"]),
                 "--page-token",
             ),
         ] {
@@ -2048,6 +2471,10 @@ mod tests {
                     "exec",
                     "command",
                 ] {
+                    // A page's cursor, which the server gave the CLI for its next page.
+                    if flag == "--page-token" && word == "token" {
+                        continue;
+                    }
                     assert!(!flag.contains(word), "{name}: `{flag}` names {word}");
                 }
                 match command.takes(flag) {
@@ -2156,7 +2583,15 @@ mod tests {
             .parent()
             .unwrap()
             .join(format!("studio-run-homes-{}", std::process::id()));
-        let home = CliHome::write(&cwd, &private, 1, "t", "knowledge", "agent/x", "main").unwrap();
+        let home = CliHome::write(
+            &cwd,
+            &private,
+            access(1, "t"),
+            "knowledge",
+            "agent/x",
+            "main",
+        )
+        .unwrap();
         let plan = || RunPlan {
             args: vec!["version".into()],
             files: Vec::new(),
@@ -2195,10 +2630,16 @@ mod tests {
         for line in text.lines().filter(|line| line.starts_with("OMNIGRAPH_")) {
             assert!(line.starts_with("OMNIGRAPH_HOME="), "{line}");
         }
+        // The private home's config names the private home's own token and certificate.
+        let private_config = std::fs::read_to_string(home.private.join("config.yaml")).unwrap();
         assert!(
-            std::fs::read_to_string(home.private.join("config.yaml"))
-                .unwrap()
-                .contains("studio: { kind: server, endpoint: \"http://127.0.0.1:1\"")
+            private_config.contains("endpoint: \"https://127.0.0.1:1\"")
+                && private_config.contains(&yaml_string(
+                    &std::path::absolute(home.private.join(TOKEN_FILE))
+                        .unwrap()
+                        .to_string_lossy()
+                )),
+            "{private_config}"
         );
         assert!(
             check_run_args(
@@ -2215,13 +2656,29 @@ mod tests {
 
         // A conversation started again on the branch writes its own token before this one
         // ends: the new token stays.
-        let again = CliHome::write(&cwd, &private, 2, "u", "knowledge", "agent/x", "main").unwrap();
+        let again = CliHome::write(
+            &cwd,
+            &private,
+            GatewayAccess {
+                port: 2,
+                token: "u",
+                certificate: "another certificate",
+            },
+            "knowledge",
+            "agent/x",
+            "main",
+        )
+        .unwrap();
         let held = home.private.clone();
         drop(home);
         assert!(!held.exists());
         assert_eq!(
-            std::fs::read_to_string(again.dir.join("credentials")).unwrap(),
-            "[studio]\ntoken = u\nendpoint = http://127.0.0.1:2\n"
+            std::fs::read_to_string(again.dir.join(TOKEN_FILE)).unwrap(),
+            "u"
+        );
+        assert_eq!(
+            std::fs::read_to_string(again.dir.join(CA_FILE)).unwrap(),
+            "another certificate"
         );
         drop(again);
         std::fs::remove_dir_all(&cwd).ok();
@@ -2239,8 +2696,7 @@ mod tests {
         let home = CliHome::write(
             &cwd,
             &cwd.join("private"),
-            1,
-            "t",
+            access(1, "t"),
             "knowledge",
             "agent/x",
             "main",
@@ -2296,12 +2752,15 @@ mod tests {
     #[test]
     fn a_conversation_home_holds_its_config_token_and_wrapper() {
         let cwd = std::env::temp_dir().join(format!("studio-cli-home-{}", std::process::id()));
-        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::remove_dir_all(&cwd).ok();
+        // A home an older Studio wrote, with the token file the CLI no longer reads.
+        let older = cwd.join(".studio/agent-20261013-101500");
+        std::fs::create_dir_all(&older).unwrap();
+        std::fs::write(older.join("credentials"), "[studio]\ntoken = old\n").unwrap();
         let home = CliHome::write(
             &cwd,
             &cwd.join("private"),
-            49152,
-            "abc123",
+            access(49152, "abc123"),
             "knowledge",
             "agent/20261013-101500",
             "main",
@@ -2310,19 +2769,28 @@ mod tests {
         assert_eq!(home.dir, cwd.join(".studio/agent-20261013-101500"));
         let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&home.dir), 0o700);
-        assert_eq!(mode(&home.dir.join("credentials")), 0o600);
+        for name in ["config.yaml", TOKEN_FILE, CA_FILE] {
+            assert_eq!(mode(&home.dir.join(name)), 0o600, "{name}");
+        }
         let config = std::fs::read_to_string(home.dir.join("config.yaml")).unwrap();
         assert!(
-            config.contains(
-                "studio: { kind: server, endpoint: \"http://127.0.0.1:49152\", credential: studio, default_graph: \"knowledge\" }"
-            ),
+            config.contains("    endpoint: \"https://127.0.0.1:49152\"\n")
+                && config.contains("    default_graph: \"knowledge\"\n"),
             "{config}"
         );
-        assert!(config.contains("defaults:\n  target: studio\n"), "{config}");
-        assert_eq!(
-            std::fs::read_to_string(home.dir.join("credentials")).unwrap(),
-            "[studio]\ntoken = abc123\nendpoint = http://127.0.0.1:49152\n"
+        assert!(
+            config.ends_with("defaults:\n  target: studio\n"),
+            "{config}"
         );
+        assert_eq!(
+            std::fs::read_to_string(home.dir.join(TOKEN_FILE)).unwrap(),
+            "abc123"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.dir.join(CA_FILE)).unwrap(),
+            CERTIFICATE
+        );
+        assert!(!home.dir.join("credentials").exists());
 
         home.use_cli(Path::new("/opt/it's here/omnigraph")).unwrap();
         assert_eq!(mode(&home.command), 0o700);
@@ -2387,7 +2855,8 @@ mod tests {
                 base: "b".repeat(64),
                 cwd: at.clone(),
                 folder: ".studio/agent-20261013-101500".into(),
-                credentials: String::new(),
+                token: String::new(),
+                certificate: String::new(),
                 private: cwd.join("private/longest"),
                 cli: std::sync::Mutex::new(Err(String::new())),
                 wrapper_runs: std::sync::atomic::AtomicBool::new(runs),
@@ -2415,11 +2884,11 @@ mod tests {
             }
         }
 
-        let credentials = home.dir.join("credentials");
+        let (token, certificate) = (home.dir.join(TOKEN_FILE), home.dir.join(CA_FILE));
         drop(home);
         assert!(
-            !credentials.exists(),
-            "the token goes with the conversation"
+            !token.exists() && !certificate.exists(),
+            "the token and the certificate go with the conversation"
         );
         write_agents_md(&cwd, "knowledge").unwrap();
         let rules = std::fs::read_to_string(cwd.join("AGENTS.md")).unwrap();
@@ -2533,8 +3002,7 @@ mod tests {
         let home = CliHome::write(
             &cwd,
             &cwd.join("private"),
-            1,
-            "t",
+            access(1, "t"),
             "knowledge",
             "agent/x",
             "main",
@@ -2599,8 +3067,7 @@ mod tests {
         let home = CliHome::write(
             &root,
             &root.join("private"),
-            1,
-            "t",
+            access(1, "t"),
             "knowledge",
             "agent/x",
             "main",
@@ -2673,8 +3140,7 @@ mod tests {
         let home = CliHome::write(
             &root,
             &root.join("private"),
-            1,
-            "t",
+            access(1, "t"),
             "knowledge",
             "agent/x",
             "main",

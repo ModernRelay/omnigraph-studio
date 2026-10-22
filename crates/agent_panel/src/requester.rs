@@ -245,8 +245,9 @@ mod windows {
 }
 
 /// A CLI for the Windows tests that waits for a write's answer: this test binary, started
-/// through the agent's batch-file wrapper, connects to the gateway's port, sends a request,
-/// and waits until the connection closes.
+/// through the agent's batch-file wrapper, connects to the gateway's port, sends a request (over
+/// TLS, trusting the certificate its home holds, as the CLI does), and waits until the
+/// connection closes.
 #[cfg(all(test, windows))]
 pub(crate) mod stand_in {
     use std::path::{Path, PathBuf};
@@ -261,45 +262,63 @@ pub(crate) mod stand_in {
     /// What [`start`] runs this test binary as. Run as a test, it does nothing.
     #[test]
     fn stands_in_for_a_waiting_cli() {
-        use std::io::{Read as _, Write as _};
+        use std::io::Write as _;
         let Some(port) = std::env::var(PORT)
             .ok()
             .and_then(|port| port.parse::<u16>().ok())
         else {
             return;
         };
-        let mut connection = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-        if let Some(sends) = std::env::var_os(SENDS) {
-            connection
-                .write_all(&std::fs::read(sends).unwrap())
-                .unwrap();
-        }
+        let connection = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let Some(sends) = std::env::var_os(SENDS) else {
+            wait(connection);
+        };
+        // As the CLI reaches the gateway: over TLS, trusting the certificate its home holds.
+        let home = std::env::var_os("OMNIGRAPH_HOME").unwrap();
+        let ca = std::fs::read_to_string(Path::new(&home).join("ca.pem")).unwrap();
+        let session = futures_rustls::rustls::ClientConnection::new(
+            crate::gateway_tls::client_trusting(&ca),
+            crate::gateway_tls::loopback(),
+        )
+        .unwrap();
+        let mut stream = futures_rustls::rustls::StreamOwned::new(session, connection);
+        stream.write_all(&std::fs::read(sends).unwrap()).unwrap();
+        stream.flush().unwrap();
+        wait(stream);
+    }
+
+    /// Reads `connection` until it closes, then ends this process.
+    fn wait(mut connection: impl std::io::Read) -> ! {
         let mut byte = [0u8; 1];
         while matches!(connection.read(&mut byte), Ok(1..)) {}
         std::process::exit(0);
     }
 
-    /// A conversation's home under `root` whose wrapper runs this test binary, and the wrapper
-    /// started as that CLI for `port`, sending `sends` when given.
+    /// A conversation's home under `root` for the gateway on `port`, whose wrapper runs this test
+    /// binary, and the wrapper started as that CLI, sending a request to the gateway whose
+    /// certificate is given, when one is.
     pub(crate) fn start(
         root: &Path,
         port: u16,
-        sends: Option<&[u8]>,
+        sends: Option<(&[u8], &str)>,
     ) -> (crate::cli_home::CliHome, std::process::Child) {
         std::fs::remove_dir_all(root).ok();
         std::fs::create_dir_all(root).unwrap();
         let home = crate::cli_home::CliHome::write(
             root,
             &root.join("private"),
-            1,
-            "t",
+            crate::cli_home::GatewayAccess {
+                port,
+                token: "t",
+                certificate: sends.map_or("", |(_, certificate)| certificate),
+            },
             "knowledge",
             "agent/x",
             "main",
         )
         .unwrap();
         assert!(home.use_cli(&std::env::current_exe().unwrap()).unwrap());
-        let wrapper = run(&home.command, port, sends.map(|sends| (root, sends)));
+        let wrapper = run(&home.command, port, sends.map(|(sends, _)| (root, sends)));
         (home, wrapper)
     }
 

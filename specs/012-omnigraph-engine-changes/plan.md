@@ -1,6 +1,6 @@
 # 012: OmniGraph engine changes
 
-Status: open · 2026-10-11, updated 2026-10-20. Landed on OmniGraph main: E6, E7, E8, E23 and E24
+Status: open · 2026-10-11, updated 2026-10-21. Landed on OmniGraph main: E6, E7, E8, E23 and E24
 by 2026-10-15, then E10, E15 (as the access route), E21 and E22 by 2026-10-20 (see "On OmniGraph
 main, 2026-10-20"). Studio's oldest supported server is the edge build `edge-20261020-7fd9cc9`,
 the first that speaks HTTP contract 0.14, until 0.14 is released (`edge-20261018-0a62bb7`, then
@@ -130,6 +130,31 @@ change is additive; the CLI's is not.
   the agent's CLI and the person's are whatever is installed, so specs 003 and 013 read both
   operator-file formats.
 
+## On OmniGraph main, 2026-10-21
+
+Checked at main `97788d37` by reading the CLI's source (`operator_schema.rs` and its
+`validation.rs` and `yaml.rs`, `credential_sources.rs`, `operator_transport.rs`, `scope.rs`,
+`planes.rs`, `commands/targets/`) and `docs/user/cli/targets.md`.
+
+- **The operator configuration, again** (#1115 at `f7db38da`, then #1126 at `ff542202`, both
+  breaking). The operator file is `version: 1` with `profiles` and `targets`; a document holding
+  `target_config_version` is refused, and the keyed `credentials` file and
+  `OMNIGRAPH_TOKEN_<OWNER>` are gone. A server target owns one `auth` provider (#1126; #1115 had a
+  map of named entries with `default_auth`): `token` from a `store`, an `env` variable or a
+  `file`, an `exec` helper, or `anonymous`, which alone may use plain HTTP, on loopback.
+  `transport.tls.ca: {mode: append|replace, file}` adds or replaces the CA roots, and
+  `transport.proxy` defaults to `direct`. `config validate` checks a file offline, with
+  `--operator-config FILE` to name it. Spec 013 writes the agent's CLI home in this form over
+  loopback TLS and takes only a CLI whose `config validate` passes it.
+- **No release reads it yet.** The installed `0.14.0-edge+50283ce` is from before #1115;
+  `edge-20261021-888223b` has #1115 without #1126 and refuses a single `auth`. The first build that
+  reads Studio's home is the edge build made from main at `ff542202` or later, which was not
+  published when this was written; until then the agent has no CLI (spec 013, as decided).
+- **The version signal** (E34, #1127): `version --json` still reports `protocols.target: 1`, as
+  before the change.
+- Studio's reading of the person's own operator file (`graph_store::cli_config`, spec 003) still
+  reads the `target_config_version` form; it is open.
+
 ## The changes
 
 Each change names the Studio spec that waits on it and Studio's behavior until then.
@@ -237,6 +262,14 @@ only http(s), and a `unix://` value falls through to storage resolution. Codex's
 allow one Unix socket but blocks loopback TCP. *Waits:* 013. *Today:* Codex reaches the gateway
 only when the person gives the conversation network access.
 
+**E34. The CLI says which operator configuration it reads.**
+[ModernRelay/omnigraph#1127](https://github.com/ModernRelay/omnigraph/issues/1127). Since #1115
+the CLI reads only the version-1 operator configuration, yet `version --json` reports
+`protocols.target: 1` as the CLIs before it did, so a client cannot tell which file a CLI reads
+without asking it to validate one. Filed to bump it to 2. *Waits:* 013. *Today:* Studio takes a
+CLI that reports 1 or 2 only when `config validate --operator-config` passes the home Studio
+wrote, and names the first build that does by commit (`ff542202`).
+
 ### Branching
 
 **E21. A branch from a commit.** *Landed (#1016) as `from_commit`; see "On OmniGraph main,
@@ -302,7 +335,9 @@ proposal and to preview a merge. *Specs:* 004, 008.
 Studio's own work first, for what landed:
 
 1. CLI targets in the agent's CLI and in reading the person's operator file (specs 013, 003):
-   the next CLI build refuses Studio's `--server` and `defaults.server`.
+   the next CLI build refuses Studio's `--server` and `defaults.server`. Then the version-1
+   operator configuration (#1115, #1126): done for the agent's CLI on 2026-10-21 (013), which waits
+   for an edge build made from `ff542202` or later; open for the person's operator file (003).
 2. With the next minimum-server bump: E10 paged history (009), E15 access (002), E21 a branch
    from a commit (008, 009), `full_text_index_required` and the compiler's new codes (007), then
    `executed` and `pipelines` (007).
@@ -328,6 +363,7 @@ Then engine changes still open:
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | The CLI reads only the version-1 operator configuration, and no published build reads Studio's home yet | OmniGraph main `97788d37`: `operator_schema.rs` (`target_config_version` refused), the diff `888223b7..ff542202` of `operator_schema.rs` (server `auth` from a map to one provider), `commands/targets/args.rs` (`config validate`); `gh release list` (newest `edge-20261021-888223b`, 2026-10-22 00:21 UTC); `~/.local/bin/omnigraph version --json` and `config validate --operator-config /dev/null` | `0.14.0-edge+50283ce` reports `http_contract` 0.14 and `protocols.target` 1, and answers "unrecognized subcommand 'config'" (exit 2). `888223b` has #1115 without #1126. E34 filed as #1127 |
 | 2026-10-21 | The server's version fields are wider than its contract says (E30) | `omnigraph-api-types/src/lib.rs` at `7fd9cc9` (`CommitOutput`, `SnapshotOutput`, `SnapshotDatasetOutput`, `SchemaApplyOutput`, `PublishedDatasetVersionConflictOutput`: `u64`; its own test decodes `9_223_372_036_854_775_809u64`); `crates/graph_client/openapi/omnigraph-0.14.0-edge.json` (`int64`, `minimum: 0`); what the running app was answered by the edge server; `graph_client` `a_detached_manifest_version_decodes` | A write `as commit` was answered with `graph_manifest_version: 10415222161995537841`, which Studio's `i64` refused to decode, so the write read as unknown; as `u64` it decodes, and the query editor says it is held |
 | 2026-10-20 | What OmniGraph main serves that Studio's minimum server does not | `openapi.json` at main `4ba904d3` diffed with `crates/graph_client/openapi/omnigraph-0.14.0-edge.json` by operation, parameter and schema property; the `changelog.d` notes added since `d883c49e`; the CLI reference and targets guide at `4ba904d3` | New: `GET /graphs/{id}/access`; `limit`, `page_token`, `head_commit_id`, `next_page_token` on commits; `from_commit` and `from_commit_id` on branch creation; `ChangeOutput.executed`; error details `branch_start_refusal` and `full_text_index_required`. Contract header still `0.13`. The CLI drops `--server` and profiles for targets (#1090) |
 | 2026-10-15 | What OmniGraph main serves that 0.13.0 does not | `openapi.json` at `v0.13.0` and at main `fe69c039`, diffed by operation id, schema properties and parameters; issues #976–#980 | New: `cluster_getDiff`, `cluster_getBranchDiff`, `cluster_getMergeBase`, `cluster_putBlob`, `cluster_clearBlob`, `cluster_publishCommit`, `cluster_dropCommit`, OAuth resource metadata; `dry_run` and `as_commit` on merge; commit kinds and filters; `ReadOutput.page`. Contract header still `0.13`. #977 and #979 closed by #987 and #988; #976, #978 and #980 open |

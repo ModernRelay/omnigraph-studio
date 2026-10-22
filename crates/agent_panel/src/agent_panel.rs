@@ -10,7 +10,10 @@ mod confined;
 mod connection;
 mod gateway;
 mod gateway_rules;
+mod gateway_tls;
 mod host;
+#[cfg(test)]
+mod json_schema;
 mod launch;
 mod mcp;
 mod panel;

@@ -1,18 +1,23 @@
-//! Studio's gateway for the agent's `omnigraph` CLI (spec 013): a loopback HTTP server per
-//! conversation. The CLI reaches it with a session token Studio wrote for this conversation;
-//! the gateway checks that token and the contract header, applies [`gateway_rules`], and
-//! forwards over [`GraphClient::forward`] with the person's token, which never leaves Studio.
+//! Studio's gateway for the agent's `omnigraph` CLI (spec 013): a loopback HTTPS server per
+//! conversation, with a certificate of its own ([`crate::gateway_tls`]) that the conversation's
+//! CLI home trusts alone. The CLI reaches it with a session token Studio wrote for this
+//! conversation; the gateway checks that token and the contract header, applies
+//! [`gateway_rules`], and forwards over [`GraphClient::forward`] with the person's token, which
+//! never leaves Studio.
 //!
 //! Reads stream their answers back. A write waits for the panel's decision, is sent once, and
 //! its answer is read whole (bounded) so the panel can show its outcome. Request bodies are
 //! read whole too, at most [`MAX_BODY`]: a JSON write is small, and a larger load is refused
 //! before anything is sent. One request per connection; the CLI opens a new one each time.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::channel::{mpsc, oneshot};
-use futures::{AsyncReadExt as _, AsyncWriteExt as _};
+use futures::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use futures_rustls::TlsAcceptor;
+use futures_rustls::rustls::ServerConfig;
 use graph_client::api::CommitKind;
 use graph_client::{
     AsyncBody, CONTRACT, CONTRACT_HEADER, ForwardRequest, GraphClient, HeaderMap, Method,
@@ -31,8 +36,9 @@ const MAX_HEAD: usize = 64 * 1024;
 pub const MAX_BODY: usize = 64 * 1024 * 1024;
 /// How long a request may take to arrive whole, its body included.
 const READ_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
-/// How long a request's line and headers, its token among them, may take: any local process
-/// can open a connection, and one that sends nothing is let go before it holds one long.
+/// How long a connection's TLS handshake may take, and then its request's line and headers, its
+/// token among them: any local process can open a connection, and one that sends nothing is let
+/// go before it holds one long.
 const HEAD_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
 /// The most a write's answer may take before the gateway stops reading it for the card.
 const MAX_WRITE_ANSWER: usize = 8 * 1024 * 1024;
@@ -101,11 +107,14 @@ pub enum Seen {
     Unknown(String),
 }
 
-/// A bound gateway. Its port and token go in the conversation's CLI home; dropping the future
-/// [`Gateway::serve`] returns closes the listener.
+/// A bound gateway. Its port, token and certificate go in the conversation's CLI home
+/// ([`Gateway::access`]); dropping the future [`Gateway::serve`] returns closes the listener.
 pub struct Gateway {
     pub port: u16,
     pub token: String,
+    /// The certificate it serves (PEM), made as it was bound; its key is in `tls` alone.
+    pub certificate: String,
+    tls: Arc<ServerConfig>,
     listener: Option<TcpListener>,
 }
 
@@ -114,11 +123,23 @@ impl Gateway {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
         let port = listener.local_addr()?.port();
         let listener = TcpListener::try_from(listener)?;
+        let identity = crate::gateway_tls::identity()?;
         Ok(Self {
             port,
             token: crate::confined::random_hex(32)?,
+            certificate: identity.certificate,
+            tls: identity.config,
             listener: Some(listener),
         })
+    }
+
+    /// What the conversation's CLI home writes to reach this gateway.
+    pub fn access(&self) -> crate::cli_home::GatewayAccess<'_> {
+        crate::cli_home::GatewayAccess {
+            port: self.port,
+            token: &self.token,
+            certificate: &self.certificate,
+        }
     }
 
     pub fn serve(
@@ -128,6 +149,7 @@ impl Gateway {
         events: mpsc::UnboundedSender<GatewayEvent>,
     ) -> impl Future<Output = ()> + Send + 'static + use<> {
         let listener = self.listener.take();
+        let acceptor = TlsAcceptor::from(self.tls.clone());
         let shared = Arc::new(Shared {
             client,
             sandbox,
@@ -139,7 +161,7 @@ impl Gateway {
             let Some(listener) = listener else { return };
             crate::socket::serve_each(
                 || listener.accept(),
-                |(stream, _)| serve_connection(stream, shared.clone()),
+                |(stream, _)| serve_connection(stream, acceptor.clone(), shared.clone()),
             )
             .await;
         }
@@ -187,30 +209,51 @@ enum ReadFailure {
     Answer(u16, &'static str, String),
 }
 
-async fn serve_connection(mut stream: TcpStream, shared: Arc<Shared>) {
-    // A local process that opens a connection and sends slowly, or nothing, holds it no longer
-    // than this.
-    let read = {
-        let read = futures::FutureExt::fuse(read_request(&mut stream, &shared.token));
-        let late = futures::FutureExt::fuse(smol::Timer::after(READ_WITHIN));
-        futures::pin_mut!(read, late);
-        futures::select! {
-            read = read => read,
-            _ = late => Err(ReadFailure::Gone),
-        }
-    };
-    let request = match read {
-        Ok(request) => request,
-        Err(ReadFailure::Gone) => return,
-        Err(ReadFailure::Answer(status, code, message)) => {
-            answer(&mut stream, status, code, &message).await;
-            return;
-        }
-    };
-    handle(stream, request, &shared).await;
+/// `future`'s output, or `None` when it takes longer than `limit`.
+async fn within<T>(limit: std::time::Duration, future: impl Future<Output = T>) -> Option<T> {
+    let future = futures::FutureExt::fuse(future);
+    let late = futures::FutureExt::fuse(smol::Timer::after(limit));
+    futures::pin_mut!(future, late);
+    futures::select! {
+        output = future => Some(output),
+        _ = late => None,
+    }
 }
 
-async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
+/// A connection's two ends, the CLI's and the gateway's, as TCP addresses: what finds the
+/// processes a write's CLI was started under (`requester`).
+type Ends = (Option<SocketAddr>, Option<SocketAddr>);
+
+async fn serve_connection(stream: TcpStream, acceptor: TlsAcceptor, shared: Arc<Shared>) {
+    let ends = (stream.peer_addr().ok(), stream.local_addr().ok());
+    // A connection that does not finish its handshake (one that speaks plain HTTP among them)
+    // is closed unanswered.
+    let Some(Ok(stream)) = within(HEAD_WITHIN, acceptor.accept(stream)).await else {
+        return;
+    };
+    let (mut reader, mut writer) = stream.split();
+    // A local process that opens a connection and sends slowly, or nothing, holds it no longer
+    // than this.
+    let read = within(READ_WITHIN, read_request(&mut reader, &shared.token)).await;
+    match read.unwrap_or(Err(ReadFailure::Gone)) {
+        Ok(request) => handle(&mut reader, &mut writer, ends, request, &shared).await,
+        Err(ReadFailure::Gone) => return,
+        Err(ReadFailure::Answer(status, code, message)) => {
+            answer(&mut writer, status, code, &message).await;
+        }
+    }
+    // The answer's end is its framing (a length, or the chunked stream's last chunk), never the
+    // connection's: a cut answer stays cut though TLS closes cleanly here.
+    writer.close().await.ok();
+}
+
+async fn handle(
+    reader: &mut (impl AsyncRead + Unpin),
+    stream: &mut (impl AsyncWrite + Unpin),
+    (client, server): Ends,
+    request: Request,
+    shared: &Shared,
+) {
     let (path, query) = match request.target.split_once('?') {
         Some((path, query)) => (path.to_owned(), Some(query.to_owned())),
         None => (request.target.clone(), None),
@@ -230,7 +273,7 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
     let mut keys = std::collections::HashSet::new();
     if request.target.contains('#') || !pairs.iter().all(|(key, _)| keys.insert(key.as_str())) {
         answer(
-            &mut stream,
+            stream,
             400,
             "bad_request",
             "Studio: a request with a `#` or a repeated query parameter is not sent. Nothing \
@@ -243,7 +286,7 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
     // Every other request carries the session's token, checked before its body was read.
     if is_health(&request.method, &path) {
         let body = if request.method == "HEAD" { "" } else { "ok" };
-        write_simple(&mut stream, 200, "text/plain", body.as_bytes()).await;
+        write_simple(stream, 200, "text/plain", body.as_bytes()).await;
         return;
     }
     let contracts = request.headers_named(CONTRACT_HEADER);
@@ -254,7 +297,7 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
             contracts.join(", ")
         };
         answer(
-            &mut stream,
+            stream,
             400,
             "api_contract_mismatch",
             &format!(
@@ -285,10 +328,10 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
         &shared.sandbox,
     );
     match verdict {
-        Verdict::Refuse(message) => answer(&mut stream, 403, "forbidden", &message).await,
+        Verdict::Refuse(message) => answer(stream, 403, "forbidden", &message).await,
         Verdict::Read => {
             let response = shared.client.forward(forward_request(&request, None)).await;
-            stream_back(&mut stream, &request.method, response).await;
+            stream_back(stream, &request.method, response).await;
         }
         Verdict::ReadWith(body) => {
             let body = serde_json::to_vec(&body).unwrap_or_default();
@@ -296,12 +339,12 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
                 .client
                 .forward(forward_request(&request, Some(body)))
                 .await;
-            stream_back(&mut stream, &request.method, response).await;
+            stream_back(stream, &request.method, response).await;
         }
         Verdict::Write(write) => {
             // Whoever ran the command, as they are now (`requester`): on Windows the CLI can
             // outlive a command stopped by its process id, its connection open.
-            let starters = Starters::of(stream.peer_addr().ok(), stream.local_addr().ok()).await;
+            let starters = Starters::of(client, server).await;
             let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
             let kind = write.kind;
             let (decide, decision) = oneshot::channel();
@@ -312,7 +355,7 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
                 .is_err()
             {
                 answer(
-                    &mut stream,
+                    stream,
                     403,
                     "forbidden",
                     "Studio: the conversation has ended. Nothing was sent.",
@@ -324,15 +367,9 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
             // a write approved then would land with the agent told it failed. A closed
             // connection while waiting ends the write unsent, and so does the end of a process
             // the CLI was started under, since whoever ran it no longer waits.
-            let gone = {
-                let mut watch = stream.clone();
-                async move {
-                    let mut byte = [0u8; 1];
-                    while matches!(
-                        futures::AsyncReadExt::read(&mut watch, &mut byte).await,
-                        Ok(1..)
-                    ) {}
-                }
+            let gone = async {
+                let mut byte = [0u8; 1];
+                while matches!(reader.read(&mut byte).await, Ok(1..)) {}
             };
             let (gone, stopped) = (
                 futures::FutureExt::fuse(gone),
@@ -358,7 +395,7 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
                     // was sent, and ends.
                     if let Undecided::Stopped = undecided {
                         answer(
-                            &mut stream,
+                            stream,
                             403,
                             "forbidden",
                             "Studio: the command that sent this write was stopped before the \
@@ -371,7 +408,7 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
             };
             let Ok(Some(on_outcome)) = decided else {
                 answer(
-                    &mut stream,
+                    stream,
                     403,
                     "forbidden",
                     "Studio: the person rejected this write. Nothing was sent.",
@@ -395,7 +432,7 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
             // When the server's answer was lost, the CLI's connection closes without one, and
             // the CLI reports the outcome as unknown, as it is.
             if let Ok(Some((status, headers, body))) = reply_rx.await {
-                write_buffered(&mut stream, status, &headers, &body).await;
+                write_buffered(stream, status, &headers, &body).await;
             }
         }
     }
@@ -584,10 +621,11 @@ fn is_health(method: &str, path: &str) -> bool {
     matches!(method, "GET" | "HEAD") && path == "/healthz"
 }
 
-/// Reads one request. Its token is checked once its headers are in, before its body (up to
-/// [`MAX_BODY`]) is read: only the conversation's CLI makes Studio read that much.
 /// Reads into `buffer` up to the end of a request's headers, and where that is.
-async fn read_head(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Result<usize, ReadFailure> {
+async fn read_head(
+    stream: &mut (impl AsyncRead + Unpin),
+    buffer: &mut Vec<u8>,
+) -> Result<usize, ReadFailure> {
     let mut chunk = [0u8; 8 * 1024];
     loop {
         if let Some(end) = find(buffer, b"\r\n\r\n") {
@@ -611,7 +649,12 @@ async fn read_head(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Result<usize
     }
 }
 
-async fn read_request(stream: &mut TcpStream, token: &str) -> Result<Request, ReadFailure> {
+/// Reads one request. Its token is checked once its headers are in, before its body (up to
+/// [`MAX_BODY`]) is read: only the conversation's CLI makes Studio read that much.
+async fn read_request(
+    stream: &mut (impl AsyncRead + Unpin),
+    token: &str,
+) -> Result<Request, ReadFailure> {
     let mut buffer = Vec::with_capacity(8 * 1024);
     let mut chunk = [0u8; 8 * 1024];
     let head_end = {
@@ -712,7 +755,7 @@ fn too_large() -> ReadFailure {
 
 /// Decodes a chunked body, at most [`MAX_BODY`].
 async fn read_chunked(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncRead + Unpin),
     mut pending: Vec<u8>,
 ) -> Result<Vec<u8>, ReadFailure> {
     let mut body = Vec::new();
@@ -791,12 +834,17 @@ fn same(left: &[u8], right: &[u8]) -> bool {
 
 /// A refusal or error the gateway makes itself, as OmniGraph's `ErrorOutput` with the contract
 /// header, so the CLI shows it as a typed error.
-async fn answer(stream: &mut TcpStream, status: u16, code: &str, message: &str) {
+async fn answer(stream: &mut (impl AsyncWrite + Unpin), status: u16, code: &str, message: &str) {
     let body = serde_json::to_vec(&json!({ "error": message, "code": code })).unwrap_or_default();
     write_simple(stream, status, "application/json", &body).await;
 }
 
-async fn write_simple(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) {
+async fn write_simple(
+    stream: &mut (impl AsyncWrite + Unpin),
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) {
     let head = format!(
         "HTTP/1.1 {status} {}\r\n{CONTRACT_HEADER}: {}\r\ncontent-type: {content_type}\r\n\
          content-length: {}\r\ncache-control: no-store\r\nconnection: close\r\n\r\n",
@@ -840,7 +888,7 @@ fn end_to_end_headers(headers: &HeaderMap) -> String {
 }
 
 async fn write_buffered(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncWrite + Unpin),
     status: StatusCode,
     headers: &HeaderMap,
     body: &[u8],
@@ -860,7 +908,7 @@ async fn write_buffered(
 /// Streams a read's answer back as it arrives: with its own length when it has one, else
 /// chunked. A HEAD answer keeps its length and carries no body.
 async fn stream_back(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncWrite + Unpin),
     method: &str,
     response: Result<graph_client::ForwardResponse, String>,
 ) {
@@ -1013,14 +1061,50 @@ mod tests {
         }
     }
 
-    /// Sends raw HTTP to the gateway and returns the status, headers and body.
-    async fn call(port: u16, raw: String) -> (u16, String, String) {
-        let mut stream = smol::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .unwrap();
-        stream.write_all(raw.as_bytes()).await.unwrap();
+    /// A client of the gateway as the CLI is one: TLS to `127.0.0.1`, trusting only the
+    /// certificates it is given.
+    #[derive(Clone)]
+    struct Cli {
+        port: u16,
+        tls: futures_rustls::TlsConnector,
+    }
+
+    impl Cli {
+        /// One that trusts `gateway`'s certificate.
+        fn of(gateway: &Gateway) -> Self {
+            Self::trusting(gateway.port, &gateway.certificate)
+        }
+
+        fn trusting(port: u16, pem: &str) -> Self {
+            Self {
+                port,
+                tls: crate::gateway_tls::client_trusting(pem).into(),
+            }
+        }
+
+        /// A connection whose handshake is done, or why it failed.
+        async fn connect(&self) -> std::io::Result<futures_rustls::client::TlsStream<TcpStream>> {
+            let tcp = TcpStream::connect(("127.0.0.1", self.port)).await?;
+            self.tls.connect(crate::gateway_tls::loopback(), tcp).await
+        }
+    }
+
+    /// Reads `stream` until it ends, cleanly or not: what arrived.
+    async fn read_all(mut stream: impl AsyncRead + Unpin) -> Vec<u8> {
         let mut answer = Vec::new();
-        stream.read_to_end(&mut answer).await.unwrap();
+        let mut buffer = [0u8; 8 * 1024];
+        while let Ok(read @ 1..) = stream.read(&mut buffer).await {
+            answer.extend_from_slice(&buffer[..read]);
+        }
+        answer
+    }
+
+    /// Sends raw HTTP to the gateway over TLS and returns the status, headers and body.
+    async fn call(cli: Cli, raw: String) -> (u16, String, String) {
+        let mut stream = cli.connect().await.unwrap();
+        stream.write_all(raw.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        let answer = read_all(stream).await;
         let text = String::from_utf8_lossy(&answer).into_owned();
         let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
         let status = head
@@ -1097,13 +1181,13 @@ mod tests {
                 GraphClient::new("http://127.0.0.1:8787", Some("person-token".into()), http)
                     .unwrap();
             let mut gateway = Gateway::bind().unwrap();
-            let (port, token) = (gateway.port, gateway.token.clone());
+            let (cli, token) = (Cli::of(&gateway), gateway.token.clone());
             let (events_tx, mut events) = mpsc::unbounded();
             let serve = smol::spawn(gateway.serve(client, sandbox(), events_tx));
             let write =
                 r#"{"query":"query m() { … }","name":"m","branch":"agent/20261013-101500"}"#;
             let _cli = smol::spawn(call(
-                port,
+                cli,
                 post("/graphs/knowledge/mutate", &token, Some(CONTRACT), write),
             ));
             let Some(GatewayEvent::Write { decide, .. }) = events.next().await else {
@@ -1158,8 +1242,11 @@ mod tests {
             let request = post("/graphs/knowledge/mutate", &token, Some(CONTRACT), write);
             let root =
                 std::env::temp_dir().join(format!("studio-gateway-stopped-{}", std::process::id()));
-            let (home, mut wrapper) =
-                crate::requester::stand_in::start(&root, port, Some(request.as_bytes()));
+            let (home, mut wrapper) = crate::requester::stand_in::start(
+                &root,
+                port,
+                Some((request.as_bytes(), &gateway.certificate)),
+            );
             let Some(GatewayEvent::Write { decide, id, .. }) = next_within(&mut events).await
             else {
                 panic!("no write event")
@@ -1414,13 +1501,13 @@ mod tests {
         smol::block_on(async {
             let (client, seen) = upstream();
             let mut gateway = Gateway::bind().unwrap();
-            let (port, token) = (gateway.port, gateway.token.clone());
+            let (cli, token) = (Cli::of(&gateway), gateway.token.clone());
             let (events_tx, mut events) = mpsc::unbounded();
             let _serve = smol::spawn(gateway.serve(client, sandbox(), events_tx));
 
             // The CLI's probe: no token, no contract header.
             let (status, head, _) = call(
-                port,
+                cli.clone(),
                 "HEAD /healthz HTTP/1.1\r\nhost: 127.0.0.1\r\n\r\n".into(),
             )
             .await;
@@ -1432,7 +1519,7 @@ mod tests {
 
             // A wrong token, and a CLI that sends no contract.
             let (status, head, body) = call(
-                port,
+                cli.clone(),
                 post("/graphs/knowledge/query", "nope", Some(CONTRACT), "{}"),
             )
             .await;
@@ -1444,10 +1531,13 @@ mod tests {
             let declared = "POST /graphs/knowledge/load HTTP/1.1\r\nhost: x\r\n\
                 authorization: Bearer wrong\r\ncontent-length: 50000000\r\n\r\n"
                 .to_owned();
-            let (status, _, _) = call(port, declared).await;
+            let (status, _, _) = call(cli.clone(), declared).await;
             assert_eq!(status, 401);
-            let (status, _, body) =
-                call(port, post("/graphs/knowledge/query", &token, None, "{}")).await;
+            let (status, _, body) = call(
+                cli.clone(),
+                post("/graphs/knowledge/query", &token, None, "{}"),
+            )
+            .await;
             assert_eq!(status, 400);
             assert!(body.contains("api_contract_mismatch"), "{body}");
             assert!(
@@ -1457,7 +1547,7 @@ mod tests {
 
             // A read goes through with the person's token, and its answer comes back.
             let (status, _, body) = call(
-                port,
+                cli.clone(),
                 post(
                     "/graphs/knowledge/query",
                     &token,
@@ -1482,7 +1572,7 @@ mod tests {
 
             // A write to main is refused before anything is sent.
             let (status, _, body) = call(
-                port,
+                cli.clone(),
                 post(
                     "/graphs/knowledge/mutate",
                     &token,
@@ -1502,7 +1592,7 @@ mod tests {
                 "/graphs/knowledge/load/ndjson?branch=agent%2F20261013-101500&branch=main&mode=append",
             ] {
                 let answer = futures::FutureExt::fuse(call(
-                    port,
+                    cli.clone(),
                     post(target, &token, Some(CONTRACT), "{}\n"),
                 ));
                 let write = futures::FutureExt::fuse(events.next());
@@ -1520,7 +1610,7 @@ mod tests {
             let write =
                 r#"{"query":"query m() { … }","name":"m","branch":"agent/20261013-101500"}"#;
             let rejected = smol::spawn(call(
-                port,
+                cli.clone(),
                 post("/graphs/knowledge/mutate", &token, Some(CONTRACT), write),
             ));
             let Some(GatewayEvent::Write {
@@ -1540,7 +1630,7 @@ mod tests {
 
             // Allowed, it is sent once and its outcome reported.
             let allowed = smol::spawn(call(
-                port,
+                cli.clone(),
                 post("/graphs/knowledge/mutate", &token, Some(CONTRACT), write),
             ));
             let Some(GatewayEvent::Write { decide, .. }) = events.next().await else {
@@ -1572,15 +1662,14 @@ mod tests {
 
             // The CLI gives up before the person decides (its command timed out): the write is
             // never sent, even when allowed afterwards.
-            let mut hung_up = smol::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .unwrap();
+            let mut hung_up = cli.connect().await.unwrap();
             hung_up
                 .write_all(
                     post("/graphs/knowledge/mutate", &token, Some(CONTRACT), write).as_bytes(),
                 )
                 .await
                 .unwrap();
+            hung_up.flush().await.unwrap();
             let Some(GatewayEvent::Write { decide, id, .. }) = events.next().await else {
                 panic!("no write event")
             };
@@ -1601,7 +1690,7 @@ mod tests {
                  {CONTRACT_HEADER}: {CONTRACT}\r\ncontent-type: application/json\r\n\
                  transfer-encoding: chunked\r\n\r\n5\r\n{{\"a\":\r\n2\r\n1}}\r\n0\r\n\r\n"
             );
-            let (status, _, _) = call(port, chunked).await;
+            let (status, _, _) = call(cli.clone(), chunked).await;
             assert_eq!(status, 200);
             assert_eq!(seen.lock().unwrap()[2].4, r#"{"a":1}"#);
 
@@ -1612,14 +1701,14 @@ mod tests {
                  transfer-encoding: chunked\r\n\r\n1\r\n{{\r\n{:x}\r\n",
                 usize::MAX
             );
-            let (status, _, body) = call(port, huge).await;
+            let (status, _, body) = call(cli.clone(), huge).await;
             assert_eq!(status, 413, "{body}");
             assert_eq!(seen.lock().unwrap().len(), 3, "nothing was sent");
 
             // A stored query the CLI runs as a read on the agent's branch is forwarded as a
             // read: no card, and its answer streams back.
             let read = futures::FutureExt::fuse(call(
-                port,
+                cli.clone(),
                 post(
                     "/graphs/knowledge/queries/people",
                     &token,
@@ -1636,6 +1725,138 @@ mod tests {
             assert_eq!(status, 200);
             assert_eq!(body, r#"{"rows":[{"n":200}]}"#);
             assert_eq!(seen.lock().unwrap().len(), 4);
+        });
+    }
+
+    /// The CLI reaches its gateway over HTTPS alone, with what its home holds: a client that
+    /// trusts only `ca.pem` and sends the token from `token` is answered; one that sends no token
+    /// is refused; one that trusts another certificate does not get through the handshake; and
+    /// plain HTTP gets no HTTP answer at all. Only the one read with the token reaches the
+    /// server, with the person's token.
+    #[test]
+    fn the_cli_reaches_the_gateway_over_https_with_what_its_home_holds() {
+        smol::block_on(async {
+            let (client, seen) = upstream();
+            let mut gateway = Gateway::bind().unwrap();
+            let cwd =
+                std::env::temp_dir().join(format!("studio-gateway-tls-{}", std::process::id()));
+            std::fs::remove_dir_all(&cwd).ok();
+            std::fs::create_dir_all(&cwd).unwrap();
+            let home = crate::cli_home::CliHome::write(
+                &cwd,
+                &cwd.join("private"),
+                gateway.access(),
+                "knowledge",
+                AGENT,
+                "main",
+            )
+            .unwrap();
+            let port = gateway.port;
+            let (events_tx, _events) = mpsc::unbounded();
+            let _serve = smol::spawn(gateway.serve(client, sandbox(), events_tx));
+            let ca = std::fs::read_to_string(home.dir.join("ca.pem")).unwrap();
+            let token = std::fs::read_to_string(home.dir.join("token")).unwrap();
+            let cli = Cli::trusting(port, &ca);
+            let body = r#"{"query":"q","branch":"main"}"#;
+
+            let (status, _, answer) = call(
+                cli.clone(),
+                post("/graphs/knowledge/query", &token, Some(CONTRACT), body),
+            )
+            .await;
+            assert_eq!((status, answer.as_str()), (200, r#"{"rows":[{"n":200}]}"#));
+            let tokenless = format!(
+                "POST /graphs/knowledge/query HTTP/1.1\r\nhost: 127.0.0.1\r\n\
+                 {CONTRACT_HEADER}: {CONTRACT}\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let (status, _, answer) = call(cli.clone(), tokenless).await;
+            assert_eq!(status, 401, "{answer}");
+
+            let stranger = crate::gateway_tls::identity().unwrap().certificate;
+            assert!(Cli::trusting(port, &stranger).connect().await.is_err());
+
+            let mut plain = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            plain
+                .write_all(post("/graphs/knowledge/query", &token, Some(CONTRACT), body).as_bytes())
+                .await
+                .unwrap();
+            let answer = within(std::time::Duration::from_secs(30), read_all(plain))
+                .await
+                .expect("the gateway closes a connection that does not speak TLS");
+            assert!(
+                !String::from_utf8_lossy(&answer).contains("HTTP/"),
+                "{answer:?}"
+            );
+
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "only the read with the token was sent");
+            assert_eq!(seen[0].2, "Bearer person-token");
+            drop(home);
+            std::fs::remove_dir_all(&cwd).ok();
+        });
+    }
+
+    /// A real omnigraph CLI that reads OmniGraph's version-1 operator configuration is chosen
+    /// for the home Studio writes, and reaches the gateway over HTTPS with that home's token and
+    /// certificate, both as the agent's shell runs it (the wrapper) and as `omnigraph_run` does
+    /// (the private home): each request reaches the server with the person's token. The fake
+    /// server's answer need not be one the CLI reads; what reached it is what is checked.
+    #[test]
+    #[ignore = "needs: OMNIGRAPH_STUDIO_LIVE_CLI, an omnigraph CLI built from OmniGraph main at \
+                ff542202 or later"]
+    fn a_live_cli_reaches_the_gateway_with_what_its_home_holds() {
+        let cli = std::env::var_os("OMNIGRAPH_STUDIO_LIVE_CLI")
+            .map(std::path::PathBuf::from)
+            .expect("set OMNIGRAPH_STUDIO_LIVE_CLI to an omnigraph CLI");
+        smol::block_on(async {
+            let (client, seen) = upstream();
+            let mut gateway = Gateway::bind().unwrap();
+            let cwd =
+                std::env::temp_dir().join(format!("studio-gateway-live-{}", std::process::id()));
+            std::fs::remove_dir_all(&cwd).ok();
+            std::fs::create_dir_all(&cwd).unwrap();
+            let home = crate::cli_home::CliHome::write(
+                &cwd,
+                &cwd.join("private"),
+                gateway.access(),
+                "knowledge",
+                AGENT,
+                "main",
+            )
+            .unwrap();
+            let (events_tx, _events) = mpsc::unbounded();
+            let _serve = smol::spawn(gateway.serve(client, sandbox(), events_tx));
+            let chosen = crate::cli_home::choose_cli(&home, vec![cli], CONTRACT).await;
+            if let crate::cli_home::CliChoice::NoMatch { found } = &chosen {
+                panic!("{}", crate::cli_home::no_cli_text(CONTRACT, found));
+            }
+            let args = ["branch", "list", "--json"];
+            let plan = crate::cli_home::check_run_args(&args.map(str::to_owned), &cwd, "knowledge")
+                .unwrap();
+            let (run, _) = crate::cli_home::run(&home, &cwd, plan).await;
+            let shell = smol::process::Command::new(&home.command)
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .await
+                .unwrap();
+            let shell = String::from_utf8_lossy(&shell.stderr).into_owned();
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 2, "omnigraph_run: {run}\nshell: {shell}");
+            for (method, uri, auth, contract, _) in seen.iter() {
+                assert_eq!(
+                    (method.as_str(), uri.as_str()),
+                    ("GET", "http://127.0.0.1:8787/graphs/knowledge/branches")
+                );
+                assert_eq!(
+                    (auth.as_str(), contract.as_str()),
+                    ("Bearer person-token", CONTRACT)
+                );
+            }
+            drop(home);
+            std::fs::remove_dir_all(&cwd).ok();
         });
     }
 }
@@ -1693,8 +1914,7 @@ mod end_to_end {
         let home = CliHome::write(
             &cwd,
             &cwd.join("private"),
-            gateway.port,
-            &gateway.token,
+            gateway.access(),
             &graph,
             &branch,
             "main",

@@ -97,6 +97,12 @@ rustix = { version = "1.1", features = ["fs"] }
 # The Agent Client Protocol at the version Zed v1.23.2 pins; stable v1 only (spec 011).
 agent-client-protocol = "=2.2.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# The agent's gateway serves HTTPS on loopback with a certificate it makes when it starts (spec
+# 013): rustls, which Studio's HTTP client already builds, over smol, with ring as its provider.
+futures-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+# The patterns of OmniGraph's operator-config schema, which the agent's CLI home is tested against.
+regex = "1"
 smol = "2"
 schemars = "1"
 semver = "1"

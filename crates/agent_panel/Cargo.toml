@@ -13,6 +13,8 @@ agent-client-protocol = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 editor = { workspace = true }
 futures = { workspace = true }
+# The gateway's TLS and the certificate it makes when it starts (spec 013).
+futures-rustls = { workspace = true }
 getrandom = { workspace = true }
 gpui = { workspace = true }
 url = { workspace = true }
@@ -22,6 +24,7 @@ graph_client = { workspace = true }
 graph_store = { workspace = true }
 menu = { workspace = true }
 percent-encoding = { workspace = true }
+rcgen = { workspace = true }
 # Zed's markdown renderer for agent replies; `editor` already builds it.
 markdown = { workspace = true }
 serde = { workspace = true }
@@ -54,7 +57,10 @@ windows-sys = { workspace = true, features = [
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 http_client = { workspace = true }
+# The CLI home's config checked against OmniGraph's operator-config JSON Schema.
+regex = { workspace = true }
 reqwest_client = { workspace = true }
+serde_norway = { workspace = true }
 
 [lints]
 workspace = true
