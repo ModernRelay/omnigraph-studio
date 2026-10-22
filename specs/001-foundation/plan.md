@@ -120,8 +120,7 @@ schema, the agent skill's `upstream/`).
   workflow's Apple secrets are set, and signed ad hoc otherwise. Run by hand
   (`workflow_dispatch`), the workflow builds the same files and publishes nothing, to check a
   release before it is tagged.
-- Homebrew cask in a ModernRelay tap. Updates: a polling updater modelled on Zed's
-  `auto_update`, later.
+- Homebrew cask in a ModernRelay tap. Updates: [spec 017](../017-auto-update/plan.md).
 
 ### Spikes that gate the MVP
 
@@ -147,7 +146,7 @@ schema, the agent skill's `upstream/`).
 ## Deferred
 
 - A Windows installer, a signed executable and its icon.
-- Auto-update, until there is a first signed release.
+- Auto-update, until there is a first signed release ([spec 017](../017-auto-update/plan.md)).
 - Engine change E19 (publish `omnigraph-compiler` to crates.io again), [spec 012](../012-omnigraph-engine-changes/plan.md). Until then the
   compiler is a git dependency on the tag of Studio's oldest supported server,
   `edge-20261020-7fd9cc9` since 2026-10-20 (`edge-20261018-0a62bb7` and `edge-20261017-d883c49`
