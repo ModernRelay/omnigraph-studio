@@ -244,6 +244,8 @@ pub struct Workspace {
     /// Studio's memory and CPU for the status bar while `studio.show_performance` is on (the
     /// default), read every two seconds while the window is in front.
     performance: Option<Performance>,
+    /// A view of the window's own at the right of the status bar: the updater's (spec 017).
+    status_item: Option<AnyView>,
     /// Whether this window is in front, which the memory and CPU reading waits for.
     window_active: bool,
     _performance: Option<Task<()>>,
@@ -456,6 +458,7 @@ impl Workspace {
             cli_errors: Vec::new(),
             _settings_subscription: settings_subscription,
             performance: None,
+            status_item: None,
             window_active: window.is_window_active(),
             _performance: None,
             _performance_subscription: performance_subscription,
@@ -2035,6 +2038,13 @@ impl Workspace {
         }
     }
 
+    /// The view drawn at the right of the status bar in every state, before the memory and CPU
+    /// readout: the updater's (spec 017).
+    pub fn set_status_item(&mut self, view: AnyView, cx: &mut Context<Self>) {
+        self.status_item = Some(view);
+        cx.notify();
+    }
+
     /// The activity log: the bottom dock's panel.
     pub fn set_activity_view(&mut self, view: AnyView, cx: &mut Context<Self>) {
         let position = self
@@ -3448,6 +3458,7 @@ impl Workspace {
                         }),
                 )
             })
+            .children(self.status_item.clone())
             .when(has_end && performance.is_some(), |bar| {
                 bar.child(studio_ui::ds::divider_v(cx))
             })
@@ -4771,13 +4782,15 @@ fn resize_handle(position: PanelPosition) -> impl IntoElement {
     })
 }
 
-/// What a close asked about closes: a tab, the shown graph, the window, or Studio.
+/// What a close asked about closes: a tab, the shown graph, the window, or Studio, quitting
+/// or restarting into an update.
 #[derive(Debug, Clone, Copy)]
 enum Closing {
     Tab(EntityId),
     Graph,
     Window,
     Quit,
+    Restart,
 }
 
 impl Closing {
@@ -4787,7 +4800,7 @@ impl Closing {
             Closing::Tab(_) => 0,
             Closing::Graph => 1,
             Closing::Window => 2,
-            Closing::Quit => 3,
+            Closing::Quit | Closing::Restart => 3,
         }
     }
 }
@@ -4857,6 +4870,7 @@ impl ConfirmClose {
                     }
                 },
                 Closing::Quit => cx.defer(|cx| quit(true, cx)),
+                Closing::Restart => cx.defer(|cx| restart(true, cx)),
             })
             .ok();
     }
@@ -4877,6 +4891,7 @@ impl ConfirmClose {
             Closing::Graph => ("Close the graph?".into(), lost),
             Closing::Window => ("Close this window?".into(), lost),
             Closing::Quit => ("Quit Omnigraph Studio?".into(), lost),
+            Closing::Restart => ("Restart to update Omnigraph Studio?".into(), lost),
         }
     }
 }
@@ -4885,6 +4900,19 @@ impl ConfirmClose {
 /// (spec 002), so that window comes forward with a toast saying so. Unless `confirmed`, tabs
 /// with unsaved work in any window are named first, in a dialog that quits once confirmed.
 pub fn quit(confirmed: bool, cx: &mut App) {
+    leave(Closing::Quit, confirmed, cx);
+}
+
+/// Restarts Studio into the update that is ready (spec 017), asked about as Quit is.
+pub fn restart(confirmed: bool, cx: &mut App) {
+    leave(Closing::Restart, confirmed, cx);
+}
+
+fn leave(closing: Closing, confirmed: bool, cx: &mut App) {
+    let verb = match closing {
+        Closing::Restart => "Restart",
+        _ => "Quit",
+    };
     let windows: Vec<WindowHandle<Workspace>> = cx
         .windows()
         .into_iter()
@@ -4896,7 +4924,7 @@ pub fn quit(confirmed: bool, cx: &mut App) {
                 let graph = workspace.running_write(cx)?;
                 workspace.show_toast(
                     ToastKind::Error,
-                    format!("A write to {graph} is still running. Quit when it finishes."),
+                    format!("A write to {graph} is still running. {verb} when it finishes."),
                     cx,
                 );
                 window.activate_window();
@@ -4924,14 +4952,17 @@ pub fn quit(confirmed: bool, cx: &mut App) {
         {
             handle
                 .update(cx, |workspace, window, cx| {
-                    workspace.confirm_close(Closing::Quit, unsaved, window, cx);
+                    workspace.confirm_close(closing, unsaved, window, cx);
                     window.activate_window();
                 })
                 .ok();
             return;
         }
     }
-    cx.quit();
+    match closing {
+        Closing::Restart => cx.restart(),
+        _ => cx.quit(),
+    }
 }
 
 impl Render for ConfirmClose {
@@ -5241,6 +5272,83 @@ mod tests {
         dialog.update_in(cx, |dialog, window, cx| dialog.close(window, cx));
         workspace.read_with(cx, |workspace, _| {
             assert!(workspace.session().is_none(), "closed once confirmed");
+        });
+    }
+
+    struct StatusProbe;
+
+    impl Render for StatusProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .debug_selector(|| "status-probe".into())
+                .child("probe")
+        }
+    }
+
+    /// The window's own status item (the updater's, spec 017) is drawn in the status bar,
+    /// with no graph open as with one.
+    #[gpui::test]
+    fn the_status_item_is_drawn_in_the_status_bar(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update(cx, |workspace, cx| {
+            let probe = cx.new(|_| StatusProbe);
+            workspace.set_status_item(probe.into(), cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("status-probe").is_some());
+    }
+
+    /// Restart to Update asks as Quit does when a tab holds unsaved work (spec 017), in its
+    /// own words; nothing restarts until it is confirmed.
+    #[gpui::test]
+    fn restarting_to_update_with_unsaved_work_asks_first(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+        });
+        let http = http_client::FakeHttpClient::create(|_| async {
+            Ok(http_client::http::Response::builder()
+                .status(404)
+                .body(http_client::AsyncBody::default())
+                .unwrap())
+        });
+        let server = graph_store::ServerEntry {
+            name: "test".into(),
+            url: "http://studio.test".into(),
+            source: graph_store::ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| graph_store::Connection::new(server, None, http).unwrap());
+        let session = cx.new(|cx| GraphSession::new(connection, "notes".into(), "main".into(), cx));
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.graph_order.push(session.entity_id());
+            workspace.subscribe_session(session.clone(), cx);
+            workspace.open_item("draft".to_owned(), window, cx, |_, cx| Unsaved {
+                focus_handle: cx.focus_handle(),
+            });
+        });
+        // Deferred, as the action's handler does: the window is held while it dispatches.
+        cx.update(|_, cx| cx.defer(|cx| restart(false, cx)));
+        cx.run_until_parked();
+        let dialog = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .modal
+                .as_ref()
+                .and_then(|modal| modal.view.clone().downcast::<ConfirmClose>().ok())
+                .expect("the restart dialog")
+        });
+        dialog.read_with(cx, |dialog, _| {
+            assert!(matches!(dialog.closing, Closing::Restart));
+            assert_eq!(
+                dialog.header().0,
+                SharedString::from("Restart to update Omnigraph Studio?")
+            );
+            assert_eq!(dialog.unsaved, [SharedString::from("Draft")]);
         });
     }
 
