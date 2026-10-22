@@ -122,3 +122,67 @@ fn installing_replaces_the_bundle_with_the_updates() {
     assert!(bundle.join("Contents/Info.plist").is_file());
     assert!(!bundle.join("Contents/Old.txt").exists());
 }
+
+/// A bundle archived as `script/bundle-mac` archives it and installed by the crate still
+/// passes `codesign --verify --strict`: the signature lives in the bundle's own files, and the
+/// install keeps them, their modes and the executable intact.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_installed_bundle_keeps_its_signature() {
+    use std::process::Command;
+    let source = tempfile::tempdir().unwrap();
+    let app = source.path().join("Omnigraph Studio.app");
+    std::fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+    std::fs::copy("/usr/bin/true", app.join("Contents/MacOS/omnigraph-studio")).unwrap();
+    std::fs::write(
+        app.join("Contents/Info.plist"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key>
+	<string>omnigraph-studio</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.modernrelay.omnigraph-studio.test</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.3.0</string>
+</dict>
+</plist>
+"#,
+    )
+    .unwrap();
+    let signed = Command::new("codesign")
+        .args(["--force", "--sign", "-"])
+        .arg(&app)
+        .status()
+        .unwrap();
+    assert!(signed.success());
+    let archive = source.path().join("update.app.tar.gz");
+    let archived = Command::new("tar")
+        .env("COPYFILE_DISABLE", "1")
+        .args(["--no-mac-metadata", "-czf"])
+        .arg(&archive)
+        .arg("-C")
+        .arg(source.path())
+        .arg("Omnigraph Studio.app")
+        .status()
+        .unwrap();
+    assert!(archived.success());
+
+    let target = tempfile::tempdir().unwrap();
+    let bundle = target.path().join("Omnigraph Studio.app");
+    std::fs::create_dir_all(bundle.join("Contents")).unwrap();
+    let job = job(serve(Vec::new()), bundle.clone());
+    let bytes = std::fs::read(&archive).unwrap();
+    futures::executor::block_on(PackagerInstaller.install(&job, bytes)).unwrap();
+    let verified = Command::new("codesign")
+        .args(["--verify", "--strict", "--verbose=2"])
+        .arg(&bundle)
+        .output()
+        .unwrap();
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+}

@@ -8,7 +8,8 @@ name: Release
 # publishing them, to check a release before tagging it.
 #
 # macOS builds are signed and notarized when the Apple secrets below are set, and signed ad hoc
-# otherwise. Linux builds are tarballs, the Windows build a zip.
+# otherwise; a tag's release needs them, so an unsigned macOS build is never published
+# (spec 017). Linux builds are tarballs, the Windows build a zip.
 #
 #   APPLE_CERTIFICATE_P12        base64 of a "Developer ID Application" certificate (.p12)
 #   APPLE_CERTIFICATE_PASSWORD   its export password
@@ -16,6 +17,13 @@ name: Release
 #   APPLE_NOTARY_KEY_P8          base64 of an App Store Connect API key (.p8)
 #   APPLE_NOTARY_KEY_ID          its key ID
 #   APPLE_NOTARY_ISSUER          its issuer ID
+#
+# Studio's updater installs a macOS update only when it is signed with the update key, whose
+# public half is crates/studio_update/update-key.pub. Without these the release still says
+# which version is newest (latest.json), and Studio offers the download instead:
+#
+#   STUDIO_UPDATER_KEY           the private key `cargo packager signer generate` writes
+#   STUDIO_UPDATER_KEY_PASSWORD  its password
 
 on:
   push:
@@ -48,6 +56,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       SIGNED: ${{ secrets.APPLE_CERTIFICATE_P12 != '' }}
+      UPDATER_KEYED: ${{ secrets.STUDIO_UPDATER_KEY != '' }}
     steps:
       # Zed's checkout has paths past Windows's 260-character limit; git fetches it.
       - name: Long paths
@@ -72,6 +81,15 @@ jobs:
             echo "tag $GITHUB_REF_NAME does not name the workspace version $version" >&2
             exit 1
           fi
+
+      # Every updating Studio and `omnigraph studio` refuse an app not signed with the Developer
+      # ID, so a tag's release stops here rather than after the builds.
+      - name: A tag's macOS build is signed
+        if: github.event_name == 'push' && runner.os == 'macOS' && env.SIGNED != 'true'
+        shell: bash
+        run: |
+          echo "a release needs the Apple secrets listed at the top of release.yml" >&2
+          exit 1
 
       - name: Linux packages
         if: runner.os == 'Linux'
@@ -124,11 +142,42 @@ jobs:
         shell: bash
         run: script/bundle-${{ runner.os == 'macOS' && 'mac' || runner.os == 'Windows' && 'windows' || 'linux' }}
 
+      # The requirement `omnigraph studio` checks before it opens or installs Studio (RFC #1017).
+      - name: The app passes the Developer ID requirement
+        if: runner.os == 'macOS' && env.SIGNED == 'true'
+        env:
+          APPLE_SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
+        run: |
+          team=$(sed -nE 's/.*\(([A-Z0-9]{10})\)$/\1/p' <<< "$APPLE_SIGN_IDENTITY")
+          if [[ -z "$team" ]]; then
+            echo "APPLE_SIGN_IDENTITY names no team: \"Developer ID Application: Name (TEAMID)\"" >&2
+            exit 1
+          fi
+          codesign --verify --deep --strict --verbose=2 \
+            -R="identifier \"com.modernrelay.omnigraph-studio\" and anchor apple generic and certificate leaf[subject.OU] = \"$team\"" \
+            "target/bundle/Omnigraph Studio.app"
+
+      - uses: taiki-e/install-action@v2
+        if: runner.os == 'macOS' && env.UPDATER_KEYED == 'true'
+        with:
+          tool: cargo-packager@0.11.8
+
+      # Writes the .sig beside the update archive: base64 of its minisign signature.
+      - name: Sign the update
+        if: runner.os == 'macOS' && env.UPDATER_KEYED == 'true'
+        env:
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.STUDIO_UPDATER_KEY }}
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.STUDIO_UPDATER_KEY_PASSWORD }}
+        run: |
+          for update in target/bundle/*.app.tar.gz; do
+            cargo packager signer sign "$update"
+          done
+
       - name: Collect
         shell: bash
         run: |
           mkdir -p dist
-          cp target/bundle/*.dmg target/bundle/*.tar.gz target/bundle/*.zip dist/ 2>/dev/null || true
+          cp target/bundle/*.dmg target/bundle/*.tar.gz target/bundle/*.sig target/bundle/*.zip dist/ 2>/dev/null || true
           ls -la dist
 
       - uses: actions/upload-artifact@v4
@@ -143,10 +192,17 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+
+      # The first-install files under names without the version, which `latest/download` always
+      # serves, and latest.json for Studio's updater (spec 017).
+      - name: Version-free copies and the update manifest
+        run: python3 script/release-files.py dist "${GITHUB_REF_NAME#v}"
 
       - name: Checksums
         run: |
@@ -175,6 +231,8 @@ jobs:
           | \`omnigraph-studio-$version-linux-aarch64.tar.gz\` | Linux arm64, glibc 2.35 or later; Wayland or X11, Vulkan |
           | \`omnigraph-studio-$version-windows-x86_64.zip\` | Windows 10 (1809) or later, x86_64 |
 
+          The same four files without the version in their names are always the newest release's, at \`https://github.com/$GITHUB_REPOSITORY/releases/latest/download/<name>\`. \`Omnigraph-Studio-$version-arm64.app.tar.gz\` with its \`.sig\`, and \`latest.json\`, are for Studio's own updater.
+
           \`SHA256SUMS\` lists every file's checksum. Each download carries \`LICENSE\` (GPL-3.0-or-later) and \`THIRD-PARTY-NOTICES.md\`, the licences of the crates, fonts, icons and themes it includes.
 
           $mac
@@ -185,7 +243,7 @@ jobs:
 
           Studio connects to an Omnigraph server of v0.14.0 or later (HTTP contract 0.14); see the README for connecting and for a sample graph. The servers of your \`omnigraph\` CLI's targets, and the agent panel, need that CLI at v0.14.0 or later.
           NOTES
-          flags=()
-          [[ "$version" == 0.* ]] && flags+=(--prerelease)
+          # A full release, so `latest` names it: Studio's updater and the CLI read it there.
+          flags=(--latest)
           gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
             --title "Omnigraph Studio $version" --notes-file notes.md "${flags[@]}"
