@@ -577,7 +577,8 @@ fn refuse_over_permissive(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(test)]
+// Every test here reads Unix file modes.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

@@ -1881,6 +1881,7 @@ mod tests {
     /// What a CLI that reads OmniGraph's version-1 operator configuration does with
     /// `config validate --operator-config FILE`: exits 0 for the private home's file in that
     /// form, run with that home, and refuses anything else.
+    #[cfg(unix)]
     const VALIDATES: &str = r#"if [ "$1 $2 $3" = "config validate --operator-config" ]; then
   if [ "$4" = "$OMNIGRAPH_HOME/config.yaml" ] && grep -qx 'version: 1' "$4" && ! grep -q target_config_version "$4"; then
     echo "operator configuration is valid"; exit 0
