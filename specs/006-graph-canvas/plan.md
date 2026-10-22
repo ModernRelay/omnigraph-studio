@@ -108,7 +108,8 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   Pointing at a cut chip for a moment opens it: its whole name, wrapped at 320 px at zoom 1
   (`OPEN_CHIP_MAX_WIDTH`) in lines of even length, drawn over its neighbours from where the
   chip starts, never narrower than it, with its mark and the pointed shadow or the selected
-  border;
+  border. It is laid out before the lines, which meet its sides level with its middle (not
+  its first line), and the cut chip is not drawn under it;
   selecting it keeps it open until another chip is selected, and the opened chip is hit where
   it is drawn. A node chip's menu offers "Show as ▸"
   with its type's single text properties and "Automatic": the graph's node name for the type
@@ -172,6 +173,7 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | A line's end ring sits on the line, at the chip's middle, opened or not | `paint` `a_line_ends_in_a_ring_on_it` (both ends of lines at zooms 0.3 to 3, chips of four sizes either side, an upright end, a piece of no length, and a chip opened to five lines; it fails by exactly 3 px with the old placement); clippy `-D warnings`; offscreen snapshots on `script/dev-server` of a walk (light, dark, zoomed in twice and out twice) and of a result whose second node's name opens to five lines (light and dark) | Before (Ragnor's screenshots): every ring 3 px below its line, and an opened chip's line and ring at its first line, the cut chip's glow showing above the card. After: each ring centred on its line at the chip's middle at every zoom and in both themes; the opened card's line turns down to its middle; no outline above it |
 | 2026-10-21 | Leaving a chip stops what was read ahead for it | `graph_canvas` `leaving_a_chip_stops_its_read_ahead` (a relationship pill's first neighbours read ahead, the pointer leaving before they answer; it fails without the stop) | The read is let go and nothing records that it was asked for, as for a tree row (spec 005). Before, it ran on until another chip's read ahead replaced it |
 | 2026-10-21 | A changed node cap reaches an open canvas, and showing a node builds its scene once | `graph_canvas` `a_new_node_cap_is_drawn_at_once` (a results canvas of three people under a cap of 2, then 3: two chips and "1 not shown", then three and no banner; it fails with the settings watch removed); `showing_a_shown_node_keeps_the_exploration`; clippy `-D warnings`; design tokens and layers; offscreen snapshots of Show on canvas, once and twice, on `script/dev-server` | Before: a cap changed in settings showed in the banner over the chips drawn under the old one until something else redrew the canvas, and Show on canvas built the whole scene twice on the main thread, once to ask whether the node was in it. After: the cap redraws the canvas at once, and a node already drawn is laid out from the one scene built to look for it; both snapshots are pixel-identical to the build before |
 | 2026-10-20 | Nothing on the ontology page is cut off at any width | `layered` `a_line_meets_a_chip_level_with_its_other_end_where_it_can` and the existing route soundness tests; `ontology` tests; workspace clippy `-D warnings`; design tokens and layers; offscreen snapshots on a third scratch server whose 101 types carry made-up properties and descriptions shaped like a personal graph's (enumerations of up to 20 values, descriptions of up to 600 characters), at 1440 and 1100 px wide, light and dark, a row pointed at; the dev graph's map | Before: at 1100 px the focus view's fixed 1,084 px of columns ran off both edges, cutting the type names on each side, and enumerations ran out of the card. After: at 1440 px the sides take 330 px each; at 1100 px the card stands above the two sides, nothing cut; enumeration values wrap under their property; a 600-character description shows five lines and More; the side titles read "Reach it 14" and "It reaches 10"; the dev map's Contributes line runs straight into Person, where it stepped 5 px |
@@ -248,6 +250,13 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   types that name recognisable parts of it (money, work, learning and events, health,
   automation, commerce, investments, equity); grouping three levels deep merged them into
   groups of 23 and 32, so it stops at two.
+- **Rings off their lines (2026-10-21).** A ring's centre was the line's end moved half a
+  ring along the last piece, in the direction `f32::signum` gave each axis; the signum of 0
+  is 1, so at a level line's end the ring also moved half a ring (3 px) down, off the line
+  (Ragnor: "the circle is still misaligned"). One function (`ring_centre`) now moves it along
+  the piece only. An opened chip also kept the cut chip's line ends, at its first line, and
+  the cut chip was still drawn under the card; it is now laid out before the lines, which meet
+  its sides at its middle, and drawn once ("when it expands it should still center").
 - **A changed cap did not reach an open canvas (2026-10-21).** The canvas read
   `canvas_max_nodes` only when it built a scene and did not watch settings, so after a change
   the banner named the new limit over chips drawn under the old one. The canvas now watches

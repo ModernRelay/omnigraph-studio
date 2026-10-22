@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use gpui::{
     App, BorderStyle, Bounds, BoxShadow, Corners, Font, FontWeight, Hsla, Pixels, Point,
-    ShapedLine, SharedString, TextAlign, TextRun, Window, point, px, quad, size,
+    ShapedLine, SharedString, TextAlign, TextRun, Window, WrappedLine, point, px, quad, size,
 };
 use studio_ui::ds::elevation::Layer;
 use studio_ui::type_color;
@@ -254,6 +254,50 @@ pub(crate) fn paint(
         })
         .collect();
 
+    // What each chip says, in its colours.
+    let pieces_of = |index: usize| -> Vec<Piece> {
+        texts[index]
+            .pieces
+            .iter()
+            .map(|(text, role)| Piece {
+                text: text.clone(),
+                color: match role {
+                    Role::Name | Role::RootName | Role::OpenHub => palette.text,
+                    Role::Count | Role::Muted => palette.muted,
+                },
+                weight: role.weight(),
+            })
+            .collect()
+    };
+    // An opened chip shows its whole name over its neighbours, from where its chip starts; it is
+    // measured before the lines, which meet it where it is drawn.
+    let open: Option<(usize, OpenChip)> = opened
+        .filter(|&index| index < scene.nodes.len() && !mark_only(index))
+        .and_then(|index| {
+            let label = whole_label(&scene.nodes[index])?;
+            let size = texts[index].size * scale;
+            let (chip, _) = pill_layout(
+                screen[index],
+                &pieces_of(index),
+                texts[index].mark,
+                size,
+                palette,
+                window,
+            );
+            Some((
+                index,
+                open_chip_layout(chip, &label, text_size, palette, window),
+            ))
+        });
+    // Where each node's lines meet it: its centre and how far its sides are from it; an opened
+    // chip's, its whole card's, so its lines and their rings meet its sides level with its
+    // middle however tall the name makes it.
+    let mut anchor: Vec<Point<Pixels>> = screen.to_vec();
+    let mut reach = reach;
+    if let Some((index, open)) = &open {
+        (anchor[*index], reach[*index]) = meets(open.rect);
+    }
+
     // Each line as right-angle pieces, with its tone: out of the node it hangs from, turning
     // near it, so a column of neighbours shares one upright. A scene has no edge from a node to
     // itself (a node is drawn once, and a result's row joins distinct nodes).
@@ -267,8 +311,8 @@ pub(crate) fn paint(
             (edge.to, edge.from)
         };
         let points = elbow(
-            (screen[parent], reach[parent]),
-            (screen[child], reach[child]),
+            (anchor[parent], reach[parent]),
+            (anchor[child], reach[child]),
             ELBOW * zoom,
         );
         if !crosses(&points, bounds, 40.) {
@@ -296,15 +340,7 @@ pub(crate) fn paint(
                 if mark_only(node) {
                     continue;
                 }
-                let (at, toward) = (points[end], points[next]);
-                let along = point(
-                    f32::from(toward.x - at.x).signum(),
-                    f32::from(toward.y - at.y).signum(),
-                );
-                let centre = point(
-                    at.x + px(along.x * RING / 2.),
-                    at.y + px(along.y * RING / 2.),
-                );
+                let centre = ring_centre(points[end], points[next]);
                 let key = (
                     (f32::from(centre.x) * 4.).round() as i64,
                     (f32::from(centre.y) * 4.).round() as i64,
@@ -364,25 +400,18 @@ pub(crate) fn paint(
             };
             continue;
         }
+        // An opened chip is drawn once, opened, over its neighbours below: not also cut here,
+        // where its glow would show around the card.
+        if open.as_ref().is_some_and(|(opened, _)| *opened == index) {
+            continue;
+        }
         let tint = type_color(&node.color_key);
         let text = &texts[index];
         let mark = text.mark.then(|| (tint, text.initial.clone()));
-        let pieces: Vec<Piece> = text
-            .pieces
-            .iter()
-            .map(|(text, role)| Piece {
-                text: text.clone(),
-                color: match role {
-                    Role::Name | Role::RootName | Role::OpenHub => palette.text,
-                    Role::Count | Role::Muted => palette.muted,
-                },
-                weight: role.weight(),
-            })
-            .collect();
         let size = text.size * scale;
         rects[index] = paint_pill(
             p,
-            &pieces,
+            &pieces_of(index),
             mark,
             size,
             PillStyle {
@@ -401,19 +430,13 @@ pub(crate) fn paint(
             cx,
         );
     }
-    // An opened chip shows its whole name over its neighbours, from where its chip starts, and
-    // is hit where it is drawn.
-    if let Some(index) = opened
-        && let Some(label) = scene.nodes.get(index).and_then(whole_label)
-        && rects[index].size.width > px(0.)
-    {
-        let node = &scene.nodes[index];
-        let focus = selected == Some(index) || marked.contains(&index);
-        rects[index] = paint_open_chip(
-            rects[index],
-            &label,
-            (type_color(&node.color_key), texts[index].initial.clone()),
-            text_size,
+    // The opened chip, over its neighbours, hit where it is drawn.
+    if let Some((index, open)) = &open {
+        let node = &scene.nodes[*index];
+        let focus = selected == Some(*index) || marked.contains(index);
+        paint_open_chip(
+            open,
+            (type_color(&node.color_key), texts[*index].initial.clone()),
             PillStyle {
                 fill: palette.card,
                 border: focus.then_some(palette.here),
@@ -425,7 +448,27 @@ pub(crate) fn paint(
             window,
             cx,
         );
+        rects[*index] = open.rect;
     }
+}
+
+/// Where lines meet a chip drawn in `rect`: at its centre's height, `reach` either side of it.
+fn meets(rect: Bounds<Pixels>) -> (Point<Pixels>, f32) {
+    (rect.center(), f32::from(rect.size.width) / 2.)
+}
+
+/// Where the ring at a line's end `at` sits: on the line, half a ring back along its last
+/// piece toward `next`, so the line stops at the ring and the ring touches what the line
+/// reaches. Pieces run at right angles, so the ring moves along one axis only; a piece of no
+/// length leaves it on the end. (`f32::signum` of zero is 1, which moved every ring at a
+/// level line's end half a ring down, off the line.)
+pub(crate) fn ring_centre(at: Point<Pixels>, next: Point<Pixels>) -> Point<Pixels> {
+    let step = |from: Pixels, to: Pixels| match f32::from(to - from) {
+        d if d > 0. => RING / 2.,
+        d if d < 0. => -RING / 2.,
+        _ => 0.,
+    };
+    point(at.x + px(step(at.x, next.x)), at.y + px(step(at.y, next.y)))
 }
 
 /// A line end's ring at `centre`: a small circle in `ink`, filled with the ground (`fill`) so
@@ -813,18 +856,19 @@ fn paint_chip_body(rect: Bounds<Pixels>, radius: f32, style: &PillStyle, window:
 
 /// A chip centred on `at`: an optional letter mark, then the pieces of text. Returns its bounds.
 #[allow(clippy::too_many_arguments)]
-fn paint_pill(
+/// A chip's pieces shaped at `text_size`, and the pill around them centred on `at`: one line
+/// high, its mark (when it has one) before them. What painting the chip draws, and what an
+/// opened chip grows from.
+fn pill_layout(
     at: Point<Pixels>,
     pieces: &[Piece],
-    mark: Option<(Hsla, SharedString)>,
+    mark: bool,
     text_size: f32,
-    style: PillStyle,
     palette: &Palette,
     window: &mut Window,
-    cx: &mut App,
-) -> Bounds<Pixels> {
+) -> (Bounds<Pixels>, Vec<ShapedLine>) {
     let s = text_size / CHIP_TEXT;
-    let lines: Vec<_> = pieces
+    let lines: Vec<ShapedLine> = pieces
         .iter()
         .map(|piece| {
             let font = Font {
@@ -847,21 +891,37 @@ fn paint_pill(
         })
         .collect();
     let gap = PILL_GAP * s;
-    let pad_x = PILL_PAD_X * s;
-    let line_height = text_size * 1.4;
-    let height = line_height + 8. * s;
-    let mark_size = PILL_MARK * s;
+    let height = text_size * 1.4 + 8. * s;
     let text_width: f32 = lines.iter().map(|l| f32::from(l.width)).sum::<f32>()
         + gap * lines.len().saturating_sub(1) as f32;
-    let width = pad_x * 2. + text_width + if mark.is_some() { mark_size + gap } else { 0. };
+    let width = PILL_PAD_X * s * 2. + text_width + if mark { PILL_MARK * s + gap } else { 0. };
     let rect = Bounds::new(
         point(at.x - px(width / 2.), at.y - px(height / 2.)),
         size(px(width), px(height)),
     );
+    (rect, lines)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_pill(
+    at: Point<Pixels>,
+    pieces: &[Piece],
+    mark: Option<(Hsla, SharedString)>,
+    text_size: f32,
+    style: PillStyle,
+    palette: &Palette,
+    window: &mut Window,
+    cx: &mut App,
+) -> Bounds<Pixels> {
+    let (rect, lines) = pill_layout(at, pieces, mark.is_some(), text_size, palette, window);
+    let s = text_size / CHIP_TEXT;
+    let gap = PILL_GAP * s;
+    let line_height = text_size * 1.4;
+    let mark_size = PILL_MARK * s;
     // A chip is not a button: the scale's `sm` corner, zoomed with it, never past round.
-    let radius = (studio_ui::ds::radii(cx).sm * s).min(height / 2.);
+    let radius = (studio_ui::ds::radii(cx).sm * s).min(f32::from(rect.size.height) / 2.);
     paint_chip_body(rect, radius, &style, window);
-    let mut x = f32::from(rect.left()) + pad_x;
+    let mut x = f32::from(rect.left()) + PILL_PAD_X * s;
     let middle = at.y;
     if let Some((tint, letter)) = mark {
         let center = point(px(x + mark_size / 2.), middle);
@@ -884,20 +944,22 @@ fn paint_pill(
     rect
 }
 
-/// A chip opened to its whole name: its mark, then the name wrapped at
-/// [`OPEN_CHIP_MAX_WIDTH`], drawn from the top left of the chip it opens and never narrower
-/// than it. Returns its bounds.
-#[allow(clippy::too_many_arguments)]
-fn paint_open_chip(
+/// A chip opened to its whole name, laid out: its card, drawn from the top left of the chip it
+/// opens and never smaller than it, and its name wrapped at [`OPEN_CHIP_MAX_WIDTH`].
+struct OpenChip {
+    rect: Bounds<Pixels>,
+    lines: Vec<WrappedLine>,
+    text_size: f32,
+}
+
+/// Lays out `chip` opened to its whole `label` at `text_size`.
+fn open_chip_layout(
     chip: Bounds<Pixels>,
     label: &str,
-    (tint, letter): (Hsla, SharedString),
     text_size: f32,
-    style: PillStyle,
     palette: &Palette,
     window: &mut Window,
-    cx: &mut App,
-) -> Bounds<Pixels> {
+) -> OpenChip {
     let s = text_size / CHIP_TEXT;
     let (gap, pad_x, mark_size) = (PILL_GAP * s, PILL_PAD_X * s, PILL_MARK * s);
     let line_height = text_size * 1.4;
@@ -928,10 +990,12 @@ fn paint_open_chip(
             .width,
     );
     let wrap = wrap_width(whole, widest, text_size);
-    let lines = window
+    let lines: Vec<WrappedLine> = window
         .text_system()
         .shape_text(text, px(text_size), &[run], Some(px(wrap)), None)
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
     let text_width = lines
         .iter()
         .map(|line| f32::from(line.width()))
@@ -942,7 +1006,27 @@ fn paint_open_chip(
         .sum();
     let width = (pad_x * 2. + mark_size + gap + text_width).max(f32::from(chip.size.width));
     let height = (text_height + pad_y * 2.).max(f32::from(chip.size.height));
-    let rect = Bounds::new(chip.origin, size(px(width), px(height)));
+    OpenChip {
+        rect: Bounds::new(chip.origin, size(px(width), px(height))),
+        lines,
+        text_size,
+    }
+}
+
+/// Paints an opened chip: its card, its mark beside the first line, and its name.
+fn paint_open_chip(
+    open: &OpenChip,
+    (tint, letter): (Hsla, SharedString),
+    style: PillStyle,
+    palette: &Palette,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let (rect, text_size) = (open.rect, open.text_size);
+    let s = text_size / CHIP_TEXT;
+    let (gap, pad_x, mark_size) = (PILL_GAP * s, PILL_PAD_X * s, PILL_MARK * s);
+    let line_height = text_size * 1.4;
+    let pad_y = 4. * s;
     let radius = studio_ui::ds::radii(cx).sm * s;
     paint_chip_body(rect, radius, &style, window);
     // The mark stays where the chip had it, beside the first line.
@@ -959,7 +1043,7 @@ fn paint_open_chip(
         cx,
     );
     let mut y = rect.top() + px(pad_y);
-    for line in &lines {
+    for line in &open.lines {
         line.paint(
             point(px(left + mark_size + gap), y),
             px(line_height),
@@ -971,7 +1055,6 @@ fn paint_open_chip(
         .ok();
         y += line.size(px(line_height)).height;
     }
-    rect
 }
 
 /// Where an opened chip's name of `whole` width wraps, at most `widest`: in lines of even
@@ -1198,5 +1281,54 @@ mod tests {
         // Two children in one column share the parent's upright.
         let other = elbow((at(0., 0.), 20.), (at(210., -40.), 40.), 18.);
         assert_eq!(other[1].x, line[1].x);
+    }
+
+    /// A line's end ring sits on the line, half a ring in from where it meets the chip: at the
+    /// chip's vertical middle, whatever the zoom, the chip's size or where the chip stands.
+    #[test]
+    fn a_line_ends_in_a_ring_on_it() {
+        let at = |x: f32, y: f32| point(px(x), px(y));
+        for zoom in [0.3, 0.5, 1., 1.6, 3.] {
+            for (child, reach) in [
+                (at(240., 0.), 40.),
+                (at(240., 90.), 80.),
+                (at(-260., -70.), 140.),
+                (at(30., 12.), 12.),
+            ] {
+                let parent = (at(0., 0.), 60. * zoom);
+                let line = elbow(parent, (child, reach * zoom), ELBOW * zoom);
+                let last = line.len() - 1;
+                for (end, next, middle) in [(0, 1, parent.0.y), (last, last - 1, child.y)] {
+                    let (end, next) = (line[end], line[next]);
+                    let centre = ring_centre(end, next);
+                    assert_eq!(centre.y, middle, "on the chip's middle at zoom {zoom}");
+                    assert_eq!(centre.y, end.y, "on the line");
+                    assert_eq!(f32::from(centre.x - end.x).abs(), RING / 2.);
+                    assert!(
+                        f32::from(centre.x - end.x) * f32::from(next.x - end.x) > 0.,
+                        "inside the line, toward its other end"
+                    );
+                }
+            }
+        }
+        // A chip opened to a name of several lines, taller and wider than it was: its lines and
+        // their rings meet its sides level with its middle, not its first line.
+        let card = Bounds::new(at(300., 100.), size(px(320.), px(124.)));
+        let (middle, reach) = meets(card);
+        let line = elbow((at(0., 0.), 60.), (middle, reach), ELBOW);
+        let end = *line.last().unwrap();
+        assert_eq!(end, at(300., 162.), "its left side, at its middle");
+        assert_eq!(ring_centre(end, line[line.len() - 2]).y, px(162.));
+        // An upright end: the ring moves along it only.
+        assert_eq!(
+            ring_centre(at(5., 10.), at(5., 40.)),
+            at(5., 10. + RING / 2.)
+        );
+        assert_eq!(
+            ring_centre(at(5., 10.), at(5., -40.)),
+            at(5., 10. - RING / 2.)
+        );
+        // A piece of no length leaves it on the end.
+        assert_eq!(ring_centre(at(5., 10.), at(5., 10.)), at(5., 10.));
     }
 }
