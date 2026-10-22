@@ -384,6 +384,7 @@ mod tests {
                 "studio.canvas_max_nodes",
                 "studio.health_check_seconds",
                 "studio.show_performance",
+                "studio.auto_update",
                 "omnigraph_cli",
                 "agent.command",
                 "agent.ask_before_writes",
@@ -392,7 +393,7 @@ mod tests {
         );
         assert_eq!(
             sections(),
-            ["Appearance", "Browsing", "Connection", "Agent"]
+            ["Appearance", "Browsing", "Connection", "Updates", "Agent"]
         );
     }
 
@@ -435,6 +436,7 @@ mod tests {
         assert_eq!(field("agent.ask_before_writes").kind, FieldKind::Toggle);
         // A doc comment's lines are one paragraph.
         assert!(!field("agent.ask_before_writes").description.contains('\n'));
+        assert_eq!(field("studio.auto_update").title, "Update automatically");
         let cli = field("omnigraph_cli");
         assert_eq!(cli.title, "Omnigraph CLI");
         assert_eq!(cli.kind, FieldKind::Text { nullable: true });

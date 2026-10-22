@@ -168,6 +168,10 @@ pub struct StudioOptions {
     /// seconds while the window is in front.
     #[schemars(title = "Show memory and CPU", extend("x-section" = "Appearance"))]
     pub show_performance: bool,
+    /// Check for a newer Studio half a minute after launch and every hour, and install it on
+    /// macOS, ready at the next restart. Off, Studio checks only when asked (spec 017).
+    #[schemars(title = "Update automatically", extend("x-section" = "Updates"))]
+    pub auto_update: bool,
 }
 
 impl Default for StudioOptions {
@@ -181,6 +185,7 @@ impl Default for StudioOptions {
             canvas_max_nodes: 2000,
             health_check_seconds: 30,
             show_performance: true,
+            auto_update: true,
         }
     }
 }
