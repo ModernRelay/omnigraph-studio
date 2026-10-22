@@ -1,7 +1,7 @@
 # 017: Studio updates itself
 
-Status: draft, not implemented; needs Developer ID signed and notarized releases (issue #3), an
-update signing key, and answers to the open questions below · 2026-10-22
+Status: built 2026-10-22 (branch `auto-update`); installing waits on Developer ID signed and
+notarized releases (issue #3) and the update key (open questions 1 and 2) · 2026-10-22
 
 ## Problem
 
@@ -251,8 +251,11 @@ Failures, as said:
 | Bundle or folder not writable | Studio can't replace itself in <folder>. · Download |
 | Install failed | Couldn't install 0.3.0: <reason>. · Download |
 
-A download refused for its signature or version is not fetched again for that version in this
-run; the next newer version is. Failed downloads wait for the next hourly check.
+A download refused for its signature or version, or one that would not install, is not fetched
+again for that version in this run; the next newer version is. Failed downloads wait for the
+next hourly check. What a check the person asked for found (up to date, a failure, a
+development build) shows for 10 seconds. Once an update is ready no further check runs: the
+next launch is the new version.
 
 ### Actions and settings
 
@@ -261,7 +264,8 @@ run; the next newer version is. Failed downloads wait for the next hourly check.
   `DownloadUpdate` ("Open the newer version's download in the browser."), and
   `ViewReleaseNotes` ("Open the release notes of the update, or of this version"; the
   release's page, `releases/tag/v<version>`). Each is in the palette only where it applies,
-  has a default binding (open question 4) and, on macOS, sits in the app menu after Settings…:
+  has no default key, as Zed's update actions have none: they are rare (the keymap test's
+  `PALETTE_ONLY`). On macOS the first sits in the app menu after Settings…:
   "Check for Updates…", or "Restart to Update" when one is ready.
 - `studio.auto_update`: `true` in `assets/settings/default.json`, titled "Update
   automatically" in Settings.
@@ -271,8 +275,9 @@ run; the next newer version is. Failed downloads wait for the next hourly check.
 - A new crate, `studio_update`, in layer 3 beside `graph_store`: the GPUI entity that
   schedules checks and holds the state, the manifest fetch, and the calls into
   `cargo-packager-updater` `0.2.3` (exact version) on background threads.
-- `studio_workspace` draws the status bar item from the entity; `studio` registers the actions
-  and the menu item.
+- `studio_workspace` gives the window a status item slot (`set_status_item`) and `restart`,
+  which asks as `quit` does; `studio` draws the item from the entity (`update_status.rs`),
+  registers the actions and sets the menu item.
 - Amendments, made with the crate: constitution I's "in practice" reads "one client crate owns
   every request to a server; `studio_update` alone fetches Studio's own releases" (1.2.1);
   `docs/architecture.md` adds the crate to layer 3 and says `graph_client` owns every request
@@ -342,7 +347,8 @@ run; the next newer version is. Failed downloads wait for the next hourly check.
    environment whose use needs a reviewer, so that a workflow change alone cannot sign a
    release.
 3. Whether a beta channel is wanted, which would bring pre-releases back alongside `latest`.
-4. The default bindings for the four actions (every action has one, `AGENTS.md`).
+4. ~~The default bindings for the four actions.~~ None: they are palette-only, as Zed's are
+   (2026-10-22).
 5. Whether a release may ever require an update (a minimum version beside the manifest), for
    example when a contract bump makes older Studios refuse every server.
 6. To check when built: that the swapped bundle opens without a Gatekeeper prompt.
@@ -365,6 +371,13 @@ run; the next newer version is. Failed downloads wait for the next hourly check.
 | 2026-10-22 | GPUI restarts into the bundle's path after the process exits | Zed `v1.23.2` `crates/gpui/src/app.rs` (`app_path`, `restart`, `set_restart_path`, `on_app_restart`), `crates/gpui_macos/src/platform.rs` (`restart`) | The macOS restart runs a script that waits while `kill -0 <pid>` succeeds, then opens the app path |
 | 2026-10-22 | The CLI's install relies on Studio's signature, a latest disk image and Studio updating itself | Omnigraph `origin/main` (`e60eb016`) `docs/rfcs/2026-10-16-graph-access-serving-and-cross-process-writes.md`, "Installing Studio"; `git grep` for a Studio file name or release URL on `origin/main` | As quoted under What exists today; the CLI names only the bundle identifier |
 | 2026-10-22 | Studio has one HTTP client, set as GPUI's global, and an XML `Info.plist` with its version | `crates/graph_store/src/graph_store.rs` (`init`); `script/bundle-mac` | `ReqwestClient::user_agent("Omnigraph-Studio/<version>")`, then `cx.set_http_client`; `CFBundleShortVersionString` in the plist it writes |
+| 2026-10-22 | The updater behaves as the Design says | `cargo test -p studio_update --lib`: the schedule (30 s, then hourly), the setting turning it on and off, a development build, download to ready with progress, a bundle saying another version, a refused download not fetched again, a failed one retried at the next check, a bundle Studio cannot replace, Linux and a build without the key, a failed check said only when asked, the 64 KiB cap, the 15 s limit, a check joining a download, the release notes and download addresses | 32 passed |
+| 2026-10-22 | `cargo-packager-updater` verifies, refuses and installs as relied on | `tests/packager.rs` against a loopback server, with an update signed by a test key made with minisign 0.12: the download, a flipped byte, a closed port, an install over a bundle, and a bundle ad hoc signed, archived as `script/bundle-mac` archives it and installed | Downloaded whole with progress to 100; the flipped byte refused; the closed port failed without being refused; the bundle replaced; the installed bundle passes `codesign --verify --strict`, and fails it once its executable is changed (checked by changing it) |
+| 2026-10-22 | The release's manifest is what Studio reads | `python3 script/test_release_files.py`; `manifest::tests::the_manifest_a_release_publishes_is_read`, on the fixture the script wrote | 5 passed; passed |
+| 2026-10-22 | `script/bundle-mac` writes an update the crate can install | `script/bundle-mac --debug`; `tar -tzf`, `tar -xzOf … Contents/Info.plist`; the workflow's `codesign -R` requirement with a made-up team on the ad hoc app | 10 entries under `Omnigraph Studio.app/`, no AppleDouble entries, version 0.2.1; the requirement parses and refuses the ad hoc app (exit 3) |
+| 2026-10-22 | Restart asks as Quit does, and the item, actions and menu are wired | `studio_workspace` `restarting_to_update_with_unsaved_work_asks_first`, `the_status_item_is_drawn_in_the_status_bar`; `studio` `update_status::each_state_says_what_the_spec_says` and the keymap test, which runs `studio::init`; the snapshot example dispatching `studio_update::CheckForUpdates` on `script/dev-server` | A dialog "Restart to update Omnigraph Studio?" naming the unsaved tab; the item drawn; the copy of every state; "Updates are off in a development build." at the right of the status bar |
+| 2026-10-22 | The whole workspace stays green | `cargo test --workspace --no-fail-fast`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check`, the layer, spelling and design-token checks | 926 passed, 0 failed, 5 ignored (885 before); the rest clean |
+| 2026-10-22 | The dependencies pass the audit, apart from advisories `main` already has | `cargo deny check` (0.20.2) | Licenses, bans and sources pass. Advisories fail on RUSTSEC-2026-0370 to 0372, 0378, 0379 and 0381 to 0383, in `rustls-webpki` 0.103.15, `wasmtime` 48.0.6, `webpki-roots`, `webpki-root-certs` and `zbus`, every one in `main`'s `Cargo.lock` at the same version |
 
 ## Corrections
 
