@@ -100,8 +100,10 @@ Four parts, built in this order; each lands on its own.
   wrap at, leaves its row: it shows under its name, which folds it, at the full width; an email
   or an id stays in its pill and is cut at the pill's end, its whole value in the tooltip. An
   edge's endpoints are rows (← from, → to) whose values are nodes. An enum's menu, a switch, a
-  field being edited, a draft's dot and the states beside a row (saving, Copied, Open in the
-  editor) keep the row's height.
+  draft's dot and the states beside a row (saving, Copied, Open in the editor) keep the row's
+  height; a long text's sit in its head, beside its name, where a folded one shows its
+  draft's dot. A field being edited stays level with its label and adds its key hints (and a
+  refusal) under it.
 - **How a relationship reads**: under a rule and "Relationships", each group is a fold row,
   "knows → Person ⌄" (← for one pointing at this node) with its count at the end, over its
   neighbours, a row each: its type's mark and its name, a click peeking it. Under the pointer
@@ -277,6 +279,7 @@ Four parts, built in this order; each lands on its own.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | A long text's controls sit in its head | `type_table` `a_long_texts_controls_and_folded_draft_sit_in_its_head` (a page's name made long: "Open in the editor" within the head's bounds; folded with a draft, its dot there), failing with the controls appended after the text as before, the button 32 px under the head | A regression review found the long text's "Open in the editor", saving dot and "Copied" stacked under the text, each a 32 px line, the hover-only button a blank strip, and a folded text's draft without its dot |
 | 2026-10-21 | A property reads as a row with its value in a pill; a long text leaves its pill; a relationship lists its neighbours as rows | `type_table` `a_long_text_leaves_its_box_and_a_short_one_stays` (a name, an email-like value with no words to wrap at, a sentence); `studio_ui` `property_and_control_parts_draw_at_their_sizes`; the 163 other `type_table` tests unchanged (fields, drafts, conflicts, relationship writes, Blob slots); offscreen snapshots of person-000001's peek in the dev graph, at rest and with the pointer on a neighbour and on a header, and of keyset-paging in the `notes` graph | Name, email and dates in pills beside their icons; tags wrapped as pills; "contributes → Project", "knows → Person" and "worksAt → Company" over rows of marks and names, the × and the "+" only under the pointer; the note's body under a "body" fold at the full width. A first pass boxed neighbours as values with their × and "+" always shown, which read as clutter beside the reference |
 | 2026-10-21 | A field open when the view follows another branch stays a draft there | `type_table` `open_fields_stay_drafts_on_the_branch_a_page_leaves` (name refused with a 403 and opened again with its notice, title being typed), failing with the fields cleared as before; `peek` `a_refused_field_opens_again_with_its_text_and_reason` (the peek going keeps the refused text) unchanged | After the session moved to fix, main held name "Ada Lovelace" bound to "Ada" and title "Countess" bound to null, fix none, and no field stayed open. Before, both texts were lost: a field with a notice stays open after a blur, so nothing else had kept it |
 | 2026-10-20 | A draft retyped elsewhere while its save is out stands | `graph_store` `drafts_wait_with_their_branch` (settled only as it went out); `type_table` `a_save_that_lands_after_a_branch_switch_keeps_the_new_branchs_draft` (a landed and a refused cell save over a retyped draft), `a_batch_reads_its_rows_again_in_one_read` and `peek` `a_conflict_is_bound_to_the_value_read_at_the_head` (a batch's and a node's drafts read again) | The retyped draft keeps its text after the save lands or is refused, and no editor reopens over it; a draft unchanged since the save settles as before |

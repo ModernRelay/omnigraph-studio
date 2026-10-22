@@ -4008,8 +4008,9 @@ impl NodePeek {
             .group(group.clone())
             .px(px(space::XS))
             .rounded(px(studio_ui::ds::radii(cx).sm))
-            .child(value_slot);
-        self.property_interaction(row, index, property, &state, group, cx)
+            .child(value_slot)
+            .children(self.property_beside(index, property, &state, group, cx));
+        self.property_interaction(row, property, &state, cx)
             .into_any_element()
     }
 
@@ -4055,7 +4056,13 @@ impl NodePeek {
             },
         };
         let group = SharedString::from(format!("peek-property-{index}"));
+        // Folded, the text's draft shows as its dot beside the name.
+        let folded_draft = !open && state.draft.is_some();
+        let beside = self.property_beside(index, property, &state, group.clone(), cx);
+        let head_selector = format!("peek-head-{name}");
+        let draft_selector = format!("peek-folded-draft-{name}");
         let head = h_flex()
+            .debug_selector(move || head_selector.clone())
             .h(px(studio_ui::ds::size::PROPERTY_ROW))
             .gap(px(space::SM))
             .items_center()
@@ -4070,7 +4077,16 @@ impl NodePeek {
                         }
                         cx.notify();
                     })),
-            );
+            )
+            .when(folded_draft, |head| {
+                head.child(
+                    div()
+                        .debug_selector(move || draft_selector.clone())
+                        .child(Indicator::dot().color(Color::Accent)),
+                )
+            })
+            .child(div().flex_1())
+            .children(beside);
         let text = v_flex()
             .id(("peek-property", index))
             .group(group.clone())
@@ -4080,38 +4096,24 @@ impl NodePeek {
             .rounded(px(studio_ui::ds::radii(cx).sm))
             .child(head)
             .when(open, |text| text.child(div().w_full().child(body)));
-        self.property_interaction(text, index, property, &state, group, cx)
+        self.property_interaction(text, property, &state, cx)
             .into_any_element()
     }
 
-    /// What a property's row or text does and shows beside its value: the hover fill, the
-    /// tooltip, a click that edits or copies, and its "Open in the editor", saving dot and
-    /// "Copied".
+    /// What a property's row or text does: the hover fill, the tooltip, and a click that edits
+    /// or copies.
     fn property_interaction(
         &self,
         element: gpui::Stateful<Div>,
-        index: usize,
         property: &gq_language::Property,
         state: &PropertyState,
-        group: SharedString,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<Div> {
         let hover = studio_ui::ds::surface::hover(cx);
-        let name = property.name.as_str();
         // Only a click's own: the copy reads the value as it is then.
         let edit_property = state.opens_editor.then(|| property.clone());
-        let copy_name = name.to_owned();
+        let copy_name = property.name.clone();
         let editable = state.editable;
-        // Text opens in the editor from a button the row shows on hover.
-        let expands = state.opens_editor && reads_as_markdown(property);
-        let expand_name = name.to_owned();
-        // Beside the value, level with the row's first line.
-        let beside = || {
-            div()
-                .h(px(studio_ui::ds::size::PROPERTY_ROW))
-                .flex()
-                .items_center()
-        };
         element
             .when(!state.editing, |row| row.hover(move |s| s.bg(hover)))
             .when(state.opens_editor || !editable, |row| row.cursor_pointer())
@@ -4125,9 +4127,34 @@ impl NodePeek {
                     this.copy(copy_name.clone(), cx)
                 }
             }))
-            .when(expands, |row| {
-                row.child(
-                    beside().child(
+    }
+
+    /// What shows beside a property's value, level with its first line, in its row (a long
+    /// text's head): its "Open in the editor" under the pointer, its saving dot, "Copied".
+    fn property_beside(
+        &self,
+        index: usize,
+        property: &gq_language::Property,
+        state: &PropertyState,
+        group: SharedString,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        // Text opens in the editor from a button the row shows on hover.
+        let expands = state.opens_editor && reads_as_markdown(property);
+        let expand_name = property.name.clone();
+        let open_selector = format!("peek-open-editor-{}", property.name);
+        let beside = || {
+            div()
+                .h(px(studio_ui::ds::size::PROPERTY_ROW))
+                .flex()
+                .items_center()
+        };
+        let mut items = Vec::new();
+        if expands {
+            items.push(
+                beside()
+                    .debug_selector(move || open_selector.clone())
+                    .child(
                         studio_ui::ds::row_icon_button(
                             ("peek-open-editor", index),
                             IconName::Maximize,
@@ -4141,22 +4168,30 @@ impl NodePeek {
                                 this.expand(&expand_name, window, cx)
                             },
                         )),
-                    ),
-                )
-            })
-            .when(state.saving, |row| {
-                row.child(
-                    beside().child(
+                    )
+                    .into_any_element(),
+            );
+        }
+        if state.saving {
+            items.push(
+                beside()
+                    .child(
                         div()
                             .id(("peek-saving", index))
                             .tooltip(Tooltip::text("Saving…"))
                             .child(Indicator::dot().color(Color::Warning)),
-                    ),
-                )
-            })
-            .when(state.copied, |row| {
-                row.child(beside().child(studio_ui::ds::text::meta("Copied").color(Color::Success)))
-            })
+                    )
+                    .into_any_element(),
+            );
+        }
+        if state.copied {
+            items.push(
+                beside()
+                    .child(studio_ui::ds::text::meta("Copied").color(Color::Success))
+                    .into_any_element(),
+            );
+        }
+        items
     }
 
     /// A short value boxed: a list's items each in their box, none a muted dash.
@@ -5426,6 +5461,55 @@ mod tests {
     /// A page at the branch head follows the window to another branch and reads its node there.
     /// A write sent before the move lets go of the draft of the branch it was sent on, never
     /// the one of the branch shown now, and leaves what the page shows alone.
+    /// A long text's controls sit in its head row, beside its name: "Open in the editor" adds
+    /// no line under the text, and a folded text shows its draft's dot there (spec 014).
+    #[gpui::test]
+    async fn a_long_texts_controls_and_folded_draft_sit_in_its_head(cx: &mut TestAppContext) {
+        let session = session(PEOPLE, cx);
+        let (view, cx) = page(session.clone(), cx);
+        let long = "Wrote the first published algorithm meant for a machine, and notes on it";
+        view.update(cx, |view, cx| {
+            if let Loadable::Loaded(values) = &mut view.values {
+                values.insert("name".into(), json!(long));
+            }
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let head = cx
+            .debug_bounds("peek-head-name")
+            .expect("a long text's head");
+        let open = cx
+            .debug_bounds("peek-open-editor-name")
+            .expect("Open in the editor");
+        assert!(
+            open.top() >= head.top() && open.bottom() <= head.bottom(),
+            "Open in the editor in the head, not under the text: {open:?} in {head:?}"
+        );
+        assert!(cx.debug_bounds("peek-folded-draft-name").is_none());
+
+        view.update(cx, |view, cx| {
+            view.folded.insert("name".into());
+            cx.notify();
+        });
+        session.update(cx, |session, cx| {
+            let key = DraftKey {
+                type_name: "Person".into(),
+                id: "p1".into(),
+                property: "name".into(),
+            };
+            let draft = DraftEntry {
+                old: json!(long),
+                text: "Ada".into(),
+            };
+            session.set_draft(key, draft, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("peek-folded-draft-name").is_some(),
+            "a folded text's draft shows its dot"
+        );
+    }
+
     #[gpui::test]
     async fn a_page_follows_its_branch_and_a_write_from_the_one_left_stays_there(
         cx: &mut TestAppContext,

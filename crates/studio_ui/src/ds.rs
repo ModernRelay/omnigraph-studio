@@ -207,9 +207,9 @@ pub mod size {
     pub const PALETTE_ROW: f32 = 32.;
     /// A row of an activity feed: taller than a data row, as a feed is read, not scanned.
     pub const FEED_ROW: f32 = 36.;
-    /// A property row ([`super::property_row`]): a boxed value and room above and below it,
-    /// as a palette row holds its tile.
-    pub const PROPERTY_ROW: f32 = PALETTE_ROW;
+    /// A property row ([`super::property_row`]): a value's pill and 4 px above and below it,
+    /// the top of a row's 28–30 px, so pills in rows one under another stay apart.
+    pub const PROPERTY_ROW: f32 = 30.;
     /// A boxed value ([`super::value_box`]): a bar button's height, so a value and the button
     /// beside it that adds or edits one line up.
     pub const VALUE: f32 = BAR_BUTTON;
@@ -2624,10 +2624,11 @@ pub fn property_value() -> Div {
         .items_center()
 }
 
-/// A boxed value in a [`property_row`]: the document's fill inside the controls' hairline
-/// (`surface::control_border`), [`size::VALUE`] tall and no wider than its row, with round
-/// ends, since a click edits or copies it (spec 002, "Round ends only for buttons with a
-/// label"). What it holds is the caller's ([`value_text`], [`node_value`]).
+/// A value in a [`property_row`]: a button with a label, since a click edits, copies or
+/// opens it (spec 002, "Round ends only for buttons with a label"), so a pill on an outline
+/// button's surface (the document's fill and `shadow-custom`), as [`value_select`] beside it,
+/// [`size::VALUE`] tall and no wider than its row. What it holds is the caller's
+/// ([`value_text`], [`node_value`]).
 pub fn value_box(cx: &App) -> Div {
     h_flex()
         .flex_none()
@@ -2639,8 +2640,11 @@ pub fn value_box(cx: &App) -> Div {
         .items_center()
         .rounded_full()
         .bg(surface::document(cx))
+        // An outline button's border: there, for its size, and clear, the ring drawn by the
+        // shadow.
         .border_1()
-        .border_color(surface::control_border(cx))
+        .border_color(gpui::transparent_black())
+        .shadow(elevation::control(cx))
         .overflow_hidden()
 }
 
