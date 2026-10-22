@@ -82,8 +82,42 @@ enum State {
     Failed(SharedString),
     /// Read again (a commit landing, a Refresh), it could not be read while commits were shown.
     /// They stay as read, and their pages and the commits merged into them go on being read;
-    /// the toolbar says why and offers Try again ([`HistoryView::retry`]).
-    Stale(SharedString),
+    /// the toolbar says why and offers Try again ([`HistoryView::retry`]), which reads it again
+    /// as `read` was to, keeping the pages read.
+    Stale {
+        error: SharedString,
+        read: FirstPage,
+    },
+}
+
+/// What a read of the first page does, once it is read, with what was read before it. Until
+/// then it changes none of it, so a read that fails leaves the history as it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FirstPage {
+    /// The pages read stay below it when it reaches the head they were read from
+    /// ([`HistoryRead::first_page`]); else it replaces them.
+    keep: bool,
+    /// The merged-in commits the server did not have are asked for again
+    /// ([`HistoryRead::forget_missing`]).
+    ask_missing: bool,
+}
+
+impl FirstPage {
+    /// The history opened, its branch changed, or its listing read from its first page again.
+    const REPLACE: Self = Self {
+        keep: false,
+        ask_missing: false,
+    };
+    /// A commit landed on the branch.
+    const KEEP: Self = Self {
+        keep: true,
+        ask_missing: false,
+    };
+    /// A Refresh.
+    const REFRESH: Self = Self {
+        keep: false,
+        ask_missing: true,
+    };
 }
 
 /// The read of the listing's next page.
@@ -513,7 +547,7 @@ impl HistoryView {
     /// Shows the branch's history again from its first page, and reads the heads of other
     /// branches not read yet.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
-        self.load(false, cx);
+        self.load(FirstPage::REPLACE, cx);
         self.load_heads(false, cx);
     }
 
@@ -521,10 +555,10 @@ impl HistoryView {
     /// did not have, and every other branch's head again now. The session keeps a head until
     /// Studio sees a commit land on its branch, and another writer's commit to a branch nobody
     /// watches is seen only so; the head read again is the session's, so the branches panel
-    /// and a later load show it too.
+    /// and a later load show it too. Which merged-in commits the server did not have is
+    /// forgotten once the page is read, so a Refresh that fails leaves the stubs saying why.
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        Arc::make_mut(&mut self.read).forget_missing();
-        self.load(false, cx);
+        self.load(FirstPage::REFRESH, cx);
         self.load_heads(true, cx);
     }
 
@@ -540,7 +574,7 @@ impl HistoryView {
     /// land on this branch.
     fn committed(&mut self, branch: &str, cx: &mut Context<Self>) {
         if branch == self.branch {
-            self.load(true, cx);
+            self.load(FirstPage::KEEP, cx);
         } else {
             self.read_head(branch.to_owned(), false, cx);
         }
@@ -551,31 +585,47 @@ impl HistoryView {
     /// page could not be read again is read again as Try again reads it.
     fn branches_changed(&mut self, cx: &mut Context<Self>) {
         match self.state {
-            State::Failed(_) => self.load(false, cx),
-            State::Stale(_) => self.retry(cx),
+            State::Failed(_) => self.load(FirstPage::REPLACE, cx),
+            State::Stale { .. } => self.retry(cx),
             State::Loading | State::Ready => {}
         }
         self.load_heads(false, cx);
     }
 
     /// Try again, after the first page could not be read again while commits were shown: reads
-    /// it again from the branch's head, and the pages read stay below it when it reaches the
-    /// head they were read from, as for a commit landing.
+    /// it again from the branch's head as the read that failed was to (a Refresh's asks again
+    /// for the merged-in commits the server did not have), and the pages read stay below it
+    /// when it reaches the head they were read from, as for a commit landing.
     fn retry(&mut self, cx: &mut Context<Self>) {
-        self.load(true, cx);
+        let failed = match self.state {
+            State::Stale { read, .. } => read,
+            _ => FirstPage::KEEP,
+        };
+        self.load(
+            FirstPage {
+                keep: true,
+                ..failed
+            },
+            cx,
+        );
     }
 
     /// Whether the commits read are shown and go on being read: the first page was read, or
     /// a read of it again failed while they were shown.
     fn shown(&self) -> bool {
-        matches!(self.state, State::Ready | State::Stale(_))
+        matches!(self.state, State::Ready | State::Stale { .. })
     }
 
-    /// Reads the branch's first page and lays it out, then the merged-in commits it names. With
-    /// `landed`, the pages read stay below it when it reaches the head they were read from
-    /// ([`HistoryRead::first_page`]), and go on continuing their listing. Until it is read,
-    /// what was read stays as it is: a read that fails changes none of it.
-    fn load(&mut self, landed: bool, cx: &mut Context<Self>) {
+    /// Reads the branch's first page and lays it out, then the merged-in commits it names, as
+    /// `read` says ([`FirstPage`]). Kept pages go on continuing their listing. Until it is
+    /// read, what was read stays as it is: a read that fails changes none of it.
+    fn load(&mut self, mut read: FirstPage, cx: &mut Context<Self>) {
+        // Kept pages go on from the listing's continuation. Once the server refused it, it
+        // would refuse it again: the listing is read from its first page instead, which a
+        // page that kept them would not replace.
+        if matches!(self.more, More::Failed { restart: true, .. }) {
+            read.keep = false;
+        }
         self.state = State::Loading;
         // A next page or a walk of merged-in commits under way ends here (`_task` is
         // replaced); one that failed stays failed, its row saying so.
@@ -586,7 +636,7 @@ impl HistoryView {
             session.commit_page(&self.branch, PAGE, None, cx)
         });
         self._task = Some(cx.spawn(async move |this, cx| {
-            Self::first_page(&this, page, landed, cx).await;
+            Self::first_page(&this, page, read, cx).await;
             this.update(cx, |this, _| this._task = None).ok();
         }));
         cx.notify();
@@ -595,7 +645,7 @@ impl HistoryView {
     async fn first_page(
         this: &WeakEntity<Self>,
         page: Task<Result<CommitListOutput, ReadError>>,
-        landed: bool,
+        first: FirstPage,
         cx: &mut AsyncApp,
     ) {
         let page = match page.await {
@@ -608,7 +658,7 @@ impl HistoryView {
                     this.state = if this.commits.is_empty() {
                         State::Failed(error)
                     } else {
-                        State::Stale(error)
+                        State::Stale { error, read: first }
                     };
                     cx.notify();
                 })
@@ -627,9 +677,14 @@ impl HistoryView {
             .background_spawn(async move {
                 let mut read = HistoryRead::clone(&held);
                 // The other branches' pages are read again after this one, so what a page that
-                // could not be read left unanswered is asked for again.
-                read.forget_unlisted();
-                let kept = read.first_page(page.commits, complete, landed);
+                // could not be read left unanswered is asked for again; a Refresh asks again
+                // for every commit not had.
+                if first.ask_missing {
+                    read.forget_missing();
+                } else {
+                    read.forget_unlisted();
+                }
+                let kept = read.first_page(page.commits, complete, first.keep);
                 (arrange(read), kept)
             })
             .await;
@@ -751,7 +806,7 @@ impl HistoryView {
     /// page when the server refused the page's continuation.
     fn retry_more(&mut self, cx: &mut Context<Self>) {
         if let More::Failed { restart: true, .. } = self.more {
-            self.load(false, cx);
+            self.load(FirstPage::REPLACE, cx);
         } else {
             self.more = More::Idle;
             self.load_next(cx);
@@ -951,7 +1006,7 @@ impl HistoryView {
     async fn read_listed(this: &WeakEntity<Self>, cx: &mut AsyncApp) {
         // The pages to read: every other branch's the first time, then those that failed in
         // passing, once their wait is over.
-        let Ok(Some((mut listed, reads, now))) = this.update(cx, |this, cx| {
+        let Ok(Some((mut listed, reads))) = this.update(cx, |this, cx| {
             let now = cx.background_executor().now();
             let names: Vec<String> = match &this.listed {
                 None => {
@@ -978,7 +1033,7 @@ impl HistoryView {
                     (name, read)
                 })
                 .collect();
-            Some((this.listed.clone().unwrap_or_default(), reads, now))
+            Some((this.listed.clone().unwrap_or_default(), reads))
         }) else {
             // No branch list yet: the stubs stay, and a drawn row naming one walks again once
             // it is in.
@@ -1006,7 +1061,9 @@ impl HistoryView {
                     Arc::new(by_id)
                 })
                 .await;
-            listed.failed_at = (!failed.is_empty()).then_some(now);
+            // When the reads ended, not when they were sent: a read that fails only after the
+            // wait (a gateway's timeout) waits it again from its failure, as a read by id does.
+            listed.failed_at = (!failed.is_empty()).then(|| cx.background_executor().now());
             listed.failed = failed;
             let stored = this.update(cx, |this, cx| {
                 if !listed.failed.is_empty() {
@@ -1994,7 +2051,7 @@ impl Render for HistoryView {
             .w(px(if self.compact { 200. } else { 240. }))
             .children(counter.map(studio_ui::ds::text::meta));
         let summary = match self.state {
-            State::Ready | State::Stale(_) => summary(
+            State::Ready | State::Stale { .. } => summary(
                 count,
                 count.saturating_sub(self.read.own.len()),
                 self.read.complete,
@@ -2003,7 +2060,7 @@ impl Render for HistoryView {
             State::Failed(_) => String::new(),
         };
         let stale = match &self.state {
-            State::Stale(error) => Some(error.clone()),
+            State::Stale { error, .. } => Some(error.clone()),
             _ => None,
         };
         let header = studio_ui::ds::toolbar(cx)
@@ -2142,13 +2199,17 @@ mod tests {
         /// branches; and how many such reads fail (500) before one is answered.
         refuse_by_id: bool,
         fail_by_id: usize,
-        /// A page token is refused (400), or its read fails (500).
-        refuse_tokens: bool,
+        /// Page tokens refused (400), as a server refuses a continuation it no longer
+        /// honours; or every token's read fails (500).
+        refused_tokens: Vec<String>,
         fail_tokens: bool,
         /// Listings, by query, whose read fails (503, a server shedding load), and how many
         /// times more; and those refused (403, a branch the credential may not read).
         fail_listings: HashMap<String, usize>,
         refuse_listings: Vec<String>,
+        /// How long of the test clock such a failure takes to answer, as a gateway that times
+        /// out does; zero by default.
+        fail_after: Duration,
         /// Every request's path and query.
         asked: Vec<String>,
     }
@@ -2231,8 +2292,9 @@ mod tests {
                     json!({ "blocks": [], "cursor": "cursor", "caught_up": true }),
                 )
             } else if path.ends_with("/commits")
-                && pairs.contains_key("page_token")
-                && self.refuse_tokens
+                && pairs
+                    .get("page_token")
+                    .is_some_and(|token| self.refused_tokens.iter().any(|t| t == token))
             {
                 (400, json!({ "error": "page token rejected" }))
             } else if path.ends_with("/commits")
@@ -2340,6 +2402,7 @@ mod tests {
         });
         let served = Arc::new(Mutex::new(served));
         let state = served.clone();
+        let executor = cx.executor();
         let http = FakeHttpClient::create(move |request| {
             let path = request.uri().path().to_owned();
             let query = request.uri().query().unwrap_or_default().to_owned();
@@ -2347,13 +2410,18 @@ mod tests {
                 Inner::Bytes(bytes) => serde_json::from_slice(bytes.get_ref()).unwrap_or_default(),
                 _ => Value::Null,
             };
-            let state = state.clone();
+            let (state, executor) = (state.clone(), executor.clone());
             async move {
-                let (status, body) = {
+                let (status, body, after) = {
                     let mut served = state.lock().unwrap();
                     served.asked.push(format!("{path}?{query}"));
-                    served.answer(&path, &query, &body)
+                    let (status, body) = served.answer(&path, &query, &body);
+                    // Only a listing `fail_listings` fails answers 503.
+                    (status, body, (status == 503).then_some(served.fail_after))
                 };
+                if let Some(after) = after.filter(|after| !after.is_zero()) {
+                    executor.timer(after).await;
+                }
                 Ok(Response::builder()
                     .status(status)
                     .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
@@ -2620,7 +2688,7 @@ mod tests {
             .update(cx, |session, cx| session.head_now("main", cx))
             .await;
         cx.run_until_parked();
-        let stale = |view: &HistoryView| matches!(view.state, State::Stale(_));
+        let stale = |view: &HistoryView| matches!(view.state, State::Stale { .. });
         view.read_with(cx, |view, _| {
             assert!(stale(view));
             assert_eq!(view.commits.len(), 400);
@@ -2755,13 +2823,45 @@ mod tests {
             ["b2", "b1", "gone"].map(|id| served.reads_of(id))
         };
         assert_eq!(reads(&served), [1, 1, 1]);
+        // A Refresh whose page fails forgets nothing: the stub still says why, and nothing is
+        // asked for. Try again then does what the Refresh was to, keeping the commits read.
+        let not_served = "The server does not serve the merged commit, as for a deleted \
+                          branch's latest commits and history cleaned up.";
+        served
+            .lock()
+            .unwrap()
+            .fail_listings
+            .insert("branch=main&limit=200".into(), 1);
+        view.update(cx, |view, cx| view.refresh(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(
+                view.state,
+                State::Stale {
+                    read: FirstPage::REFRESH,
+                    ..
+                }
+            ));
+            check(view);
+            assert_eq!(view.read.absent("gone"), Some(Absent::NotHad));
+            assert_eq!(view.why_not_drawn("gone"), not_served);
+        });
+        assert_eq!(reads(&served), [1, 1, 1]);
+        view.update(cx, |view, cx| view.retry(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.state, State::Ready));
+            check(view);
+            assert_eq!(view.why_not_drawn("gone"), not_served);
+        });
+        assert_eq!(reads(&served), [1, 1, 2], "asked for again");
         // ⌘R where the history has the keyboard is its Refresh.
         let listings = served.lock().unwrap().listings().len();
         cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
         cx.dispatch_action(Refresh);
         cx.run_until_parked();
         view.read_with(cx, |view, _| check(view));
-        assert_eq!(reads(&served), [1, 1, 2]);
+        assert_eq!(reads(&served), [1, 1, 3]);
         assert_eq!(
             served.lock().unwrap().listings().len(),
             listings + 1,
@@ -2929,8 +3029,10 @@ mod tests {
 
     /// For a token refused commits by id, a branch whose page could not be read is not taken for
     /// one without the merged commit: the stub says that branch's list could not be read. Once
-    /// a while has passed, while the row shows, a page that failed in passing is read again, it
-    /// alone, and draws the merge; one the server refused is read again only by a Refresh.
+    /// a while has passed since it failed, while the row shows, a page that failed in passing is
+    /// read again, it alone, and draws the merge; one the server refused is read again only by a
+    /// Refresh. Here `feature`'s page fails only after 30 s, as a gateway timing out does: the
+    /// wait runs from its failure, not from when it was sent.
     #[gpui::test]
     async fn a_listing_that_could_not_be_read_is_read_again_alone(cx: &mut TestAppContext) {
         let (session, served) = serve(
@@ -2964,11 +3066,30 @@ mod tests {
                 refuse_by_id: true,
                 fail_listings: HashMap::from([(format!("branch=feature&limit={LISTED_PAGE}"), 1)]),
                 refuse_listings: vec![format!("branch=secret&limit={LISTED_PAGE}")],
+                fail_after: Duration::from_secs(30),
                 ..Default::default()
             },
             cx,
         );
         let (view, cx) = open(&session, cx);
+        let pages = |served: &Arc<Mutex<Served>>| {
+            let served = served.lock().unwrap();
+            let listings = served.listings();
+            ["feature", "fix", "secret"].map(|branch| {
+                let page = format!("branch={branch}&limit={LISTED_PAGE}");
+                listings.iter().filter(|listing| **listing == page).count()
+            })
+        };
+        assert_eq!(pages(&served), [1, 1, 1]);
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.why_not_drawn("b2"),
+                "The merged commits are being read."
+            )
+        });
+        // `feature`'s page fails 30 s after it was sent.
+        cx.executor().advance_clock(Duration::from_secs(30));
+        cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert_eq!(ids(view), ["m3", "m2", "m1"]);
             assert!(view.is_stub(0) && view.is_stub(1));
@@ -2980,15 +3101,10 @@ mod tests {
                  for again while this row shows."
             );
         });
-        let pages = |served: &Arc<Mutex<Served>>| {
-            let served = served.lock().unwrap();
-            let listings = served.listings();
-            ["feature", "fix", "secret"].map(|branch| {
-                let page = format!("branch={branch}&limit={LISTED_PAGE}");
-                listings.iter().filter(|listing| **listing == page).count()
-            })
-        };
-        assert_eq!(pages(&served), [1, 1, 1]);
+        // A row drawn right after the failure does not send the page again.
+        view.update(cx, |view, cx| view.want_merged(&(0..3), cx));
+        cx.run_until_parked();
+        assert_eq!(pages(&served), [1, 1, 1], "sent again as it failed");
         cx.executor()
             .advance_clock(MERGED_RETRY_AFTER - Duration::from_millis(1));
         cx.run_until_parked();
@@ -3121,9 +3237,12 @@ mod tests {
     }
 
     /// Try again after a refused continuation reads the listing from its first page; after one
-    /// that failed otherwise it sends the same continuation again.
+    /// that failed otherwise it sends the same continuation again. When that first page fails
+    /// too, the toolbar's Try again reads the listing afresh rather than keep the pages going
+    /// on from the refused continuation, so one Try again is enough.
     #[gpui::test]
     async fn try_again_after_a_refused_page_starts_from_the_first(cx: &mut TestAppContext) {
+        let first_page = "branch=main&limit=200";
         let (session, served) = serve(
             Served {
                 branches: vec![("main".into(), chain("m", 450))],
@@ -3141,26 +3260,69 @@ mod tests {
         {
             let mut served = served.lock().unwrap();
             served.fail_tokens = false;
-            served.refuse_tokens = true;
+            served.refused_tokens = vec!["m449_200".into()];
         }
         view.update(cx, |view, cx| view.retry_more(cx));
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert!(matches!(view.more, More::Failed { restart: true, .. }));
         });
+        // m450 lands, and the first page read for the restart fails: the commits stay, and so
+        // does the refused continuation's failure.
+        {
+            let mut served = served.lock().unwrap();
+            served
+                .chain_mut("main")
+                .insert(0, commit("m450", 4_510, Some("m449"), None));
+            served.fail_listings.insert(first_page.into(), 1);
+        }
         view.update(cx, |view, cx| view.retry_more(cx));
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
-            assert!(matches!(view.more, More::Idle));
+            assert!(matches!(view.state, State::Stale { .. }));
+            assert!(matches!(view.more, More::Failed { restart: true, .. }));
             assert_eq!(view.commits.len(), 200);
         });
+        // One Try again: a listing of m450's, whose next page is read.
+        view.update(cx, |view, cx| view.retry(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.state, State::Ready));
+            assert!(matches!(view.more, More::Idle));
+            assert_eq!(view.commits.len(), 200);
+            assert_eq!(view.commits[0].graph_commit_id, "m450");
+        });
+        view.update(cx, |view, cx| view.want_more(&(170..200), cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.more, More::Idle));
+            assert_eq!(view.commits.len(), 400);
+        });
+        // The refused continuation is not sent again. (The first page is read once more than
+        // History asks: the session, available again after the 503, reads main's head, finds
+        // m450 it had not seen, and says a commit landed, which keeps the pages.)
+        let served = served.lock().unwrap();
+        let continued: Vec<&str> = served
+            .listings()
+            .into_iter()
+            .filter(|listing| listing.contains("page_token"))
+            .collect();
         assert_eq!(
-            served.lock().unwrap().listings(),
+            continued,
             [
-                "branch=main&limit=200",
                 "branch=main&limit=200&page_token=m449_200",
                 "branch=main&limit=200&page_token=m449_200",
-                "branch=main&limit=200",
+                "branch=main&limit=200&page_token=m450_200",
+            ]
+        );
+        // Up to the Try again: the page, the failed and the refused continuation, the restart.
+        assert_eq!(
+            served.listings()[..4],
+            [
+                first_page,
+                "branch=main&limit=200&page_token=m449_200",
+                "branch=main&limit=200&page_token=m449_200",
+                first_page,
             ]
         );
     }

@@ -84,6 +84,13 @@ from Zed with notices).
   the commits merged into them go on being read. Only a first read with no commit shown gives
   the list's place to the error (since 2026-10-21; before, any failed first page replaced every
   row with it, stopped paging and merged reads, and its recovery dropped the pages read).
+  A read of the first page changes nothing until it is read: a Refresh forgets which merged-in
+  commits the server did not have only then, so one that fails leaves each stub saying why,
+  and its Try again asks for them again as the Refresh was to. Once the server refused the
+  listing's continuation, Try again reads the listing from its first page rather than keep the
+  pages going on from that continuation (since 2026-10-21; before, a failed Refresh had
+  forgotten why the stubs were stubs, and Try again kept the refused continuation, which took
+  a second Try again).
 - Built (row counts): a drawn row without counts reads its commit's first 500 changes and nets
   them as the detail does ("+ more" when there are more); answers are kept, since a commit's
   changes never change, and the detail's full count replaces a first-page one. A commit
@@ -108,10 +115,12 @@ route checks `read` on no branch, so it refuses (403) a token whose read grant n
 History then reads the newest 1,000 commits of up to 20 other branches, one page each (the
 server's most), once until the next load or Refresh, and never a listing whole. A branch whose
 page could not be read is kept out of those read: one that failed in passing (a timeout, a 5xx,
-a 429) is read again, it alone, 5 s later while a row naming a commit it may hold is drawn, and
-one the server refused (another 4xx: a branch the credential may not read, one deleted since)
-at the next load or Refresh (since 2026-10-21; before, a page that failed counted as one
-without the commit, until the next load). A merged parent not read yet, not had, or in none of
+a 429) is read again, it alone, 5 s after it failed while a row naming a commit it may hold is
+drawn, and one the server refused (another 4xx: a branch the credential may not read, one
+deleted since) at the next load or Refresh (since 2026-10-21; before, a page that failed
+counted as one without the commit, until the next load; and, the same day, the 5 s ran from
+when the page was asked for, so one failing after them, at a gateway's 30 s timeout, was asked
+for again as it failed). A merged parent not read yet, not had, or in none of
 those pages draws as a stub, and the merge mark's tooltip says which: the server does not serve
 it (a deleted branch's latest commits, history cleaned up); it is not among the newest 1,000
 commits of any branch read and the credential may not read a commit by its id; it is not among
@@ -161,6 +170,9 @@ away are dropped.
 | 2026-10-21 | The graph's first commit is named, and its changes never asked for | `history` `the_first_commits_changes_are_never_asked_for` (a three-commit chain, row counts read for every row) and `a_branch_starts_here_only_at_a_published_commit` (the first commit listed and in its own tab) | Before (found in the running app on the edge server), each History open sent `/commits/{root}/changes` and the server answered 409; the row showed nothing and the detail an error. Now no `/commits/m0/changes` is sent, the row reads "first commit", and both views are in their `First` state: "The graph's first commit", with no read. Not yet seen in the running app |
 | 2026-10-21 | A first page read again that fails keeps the commits shown | `history` `a_failed_read_again_keeps_the_commits_shown` (two pages read, m450 lands, its first page answers 503 until cleared: the rows stay, the next page is read, the branch list read again fails again, then Try again) and `a_first_read_that_fails_says_why_in_place_of_the_list` (the first read answers 503 with nothing shown); both check the drawn window for the toolbar's note and the error state | Before (found in review), `first_page` set `Failed` even for a commit landing, so the error state took every row's place, paging and merged reads stopped, and the branch list read again ran `load(false)`, which dropped the pages read. Now the 400 rows stay with "The newest commits could not be read" in the toolbar and no error state, the third page brings 450, and Try again puts m450 on top of them (451, `m0` last) with no listing read again but the first page; with nothing shown, the error state takes the list's place, and the branch list read again reads it. A mutation that always sets `Failed` fails the first test |
 | 2026-10-21 | A listing that could not be read is not taken for one without the commit | `history` `a_listing_that_could_not_be_read_is_read_again_alone` (a token refused by id; `feature`'s page answers 503 once, `secret`'s 403); `history::merged` `a_commit_a_page_not_read_may_hold_is_answered_once_it_is_read` | Before (found in review), `read_listed` dropped a failed page and `take_from` marked every commit it may hold `NotListed`, kept until the next load, its tooltip saying it was among the newest 1,000 commits of no branch read. Now b2 is `Absent::Unlisted`, its tooltip naming the lists of `feature` and `secret`; 5 s later, with the row drawn, `feature`'s page alone is read again (not `fix`'s, nor the refused `secret`'s), b2 and b1 draw, and z9's tooltip names `secret` alone, which a Refresh reads again. A mutation that drops the failure fails the test |
+| 2026-10-21 | A listing that fails slowly waits from its failure | `history` `a_listing_that_could_not_be_read_is_read_again_alone`, extended: `feature`'s page fails only after 30 s of the test clock (`Served::fail_after`), then a drawn row asks at once, 1 ms before the 5 s and at them | Before (found in review of `9e8cfdd`), `failed_at` was the time the reads were planned, so a page failing 30 s later was due at once and the next redraw sent the same 1,000-commit page again, back to back. Now it is the time the reads ended, as for a read by id: nothing is sent at the failure nor 1 ms short of 5 s, and `feature`'s page alone at 5 s. A mutation that dates the failure 30 s back fails the test |
+| 2026-10-21 | A failed Refresh keeps why each stub is one | `history` `merged_in_commits_are_read_by_their_ids`, extended: a Refresh whose first page answers 503, then Try again, then ⌘R | Before (found in review of `9e8cfdd`), `refresh` forgot the missing commits before its page was read, so after the 503 `gone` read as "being read" or "older". Now it stays `Absent::NotHad` with the server-does-not-serve tooltip and is not asked for; Try again (`State::Stale { read: FirstPage::REFRESH }`) asks for it once, as the Refresh was to, keeping the rows, and ⌘R once more. A mutation that forgets before the read fails the test |
+| 2026-10-21 | One Try again after a failed restart | `history` `try_again_after_a_refused_page_starts_from_the_first`, extended: the continuation `m449_200` refused (`Served::refused_tokens`), m450 lands, the restart's first page answers 503, then the toolbar's Try again and the next page | Before (found in review of `9e8cfdd`), Try again read the first page keeping the pages, which it reached, so the refused `m449_200` stayed the continuation and the next page was refused again: a second Try again. Now a refused continuation makes the read replace the pages: 200 rows from m450, and the next page is `m450_200`, read; `m449_200` is never sent again. (The session, available again after the 503, reads main's head and reports m450 as landed, one more first page that keeps the pages.) A mutation that keeps the pages fails the test with 201 rows |
 
 ## Corrections
 
