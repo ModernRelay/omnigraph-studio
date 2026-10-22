@@ -7053,10 +7053,18 @@ impl TypeTable {
                         .collect()
                 }),
             );
+        let sideways = self.table_state.read(cx).horizontal_scroll_handle.clone();
         v_flex()
             .size_full()
             .child(header)
-            .child(div().flex_1().min_h_0().child(table))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(table)
+                    .child(sideways_scroll(sideways)),
+            )
             .into_any_element()
     }
 
@@ -7098,6 +7106,11 @@ impl TypeTable {
                         .id("table-header-scrollable")
                         .h_full()
                         .flex_grow(1.)
+                        // A flex container, as Zed's row strips are: its child keeps its
+                        // columns' width, so the strip measures what it can scroll. A block
+                        // child stretched to the strip measured nothing, and its clamp put the
+                        // shared offset, every row's, back to 0 on each draw.
+                        .flex()
                         .overflow_x_scroll()
                         .restrict_scroll_to_axis()
                         .track_scroll(&handle)
@@ -8697,6 +8710,40 @@ fn new_scope(session: &Entity<GraphSession>, cx: &mut App) -> ReadScope {
     })
 }
 
+/// Takes a sideways swipe over the rows before Zed's row list sees it, and moves the columns.
+/// The list scrolls only vertically, and GPUI gives a vertical-only scroll area a purely
+/// sideways delta as a vertical one, so without this a swipe meant for the columns moved the
+/// rows. A swipe more sideways than down is taken here, in the capture phase: the shared
+/// horizontal handle (the header's and every row's) moves by it, within its range, and the
+/// event goes no further. Any other swipe passes through untouched.
+fn sideways_scroll(handle: gpui::ScrollHandle) -> impl IntoElement {
+    gpui::canvas(
+        |bounds, window, _| window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
+        move |_, hitbox, window, _| {
+            window.on_mouse_event(move |event: &gpui::ScrollWheelEvent, phase, window, cx| {
+                if phase != gpui::DispatchPhase::Capture || !hitbox.is_hovered(window) {
+                    return;
+                }
+                let delta = event.delta.pixel_delta(window.line_height());
+                if delta.x.abs() <= delta.y.abs() {
+                    return;
+                }
+                let offset = handle.offset();
+                let x = (offset.x + delta.x).clamp(-handle.max_offset().x, px(0.));
+                if x != offset.x {
+                    handle.set_offset(point(x, offset.y));
+                    window.refresh();
+                }
+                cx.stop_propagation();
+            });
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9922,6 +9969,72 @@ mod tests {
         assert!(
             !after.iter().any(|name| name == "studio_count"),
             "{after:?}"
+        );
+    }
+
+    /// A sideways wheel over the rows moves the columns, not the rows, and the columns stay
+    /// where it put them when the table draws again (spec 004).
+    #[gpui::test]
+    async fn a_sideways_wheel_scrolls_the_columns_not_the_rows(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let edges: String = (1..=20)
+            .map(|i| format!("edge R{i:02}: Person -> Person\n"))
+            .collect();
+        let schema = format!("{PEOPLE}{edges}");
+        let rows: Vec<serde_json::Value> = (0..60)
+            .map(|i| {
+                serde_json::json!({"n": {"@id": format!("p{i}"), "slug": format!("p{i}"), "name": format!("Person {i}")}})
+            })
+            .collect();
+        let (session, _) = crate::test_support::session_routing(
+            &schema,
+            move |request| match request["name"].as_str() {
+                Some("studio_page_degrees") => serde_json::json!([]),
+                _ => serde_json::Value::Array(rows.clone()),
+            },
+            cx,
+        );
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session.clone(),
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let offsets = |cx: &mut gpui::VisualTestContext| {
+            table.read_with(cx, |table, cx| {
+                let state = table.table_state.read(cx);
+                (
+                    state.horizontal_scroll_handle.offset().x,
+                    state.scroll_handle.0.borrow().base_handle.offset().y,
+                )
+            })
+        };
+        assert_eq!(offsets(cx), (px(0.), px(0.)));
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: point(px(400.), px(300.)),
+            delta: gpui::ScrollDelta::Pixels(point(px(-120.), px(0.))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        let (x, y) = offsets(cx);
+        assert_eq!(y, px(0.), "the rows did not move");
+        assert_eq!(x, px(-120.), "the columns moved by the wheel's width");
+        // Drawn again, they stay.
+        table.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(
+            offsets(cx).0,
+            px(-120.),
+            "a draw keeps the columns where they were"
         );
     }
 
