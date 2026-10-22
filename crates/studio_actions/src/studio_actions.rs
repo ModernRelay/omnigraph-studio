@@ -682,3 +682,21 @@ pub mod agent {
         pub session: String,
     }
 }
+
+pub mod update {
+    use gpui::actions;
+
+    actions!(
+        studio_update,
+        [
+            /// Check for a newer version of Omnigraph Studio.
+            CheckForUpdates,
+            /// Restart to finish installing the update that is ready.
+            RestartToUpdate,
+            /// Open the newer version's download in the browser.
+            DownloadUpdate,
+            /// Open the release notes of the update, or of this version.
+            ViewReleaseNotes,
+        ]
+    );
+}

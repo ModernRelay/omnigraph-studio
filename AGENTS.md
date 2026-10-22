@@ -44,6 +44,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo deny check
 python3 script/check-layers.py   # crate layer rule; keep its table in step with docs/architecture.md
 python3 script/check-brand.py    # the name is written Omnigraph
+python3 script/test_release_files.py   # a release's version-free copies and latest.json
 ```
 
 - macOS needs the Command Line Tools: the default `runtime-shaders` feature compiles GPUI's Metal
@@ -66,7 +67,8 @@ python3 script/check-brand.py    # the name is written Omnigraph
 ## Rules
 
 - Follow the layers in `docs/architecture.md`. Feature crates never depend on each other.
-- Only `graph_client` makes HTTP requests. Only `graph_store` turns responses into entities.
+- Only `graph_client` makes requests to Omnigraph servers, and only `studio_update` fetches
+  Studio's own releases. Only `graph_store` turns responses into entities.
 - Every new action goes in `studio_actions`, gets a default binding in `assets/keymaps/`, and
   appears in the palette.
 - Copying from Zed is allowed (GPL). Keep the file's copyright notice and add a

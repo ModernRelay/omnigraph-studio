@@ -47,6 +47,7 @@ Add tasks, contracts or data-model files only for large features.
 | 014 | [Node pages, editing in place, and long text](014-node-pages/plan.md) | part 1 built |
 | 015 | [One read model](015-read-model/plan.md) | draft |
 | 016 | [Studio as an OAuth client](016-oauth-client/plan.md) | draft |
+| 017 | [Studio updates itself](017-auto-update/plan.md) | built; installing waits on signing |
 
 Each plan's first line holds its full status. 012 is not scheduled: it records every Omnigraph change Studio would use, what Studio does
 without it, and which plan waits on it. Each feature plan's Deferred section names its IDs.

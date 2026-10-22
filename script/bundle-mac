@@ -11,6 +11,8 @@
 #                           app and the DMG with the hardened runtime and a secure timestamp
 #   STUDIO_NOTARY_PROFILE   a profile saved with `xcrun notarytool store-credentials`; submits
 #                           the DMG, waits, and staples the ticket
+# Beside the DMG it writes the update Studio's updater installs (spec 017),
+# Omnigraph-Studio-<version>-<arch>.app.tar.gz: the signed app, the bundle its top directory.
 # Without an identity the app is signed ad hoc and opens only on the Mac that built it.
 # STUDIO_BUNDLE_ID overrides the bundle identifier.
 set -euo pipefail
@@ -149,5 +151,12 @@ if [[ -n "${STUDIO_NOTARY_PROFILE:-}" ]]; then
   xcrun stapler validate "$dmg"
 fi
 
+# The update archive, of the app as signed. No AppleDouble entries: a bundle keeps its signature
+# in files of its own, and the updater unpacks every entry into the bundle.
+update="$out/Omnigraph-Studio-$version-$arch.app.tar.gz"
+rm -f "$update"
+COPYFILE_DISABLE=1 tar --no-mac-metadata -czf "$update" -C "$(dirname "$app")" "$(basename "$app")"
+
 echo "$app"
 echo "$dmg"
+echo "$update"

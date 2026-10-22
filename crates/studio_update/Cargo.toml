@@ -1,0 +1,35 @@
+[package]
+name = "studio_update"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/studio_update.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+futures = { workspace = true }
+gpui = { workspace = true }
+http_client = { workspace = true }
+log = { workspace = true }
+cargo-packager-updater = { workspace = true }
+flate2 = { workspace = true }
+semver = { workspace = true }
+serde_json = { workspace = true }
+studio_settings = { workspace = true }
+tar = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
+[dev-dependencies]
+base64 = { workspace = true }
+studio_settings = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+http_client = { workspace = true, features = ["test-support"] }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

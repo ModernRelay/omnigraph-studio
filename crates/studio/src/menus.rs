@@ -8,6 +8,7 @@ use studio_actions::graph::{
     OpenSchema, ReviewBranch,
 };
 use studio_actions::query::{Save, SaveAs};
+use studio_actions::update::{CheckForUpdates, RestartToUpdate};
 use studio_actions::workspace::{
     ActivateNextPane, ActivatePreviousPane, CloseActiveItem, CloseAllItems, CloseOtherItems,
     GoBack, GoForward, GoTo, NewWindow, OpenGraph, OpenSettings, Quit, Refresh, RevealLog,
@@ -16,9 +17,21 @@ use studio_actions::workspace::{
 };
 
 pub fn set(cx: &mut App) {
+    // Check for Updates, or Restart to Update once an update is ready (spec 017).
+    let update = if studio_update::Updater::global(cx).is_some_and(|updater| {
+        matches!(
+            updater.read(cx).state(),
+            studio_update::UpdateState::Ready { .. }
+        )
+    }) {
+        MenuItem::action("Restart to Update", RestartToUpdate)
+    } else {
+        MenuItem::action("Check for Updates…", CheckForUpdates)
+    };
     cx.set_menus([
         Menu::new("Omnigraph Studio").items([
             MenuItem::action("Settings…", OpenSettings),
+            update,
             MenuItem::separator(),
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),

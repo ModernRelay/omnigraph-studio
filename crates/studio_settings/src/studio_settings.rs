@@ -168,6 +168,10 @@ pub struct StudioOptions {
     /// seconds while the window is in front.
     #[schemars(title = "Show memory and CPU", extend("x-section" = "Appearance"))]
     pub show_performance: bool,
+    /// Check for a newer Studio half a minute after launch and every hour, and install it on
+    /// macOS, ready at the next restart. Off, Studio checks only when asked (spec 017).
+    #[schemars(title = "Update automatically", extend("x-section" = "Updates"))]
+    pub auto_update: bool,
 }
 
 impl Default for StudioOptions {
@@ -181,6 +185,7 @@ impl Default for StudioOptions {
             canvas_max_nodes: 2000,
             health_check_seconds: 30,
             show_performance: true,
+            auto_update: true,
         }
     }
 }
@@ -456,6 +461,12 @@ fn find_data_dir() -> PathBuf {
                 "omnigraph-studio"
             })
     }
+}
+
+/// Whether `exe` is an installed Studio rather than a build or a test: only a release build
+/// checks for updates (spec 017).
+pub fn is_release_build(exe: &std::path::Path) -> bool {
+    !is_build_output(exe) && !is_test_binary(exe)
 }
 
 /// Whether an executable is Cargo's build output rather than an installed app: it sits in a
@@ -1067,6 +1078,23 @@ mod tests {
             assert!(state.problems.is_empty());
             assert_eq!(state.modified, modified);
         });
+    }
+
+    #[test]
+    fn only_an_installed_build_is_a_release_build() {
+        let release = |path: &str| is_release_build(std::path::Path::new(path));
+        assert!(release(
+            "/Applications/Omnigraph Studio.app/Contents/MacOS/omnigraph-studio"
+        ));
+        assert!(release(
+            "/home/ada/omnigraph-studio-0.3.0-linux-x86_64/bin/omnigraph-studio"
+        ));
+        assert!(!release(
+            "/w/omnigraph-studio/target/debug/omnigraph-studio"
+        ));
+        assert!(!release(
+            "/w/omnigraph-studio/target/debug/deps/studio_update-f7f2cad5771331a9"
+        ));
     }
 
     #[test]
