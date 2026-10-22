@@ -312,8 +312,11 @@ its open section.
   inserts every node and then every relationship again in one commit bound to the delete's
   commit, so it applies only while the branch is still there; unkeyed relationships come back
   under new ids. When Undo could not restore it (a node type without `@key`, or Blob or Vector
-  values on the nodes or their relationships, judged from the schema), the dialog says why and
-  asks for the key, or `delete N` for several rows, to be typed (constitution IV). An edge
+  values on the nodes or their relationships, judged from the schema; or more than the 20,000
+  nodes and relationships Undo puts back in one commit, counted at the pin with one
+  `builder::edge_count` per relationship type and deleted end, less those both ends lose, since
+  2026-10-21: before, such a delete offered an Undo that restored nothing), the dialog says why
+  and asks for the key, or `delete N` for several rows, to be typed (constitution IV). An edge
   delete takes no dependents; deleting a relationship its source needs is refused by the
   server, which the dialog shows.
 - An edit open when the table moves to another branch (a link, a toast's follow-up), when its
@@ -372,6 +375,7 @@ kept answers.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | A delete larger than Undo puts back is confirmed by typing | `graph_store` `a_delete_past_what_undo_puts_back_is_planned_without_undo` (⌘⌫ on a Tag on 25,000 documents; the same on ten; an unkeyed Note), `relationships_between_deleted_nodes_count_once` (the counts per relationship type and end, each type-checked); the first run again with the count undone; `dialogs.rs` read: a plan's `undo_unavailable` already asks for the key and leaves Undo off the toast | The Tag's plan named 25,005 changes (1 node, 25,000 Tagged, Broader 3 + 2 − 1) past 20,000, four count reads all held at c1; ten documents offered Undo; the Note read no count. Undone, the plan offered Undo, which then restored nothing. `DeletePlan.requested`, which nothing read, is gone |
 | 2026-10-21 | The grid sits flush in the document and ends at its last column | Offscreen snapshots (1440×900 at 2×) against a scratch dev server, light and dark, before and after: Person, Project, Company, and Person at 2400×700 | Before, the grid was a card inset 16 px in the page, and the thin strip after `tags` was the next column's (`contributes`) first 12 px, its cell inset, cut at the card's edge. After, the header and rows start at the document's edge under the toolbar, the key's text at the toolbar title's 16 px, every column but the last ruled on its right; Project, narrower than the page, ends at its last column with no fill or hairline past it |
 | 2026-10-21 | Which of the table's writes tell its peek | `table.rs` `tell_peek_wrote`'s callers: a saved cell, drafts saved together, a bulk set, `row_inserted`, a Blob stored or cleared; not `rows_deleted`, nor `undo_delete`, which writes through `GraphSession::write_on` | The doc said the peek hears every write; it now names these and says why a delete and its Undo are not told (they change relationships, which `TableWrote` cannot carry) and what the peek does instead |
 | 2026-10-21 | A Blob tab or a peek shows Blob values where they hold, not at the pin | `type_table` `a_views_own_blob_write_leaves_its_next_one_bound_where_it_holds`, extended (after the page's bound write over another writer's commit, `BlobsAt::Own("c2")` and Open's `at_commit` `c2`), and `a_peek_opened_after_its_tables_blob_write_shows_it_where_it_holds` (a table behind its branch stores a Blob: a peek opened then reads at the table's pin `c1`, shows the 6-byte value written, and holds its Blobs at `c3`) | Before, Open read at the view's commit (`c0`), the value replaced, and that tab's first upload was refused as changed; a peek opened from a table got the pin alone and read the value replaced there |

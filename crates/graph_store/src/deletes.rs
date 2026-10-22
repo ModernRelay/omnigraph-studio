@@ -6,14 +6,17 @@
 //! server refuses a delete that leaves it so, so it is deleted too, in the same commit. Its own
 //! dependents follow, round by round, until a round finds none. Every read is held at the
 //! commit the rows were shown at, and the delete is bound to that commit, so what the dialog
-//! lists is exactly what goes.
+//! lists is exactly what goes. What it removes is counted there too, so a delete larger than
+//! Undo puts back is confirmed by typing before it is sent, not found too large by Undo after.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use gpui::{App, Entity, Task};
-use gq_language::builder::{delete_nodes, required_dependents};
-use gq_language::{BuiltQuery, SchemaModel};
+use gq_language::builder::{
+    EdgeEnd, delete_nodes, edge_count, endpoint_property_key, required_dependents,
+};
+use gq_language::{BuiltQuery, Filter, FilterOp, SchemaModel};
 use graph_client::ReadError;
 use serde_json::Value;
 
@@ -47,10 +50,9 @@ pub struct Dependent {
 pub struct DeletePlan {
     /// Every node to delete, by type, the type of the rows asked for first.
     pub nodes: Vec<(String, Vec<String>)>,
-    /// How many rows were asked for.
-    pub requested: usize,
     pub dependents: Vec<Dependent>,
-    /// Why Undo could not restore this delete, when it could not.
+    /// Why Undo could not restore this delete, when it could not: judged from the schema, then
+    /// from how much it removes at the commit it is bound to.
     pub undo_unavailable: Option<String>,
 }
 
@@ -115,7 +117,6 @@ pub fn plan_node_delete(
     cx: &mut App,
 ) -> Task<Result<DeletePlan, PlanError>> {
     cx.spawn(async move |cx| {
-        let requested = ids.len();
         let mut nodes: Vec<(String, Vec<String>)> = vec![(type_name.clone(), ids.clone())];
         let mut seen: HashMap<String, BTreeSet<String>> =
             HashMap::from([(type_name.clone(), ids.into_iter().collect())]);
@@ -178,18 +179,123 @@ pub fn plan_node_delete(
             }
             if next.is_empty() {
                 let types: Vec<&str> = nodes.iter().map(|(t, _)| t.as_str()).collect();
-                let undo_unavailable = undo_unavailable(&schema, &types);
+                let mut unavailable = undo_unavailable(&schema, &types);
+                // Undo reads the delete's changes and puts at most `UNDO_CAP` back: a delete
+                // that removes more is found so here, at the pin, so its dialog asks for the
+                // key to be typed rather than offering an Undo that would restore nothing.
+                if unavailable.is_none() {
+                    let removed = removed_changes(&session, &schema, &nodes, &at_commit, cx).await;
+                    unavailable = undo_past_cap(removed);
+                }
                 return Ok(DeletePlan {
                     nodes,
-                    requested,
                     dependents,
-                    undo_unavailable,
+                    undo_unavailable: unavailable,
                 });
             }
             grown = next;
         }
         Err(PlanError::TooMany)
     })
+}
+
+/// Why Undo could not put back a delete that makes `removed` changes: more than it puts back
+/// in one commit, or a count that could not be read, which promises nothing.
+fn undo_past_cap(removed: Result<usize, String>) -> Option<String> {
+    match removed {
+        Ok(removed) if removed > UNDO_CAP => Some(format!(
+            "It removes {} nodes and relationships, more than the {} Undo puts back in one \
+             commit.",
+            studio_ui::group_digits(removed),
+            studio_ui::group_digits(UNDO_CAP)
+        )),
+        Ok(_) => None,
+        Err(reason) => Some(format!(
+            "Studio could not count what it removes ({reason}), so it cannot say Undo would \
+             put it all back."
+        )),
+    }
+}
+
+/// How many changes deleting `nodes` makes, counted at `at_commit`: one per node, and one per
+/// relationship any of them has. The rows asked for are counted as they were asked for, so one
+/// gone already counts too: the count is never short.
+async fn removed_changes(
+    session: &Entity<GraphSession>,
+    schema: &SchemaModel,
+    nodes: &[(String, Vec<String>)],
+    at_commit: &Option<String>,
+    cx: &mut gpui::AsyncApp,
+) -> Result<usize, String> {
+    let counts = removal_counts(schema, nodes)?;
+    let reads: Vec<_> = counts
+        .iter()
+        .map(|(_, query)| {
+            session.update(cx, |session, cx| session.read(query, at_commit.clone(), cx))
+        })
+        .collect();
+    let outputs = futures::future::join_all(reads).await;
+    let mut removed: i64 = nodes.iter().map(|(_, ids)| ids.len() as i64).sum();
+    for ((sign, _), output) in counts.iter().zip(outputs) {
+        let output = output.map_err(|error| error.to_string())?;
+        let n = count_of(&output.rows)
+            .ok_or_else(|| "the server's count could not be read".to_owned())?;
+        removed += sign * n;
+    }
+    Ok(removed.max(0) as usize)
+}
+
+/// The reads that count the relationships deleting `nodes` removes, each with the sign it is
+/// summed with. A relationship type with a deleted end is counted by its ends' keys, which are
+/// the nodes' ids: those from the deleted sources and those to the deleted targets, less those
+/// both, so a relationship between two deleted nodes, or from a node to itself, counts once as
+/// it is one change.
+fn removal_counts(
+    schema: &SchemaModel,
+    nodes: &[(String, Vec<String>)],
+) -> Result<Vec<(i64, BuiltQuery)>, String> {
+    // The filter on one end: its key among the deleted ids of its type; none when no node of
+    // its type goes. A node without a key has no value to match its id by.
+    let end = |end: EdgeEnd, type_name: &str| -> Result<Option<Filter>, String> {
+        let Some((_, ids)) = nodes
+            .iter()
+            .find(|(t, ids)| t == type_name && !ids.is_empty())
+        else {
+            return Ok(None);
+        };
+        let key = schema
+            .node(type_name)
+            .and_then(|node| node.key.as_deref())
+            .ok_or_else(|| format!("{type_name} has no key"))?;
+        Ok(Some(Filter {
+            property: endpoint_property_key(end, key),
+            op: FilterOp::In,
+            value: Value::from(ids.clone()),
+        }))
+    };
+    let count = |edge: &str, filters: &[Filter]| {
+        edge_count(schema, edge, filters).map_err(|error| error.to_string())
+    };
+    let mut counts = Vec::new();
+    for edge in &schema.edges {
+        let from = end(EdgeEnd::From, &edge.from)?;
+        let to = end(EdgeEnd::To, &edge.to)?;
+        for filter in [&from, &to].into_iter().flatten() {
+            counts.push((1, count(&edge.name, std::slice::from_ref(filter))?));
+        }
+        if let (Some(from), Some(to)) = (from, to) {
+            counts.push((-1, count(&edge.name, &[from, to])?));
+        }
+    }
+    Ok(counts)
+}
+
+/// The count a `count(…) as n` read returns; an answer of no row counts none.
+fn count_of(rows: &Value) -> Option<i64> {
+    match rows.as_array()?.first() {
+        Some(row) => row.get("n")?.as_i64(),
+        None => Some(0),
+    }
 }
 
 /// Why Undo could not bring back nodes of `types` with their relationships: an insert cannot
@@ -513,7 +619,6 @@ mod tests {
                 ("Company".into(), vec!["acme".into()]),
                 ("Person".into(), vec!["ada".into(), "cy".into()]),
             ],
-            requested: 1,
             dependents: vec![
                 Dependent {
                     type_name: "Person".into(),
@@ -537,5 +642,177 @@ mod tests {
         assert_eq!(plan.dependent_counts(), [("Person".to_owned(), 2)]);
         let check = gq_language::check(&schema, &query.text);
         assert!(check.diagnostics.is_empty(), "{:?}", check.diagnostics);
+    }
+
+    const TAGS: &str = "node Tag {\n  slug: String @key\n}\n\
+        node Doc {\n  slug: String @key\n}\n\
+        node Note {\n  body: String\n}\n\
+        edge Tagged: Doc -> Tag\n\
+        edge Broader: Tag -> Tag\n\
+        edge Cites: Doc -> Doc\n";
+
+    /// A relationship type is counted from each end that loses nodes, less what both ends
+    /// lose, so a relationship between two deleted nodes, or from one to itself, counts once;
+    /// a type no deleted node takes part in is not read. Every count type-checks.
+    #[test]
+    fn relationships_between_deleted_nodes_count_once() {
+        let schema = SchemaModel::parse(TAGS).unwrap();
+        let tags = [("Tag".to_owned(), vec!["t1".to_owned(), "t2".to_owned()])];
+        let counts = removal_counts(&schema, &tags).unwrap();
+        let shape: Vec<(i64, bool, bool)> = counts
+            .iter()
+            .map(|(sign, query)| {
+                assert!(!query.text.contains("$e:cites"), "{}", query.text);
+                let check = gq_language::check(&schema, &query.text);
+                assert!(check.diagnostics.is_empty(), "{:?}", check.diagnostics);
+                (
+                    *sign,
+                    query.text.contains("$a.slug in"),
+                    query.text.contains("$b.slug in"),
+                )
+            })
+            .collect();
+        // Broader from, to, and less both; Tagged by its target.
+        assert_eq!(
+            shape,
+            [
+                (1, true, false),
+                (1, false, true),
+                (-1, true, true),
+                (1, false, true)
+            ]
+        );
+        assert!(counts[3].1.text.contains("$e:tagged"));
+        // Docs too: Tagged and Cites are read from their sources as well.
+        let both = [tags[0].clone(), ("Doc".to_owned(), vec!["d1".to_owned()])];
+        let counts = removal_counts(&schema, &both).unwrap();
+        let signs: Vec<i64> = counts.iter().map(|(sign, _)| *sign).collect();
+        assert_eq!(signs, [1, 1, -1, 1, 1, -1, 1, 1, -1]);
+        // A node type without a key has nothing to count its relationships by.
+        let unkeyed = SchemaModel::parse(
+            "node Note {\n  body: String\n}\nnode Tag {\n  slug: String @key\n}\n\
+             edge About: Note -> Tag\n",
+        )
+        .unwrap();
+        assert!(
+            removal_counts(&unkeyed, &[("Note".to_owned(), vec!["n1".to_owned()])])
+                .unwrap_err()
+                .contains("Note has no key")
+        );
+    }
+
+    /// A delete that removes more than Undo puts back in one commit, a tag on 25,000 documents,
+    /// is planned without Undo, so its dialog asks for the key to be typed; the same delete of
+    /// a tag on ten offers Undo. Each relationship count is held at the commit the rows were
+    /// shown at, and a delete the schema already rules Undo out for counts nothing.
+    #[gpui::test]
+    async fn a_delete_past_what_undo_puts_back_is_planned_without_undo(cx: &mut TestAppContext) {
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let log = seen.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let log = log.clone();
+            async move {
+                let path = request.uri().path().to_owned();
+                let mut body = Vec::new();
+                use futures::AsyncReadExt as _;
+                request.into_body().read_to_end(&mut body).await.ok();
+                let body = if path.ends_with("/schema") {
+                    serde_json::json!({ "schema_source": TAGS })
+                } else if path.ends_with("/query") {
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    log.lock().unwrap().push(request.clone());
+                    let text = request["query"].as_str().unwrap_or_default();
+                    let hub = request["params"].to_string().contains("hub");
+                    let (from, to) = (text.contains("$a.slug in"), text.contains("$b.slug in"));
+                    let n = match (text.contains("$e:tagged"), from, to) {
+                        (true, ..) if hub => 25_000,
+                        (true, ..) => 10,
+                        (false, true, true) => 1,
+                        (false, true, false) => 3,
+                        (false, false, true) => 2,
+                        _ => 0,
+                    };
+                    let rows = if request["name"] == "studio_edge_count" {
+                        serde_json::json!([{ "n": n }])
+                    } else {
+                        serde_json::json!([])
+                    };
+                    serde_json::json!({
+                        "query_name": "q",
+                        "target": {"branch": null, "snapshot": "c1"},
+                        "row_count": rows.as_array().unwrap().len(),
+                        "columns": ["n"],
+                        "rows": rows,
+                        "graph_commit_id": "c1",
+                    })
+                } else {
+                    serde_json::json!({ "branches": ["main"] })
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        let schema = Arc::new(SchemaModel::parse(TAGS).unwrap());
+        let plan = |type_name: &str, id: &str| {
+            let plan = cx.update(|cx| {
+                plan_node_delete(
+                    session.clone(),
+                    schema.clone(),
+                    type_name.into(),
+                    vec![id.into()],
+                    Some("c1".into()),
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+            futures::executor::block_on(plan).unwrap()
+        };
+        let counts = |seen: &Mutex<Vec<Value>>| -> Vec<Value> {
+            let counts = seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|read| read["name"] == "studio_edge_count")
+                .cloned()
+                .collect();
+            seen.lock().unwrap().clear();
+            counts
+        };
+
+        let hub = plan("Tag", "hub");
+        // The tag, its 25,000 documents, and Broader's 3 + 2 - 1.
+        let reason = hub.undo_unavailable.expect("Undo is not offered");
+        assert!(
+            reason.contains("25,005") && reason.contains("20,000"),
+            "{reason}"
+        );
+        let reads = counts(&seen);
+        assert_eq!(reads.len(), 4, "{reads:#?}");
+        assert!(
+            reads.iter().all(|read| read["snapshot"] == "c1"
+                || (read["branch"] == "main" && read.get("snapshot").is_none())),
+            "{reads:#?}"
+        );
+
+        let small = plan("Tag", "rare");
+        assert_eq!(small.undo_unavailable, None);
+        assert_eq!(counts(&seen).len(), 4);
+
+        let note = plan("Note", "n1");
+        assert!(note.undo_unavailable.unwrap().contains("no key"));
+        assert!(counts(&seen).is_empty(), "nothing counted");
     }
 }
