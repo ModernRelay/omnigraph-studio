@@ -385,7 +385,11 @@ handshake cannot make Studio read one. A body whose end cannot be told (a `conte
 that is not one number, a transfer coding that does not end with `chunked`) is refused (400). A
 target holding a `#`, or a query parameter given twice, is refused (400) before the rules
 read it: forwarding drops a `#` and all that follows it, so the rules would judge a query the
-server never sees, and a repeated key could be judged by one value and read as another.
+server never sees, and a repeated key could be judged by one value and read as another. The
+gateway serves 64 connections at once; full, it closes the oldest that has not yet given the
+token to take the next, so connections another local process holds open never keep the CLI
+out (since 2026-10-22; before, a full gateway closed the next connection unread, so 64 idle
+ones, each let go within 10 s and opened again, locked the CLI out).
 
 | Request | Rule |
 |---|---|
@@ -492,7 +496,8 @@ and cards apply, because the CLI still speaks to the gateway.
   storage URI would make Studio open storage itself.
 - Files given to `--query`, `--data`, `--params-file`, `--file`, `--out` and `--schema`, and
   `save_to`, must be inside the working directory (relative, or absolute under it, never
-  through `..`, and never under `.studio`, which holds Studio's files for the conversation), so
+  through `..`, and never under `.studio`, which holds Studio's files for the conversation, by
+  any name that opens it: another case, trailing dots and spaces, or an NTFS stream's name), so
   the agent can process them in its own sandbox. Studio opens only regular files there, without
   waiting on a pipe. The CLI runs outside that
   sandbox, so it never opens them there: Studio copies each input into a private folder before
@@ -685,6 +690,8 @@ CLI is the one they trust).
 | 2026-10-21 | The private CLI homes stay on the machine on Windows | `agent_panel` `agents_work_in_the_local_folder_of_studios_roaming_data` (now also: `private_homes()` and the working directories share one `agent` folder) | The homes were under `studio_settings::data_dir()`, the roaming `%APPDATA%` on Windows; they now come from the same `%LOCALAPPDATA%` counterpart as the working directories (`sessions::agent_dir`). Run on macOS, where both are the data folder; the Windows mapping is `local_counterpart`'s, checked by the same test |
 | 2026-10-21 | A real CLI that reads the home reaches the gateway, run | `agent_panel` `gateway` `a_live_cli_reaches_the_gateway_with_what_its_home_holds` with `OMNIGRAPH_STUDIO_LIVE_CLI=~/.local/bin/omnigraph`, `0.14.0-edge+7fff9df` (commit `7fff9dfd`, OmniGraph main with `ff542202`), on macOS, with the gateway changes above | Passed. `choose_cli` took it (`version --json`: contract 0.14, target protocol 1; its `config validate` accepted the private home) with the wrapper ready. `branch list --json` through `omnigraph_run` (`--target studio`) and through the wrapper (the default target) each reached the fake server once, over TLS, with the person's token and the contract, and the CLI read the gateway's answer (it reported the fake answer's missing `branches`, `http_status: 200`). The wrapper's first run took 7-23 s across runs, a fresh two-line script written by the test binary the same, the CLI on that home 24 ms and every later run about 20 ms: the first exec of a new script, which Gatekeeper scans (the wrapper's known first-run cost, above), not the CLI or the gateway. Supersedes the row above's "Not run"; the server end-to-end test is still not run |
 | 2026-10-21 | The wrapper's first run waits for Gatekeeper's scan | An unsigned C probe (not checked in) that writes a two-line script, makes it `0700` and runs it twice; `/usr/bin/log show` for `syspolicyd` and `XprotectService` over those seconds; Apple M5 Pro, macOS 26.5.2 | `syspolicyd` logged `GK performScan` for the script (`-67062`: unsigned), opened XProtect's analysis service, which loaded the XProtect YARA rules, then `Putting executable into provenance`; the second run logged no scan. First run 0.17 s and 0.26 s in two tries, second 6 ms and 12 ms. Not reproduced: the 7-23 s the live test saw while builds were running |
+| 2026-10-22 | The gateway keeps a slot for a connection that gives the token | `agent_panel` `socket::a_full_listener_lets_go_of_the_oldest_unproved_connection` (a listener of 64: the CLI's connection, then 63 held open by another process, then connections with and without the token until all 64 have it, then one more), `gateway::only_a_request_with_the_token_has_its_body_read`, extended (only the token proves a connection, before its body is read); the MCP socket's connections prove themselves by reaching its private folder | Full, each next connection closed the oldest without the token, never the CLI's; with all 64 holding it, the next was closed unread. Before, a full listener closed the next whatever it was, the CLI's among them, for as long as 64 others were held |
+| 2026-10-22 | `.studio` is refused by an NTFS stream's name | `agent_panel` `the_studio_folder_is_refused_by_any_name_that_opens_it`, extended: `.studio::$INDEX_ALLOCATION`, `.Studio:$I30:$INDEX_ALLOCATION` and `.studio. :stream` | Refused on every platform, the name read up to its first `:`. Before, each passed, and NTFS opens the folder itself by the first two. Not covered still: an 8.3 short name (`STUDIO~1`) |
 
 ## Corrections
 

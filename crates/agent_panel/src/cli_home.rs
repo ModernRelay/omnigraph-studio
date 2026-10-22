@@ -1376,12 +1376,15 @@ pub fn inside(cwd: &Path, value: &str) -> Result<Vec<String>, String> {
 
 /// Whether `part`, a path's first part in the working directory, opens the `.studio` folder.
 /// macOS and Windows find a name in any case (`.Studio` opens `.studio`), and so can a Linux
-/// folder that folds case; Windows also drops a name's trailing dots and spaces (`.studio.`).
-/// Matched so everywhere, by Unicode's case mappings both ways, since a file system folds case
-/// by its own table (`.ſtudio` is `.STUDIO` upper-cased).
+/// folder that folds case; NTFS reads what follows a `:` as one of the name's streams
+/// (`.studio::$INDEX_ALLOCATION` is the folder itself), and Windows drops the trailing dots and
+/// spaces before it (`.studio.`). Matched so on every platform, where refusing such a name
+/// costs nothing, and by Unicode's case mappings both ways, since a file system folds case by
+/// its own table (`.ſtudio` is `.STUDIO` upper-cased).
 fn names_studio_folder(part: &str) -> bool {
-    let part = part.trim_end_matches(['.', ' ']);
-    part.to_lowercase() == ".studio" || part.to_uppercase() == ".STUDIO"
+    let name = part.split(':').next().unwrap_or(part);
+    let name = name.trim_end_matches(['.', ' ']);
+    name.to_lowercase() == ".studio" || name.to_uppercase() == ".STUDIO"
 }
 
 /// Reads `from` into `into` until its end, or until it holds more than `cap` bytes: whether it
@@ -2224,8 +2227,9 @@ fi"#;
     }
 
     /// `omnigraph_run` touches no file in the `.studio` folder, under any name a file system may
-    /// open it by: in another case, as macOS and Windows find names, or with the trailing dots
-    /// and spaces Windows drops. A folder only named like it is the agent's.
+    /// open it by: in another case, as macOS and Windows find names, with the trailing dots and
+    /// spaces Windows drops, or naming one of its NTFS streams. A folder only named like it is
+    /// the agent's.
     #[test]
     fn the_studio_folder_is_refused_by_any_name_that_opens_it() {
         let cwd = std::env::temp_dir().join("studio-run-studio-folder");
@@ -2238,6 +2242,9 @@ fi"#;
             ".Studio . /agent-x/token",
             ".ſtudio/agent-x/token",
             ".studıo/agent-x/token",
+            ".studio::$INDEX_ALLOCATION/agent-x/token",
+            ".Studio:$I30:$INDEX_ALLOCATION/agent-x/token",
+            ".studio. :stream",
         ] {
             let refused = inside(&cwd, value);
             assert!(

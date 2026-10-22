@@ -30,6 +30,7 @@ use smol::net::{TcpListener, TcpStream};
 
 use crate::gateway_rules::{self, Incoming, Sandbox, Verdict, WriteKind, WriteSummary};
 use crate::requester::Starters;
+use crate::socket::Standing;
 
 /// The most a request's line and headers may take.
 const MAX_HEAD: usize = 64 * 1024;
@@ -168,7 +169,9 @@ impl Gateway {
             let Some(listener) = listener else { return };
             crate::socket::serve_each(
                 || listener.accept(),
-                |(stream, _)| serve_connection(stream, acceptor.clone(), shared.clone()),
+                |(stream, _), standing| {
+                    serve_connection(stream, acceptor.clone(), shared.clone(), standing)
+                },
             )
             .await;
         }
@@ -231,7 +234,14 @@ async fn by<T>(deadline: Instant, future: impl Future<Output = T>) -> Option<T> 
 /// processes a write's CLI was started under (`requester`).
 type Ends = (Option<SocketAddr>, Option<SocketAddr>);
 
-async fn serve_connection(stream: TcpStream, acceptor: TlsAcceptor, shared: Arc<Shared>) {
+/// Serves one connection. Its [`Standing`] is raised once its request carries the session's
+/// token: until then a full listener may close it for another.
+async fn serve_connection(
+    stream: TcpStream,
+    acceptor: TlsAcceptor,
+    shared: Arc<Shared>,
+    standing: Standing,
+) {
     let ends = (stream.peer_addr().ok(), stream.local_addr().ok());
     // Both bounds count from here, so the handshake's time comes out of the head's: a local
     // process that opens a connection and sends slowly, or nothing, holds it no longer than
@@ -246,7 +256,7 @@ async fn serve_connection(stream: TcpStream, acceptor: TlsAcceptor, shared: Arc<
     let (mut reader, mut writer) = stream.split();
     let read = by(
         opened + READ_WITHIN,
-        read_request(&mut reader, &shared.token, head_by),
+        read_request(&mut reader, &shared.token, head_by, &standing),
     )
     .await;
     match read.unwrap_or(Err(ReadFailure::Gone)) {
@@ -716,12 +726,13 @@ impl Framing {
 /// Reads one request, its body last. The health probe carries no token and may carry no body:
 /// one that declares a body is refused without a byte of it read. Every other request's token
 /// is checked once its headers are in, before its body (up to [`MAX_BODY`]) is read: only the
-/// conversation's CLI makes Studio read that much. Its line and headers must be in by
-/// `head_by`.
+/// conversation's CLI makes Studio read that much, and its connection's `standing` is raised
+/// then. Its line and headers must be in by `head_by`.
 async fn read_request(
     stream: &mut (impl AsyncRead + Unpin),
     token: &str,
     head_by: Instant,
+    standing: &Standing,
 ) -> Result<Request, ReadFailure> {
     let mut buffer = Vec::with_capacity(8 * 1024);
     let mut chunk = [0u8; 8 * 1024];
@@ -781,6 +792,7 @@ async fn read_request(
             "Studio: this token is not the one Studio wrote for this conversation.".into(),
         ));
     }
+    standing.prove();
     let mut rest = buffer[head_end..].to_vec();
     let body = match framing {
         Framing::None => Vec::new(),
@@ -1603,7 +1615,8 @@ mod tests {
     /// carries none, and a request with no token or another, are refused once their headers are
     /// in, whatever body they declare, without a byte of it read: any local process can send
     /// them. The probe without a body is answered, and a request with the token has its body
-    /// read.
+    /// read. Only the token proves the connection, before its body is read, so a full
+    /// listener keeps it.
     #[test]
     fn only_a_request_with_the_token_has_its_body_read() {
         let read = |head: &str| {
@@ -1611,17 +1624,19 @@ mod tests {
                 head: head.as_bytes().to_vec(),
                 body_read: 0,
             };
+            let standing = Standing::default();
             let read = smol::block_on(read_request(
                 &mut stream,
                 "the-token",
                 Instant::now() + HEAD_WITHIN,
+                &standing,
             ));
             let status = match read {
                 Ok(_) => 200,
                 Err(ReadFailure::Answer(status, ..)) => status,
                 Err(ReadFailure::Gone) => 0,
             };
-            (status, stream.body_read)
+            (status, stream.body_read, standing.proved())
         };
         let large = format!("content-length: {MAX_BODY}");
         for (request, status) in [
@@ -1667,22 +1682,23 @@ mod tests {
                 401,
             ),
         ] {
-            assert_eq!(read(&request), (status, 0), "{request}");
+            assert_eq!(read(&request), (status, 0, false), "{request}");
         }
         // What the stream counts is read: a request with the token has the body it declares
         // read, and one that declares a body it cannot frame is refused.
-        let (status, body_read) = read(
+        let (status, body_read, proved) = read(
             "POST /graphs/knowledge/load HTTP/1.1\r\nhost: x\r\nauthorization: Bearer \
              the-token\r\ncontent-length: 100000\r\n\r\n",
         );
         assert_eq!(status, 200);
         assert!(body_read >= 100_000, "{body_read}");
+        assert!(proved);
         for framing in ["content-length: 5, 6", "transfer-encoding: gzip"] {
             let request = format!(
                 "POST /graphs/knowledge/load HTTP/1.1\r\nhost: x\r\nauthorization: Bearer \
                  the-token\r\n{framing}\r\n\r\n"
             );
-            assert_eq!(read(&request), (400, 0), "{framing}");
+            assert_eq!(read(&request), (400, 0, true), "{framing}");
         }
     }
 
