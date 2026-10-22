@@ -180,9 +180,13 @@ struct RowsOutput {
     /// The read that made these rows, which Refresh sends again; none for a statement, which
     /// names its own branches, or a read at a pinned commit, which never moves.
     rerun: Option<Prepared>,
-    /// The branch moved past the commit these rows were read at (constitution II): the tab
-    /// offers Refresh and never reads again by itself.
+    /// The branch the rows were read at moved past the commit they were read at
+    /// (constitution II): while it is the session's branch, the tab offers Refresh, and it
+    /// never reads again by itself. Kept when the session moves to another branch and back.
     newer: bool,
+    /// The head of that branch the session knew when the rows were shown, which may lag the
+    /// commit they were read at: a later head other than both is a newer one.
+    head_seen: Option<String>,
 }
 
 /// A read's rows made ready to show: the table, each column's width from its content, which
@@ -353,14 +357,22 @@ impl Failure {
     }
 }
 
-/// A file tab's unsaved text as a remembered tab brings it back, and a hash of the file's text
-/// it was typed over ([`content_hash`]): `None` when the tab was remembered by a build that
-/// kept no hash, so whether the file changed since is not known.
+/// A file tab's text as a remembered tab brings it back, and a hash of the file's text it was
+/// typed over ([`content_hash`]): `None` when the tab was remembered by a build that kept no
+/// hash, so whether the file changed since is not known.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Draft {
     pub text: String,
     pub based_on: Option<String>,
+    /// The text was the file's when the tab was remembered: the file is shown when it can be
+    /// read, and this only when it cannot (deleted, or gone with a `git switch`), so the text
+    /// is not lost with it.
+    pub saved: bool,
 }
+
+/// The longest text a saved file tab remembers for when its file is gone; a longer one comes
+/// back only from its file. An unsaved draft is remembered whole.
+const REMEMBERED_SAVED_TEXT: usize = 256 * 1024;
 
 /// A file tab whose file is being read off the main thread: the tab shows it is reading, runs
 /// and saves nothing, and keeps what it remembered until the file is in.
@@ -410,6 +422,23 @@ pub fn content_hash(text: &str) -> String {
     format!("fnv1a64:{hash:016x}:{}", text.len())
 }
 
+/// One of the server's suggested edits, held in the editor. It is checked against its context,
+/// its place with a little text either side, because an insertion's place alone holds no text
+/// to check: text typed there, or the whole text replaced (a clean tab taking its file's),
+/// leaves an empty place empty.
+struct HeldEdit {
+    /// The context, anchored in the text as it was run; text typed just outside it stays out.
+    context: std::ops::Range<Anchor>,
+    /// The context's text as it was run: the edit holds while the context still reads so.
+    original: String,
+    /// Where the edit is in the context, in bytes.
+    within: std::ops::Range<usize>,
+    replacement: String,
+}
+
+/// How many bytes either side of a held edit its context takes.
+const EDIT_CONTEXT: usize = 16;
+
 /// How many of the branch's latest commits the snapshot picker offers.
 const PICKER_COMMITS: usize = 15;
 
@@ -431,6 +460,9 @@ pub struct QueryEditor {
     file_error: Option<String>,
     /// The file's text is being read: the tab says so until it is in.
     loading: Option<Loading>,
+    /// The file could not be read when the tab came back: the tab holds the text it
+    /// remembered, and a bar says the file is gone and offers Save As.
+    file_gone: bool,
     /// The file changed on disk after the draft was typed over it, and `saved_text` is what
     /// it holds now: the draft stays, and is written over the file only when the person says.
     disk_change: Option<DiskChange>,
@@ -468,7 +500,10 @@ pub struct QueryEditor {
     diagnostic_at: Option<Anchor>,
     /// The server's suggested edits for that diagnostic, anchored in the text as it was run,
     /// so they land where they were meant after edits elsewhere.
-    diagnostic_edits: Vec<(std::ops::Range<Anchor>, String)>,
+    diagnostic_edits: Vec<HeldEdit>,
+    /// Every one of `diagnostic_edits` still finds the text it was made for, so Apply is
+    /// offered; found again at each edit, and the results drawn again when it changes.
+    server_fix_holds: bool,
     last_runs: HashMap<String, RunNote>,
     /// The branch's latest commits, for the snapshot picker: id, Unix micros, actor. Read when
     /// the picker opens, and kept until a commit lands on the branch.
@@ -633,9 +668,11 @@ impl Item for QueryEditor {
         self.writing || self.stored.is_none() && self.unsaved
     }
 
-    /// The rows shown were read at a commit the branch has moved past.
-    fn is_stale(&self, _cx: &App) -> bool {
-        matches!(&self.output, Output::Rows(rows) if rows.newer)
+    /// The rows shown were read at a commit their branch, the one shown, has moved past.
+    fn is_stale(&self, cx: &App) -> bool {
+        let branch = &self.session.read(cx).branch;
+        matches!(&self.output, Output::Rows(rows)
+            if rows.newer && matches!(&rows.read_at, ReadAt::Branch(read) if read == branch))
     }
 
     fn tab_icon(&self, _cx: &App) -> Option<IconName> {
@@ -695,23 +732,36 @@ impl Item for QueryEditor {
         let draft = match (&self.loading, &self.path) {
             // Still being read: what was remembered, as it was.
             (Some(loading), _) => loading.draft.clone(),
-            (None, Some(_)) if !self.unsaved => None,
+            // Saved: the file's text, for the restart that finds the file gone.
+            (None, Some(_)) if !self.unsaved => {
+                let text = self.editor.read(cx).text(cx);
+                (text.len() <= REMEMBERED_SAVED_TEXT).then(|| Draft {
+                    based_on: Some(content_hash(&text)),
+                    text,
+                    saved: true,
+                })
+            }
             (None, Some(_)) => Some(Draft {
                 text: self.editor.read(cx).text(cx),
                 based_on: match &self.disk_change {
                     Some(change) => change.based_on.clone(),
                     None => self.saved_text.as_deref().map(content_hash),
                 },
+                saved: false,
             }),
             (None, None) => Some(Draft {
                 text: self.editor.read(cx).text(cx),
                 based_on: None,
+                saved: false,
             }),
         };
         if let Some(draft) = draft {
             data["text"] = Value::String(draft.text);
             if let Some(based_on) = draft.based_on {
                 data["based_on"] = Value::String(based_on);
+            }
+            if draft.saved {
+                data["saved"] = Value::Bool(true);
             }
         }
         Some(SavedItem {
@@ -839,13 +889,11 @@ impl QueryEditor {
                         this.pending_write = None;
                         this.commits.clear();
                         this.commits_stale(window, cx);
-                        // Rows of the branch left name it in the footer; Refresh is offered
-                        // only for the session's branch, which Run reads.
-                        if let Output::Rows(rows) = &mut this.output
-                            && std::mem::take(&mut rows.newer)
-                        {
-                            cx.emit(ItemEvent::UpdateTab);
-                        }
+                        // Rows of the branch left name it in the footer, and offer Refresh
+                        // only on their own branch, which Run reads: back on it, they are
+                        // compared with the head the session knows for it now.
+                        this.compare_rows_with_head(cx);
+                        cx.emit(ItemEvent::UpdateTab);
                         // A write still to run says which branch it asks before writing to.
                         this.redraw_expected(cx);
                         cx.notify()
@@ -870,6 +918,7 @@ impl QueryEditor {
             unsaved: false,
             file_error: None,
             loading: None,
+            file_gone: false,
             disk_change: None,
             disk_task: None,
             file_focus: cx.focus_handle(),
@@ -890,6 +939,7 @@ impl QueryEditor {
             problems: QueryProblems::new(cx),
             diagnostic_at: None,
             diagnostic_edits: Vec::new(),
+            server_fix_holds: false,
             last_runs: HashMap::new(),
             at_commit: None,
             editor,
@@ -1151,10 +1201,12 @@ impl QueryEditor {
     }
 
     /// The file this tab was [`Self::reading`] was read: `disk` is its text, `None` when it
-    /// could not be read. A tab with no draft shows the file; a draft typed over the text the
-    /// file still holds is kept; a draft over a file that changed since is kept too, with the
-    /// bar saying so, and ⌘S asks before writing over the file. Returns false when there is
-    /// nothing to show: no draft, and no file.
+    /// could not be read. A tab that was saved, or remembered nothing, shows the file; a draft
+    /// typed over the text the file still holds is kept; a draft over a file that changed
+    /// since is kept too, with the bar saying so, and ⌘S asks before writing over the file. A
+    /// file that cannot be read leaves the tab with the text it remembered, saved or not, and
+    /// a bar saying the file is gone. Returns false when there is nothing to show: nothing
+    /// remembered, and no file.
     pub fn file_read(
         &mut self,
         disk: Option<String>,
@@ -1168,15 +1220,14 @@ impl QueryEditor {
             .update(cx, |editor, _| editor.set_read_only(false));
         match (draft, disk) {
             (None, None) => return false,
-            (None, Some(disk)) => {
+            (None, Some(disk)) | (Some(Draft { saved: true, .. }), Some(disk)) => {
                 self.saved_text = Some(disk.clone());
                 self.set_text(&disk, window, cx);
             }
             (Some(draft), None) => {
+                // Nothing is on disk: the text is the tab's alone, and closing it asks.
                 self.saved_text = Some(String::new());
-                self.file_error = Some(
-                    "The file could not be read; the draft is kept, and Save writes it.".into(),
-                );
+                self.file_gone = true;
                 self.set_text(&draft.text, window, cx);
             }
             (Some(draft), Some(disk)) => {
@@ -1224,6 +1275,8 @@ impl QueryEditor {
         let (Some(disk), Some(saved)) = (disk, &self.saved_text) else {
             return;
         };
+        // The file is back (a `git switch` back): what it holds is compared as any change.
+        self.file_gone = false;
         if disk == *saved || self.saving || self.loading.is_some() {
             return;
         }
@@ -1446,6 +1499,7 @@ impl QueryEditor {
                         this.path = Some(path);
                         this.saved_text = Some(text);
                         this.disk_change = None;
+                        this.file_gone = false;
                         // Typing while it was written stays unsaved.
                         this.sync_unsaved(cx);
                         this.file_error = None;
@@ -1540,6 +1594,8 @@ impl QueryEditor {
                 cx.emit(ItemEvent::UpdateTab);
             }
         }
+        // An edit where the server's suggestion goes takes back its Apply.
+        self.sync_server_fix(cx);
         self.schedule_check(window, cx);
         self.cursor_moved(window, cx);
     }
@@ -2107,33 +2163,79 @@ impl QueryEditor {
         self.diagnostic_at = byte.map(|byte| snapshot.anchor_before(clip(byte, Bias::Left)));
         self.diagnostic_edits = edits
             .iter()
-            .map(|(range, text)| {
-                let start = snapshot.anchor_after(clip(range.start, Bias::Left));
-                let end = snapshot.anchor_before(clip(range.end, Bias::Right));
-                (start..end, text.clone())
+            .map(|(range, replacement)| {
+                let (start, end) = (clip(range.start, Bias::Left), clip(range.end, Bias::Right));
+                let around = clip(start.0.saturating_sub(EDIT_CONTEXT), Bias::Left)
+                    ..clip(end.0 + EDIT_CONTEXT, Bias::Right);
+                HeldEdit {
+                    context: snapshot.anchor_after(around.start)
+                        ..snapshot.anchor_before(around.end),
+                    original: snapshot.text_for_range(around.clone()).collect(),
+                    within: start.0 - around.start.0..end.0 - around.start.0,
+                    replacement: replacement.clone(),
+                }
             })
             .collect();
+        self.server_fix_holds = self.server_fix_place(cx).is_some();
     }
 
-    /// Applies the server's suggested edits, where their anchors are now.
-    fn apply_server_fix(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Where the server's suggested edits go in the text now: `None` when there are none, or
+    /// when one's context ([`HeldEdit`]) no longer reads as it did, so `()` typed where the
+    /// server would insert `()` is not doubled. The compiler's fixes ask the same of the whole
+    /// text ([`Self::apply_fix`]); these are held across edits elsewhere, so each asks it of
+    /// the text around its own place.
+    fn server_fix_place(
+        &self,
+        cx: &App,
+    ) -> Option<Vec<(std::ops::Range<MultiBufferOffset>, String)>> {
         if self.diagnostic_edits.is_empty() || self.stored.is_some() {
+            return None;
+        }
+        let snapshot = self.snapshot(cx);
+        self.diagnostic_edits
+            .iter()
+            .map(|edit| {
+                let start = edit.context.start.to_offset(&snapshot);
+                let end = edit.context.end.to_offset(&snapshot);
+                let holds = start <= end
+                    && studio_ui::text::pieces_are(
+                        end.0 - start.0,
+                        snapshot.text_for_range(start..end),
+                        &edit.original,
+                    );
+                holds.then(|| {
+                    (
+                        MultiBufferOffset(start.0 + edit.within.start)
+                            ..MultiBufferOffset(start.0 + edit.within.end),
+                        edit.replacement.clone(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Whether Apply is offered changed with an edit: the results say so.
+    fn sync_server_fix(&mut self, cx: &mut Context<Self>) {
+        if self.diagnostic_edits.is_empty() && !self.server_fix_holds {
             return;
         }
-        let edits = std::mem::take(&mut self.diagnostic_edits);
-        self.editor.update(cx, |editor, cx| {
-            let snapshot = editor.buffer().read(cx).snapshot(cx);
-            let mut placed: Vec<(std::ops::Range<MultiBufferOffset>, String)> = edits
-                .iter()
-                .map(|(range, text)| {
-                    let start = range.start.to_offset(&snapshot);
-                    let end = range.end.to_offset(&snapshot).max(start);
-                    (start..end, text.clone())
-                })
-                .collect();
-            placed.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
-            editor.edit(placed, cx)
-        });
+        let holds = self.server_fix_place(cx).is_some();
+        if holds != self.server_fix_holds {
+            self.server_fix_holds = holds;
+            self.redraw_results(cx);
+        }
+    }
+
+    /// Applies the server's suggested edits, where their anchors are now, while their places
+    /// hold the text they were made for.
+    fn apply_server_fix(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mut placed) = self.server_fix_place(cx) else {
+            return;
+        };
+        self.diagnostic_edits.clear();
+        self.server_fix_holds = false;
+        placed.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+        self.editor.update(cx, |editor, cx| editor.edit(placed, cx));
         window.focus(&self.editor_focus, cx);
         self.redraw_results(cx);
         cx.notify();
@@ -2621,6 +2723,7 @@ impl QueryEditor {
                     next,
                     rerun,
                     newer: false,
+                    head_seen: None,
                 }))
             }
             Answer::Refused(error) => {
@@ -2633,32 +2736,48 @@ impl QueryEditor {
     /// The rows just shown against the head of their branch: a head the session learned while
     /// the read was out, other than the commit the answer was read at, is a newer one.
     fn rows_against_head(&mut self, head_before: Option<String>, cx: &mut Context<Self>) {
-        let session_branch = self.session.read(cx).branch.clone();
+        let session = self.session.read(cx);
+        let Output::Rows(rows) = &mut self.output else {
+            return;
+        };
+        let ReadAt::Branch(branch) = &rows.read_at else {
+            return;
+        };
+        let now = session.head(branch).map(str::to_owned);
+        rows.head_seen = now.clone();
+        if let (Some(now), Some(commit)) = (now, rows.commit.clone())
+            && Some(&now) != head_before.as_ref()
+            && now != commit
+        {
+            let branch = branch.clone();
+            self.head_moved(&branch, &now, cx);
+        }
+    }
+
+    /// The rows against the head the session knows for their branch now, when the session
+    /// moves to a branch: a head that is neither the commit they were read at nor the one the
+    /// session knew when they were shown is newer. One the session learns later comes as
+    /// [`SessionEvent::HeadMoved`].
+    fn compare_rows_with_head(&mut self, cx: &mut Context<Self>) {
         let Output::Rows(rows) = &self.output else {
             return;
         };
         let (ReadAt::Branch(branch), Some(commit)) = (&rows.read_at, &rows.commit) else {
             return;
         };
-        let now = self.session.read(cx).head(branch).map(str::to_owned);
-        if *branch == session_branch
-            && let Some(now) = now
-            && Some(&now) != head_before.as_ref()
-        {
-            let (branch, commit) = (branch.clone(), commit.clone());
-            if now != commit {
-                self.head_moved(&branch, &now, cx);
-            }
+        let Some(head) = self.session.read(cx).head(branch).map(str::to_owned) else {
+            return;
+        };
+        if head != *commit && Some(&head) != rows.head_seen.as_ref() {
+            let branch = branch.clone();
+            self.head_moved(&branch, &head, cx);
         }
     }
 
-    /// `branch`'s head is now `head`: rows read at the branch at another commit offer Refresh
-    /// (constitution II). Nothing is read again until the person asks, and a write's outcome
-    /// is never run again.
+    /// `branch`'s head is now `head`: rows read at the branch at another commit have a newer
+    /// one, which the tab offers to read while the branch is the session's (constitution II).
+    /// Nothing is read again until the person asks, and a write's outcome is never run again.
     fn head_moved(&mut self, branch: &str, head: &str, cx: &mut Context<Self>) {
-        if *branch != self.session.read(cx).branch {
-            return;
-        }
         let Output::Rows(rows) = &mut self.output else {
             return;
         };
@@ -2684,8 +2803,13 @@ impl QueryEditor {
         if self.writing {
             return;
         }
+        // Sent to the session's branch, as Run is: rows of another branch are read again
+        // there, once the session is back on it.
+        let branch = self.session.read(cx).branch.clone();
         let Some(rerun) = (match &self.output {
-            Output::Rows(rows) => rows.rerun.clone(),
+            Output::Rows(rows) if matches!(&rows.read_at, ReadAt::Branch(read) if *read == branch) => {
+                rows.rerun.clone()
+            }
             _ => None,
         }) else {
             return;
@@ -3717,6 +3841,43 @@ impl QueryEditor {
         )
     }
 
+    /// The bar that says the tab's file is gone, so the text it holds is on no disk: Save As
+    /// keeps it elsewhere, and Save writes it back where it was.
+    fn render_file_gone(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use studio_ui::ds::{self, size, space};
+        if !self.file_gone {
+            return None;
+        }
+        let name = self.path.as_deref().map(file_name).unwrap_or_default();
+        let focus = self.editor_focus.clone();
+        Some(
+            h_flex()
+                .flex_none()
+                .min_h(px(size::STRIP))
+                .px(px(space::EDGE))
+                .gap(px(space::INLINE))
+                .items_center()
+                .bg(ds::surface::warning(cx))
+                .border_b_1()
+                .border_color(ds::surface::warning_border(cx))
+                .child(studio_ui::ds::icon::lead(IconName::Warning).color(Color::Warning))
+                .child(div().flex_1().min_w_0().child(ds::text::body(format!(
+                    "{name} is not on disk any more: it was moved or deleted. This is the text \
+                     the tab last held; Save As keeps it, and Save writes it back where it was."
+                ))))
+                .child(
+                    ds::button("file-gone-save-as", "Save As…")
+                        .style(ButtonStyle::Filled)
+                        .disabled(self.saving)
+                        .key_binding(KeyBinding::for_action_in(&SaveAs, &focus, cx))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.save_as(&SaveAs, window, cx)),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_results(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match &self.output {
             Output::Empty => self.render_expected(cx),
@@ -4319,7 +4480,7 @@ impl QueryEditor {
             .as_ref()
             .filter(|_| self.stored.is_none())
             .and_then(|d| Some((d.suggestion.clone()?, d.review)));
-        let can_apply = !self.diagnostic_edits.is_empty();
+        let (can_apply, applied) = (self.server_fix_holds, self.diagnostic_edits.is_empty());
         v_flex()
             .flex_1()
             .min_h_0()
@@ -4382,7 +4543,13 @@ impl QueryEditor {
                                             .style(ButtonStyle::Tinted(ui::TintColor::Accent))
                                             .disabled(!can_apply)
                                             .tooltip(Tooltip::text(match (can_apply, review) {
-                                                (false, _) => "Applied; run the query again",
+                                                (false, _) if applied => {
+                                                    "Applied; run the query again"
+                                                }
+                                                (false, _) => {
+                                                    "The query changed where this edit goes; run \
+                                                     it again for the server's suggestion now"
+                                                }
                                                 (true, true) => {
                                                     "Apply the server's suggested edit; it asks \
                                                      for a look before you run again"
@@ -4409,7 +4576,10 @@ impl Render for QueryEditor {
             crate::syntax::language(crate::syntax::Syntax::Gq, cx);
         }
         let toolbar = self.render_toolbar(cx).into_any_element();
-        let disk_change = self.render_disk_change(cx);
+        // At most one: a file that changed on disk is one that can be read.
+        let disk_change = self
+            .render_disk_change(cx)
+            .or_else(|| self.render_file_gone(cx));
         // Cached, as the results are: a key in the query draws the tab again, and the list
         // only when its problems change. A cached view is laid out at its style's size.
         let problems = self.problems_height().map(|height| {
@@ -5773,6 +5943,7 @@ mod tests {
             let draft = |text: &str, over: Option<&str>| Draft {
                 text: text.into(),
                 based_on: over.map(content_hash),
+                saved: false,
             };
             let reopen = |editor: &mut QueryEditor, draft: Option<Draft>| {
                 editor.loading = Some(Loading { draft });
@@ -5791,8 +5962,10 @@ mod tests {
             editor.update_in(cx, |editor, window, cx| {
                 assert!(!editor.is_dirty(cx));
                 let saved = editor.serialize(cx).unwrap();
-                assert!(saved.data.get("text").is_none(), "comes back as its file");
                 assert_eq!(saved.data["path"], json!(path.to_string_lossy()));
+                // Its text is kept as the file's, for a restart that finds the file gone.
+                assert_eq!(saved.data["saved"], json!(true));
+                assert_eq!(saved.data["text"], json!(a));
 
                 // A draft over the text the file still holds is kept, and remembered with it.
                 reopen(editor, Some(draft(b, Some(a))));
@@ -5858,11 +6031,13 @@ mod tests {
                 editor.take_disk_text(window, cx);
                 assert_eq!(editor.editor.read(cx).text(cx), b, "the file's text taken");
 
-                // A file that cannot be read keeps the draft; without one, there is no tab.
+                // A file that cannot be read keeps the draft; with nothing remembered, there is
+                // no tab.
                 reopen(editor, Some(draft(a, Some(b))));
                 assert!(editor.file_read(None, window, cx));
                 assert_eq!(editor.editor.read(cx).text(cx), a);
-                assert!(editor.file_error.is_some());
+                assert!(editor.file_gone);
+                editor.file_gone = false;
                 reopen(editor, None);
                 assert!(!editor.file_read(None, window, cx));
             });
@@ -6242,6 +6417,209 @@ mod tests {
                     "// people\nquery people() { match { $p: Person } return { $p.name } }"
                 );
                 assert!(editor.diagnostic_edits.is_empty(), "applied once");
+            });
+        }
+
+        /// Runs the tab's query and has the server refuse it with a diagnostic whose
+        /// suggestion inserts `()` at `at` of the text sent, as a missing parameter list's does.
+        fn refused_with_an_insertion(
+            editor: &mut QueryEditor,
+            at: usize,
+            cx: &mut Context<QueryEditor>,
+        ) {
+            let prepared = editor.prepare(false, cx).unwrap();
+            let refused = ReadError::Refused(graph_client::ApiErrorSummary {
+                status: 400,
+                message: "parse error".into(),
+                code: Some(ErrorCode::BadRequest),
+                diagnostic: Some(json!({
+                    "code": "Q002", "position": {"line": 1, "column": 13, "byte": at},
+                    "expected": "a parameter list",
+                    "suggestion": {"applicability": "machine_applicable",
+                                   "edits": [{"start": at, "end": at, "replacement": "()"}]},
+                })),
+                change_diff_refusal: None,
+            });
+            let sent = prepared.sent.clone();
+            let read_at = ReadAt::Branch("main".into());
+            editor.finish_read(prepared, read_at, Err(refused), Duration::ZERO, None);
+            editor.hold_diagnostic(sent.as_ref(), cx);
+        }
+
+        /// The server's suggested edit applies only while the text around its place reads as
+        /// it was run: `()` typed where it would insert `()`, or the whole text replaced (a
+        /// clean tab taking its file's text), takes Apply back, and Apply then changes nothing.
+        #[gpui::test]
+        async fn a_suggested_edit_is_not_applied_over_text_changed_where_it_goes(
+            cx: &mut TestAppContext,
+        ) {
+            init(cx);
+            let session = session(cx);
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(1, session, window, cx));
+            let text = "query people { match { $p: Person } return { $p.name } }";
+            let at = text.find(" {").unwrap();
+            let fixed = "query people() { match { $p: Person } return { $p.name } }";
+            editor.update_in(cx, |editor, window, cx| {
+                editor.set_text(text, window, cx);
+                editor.cursor = 0;
+                refused_with_an_insertion(editor, at, cx);
+                assert!(editor.server_fix_holds, "offered as run");
+                editor.editor.update(cx, |editor, cx| {
+                    editor.edit([(MultiBufferOffset(at)..MultiBufferOffset(at), "()")], cx)
+                });
+            });
+            cx.run_until_parked();
+            editor.update_in(cx, |editor, window, cx| {
+                assert!(!editor.server_fix_holds, "`()` was typed where it goes");
+                editor.apply_server_fix(window, cx);
+                assert_eq!(editor.editor.read(cx).text(cx), fixed, "not `people()()`");
+
+                editor.set_text(text, window, cx);
+                refused_with_an_insertion(editor, at, cx);
+                assert!(editor.server_fix_holds);
+                // The file's newer text replaces the tab's whole.
+                editor.set_text(&format!("// from disk\n{text}"), window, cx);
+            });
+            cx.run_until_parked();
+            editor.update_in(cx, |editor, window, cx| {
+                assert!(!editor.server_fix_holds, "the text it was made for is gone");
+                editor.apply_server_fix(window, cx);
+                assert_eq!(
+                    editor.editor.read(cx).text(cx),
+                    format!("// from disk\n{text}")
+                );
+            });
+        }
+
+        /// Rows older than their branch's head stay so while the session is on another
+        /// branch, where they offer no Refresh and read nothing, and offer it again back on
+        /// their own; a move of their branch while the session is away is kept too.
+        #[gpui::test]
+        async fn rows_stay_newer_across_a_branch_switch(cx: &mut TestAppContext) {
+            init(cx);
+            let rows = json!({
+                "query_name": "people", "target": {"branch": "main"}, "row_count": 1,
+                "columns": ["p.name"], "rows": [{"p.name": "Ada"}],
+                "graph_commit_id": "01JHEADAAAAA",
+            });
+            let (session, asked) = served(
+                cx,
+                vec![
+                    ("/query", rows.to_string()),
+                    (
+                        "/branches",
+                        json!({"branches": ["main", "dev"]}).to_string(),
+                    ),
+                ],
+            );
+            cx.run_until_parked();
+            let reads = || {
+                asked
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|line| line.ends_with("/query"))
+                    .count()
+            };
+            let moved = |head: &str| SessionEvent::HeadMoved {
+                branch: "main".into(),
+                head: head.into(),
+            };
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(1, session.clone(), window, cx));
+            editor.update_in(cx, |editor, window, cx| {
+                editor.set_text(
+                    "query people() { match { $p: Person } return { $p.name } }",
+                    window,
+                    cx,
+                );
+                editor.cursor = 0;
+                editor.run(&Run, window, cx);
+            });
+            cx.run_until_parked();
+            let stale = |cx: &mut gpui::VisualTestContext| {
+                editor.read_with(cx, |editor, cx| editor.is_stale(cx))
+            };
+            session.update(cx, |_, cx| cx.emit(moved("01JNEXTAAAAA")));
+            cx.run_until_parked();
+            assert!(stale(cx), "main moved past the rows");
+            let switch = |branch: &str, cx: &mut gpui::VisualTestContext| {
+                session.update(cx, |session, cx| session.set_branch(branch.into(), cx));
+                cx.run_until_parked();
+            };
+            switch("dev", cx);
+            assert!(!stale(cx), "no Refresh for main's rows on dev");
+            let before = reads();
+            editor.update(cx, |editor, cx| editor.refresh_rows(cx));
+            cx.run_until_parked();
+            assert_eq!(reads(), before, "dev's head is not where they came from");
+            switch("main", cx);
+            assert!(
+                stale(cx),
+                "back on main, the rows are still older than its head"
+            );
+
+            // Read again; then main moves while the session is on dev.
+            editor.update(cx, |editor, cx| editor.refresh_rows(cx));
+            cx.run_until_parked();
+            assert!(!stale(cx));
+            switch("dev", cx);
+            session.update(cx, |_, cx| cx.emit(moved("01JLASTAAAAA")));
+            cx.run_until_parked();
+            assert!(!stale(cx));
+            switch("main", cx);
+            assert!(stale(cx), "the move while away is kept");
+        }
+
+        /// A saved file tab remembers its text for the restart that finds its file gone
+        /// (deleted, or gone with a `git switch`): the tab stays, with the text and a bar that
+        /// says the file is gone and offers Save As, and Save writes it back. One whose file
+        /// reads shows the file, whatever it remembered; a text past the bound is not kept.
+        #[gpui::test]
+        async fn a_saved_tabs_text_outlives_its_file(cx: &mut TestAppContext) {
+            init(cx);
+            let session = session(cx);
+            let path = scratch("gone").join("kept.gq");
+            let remembered = |text: &str| Draft {
+                text: text.into(),
+                based_on: Some(content_hash(text)),
+                saved: true,
+            };
+            let opened = path.clone();
+            let draft = remembered("query kept() {}");
+            let (editor, cx) = cx.add_window_view(move |window, cx| {
+                QueryEditor::reading(1, session, opened, Some(draft), window, cx)
+            });
+            editor.update_in(cx, |editor, window, cx| {
+                assert!(editor.file_read(None, window, cx), "the tab stays");
+                assert_eq!(editor.editor.read(cx).text(cx), "query kept() {}");
+                assert!(editor.file_gone && editor.render_file_gone(cx).is_some());
+                assert!(editor.is_dirty(cx), "on no disk: closing asks");
+                assert_eq!(
+                    editor.serialize(cx).unwrap().data["text"],
+                    json!("query kept() {}")
+                );
+                editor.save_now(window, cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "query kept() {}");
+            editor.update_in(cx, |editor, window, cx| {
+                assert!(!editor.file_gone && !editor.is_dirty(cx));
+
+                // The file reads: it is shown, not what was remembered of it.
+                editor.loading = Some(Loading {
+                    draft: Some(remembered("query old() {}")),
+                });
+                assert!(editor.file_read(Some("query new() {}".into()), window, cx));
+                assert_eq!(editor.editor.read(cx).text(cx), "query new() {}");
+                assert!(!editor.is_dirty(cx) && editor.disk_change.is_none());
+
+                let long = format!("// {}", "x".repeat(REMEMBERED_SAVED_TEXT));
+                editor.set_text(&long, window, cx);
+                editor.saved_text = Some(long);
+                editor.unsaved = false;
+                assert!(editor.serialize(cx).unwrap().data.get("text").is_none());
             });
         }
     }

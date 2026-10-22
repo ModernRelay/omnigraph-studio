@@ -54,14 +54,18 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   (`list_company.gq`, then `-2`, …). ⌘⇧S picks any path in the system dialog; ⌘O opens a file
   (or `studio_graph::OpenQueryFile { path }`). A file tab is titled by the file, keyed by its
   path so it opens once, and shows the changed dot while its text differs from the file; its
-  path comes back after a restart, and its draft only while it is unsaved, with a hash of the
-  file's text it was typed over (since 2026-10-21). The file is read off the main thread, the
-  tab saying "Reading people.gq…" until its text is in: a saved tab shows the file as it is
-  then; a draft over the text the file still holds is kept; a draft over a file changed since
-  is kept too, under a bar that says the file changed on disk, and ⌘S writes nothing over it:
-  it moves to the bar, where ↵ saves over the file and "Use the file's text" takes it (⌘Z
-  brings the draft back). ⌘S also finds a file that changed while its tab was open, and a tab
-  with nothing unsaved takes the file's text when its editor takes the keyboard again. The left dock's Queries panel lists the folder,
+  path comes back after a restart with its text and a hash of the file's text it was typed
+  over, the text marked as the file's while the tab is saved (since 2026-10-21; a saved text
+  over 256 KB is not kept). The file is read off the main thread, the tab saying "Reading
+  people.gq…" until its text is in: a saved tab shows the file as it is then; a draft over the
+  text the file still holds is kept; a draft over a file changed since is kept too, under a bar
+  that says the file changed on disk, and ⌘S writes nothing over it: it moves to the bar, where
+  ↵ saves over the file and "Use the file's text" takes it (⌘Z brings the draft back). A file
+  that cannot be read (deleted, or gone with a `git switch`) leaves the tab open with the text
+  it remembered, saved or not, under a bar that says the file is gone and offers Save As (⌘⇧S);
+  ⌘S writes it back where it was. ⌘S also finds a file that changed while its tab was open,
+  and a tab with nothing unsaved takes the file's text when its editor takes the keyboard
+  again. The left dock's Queries panel lists the folder,
   newest first; New query, Open a file… and Show the folder are icon buttons in its title
   line. Its rows take the keyboard as Studio's other lists do: shown from its button or key,
   the panel has it; ↑ and ↓ move among the rows that open a query (saved files, stored queries,
@@ -170,7 +174,9 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   session branch's head offer "Newer data · Refresh" in the toolbar, and the tab its stale
   dot, once the branch's head moves past the commit they were read at (constitution II, since
   2026-10-21); Refresh or ⌘R reads the same read again, and nothing is read by itself. A
-  write's outcome is never run again.
+  write's outcome is never run again. On another branch they offer nothing; back on theirs
+  they offer it again, compared with the head the session knows for it then, and a move of
+  their branch while away counts.
 - A mutation never runs on ⌘↵: a bar names the branch ("Run on main", ↵) and Esc cancels. One
   that moves no branch says so (since 2026-10-21): a declaration `as commit` is held as a
   commit to publish or drop later ("Hold for main"), one `as unattached branch` writes a
@@ -248,8 +254,9 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | A suggestion's Apply needs the text it was made for; newer rows stay newer across a branch switch; a saved tab's text outlives its file | Regression review of `e54cdab`; `query_editor` `a_suggested_edit_is_not_applied_over_text_changed_where_it_goes` (`()` typed where it inserts `()`, and the whole text replaced by the file's, take Apply back), `rows_stay_newer_across_a_branch_switch` (flagged on main, away on dev with no Refresh and no read, flagged again back on main; a move while on dev kept), `a_saved_tabs_text_outlives_its_file` (a saved tab whose file is gone stays with its text, the bar and Save As, and ⌘S writes it back; one whose file reads shows the file; a text over 256 KB is not kept). All three fail with the old behaviour put back | Each held edit is checked against its place with 16 bytes either side, anchored in the text as run: an insertion's place alone holds no text, so text typed there, or the whole text replaced, left it "holding". `BranchChanged` compares the rows with the head instead of clearing their flag, and Refresh reads only on the rows' own branch. Before, `e54cdab` remembered a saved tab without its text and closed it with "could not be read" when its file was gone |
 | 2026-10-21 | Nothing is completed in a comment or a string, or after a dot no `$var` precedes | `gq_language` `nothing_is_offered_in_a_comment_or_a_string`, `a_dot_offers_only_a_variables_fields`, `comments_and_strings_hold_what_is_typed_in_them` (`lex::in_comment_or_string`) | `// see the docs.`, `// group by company`, an open `/*`, an open string and an `@description` string offer nothing; past a closed comment or string `Pe` offers `Person` again; `limit 1.` and `Person.` offer nothing, `$p.` the properties. Before, `.` offered every type and ↵ inserted the first. Not yet seen in the running app |
-| 2026-10-21 | A restored file tab meets its file as it is now | `query_editor` `a_remembered_draft_meets_its_file_as_it_is_now` (a saved tab is remembered without its text and shows the file; a draft over the unchanged file is kept with `based_on`; a draft over a changed file is kept, the bar shows, ⌘S leaves the file as it was and moves to the bar, Save over it writes the draft; no hash and other text shows the bar; an unreadable file keeps the draft; no draft and no file opens nothing), `an_open_file_changed_elsewhere_is_not_written_over` (a clean tab takes the file's text on focus; ⌘S over a file changed since writes nothing and asks) | Before, every file tab saved its text and restore preferred it to the file, so ⌘S wrote an older draft over a newer file. Hash: FNV-1a 64 with the length (`view::content_hash`), stable across builds. Not yet seen in the running app |
+| 2026-10-21 | A restored file tab meets its file as it is now | `query_editor` `a_remembered_draft_meets_its_file_as_it_is_now` (a saved tab is remembered with its text marked as the file's and shows the file; a draft over the unchanged file is kept with `based_on`; a draft over a changed file is kept, the bar shows, ⌘S leaves the file as it was and moves to the bar, Save over it writes the draft; no hash and other text shows the bar; an unreadable file keeps the draft under the file-gone bar; nothing remembered and no file opens nothing), `an_open_file_changed_elsewhere_is_not_written_over` (a clean tab takes the file's text on focus; ⌘S over a file changed since writes nothing and asks) | Before, every file tab saved its text and restore preferred it to the file, so ⌘S wrote an older draft over a newer file. Hash: FNV-1a 64 with the length (`view::content_hash`), stable across builds. Not yet seen in the running app |
 | 2026-10-21 | Run above a declaration runs it after an unclosed one | `gq_language` `a_declaration_starts_where_an_unclosed_one_before_it_ends` (fails with the inclusive end put back: `declaration_at(b.start)` was `a`); `query_editor` `the_run_line_runs_the_declaration_below_it` | `Outline::declaration_at` takes the half-open range; the Run line above `b` reads "Running b on main…" |
 | 2026-10-21 | Declarations sharing a name are told apart by place | `gq_language` `a_second_declaration_of_a_name_is_a_problem` (the compiler accepts the copy); `query_editor` `declarations_that_share_a_name_are_told_apart_by_place`, `a_write_named_like_a_read_asks_before_it_writes` | A read copied and changed to `delete`, its name kept, is checked as a write and waits for "Person" typed; nothing goes to `/query`; its type error is underlined in it, not its namesake; the copy's name is a `duplicate` problem at 2:7. Before, the delete took the read's check and was sent to `/query` |
 | 2026-10-21 | A stored query's values waiting for the catalog are saved | `query_editor` `values_waiting_for_the_catalog_are_saved_with_the_tab` | Values filled before the catalog is read are in the saved `values`; once an input is made, what it holds replaces them. Before, they were saved as `{}` |
@@ -301,6 +308,10 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 
 ## Corrections
 
+- 2026-10-21 · Fixes to the fixes of the same day: a server suggestion's Apply did not check
+  the text where it went, so `()` typed there became `()()`; switching branches cleared the
+  rows' "Newer data" for good; and a saved file tab was remembered without its text, so a
+  deleted file closed it and lost the text.
 - 2026-10-21 · Completion ran inside comments and strings, and after any `.` offered every
   type, so ↵ at the end of `// see the docs.` inserted one.
 - 2026-10-21 · A file tab always saved its text, and a restored one showed it over the file,

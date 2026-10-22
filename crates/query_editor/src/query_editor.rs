@@ -40,8 +40,8 @@ pub(crate) fn saved_queries_changed(cx: &mut App) {
 
 /// Opens `path` in a query tab, or shows the tab already editing it as it is. A new tab opens
 /// at once, in its place among the others, and reads the file off the main thread, saying it
-/// is reading until the text is in. `draft` is a remembered tab's unsaved text and what it
-/// was typed over (`QueryEditor::file_read` decides between it and the file); without one, a
+/// is reading until the text is in. `draft` is a remembered tab's text and what it was typed
+/// over (`QueryEditor::file_read` decides between it and the file); with nothing remembered, a
 /// file that cannot be read closes the tab and says so.
 fn open_file(
     workspace: &mut Workspace,
@@ -200,8 +200,9 @@ pub fn init(cx: &mut App) {
             .map(str::to_owned);
         let widths = saved_widths(data);
         if let Some(path) = data.get("path").and_then(|path| path.as_str()) {
-            // A file tab keeps its text only while it is unsaved, with the hash of the file it
-            // was typed over; a build that kept no hash kept its text always, and whether its
+            // A file tab keeps its text with the hash of the file's text it was typed over,
+            // and says whether it was the file's (`saved`): that is shown only when the file
+            // cannot be read. A build that kept no hash kept its text always, and whether its
             // file changed since is not known.
             let draft = text.map(|text| view::Draft {
                 text,
@@ -209,6 +210,7 @@ pub fn init(cx: &mut App) {
                     .get("based_on")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
+                saved: data.get("saved").and_then(Value::as_bool).unwrap_or(false),
             });
             if let Some(editor) = open_file(workspace, PathBuf::from(path), draft, window, cx) {
                 editor.update(cx, |editor, cx| {
