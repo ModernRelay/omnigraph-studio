@@ -52,6 +52,14 @@ struct Entry {
 pub(crate) struct ReadToken(#[allow(dead_code)] Rc<()>);
 
 impl Entry {
+    /// Whether the view shows anything of this dependence: an answer came in (or failed), a
+    /// caller gave one, or a read is still out, whose answer may come. Reads all stopped before
+    /// any answered (a read ahead for a row the pointer left) show nothing, so they make no
+    /// change count, and the feed is not asked about their types.
+    fn shows(&self) -> bool {
+        self.known || self.unlisted || self.out.iter().any(|read| read.strong_count() > 0)
+    }
+
     /// The nodes listed, when they are all known.
     fn listed(&self) -> Option<&[String]> {
         let settled = self.out.iter().all(|read| read.strong_count() == 0);
@@ -200,6 +208,7 @@ impl Scope {
     pub(crate) fn names(&self) -> impl Iterator<Item = String> + '_ {
         self.entries
             .iter()
+            .filter(|entry| entry.shows())
             .flat_map(|entry| depends_types(&entry.depends))
             .map(|ty| ty.name().to_owned())
     }
@@ -208,6 +217,7 @@ impl Scope {
     pub(crate) fn unchanged(&self, since: &ChangesSince) -> bool {
         self.entries
             .iter()
+            .filter(|entry| entry.shows())
             .all(|entry| depends_unchanged(since, &entry.depends, entry.listed()))
     }
 }
@@ -342,6 +352,27 @@ mod tests {
         );
         drop(dropped);
         assert!(scope.unchanged(&p9()));
+        assert!(!scope.unchanged(&since(json!([node("Person", "p2")]), &asked)));
+    }
+
+    /// A list whose every read stopped before it answered (read ahead for a row the pointer
+    /// left) shows nothing: no change counts for it, not its listed type's, not its edges', and
+    /// the feed is not asked about them. Asked again, it counts from then.
+    #[test]
+    fn a_list_stopped_before_it_answered_shows_nothing() {
+        let (mut scope, _handle) = Scope::new(1, "main".into());
+        let asked = ["Person", "Knows"];
+        let (_, stopped) = scope.add(neighbours_of("p1"));
+        drop(stopped);
+        assert!(scope.unchanged(&since(json!([node("Person", "p9")]), &asked)));
+        assert!(scope.unchanged(&since(json!([edge("Knows", "e9", "p3", "p1")]), &asked)));
+        assert_eq!(scope.names().count(), 0);
+
+        let (read, token) = scope.add(neighbours_of("p1"));
+        assert!(!scope.unchanged(&since(json!([node("Person", "p9")]), &asked)));
+        scope.answered(read, &json!([{ "id": "p2" }]));
+        drop(token);
+        assert!(scope.unchanged(&since(json!([node("Person", "p9")]), &asked)));
         assert!(!scope.unchanged(&since(json!([node("Person", "p2")]), &asked)));
     }
 

@@ -16,6 +16,10 @@ use crate::session::GraphSession;
 /// The rows a read other than the head probe answers with, from its request body.
 pub type Rows = Box<dyn Fn(&Value) -> Value + Send>;
 
+/// Which reads, by their request body, are never answered, as a slow server's are not
+/// before their view stops waiting.
+pub type Hold = Box<dyn Fn(&Value) -> bool + Send>;
+
 pub struct Served {
     pub head: String,
     pub schema: String,
@@ -30,6 +34,8 @@ pub struct Served {
     /// The branch list, and what every other route but a branch delete answers: `main` alone
     /// at first.
     pub branches: Vec<String>,
+    /// Reads never answered: none at first.
+    pub hold: Hold,
     rows: Rows,
 }
 
@@ -126,6 +132,7 @@ pub fn followed_session(
         commits: Vec::new(),
         feeds: Vec::new(),
         branches: vec!["main".into()],
+        hold: Box::new(|_| false),
         rows: Box::new(rows),
     }));
     let state = served.clone();
@@ -137,6 +144,13 @@ pub fn followed_session(
         async move {
             let mut bytes = Vec::new();
             request.into_body().read_to_end(&mut bytes).await.ok();
+            if path.ends_with("/query") {
+                let asked: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                let held = (state.lock().unwrap().hold)(&asked);
+                if held {
+                    futures::future::pending::<()>().await;
+                }
+            }
             let mut served = state.lock().unwrap();
             if path.ends_with("/schema") {
                 served.schema_reads += 1;

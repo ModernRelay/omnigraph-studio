@@ -725,6 +725,9 @@ pub struct GraphSession {
     opened: bool,
     /// The wait after a 503 ended while the graph was parked: it is asked again when shown.
     recheck_owed: bool,
+    /// The settings named a type's nodes otherwise while the graph was parked: views hear it
+    /// ([`SessionEvent::SchemaChanged`]) when it is shown again.
+    names_owed: bool,
     /// Numbers the branch-list reads as they are sent, and the newest whose list was taken: a
     /// list asked for before one already taken answers for an older moment, and is not taken.
     branch_lists_sent: u64,
@@ -832,6 +835,7 @@ impl GraphSession {
             shown: false,
             opened: false,
             recheck_owed: false,
+            names_owed: false,
             branch_lists_sent: 0,
             branch_list_taken: 0,
             credential_owed: false,
@@ -1312,14 +1316,25 @@ impl GraphSession {
     /// again at once ([`SessionEvent::SchemaChanged`]), so a node has one name everywhere.
     fn labels_changed(&mut self, cx: &mut Context<Self>) {
         let labels = self.chosen_labels(cx);
+        self.take_labels(labels, cx);
+    }
+
+    /// Names each type's nodes by `labels`. Views hear it at once, and read what they show
+    /// again under the new names; a parked graph's views hear it when it is shown again, since
+    /// a parked graph asks the server nothing.
+    pub(crate) fn take_labels(&mut self, labels: BTreeMap<String, String>, cx: &mut Context<Self>) {
         if labels == self.labels {
             return;
         }
         self.labels = labels;
         if let Loadable::Loaded(model) = &self.schema {
             self.schema = Loadable::Loaded(self.named(model.clone()));
-            cx.emit(SessionEvent::SchemaChanged);
-            cx.notify();
+            if self.shown {
+                cx.emit(SessionEvent::SchemaChanged);
+                cx.notify();
+            } else {
+                self.names_owed = true;
+            }
         }
     }
 
@@ -1913,15 +1928,34 @@ impl GraphSession {
         snapshot: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<(u64, Option<String>), String>> {
-        // A count lists no nodes: nothing it says waits for its answer.
-        if let Some(scope) = self.scopes.get_mut(&scope.id) {
-            let _ = scope.add(Depends::EdgesAt {
+        let scope_id = scope.id;
+        let entry = self.scopes.get_mut(&scope_id).map(|scope| {
+            scope.add(Depends::EdgesAt {
                 edge: group.edge.clone(),
                 nodes: vec![id.to_owned()],
                 listed: None,
-            });
-        }
-        self.degree_at(type_name, group, id, snapshot, cx)
+            })
+        });
+        let count = self.degree_at(type_name, group, id, snapshot, cx);
+        let Some((entry, token)) = entry else {
+            return count;
+        };
+        // Out while the view waits, and shown once in: a count its view stopped waiting for
+        // (a read ahead for a row the pointer left) shows nothing.
+        cx.spawn(async move |this, cx| {
+            let _token = token;
+            let result = count.await;
+            this.update(cx, |this, _| {
+                if let Some(scope) = this.scopes.get_mut(&scope_id) {
+                    match &result {
+                        Ok(_) => scope.answered(entry, &Value::Null),
+                        Err(_) => scope.failed(entry),
+                    }
+                }
+            })
+            .ok();
+            result
+        })
     }
 
     /// [`GraphSession::blob_meta`] for what a view shows: the cell depends on its node or edge.
@@ -1932,8 +1966,9 @@ impl GraphSession {
         snapshot: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<BlobMeta, ReadError>> {
+        // A cell lists no nodes: it counts from the moment it is asked, answered or not.
         if let Some(scope) = self.scopes.get_mut(&scope.id) {
-            let _ = scope.add(if cell.edge {
+            let depends = if cell.edge {
                 Depends::Types {
                     nodes: Vec::new(),
                     edges: vec![cell.type_name.clone()],
@@ -1943,7 +1978,8 @@ impl GraphSession {
                     type_name: cell.type_name.clone(),
                     id: cell.id.clone(),
                 }
-            });
+            };
+            scope.add_known(depends, Some(Vec::new()));
         }
         self.blob_meta(cell, snapshot, cx)
     }
@@ -2171,12 +2207,18 @@ impl GraphSession {
             self.credential_owed = false;
             self.access_owed = false;
             self.recheck_owed = false;
+            self.names_owed = false;
             self.head_check_missed = false;
             self.credential = self.client(cx).credential_changes();
             self.reload(cx);
             let branch = AccessScope::branch(&self.branch);
             self.read_access(branch, cx);
             return;
+        }
+        // Its nodes named otherwise while parked: views read under the new names now.
+        if std::mem::take(&mut self.names_owed) {
+            cx.emit(SessionEvent::SchemaChanged);
+            cx.notify();
         }
         // A new token, or a 403 on the graph, while parked: what the graph shows, and what the
         // credential may do, are read now.

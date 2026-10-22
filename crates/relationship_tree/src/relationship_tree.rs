@@ -126,6 +126,19 @@ impl StickyCandidate for StickyRow {
     }
 }
 
+/// A row's element key: a hash of what the row is (its path and kind, and for a loading or
+/// error row what it reads, since a group's count and its page can both fail), the same
+/// across rebuilds wherever the row moves in the list.
+fn row_key(entry: &Entry) -> usize {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    rows::row_id(entry).hash(&mut hasher);
+    if let EntryKind::Loading { target } | EntryKind::Error { target, .. } = &entry.kind {
+        target.hash(&mut hasher);
+    }
+    hasher.finish() as usize
+}
+
 /// Whether a row opens, and whether it is open: a node that has relationships, a group or a
 /// value with neighbours.
 fn disclosure(entry: &Entry) -> (bool, bool) {
@@ -1012,8 +1025,14 @@ impl RelationshipTree {
             _ => None,
         };
 
+        // Keyed by what the row is, not where it is: GPUI keeps an element's hover by its id, so
+        // a row the pointer rests on while rows above it come or go stays the row its read
+        // ahead is for, and leaving it stops that read, not another row's.
         h_flex()
-            .id((if sticky { "sticky-row" } else { "tree-row" }, row))
+            .id((
+                if sticky { "sticky-row" } else { "tree-row" },
+                row_key(entry),
+            ))
             .when(!sticky, |d| {
                 d.debug_selector(move || format!("tree-row-{row}"))
             })
@@ -1603,6 +1622,40 @@ mod tests {
     use graph_store::test_server::followed_session;
 
     use super::*;
+
+    /// A row's element key follows what the row is, wherever it sits in the list, so its hover
+    /// (and so its read ahead) stays with it when rows above it come or go; a group's count
+    /// error and its page error, at one path, are told apart.
+    #[test]
+    fn a_rows_key_follows_the_row_not_its_place() {
+        use graph_store::{ExplorePath, GroupKey, LoadTarget, NodeRef};
+        let group = gq_language::RelationshipGroup {
+            edge: "Knows".into(),
+            direction: gq_language::Direction::Outgoing,
+            other_type: "Person".into(),
+        };
+        let key = GroupKey::new(NodeRef::new("Person", "ada"), group.clone());
+        let path = ExplorePath::root().child_group(&group);
+        let at = |depth, kind| Entry {
+            path: path.clone(),
+            depth,
+            parent: Some(depth),
+            kind,
+        };
+        let error = |target| EntryKind::Error {
+            target,
+            message: "refused".into(),
+        };
+        let count = error(LoadTarget::Count(key.clone()));
+        assert_eq!(
+            row_key(&at(1, count.clone())),
+            row_key(&at(4, count.clone()))
+        );
+        assert_ne!(
+            row_key(&at(1, count)),
+            row_key(&at(1, error(LoadTarget::Page(key))))
+        );
+    }
 
     /// What the dock's host gives a panel that scrolls itself: its size, here shorter than the
     /// window, as a bottom dock across the window or a tall breadcrumb leaves it.

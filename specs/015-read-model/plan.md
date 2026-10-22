@@ -259,7 +259,9 @@ A first cut of parts 1 and 4, ahead of the shared cache:
 - Each view holds a read scope (`graph_store::scope::ReadScope`) and reads what it shows through
   it (`read_in`, `degree_in`, `blob_meta_in`; `note_in` for what a caller read for it, as the
   table's row and relationships given to its peek). The scope keeps each answer's `Depends`
-  from the moment it is asked, and the nodes a list named once it is in. It is the one read
+  from the moment it is asked, and the nodes a list named once it is in; one whose every read
+  stopped before answering (its view stopped waiting, as for a read ahead the pointer left)
+  shows nothing and counts for nothing (since 2026-10-21). It is the one read
   set: the feed's type filter is the union of live scopes, and `scope_since(scope, from, to)`
   says whether a move changed anything the view shows (a list still being read counts its whole
   listed type). A page, a peek, a table and the tree and canvas move to the head when it says

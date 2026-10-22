@@ -1263,7 +1263,9 @@ pub struct Exploration {
     /// opened since.
     ahead: Option<(ExplorePath, Vec<LoadTarget>)>,
     /// How many counts, neighbour lists, values and labels the state may hold before those
-    /// nothing open can reach are let go ([`ExploreState::retain_reachable`]).
+    /// nothing open can reach are let go ([`ExploreState::retain_reachable`]): [`KEPT_READS`],
+    /// or twice what the last letting go kept, and [`KEPT_READS`] again whenever the walk
+    /// starts over (a new root, a re-root, going back, Refresh, a reading again).
     prune_at: usize,
     /// What the exploration has read at its pin: a head move that changed none of it moves the
     /// pin without reading again (spec 015).
@@ -1471,6 +1473,7 @@ impl Exploration {
     /// Makes the node at `path` the root, at the same commit.
     pub fn reroot(&mut self, path: &ExplorePath, cx: &mut Context<Self>) {
         if self.state.reroot(path) {
+            self.walk_starts_over();
             self.request_missing(cx);
             self.changed(cx);
             cx.emit(ExplorationEvent::SelectionChanged);
@@ -1504,6 +1507,7 @@ impl Exploration {
         state.grouping = grouping;
         state.searches = searches;
         *self.state = state;
+        self.walk_starts_over();
         self.request_missing(cx);
         self.changed(cx);
         cx.emit(ExplorationEvent::SelectionChanged);
@@ -1753,6 +1757,7 @@ impl Exploration {
         self.generation += 1;
         self.tasks.clear();
         self.ahead = None;
+        self.prune_at = KEPT_READS;
         self.state.clear_loaded();
         self.request_missing(cx);
         self.changed(cx);
@@ -1763,6 +1768,7 @@ impl Exploration {
         self.generation += 1;
         self.tasks.clear();
         self.ahead = None;
+        self.prune_at = KEPT_READS;
         self.carried.clear();
         self.pin = None;
         self.newer_available = false;
@@ -2141,6 +2147,14 @@ impl Exploration {
         }
         cx.emit(ExplorationEvent::Loaded);
         cx.notify();
+    }
+
+    /// The walk starts over from another root, keeping what was read: the bound is
+    /// [`KEPT_READS`] again, so what the old root's paths read and the new one's cannot reach
+    /// goes now rather than once the state has grown to the old walk's size twice over.
+    fn walk_starts_over(&mut self) {
+        self.prune_at = KEPT_READS;
+        self.bound_reads();
     }
 
     /// Keeps what the state holds bounded: past [`KEPT_READS`] counts, neighbour lists, values
@@ -3422,6 +3436,161 @@ mod tests {
         exploration.read_with(cx, |exploration, _| {
             assert!(ahead_of(exploration, "p2").is_empty());
             assert_eq!(ahead_of(exploration, "p4").len(), PREFETCH_LIMIT);
+        });
+    }
+
+    /// A relationship read ahead and left before its neighbours answered shows nothing: another
+    /// writer's change to a node of the type at its other end leaves the exploration as it is,
+    /// and its pin follows the head.
+    #[gpui::test]
+    async fn a_relationship_left_before_it_answered_changes_nothing_shown(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::test_server::{followed_session, node_change};
+        let (session, served) = followed_session(
+            SCHEMA,
+            |asked| match asked["name"].as_str() {
+                Some("studio_page_degrees") => json!([{ "id": "p1", "n": 3 }]),
+                _ => json!([{ "id": "p1", "label": "Ada" }]),
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        let exploration = cx.update(|cx| Exploration::for_session(&session, cx));
+        exploration.update(cx, |exploration, cx| exploration.root_at(person("p1"), cx));
+        cx.run_until_parked();
+        // Its neighbours never answer before the pointer moves on.
+        served.lock().unwrap().hold = Box::new(|asked| {
+            asked["name"] == "studio_neighbours"
+                && asked["query"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("orksAt"))
+        });
+        let schema = schema();
+        let works_at = group(&schema, "Person", "WorksAt", Direction::Outgoing);
+        let path = ExplorePath::root().child_group(&works_at);
+        exploration.update(cx, |exploration, cx| {
+            exploration.prefetch(&path, cx);
+            assert_eq!(exploration.tasks.len(), 1, "its first page");
+        });
+        cx.run_until_parked();
+        exploration.update(cx, |exploration, cx| exploration.end_prefetch(&path, cx));
+        cx.run_until_parked();
+
+        served
+            .lock()
+            .unwrap()
+            .commit("c2", vec![node_change("Company", "k9")]);
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        let (pin, newer) = exploration.read_with(cx, |exploration, _| {
+            (
+                exploration.pin().map(str::to_owned),
+                exploration.newer_available(),
+            )
+        });
+        assert_eq!((pin.as_deref(), newer), (Some("c2"), false));
+    }
+
+    /// Nodes named otherwise in the settings while the graph is parked: nothing is said and
+    /// nothing read until it is shown again, when the tree reads what it shows under the new
+    /// names.
+    #[gpui::test]
+    async fn a_parked_graph_reads_under_new_names_only_when_shown(cx: &mut gpui::TestAppContext) {
+        use crate::test_server::followed_session;
+        let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let log = asked.clone();
+        let (session, _served) = followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n  title: String\n}\n",
+            move |request| {
+                log.lock()
+                    .unwrap()
+                    .push(request["name"].as_str().unwrap_or_default().to_owned());
+                json!([{ "id": "p1", "label": "Ada", "n": 0 }])
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        let exploration = cx.update(|cx| Exploration::for_session(&session, cx));
+        exploration.update(cx, |exploration, cx| exploration.root_at(person("p1"), cx));
+        cx.run_until_parked();
+        let heard = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = heard.clone();
+        let _heard = cx.update(|cx| {
+            cx.subscribe(&session, move |_, event: &SessionEvent, _| {
+                if *event == SessionEvent::SchemaChanged {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            })
+        });
+        let heard = || heard.load(std::sync::atomic::Ordering::SeqCst);
+
+        session.update(cx, |session, cx| session.set_shown(false, cx));
+        asked.lock().unwrap().clear();
+        let by_title = [("Person".to_owned(), "title".to_owned())]
+            .into_iter()
+            .collect();
+        session.update(cx, |session, cx| session.take_labels(by_title, cx));
+        cx.run_until_parked();
+        assert_eq!(heard(), 0);
+        assert!(asked.lock().unwrap().is_empty(), "{:?}", asked.lock());
+
+        session.update(cx, |session, cx| session.set_shown(true, cx));
+        cx.run_until_parked();
+        assert_eq!(heard(), 1);
+        assert!(
+            asked
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|name| name == "studio_node"),
+            "read again under the new names: {:?}",
+            asked.lock()
+        );
+    }
+
+    /// The bound a large walk raised starts over at `KEPT_READS` when the walk does: a re-root
+    /// lets go at once of what the new root cannot reach, rather than once the state has grown
+    /// to twice the old walk's size.
+    #[gpui::test]
+    async fn a_reroot_starts_the_bound_over(cx: &mut gpui::TestAppContext) {
+        use crate::test_server::followed_session;
+        let (session, _served) = followed_session(
+            SCHEMA,
+            |_| json!([{ "id": "p1", "label": "Ada", "n": 0 }]),
+            cx,
+        );
+        cx.run_until_parked();
+        let exploration = cx.update(|cx| Exploration::for_session(&session, cx));
+        exploration.update(cx, |exploration, cx| exploration.root_at(person("p1"), cx));
+        cx.run_until_parked();
+        let schema = schema();
+        let knows = group(&schema, "Person", "Knows", Direction::Outgoing);
+        exploration.update(cx, |exploration, cx| {
+            // What a walk far wider than the bound left: counts no path reaches any more.
+            let state = exploration.state.unseen();
+            for n in 0..KEPT_READS + 100 {
+                state.apply_count(GroupKey::new(person(&format!("x{n}")), knows.clone()), 1);
+            }
+            exploration.prune_at = 4 * KEPT_READS;
+            exploration.bound_reads();
+            assert!(
+                exploration.state().held() > KEPT_READS,
+                "under the raised bound"
+            );
+
+            let p2 = ExplorePath::root()
+                .child_group(&knows)
+                .child_node(&person("p2"));
+            exploration.reroot(&p2, cx);
+            assert_eq!(exploration.prune_at, KEPT_READS);
+            let far = exploration
+                .state()
+                .counts
+                .keys()
+                .filter(|key| key.node.id.starts_with('x'))
+                .count();
+            assert_eq!(far, 0, "what the new root cannot reach went");
         });
     }
 
