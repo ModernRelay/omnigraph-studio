@@ -237,8 +237,10 @@ mod tests {
         }
         std::fs::write(elsewhere.join("diary.md"), "mine").unwrap();
         write(&cwd).unwrap();
+        // One part at a time: `cmd` takes a `/` in a path for a switch.
         let linked = cwd
-            .join(".agents/skills")
+            .join(".agents")
+            .join("skills")
             .join(NAME)
             .join("references")
             .join("linked");
