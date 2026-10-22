@@ -220,8 +220,9 @@ stay put), IX (paged, virtualized).
   settings: `graphs."<server url>/<graph>".views` in `settings.json`, each with its type, filters
   (`FilterOp::key` names), sort, grouping, hidden columns and column order. The toolbar's
   Views menu lists the type's views with the shown one checked, saves the table's state under
-  a name (the same name replaces), and deletes the shown one; the button reads the view's
-  name while the table matches it. Its "Name rows by ▸" submenu picks the property that names
+  a name (the same name replaces), and deletes the shown one; its chip reads "Views" and the
+  view's name while the table matches it, and its × leaves the view: no filter, order or
+  grouping, every column in its first place (the view stays saved). Its "Name rows by ▸" submenu picks the property that names
   the type's nodes across the graph (spec 002, "Node names"), "Automatic" first. Filters, a sort or a grouping the schema no longer has are
   left out; a hidden or ordered column the schema no longer has is ignored.
 
@@ -233,11 +234,23 @@ sorts ascending or descending, groups by the column, starts a filter on it, move
 right among the shown columns, hides it, and shows every column again once any is hidden or
 moved. Dragging a header onto another moves its column into that place. The toolbar's Columns
 menu lists every column but the pinned one, checked while it shows, and stays open while
-columns are picked; its button reads "N hidden" while any is. A column the schema adds later
+columns are picked; its chip reads "Columns N hidden" while any is, and its × shows every
+column in its first order. A column the schema adds later
 appears after the ordered ones. Hiding only stops showing: a filter, a sort or a grouping on a
 hidden column still applies, and a hidden relationship column reads nothing until it shows,
 when its neighbours are read for the rows already loaded, 100 at a time, at the table's commit.
 The layout is part of the tab and of saved views. Widths stay fitted to the column's type.
+
+### The toolbar
+
+Built: the toolbar's controls are spec 002's control chips, after the reference filter chips:
+Views, Columns, Sort, Group, Filters and Row, each a raised pill with its icon and name. A set
+control says what it is set to in the accent ("Sort name ↑", "Group status", "Filters 2") and
+clears with its × after a hairline; an unset one is its button alone. The Sort chip's menu
+lists the properties the rows can be ordered by (a header's menu orders by its column too),
+then Ascending and Descending for the order set; its × returns the rows to their ids' order.
+Group's × stops grouping; Filters' clears every filter (the bar under the toolbar keeps each
+filter's own ×). Row is an action, with no state to clear.
 
 ### Grouping
 
@@ -426,6 +439,7 @@ kept answers.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | The toolbar's controls are chips that say what they are set to and clear | `type_table` tests (179) unchanged; `studio_ui` `property_and_control_parts_draw_at_their_sizes` (a chip 26 px, its button centred); offscreen snapshots of Person (1440×900 at 2×, a scratch HOME so no config toast covers the toolbar): at rest, the Sort menu open, "name" chosen, then its × | At rest six pills, Views to Row, and Refresh. The Sort menu listed name, title, email and born, with Ascending and Descending disabled until an order was set; choosing name read "Sort name ↑ ×", put the header's arrow on name and ordered the rows from Ada Allen; the × read "Sort" again and the rows returned to id order. A ↓ icon beside "name ↑" contradicted it, so Sort's icon is ⇕ |
 | 2026-10-21 | A read sent before the table's own write landed is read again at the write's commit | `type_table` `a_read_sent_before_the_tables_own_write_landed_is_read_again_at_its_commit` (a header click reads the first page at c1 while the table's delete of p1 lands at c2; grouped, a section's page read at c2 while p2's delete lands at c3), failing with the pin check undone | Both read again at the new pin: p1 does not come back, nor p2. Undone, the c1 page showed p1 again under c2 |
 | 2026-10-21 | A sorted table whose rows lack the sort's value reads them | `type_table` `a_sorted_table_whose_rows_hold_no_value_reads_them_at_once` ("email is empty", sorted by email), failing with the read-on undone | p1 and p2 read, the list exhausted. Undone, no row showed while the count said 2 |
 | 2026-10-21 | ⌘Z in a cell takes nothing from the cell edited before | `type_table` `undo_in_a_cell_never_brings_back_another_cells_text` ("Ada L" typed in p1's name and saved, then p2's name opened, ⌘Z, ↵), failing with one editor kept across edits | p2's name stayed "Grace" and one write went, p1's. With the shared editor, ⌘Z brought back "Ada L" |

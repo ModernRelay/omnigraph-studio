@@ -218,20 +218,7 @@ const ROW_GROUP: &str = "table-row";
 /// since the grid runs to the document's edges. The other cells keep a cell's inset.
 const KEY_INSET: f32 = space::EDGE;
 
-/// A property's icon, by what it holds: text, a number, a time, a choice, a file.
-fn property_icon(property: &Property) -> IconName {
-    if property.enum_values.is_some() {
-        return IconName::ListTodo;
-    }
-    match property.kind {
-        ScalarKind::Text => IconName::CaseSensitive,
-        ScalarKind::Bool => IconName::Check,
-        ScalarKind::Integer | ScalarKind::Float => IconName::Hash,
-        ScalarKind::Date | ScalarKind::DateTime => IconName::Clock,
-        ScalarKind::Vector => IconName::Sparkle,
-        ScalarKind::Blob => IconName::File,
-    }
-}
+use crate::peek::property_icon;
 
 /// One row's neighbours through one relationship: how many, and the first few by id (as many
 /// as the peek shows; the cell shows `RELATION_CHIPS_SHOWN`). `whole` when the row's whole list
@@ -418,7 +405,8 @@ pub struct TypeTable {
     filter_menus: [PopoverMenuHandle<ContextMenu>; 2],
     /// The toolbar's Views, Columns and Group menus, whose buttons keep their tooltips quiet
     /// while open.
-    toolbar_menus: [PopoverMenuHandle<ContextMenu>; 3],
+    /// Views, Columns, Group and Sort, in that order.
+    toolbar_menus: [PopoverMenuHandle<ContextMenu>; 4],
     filter_draft: Option<FilterDraft>,
     filter_editor: Entity<Editor>,
     /// Rows picked for a bulk set (⌘-click, ⇧-click), by id, and the row ⇧ extends from.
@@ -1739,19 +1727,16 @@ impl TypeTable {
         let hidden = self.all_columns.len().saturating_sub(self.columns.len());
         let table = cx.entity().downgrade();
         let open = self.toolbar_menus[1].is_deployed();
-        PopoverMenu::new("columns-menu")
+        let menu = PopoverMenu::new("columns-menu")
             .anchor(gpui::Anchor::TopRight)
             .with_handle(self.toolbar_menus[1].clone())
             .trigger(
-                studio_ui::ds::toolbar_button(
+                studio_ui::ds::chip_button(
                     "columns",
-                    match hidden {
-                        0 => "Columns".to_owned(),
-                        n => format!("{n} hidden"),
-                    },
+                    IconName::Eye,
+                    "Columns",
+                    (hidden > 0).then(|| format!("{hidden} hidden").into()),
                 )
-                .style(ButtonStyle::Subtle)
-                .start_icon(Icon::new(IconName::Eye))
                 .disabled(self.all_columns.len() < 2)
                 .when(!open, |button| {
                     button.tooltip(Tooltip::text(
@@ -1809,7 +1794,14 @@ impl TypeTable {
                         )
                     },
                 ))
-            })
+            });
+        let reset = cx.listener(|this, _, _, cx| {
+            this.arrange_columns(cx, |layout, _| layout.reset());
+            cx.notify();
+        });
+        studio_ui::ds::control_chip("columns-chip", menu).when(hidden > 0, |chip| {
+            chip.on_clear("Show every column, in its first order", reset)
+        })
     }
 
     /// The toolbar's Group menu: the properties rows can be grouped by, and No grouping.
@@ -1825,19 +1817,17 @@ impl TypeTable {
         });
         let table = cx.entity().downgrade();
         let open = self.toolbar_menus[2].is_deployed();
-        PopoverMenu::new("group-menu")
+        let grouped = current_label.is_some();
+        let menu = PopoverMenu::new("group-menu")
             .anchor(gpui::Anchor::TopRight)
             .with_handle(self.toolbar_menus[2].clone())
             .trigger(
-                studio_ui::ds::toolbar_button(
+                studio_ui::ds::chip_button(
                     "group",
-                    match &current_label {
-                        Some(label) => format!("Group: {label}"),
-                        None => "Group".to_owned(),
-                    },
+                    IconName::ListTree,
+                    "Group",
+                    current_label.map(SharedString::from),
                 )
-                .style(ButtonStyle::Subtle)
-                .start_icon(Icon::new(IconName::ListTree))
                 .disabled(choices.is_empty())
                 .when(!open, |button| {
                     button.tooltip(Tooltip::text(
@@ -1946,7 +1936,100 @@ impl TypeTable {
                     }
                     menu
                 }))
+            });
+        studio_ui::ds::control_chip("group-chip", menu).when(grouped, |chip| {
+            chip.on_clear(
+                "Stop grouping the rows",
+                cx.listener(|this, _, _, cx| this.set_grouping(None, cx)),
+            )
+        })
+    }
+
+    /// The toolbar's Sort menu: the properties the rows can be ordered by, then the direction.
+    /// A column header's menu orders by its column as well.
+    fn render_sort_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let choices: Vec<(String, String)> = self
+            .all_columns
+            .iter()
+            .filter_map(|column| {
+                column
+                    .property()
+                    .filter(|property| Sort::allowed(property))
+                    .map(|property| (property.name.clone(), column.title.clone()))
             })
+            .collect();
+        let current = self.sort.clone();
+        let current_label = current.as_ref().map(|sort| {
+            let title = choices
+                .iter()
+                .find(|(name, _)| *name == sort.property)
+                .map_or(sort.property.as_str(), |(_, title)| title.as_str());
+            SharedString::from(format!(
+                "{title} {}",
+                if sort.descending { "↓" } else { "↑" }
+            ))
+        });
+        let sorted = current.is_some();
+        let table = cx.entity().downgrade();
+        let open = self.toolbar_menus[3].is_deployed();
+        let menu = PopoverMenu::new("sort-menu")
+            .anchor(gpui::Anchor::TopRight)
+            .with_handle(self.toolbar_menus[3].clone())
+            .trigger(
+                studio_ui::ds::chip_button("sort", IconName::ChevronUpDown, "Sort", current_label)
+                    .disabled(choices.is_empty())
+                    .when(!open, |button| {
+                        button.tooltip(Tooltip::text(
+                            "Order the rows by a property · a column's header orders by it too",
+                        ))
+                    }),
+            )
+            .menu(move |window, cx| {
+                let (table, current, choices) = (table.clone(), current.clone(), choices.clone());
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    let set = |sort: Option<Sort>| {
+                        let table = table.clone();
+                        move |_: &mut Window, cx: &mut App| {
+                            table
+                                .update(cx, |table, cx| table.set_sort(sort.clone(), cx))
+                                .ok();
+                        }
+                    };
+                    let descending = current.as_ref().is_some_and(|sort| sort.descending);
+                    for (name, title) in choices.iter() {
+                        menu = menu.toggleable_entry(
+                            title.clone(),
+                            current.as_ref().is_some_and(|sort| sort.property == *name),
+                            IconPosition::Start,
+                            None,
+                            set(Some(Sort {
+                                property: name.clone(),
+                                descending,
+                            })),
+                        );
+                    }
+                    menu = menu.separator();
+                    for (label, down) in [("Ascending", false), ("Descending", true)] {
+                        let sort = current.clone().map(|sort| Sort {
+                            descending: down,
+                            ..sort
+                        });
+                        menu = menu.item(
+                            ContextMenuEntry::new(label)
+                                .toggleable(IconPosition::Start, sorted && descending == down)
+                                .disabled(!sorted)
+                                .handler(set(sort)),
+                        );
+                    }
+                    menu
+                }))
+            });
+        studio_ui::ds::control_chip("sort-chip", menu).when(sorted, |chip| {
+            chip.on_clear(
+                "Stop ordering the rows: they follow their ids",
+                cx.listener(|this, _, _, cx| this.set_sort(None, cx)),
+            )
+        })
     }
 
     /// The toolbar's Views menu: this type's saved views, then save and delete.
@@ -1965,16 +2048,17 @@ impl TypeTable {
             TableKind::Edge => None,
         };
         let open = self.toolbar_menus[0].is_deployed();
-        PopoverMenu::new("views-menu")
+        let shown = active.is_some();
+        let menu = PopoverMenu::new("views-menu")
             .anchor(gpui::Anchor::TopRight)
             .with_handle(self.toolbar_menus[0].clone())
             .trigger(
-                studio_ui::ds::toolbar_button(
+                studio_ui::ds::chip_button(
                     "views",
-                    active.clone().unwrap_or_else(|| "Views".into()),
+                    IconName::Star,
+                    "Views",
+                    active.clone().map(SharedString::from),
                 )
-                .style(ButtonStyle::Subtle)
-                .start_icon(Icon::new(IconName::Star))
                 .when(!open, |button| {
                     button.tooltip(Tooltip::text(
                         "Saved filters, order, grouping and columns for this type",
@@ -2038,7 +2122,17 @@ impl TypeTable {
                     }
                     menu
                 }))
-            })
+            });
+        // Leaving a view shows the table as it first opens: no filter, order or grouping, and
+        // every column in its first place. The view stays saved.
+        studio_ui::ds::control_chip("views-chip", menu).when(shown, |chip| {
+            chip.on_clear(
+                "Leave this view: no filter, order or grouping, every column",
+                cx.listener(|this, _, _, cx| {
+                    this.apply_view(&studio_settings::SavedView::default(), cx)
+                }),
+            )
+        })
     }
 
     /// Restores a remembered order, if the property can still order the table.
@@ -6101,23 +6195,42 @@ impl TypeTable {
             })
             .child(div().flex_1())
             .child(
+                // The controls as chips (spec 002, "Control chips"): each set one says what it
+                // is set to and clears with its ×.
                 studio_ui::ds::toolbar_actions()
+                    .gap(px(space::SM))
                     .child(self.render_views_menu(cx))
                     .child(self.render_columns_menu(cx))
+                    .child(self.render_sort_menu(cx))
                     .child(self.render_group_menu(cx))
                     .child(
-                        studio_ui::ds::toolbar_button("add-filter", "Filter")
-                            .style(ButtonStyle::Subtle)
-                            .start_icon(Icon::new(IconName::Filter))
+                        studio_ui::ds::control_chip(
+                            "filter-chip",
+                            studio_ui::ds::chip_button(
+                                "add-filter",
+                                IconName::Filter,
+                                "Filters",
+                                (!self.filters.is_empty()).then(|| {
+                                    studio_ui::group_count(self.filters.len() as i64).into()
+                                }),
+                            )
                             .tooltip(|_, cx| Tooltip::for_action("Add a filter", &AddFilter, cx))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_filter_draft(window, cx)
-                            })),
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.open_filter_draft(window, cx)
+                                }),
+                            ),
+                        )
+                        .when(!self.filters.is_empty(), |chip| {
+                            chip.on_clear(
+                                "Clear the filters",
+                                cx.listener(|this, _, _, cx| this.clear_filters(cx)),
+                            )
+                        }),
                     )
-                    .child(
-                        studio_ui::ds::toolbar_button("insert-row", "Row")
-                            .style(ButtonStyle::Subtle)
-                            .start_icon(Icon::new(IconName::Plus))
+                    .child(studio_ui::ds::control_chip(
+                        "insert-row-chip",
+                        studio_ui::ds::chip_button("insert-row", IconName::Plus, "Row", None)
                             .disabled(pinned || refused.is_some())
                             .tooltip(move |_, cx| match &refused {
                                 _ if pinned => Tooltip::simple("Read-only at an older commit", cx),
@@ -6127,7 +6240,7 @@ impl TypeTable {
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.on_insert(&InsertRow, window, cx)
                             })),
-                    )
+                    ))
                     .child(
                         studio_ui::ds::toolbar_icon_button("refresh-table", IconName::RotateCw)
                             .tooltip(|_, cx| Tooltip::for_action("Refresh", &RefreshTable, cx))
