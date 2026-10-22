@@ -1,6 +1,6 @@
 //! The command palette (spec 002): every action available where the person is, with its
 //! binding, fuzzy filtered and ranked by recent use, plus the graph's types, nodes found by id
-//! or name, queries (open tabs, saved files, stored queries and their aliases) and branches.
+//! or name, queries (open tabs, saved files and stored queries) and branches.
 //! Scope tabs narrow it (All ⌘1, Types ⌘2, Nodes ⌘3, Queries ⌘4, Branches ⌘5, Commands ⌘6);
 //! Tab hands the text to the agent. ⌘K opens All, ⌘P Nodes, ⌘⇧B Branches, and in an open
 //! palette ⌘P and ⌘⇧B change the scope and keep the text; `?` opens the keyboard shortcuts
@@ -27,7 +27,7 @@ use gpui::{
 };
 use gq_language::SchemaModel;
 use gq_language::builder::{node_search, search_matches};
-use graph_store::{ConnectionRegistry, EntityKind, GraphSession, Loadable};
+use graph_store::{EntityKind, GraphSession, Loadable};
 use serde_json::Value;
 use studio_actions::agent::Ask;
 use studio_actions::graph::{OpenNode, OpenQueryFile, OpenStoredQuery, OpenType};
@@ -282,11 +282,6 @@ enum Row {
         mutation: bool,
         description: Option<String>,
     },
-    /// An alias from the CLI config for a stored query this graph serves.
-    Alias {
-        action: Box<dyn Action>,
-        query: String,
-    },
     /// The node types not yet read for the text: running it reads the next ones.
     MoreTypes {
         count: usize,
@@ -300,8 +295,7 @@ impl Row {
             | Row::Type { action, .. }
             | Row::Node { action, .. }
             | Row::Saved { action }
-            | Row::Stored { action, .. }
-            | Row::Alias { action, .. } => Some(action.as_ref()),
+            | Row::Stored { action, .. } => Some(action.as_ref()),
             Row::Branch { .. } | Row::Tab { .. } | Row::MoreTypes { .. } => None,
         }
     }
@@ -1085,7 +1079,6 @@ impl CommandPalette {
             } else {
                 "stored".into()
             }),
-            Row::Alias { query, .. } => muted(format!("alias · {query}")),
             Row::MoreTypes { count } => muted(format!("next {}", (*count).min(TYPES_PER_SEARCH))),
         };
         let icon_tile = |glyph| studio_ui::ds::icon_tile(glyph, cx);
@@ -1104,7 +1097,6 @@ impl CommandPalette {
             }),
             Row::Tab { .. } | Row::Saved { .. } => icon_tile(IconName::Code),
             Row::Stored { .. } => icon_tile(IconName::Server),
-            Row::Alias { .. } => icon_tile(IconName::Link),
             Row::MoreTypes { .. } => icon_tile(IconName::MagnifyingGlass),
             Row::Action { .. } => icon_tile(command_icon(&candidate.key)),
         };
@@ -1164,9 +1156,6 @@ impl CommandPalette {
             } => Some(description.clone().into()),
             Row::Stored { .. } => {
                 Some("Open this stored query in a tab, to run on the server.".into())
-            }
-            Row::Alias { query, .. } => {
-                Some(format!("Open {query} with this alias's values from the CLI config.").into())
             }
             Row::MoreTypes { count } => Some(
                 format!(
@@ -1258,9 +1247,7 @@ fn add_branch_rows(
     }
 }
 
-/// Rows for the graph's stored queries, each followed by the CLI config's aliases for it, when
-/// opening one is available where the person is. An alias for a query the graph does not
-/// serve cannot open, and is left out.
+/// Rows for the graph's stored queries, when opening one is available where the person is.
 fn add_stored_rows(
     session: &Entity<GraphSession>,
     window: &mut Window,
@@ -1268,24 +1255,17 @@ fn add_stored_rows(
     rows: &mut Vec<Row>,
     candidates: &mut Vec<Candidate>,
 ) {
-    let open = |name: &str, alias: Option<&str>| OpenStoredQuery {
+    let open = |name: &str| OpenStoredQuery {
         name: name.to_owned(),
-        alias: alias.map(str::to_owned),
+        alias: None,
     };
-    if !window.is_action_available(&open("", None), cx) {
+    if !window.is_action_available(&open(""), cx) {
         return;
     }
     let session = session.read(cx);
     let Loadable::Loaded(queries) = &session.stored_queries else {
         return;
     };
-    let aliases = ConnectionRegistry::try_global(cx)
-        .map(|registry| {
-            registry
-                .read(cx)
-                .aliases_for(&session.server_name(cx), &session.graph_id)
-        })
-        .unwrap_or_default();
     for query in queries.iter() {
         candidates.push(Candidate {
             label: query.name.clone(),
@@ -1293,21 +1273,10 @@ fn add_stored_rows(
             group: Group::Query,
         });
         rows.push(Row::Stored {
-            action: Box::new(open(&query.name, None)),
+            action: Box::new(open(&query.name)),
             mutation: query.mutation,
             description: query.description.clone(),
         });
-        for alias in aliases.iter().filter(|alias| alias.query == query.name) {
-            candidates.push(Candidate {
-                label: alias.name.clone(),
-                key: format!("query-alias:{}", alias.name),
-                group: Group::Query,
-            });
-            rows.push(Row::Alias {
-                action: Box::new(open(&query.name, Some(&alias.name))),
-                query: query.name.clone(),
-            });
-        }
     }
 }
 
