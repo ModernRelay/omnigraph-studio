@@ -6,8 +6,8 @@ the open questions below · 2026-10-21
 ## Problem
 
 A server that admits people through OIDC asks for a short-lived access token issued for it,
-and Studio has no way to get one. Studio connects with no credential, with a static token the
-OmniGraph CLI exports for a server target, or with a token typed into Studio. Against an OIDC
+and Studio has no way to get one. Studio connects with no credential or with a static token the
+OmniGraph CLI exports for a server target. Against an OIDC
 server it gets a 401 and can only say so. A managed target gets no token (spec 003), and the
 change that moves targets onto the CLI's commands refuses it: the CLI's managed data credential
 is not Studio's to borrow (RFC #1017, Appendix A2). This plan
@@ -30,21 +30,21 @@ managed, signing a person in through their browser. It is a spec only; nothing i
 
 ## What exists today (checked)
 
-- Studio (`omnigraph-studio` main at `5421b74`):
-  - A server comes from the CLI, from Studio's own list, or from the environment
-    (`ServerSource`, `crates/graph_store/src/connection.rs`). A token typed into Studio is kept
-    in the OS keychain through GPUI's `write_credentials(url, user, secret)` with the server's
-    URL as the key and `omnigraph-studio` as the user (`crates/graph_store/src/registry.rs`,
-    `KEYCHAIN_USER`).
-  - GPUI keeps one keychain item per key string: on macOS a `kSecClassInternetPassword` whose
+- Studio:
+  - Studio keeps no server list or tokens of its own (spec 003): every server is a CLI target
+    (`omnigraph target list --json`), its token comes from `omnigraph credentials export`, and
+    Add server runs `omnigraph target add` and `omnigraph credentials set --stdin --replace`.
+    The OAuth refresh token below is the only secret Studio would keep.
+  - GPUI's `write_credentials(url, user, secret)` and `read_credentials(url)` reach the OS
+    keychain, one item per key string: on macOS a `kSecClassInternetPassword` whose
     `kSecAttrServer` is the key and whose `kSecAttrAccount` is the user; a write replaces the
     item for that key (`gpui_macos/src/platform.rs`, Zed `v1.23.2`).
   - A 401 is `ConnectionState::Unauthorized`, and the connection knows whether a token was sent
     (`refused_with_token`); the copy is "Asks for a token" or "Token refused" (spec 003,
     2026-10-21).
-  - Part 1 of this change, under way separately: targets and static tokens come from the CLI
-    (`target list`/`inspect --json`, `credentials export` over a pipe), direct targets are
-    refused, and managed targets are refused until this plan is built (spec 003).
+  - Direct targets are refused, and managed targets are refused until this plan is built
+    (spec 003); the CLI runs one command at a time, since it holds its operator home's lock
+    (`d9b361d`).
   - Studio already binds a loopback listener for the agent gateway (spec 011, `a56532b`).
 - OmniGraph (main at `7fff9dfd`):
   - Every 401 carries `WWW-Authenticate: Bearer`, adding `error="invalid_token"` when a
