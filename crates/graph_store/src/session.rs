@@ -152,11 +152,63 @@ pub struct DraftEntry {
 #[derive(Debug, Clone)]
 pub struct OutcomeEntry {
     pub at: SystemTime,
+    /// The branch the write went to: a merge's target.
     pub branch: String,
+    /// What the write did, in words, for display alone: no logic reads a fact out of it.
     pub description: String,
     pub outcome: OutcomeKind,
     /// What a committed write's toast offers instead of opening the commit.
     pub follow_up: Option<FollowUp>,
+    /// A merge Studio sent ([`GraphSession::merge`]): its source, the heads it was sent over and
+    /// what the target's history showed of it since. Its target is [`Self::branch`] and how it
+    /// ended [`Self::outcome`].
+    pub merge: Option<MergeEntry>,
+}
+
+impl OutcomeEntry {
+    /// A merge whose outcome is unknown and which the target's history has not settled: it may
+    /// have landed, or may still land, so no review of its branches offers Merge, or a fix,
+    /// meanwhile.
+    pub fn merge_may_land(&self) -> bool {
+        matches!(self.outcome, OutcomeKind::Unknown { .. })
+            && self
+                .merge
+                .as_ref()
+                .is_some_and(|merge| merge.settled.is_none())
+    }
+}
+
+/// A merge as its outcome entry keeps it ([`OutcomeEntry::merge`]). One whose outcome is
+/// unknown is settled by reading the target's history, never by merging again (constitution
+/// III): the read needs the heads it was sent over, and what it shows is recorded here, so
+/// every review of the same branches in the session starts from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeEntry {
+    /// The branch merged.
+    pub source: String,
+    pub sent: MergeSent,
+    /// What the target's history showed of a merge whose outcome is unknown, once a read could
+    /// tell ([`GraphSession::settle_merge`]); `None` until then.
+    pub settled: Option<MergeSettled>,
+}
+
+/// The heads a merge was sent over: the source head it merges, and the target's head as Studio
+/// read it just before sending the merge. A merge that lands publishes a commit of the target
+/// above that head, so the target's history is read for it only down to there.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MergeSent {
+    pub source_head: Option<String>,
+    pub target_head: Option<String>,
+}
+
+/// What the target's history showed of a merge whose outcome is unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeSettled {
+    /// The history holds the merge: it landed.
+    Landed,
+    /// The history read, down to the target's head before the merge or to its end, does not
+    /// hold it. The merge may still land, but nothing shows it, so Merge may run again.
+    NotShown,
 }
 
 /// A follow-up a write's outcome offers once it commits (spec 002, toasts).
@@ -3593,7 +3645,7 @@ impl GraphSession {
                     OutcomeKind::Committed { .. } | OutcomeKind::Held { .. }
                 );
                 let made = (creates_branch && went_through).then(|| branch.clone());
-                this.finish_write(branch, description, outcome, None, None, cx);
+                this.finish_write(WriteLog::new(branch, description), outcome, None, cx);
                 if let Some(made) = made {
                     this.reload_branches_after(made, cx);
                 }
@@ -3604,34 +3656,95 @@ impl GraphSession {
         ExternalWrite { done }
     }
 
-    /// Adds a write's outcome to the log, which keeps the newest [`OUTCOMES`].
-    fn log_outcome(
-        &mut self,
-        branch: String,
-        description: String,
-        outcome: OutcomeKind,
-        follow_up: Option<FollowUp>,
-    ) {
+    /// Adds a write's outcome to the log, which keeps the newest [`OUTCOMES`]. A merge that may
+    /// still land is kept past them ([`OutcomeEntry::merge_may_land`]): the reviews of its
+    /// branches keep Merge off by it until the target's history settles it. There is at most one
+    /// for each source and target, since no review merges those branches again meanwhile.
+    fn log_outcome(&mut self, log: WriteLog, outcome: OutcomeKind) {
         if self.outcomes.len() >= OUTCOMES {
-            self.outcomes.drain(..=self.outcomes.len() - OUTCOMES);
+            let mut over = self.outcomes.len() + 1 - OUTCOMES;
+            self.outcomes.retain(|entry| {
+                if over == 0 || entry.merge_may_land() {
+                    return true;
+                }
+                over -= 1;
+                false
+            });
         }
+        let WriteLog {
+            branch,
+            description,
+            follow_up,
+            merge,
+        } = log;
         self.outcomes.push(OutcomeEntry {
             at: SystemTime::now(),
             branch,
             description,
             outcome,
             follow_up,
+            merge,
         });
         self.outcomes_logged += 1;
     }
 
+    /// The newest merge of `source` into `target` the log holds: its entry says whether that
+    /// merge may still land ([`OutcomeEntry::merge_may_land`]).
+    pub fn newest_merge(&self, source: &str, target: &str) -> Option<&OutcomeEntry> {
+        self.outcomes.iter().rev().find(|entry| {
+            entry.branch == target
+                && entry
+                    .merge
+                    .as_ref()
+                    .is_some_and(|merge| merge.source == source)
+        })
+    }
+
+    /// The newest merge of `source` into `target` sent over `sent` the log holds.
+    pub fn merge_sent(&self, source: &str, target: &str, sent: &MergeSent) -> Option<&MergeEntry> {
+        self.outcomes
+            .iter()
+            .rev()
+            .filter(|entry| entry.branch == target)
+            .filter_map(|entry| entry.merge.as_ref())
+            .find(|merge| merge.source == source && merge.sent == *sent)
+    }
+
+    /// Records on its entry what the target's history showed of the merge of `source` into
+    /// `target` sent over `sent`, whose outcome is unknown: every review of those branches reads
+    /// it there. A merge shown to have landed stays so, since a read that does not show it may
+    /// have come before it landed. Answers what the entry holds now, `None` when the log holds no
+    /// such merge.
+    pub fn settle_merge(
+        &mut self,
+        source: &str,
+        target: &str,
+        sent: &MergeSent,
+        settled: MergeSettled,
+        cx: &mut Context<Self>,
+    ) -> Option<MergeSettled> {
+        let merge = self
+            .outcomes
+            .iter_mut()
+            .rev()
+            .filter(|entry| {
+                entry.branch == target && matches!(entry.outcome, OutcomeKind::Unknown { .. })
+            })
+            .filter_map(|entry| entry.merge.as_mut())
+            .find(|merge| merge.source == source && merge.sent == *sent)?;
+        if merge.settled != Some(MergeSettled::Landed) && merge.settled != Some(settled) {
+            merge.settled = Some(settled);
+            cx.emit(SessionEvent::ActivityChanged);
+            cx.notify();
+        }
+        merge.settled
+    }
+
     fn finish_write(
         &mut self,
-        branch: String,
-        description: String,
+        log: WriteLog,
         outcome: OutcomeKind,
         parent: Option<String>,
-        follow_up: Option<FollowUp>,
         cx: &mut Context<Self>,
     ) {
         self.writes_in_flight = self.writes_in_flight.saturating_sub(1);
@@ -3639,7 +3752,8 @@ impl GraphSession {
             OutcomeKind::Committed { commit } => commit.clone(),
             _ => None,
         };
-        self.log_outcome(branch.clone(), description, outcome, follow_up);
+        let branch = log.branch.clone();
+        self.log_outcome(log, outcome);
         if let Some(commit) = commit {
             self.committed(branch, commit, parent, cx);
         }
@@ -3756,11 +3870,13 @@ impl GraphSession {
     /// `delete_branch` is set: the deletion is the server's, reported on the answer, and never
     /// undoes the merge. A session on the deleted branch moves to `target`. A merge that landed
     /// while the deletion did not is logged as the merge, with `source` left and the server's
-    /// reason.
+    /// reason. The entry keeps the merge's source and `sent`, the heads it was sent over
+    /// ([`OutcomeEntry::merge`]).
     pub fn merge(
         &mut self,
         source: String,
         target: String,
+        sent: MergeSent,
         delete_branch: bool,
         cx: &mut Context<Self>,
     ) -> Task<WriteOutcome<BranchMergeOutput>> {
@@ -3801,7 +3917,14 @@ impl GraphSession {
                     _ if delete_branch => format!("{merged} and delete {source}"),
                     _ => merged,
                 };
-                WriteLog::new(target, description)
+                WriteLog {
+                    merge: Some(MergeEntry {
+                        source,
+                        sent,
+                        settled: None,
+                    }),
+                    ..WriteLog::new(target, description)
+                }
             },
             move |this, outcome, cx| {
                 let deleted = matches!(
@@ -3845,12 +3968,8 @@ impl GraphSession {
             let kind = outcome_kind(&outcome, commit);
             let parent = parent_of(&outcome, commit);
             this.update(cx, |this, cx| {
-                let WriteLog {
-                    branch,
-                    description,
-                    follow_up,
-                } = log(this, &outcome, cx);
-                this.finish_write(branch, description, kind, parent, follow_up, cx);
+                let log = log(this, &outcome, cx);
+                this.finish_write(log, kind, parent, cx);
                 after(this, &outcome, cx);
             })
             .ok();
@@ -3861,11 +3980,12 @@ impl GraphSession {
 }
 
 /// What one write's outcome is logged with ([`GraphSession::run_write`]): the branch it went
-/// to, what it did, and what its toast offers once it commits.
+/// to, what it did, what its toast offers once it commits, and a merge's own facts.
 struct WriteLog {
     branch: String,
     description: String,
     follow_up: Option<FollowUp>,
+    merge: Option<MergeEntry>,
 }
 
 impl WriteLog {
@@ -3874,6 +3994,7 @@ impl WriteLog {
             branch,
             description,
             follow_up: None,
+            merge: None,
         }
     }
 }
@@ -4283,7 +4404,9 @@ mod tests {
     }
 
     /// A merge asked to delete its branch is logged as what happened: deleted with it, or
-    /// merged with the branch left and the server's reason, the session staying there.
+    /// merged with the branch left and the server's reason, the session staying there. Its entry
+    /// keeps the merge's source and the heads it was sent over as fields, and a merge that
+    /// committed has nothing to settle.
     #[gpui::test]
     async fn a_merge_whose_deletion_was_refused_says_the_branch_stays(cx: &mut TestAppContext) {
         let merged = |deleted: bool| {
@@ -4302,19 +4425,38 @@ mod tests {
         };
         let session = answering_session(vec![merged(false), merged(true)], "feature", cx);
         cx.run_until_parked();
+        let sent = MergeSent {
+            source_head: Some("f1".into()),
+            target_head: Some("m1".into()),
+        };
         let merge = |cx: &mut TestAppContext| {
             let write = session.update(cx, |session, cx| {
-                session.merge("feature".into(), "main".into(), true, cx)
+                session.merge("feature".into(), "main".into(), sent.clone(), true, cx)
             });
             cx.run_until_parked();
             futures::executor::block_on(write);
-            session.read_with(cx, |session, _| {
+            session.update(cx, |session, cx| {
                 let entry = session.outcomes.last().unwrap();
-                (
+                assert_eq!(
+                    entry.merge,
+                    Some(MergeEntry {
+                        source: "feature".into(),
+                        sent: sent.clone(),
+                        settled: None,
+                    })
+                );
+                assert!(!entry.merge_may_land());
+                let said = (
                     entry.branch.clone(),
                     entry.description.clone(),
                     session.branch.clone(),
-                )
+                );
+                assert_eq!(
+                    session.settle_merge("feature", "main", &sent, MergeSettled::Landed, cx),
+                    None,
+                    "committed, not settled"
+                );
+                said
             })
         };
         assert_eq!(
@@ -4537,10 +4679,60 @@ mod tests {
         });
     }
 
-    /// The activity log keeps the newest writes.
+    /// The activity log keeps the newest writes, and past them a merge that may still land, by
+    /// which the reviews of its branches keep Merge off. What the target's history showed of a
+    /// lost merge is recorded on its entry, a merge shown to have landed staying so; once
+    /// settled, it goes as any other write.
     #[gpui::test]
     async fn the_activity_log_keeps_the_newest_writes(cx: &mut TestAppContext) {
-        let session = listing_session(r#"{"branches":["main"]}"#, "main", cx);
+        let lost = || (504, serde_json::json!({}));
+        let session = answering_session(vec![lost(), lost()], "fix", cx);
+        cx.run_until_parked();
+        let sent = MergeSent {
+            source_head: Some("f1".into()),
+            target_head: Some("m1".into()),
+        };
+        for source in ["feature", "fix"] {
+            let write = session.update(cx, |session, cx| {
+                session.merge(source.into(), "main".into(), sent.clone(), false, cx)
+            });
+            cx.run_until_parked();
+            futures::executor::block_on(write);
+        }
+        session.update(cx, |session, cx| {
+            let lost = session.newest_merge("fix", "main").unwrap();
+            assert!(matches!(lost.outcome, OutcomeKind::Unknown { .. }));
+            assert!(lost.merge_may_land());
+            let other = MergeSent::default();
+            let mut settle =
+                |sent: &MergeSent, settled| session.settle_merge("fix", "main", sent, settled, cx);
+            assert_eq!(settle(&other, MergeSettled::Landed), None, "not sent so");
+            assert_eq!(
+                settle(&sent, MergeSettled::NotShown),
+                Some(MergeSettled::NotShown)
+            );
+            assert_eq!(
+                settle(&sent, MergeSettled::Landed),
+                Some(MergeSettled::Landed)
+            );
+            assert_eq!(
+                settle(&sent, MergeSettled::NotShown),
+                Some(MergeSettled::Landed),
+                "a merge that landed stays so"
+            );
+            assert!(
+                !session
+                    .newest_merge("fix", "main")
+                    .unwrap()
+                    .merge_may_land()
+            );
+            assert!(
+                session
+                    .newest_merge("feature", "main")
+                    .unwrap()
+                    .merge_may_land()
+            );
+        });
         for n in 0..=OUTCOMES {
             let refused = OutcomeKind::Refused {
                 message: "no".into(),
@@ -4554,7 +4746,13 @@ mod tests {
         }
         session.read_with(cx, |session, _| {
             assert_eq!(session.outcomes.len(), OUTCOMES);
-            assert_eq!(session.outcomes[0].description, "write 1");
+            assert!(session.outcomes[0].merge_may_land(), "the lost merge stays");
+            assert!(session.newest_merge("feature", "main").is_some());
+            assert!(
+                session.newest_merge("fix", "main").is_none(),
+                "the settled one went"
+            );
+            assert_eq!(session.outcomes[1].description, "write 2");
             assert_eq!(
                 session.outcomes.last().unwrap().description,
                 format!("write {OUTCOMES}")

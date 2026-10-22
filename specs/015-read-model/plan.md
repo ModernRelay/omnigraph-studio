@@ -237,6 +237,12 @@ Three parts in `graph_store`, owned by `GraphSession`, and one change in how vie
 - Historical reads of whole nodes: a refusal naming a property added since the commit is
   answered by reading again without that property, once per property, and the property shows as
   "added later".
+- **Writes' outcomes** are the session's too: its outcome log is the one record of what
+  Studio's writes did, and views read it rather than keep their own. A merge's entry carries its
+  source, target, the source head it was sent for, the target's head just before it was sent and
+  its outcome as fields, and later what a read of the target's history showed of a lost one; the
+  description is for display alone. Every review of the same branches starts from that entry
+  (spec 008; since 2026-10-21).
 
 ### Carry-forward as built (2026-10-18)
 
@@ -399,6 +405,7 @@ commit can be cleaned up; measure first).
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | A lost merge has one record, the session's outcome log | `review` `a_review_opened_after_the_one_that_merged_closed_starts_from_the_log`, `settling_a_lost_merge_in_one_review_lets_another_merge`; `graph_store` `the_activity_log_keeps_the_newest_writes`, extended (spec 008's validation log) | Pass. A review opened after the one that merged closed, and one open beside it, start from and settle by the log's entry alone; the review's own per-session record (a global keyed by session) is gone |
 | 2026-10-21 | Seeds never push out an answer that was read | `graph_store` `seeded_answers_never_push_out_an_answer_that_was_read` (an answer read at c1, then 5,120 node answers seeded at c1 through `GraphSession::seed`); `a_page_read_at_a_commit_answers_its_nodes` still passing with the seed forgotten from its own memo | The read answer is still held; 1,024 seeds are kept, and at most 1,024 seed commit families. Before, seeds went into the 4,096-entry `pinned_reads` and the read answer went first |
 | 2026-10-21 | A branch read refused for its own reason is not sent again pinned | `graph_store` `a_branch_read_refused_is_sent_pinned_only_when_the_branch_is_gone` (the head at c1; the branch read answered 409, then 404); `openapi/omnigraph-0.14.0-edge.json`, `POST /graphs/{graph_id}/query` responses (409: `full_text_index_rebuild_required` or `full_text_index_required`, "neither is cleared by retrying"; no 404 listed, the server's `not_found` for a branch it does not know) | 409: one branch read and the refusal returned; 404: the branch read, then one pinned read, answered. Before, a 409 was sent again pinned and refused again |
 | 2026-10-21 | The memo weighs an answer as decoding it allocates | `graph_store` `an_answer_is_weighed_as_decoding_it_allocates`, a counting allocator around the system's, on the measuring thread only (debug build, Apple M5 Pro, 48 GB): 2,000 node rows of 8 properties (346,900 bytes of JSON) and 50 rows of 20,000 characters (1,001,758 bytes) decoded as a `ReadOutput` | Node rows: 4,869,438 bytes allocated (14.0 times the text), weighed 4,901,677 (0.7% over); the weight before was 1,274,060 (26%), so the 64 MiB budget held about 250 MB. Long text: 1,041,100 allocated, weighed 1,042,139. Each string is counted at its length, each array at its slots, and each object at its entries and hash index as `IndexMap` grows them (`object_room`) |

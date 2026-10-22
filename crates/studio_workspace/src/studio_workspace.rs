@@ -6198,6 +6198,7 @@ mod tests {
                 commit: Some("c2".into()),
             },
             follow_up,
+            merge: None,
         };
         let (label, action) =
             committed_follow_up(&entry(Some(graph_store::FollowUp::UndoDelete)), "c2");
@@ -6281,6 +6282,7 @@ mod tests {
                     description: description.into(),
                     outcome,
                     follow_up,
+                    merge: None,
                 });
                 session.outcomes_logged += 1;
                 cx.emit(SessionEvent::ActivityChanged);
@@ -6388,6 +6390,7 @@ mod tests {
                 description: description.into(),
                 outcome,
                 follow_up,
+                merge: None,
             });
             session.outcomes_logged += 1;
             cx.emit(SessionEvent::ActivityChanged);

@@ -253,6 +253,7 @@ mod tests {
             description: "add".into(),
             outcome,
             follow_up: None,
+            merge: None,
         };
         let proposal = said(&entry(OutcomeKind::Held {
             commit: "01JPROPOSALAA".into(),

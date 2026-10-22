@@ -168,12 +168,16 @@ place), X (designed on 0.13; the better routes are deferred).
   off until main's history settles it: open History to check, or Refresh to read it again."):
   a second merge would cancel the read and be sent while the first may still land. Revert and
   Edit stay off with it, saying a merge may be running: a fix could land on either side of the
-  merge (since 2026-10-21). Refresh reads the history again, never the merge. The lost merge,
-  with the head it was sent for and the target's head before it, is kept for the session's
-  reviews of the same branches: one opened again, or open elsewhere and read again, starts from
-  it and reads the history for it, offering neither Merge nor a fix meanwhile (since
-  2026-10-21). The session's outcome log cannot carry this today: it names the branches only in
-  its description and records neither head, so the review keeps its own record. History read to its end without the merge lets
+  merge (since 2026-10-21). Refresh reads the history again, never the merge. The lost merge is
+  one entry of the session's outcome log, whose fields are the source and target, the source
+  head the merge was sent for, the target's head just before it was sent and the outcome; its
+  description is for display alone. Every review of the same branches in the session starts
+  from the log's newest merge of them: one opened again, or open elsewhere and read again,
+  reads the history for it, offering neither Merge nor a fix meanwhile (since 2026-10-21).
+  What a read of the history shows, landed or not shown, is recorded on that entry, so the
+  session's other reviews of the same branches take it without a Refresh of their own, and a
+  merge shown to have landed stays so. The log keeps a merge that may still land past its
+  newest 1,000 writes (since 2026-10-21). History read to its end without the merge lets
   Merge run again, saying the first may still land ("… does not show it yet, but the merge may
   still land. Studio did not retry; open History to check before merging again."), and a merge
   it shows ends the review's merging as a committed one does (since 2026-10-21).
@@ -229,6 +233,7 @@ place), X (designed on 0.13; the better routes are deferred).
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | A lost merge is one entry of the session's outcome log, which every review of its branches reads | `review` `a_review_opened_after_the_one_that_merged_closed_starts_from_the_log` (the review that sent a merge answered 504 closed and released, main's history unreadable); `settling_a_lost_merge_in_one_review_lets_another_merge` (a review open since before the merge and one opened after it; the sender's Refresh reads main down to m2 without the merge); `a_lost_merge_keeps_merge_off_until_history_settles_it` and `a_lost_merge_is_looked_for_only_above_the_head_it_was_sent_over`, unchanged in what they assert; `graph_store` `a_merge_whose_deletion_was_refused_says_the_branch_stays` and `the_activity_log_keeps_the_newest_writes`, extended | The entry holds main, `feature`, f2 sent over m2 and the 504 as fields; the review opened after the first closed starts from it alone, reads main's history for f2 and sends neither the merge nor a fix. The sender's read records "not shown" on the entry: the review open since before offers Merge and its refused Revert again, the one opened after takes "not shown" without reading, and its merge is sent. A merge recorded as landed stays so; a lost merge not settled outlives 1,001 later writes, a settled one does not. Before, the review kept a second, per-session record of lost merges beside the log, whose entry named the branches only in its description |
 | 2026-10-21 | A lost merge keeps the fixes off too, and a reopened review keeps Merge off | `review` `a_lost_merge_keeps_merge_off_until_history_settles_it`, extended: Revert while main's history cannot be read; a second review of feature into main opened after the lost merge; a Refresh after it settles | Revert is refused ("A merge is running, or may be") and no `/mutate` is sent; the reopened review starts from the lost merge, reads main's history for it, and sends neither the merge nor a fix; settled as not shown, fixes and Merge are offered again, and a Refresh after that forgets it, so a review opened since starts idle. Before, Revert stayed on while the banner said Merge stays off, and a reopened tab offered Merge at once |
 | 2026-10-21 | A lost merge is looked for only above the target's head before it | `review` `a_lost_merge_is_looked_for_only_above_the_head_it_was_sent_over` (main of 10,501 commits, its head m10500 when the merge was checked, the merge answered 504 and never landed) | One page of main read, the merge not shown, Merge offered again. Before, 20 pages and "not reached", repeated at every Refresh, so Merge stayed off in that tab for good |
 | 2026-10-21 | A new token leaves nothing the old one read | `review` `a_new_credential_reads_the_review_again`, extended: the new token refused the merge base | At once and after the refused read: no review data, cards, rows, scope-menu commits, names, dry run or bound head; the review reads as failed; the person's reviewed mark is kept; allowed again, a scope change reads the merge base. Before, the old token's counts, banners and scope menu stayed, for good after a refused read, and a scope change reused the old token's merge base and commits |
