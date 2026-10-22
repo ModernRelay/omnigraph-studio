@@ -112,6 +112,26 @@ mod tests {
         assert_eq!(update.signature, "c2lnbmF0dXJl");
     }
 
+    /// The manifest `script/release-files.py` writes, which its own test compares with.
+    #[test]
+    fn the_manifest_a_release_publishes_is_read() {
+        let written = include_str!("../tests/fixtures/latest.json");
+        let release = parse(written.as_bytes(), "macos-aarch64").unwrap();
+        assert_eq!(release.version, Version::new(0, 3, 0));
+        let update = release.update.expect("macOS is offered the update");
+        assert_eq!(
+            update.url,
+            "https://github.com/ModernRelay/omnigraph-studio/releases/download/v0.3.0/Omnigraph-Studio-0.3.0-arm64.app.tar.gz"
+        );
+        assert_eq!(update.signature, "c2lnbmF0dXJl");
+        assert!(
+            parse(written.as_bytes(), "linux-x86_64")
+                .unwrap()
+                .update
+                .is_none()
+        );
+    }
+
     #[test]
     fn a_platform_without_an_entry_only_learns_the_version() {
         let release = parse(MANIFEST.as_bytes(), "linux-x86_64").unwrap();

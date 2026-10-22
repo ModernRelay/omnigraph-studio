@@ -80,6 +80,7 @@ jobs:
       - run: python3 script/check-layers.py
       - run: python3 script/check-design-tokens.py
       - run: python3 script/check-brand.py
+      - run: python3 script/test_release_files.py
 
   deny:
     runs-on: ubuntu-24.04
