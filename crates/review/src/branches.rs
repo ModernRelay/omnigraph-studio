@@ -1,10 +1,10 @@
 //! Branches (spec 008): the sidebar list, switching, and the create and delete dialogs.
 //!
 //! OmniGraph's `GET /branches` returns names only (E9 waits on branch details), so each
-//! branch's last commit comes from its own `GET /commits?branch=`, for up to
-//! [`DETAIL_LIMIT`] branches.
+//! branch's last commit comes from its own `GET /commits?branch=`, for the branches the list
+//! draws: none while it is hidden, and those in view while it is shown.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use editor::{Editor, EditorEvent};
@@ -25,9 +25,6 @@ use ui::{Tooltip, right_click_menu};
 use crate::view::open_review;
 use studio_workspace::ModalView;
 
-/// Branches whose last commit is read for the list.
-const DETAIL_LIMIT: usize = 20;
-
 /// The branch every review and merge targets.
 pub const TARGET: &str = "main";
 
@@ -43,12 +40,20 @@ pub struct BranchList {
     workspace: WeakEntity<Workspace>,
     session: Option<Entity<GraphSession>>,
     details: HashMap<String, BranchDetail>,
+    /// The branches whose head has been asked for since it last could have moved: read, or
+    /// being read. A commit to one, or a change of the list, asks again for those drawn.
+    asked: HashSet<String>,
+    /// Each branch's head read, by branch: a newer one takes the place of one still out.
+    reads: HashMap<String, Task<()>>,
+    /// Branches drawn without their head asked for, and whether a read of them is due once the
+    /// frame that drew them is out ([`Self::read_drawn`]).
+    unread: Vec<String>,
+    unread_due: bool,
     /// The list's scroll: it draws only the rows in view.
     scroll: UniformListScrollHandle,
     /// How many rows the list has built, for the test that it builds only those in view.
     #[cfg(test)]
     rows_drawn: usize,
-    _details_task: Option<Task<()>>,
     _workspace_subscription: Option<Subscription>,
     _session_subscription: Option<Subscription>,
 }
@@ -66,10 +71,13 @@ impl BranchList {
             workspace: workspace.clone(),
             session: None,
             details: HashMap::new(),
+            asked: HashSet::new(),
+            reads: HashMap::new(),
+            unread: Vec::new(),
+            unread_due: false,
             scroll: UniformListScrollHandle::new(),
             #[cfg(test)]
             rows_drawn: 0,
-            _details_task: None,
             _workspace_subscription: None,
             _session_subscription: None,
         };
@@ -94,62 +102,96 @@ impl BranchList {
             return;
         }
         self._session_subscription = session.as_ref().map(|session| {
-            cx.subscribe(session, |this, _, event: &SessionEvent, cx| match event {
-                SessionEvent::BranchesChanged | SessionEvent::Committed { .. } => {
-                    this.load_details(cx)
-                }
-                SessionEvent::BranchChanged => cx.notify(),
-                _ => {}
-            })
+            cx.subscribe(
+                session,
+                |this, session, event: &SessionEvent, cx| match event {
+                    SessionEvent::BranchesChanged => this.branches_changed(&session, cx),
+                    // The session forgot the branch's head: a read still out answers for before.
+                    SessionEvent::Committed { branch } => {
+                        this.asked.remove(branch);
+                        this.reads.remove(branch);
+                        cx.notify();
+                    }
+                    SessionEvent::BranchChanged => cx.notify(),
+                    _ => {}
+                },
+            )
         });
         self.session = session;
         // The details shown and the reads still out are the previous graph's: a read landing
         // after the switch would name its heads on this graph's rows. This graph's are read
-        // once its branches are.
+        // once its branches are drawn.
         self.details.clear();
-        self._details_task = None;
-        self.load_details(cx);
+        self.asked.clear();
+        self.reads.clear();
+        self.unread.clear();
         cx.notify();
     }
 
-    /// Each branch's head commit, read alone (or from a commit list the session holds): after
-    /// a commit, only the branch it landed on is read again.
-    fn load_details(&mut self, cx: &mut Context<Self>) {
+    /// The branch list changed. A branch made, or deleted and made again, has another head, so
+    /// those drawn are asked for again, the session answering the others from what it holds;
+    /// one no longer listed is forgotten with its read.
+    fn branches_changed(&mut self, session: &Entity<GraphSession>, cx: &mut Context<Self>) {
+        let listed = session.read(cx).branches.loaded();
+        let listed = |branch: &String| listed.is_some_and(|list| list.contains(branch));
+        self.details.retain(|branch, _| listed(branch));
+        self.reads.retain(|branch, _| listed(branch));
+        self.asked.clear();
+        cx.notify();
+    }
+
+    /// Notes the branches of `drawn` whose head is still to be asked for, to read once the
+    /// frame is out: a list hidden in its dock is not drawn, so it asks for none, and a shown
+    /// one only for the rows in view. Each is asked for once until it could have moved.
+    fn note_drawn(&mut self, drawn: &[String], window: &mut Window, cx: &mut Context<Self>) {
+        for branch in drawn {
+            if !self.asked.contains(branch) && !self.unread.contains(branch) {
+                self.unread.push(branch.clone());
+            }
+        }
+        if !self.unread.is_empty() && !std::mem::replace(&mut self.unread_due, true) {
+            cx.defer_in(window, |this, _, cx| {
+                this.unread_due = false;
+                this.read_drawn(cx);
+            });
+        }
+    }
+
+    /// Each drawn branch's head commit, read alone (or from a commit list the session holds:
+    /// after a commit, only the branch it landed on is read again).
+    fn read_drawn(&mut self, cx: &mut Context<Self>) {
+        let unread = std::mem::take(&mut self.unread);
         let Some(session) = self.session.clone() else {
             return;
         };
-        let Some(branches) = session.read(cx).branches.loaded().cloned() else {
-            return;
-        };
-        let reads: Vec<_> = branches
-            .into_iter()
-            .take(DETAIL_LIMIT)
-            .map(|branch| {
-                let read =
-                    session.update(cx, |session, cx| session.head_commit(&branch, false, cx));
-                (branch, read)
-            })
-            .collect();
-        self._details_task = Some(cx.spawn(async move |this, cx| {
-            let mut details = HashMap::new();
-            for (branch, read) in reads {
-                if let Ok(Some(head)) = read.await {
-                    details.insert(
-                        branch,
-                        BranchDetail {
-                            head: head.graph_commit_id,
-                            created_at: head.created_at,
-                            actor: head.actor_id,
-                        },
-                    );
-                }
+        for branch in unread {
+            if !self.asked.insert(branch.clone()) {
+                continue;
             }
-            this.update(cx, |this, cx| {
-                this.details = details;
-                cx.notify();
-            })
-            .ok();
-        }));
+            let read = session.update(cx, |session, cx| session.head_commit(&branch, false, cx));
+            let key = branch.clone();
+            let task = cx.spawn(async move |this, cx| {
+                let head = read.await;
+                this.update(cx, |this, cx| {
+                    match head {
+                        Ok(Some(head)) => {
+                            let detail = BranchDetail {
+                                head: head.graph_commit_id,
+                                created_at: head.created_at,
+                                actor: head.actor_id,
+                            };
+                            this.details.insert(branch, detail);
+                        }
+                        _ => {
+                            this.details.remove(&branch);
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+            });
+            self.reads.insert(key, task);
+        }
     }
 
     fn render_branch(
@@ -309,13 +351,19 @@ impl BranchList {
     }
 
     /// The rows in `range` of the list: the branches it reaches, each with its right-click menu
-    /// (built only when it opens), then "New branch…" after the last.
-    fn render_rows(&mut self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    /// (built only when it opens), then "New branch…" after the last. The heads of the branches
+    /// drawn are read after the frame ([`Self::note_drawn`]).
+    fn render_rows(
+        &mut self,
+        range: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         #[cfg(test)]
         {
             self.rows_drawn += range.len();
         }
-        let Some(session) = self.session.as_ref() else {
+        let Some(session) = self.session.clone() else {
             return Vec::new();
         };
         let session = session.read(cx);
@@ -323,14 +371,19 @@ impl BranchList {
             return Vec::new();
         };
         let current = session.branch.as_str();
-        range
+        let rows = range
+            .clone()
             .map(|index| match branches.get(index) {
                 Some(branch) => self
                     .render_branch(index, branch.clone(), *branch == current)
                     .into_any_element(),
                 None => Self::render_new_branch(current).into_any_element(),
             })
-            .collect()
+            .collect();
+        let end = range.end.min(branches.len());
+        let drawn = branches[range.start.min(end)..end].to_vec();
+        self.note_drawn(&drawn, window, cx);
+        rows
     }
 }
 
@@ -352,7 +405,9 @@ impl Render for BranchList {
             return uniform_list(
                 "branch-rows",
                 rows,
-                cx.processor(|this, range: Range<usize>, _window, cx| this.render_rows(range, cx)),
+                cx.processor(|this, range: Range<usize>, window, cx| {
+                    this.render_rows(range, window, cx)
+                }),
             )
             .track_scroll(&self.scroll)
             .size_full()
@@ -1003,16 +1058,38 @@ mod tests {
     use super::*;
     use crate::view::tests::fake_server;
 
+    /// The branches whose head was asked for, sorted: the reads go out together, in no set order.
+    fn heads_asked(asked: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+        let mut heads: Vec<String> = asked
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|request| {
+                let (path, rest) = request.split_once('?')?;
+                if !path.ends_with("/commits") {
+                    return None;
+                }
+                let query = rest.split(' ').next()?;
+                query
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("branch="))
+                    .map(str::to_owned)
+            })
+            .collect();
+        heads.sort();
+        heads
+    }
+
     /// The sidebar's branches are a list that builds only the rows in view, however many
     /// branches the graph has: of 2,000, a dock of 320 pt builds a screenful, not every row and
-    /// its menu at every frame.
+    /// its menu at every frame, and reads the heads of those rows alone, once.
     #[gpui::test]
     async fn the_branch_list_builds_only_the_rows_in_view(cx: &mut gpui::TestAppContext) {
         cx.update(studio_theme::init_test);
         let names: Vec<String> = std::iter::once("main".to_owned())
             .chain((1..2_000).map(|i| format!("feature-{i:04}")))
             .collect();
-        let (session, _) = fake_server(
+        let (session, asked) = fake_server(
             move |path, _, _| {
                 if path.ends_with("/branches") {
                     (200, json!({ "branches": names }))
@@ -1042,6 +1119,116 @@ mod tests {
         let drawn = list.read_with(cx, |list, _| list.rows_drawn);
         assert!(drawn > 0, "the rows in view are drawn");
         assert!(drawn < 100, "{drawn} rows built of 2,001");
+        // The heads read are those of the first rows, the ones in view, each once however often
+        // they are drawn (`drawn` also counts the row the list measures).
+        let heads = heads_asked(&asked);
+        assert!(!heads.is_empty() && heads.len() <= drawn, "{heads:?}");
+        let mut in_view: Vec<String> = std::iter::once("main".to_owned())
+            .chain((1..heads.len()).map(|i| format!("feature-{i:04}")))
+            .collect();
+        in_view.sort();
+        assert_eq!(heads, in_view);
+    }
+
+    /// Draws the branch list, cached, while it shows it, as a dock draws its active panel.
+    struct DockStandIn {
+        list: Entity<BranchList>,
+        shown: bool,
+    }
+
+    impl Render for DockStandIn {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(260.)).h(px(320.)).when(self.shown, |dock| {
+                dock.child(
+                    gpui::AnyView::from(self.list.clone())
+                        .cached(gpui::StyleRefinement::default().size_full()),
+                )
+            })
+        }
+    }
+
+    /// A branch list hidden in its dock reads no branch's head, as the window opens or when the
+    /// branches change: each read takes one of the session's read slots from what is shown.
+    /// Shown, it reads each head once; a change of the list while it is hidden is read when it
+    /// is shown again, the heads the session holds answered without a request.
+    #[gpui::test]
+    async fn a_hidden_branch_list_reads_no_heads_until_shown(cx: &mut gpui::TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let listed = std::sync::Arc::new(std::sync::Mutex::new(vec![
+            "main".to_owned(),
+            "feature".to_owned(),
+            "spike".to_owned(),
+        ]));
+        let served = listed.clone();
+        let (session, asked) = fake_server(
+            move |path, query, _| {
+                if path.ends_with("/branches") {
+                    (200, json!({ "branches": *served.lock().unwrap() }))
+                } else if path.ends_with("/commits") {
+                    let branch = query
+                        .split('&')
+                        .find_map(|pair| pair.strip_prefix("branch="))
+                        .unwrap_or_default();
+                    let commit = json!({ "graph_commit_id": format!("{branch}-1"), "graph_manifest_version": 1, "kind": "published", "created_at": 0, "actor_id": "act-alice" });
+                    (200, json!({ "commits": [commit] }))
+                } else {
+                    (404, json!({ "error": "not here" }))
+                }
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        let held = session.clone();
+        let (dock, cx) = cx.add_window_view(move |window, cx| {
+            let list =
+                cx.new(|cx| BranchList::new(WeakEntity::new_invalid(), Some(held), window, cx));
+            DockStandIn { list, shown: false }
+        });
+        cx.run_until_parked();
+        let show = |shown: bool, cx: &mut gpui::VisualTestContext| {
+            dock.update(cx, |dock, cx| {
+                dock.shown = shown;
+                cx.notify();
+            });
+            cx.run_until_parked();
+        };
+        assert!(heads_asked(&asked).is_empty(), "nothing read while hidden");
+        session.update(cx, |session, cx| session.reload_branches(cx));
+        cx.run_until_parked();
+        assert!(
+            heads_asked(&asked).is_empty(),
+            "nor when the branches change"
+        );
+
+        show(true, cx);
+        assert_eq!(heads_asked(&asked), ["feature", "main", "spike"]);
+        let list = dock.read_with(cx, |dock, _| dock.list.clone());
+        list.read_with(cx, |list, _| {
+            assert_eq!(list.details.len(), 3, "{:?}", list.details);
+            assert_eq!(list.details["feature"].head, "feature-1");
+        });
+        // Drawn again, nothing is read again.
+        list.update(cx, |list, cx| {
+            list.rows_drawn = 0;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        list.read_with(cx, |list, _| assert!(list.rows_drawn > 0, "drawn again"));
+        assert_eq!(heads_asked(&asked).len(), 3);
+
+        // A branch made while the list is hidden is read when it is shown, the others from
+        // the heads the session holds.
+        show(false, cx);
+        listed.lock().unwrap().push("late".into());
+        session.update(cx, |session, cx| session.reload_branches(cx));
+        cx.run_until_parked();
+        assert_eq!(heads_asked(&asked).len(), 3, "nothing read while hidden");
+        show(true, cx);
+        assert_eq!(heads_asked(&asked), ["feature", "late", "main", "spike"]);
+        list.read_with(cx, |list, _| {
+            assert_eq!(list.details["late"].head, "late-1");
+            assert_eq!(list.details.len(), 4);
+        });
     }
 
     /// The details shown are the shown graph's own: a switch to another graph while the first
