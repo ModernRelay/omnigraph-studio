@@ -94,15 +94,20 @@ a token, as today.
 
 ### Discovery
 
-1. **Protected-resource metadata.** Take the URL from the challenge's `resource_metadata`. With
-   no challenge yet (a managed target before its first request), derive it as RFC 9728 does
-   from the endpoint: `https://host/.well-known/oauth-protected-resource` followed by the
-   endpoint's path, if it has one. Never assume the metadata sits at the host's root otherwise.
-   `GET` it over HTTPS (HTTP only for a loopback endpoint), 10 seconds, at most 64 KiB, JSON.
-2. **Check it.** `resource` must be an absolute URL on the endpoint's origin; the token is
-   requested for exactly that resource and sent on REST and `/mcp` alike (RFC #1017, A2).
-   `authorization_servers` must name exactly one issuer, an HTTPS URL; several are refused for
-   now (open question 8). `bearer_methods_supported`, when present, must include `header`.
+1. **Protected-resource metadata.** Take the URL from the challenge's `resource_metadata`. The
+   server derives it from its resource identifier (RFC 9728 §3.1), so it can name another
+   origin than the endpoint's: a managed target's resource is published by the managed control
+   plane. With no challenge yet, Studio sends one request without a credential to get one; it
+   never assumes the metadata sits at the host's root. `GET` it over HTTPS (HTTP only for a
+   loopback endpoint), 10 seconds, at most 64 KiB, JSON.
+2. **Check it.** `resource` must be an absolute HTTPS URL (HTTP only on loopback) on an origin
+   Studio expects: for a server target, the endpoint's origin; for a managed target, the origin
+   of the target's profile `api`, the managed control plane that publishes it. A resource on any
+   other origin is refused, so a data host cannot have Studio fetch a token for someone else's
+   resource. The token is requested for exactly that resource and sent only to the endpoint,
+   on REST and `/mcp` alike (RFC #1017, A2). `authorization_servers` must name exactly one
+   issuer, an HTTPS URL; several are refused for now (open question 7).
+   `bearer_methods_supported`, when present, must include `header`.
 3. **Authorization-server metadata.** Fetch RFC 8414's
    `/.well-known/oauth-authorization-server` for the issuer (path inserted after the host),
    else OpenID Connect discovery's `/.well-known/openid-configuration`; same bounds. Its
@@ -149,11 +154,12 @@ Studio restarts; they hold no secrets.
   `redirect_uri`, `client_id`, `code_verifier`, `resource`), 15 seconds, at most 64 KiB. The
   answer must have `token_type` `Bearer`, an `access_token` and an `expires_in` of 300 or less.
 - **Checking the token.** Studio reads the access token's JWT claims without verifying its
-  signature (the server does that) and refuses to use it unless `aud` is exactly the resource
-  (a string, or an array of that one string) and `iss` the issuer. `sub` is the account. When
-  the target names an organization (a managed profile's `organization_id`), the token's
-  organization claim must match, or the sign-in is refused with both organizations named.
-  Studio never asks for or sends an ID token.
+  signature (the server does that, with the same claims) and refuses to use it unless `aud` is
+  one string equal to the resource, `iss` the issuer and `client_id` Studio's own. `sub` is the
+  account and `org_id` its organization. When the target names an organization (a managed
+  profile's `organization_id`), `org_id` must equal it, or the sign-in is refused with both
+  organizations named; a self-hosted server's organization is not published, so Studio shows
+  `org_id` and leaves the check to the server. Studio never asks for or sends an ID token.
 
 ### Custody
 
@@ -175,12 +181,14 @@ Studio restarts; they hold no secrets.
 - An access token is refreshed when 60 seconds or less of its life remain and the server is in
   use, and before a request that would otherwise send an expired one. Nothing refreshes for a
   server no view reads.
-- One refresh runs at a time per issuer and resource, for every view and window; others wait
-  for its answer.
+- One refresh runs at a time per client, issuer, resource and account, for every view and
+  window; others wait for its answer. These tokens are never mixed with a static token or the
+  CLI's credentials.
 - Every refresh sends `grant_type=refresh_token`, `refresh_token`, `client_id` and `resource`;
   without the resource an authorization server may issue a token for a default audience. The
   new token is checked as a new sign-in's is.
-- A rotated refresh token replaces the keychain item before the new access token is used.
+- Refresh tokens rotate: the one returned replaces the keychain item before the new access
+  token is used.
 - `invalid_grant` signs the person out of that server ("Signed out: sign in again"). A refresh
   that fails or times out may have rotated the refresh token anyway; Studio tries once more
   after 5 seconds, and after a second failure asks the person to sign in again. No refresh is
@@ -228,7 +236,8 @@ Studio restarts; they hold no secrets.
     OIDC identity trust (which also admits the resource's host for MCP);
   - register Studio as a public client with loopback redirects, or accept its Client ID
     Metadata Document;
-  - expose the protected-resource metadata and `/mcp` on public data hosts.
+  - expose the protected-resource metadata and `/mcp` on public data hosts, and give each data
+    host a public route: OAuth does not make a private serving endpoint reachable.
 
   Its authorization server is AuthKit. Studio must not depend on `/openapi.json` being
   reachable through every deployment's proxy.
@@ -252,29 +261,30 @@ Studio restarts; they hold no secrets.
 - The implementation, after the prerequisites and open questions are settled.
 - Whether managed agents use the CLI's relay or are OAuth clients themselves (RFC #1017, A3;
   #1025's last item).
-- Several authorization servers for one resource (open question 8).
+- Several authorization servers for one resource (open question 7).
 - Signing in from a link (`omnigraph-studio://open?target=…`): a link never starts a sign-in on
   its own; it opens the server, which then shows Sign in needed.
 
 ## Open questions
 
-1. Where Studio's Client ID Metadata Document is published, and whether AuthKit accepts a
-   metadata-document client ID or Studio must be pre-registered (and with which ID per
-   environment).
-2. Whether the managed control plane's authorization server accepts a loopback redirect on
-   any port (RFC 8252 §7.3) for a public client.
+1. Where Studio's Client ID Metadata Document is published, and whether the managed control
+   plane's authorization server accepts it for Studio, or Studio is pre-registered there (and
+   with which ID per environment). The managed control plane prefers metadata-document
+   clients and keeps pre-registration for clients that need it.
+2. Whether that authorization server accepts a loopback redirect on any port (RFC 8252 §7.3)
+   for a public client.
 3. Which scopes Studio requests so that a refresh token is issued (for example
-   `offline_access`), and the refresh token's lifetime and rotation.
-4. How a person in several organizations gets a token for the server's organization: the
-   hosted flow's organization choice, or a hint Studio sends. A self-hosted OIDC server's
-   metadata names no organization, so Studio cannot check it before the server refuses.
-5. Which resource identifier managed data hosts publish: the service root or `/mcp`. Studio
-   accepts any resource on the endpoint's origin; the server must accept that token on every
-   route Studio calls.
-6. Which claim names the account for display (`sub` alone, or an email), and the name of the
-   organization claim in AuthKit's access tokens.
-7. Whether the authorization server publishes a `revocation_endpoint`.
-8. What to do with metadata naming several authorization servers.
+   `offline_access`), and how long a refresh token lasts. That they rotate and must repeat the
+   resource is settled.
+4. How a person in several organizations gets a token for the target's organization: the
+   hosted flow's organization choice, or a hint Studio sends.
+5. Whether a managed target's resource on the managed control plane's origin, accepted under
+   the profile-`api` rule above, is acceptable to a strict RFC 9728 §3.3 reading (the resource
+   should match the URL requested), or the resource should be named on the data host.
+6. What to show for the account: `sub` is an opaque identifier, and Studio requests no ID
+   token.
+7. What to do with metadata naming several authorization servers (none does today).
+8. Whether the authorization server publishes a `revocation_endpoint`.
 
 ## Validation log
 
@@ -282,6 +292,8 @@ Studio restarts; they hold no secrets.
 |---|---|---|---|
 | 2026-10-21 | The server's challenge, metadata and token rules are as stated | OmniGraph main `7fff9dfd`: `crates/omnigraph-server/src/challenge.rs` (tests render `Bearer resource_metadata="…/.well-known/oauth-protected-resource/mcp"` and the `error="invalid_token"` form), `src/oidc_identity.rs` `resource_metadata`, `src/handlers.rs` (the two well-known routes), `docs/user/operations/server.md` and `mcp.md` | As written under What exists today; the metadata names one issuer and only `header` bearer use |
 | 2026-10-21 | GPUI keeps one keychain item per key string | Zed `v1.23.2` `crates/gpui/src/platform.rs` (`write_credentials(url, username, password)`, `read_credentials(url)`), `crates/gpui_macos/src/platform.rs` (`kSecAttrServer` = the key, `kSecAttrAccount` = the user) | A write replaces the item for its key; a read returns that one item's user and secret |
+| 2026-10-21 | The challenge's metadata URL follows the resource, and the server checks the claims Studio reads | OmniGraph main `7fff9dfd`: `crates/omnigraph-server/src/mcp.rs` (`advertised_metadata_url`: the well-known prefix before the resource's path, on the resource's origin), `src/oidc_identity.rs` (required `iss`, `sub`, `aud`, `iat`, `exp`; `aud` one string equal to the audience, `org_id` equal to the binding's organization, a bounded `client_id`) | A resource on another origin moves the metadata there; an `aud` array is refused, so Studio requires a string |
+| 2026-10-21 | The managed control plane's own design agrees with this plan | Its identity and client specifications, read at their current head (a private repository, not cited here) | It publishes each managed cluster's resource and metadata itself, on its own origin, not on the data host; it prefers metadata-document clients; refresh tokens rotate and must repeat the resource; a client never silently opens a browser or replays a write; OAuth access needs a public route to the data host. Its OAuth profile is built, off by default and enabled per deployment |
 | 2026-10-21 | A managed target can name its data endpoint without network access | OmniGraph main `docs/user/cli/targets.md` ("Configure destinations", `target inspect`) | `endpoint` is optional on a managed target and required for data operations |
 
 ## Corrections
