@@ -9,6 +9,18 @@ publish.workspace = true
 path = "src/studio_update.rs"
 
 [dependencies]
+anyhow = { workspace = true }
+cargo-packager-updater = { workspace = true }
+flate2 = { workspace = true }
+semver = { workspace = true }
+serde_json = { workspace = true }
+tar = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
