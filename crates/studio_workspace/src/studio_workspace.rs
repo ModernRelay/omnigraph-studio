@@ -113,14 +113,47 @@ struct Toast {
     /// Time left on screen; `None` stays until dismissed (errors, spec 002).
     remaining: Option<Duration>,
     hovered: bool,
+    /// How many errors this toast stands for, folded into it off a full stack
+    /// ([`Workspace::make_room`]); 0 for a toast that stands for itself.
+    folded: usize,
 }
 
 impl Toast {
-    /// Whether the toast stays when the stack is full ([`Workspace::make_room`]): an error,
-    /// which stays until dismissed, and an Undo, which only this toast offers.
+    /// Whether the toast is not simply taken away when the stack is full
+    /// ([`Workspace::make_room`]): an error, which stays until dismissed and is folded at
+    /// most, and an Undo, which only this toast offers.
     fn kept(&self) -> bool {
         self.kind == ToastKind::Error || self.action.as_ref().is_some_and(|f| f.undoes)
     }
+
+    /// The toast that stands for `count` errors folded off a full stack. It stays until
+    /// dismissed, as they would have, and opens the activity log, which lists each write's
+    /// refusal and unknown outcome with its reason.
+    fn folded_errors(id: usize, count: usize) -> Self {
+        Self {
+            id,
+            kind: ToastKind::Error,
+            message: folded_errors_text(count),
+            action: Some(FollowUp {
+                label: "Open activity".into(),
+                action: Box::new(studio_actions::workspace::ActivatePanel {
+                    id: ACTIVITY_PANEL.into(),
+                }),
+                on: None,
+                undoes: false,
+            }),
+            remaining: None,
+            hovered: false,
+            folded: count,
+        }
+    }
+}
+
+/// The text of the toast that stands for `count` errors folded off the stack, which takes the
+/// place of the oldest of them: so they are earlier than every error still shown. A fold starts
+/// at two, the fewest that makes room.
+fn folded_errors_text(count: usize) -> SharedString {
+    format!("{count} earlier errors").into()
 }
 
 struct FollowUp {
@@ -2219,6 +2252,7 @@ impl Workspace {
             action,
             remaining,
             hovered: false,
+            folded: 0,
         });
         cx.notify();
         if remaining.is_none() {
@@ -2255,11 +2289,14 @@ impl Workspace {
         .detach();
     }
 
-    /// Makes room for one more toast within [`TOASTS_SHOWN`], past which they would cover the
-    /// window: the oldest toast that is not kept ([`Toast::kept`]) goes, one with no follow-up
-    /// before one with. An Undo and an error are never taken away: while every toast
-    /// shown is one of those, the stack grows past the limit, and the next toast that is not
-    /// kept takes the place of the one before it.
+    /// Makes room for one more toast within [`TOASTS_SHOWN`], past which they would run below
+    /// the window's edge, the newest last: the oldest toast that is not kept ([`Toast::kept`])
+    /// goes, one with no follow-up before one with. While every toast shown is kept, errors
+    /// fold instead ([`Self::fold_oldest_error`]), so a run of them, such as an agent's
+    /// refused writes, takes the place of one. An Undo, which only its toast offers, is never
+    /// taken away nor folded: the stack passes the limit only when Undos fill it, with at most
+    /// one other toast and the one coming. Undos come only from deletes the person confirmed,
+    /// and each goes after [`TOAST_DURATION`].
     fn make_room(&mut self) {
         if self.toasts.len() < TOASTS_SHOWN {
             return;
@@ -2269,9 +2306,35 @@ impl Workspace {
             .iter()
             .position(|toast| !toast.kept() && toast.action.is_none())
             .or_else(|| self.toasts.iter().position(|toast| !toast.kept()));
-        if let Some(gone) = gone {
-            self.toasts.remove(gone);
+        match gone {
+            Some(gone) => {
+                self.toasts.remove(gone);
+            }
+            None => self.fold_oldest_error(),
         }
+    }
+
+    /// One toast fewer by folding errors: the oldest error shown on its own joins the toast
+    /// that counts errors folded, or, with none up, the two oldest become that toast, in the
+    /// older's place. Fewer than that up, nothing folds.
+    fn fold_oldest_error(&mut self) {
+        let alone = |toast: &Toast| toast.kind == ToastKind::Error && toast.folded == 0;
+        let Some(oldest) = self.toasts.iter().position(alone) else {
+            return;
+        };
+        if let Some(fold) = self.toasts.iter_mut().find(|toast| toast.folded > 0) {
+            fold.folded += 1;
+            fold.message = folded_errors_text(fold.folded);
+            self.toasts.remove(oldest);
+            return;
+        }
+        let Some(next) = self.toasts[oldest + 1..].iter().position(alone) else {
+            return;
+        };
+        self.toasts.remove(oldest + 1 + next);
+        let id = self.next_toast;
+        self.next_toast += 1;
+        self.toasts[oldest] = Toast::folded_errors(id, 2);
     }
 
     pub fn dismiss_toast(&mut self, id: usize, cx: &mut Context<Self>) {
@@ -6455,7 +6518,8 @@ mod tests {
 
     /// A full stack takes away a toast with no follow-up first, then the oldest with one, but
     /// never an Undo or an error: an agent's four commits after a delete leave the delete's
-    /// Undo up, and a stack of nothing but those grows rather than lose one.
+    /// Undo up. A stack of nothing but those makes room by folding its two oldest errors into
+    /// one toast that counts them.
     #[gpui::test]
     fn an_undo_and_an_error_stay_when_toasts_overflow(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
@@ -6521,14 +6585,114 @@ mod tests {
         assert_eq!(
             shown(cx),
             [
-                "A write to people is still running.",
+                "2 earlier errors",
                 "Delete Person ada · committed to main",
-                "Second error",
                 "Third error",
                 "Agent write 8 · committed to main",
             ],
-            "kept toasts fill the stack, which grows by the one after them"
+            "with kept toasts filling the stack, the two oldest errors folded; the newest commit \
+             took the place of the one before it"
         );
+    }
+
+    /// An agent's writes refused one after another fold into one toast once the stack is full,
+    /// rather than pushing what follows them below the window's edge: a delete's Undo among a
+    /// dozen refusals stays within [`TOASTS_SHOWN`], beside the newest refusals, and the folded
+    /// toast counts the rest and opens the activity log.
+    #[gpui::test]
+    fn a_dozen_errors_fold_and_leave_an_undo_within_the_stack(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+        });
+        let people = idle_session("http://b.test", "people", cx);
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update(cx, |workspace, cx| {
+            workspace.graph_order.push(people.entity_id());
+            workspace.subscribe_session(people.clone(), cx);
+            for id in ["nodes", ACTIVITY_PANEL] {
+                let view = cx.new(|_| Field);
+                workspace.add_panel(
+                    PanelPosition::Bottom,
+                    id,
+                    id,
+                    IconName::Table,
+                    view.into(),
+                    cx,
+                );
+            }
+            workspace.activate_panel("nodes", cx);
+        });
+        let refuse = |n: usize, cx: &mut gpui::VisualTestContext| {
+            let outcome = OutcomeKind::Refused {
+                message: "the policy denies it".into(),
+            };
+            log_outcome(&people, &format!("Agent write {n}"), outcome, None, cx);
+        };
+        for n in 1..=6 {
+            refuse(n, cx);
+        }
+        log_outcome(
+            &people,
+            "Delete Person ada",
+            OutcomeKind::Committed {
+                commit: Some("c7".into()),
+            },
+            Some(graph_store::FollowUp::UndoDelete),
+            cx,
+        );
+        for n in 8..=13 {
+            refuse(n, cx);
+        }
+        let refused = |n: usize| {
+            format!("Agent write {n} · refused: the policy denies it. Nothing was written.")
+        };
+        let (shown, fold) = workspace.read_with(cx, |workspace, _| {
+            let shown = workspace
+                .toasts
+                .iter()
+                .map(|toast| {
+                    let label = toast.action.as_ref().map(|f| f.label.to_string());
+                    (toast.message.to_string(), label)
+                })
+                .collect::<Vec<_>>();
+            (shown, workspace.toasts[0].id)
+        });
+        assert_eq!(
+            shown,
+            [
+                (
+                    "10 earlier errors".to_owned(),
+                    Some("Open activity".to_owned())
+                ),
+                (
+                    "Delete Person ada · committed to main".to_owned(),
+                    Some("Undo".to_owned())
+                ),
+                (refused(12), None),
+                (refused(13), None),
+            ],
+            "the Undo is up within the stack, beside the two newest refusals; the ten before \
+             them are counted"
+        );
+
+        // Pressed in the window, which holds the keyboard, as the toast's button is.
+        workspace.update_in(cx, |workspace, window, cx| {
+            window.focus(&workspace.focus_handle, cx)
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.run_follow_up(fold, window, cx)
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                (workspace.bottom.open, workspace.bottom.active_id()),
+                (true, Some(ACTIVITY_PANEL.into())),
+                "Open activity shows the activity log"
+            );
+            assert_eq!(workspace.toasts.len(), 3, "and the folded toast goes");
+        });
     }
 
     /// Toasts are told apart by the outcome, never by their text: two deletes described alike

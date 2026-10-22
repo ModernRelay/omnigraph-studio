@@ -486,10 +486,16 @@ and a 97 % fill let the text behind show through.
 - Silent success for routine work. A toast only after a durable publish, with one follow-up
   ("Committed to feature-x · View commit"); 10 s, paused on hover. Four show at once. A fifth
   takes away the oldest toast with no follow-up, else the oldest with one, but never one that
-  offers Undo, which only it offers, nor an error, which stays until dismissed: while every
-  toast shown is one of those, the stack grows past four, and the next other toast takes the
-  place of the one before it (since 2026-10-21; before, the oldest went whatever it was, so an
-  agent's four commits within a delete's ten seconds took its Undo away).
+  offers Undo, which only it offers, nor an error, which stays until dismissed (since
+  2026-10-21; before, the oldest went whatever it was, so an agent's four commits within a
+  delete's ten seconds took its Undo away). While every toast shown is one of those, errors
+  fold instead: the two oldest become one toast in the older's place, "2 earlier errors" with
+  Open activity, and each later fold adds the oldest error still shown to its count. Open
+  activity shows the activity log, which lists each write's refusal and unknown outcome with
+  its reason; another error is only counted. An Undo is never folded, so the stack passes four
+  only while Undos fill it, each gone after its 10 s (since 2026-10-21; before, such a stack
+  grew by every error, so an agent's dozen refused writes pushed what came after them, a
+  delete's Undo among it, below the window's edge).
 - A write's follow-up (View commit, Undo, Open history) names the graph written to, by its
   server's address and id as tabs identify it, and the branch, and acts there whatever the
   window shows when it is pressed: the window shows that graph on that branch first, bringing
@@ -930,6 +936,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 |---|---|---|---|
 | 2026-10-21 | The saved recent list is read as it was written | `command_palette` `saved_keys_follow_those_run` (it replaces `saved_keys_follow_those_run_and_drop_found_nodes`: a list saved after a key was run, then 55 more keys) | The saved keys followed `type:Person` in their own order, each once, up to the 50 kept. No key is dropped on reading: Studio records no `node:` key, and the filter for the ones an earlier build saved is gone with `found::is_node_key` |
 | 2026-10-21 | A full toast stack keeps an Undo and an error | `studio_workspace` `an_undo_and_an_error_stay_when_toasts_overflow` (an error, a delete with Undo, an info toast, then four commits; then two more errors and two commits); run again with the oldest toast taken away, as before | The info went first, then the oldest commits: the error, the Undo and the two newest commits showed. With four kept toasts the stack grew to five, the newest commit taking the place of the one before it. Taking the oldest away left only the four commits, the error and the Undo gone |
+| 2026-10-21 | A full toast stack folds its errors, so an Undo stays within it | `studio_workspace` `a_dozen_errors_fold_and_leave_an_undo_within_the_stack` (six refused writes, a delete with Undo, six more refusals; then Open activity pressed) and `an_undo_and_an_error_stay_when_toasts_overflow`, its second half updated (an error, the Undo and two more errors up, then two commits); both run again with the fold taken out | Four toasts: "10 earlier errors" with Open activity, the Undo, and the two newest refusals; Open activity showed the bottom dock on the activity log, and the folded toast went. In the other test the two oldest errors became "2 earlier errors" and the newest commit took the place of the one before it. Without the fold the first test showed thirteen toasts, the Undo seventh, and the other five |
 | 2026-10-21 | Spec text matches the code | `studio_workspace` `watch_graph` (every open graph's outcomes toasted, a parked one's named; a missing branch's notice only while shown); `type_table` `table.rs` (the header's `ruled`, `index < last`, and the data cell's `border_r_1`, `col + 1 < columns.len()`) | "Toasts follow the shown graph" and "every cell ruled on its right" were not what the code does; both read as it does now |
 | 2026-10-21 | A graph reopened behind sends nothing until first shown | `graph_store` at `43ad4f3`: `a_graph_opened_behind_asks_nothing_until_first_shown`, `a_503_recheck_waits_for_the_graph_to_show_and_keeps_what_it_holds`; `studio` `lib.rs` opens a window's other graphs with `open_session_behind` before `Workspace::add_session_behind` | Written here from that commit and its tests, read against the code |
 | 2026-10-21 | A commit's toast, Undo among them, is offered while other writes of its graph are out | `studio_workspace` `a_commit_is_toasted_while_another_write_of_its_graph_is_out` (a write held out with `writes_in_flight`, then a delete that can be undone and a cell's save logged); run again with `toast_outcomes`' earlier condition put back; a read of `graph_store` `GraphSession::finish_write`, the one caller of `log_outcome`, and of review's `queue_fix`/`send_next_fix` (one fix out at a time) | Both toasted, "Delete Person ada · committed to main" with Undo and the save with View commit. With the earlier condition, neither: a commit waited until no write of its graph was out. The folding never folded a review's run of fixes, which lands one fix at a time with none out, only other views' and the agent's writes |
