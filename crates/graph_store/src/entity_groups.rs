@@ -6,6 +6,11 @@
 //! the review unchanged for its relationships. When the other end has a group too, the
 //! relationship is mirrored there, so either entity tells its whole story while each change is
 //! counted, reviewed and reverted once.
+//!
+//! A relationship whose ends moved ([`FoldedChange::moved_ends`]: one edge, upserted with
+//! another end) is reviewed with the end it stayed at, as a relationship moved to another end
+//! is, its line naming the old end and the new; the old end's group mirrors it too. With both
+//! ends moved, it is reviewed where it is now, and its line names both old ends.
 
 use std::collections::{HashMap, HashSet};
 
@@ -33,6 +38,31 @@ pub struct GroupRelationship {
     /// The other end's group, when the review has one. For a mirror, the group the
     /// relationship is reviewed in.
     pub other_group: Option<usize>,
+    /// For a relationship whose ends moved ([`FoldedChange::moved_ends`]), the other end it
+    /// had before, when that end moved.
+    pub other_was: Option<EarlierEnd>,
+    /// For one whose ends both moved, the end the group's entity holds now as it was before:
+    /// another entity's.
+    pub here_was: Option<EarlierEnd>,
+}
+
+/// An end a relationship had before it moved ([`GroupRelationship::other_was`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EarlierEnd {
+    pub type_name: String,
+    pub id: String,
+    /// Its group, when the review has one.
+    pub group: Option<usize>,
+}
+
+impl EarlierEnd {
+    fn of((type_name, id): &(String, String)) -> Self {
+        Self {
+            type_name: type_name.clone(),
+            id: id.clone(),
+            group: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +137,10 @@ pub struct RelationshipEntry {
     /// For a relationship moved to another end ([`EntityGroup::repoints`]): the removed
     /// change this entry stands for too, and its other end, named.
     pub replaces: Option<(usize, String)>,
+    /// For a relationship whose ends moved ([`GroupRelationship::other_was`]): the other end
+    /// it had before, named, and when both moved, who held this entity's end before, named.
+    pub other_was: Option<String>,
+    pub here_was: Option<String>,
 }
 
 /// The relationship lines a review card draws for one entity ([`EntityGroups::lines`]): the
@@ -183,9 +217,17 @@ impl EntityGroups {
             if !change.is_edge() {
                 continue;
             }
-            let ends = change.endpoints().and_then(|(from, to)| {
-                let edge = schema?.edge(&change.type_name)?;
-                Some(((edge.from.clone(), from), (edge.to.clone(), to)))
+            let types = schema
+                .and_then(|schema| schema.edge(&change.type_name))
+                .map(|edge| (edge.from.clone(), edge.to.clone()));
+            let ends = types.as_ref().and_then(|(from_type, to_type)| {
+                let (from, to) = change.endpoints()?;
+                Some(((from_type.clone(), from), (to_type.clone(), to)))
+            });
+            // The ends it had before, when it moved.
+            let was = types.as_ref().and_then(|(from_type, to_type)| {
+                let ((from, to), _) = change.moved_ends()?;
+                Some(((from_type.clone(), from), (to_type.clone(), to)))
             });
             let Some((from, to)) = ends else {
                 home[ix] = groups.len();
@@ -206,18 +248,27 @@ impl EntityGroups {
             let added = |end: &(String, String)| {
                 node(end).is_some_and(|g| net_of(g, &groups) == Some(NetChange::Added))
             };
-            let at_source = if added(&from) {
-                true
-            } else if added(&to) {
-                false
-            } else {
-                node(&from).is_some() || node(&to).is_none()
+            let at_source = match &was {
+                // Moved: with the end it stayed at, which tells it as one change.
+                Some((was_from, _)) if *was_from == from => true,
+                Some((_, was_to)) if *was_to == to => false,
+                _ if added(&from) => true,
+                _ if added(&to) => false,
+                _ => node(&from).is_some() || node(&to).is_none(),
             };
             let (here, there, direction) = if at_source {
                 (&from, &to, Direction::Outgoing)
             } else {
                 (&to, &from, Direction::Incoming)
             };
+            // The ends that moved, each as it was: the other's, and this one's when both did.
+            let (here_was, other_was) = match &was {
+                Some((was_from, was_to)) if at_source => (Some(was_from), Some(was_to)),
+                Some((was_from, was_to)) => (Some(was_to), Some(was_from)),
+                None => (None, None),
+            };
+            let here_was = here_was.filter(|end| *end != here).map(EarlierEnd::of);
+            let other_was = other_was.filter(|end| *end != there).map(EarlierEnd::of);
             let group = match node(here) {
                 Some(group) => group,
                 None => *anchors.entry(here.clone()).or_insert_with(|| {
@@ -241,6 +292,8 @@ impl EntityGroups {
                 other_type: there.0.clone(),
                 other_id: there.1.clone(),
                 other_group: None,
+                other_was,
+                here_was,
             });
         }
 
@@ -323,32 +376,62 @@ impl EntityGroups {
             .map(|(ix, group)| ((group.type_name.as_str(), group.id.as_str()), ix))
             .collect();
         let mut mirrors: Vec<(usize, GroupRelationship)> = Vec::new();
-        let mut others: Vec<(usize, usize, usize)> = Vec::new();
+        let mut others: Vec<(usize, usize, Option<usize>)> = Vec::new();
+        // The groups of the ends a moved relationship had: `(group, line, other's, this one's)`.
+        let mut earlier: Vec<(usize, usize, Option<usize>, Option<usize>)> = Vec::new();
+        let group_of = |end: &EarlierEnd| {
+            lookup
+                .get(&(end.type_name.as_str(), end.id.as_str()))
+                .copied()
+        };
         for (ix, group) in groups.iter().enumerate() {
             for (at, relationship) in group.relationships.iter().enumerate() {
-                let Some(&other) = lookup.get(&(
-                    relationship.other_type.as_str(),
-                    relationship.other_id.as_str(),
-                )) else {
-                    continue;
+                let mirror = || GroupRelationship {
+                    change: relationship.change,
+                    direction: relationship.direction.reversed(),
+                    other_type: group.type_name.clone(),
+                    other_id: group.id.clone(),
+                    other_group: Some(ix),
+                    other_was: None,
+                    here_was: None,
                 };
+                let other = lookup
+                    .get(&(
+                        relationship.other_type.as_str(),
+                        relationship.other_id.as_str(),
+                    ))
+                    .copied();
                 others.push((ix, at, other));
-                if other != ix {
-                    mirrors.push((
-                        other,
-                        GroupRelationship {
-                            change: relationship.change,
-                            direction: relationship.direction.reversed(),
-                            other_type: group.type_name.clone(),
-                            other_id: group.id.clone(),
-                            other_group: Some(ix),
-                        },
-                    ));
+                if let Some(other) = other.filter(|other| *other != ix) {
+                    mirrors.push((other, mirror()));
+                }
+                if relationship.other_was.is_none() && relationship.here_was.is_none() {
+                    continue;
+                }
+                let other_was = relationship.other_was.as_ref().and_then(group_of);
+                let here_was = relationship.here_was.as_ref().and_then(group_of);
+                earlier.push((ix, at, other_was, here_was));
+                // The end it moved from was joined to this entity: that end's card tells it too.
+                // With both ends moved, the old ends were joined to each other, not to this one,
+                // and the line names them.
+                if relationship.here_was.is_none()
+                    && let Some(was) = other_was.filter(|was| *was != ix)
+                {
+                    mirrors.push((was, mirror()));
                 }
             }
         }
         for (ix, at, other) in others {
-            groups[ix].relationships[at].other_group = Some(other);
+            groups[ix].relationships[at].other_group = other;
+        }
+        for (ix, at, other_was, here_was) in earlier {
+            let relationship = &mut groups[ix].relationships[at];
+            if let Some(end) = &mut relationship.other_was {
+                end.group = other_was;
+            }
+            if let Some(end) = &mut relationship.here_was {
+                end.group = here_was;
+            }
         }
         for (group, mirror) in mirrors {
             groups[group].mirrors.push(mirror);
@@ -467,6 +550,15 @@ impl EntityGroups {
                         relationship.other_id.clone(),
                     ));
                 }
+                // The ends a moved relationship had, which its line names.
+                for end in [&relationship.other_was, &relationship.here_was]
+                    .into_iter()
+                    .flatten()
+                {
+                    if unchanged(end.group) && seen.insert((&end.type_name, &end.id)) {
+                        ends.push((end.type_name.clone(), end.id.clone()));
+                    }
+                }
             }
         }
         ends
@@ -518,21 +610,22 @@ impl EntityGroups {
             removed: counts.removed,
             ..RelationshipLines::default()
         };
-        let other_name = |relationship: &GroupRelationship| {
-            relationship
-                .other_group
+        // An end by its name in the review, else the one read from the graph, else its id.
+        let end_name = |type_name: &str, id: &str, group: Option<usize>| {
+            group
                 .and_then(|g| self.groups[g].change)
                 .and_then(|c| entity_name(&folded.changes[c], schema))
-                .or_else(|| {
-                    names
-                        .get(&(
-                            relationship.other_type.clone(),
-                            relationship.other_id.clone(),
-                        ))
-                        .cloned()
-                })
-                .unwrap_or_else(|| relationship.other_id.clone())
+                .or_else(|| names.get(&(type_name.to_owned(), id.to_owned())).cloned())
+                .unwrap_or_else(|| id.to_owned())
         };
+        let other_name = |relationship: &GroupRelationship| {
+            end_name(
+                &relationship.other_type,
+                &relationship.other_id,
+                relationship.other_group,
+            )
+        };
+        let earlier_name = |end: &EarlierEnd| end_name(&end.type_name, &end.id, end.group);
         let entry = |relationship: &GroupRelationship, mirror: bool| {
             let edge = &folded.changes[relationship.change];
             let other = relationship
@@ -569,6 +662,8 @@ impl EntityGroups {
                 other_type: relationship.other_type.clone(),
                 other_is_new: other.and_then(FoldedChange::net) == Some(NetChange::Added),
                 replaces,
+                other_was: relationship.other_was.as_ref().map(earlier_name),
+                here_was: relationship.here_was.as_ref().map(earlier_name),
             }
         };
         lines.entries = self
@@ -877,6 +972,94 @@ mod tests {
         );
         // Both changes are still reviewed on the card.
         assert_eq!(groups.groups[0].changes().count(), 5);
+    }
+
+    /// One edge upserted with another end is reviewed with the end it stayed at, its line
+    /// naming the old end and the new, and mirrored on the old end's card, which it left. With
+    /// both ends moved it is reviewed where it is now, its line naming both old ends, and the
+    /// old ends, joined to each other rather than to it, mirror nothing. The ends it had are
+    /// read from the graph when the review knows them only by id.
+    #[test]
+    fn a_relationship_whose_end_moved_names_the_end_it_had() {
+        let schema = SchemaModel::parse(SCHEMA).unwrap();
+        let moved = |id: &str, (from, to): (&str, &str), now: (&str, &str)| FoldedChange {
+            after: image(json!({}), Some(now)),
+            ..edge("Knows", id, from, to, NetChange::Removed)
+        };
+        let folded = folded(vec![
+            node("Person", "ana", NetChange::Changed),
+            node("Person", "dan", NetChange::Changed),
+            // Its source moved from Ana to Bob; Maya, its target, stayed.
+            moved("e1", ("ana", "maya"), ("bob", "maya")),
+            // Both ends moved.
+            moved("e2", ("cleo", "dan"), ("eve", "finn")),
+        ]);
+        assert_eq!(folded.changes[2].net(), Some(NetChange::Changed));
+        let groups = EntityGroups::new(&folded, Some(&schema));
+        assert_eq!(
+            summary(&groups, &folded),
+            [
+                "Existing Person:ana | mirror Knows -> Person:maya",
+                "Existing Person:dan",
+                "Existing Person:maya (unchanged) | Knows <- Person:bob",
+                "Existing Person:eve (unchanged) | Knows -> Person:finn",
+            ]
+        );
+        let reviewed: usize = groups.groups.iter().map(|g| g.changes().count()).sum();
+        assert_eq!(reviewed, folded.changes.len(), "each change reviewed once");
+        let ends: Vec<String> = groups
+            .unnamed_ends()
+            .into_iter()
+            .map(|(type_name, id)| format!("{type_name}:{id}"))
+            .collect();
+        assert_eq!(
+            ends,
+            [
+                "Person:maya",
+                "Person:bob",
+                "Person:eve",
+                "Person:finn",
+                "Person:cleo"
+            ],
+            "Ana and Dan are named by the review"
+        );
+        let names = NodeNames::from([
+            (("Person".into(), "bob".into()), "Bob Brown".into()),
+            (("Person".into(), "cleo".into()), "Cleo Ng".into()),
+        ]);
+        let line = |group: usize| {
+            groups
+                .lines(&folded, group, Some(&schema), &names, usize::MAX)
+                .entries
+                .remove(0)
+        };
+        let maya = line(2);
+        assert_eq!(
+            (
+                maya.net,
+                maya.other.as_str(),
+                maya.other_was.as_deref(),
+                maya.here_was
+            ),
+            (Some(NetChange::Changed), "Bob Brown", Some("ana"), None)
+        );
+        let eve = line(3);
+        assert_eq!(
+            (
+                eve.other.as_str(),
+                eve.other_was.as_deref(),
+                eve.here_was.as_deref()
+            ),
+            ("finn", Some("dan"), Some("Cleo Ng"))
+        );
+        let ana = line(0);
+        assert_eq!((ana.net, ana.other.as_str()), (None, "maya"), "a mirror");
+        assert_eq!(
+            groups
+                .lines(&folded, 2, Some(&schema), &names, usize::MAX)
+                .changed,
+            1
+        );
     }
 
     /// A relationship from an entity to itself is reviewed there once, with no mirror.

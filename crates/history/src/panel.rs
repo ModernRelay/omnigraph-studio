@@ -14,7 +14,8 @@ use crate::view::HistoryView;
 pub(crate) struct HistoryPanel {
     session: Option<Entity<GraphSession>>,
     /// Made when the panel is first drawn: a window whose History is never shown reads no
-    /// history.
+    /// history. Once made, it reads what commits ask of it only when drawn, so a panel hidden
+    /// since reads nothing until shown again ([`HistoryView::panel`]).
     view: Option<Entity<HistoryView>>,
     /// The keyboard's place until the list exists, handed to it when it does.
     focus_handle: FocusHandle,
@@ -29,6 +30,11 @@ impl HistoryPanel {
                 .as_ref()
                 .map_or_else(|| self.focus_handle.clone(), |view| view.focus_handle(cx)),
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn view(&self) -> Option<&Entity<HistoryView>> {
+        self.view.as_ref()
     }
 }
 

@@ -75,8 +75,12 @@ const ROW_COUNT_PAGE: u32 = 500;
 
 /// The read of the listing's first page.
 enum State {
-    /// Being read. Commits read before stay shown meanwhile.
-    Loading,
+    /// Being read, as `read` says. Commits read before stay shown meanwhile. A read of it
+    /// started before this one ends takes its place and does what both say
+    /// ([`FirstPage::with`]).
+    Loading {
+        read: FirstPage,
+    },
     Ready,
     /// It could not be read and no commit is shown: why takes the list's place.
     Failed(SharedString),
@@ -103,6 +107,16 @@ struct FirstPage {
 }
 
 impl FirstPage {
+    /// A read that takes the place of `pending`, still under way, doing what both say: it keeps
+    /// the pages read only when both would, and asks again for the merged-in commits the server
+    /// did not have when either would. A Refresh's ask is not lost to a commit landing.
+    fn with(self, pending: Self) -> Self {
+        Self {
+            keep: self.keep && pending.keep,
+            ask_missing: self.ask_missing || pending.ask_missing,
+        }
+    }
+
     /// The history opened, its branch changed, or its listing read from its first page again.
     const REPLACE: Self = Self {
         keep: false,
@@ -118,6 +132,28 @@ impl FirstPage {
         keep: false,
         ask_missing: true,
     };
+}
+
+/// What the session's events asked of the bottom-dock panel since it was last drawn, read when
+/// it is next drawn ([`HistoryView::panel`]). A dock draws only the panel it shows, so a History
+/// panel hidden behind another or in a closed dock reads nothing for the commits that land
+/// meanwhile, and shown again reads once for all of them; a shown one reads at its next frame.
+#[derive(Default)]
+struct Owed {
+    /// The window's branch changed: its history is read from its first page.
+    reload: bool,
+    /// A commit landed on the branch: its first page is read again, keeping the pages read.
+    landed: bool,
+    /// The branch list changed: the tags follow it ([`HistoryView::branches_changed`]).
+    branches: bool,
+    /// Other branches a commit landed on, whose tags move.
+    tags: Vec<String>,
+}
+
+impl Owed {
+    fn is_empty(&self) -> bool {
+        !self.reload && !self.landed && !self.branches && self.tags.is_empty()
+    }
 }
 
 /// The read of the listing's next page.
@@ -352,6 +388,9 @@ pub struct HistoryView {
     head_asked: HashMap<String, u64>,
     head_reads: HashMap<String, Task<()>>,
     next_head_read: u64,
+    /// The panel's reads owed until it is next drawn, and whether that draw has them due.
+    owed: Owed,
+    owed_due: bool,
 }
 
 impl EventEmitter<ItemEvent> for HistoryView {}
@@ -415,7 +454,9 @@ impl HistoryView {
         view
     }
 
-    /// The bottom-dock panel: the window's branch, rows only.
+    /// The bottom-dock panel: the window's branch, rows only. It is made when first drawn, and
+    /// reads what the session's events ask of it when next drawn ([`Owed`]), so a hidden panel
+    /// asks the server nothing.
     pub fn panel(
         session: Entity<GraphSession>,
         window: &mut Window,
@@ -426,20 +467,62 @@ impl HistoryView {
         view._session_subscription =
             Some(
                 cx.subscribe(&session, |this, session, event, cx| match event {
+                    // The branch left's commits never show under the new one's name meanwhile.
                     SessionEvent::BranchChanged => {
                         this.branch = session.read(cx).branch.clone();
                         this.forget_branch();
-                        this.reload(cx);
+                        this.owe(|owed| owed.reload = true, cx);
+                    }
+                    SessionEvent::Committed { branch } if *branch == this.branch => {
+                        this.owe(|owed| owed.landed = true, cx)
                     }
                     SessionEvent::Committed { branch } if this.shows(branch) => {
-                        this.committed(branch, cx)
+                        let branch = branch.clone();
+                        this.owe(
+                            |owed| {
+                                if !owed.tags.contains(&branch) {
+                                    owed.tags.push(branch);
+                                }
+                            },
+                            cx,
+                        )
                     }
                     // The list of other branches, whose heads the history shows.
-                    SessionEvent::BranchesChanged => this.branches_changed(cx),
+                    SessionEvent::BranchesChanged => this.owe(|owed| owed.branches = true, cx),
                     _ => {}
                 }),
             );
         view
+    }
+
+    /// Notes a read the panel owes, and draws it again: a shown panel reads it at that frame
+    /// ([`Self::read_owed`]); a hidden one is not drawn, and reads it when shown again.
+    fn owe(&mut self, owe: impl FnOnce(&mut Owed), cx: &mut Context<Self>) {
+        owe(&mut self.owed);
+        cx.notify();
+    }
+
+    /// The reads the panel owes, once for everything that came since it was last drawn: the
+    /// branch's history again (from its first page after a branch change, else keeping the
+    /// pages read after commits), the tags for a changed branch list, and the heads of the other
+    /// branches commits landed on.
+    fn read_owed(&mut self, cx: &mut Context<Self>) {
+        let owed = std::mem::take(&mut self.owed);
+        if owed.reload {
+            self.reload(cx);
+        } else if owed.landed {
+            self.load(FirstPage::KEEP, cx);
+        }
+        if owed.branches {
+            self.branches_changed(cx);
+        }
+        if !owed.reload {
+            for branch in owed.tags {
+                if branch != self.branch && self.others.contains(&branch) {
+                    self.read_head(branch, false, cx);
+                }
+            }
+        }
     }
 
     fn build(
@@ -482,8 +565,12 @@ impl HistoryView {
             head_asked: HashMap::new(),
             head_reads: HashMap::new(),
             next_head_read: 0,
+            owed: Owed::default(),
+            owed_due: false,
             focus_handle: cx.focus_handle(),
-            state: State::Loading,
+            state: State::Loading {
+                read: FirstPage::REPLACE,
+            },
             read: Arc::default(),
             next_page: None,
             listing_head: None,
@@ -587,7 +674,7 @@ impl HistoryView {
         match self.state {
             State::Failed(_) => self.load(FirstPage::REPLACE, cx),
             State::Stale { .. } => self.retry(cx),
-            State::Loading | State::Ready => {}
+            State::Loading { .. } | State::Ready => {}
         }
         self.load_heads(false, cx);
     }
@@ -626,7 +713,11 @@ impl HistoryView {
         if matches!(self.more, More::Failed { restart: true, .. }) {
             read.keep = false;
         }
-        self.state = State::Loading;
+        // A read of it under way ends here (`_task` is replaced): this one does what it was to.
+        if let State::Loading { read: pending } = self.state {
+            read = read.with(pending);
+        }
+        self.state = State::Loading { read };
         // A next page or a walk of merged-in commits under way ends here (`_task` is
         // replaced); one that failed stays failed, its row saying so.
         if matches!(self.more, More::Reading) {
@@ -2045,6 +2136,13 @@ impl HistoryView {
 
 impl Render for HistoryView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Drawn, so shown: the panel reads what it owes once the frame is out, not inside it.
+        if !self.owed.is_empty() && !std::mem::replace(&mut self.owed_due, true) {
+            cx.defer_in(window, |this, _, cx| {
+                this.owed_due = false;
+                this.read_owed(cx);
+            });
+        }
         let count = self.commits.len();
         let counter = self.match_counter();
         let search = studio_ui::ds::search_field(self.search.clone(), cx)
@@ -2056,7 +2154,7 @@ impl Render for HistoryView {
                 count.saturating_sub(self.read.own.len()),
                 self.read.complete,
             ),
-            State::Loading => "Reading…".into(),
+            State::Loading { .. } => "Reading…".into(),
             State::Failed(_) => String::new(),
         };
         let stale = match &self.state {
@@ -2116,7 +2214,7 @@ impl Render for HistoryView {
                     .debug_selector(|| "history-error".into())
                     .into_any_element()
             }
-            State::Loading if self.commits.is_empty() => {
+            State::Loading { .. } if self.commits.is_empty() => {
                 studio_ui::ds::loading_state("Reading commits…").into_any_element()
             }
             _ if self.compact => self.cached_rows(),
@@ -2867,6 +2965,21 @@ mod tests {
             listings + 1,
             "the first page read again"
         );
+        // A commit landing while a Refresh's page is out reads it in the Refresh's place, and
+        // asks again for what the Refresh was to.
+        view.update(cx, |view, cx| {
+            view.refresh(cx);
+            view.committed("main", cx);
+            assert!(matches!(
+                view.state,
+                State::Loading {
+                    read: FirstPage::REFRESH
+                }
+            ));
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| check(view));
+        assert_eq!(reads(&served), [1, 1, 4], "asked for again");
     }
 
     /// A merge whose branch goes on below the oldest commit of the pages read is read as far
@@ -3472,6 +3585,96 @@ mod tests {
             ..Default::default()
         };
         serve(served, cx).0
+    }
+
+    /// Draws the History panel, cached, while it shows it, as a dock draws its active panel.
+    struct DockStandIn {
+        panel: Entity<crate::panel::HistoryPanel>,
+        shown: bool,
+    }
+
+    impl Render for DockStandIn {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().when(self.shown, |dock| {
+                dock.child(
+                    AnyView::from(self.panel.clone())
+                        .cached(StyleRefinement::default().size_full()),
+                )
+            })
+        }
+    }
+
+    /// A History panel hidden (another panel shown in its dock, or the dock closed) reads
+    /// nothing for the commits that land, about twenty an hour on a busy graph; shown again, it
+    /// reads its first page once for all of them, keeping what it had read.
+    #[gpui::test]
+    async fn a_hidden_panel_reads_nothing_until_shown_again(cx: &mut TestAppContext) {
+        let (session, served) = serve(
+            Served {
+                branches: vec![("main".into(), chain("m", 3))],
+                ..Default::default()
+            },
+            cx,
+        );
+        let held = session.clone();
+        let (dock, cx) = cx.add_window_view(move |window, cx| {
+            let panel = cx.new(|cx| {
+                crate::panel::HistoryPanel::new(WeakEntity::new_invalid(), Some(held), window, cx)
+            });
+            DockStandIn { panel, shown: true }
+        });
+        cx.run_until_parked();
+        let listings = |served: &Arc<Mutex<Served>>| served.lock().unwrap().listings().len();
+        assert_eq!(
+            listings(&served),
+            1,
+            "the first page, as the panel was drawn"
+        );
+        let show = |shown: bool, cx: &mut VisualTestContext| {
+            dock.update(cx, |dock, cx| {
+                dock.shown = shown;
+                cx.notify();
+            });
+            cx.run_until_parked();
+        };
+        show(false, cx);
+        session
+            .update(cx, |session, cx| session.head_now("main", cx))
+            .await;
+        for (id, parent, at) in [("m3", "m2", 1_000), ("m4", "m3", 1_010)] {
+            served
+                .lock()
+                .unwrap()
+                .chain_mut("main")
+                .insert(0, commit(id, at, Some(parent), None));
+            session
+                .update(cx, |session, cx| session.head_now("main", cx))
+                .await;
+            cx.run_until_parked();
+        }
+        assert_eq!(listings(&served), 1, "nothing read while hidden");
+
+        show(true, cx);
+        assert_eq!(listings(&served), 2, "one read for both commits");
+        let view = dock.read_with(cx, |dock, cx| dock.panel.read(cx).view().cloned());
+        let view = view.expect("made when first drawn");
+        view.read_with(cx, |view, _| {
+            assert_eq!(ids(view), ["m4", "m3", "m2", "m1", "m0"])
+        });
+        // Shown, a commit is read at the next frame.
+        served
+            .lock()
+            .unwrap()
+            .chain_mut("main")
+            .insert(0, commit("m5", 1_020, Some("m4"), None));
+        session
+            .update(cx, |session, cx| session.head_now("main", cx))
+            .await;
+        cx.run_until_parked();
+        assert_eq!(listings(&served), 3);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.commits[0].graph_commit_id, "m5")
+        });
     }
 
     /// The commit shown beside the list draws on its own: a change there (a scroll, a page of

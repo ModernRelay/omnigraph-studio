@@ -111,7 +111,7 @@ pub fn more_lines_label(left_out: usize) -> String {
 }
 
 /// The card for change `ix` of `folded`: its kind, id and changed property rows, and a lone
-/// relationship's ends.
+/// relationship's ends, with a row for each end it moved from ([`FoldedChange::moved_ends`]).
 fn change_card(
     folded: &FoldedChanges,
     ix: usize,
@@ -120,12 +120,42 @@ fn change_card(
     id: impl Into<ElementId>,
 ) -> ChangeCard {
     let change = &folded.changes[ix];
-    let mut card = ChangeCard::new(id, kind_of(change.net()), change.id.clone())
-        .rows(rows.get(ix, || property_rows(change, schema)));
+    let mut card =
+        ChangeCard::new(id, kind_of(change.net()), change.id.clone()).rows(rows.get(ix, || {
+            let mut rows = moved_end_rows(change);
+            rows.extend(property_rows(change, schema));
+            rows
+        }));
     if let Some((from, to)) = change.endpoints() {
         card = card.endpoints(from, to);
     }
     card
+}
+
+/// A lone relationship's rows for the ends it moved, `from` and `to`, each its old end against
+/// its new: no schema names their types, so their ids.
+fn moved_end_rows(change: &FoldedChange) -> Vec<PropertyRow> {
+    if change.moved_ends().is_none() {
+        return Vec::new();
+    }
+    let before = change
+        .before
+        .as_ref()
+        .and_then(|image| image.endpoints.as_ref());
+    let after = change
+        .after
+        .as_ref()
+        .and_then(|image| image.endpoints.as_ref());
+    let (Some(before), Some(after)) = (before, after) else {
+        return Vec::new();
+    };
+    ["from", "to"]
+        .into_iter()
+        .filter_map(|end| {
+            let (was, now) = (before.get(end)?, after.get(end)?);
+            (was != now).then(|| PropertyRow::new(end, Some(was), Some(now)))
+        })
+        .collect()
 }
 
 /// The card for group `ix`: its own change named by its label, or for a node standing
@@ -154,7 +184,9 @@ pub fn entity_card(
 /// A card's line for one relationship entry of `folded`: what changed, which way it points,
 /// the other end, and a changed relationship's property rows; for one moved to another end
 /// ([`RelationshipEntry::replaces`]), both ends and the removed edge's values against the new
-/// one's. A mirror's line carries `mirror_note`, which says where it is shown in full.
+/// one's, and for one edge whose ends moved ([`RelationshipEntry::other_was`]), the end it had
+/// and the end it has, and who held this entity's end when both moved. A mirror's line carries
+/// `mirror_note`, which says where it is shown in full.
 pub fn relationship_line(
     entry: RelationshipEntry,
     folded: &FoldedChanges,
@@ -187,17 +219,7 @@ pub fn relationship_line(
         }),
         None => Rc::from([]),
     };
-    let note = match (kind, &entry.replaces) {
-        (None, _) => Some(mirror_note),
-        (Some(_), Some(_)) if entry.other_is_new => Some("moved, new"),
-        (Some(_), Some(_)) => Some("moved"),
-        (Some(_), None) if entry.other_is_new => Some("new"),
-        (Some(_), None) => None,
-    };
-    let other = match &entry.replaces {
-        Some((_, was)) => format!("{was} → {}", entry.other),
-        None => entry.other,
-    };
+    let (other, note) = other_end(&entry, mirror_note);
     let line = RelationshipLine::new(id, kind, entry.words, entry.outgoing, other)
         .other_detail(entry.other_type)
         .rows(rows);
@@ -205,6 +227,38 @@ pub fn relationship_line(
         Some(note) => line.note(note),
         None => line,
     }
+}
+
+/// What a relationship line names at its other end, and the note at its end: a mirror's says
+/// where it is shown in full (`mirror_note`); a relationship that moved names the end it had
+/// before the end it has ("Acme → Globex"), and says "moved", or, when both its ends moved,
+/// who held this entity's end ("moved from Ana"); "new" marks an end the branch added.
+fn other_end(
+    entry: &RelationshipEntry,
+    mirror_note: &'static str,
+) -> (String, Option<SharedString>) {
+    if entry.net.is_none() {
+        return (entry.other.clone(), Some(mirror_note.into()));
+    }
+    let was = entry
+        .replaces
+        .as_ref()
+        .map(|(_, was)| was)
+        .or(entry.other_was.as_ref());
+    let other = match was {
+        Some(was) => format!("{was} → {}", entry.other),
+        None => entry.other.clone(),
+    };
+    let moved = was.is_some() || entry.here_was.is_some();
+    let note = match &entry.here_was {
+        Some(here_was) if entry.other_is_new => Some(format!("moved from {here_was}, new").into()),
+        Some(here_was) => Some(format!("moved from {here_was}").into()),
+        None if moved && entry.other_is_new => Some("moved, new".into()),
+        None if moved => Some("moved".into()),
+        None if entry.other_is_new => Some("new".into()),
+        None => None,
+    };
+    (other, note)
 }
 
 /// The header above a run of one type's cards: the section's title when the run opens it, in
@@ -282,6 +336,60 @@ mod tests {
         assert_eq!(
             more_lines_label(1_380),
             "Show 200 more of the 1,380 relationships not shown"
+        );
+    }
+
+    /// A relationship that moved names the end it had before the end it has; when both its
+    /// ends moved, who held this entity's end. A plain change names its other end alone, and a
+    /// mirror says where it is reviewed.
+    #[test]
+    fn a_moved_relationship_names_the_end_it_had() {
+        let entry = |net, other_was: Option<&str>, here_was: Option<&str>| RelationshipEntry {
+            change: 0,
+            net,
+            words: "knows".into(),
+            outgoing: false,
+            other: "Bob".into(),
+            other_type: "Person".into(),
+            other_is_new: false,
+            replaces: None,
+            other_was: other_was.map(Into::into),
+            here_was: here_was.map(Into::into),
+        };
+        let line = |entry: RelationshipEntry| {
+            let (other, note) = other_end(&entry, "reviewed there");
+            (other, note.map(|note| note.to_string()))
+        };
+        let changed = Some(NetChange::Changed);
+        assert_eq!(
+            line(entry(changed, Some("Ana"), None)),
+            ("Ana → Bob".to_owned(), Some("moved".to_owned()))
+        );
+        assert_eq!(
+            line(entry(changed, Some("Maya"), Some("Cleo"))),
+            ("Maya → Bob".to_owned(), Some("moved from Cleo".to_owned()))
+        );
+        assert_eq!(
+            line(RelationshipEntry {
+                other_is_new: true,
+                ..entry(changed, Some("Ana"), None)
+            }),
+            ("Ana → Bob".to_owned(), Some("moved, new".to_owned()))
+        );
+        assert_eq!(
+            line(RelationshipEntry {
+                other_is_new: true,
+                ..entry(changed, Some("Maya"), Some("Cleo"))
+            }),
+            (
+                "Maya → Bob".to_owned(),
+                Some("moved from Cleo, new".to_owned())
+            )
+        );
+        assert_eq!(line(entry(changed, None, None)), ("Bob".to_owned(), None));
+        assert_eq!(
+            line(entry(None, None, None)),
+            ("Bob".to_owned(), Some("reviewed there".to_owned()))
         );
     }
 

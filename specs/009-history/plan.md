@@ -37,7 +37,13 @@ from Zed with notices).
 - Selecting a commit opens its changes (spec 008's entity cards) in a detail split, headed like
   the inspector: a small "Commit" label, the short id as the title (click copies the full id),
   then one meta row (actor, time, branch, parent and merged parent as links, change count).
-  The per-type breakdown is the group headers over the cards, not a second summary. A commit
+  The per-type breakdown is the group headers over the cards, not a second summary. An edge
+  a load upserted with another end (the change's before and after images name different
+  ends) is one change on the card of the end it stayed at, "~ knows ← Ana → Bob, moved", and
+  mirrored on the old end's card; with both ends moved, on its card where it is now, naming
+  who held that end ("moved from Cleo"); one whose type the schema lacks shows a `from` or
+  `to` row. A review shows it alike (since 2026-10-21; before, "~ knows Bob" with no rows, the
+  old end never named). A commit
   held off every branch names what it is in the branch's place ("Unpublished, on no branch
   until published to main", "Unattached snapshot, on no branch"), and a commit still being read
   names no branch until its kind is known (since 2026-10-21). The graph's first commit has no
@@ -62,7 +68,12 @@ from Zed with notices).
   branch and its head, and refuses edits, inserts and deletes with the reason; a pinned query
   reads the snapshot and refuses writes. Both come back after a restart.
 - The bottom-dock panel follows the window's branch and graph; rows only, and a click opens the
-  commit in its own tab.
+  commit in its own tab. Hidden (another panel shown in its dock, or the dock closed), it asks
+  the server nothing: what a commit, a change of branch or a changed branch list asks of it is
+  read when it is next drawn, once for all of them, keeping the pages read after commits. A
+  dock draws only the panel it shows, so its view reads them from its own draw, after the
+  frame (since 2026-10-21; before, a panel shown once read its first page at every commit to
+  its branch, about twenty an hour on the personal graph, for the rest of the run).
 - Built (paging, E10, 2026-10-20): History reads its branch's newest 200 commits, and the
   next page when the rows drawn come within a screen of the list's end; every later page
   answers for the head the first page resolved (`head_commit_id`), so the pages stay one
@@ -86,11 +97,14 @@ from Zed with notices).
   row with it, stopped paging and merged reads, and its recovery dropped the pages read).
   A read of the first page changes nothing until it is read: a Refresh forgets which merged-in
   commits the server did not have only then, so one that fails leaves each stub saying why,
-  and its Try again asks for them again as the Refresh was to. Once the server refused the
-  listing's continuation, Try again reads the listing from its first page rather than keep the
-  pages going on from that continuation (since 2026-10-21; before, a failed Refresh had
-  forgotten why the stubs were stubs, and Try again kept the refused continuation, which took
-  a second Try again).
+  and its Try again asks for them again as the Refresh was to. A read that takes the place of
+  one still under way, as a commit landing during a Refresh does, does what both were to: it
+  keeps the pages read only when both would, and asks again for those commits when either
+  would (since 2026-10-21; before, the commit's read dropped the Refresh's ask). Once the
+  server refused the listing's continuation, Try again reads the listing from its first page
+  rather than keep the pages going on from that continuation (since 2026-10-21; before, a
+  failed Refresh had forgotten why the stubs were stubs, and Try again kept the refused
+  continuation, which took a second Try again).
 - Built (row counts): a drawn row without counts reads its commit's first 500 changes and nets
   them as the detail does ("+ more" when there are more); answers are kept, since a commit's
   changes never change, and the detail's full count replaces a first-page one. A commit
@@ -150,6 +164,9 @@ away are dropped.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | An edge moved to another end names both | `graph_store` `changes::an_edge_with_another_end_is_changed_and_names_both`, `entity_groups::a_relationship_whose_end_moved_names_the_end_it_had` (Knows from Ana to Maya upserted from Bob, and from Cleo to Dan upserted from Eve to Finn, Ana and Dan changed in the review); `change_cards` `a_moved_relationship_names_the_end_it_had`; `carry.rs` `Logged::add`, which already took both images' ends | The first is on Maya's card, "Ana → Bob", "moved", and mirrored on Ana's; the second on Eve's, "Dan → Finn", "moved from Cleo", with no mirror on Dan's, whose Dan was joined to Cleo; each change is reviewed once, and Maya, Bob, Eve, Finn and Cleo are read for their names. Before, both were homed by their new ends alone, read "~ knows Bob" and "~ knows Finn" with no rows, and the old ends were neither named nor read. Not yet seen in the running app |
+| 2026-10-21 | A commit landing during a Refresh keeps the Refresh's ask | `history` `merged_in_commits_are_read_by_their_ids`, extended: a Refresh, then a commit to the branch before the Refresh's page is read | The read in its place is `State::Loading { read: FirstPage::REFRESH }`, and the merged commit the server does not have is asked for once more. Before, `committed` sent `load(FirstPage::KEEP)`, which replaced the Refresh's task and its `ask_missing`, so the stub was not asked for again until the next Refresh (found in review of `0ecb3a0`) |
+| 2026-10-21 | A hidden History panel reads nothing until shown | `history` `a_hidden_panel_reads_nothing_until_shown_again` (the panel drawn cached by a stand-in dock, as `studio_workspace` `panel_body` draws a bottom panel; hidden, two commits land; shown; then a third) | One listing as first drawn; none for the two commits while hidden; one when shown again, the five commits in order; one more for the third, while shown. Before, `HistoryView::panel` read the first page at each `Committed` whether drawn or not. Not yet seen in the running app |
 | 2026-10-21 | A refused comparison is read from a typed field | `graph_client` `a_refused_commit_comparison_names_its_reason`, extended (the whole refusal with its type, and a reason a later build sends); `history` `a_refused_comparison_says_why`; the contract test tables (`ErrorOutput` now lists `change_diff_refusal`, checked against `openapi/omnigraph-0.14.0-edge.json`) | `ErrorOutput` carries `change_diff_refusal` as `ChangeDiffRefusalOutput`, and `ApiErrorSummary` keeps it whole, boxed so a read's error stays under clippy's `result_large_err` bound; before, it was parsed out of `ErrorOutput::other`. A schema boundary on `Person` says it is "across a change to Person's schema", then the server's reason; another 409 gives the server's reason and claims no schema change |
 | 2026-10-11 | `git_graph.rs` exists at the pin | `git ls-tree -r v1.23.2 crates/git_ui/src` | Present |
 | 2026-10-12 | Lanes connect and never collide | `history::lanes` property test over 2,000 seeded random commit graphs (up to 60 commits, merges, missing parents): every edge is one line, rows join edge to edge, no two lines share a lane, width bounded | Passes; a mutation that leaves ending lanes busy fails at seed 0 |

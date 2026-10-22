@@ -212,6 +212,19 @@ impl FoldedChange {
         endpoints_of(image.endpoints.as_ref()?)
     }
 
+    /// An edge whose ends differ between its first before image and its last after image,
+    /// `(before, after)`, each `(from, to)`: a load that upserts an edge by its id with another
+    /// `src` or `dst` moves it, and the change feed's two images name the two ends. Such an
+    /// edge is changed ([`Self::net`]) even when no property is, so its card names the ends.
+    pub fn moved_ends(&self) -> Option<((String, String), (String, String))> {
+        if !self.is_edge() {
+            return None;
+        }
+        let before = endpoints_of(self.before.as_ref()?.endpoints.as_ref()?)?;
+        let after = endpoints_of(self.after.as_ref()?.endpoints.as_ref()?)?;
+        (before != after).then_some((before, after))
+    }
+
     /// A key that identifies the entity across refreshes of the same review.
     pub fn key(&self) -> String {
         format!(
@@ -824,6 +837,57 @@ mod tests {
         assert_eq!(counts[2].type_name, "WorksAt");
         assert_eq!(folded.entity_count(), 4);
         assert_eq!(folded.relationship_count(), 1);
+    }
+
+    /// An edge upserted with another end is changed though no property is, and says which ends
+    /// it had before and has now; one whose ends stayed, or that only one image names, has none.
+    #[test]
+    fn an_edge_with_another_end_is_changed_and_names_both() {
+        let knows = |id: &str, before: Option<(&str, &str)>, after: Option<(&str, &str)>| {
+            let image = |ends: Option<(&str, &str)>| {
+                ends.map(|(from, to)| ChangeImageOutput {
+                    properties: json!({"since": 1}).as_object().unwrap().clone(),
+                    endpoints: Some(json!({"from": from, "to": to})),
+                })
+            };
+            EntityChangeOutput {
+                kind: EntityKind::Edge,
+                entity_type: ChangeTypeOutput {
+                    id: "t-Knows".into(),
+                    name: "Knows".into(),
+                },
+                id: id.into(),
+                op: ChangeOp::Update,
+                before: image(before),
+                after: image(after),
+            }
+        };
+        let mut fold = ChangeFold::new();
+        let c = cause("c1", "act-a");
+        fold.add(
+            &c,
+            knows("moved", Some(("ana", "maya")), Some(("bob", "maya"))),
+        );
+        fold.add(
+            &c,
+            knows("kept", Some(("ana", "maya")), Some(("ana", "maya"))),
+        );
+        fold.add(&c, knows("new", None, Some(("ana", "theo"))));
+        let folded = fold.finish();
+        let moved = &folded.changes[0];
+        assert_eq!(moved.id, "moved");
+        assert_eq!(moved.net(), Some(NetChange::Changed));
+        assert!(moved.property_diffs(&[]).is_empty(), "no property changed");
+        assert_eq!(
+            moved.moved_ends(),
+            Some((
+                ("ana".to_owned(), "maya".to_owned()),
+                ("bob".to_owned(), "maya".to_owned())
+            ))
+        );
+        let ids: Vec<&str> = folded.changes.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["moved", "new"], "an edge that stayed is dropped");
+        assert_eq!(folded.changes[1].moved_ends(), None);
     }
 
     #[test]
