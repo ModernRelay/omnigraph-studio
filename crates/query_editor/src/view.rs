@@ -380,6 +380,15 @@ struct Loading {
     draft: Option<Draft>,
 }
 
+/// A file tab's file that could not be read when the tab came back (deleted, or gone with a
+/// `git switch`).
+struct GoneFile {
+    /// The hash of the file's text the tab's text was typed over ([`Draft::based_on`]), kept
+    /// while the file is gone: a file that comes back holding that text, or the tab's own, is
+    /// the file as the tab knew it, not one changed elsewhere ([`QueryEditor::file_back`]).
+    based_on: Option<String>,
+}
+
 /// The file changed on disk after the draft was typed over it (another editor, a `git pull`):
 /// the draft is kept and the file is not written over until the person says so.
 struct DiskChange {
@@ -462,7 +471,7 @@ pub struct QueryEditor {
     loading: Option<Loading>,
     /// The file could not be read when the tab came back: the tab holds the text it
     /// remembered, and a bar says the file is gone and offers Save As.
-    file_gone: bool,
+    file_gone: Option<GoneFile>,
     /// The file changed on disk after the draft was typed over it, and `saved_text` is what
     /// it holds now: the draft stays, and is written over the file only when the person says.
     disk_change: Option<DiskChange>,
@@ -743,9 +752,12 @@ impl Item for QueryEditor {
             }
             (None, Some(_)) => Some(Draft {
                 text: self.editor.read(cx).text(cx),
-                based_on: match &self.disk_change {
-                    Some(change) => change.based_on.clone(),
-                    None => self.saved_text.as_deref().map(content_hash),
+                // While the file is gone `saved_text` is empty, which the text was not typed
+                // over: the gone file's record keeps what it was.
+                based_on: match (&self.disk_change, &self.file_gone) {
+                    (Some(change), _) => change.based_on.clone(),
+                    (None, Some(gone)) => gone.based_on.clone(),
+                    (None, None) => self.saved_text.as_deref().map(content_hash),
                 },
                 saved: false,
             }),
@@ -918,7 +930,7 @@ impl QueryEditor {
             unsaved: false,
             file_error: None,
             loading: None,
-            file_gone: false,
+            file_gone: None,
             disk_change: None,
             disk_task: None,
             file_focus: cx.focus_handle(),
@@ -1225,9 +1237,12 @@ impl QueryEditor {
                 self.set_text(&disk, window, cx);
             }
             (Some(draft), None) => {
-                // Nothing is on disk: the text is the tab's alone, and closing it asks.
+                // Nothing is on disk: the text is the tab's alone, and closing it asks. What it
+                // was typed over is kept, for the file coming back.
                 self.saved_text = Some(String::new());
-                self.file_gone = true;
+                self.file_gone = Some(GoneFile {
+                    based_on: draft.based_on,
+                });
                 self.set_text(&draft.text, window, cx);
             }
             (Some(draft), Some(disk)) => {
@@ -1270,14 +1285,25 @@ impl QueryEditor {
     }
 
     /// The file holds `disk` now. A tab with nothing unsaved shows it; one with a draft keeps
-    /// the draft and says the file changed. A file gone says nothing until a save writes it.
+    /// the draft and says the file changed. A file gone says nothing until a save writes it,
+    /// and one back is compared with what the tab knew of it ([`Self::file_back`]).
     fn disk_read(&mut self, disk: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(disk), Some(saved)) = (disk, &self.saved_text) else {
+        let Some(disk) = disk else {
             return;
         };
-        // The file is back (a `git switch` back): what it holds is compared as any change.
-        self.file_gone = false;
-        if disk == *saved || self.saving || self.loading.is_some() {
+        if self.saving || self.loading.is_some() {
+            return;
+        }
+        if let Some(gone) = self.file_gone.take() {
+            self.file_back(gone, disk, cx);
+            cx.emit(ItemEvent::UpdateTab);
+            cx.notify();
+            return;
+        }
+        let Some(saved) = &self.saved_text else {
+            return;
+        };
+        if disk == *saved {
             return;
         }
         if self.unsaved || self.disk_change.is_some() {
@@ -1295,6 +1321,33 @@ impl QueryEditor {
         }
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
+    }
+
+    /// The tab's file was gone and holds `disk` again (a `git switch` back), seen by a read or
+    /// by a save. While it was gone the tab compared its text with nothing, so `disk` is
+    /// compared with what the tab knew of the file instead: the tab's own text, or the text it
+    /// was typed over (`gone.based_on`), is the file as the tab knew it and is taken as the
+    /// file's text with no bar, the tab's text unsaved only when it differs from it. Other text
+    /// was changed elsewhere, and the bar says so as for any change.
+    fn file_back(&mut self, gone: GoneFile, disk: String, cx: &mut Context<Self>) {
+        let the_tabs = {
+            let buffer = self.editor.read(cx).buffer().read(cx).read(cx);
+            let end = buffer.len();
+            studio_ui::text::pieces_are(
+                end.0,
+                buffer.text_for_range(MultiBufferOffset(0)..end),
+                &disk,
+            )
+        };
+        let typed_over = gone.based_on.as_deref() == Some(content_hash(&disk).as_str());
+        if !the_tabs && !typed_over {
+            self.disk_change = Some(DiskChange {
+                based_on: gone.based_on,
+                asked: false,
+            });
+        }
+        self.saved_text = Some(disk);
+        self.sync_unsaved(cx);
     }
 
     /// The bar's Save over it: the draft is written over the file's newer text.
@@ -1499,23 +1552,38 @@ impl QueryEditor {
                         this.path = Some(path);
                         this.saved_text = Some(text);
                         this.disk_change = None;
-                        this.file_gone = false;
+                        this.file_gone = None;
                         // Typing while it was written stays unsaved.
                         this.sync_unsaved(cx);
                         this.file_error = None;
                         crate::saved_queries_changed(cx);
                     }
-                    Ok(Saved::Changed(now)) => {
-                        // Nothing was written: the draft stays, and the bar asks.
-                        this.disk_change = Some(DiskChange {
-                            based_on: this.saved_text.as_deref().map(content_hash),
-                            asked: true,
-                        });
-                        this.saved_text = Some(now);
-                        this.sync_unsaved(cx);
-                        this.save_next = None;
-                        window.focus(&this.file_focus, cx);
-                    }
+                    Ok(Saved::Changed(now)) => match this.file_gone.take() {
+                        // The save expected no file and found it back, so nothing was written.
+                        // Back as the tab knew it, the save goes on over it; changed elsewhere,
+                        // the bar asks.
+                        Some(gone) => {
+                            this.file_back(gone, now, cx);
+                            if let Some(change) = &mut this.disk_change {
+                                change.asked = true;
+                                this.save_next = None;
+                                window.focus(&this.file_focus, cx);
+                            } else if this.unsaved {
+                                this.save_next.get_or_insert(None);
+                            }
+                        }
+                        None => {
+                            // Nothing was written: the draft stays, and the bar asks.
+                            this.disk_change = Some(DiskChange {
+                                based_on: this.saved_text.as_deref().map(content_hash),
+                                asked: true,
+                            });
+                            this.saved_text = Some(now);
+                            this.sync_unsaved(cx);
+                            this.save_next = None;
+                            window.focus(&this.file_focus, cx);
+                        }
+                    },
                     Err(error) => {
                         this.file_error = Some(format!("Could not save: {error}"));
                     }
@@ -3845,9 +3913,7 @@ impl QueryEditor {
     /// keeps it elsewhere, and Save writes it back where it was.
     fn render_file_gone(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         use studio_ui::ds::{self, size, space};
-        if !self.file_gone {
-            return None;
-        }
+        self.file_gone.as_ref()?;
         let name = self.path.as_deref().map(file_name).unwrap_or_default();
         let focus = self.editor_focus.clone();
         Some(
@@ -6036,8 +6102,8 @@ mod tests {
                 reopen(editor, Some(draft(a, Some(b))));
                 assert!(editor.file_read(None, window, cx));
                 assert_eq!(editor.editor.read(cx).text(cx), a);
-                assert!(editor.file_gone);
-                editor.file_gone = false;
+                assert!(editor.file_gone.is_some());
+                editor.file_gone = None;
                 reopen(editor, None);
                 assert!(!editor.file_read(None, window, cx));
             });
@@ -6391,6 +6457,7 @@ mod tests {
                                        "edits": [{"start": at, "end": at, "replacement": "()"}]},
                     })),
                     change_diff_refusal: None,
+                    challenge: None,
                 });
                 let sent = prepared.sent.clone();
                 let at = ReadAt::Branch("main".into());
@@ -6439,6 +6506,7 @@ mod tests {
                                    "edits": [{"start": at, "end": at, "replacement": "()"}]},
                 })),
                 change_diff_refusal: None,
+                challenge: None,
             });
             let sent = prepared.sent.clone();
             let read_at = ReadAt::Branch("main".into());
@@ -6574,43 +6642,129 @@ mod tests {
 
         /// A saved file tab remembers its text for the restart that finds its file gone
         /// (deleted, or gone with a `git switch`): the tab stays, with the text and a bar that
-        /// says the file is gone and offers Save As, and Save writes it back. One whose file
-        /// reads shows the file, whatever it remembered; a text past the bound is not kept.
+        /// says the file is gone and offers Save As, and Save writes it back. A file that comes
+        /// back holding the tab's text, or the text the tab's was typed over, is taken with no
+        /// bar, whether the editor taking the keyboard or ⌘S finds it, and ⌘S writes; one
+        /// that comes back holding other text keeps the tab's, and the bar says it changed.
+        /// One whose file reads shows the file, whatever it remembered; a text past the bound
+        /// is not kept.
         #[gpui::test]
         async fn a_saved_tabs_text_outlives_its_file(cx: &mut TestAppContext) {
             init(cx);
             let session = session(cx);
             let path = scratch("gone").join("kept.gq");
+            let (kept, draft, other) = ("query kept() {}", "query draft() {}", "query other() {}");
             let remembered = |text: &str| Draft {
                 text: text.into(),
                 based_on: Some(content_hash(text)),
                 saved: true,
             };
             let opened = path.clone();
-            let draft = remembered("query kept() {}");
             let (editor, cx) = cx.add_window_view(move |window, cx| {
-                QueryEditor::reading(1, session, opened, Some(draft), window, cx)
+                QueryEditor::reading(1, session, opened, Some(remembered(kept)), window, cx)
             });
+            // A restart on a branch without the file.
+            let restart_gone =
+                |editor: &mut QueryEditor, window: &mut Window, cx: &mut Context<QueryEditor>| {
+                    editor.loading = Some(Loading {
+                        draft: Some(remembered(kept)),
+                    });
+                    editor.disk_change = None;
+                    assert!(editor.file_read(None, window, cx), "the tab stays");
+                    assert!(editor.file_gone.is_some());
+                };
+            let file = || std::fs::read_to_string(&path).unwrap();
             editor.update_in(cx, |editor, window, cx| {
-                assert!(editor.file_read(None, window, cx), "the tab stays");
-                assert_eq!(editor.editor.read(cx).text(cx), "query kept() {}");
-                assert!(editor.file_gone && editor.render_file_gone(cx).is_some());
+                restart_gone(editor, window, cx);
+                assert_eq!(editor.editor.read(cx).text(cx), kept);
+                assert!(editor.render_file_gone(cx).is_some());
                 assert!(editor.is_dirty(cx), "on no disk: closing asks");
+                let saved = editor.serialize(cx).unwrap();
+                assert_eq!(saved.data["text"], json!(kept));
                 assert_eq!(
-                    editor.serialize(cx).unwrap().data["text"],
-                    json!("query kept() {}")
+                    saved.data["based_on"],
+                    json!(content_hash(kept)),
+                    "still what it was typed over, not the empty text compared while gone"
                 );
                 editor.save_now(window, cx);
             });
             cx.run_until_parked();
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), "query kept() {}");
-            editor.update_in(cx, |editor, window, cx| {
-                assert!(!editor.file_gone && !editor.is_dirty(cx));
+            assert_eq!(file(), kept);
+            editor.update_in(cx, |editor, _, cx| {
+                assert!(editor.file_gone.is_none() && !editor.is_dirty(cx));
+            });
 
+            // Back as it was, found as the editor takes the keyboard: no bar, and ⌘S writes.
+            std::fs::remove_file(&path).unwrap();
+            editor.update_in(cx, |editor, window, cx| restart_gone(editor, window, cx));
+            std::fs::write(&path, kept).unwrap();
+            editor.update_in(cx, |editor, window, cx| editor.check_disk(window, cx));
+            cx.run_until_parked();
+            editor.update_in(cx, |editor, window, cx| {
+                assert!(editor.file_gone.is_none() && editor.disk_change.is_none());
+                assert!(editor.render_disk_change(cx).is_none() && !editor.is_dirty(cx));
+                editor.set_text(draft, window, cx);
+                editor.save_now(window, cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(file(), draft, "⌘S wrote");
+
+            // A draft over it, the file back holding what the draft was typed over, found by
+            // ⌘S: no bar, and the save goes on over it.
+            std::fs::remove_file(&path).unwrap();
+            editor.update_in(cx, |editor, window, cx| {
+                restart_gone(editor, window, cx);
+                editor.set_text(draft, window, cx);
+            });
+            std::fs::write(&path, kept).unwrap();
+            editor.update_in(cx, |editor, window, cx| editor.save_now(window, cx));
+            cx.run_until_parked();
+            assert_eq!(file(), draft, "written over the text it was typed over");
+            editor.update_in(cx, |editor, _, cx| {
+                assert!(editor.file_gone.is_none() && editor.disk_change.is_none());
+                assert!(!editor.is_dirty(cx));
+            });
+
+            // Back holding other text, found either way: the tab's text stays, the bar says
+            // the file changed, and ⌘S writes nothing until the person says.
+            for found_by_save in [false, true] {
+                std::fs::remove_file(&path).unwrap();
+                editor.update_in(cx, |editor, window, cx| restart_gone(editor, window, cx));
+                std::fs::write(&path, other).unwrap();
+                editor.update_in(cx, |editor, window, cx| match found_by_save {
+                    false => editor.check_disk(window, cx),
+                    true => editor.save_now(window, cx),
+                });
+                cx.run_until_parked();
+                editor.update_in(cx, |editor, window, cx| {
+                    assert_eq!(editor.editor.read(cx).text(cx), kept);
+                    assert!(editor.file_gone.is_none() && editor.is_dirty(cx));
+                    assert!(editor.render_disk_change(cx).is_some());
+                    assert_eq!(
+                        editor.serialize(cx).unwrap().data["based_on"],
+                        json!(content_hash(kept))
+                    );
+                    if !found_by_save {
+                        editor.save_now(window, cx);
+                    }
+                    assert!(
+                        editor
+                            .disk_change
+                            .as_ref()
+                            .is_some_and(|change| change.asked),
+                        "⌘S asks"
+                    );
+                });
+                cx.run_until_parked();
+                assert_eq!(file(), other, "⌘S wrote nothing");
+            }
+
+            editor.update_in(cx, |editor, window, cx| {
                 // The file reads: it is shown, not what was remembered of it.
                 editor.loading = Some(Loading {
                     draft: Some(remembered("query old() {}")),
                 });
+                editor.disk_change = None;
                 assert!(editor.file_read(Some("query new() {}".into()), window, cx));
                 assert_eq!(editor.editor.read(cx).text(cx), "query new() {}");
                 assert!(!editor.is_dirty(cx) && editor.disk_change.is_none());
