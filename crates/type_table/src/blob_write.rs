@@ -298,28 +298,13 @@ pub(crate) struct Binding {
     pub read_at: Option<String>,
 }
 
-/// Stores the file at `path` in `cell` on `branch`, bound to `shown` read at `read_at`, as the
-/// view held them when the file was chosen ([`upload_bound`]).
-pub(crate) fn upload(
-    session: &Entity<GraphSession>,
-    branch: &str,
-    cell: BlobCell,
-    shown: BlobMeta,
-    read_at: Option<String>,
-    path: PathBuf,
-    cx: &mut App,
-) -> Task<BlobWritten> {
-    let binding = move |_: &mut App| Binding { shown, read_at };
-    upload_bound(session, branch, cell, binding, path, cx)
-}
-
 /// Stores the file at `path` in `cell` on `branch`, bound to what `binding` gives when the write
 /// is sent. It is asked once, after the file is read off the main thread, so a view gives what
 /// it shows then: one of its own writes landing while the file is read moves the commit its
 /// values hold at, and every validator of the type with it, so a binding taken when the file
 /// was chosen would name the one before and be refused as changed elsewhere. A file over
-/// [`BLOB_PUT_MAX`] is refused before anything is sent. This is the whole of an upload but the
-/// picker, so a test can drive it.
+/// [`BLOB_PUT_MAX`] is refused before anything is sent. Every view's upload goes through here,
+/// with all of it but the picker, so a test can drive it.
 pub(crate) fn upload_bound(
     session: &Entity<GraphSession>,
     branch: &str,
@@ -356,7 +341,8 @@ pub(crate) fn upload_bound(
     })
 }
 
-/// Sets `cell` to null on `branch`, bound to `shown` read at `read_at` as [`upload`] binds.
+/// Sets `cell` to null on `branch`, bound to `shown` read at `read_at` ([`bind`]). With no file
+/// to read first, it is bound as it is sent.
 pub(crate) fn clear(
     session: &Entity<GraphSession>,
     branch: &str,

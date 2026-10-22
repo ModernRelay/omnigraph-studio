@@ -126,9 +126,10 @@ stay put), IX (paged, virtualized).
   on the table's Blob cell under the cursor, whose status bar then lists both; the buttons'
   tooltips name the keys. The file is read off the main thread and refused over 32 MiB before anything
   is sent. The write goes to the branch the view shows, once, bound to the value shown as read
-  at the view's commit, taken as the write is sent, after the file is read, from what a table
-  cell shows then (`blob_write::upload_bound`; since 2026-10-21, before which the table's own
-  write landing while the file was read had it refused as changed): a managed value by its
+  at the view's commit, taken as the write is sent, after the file is read, from what the table
+  cell, the peek's slot or the Blob tab shows then (`blob_write::upload_bound`, the one upload;
+  since 2026-10-21, before which a write of the view's own, or of the table a peek came from,
+  landing while the file was read had it refused as changed): a managed value by its
   ETag, which names the type's table version, so it is read again at the view's commit when
   the view moved since (its own writes move it). A view behind its branch reads it at its own
   last commit when that commit's write was itself bound to an ETag read where the values shown
@@ -439,6 +440,7 @@ kept answers.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | The peek and the Blob tab bind an upload as it is sent | `type_table` `a_slot_upload_is_bound_to_what_the_view_shows_as_it_is_sent` (the peek's table saves p1's `scan` at c2 while a file for `doc` is read), `a_tabs_upload_is_bound_to_what_the_tab_shows_as_it_is_sent` (the tab comes to show a save of its cell at c2 while the file is read), each failing with the binding taken when the file was chosen | Both writes carried the ETag read at c2 and stored the file at c3. Bound when chosen, each sent the ETag read at c1 (the peek `"e2"`, the tab `"e1"`), which the server refuses with a 412, though the value each would replace was the one it showed then. `blob_write::upload`, which bound when chosen, is gone. The tab sends one write at a time and follows no other view's, so its test moves it to c2 itself |
 | 2026-10-21 | The toolbar's controls are chips that say what they are set to and clear | `type_table` tests (179) unchanged; `studio_ui` `property_and_control_parts_draw_at_their_sizes` (a chip 26 px, its button centred); offscreen snapshots of Person (1440×900 at 2×, a scratch HOME so no config toast covers the toolbar): at rest, the Sort menu open, "name" chosen, then its × | At rest six pills, Views to Row, and Refresh. The Sort menu listed name, title, email and born, with Ascending and Descending disabled until an order was set; choosing name read "Sort name ↑ ×", put the header's arrow on name and ordered the rows from Ada Allen; the × read "Sort" again and the rows returned to id order. A ↓ icon beside "name ↑" contradicted it, so Sort's icon is ⇕ |
 | 2026-10-21 | A read sent before the table's own write landed is read again at the write's commit | `type_table` `a_read_sent_before_the_tables_own_write_landed_is_read_again_at_its_commit` (a header click reads the first page at c1 while the table's delete of p1 lands at c2; grouped, a section's page read at c2 while p2's delete lands at c3), failing with the pin check undone | Both read again at the new pin: p1 does not come back, nor p2. Undone, the c1 page showed p1 again under c2 |
 | 2026-10-21 | A sorted table whose rows lack the sort's value reads them | `type_table` `a_sorted_table_whose_rows_hold_no_value_reads_them_at_once` ("email is empty", sorted by email), failing with the read-on undone | p1 and p2 read, the list exhausted. Undone, no row showed while the count said 2 |

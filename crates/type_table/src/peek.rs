@@ -3,6 +3,7 @@
 //! at full size as a node's page in a tab of its own. Every read is pinned to the commit the row
 //! was read at, or to the first read when the node was opened by id (constitution II).
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
@@ -35,7 +36,7 @@ use crate::blob::{
     IMAGE_MAX, KIND_PREFIX, PREVIEW_PREFIX, Preview, bytes_wanted, preview, read_range,
     save_folder, save_value, suggested_file_name,
 };
-use crate::blob_write::{self, BlobChange, BlobEdit, BlobWritten};
+use crate::blob_write::{self, Binding, BlobChange, BlobEdit, BlobWritten};
 use crate::model::{
     BlobsAt, FROM_COLUMN, Notice, SaveResult, TO_COLUMN, Tone, changed_elsewhere, count_of,
     display_value, edited, field_rows, node_label, node_rows, reads_as_markdown, save_result,
@@ -1480,20 +1481,34 @@ impl NodePeek {
                 .commit(self.snapshot.as_deref())
                 .map(str::to_owned),
         };
-        let bound_at = read_at.clone();
+        // Where the write was bound, once it is: an upload's binding is worked out as it is
+        // sent, after the file is read.
+        let bound_at = Rc::new(RefCell::new(read_at.clone()));
         slot.edit = Some(BlobEdit::Saving(change.clone()));
         self.saving.insert(property.to_owned());
         let (cell, branch) = (self.blob_cell(property), self.branch.clone());
         let write = match &change {
-            BlobChange::Upload(path) => blob_write::upload(
-                &self.session,
-                &branch,
-                cell,
-                shown,
-                read_at,
-                path.clone(),
-                cx,
-            ),
+            BlobChange::Upload(path) => {
+                // One of the view's own writes, or its table's, landing while the file is read
+                // moves where the values it shows hold, and every validator of the type with
+                // them: the write is bound to what the slot shows as it goes. After a conflict
+                // it stays bound to what the head held then; with the view gone or on another
+                // branch, to what the slot showed when the file was chosen.
+                let view = cx.entity().downgrade();
+                let (property, chosen) = (property.to_owned(), bound_at.clone());
+                let (sent_on, again) = (branch.clone(), over.is_some());
+                let chose = Binding { shown, read_at };
+                let binding = move |cx: &mut App| {
+                    let now = view
+                        .upgrade()
+                        .filter(|_| !again)
+                        .and_then(|view| view.read(cx).blob_binding(&property, &sent_on));
+                    let binding = now.unwrap_or(chose);
+                    *chosen.borrow_mut() = binding.read_at.clone();
+                    binding
+                };
+                blob_write::upload_bound(&self.session, &branch, cell, binding, path.clone(), cx)
+            }
             BlobChange::Clear => {
                 blob_write::clear(&self.session, &branch, cell, shown, read_at, cx)
             }
@@ -1502,12 +1517,30 @@ impl NodePeek {
         cx.spawn(async move |this, cx| {
             let written = write.await;
             this.update(cx, |this, cx| {
+                let bound_at = bound_at.borrow().clone();
                 this.blob_written(&property, &branch, change, (written, bound_at), cx)
             })
             .ok();
         })
         .detach();
         cx.notify();
+    }
+
+    /// What a Blob write to slot `property`, sent on `branch`, is bound to now: the value the
+    /// slot shows, read where the values the view shows hold ([`BlobsAt`]). `None` once the
+    /// view reads another branch, or its slot holds no value it has read.
+    fn blob_binding(&self, property: &str, branch: &str) -> Option<Binding> {
+        if self.branch != branch {
+            return None;
+        }
+        let slot = self.blobs.iter().find(|slot| slot.property == property)?;
+        Some(Binding {
+            shown: slot.meta.loaded()?.clone(),
+            read_at: self
+                .blobs_at
+                .commit(self.snapshot.as_deref())
+                .map(str::to_owned),
+        })
     }
 
     /// Lands a Blob write of slot `property` sent on `branch`, with the commit its validator was
@@ -7716,6 +7749,94 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert_eq!(view.snapshot.as_deref(), Some("c3"));
             assert_eq!(view.blobs[0].meta, Loadable::Loaded(BlobMeta::Null));
+        });
+    }
+
+    /// A file stored in a slot is bound as it is sent, after the file is read, to what the slot
+    /// shows then. The table the peek came from saves another of the node's Blob values while
+    /// the file is read: the peek follows it to its commit, where every ETag of the type has
+    /// moved, and the upload carries the ETag read there and is stored. Bound when the file
+    /// was chosen, it named the ETag read before and was refused as changed elsewhere, though
+    /// the value it would replace had not changed.
+    #[gpui::test]
+    async fn a_slot_upload_is_bound_to_what_the_view_shows_as_it_is_sent(cx: &mut TestAppContext) {
+        const TWO_BLOBS: &str =
+            "node Person {\n  slug: String @key\n  name: String\n  doc: Blob?\n  scan: Blob?\n}\n";
+        let (session, blobs) = crate::test_support::session_with_blobs(TWO_BLOBS, cx);
+        blobs
+            .versioned
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        blobs.set("Person/p1/scan", b"scan");
+        blobs.set("Person/p1/doc", b"old");
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (view, cx) = cx.add_window_view({
+            let session = session.clone();
+            move |_, cx| NodePeek::page(session, "Person".into(), "p1".into(), None, cx)
+        });
+        cx.run_until_parked();
+        let chosen = blobs.get("Person/p1/doc").unwrap().1;
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.reads_at(), Some("c1"));
+            assert_eq!(view.blob_size("doc"), Some(3));
+        });
+
+        // The table's save of p1's scan, out and then in at the server: c2, on c1.
+        view.update(cx, |view, cx| {
+            view.table_saves(HashSet::from(["scan".to_owned()]), cx)
+        });
+        let scan = BlobCell {
+            edge: false,
+            type_name: "Person".into(),
+            id: "p1".into(),
+            property: "scan".into(),
+        };
+        let saved = session.update(cx, |session, cx| {
+            session.blob_put_on("main", scan, None, b"new scan".to_vec(), "scan".into(), cx)
+        });
+        cx.run_until_parked();
+        saved.await;
+        let moved = blobs.get("Person/p1/doc").unwrap().1;
+        assert_ne!(moved, chosen, "the scan's write moved every ETag of Person");
+
+        // The file is chosen, then the table's save reaches the peek while it is read.
+        let file = crate::test_support::upload_file("bound-in-slot.txt", b"bound", None);
+        view.update(cx, |view, cx| {
+            view.upload_blob("doc", file, cx);
+            let stored = blobs.get("Person/p1/scan").unwrap();
+            let wrote = TableWrote {
+                commit: "c2".into(),
+                parent: Some("c1".into()),
+                values: Vec::new(),
+                blob: Some((
+                    "scan".into(),
+                    BlobMeta::Managed {
+                        size: stored.0.len() as u64,
+                        etag: Some(stored.1),
+                    },
+                )),
+                type_name: "Person".into(),
+                touched: HashSet::new(),
+            };
+            view.table_wrote(wrote, cx);
+            view.table_saves(HashSet::new(), cx);
+        });
+        cx.run_until_parked();
+        let writes = blobs.writes.lock().unwrap().clone();
+        let sent = writes.last().unwrap();
+        assert_eq!(sent.cell, "Person/p1/doc");
+        assert_eq!(sent.if_match.as_deref(), Some(moved.as_str()));
+        assert_eq!(blobs.get("Person/p1/doc").unwrap().0, b"bound");
+        view.read_with(cx, |view, _| {
+            let doc = view
+                .blobs
+                .iter()
+                .find(|slot| slot.property == "doc")
+                .unwrap();
+            assert_eq!(doc.edit, None, "stored, not refused as changed elsewhere");
+            assert_eq!(view.reads_at(), Some("c3"), "its own commit");
         });
     }
 

@@ -30,7 +30,7 @@ use crate::blob::{
     KIND_PREFIX, ShownImage, ValueKind, hex_dump_lines, read_value, save_folder, save_value,
     suggested_file_name, value_kind,
 };
-use crate::blob_write::{self, BlobChange, BlobEdit, BlobWritten};
+use crate::blob_write::{self, Binding, BlobChange, BlobEdit, BlobWritten};
 use crate::model::{Notice, Tone};
 use crate::pdf;
 
@@ -525,6 +525,15 @@ impl BlobView {
             .or_else(|| self.opened_at.clone())
     }
 
+    /// What a write is bound to now: the value the tab shows, read where it reads the value.
+    /// `None` while it has not read what the cell holds.
+    fn binding(&self) -> Option<Binding> {
+        Some(Binding {
+            shown: self.meta.clone()?,
+            read_at: self.reading_at(),
+        })
+    }
+
     /// Why the value cannot take a file here, or `None` when it can.
     fn write_refusal(&self, cx: &App) -> Option<String> {
         let schema = self.session.read(cx).schema_model();
@@ -632,15 +641,21 @@ impl BlobView {
         };
         let (cell, branch) = (self.cell.clone(), self.branch.clone());
         let write = match &change {
-            BlobChange::Upload(path) => blob_write::upload(
-                &self.session,
-                &branch,
-                cell,
-                shown,
-                read_at,
-                path.clone(),
-                cx,
-            ),
+            BlobChange::Upload(path) => {
+                // Bound to what the tab shows as the write goes, after the file is read, where
+                // the tab reads the value then. After a conflict it stays bound to what the head
+                // held then; with the tab closed, to what it showed when the file was chosen.
+                let tab = cx.entity().downgrade();
+                let again = over.is_some();
+                let chose = Binding { shown, read_at };
+                let binding = move |cx: &mut App| {
+                    tab.upgrade()
+                        .filter(|_| !again)
+                        .and_then(|tab| tab.read(cx).binding())
+                        .unwrap_or(chose)
+                };
+                blob_write::upload_bound(&self.session, &branch, cell, binding, path.clone(), cx)
+            }
             BlobChange::Clear => {
                 blob_write::clear(&self.session, &branch, cell, shown, read_at, cx)
             }
@@ -1588,6 +1603,70 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert_eq!(view.edit, None, "stored");
             assert_eq!(view.own_commit.as_deref(), Some("c2"));
+        });
+    }
+
+    /// A file stored from the tab is bound as it is sent, after the file is read, to what the
+    /// tab shows then, read where it reads the value then. The cell is saved while the file is
+    /// read, and the tab moves to that save's commit and value, as the landing of its own write
+    /// moves it (`written`); the upload carries the ETag read there and is stored. Bound when
+    /// the file was chosen, it named the value the tab no longer showed and was refused as
+    /// changed. The tab sends one write at a time and follows no other view's, so this test
+    /// moves it itself: nothing it does today moves what it shows while a file is read.
+    #[gpui::test]
+    async fn a_tabs_upload_is_bound_to_what_the_tab_shows_as_it_is_sent(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, blobs) = crate::test_support::session_with_blobs(DOCS, cx);
+        blobs
+            .versioned
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let chosen = blobs.set("Person/p1/doc", b"old");
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            BlobView::new(session.clone(), doc(), None, false, window, cx)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.reading_at().as_deref(), Some("c1"));
+            assert_eq!(
+                view.meta,
+                Some(BlobMeta::Managed {
+                    size: 3,
+                    etag: Some(chosen.clone())
+                })
+            );
+        });
+        // The cell is saved at c2: a value of the same size, under a new ETag.
+        let saved = session.update(cx, |session, cx| {
+            let bytes = b"mid".to_vec();
+            session.blob_put_on("main", doc(), Some(chosen.clone()), bytes, "mid".into(), cx)
+        });
+        cx.run_until_parked();
+        saved.await;
+        let now = blobs.get("Person/p1/doc").unwrap().1;
+
+        let file = crate::test_support::upload_file("bound-in-tab.txt", b"bound", None);
+        view.update(cx, |view, cx| {
+            view.upload(file, cx);
+            // While the file is read, the tab comes to show the save, at its commit.
+            view.own_commit = Some("c2".into());
+            view.meta = Some(BlobMeta::Managed {
+                size: 3,
+                etag: Some(now.clone()),
+            });
+        });
+        cx.run_until_parked();
+        let writes = blobs.writes.lock().unwrap().clone();
+        assert_eq!(writes.len(), 2, "the save, then the upload");
+        assert_eq!(writes[1].if_match.as_deref(), Some(now.as_str()));
+        assert_eq!(blobs.get("Person/p1/doc").unwrap().0, b"bound");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.edit, None, "stored, not refused as changed");
+            assert_eq!(view.own_commit.as_deref(), Some("c3"));
         });
     }
 
