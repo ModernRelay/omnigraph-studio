@@ -147,7 +147,7 @@ Agents (claude-agent-acp 0.89.1 with Claude Agent SDK 0.3.293; codex-acp 2.2.2 w
 | Piece | Where | Role |
 |---|---|---|
 | Forwarding | `GraphClient::forward` (`crates/graph_client/src/client.rs`) | Sends a request on as it came, with the person's token and the contract header. Bodies stream both ways, no total timeout, never retried, and a path that would leave the server root is refused. The one client crate keeps every request (I) |
-| Rules | `crates/agent_panel/src/gateway_rules.rs` | `classify(request, sandbox) -> Verdict`: health, read, read with a rewritten body, a write for the agent's branch, or a refusal |
+| Rules | `crates/agent_panel/src/gateway_rules.rs` | `classify(request, sandbox) -> Verdict`: read, read with a rewritten body, a write for the agent's branch, or a refusal. The health probe never reaches them: the gateway answers it |
 | Gateway | `crates/agent_panel/src/gateway.rs`, `gateway_tls.rs`, `requester.rs` | A loopback HTTPS (HTTP/1.1 over TLS) server per conversation (`127.0.0.1:0`, one request per connection), with a certificate it makes when it starts. Checks the session token and contract header, applies the rules, forwards, and reports writes to the panel. On Windows it holds the processes a write's CLI was started under while the write waits |
 | CLI home | `crates/agent_panel/src/cli_home.rs` | The conversation's directory, config, token, certificate and wrapper; the shared `AGENTS.md`; finding a CLI that reads the home |
 | Panel | `crates/agent_panel/src/panel.rs` | Starts the gateway and home with the conversation, shows each write as a card, and records outcomes in the session's write log (`GraphSession::note_write`) |
@@ -206,6 +206,17 @@ files are private as the home's other files are: the folder is under the person'
 the directory, puts `127.0.0.1,localhost` in `NO_PROXY`, and runs the chosen CLI. The agent runs
 it by absolute path, so neither an environment filter nor a shell snapshot that reorders PATH
 can change what the CLI reads.
+
+Known first-run cost on macOS: the wrapper is a newly written executable, so its first run
+waits for Gatekeeper's scan of it before the shell starts it. `syspolicyd` logs
+`GK performScan` for the new script (unsigned, `-67062`), asks XProtect's analysis service to
+match it against the XProtect rules, and records its provenance; later runs are not scanned.
+Measured with an unsigned probe that writes a two-line script and runs it twice: 0.17 s and
+0.26 s for the first run, 6-12 ms for the second (2026-10-21, Apple M5 Pro, macOS 26.5.2).
+While builds were running, the live test's first wrapper run took 7-23 s and a fresh script
+from the same process as long, every later run about 20 ms; why the scan took that long then
+was not isolated. The agent's first command of each conversation can pay it. No workaround for
+now.
 
 On Windows the wrapper is the batch file `omnigraph.cmd`, written from the same account of what
 it does as the shell script (`cli_home::Wrapper`), so only the syntax differs. It removes the
@@ -267,13 +278,16 @@ conversation) makes a new key and certificate.
 The stack is rustls, which Studio's HTTP client already builds, over smol through
 `futures-rustls`, with ring as the provider (Studio's graph builds both ring and aws-lc-rs, so
 none is the process default), and `rcgen` makes the certificate. The server offers only
-`http/1.1` and no session resumption: each CLI command is a new process. A connection's
-handshake shares the head's 10-second bound; one that does not complete it, plain HTTP among
-them, is closed with no answer. After the handshake the stream is split: the request is read and
-the "CLI went away" watch runs on the read half while the answer goes out on the write half, and
-the connection ends with TLS's close. An answer's end is still its framing (a length or the last
-chunk), so a cut answer stays cut. The connection's TCP ends are taken before the handshake, for
-`requester`.
+`http/1.1` and no session resumption: each CLI command is a new process. One 10-second bound,
+counted from the connection's opening, covers its handshake and then its request's line and
+headers together, so a process that need not trust the certificate to finish a handshake holds a
+connection no longer than that without the token. One that does not complete the handshake,
+plain HTTP among them, is closed with no answer. The whole request, a body read only with the
+token, must be in within 60 seconds of the opening. After the handshake the stream is split: the
+request is read and the "CLI went away" watch runs on the read half while the answer goes out on
+the write half, and the connection ends with TLS's close. An answer's end is still its framing (a
+length or the last chunk), so a cut answer stays cut. The connection's TCP ends are taken before
+the handshake, for `requester`.
 
 ### The agent's environment
 
@@ -346,12 +360,13 @@ it is.
    the same commit. A configured `agent.omnigraph_cli` that does not fit is passed over with a
    notice naming the one used.
 
-Until an edge build with `ff542202` is published and installed, every conversation's agent has
-no CLI: the installed `0.14.0-edge+50283ce` is refused (it has no `config validate`), as decided.
-The end-to-end check against a real CLI of the version-1 line waits for that build: the ignored
-`gateway` test `a_live_cli_reaches_the_gateway_with_what_its_home_holds` runs it with
-`OMNIGRAPH_STUDIO_LIVE_CLI` pointing at one, and the ignored
-`the_stock_cli_reads_and_writes_its_branch_through_the_gateway` against a server.
+`0.14.0-edge+50283ce` is refused (it has no `config validate`), as decided. The first build of
+the version-1 line installed here, `0.14.0-edge+7fff9df` (2026-10-21, OmniGraph main with
+`ff542202`), is taken: the ignored `gateway` test
+`a_live_cli_reaches_the_gateway_with_what_its_home_holds`, run with `OMNIGRAPH_STUDIO_LIVE_CLI`
+pointing at it, passes (validation log). The ignored
+`the_stock_cli_reads_and_writes_its_branch_through_the_gateway` also needs a server and has not
+been run with it.
 
 ### Gateway rules
 
@@ -362,7 +377,12 @@ use). Of the request's headers only `accept`, `content-type`, `if-match`, `if-no
 `omnigraph-if-actor`, `omnigraph-if-graph-commit` and `range` are passed on; the gateway sets the
 token and contract itself. `omnigraph-if-actor` is the CLI's `--as`, which can only narrow a
 request: the server refuses it unless it names the person's actor. Request bodies are read
-whole, at most 64 MiB (413 above, before anything is sent). A
+whole, at most 64 MiB (413 above, before anything is sent), and only once the token has been
+checked: a request without it is refused (401) from its headers, its body unread. The probe
+carries no body, so one that declares a body (a `content-length` other than 0, or any
+`transfer-encoding`) is refused (400) unread too, and any local process that finishes a
+handshake cannot make Studio read one. A body whose end cannot be told (a `content-length`
+that is not one number, a transfer coding that does not end with `chunked`) is refused (400). A
 target holding a `#`, or a query parameter given twice, is refused (400) before the rules
 read it: forwarding drops a `#` and all that follows it, so the rules would judge a query the
 server never sees, and a repeated key could be judged by one value and read as another.
@@ -439,7 +459,9 @@ and cards apply, because the CLI still speaks to the gateway.
   directory, its wrapper and `.studio/<branch>/config.yaml` included. So Studio never runs the
   wrapper or reads that home: it starts the chosen CLI itself, with `OMNIGRAPH_HOME` set to a
   copy of the conversation's config and credentials in a private folder outside every working
-  directory (`<data dir>/agent/homes/`, `0700`), with every `OMNIGRAPH_*` variable of Studio's
+  directory (`<data dir>/agent/homes/`, `0700`; on Windows under `%LOCALAPPDATA%`, beside the
+  working directories, since a roaming `%APPDATA%` would carry its token and certificate to a
+  network share), with every `OMNIGRAPH_*` variable of Studio's
   own removed, and with that folder as its current directory. Run files are staged there too,
   not in the temporary directory, which a sandboxed agent may write. The folder goes with the
   conversation.
@@ -657,8 +679,31 @@ CLI is the one they trust).
 | 2026-10-21 | `--page-token` passes where a command pages | `agent_panel` `every_flag_studio_knows_passes`, `run_passes_only_the_flags_studio_knows`; `commands/history/args.rs` at `97788d37` | `commit list`, `branch diff` and `commit changes` take it in both forms; `changes poll`, which has none, refuses it by name |
 | 2026-10-21 | The Windows stand-in CLI speaks TLS to the gateway | `requester::stand_in` (now a rustls client trusting its home's `ca.pem`) for `gateway` `a_write_whose_command_was_stopped_is_not_sent` | Windows only; not run here. CI runs it on `windows-2025` |
 | 2026-10-21 | A real CLI that reads the home reaches the gateway | `agent_panel` `gateway` `a_live_cli_reaches_the_gateway_with_what_its_home_holds` (ignored: `needs: OMNIGRAPH_STUDIO_LIVE_CLI`): `choose_cli` must take the CLI, then `branch list --json` through `omnigraph_run` and through the wrapper must each reach a fake server with the person's token | Not run: no build made from main at `ff542202` or later is published or installed, and building OmniGraph here is too heavy for the disk. Run it, and the server end-to-end test, with the next edge build |
+| 2026-10-21 | The gateway reads a body only for a request with the token, and one bound covers the handshake and the head | `agent_panel` `gateway` `only_a_request_with_the_token_has_its_body_read` (new: a stream that gives the head, then body on demand, counting it), `a_connection_is_let_go_one_bound_after_it_opens` (new; the head's bound is 3 s in tests, 10 s in Studio), `the_gateway_checks_the_session_then_forwards_reads_and_approved_writes` (a probe declaring a 64 MiB or chunked body, over TLS, must be answered within 5 s); each run red first against the old order (health before the token check, the body read for it; a bound of its own for the head) | Before: `GET /healthz` with a declared 64 MiB body and no token had all 64 MiB read and was answered 200; over TLS such a probe whose body never came got no answer within 5 s (the gateway waited up to 60 s for it); a connection that finished its handshake 2 s in and sent nothing was held 5.0 s. After: the probe declaring any body, or an unreadable length, is refused 400 and a request without the token 401, each with 0 body bytes read; the probe without a body is answered; the token's request has its body read; a `content-length` of two values or a `transfer-encoding: gzip` is refused 400 unread; the late-handshake connection is let go within 4 s of opening |
+| 2026-10-21 | `omnigraph_run` removes an OmniGraph variable Studio holds | `agent_panel` `a_run_starts_the_chosen_cli_with_its_private_home`, now run again by itself in a process of its own started with `OMNIGRAPH_TOKEN_STUDIO_TEST` set (so no other test's environment changes) | Before, the test set no `OMNIGRAPH_*` variable, so the 2026-10-18 row's "no other `OMNIGRAPH_*` variable" was true of an environment that held none. Now the fake CLI's `env` shows `OMNIGRAPH_HOME` alone, neither the variable's name nor its value |
+| 2026-10-21 | `.studio` is refused by any name that opens it | `agent_panel` `the_studio_folder_is_refused_by_any_name_that_opens_it` (new) | `.Studio`, `.STUDIO`, `.studio.`, `.Studio . `, `.ſtudio` and `.studıo` (both upper-case to `.STUDIO`), and an absolute `<cwd>/.Studio/…`, are refused; `.studios`, `studio` and a nested `data/.studio` pass. Before, only the exact `.studio` was refused, and on APFS `--out .Studio/…` opens the folder. Not covered: an NTFS 8.3 short name of `.studio` (`STUDIO~1`) |
+| 2026-10-21 | The private CLI homes stay on the machine on Windows | `agent_panel` `agents_work_in_the_local_folder_of_studios_roaming_data` (now also: `private_homes()` and the working directories share one `agent` folder) | The homes were under `studio_settings::data_dir()`, the roaming `%APPDATA%` on Windows; they now come from the same `%LOCALAPPDATA%` counterpart as the working directories (`sessions::agent_dir`). Run on macOS, where both are the data folder; the Windows mapping is `local_counterpart`'s, checked by the same test |
+| 2026-10-21 | A real CLI that reads the home reaches the gateway, run | `agent_panel` `gateway` `a_live_cli_reaches_the_gateway_with_what_its_home_holds` with `OMNIGRAPH_STUDIO_LIVE_CLI=~/.local/bin/omnigraph`, `0.14.0-edge+7fff9df` (commit `7fff9dfd`, OmniGraph main with `ff542202`), on macOS, with the gateway changes above | Passed. `choose_cli` took it (`version --json`: contract 0.14, target protocol 1; its `config validate` accepted the private home) with the wrapper ready. `branch list --json` through `omnigraph_run` (`--target studio`) and through the wrapper (the default target) each reached the fake server once, over TLS, with the person's token and the contract, and the CLI read the gateway's answer (it reported the fake answer's missing `branches`, `http_status: 200`). The wrapper's first run took 7-23 s across runs, a fresh two-line script written by the test binary the same, the CLI on that home 24 ms and every later run about 20 ms: the first exec of a new script, which Gatekeeper scans (the wrapper's known first-run cost, above), not the CLI or the gateway. Supersedes the row above's "Not run"; the server end-to-end test is still not run |
+| 2026-10-21 | The wrapper's first run waits for Gatekeeper's scan | An unsigned C probe (not checked in) that writes a two-line script, makes it `0700` and runs it twice; `/usr/bin/log show` for `syspolicyd` and `XprotectService` over those seconds; Apple M5 Pro, macOS 26.5.2 | `syspolicyd` logged `GK performScan` for the script (`-67062`: unsigned), opened XProtect's analysis service, which loaded the XProtect YARA rules, then `Putting executable into provenance`; the second run logged no scan. First run 0.17 s and 0.26 s in two tries, second 6 ms and 12 ms. Not reproduced: the 7-23 s the live test saw while builds were running |
 
 ## Corrections
+
+- 2026-10-21 · The gateway answered the health probe without its token but read the probe's body
+  first, up to 64 MiB, though the plan said a body is read only after the token check: any local
+  process that finished a TLS handshake (it need not trust the certificate) could make Studio
+  hold 64 MiB per connection, about 4 GiB over the 64 connections a listener serves, and take
+  every one of them from the agent's CLI. The probe now carries no body (one that declares one
+  is refused unread), a request without the token is refused before its body as before, and the
+  handshake and the head share one 10-second bound from the connection's opening instead of
+  10 seconds each, so such a connection holds a place no longer than that.
+- 2026-10-21 · `a_run_starts_the_chosen_cli_with_its_private_home`, cited for `omnigraph_run`
+  removing Studio's `OMNIGRAPH_*` variables, ran in an environment that held none; it now runs in
+  a process of its own that holds one. The rules test named for health had no health case; it is
+  `reads_go_anywhere`, and the gateway's tests own the probe. The `.studio` refusal compared the
+  name exactly, so `.Studio/…` reached the folder on a case-insensitive file system; it now
+  matches the name in any case and without Windows' trailing dots and spaces. The private CLI
+  homes, which hold the session token and certificate, were under the roaming `%APPDATA%` on
+  Windows; they are now under `%LOCALAPPDATA%` with the working directories.
 
 - 2026-10-21 · `--page-token` was refused by `omnigraph_run` with the flags named for a token. It
   is a page's cursor, not a credential, and now passes where the CLI takes it.

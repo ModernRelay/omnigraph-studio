@@ -13,6 +13,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use futures::channel::{mpsc, oneshot};
 use futures::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
@@ -34,12 +35,18 @@ use crate::requester::Starters;
 const MAX_HEAD: usize = 64 * 1024;
 /// The most a request body may take; a larger load is refused with 413.
 pub const MAX_BODY: usize = 64 * 1024 * 1024;
-/// How long a request may take to arrive whole, its body included.
+/// How long, from the connection's opening, its request may take to arrive whole, its body
+/// included. Only a request with the session's token has a body read.
 const READ_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
-/// How long a connection's TLS handshake may take, and then its request's line and headers, its
-/// token among them: any local process can open a connection, and one that sends nothing is let
-/// go before it holds one long.
-const HEAD_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long, from the connection's opening, its TLS handshake and then its request's line and
+/// headers, its token among them, may take together. Any local process can open a connection and
+/// finish the handshake (it need not trust the certificate), so one that sends nothing, or sends
+/// slowly, is let go by then: without the token it never holds a connection longer.
+const HEAD_WITHIN: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_secs(3)
+} else {
+    std::time::Duration::from_secs(10)
+};
 /// The most a write's answer may take before the gateway stops reading it for the card.
 const MAX_WRITE_ANSWER: usize = 8 * 1024 * 1024;
 /// Request headers passed on to the server; the gateway sets the token and contract itself.
@@ -209,10 +216,10 @@ enum ReadFailure {
     Answer(u16, &'static str, String),
 }
 
-/// `future`'s output, or `None` when it takes longer than `limit`.
-async fn within<T>(limit: std::time::Duration, future: impl Future<Output = T>) -> Option<T> {
+/// `future`'s output, or `None` when it is not done by `deadline`.
+async fn by<T>(deadline: Instant, future: impl Future<Output = T>) -> Option<T> {
     let future = futures::FutureExt::fuse(future);
-    let late = futures::FutureExt::fuse(smol::Timer::after(limit));
+    let late = futures::FutureExt::fuse(smol::Timer::at(deadline));
     futures::pin_mut!(future, late);
     futures::select! {
         output = future => Some(output),
@@ -226,15 +233,22 @@ type Ends = (Option<SocketAddr>, Option<SocketAddr>);
 
 async fn serve_connection(stream: TcpStream, acceptor: TlsAcceptor, shared: Arc<Shared>) {
     let ends = (stream.peer_addr().ok(), stream.local_addr().ok());
+    // Both bounds count from here, so the handshake's time comes out of the head's: a local
+    // process that opens a connection and sends slowly, or nothing, holds it no longer than
+    // `HEAD_WITHIN` in all.
+    let opened = Instant::now();
+    let head_by = opened + HEAD_WITHIN;
     // A connection that does not finish its handshake (one that speaks plain HTTP among them)
     // is closed unanswered.
-    let Some(Ok(stream)) = within(HEAD_WITHIN, acceptor.accept(stream)).await else {
+    let Some(Ok(stream)) = by(head_by, acceptor.accept(stream)).await else {
         return;
     };
     let (mut reader, mut writer) = stream.split();
-    // A local process that opens a connection and sends slowly, or nothing, holds it no longer
-    // than this.
-    let read = within(READ_WITHIN, read_request(&mut reader, &shared.token)).await;
+    let read = by(
+        opened + READ_WITHIN,
+        read_request(&mut reader, &shared.token, head_by),
+    )
+    .await;
     match read.unwrap_or(Err(ReadFailure::Gone)) {
         Ok(request) => handle(&mut reader, &mut writer, ends, request, &shared).await,
         Err(ReadFailure::Gone) => return,
@@ -282,8 +296,9 @@ async fn handle(
         .await;
         return;
     }
-    // The CLI probes `/healthz` with no token and no contract header before every request.
-    // Every other request carries the session's token, checked before its body was read.
+    // The CLI probes `/healthz` with no token, no contract header and no body before every
+    // request; one that declared a body was refused unread. Every other request carries the
+    // session's token, checked before its body was read.
     if is_health(&request.method, &path) {
         let body = if request.method == "HEAD" { "" } else { "ok" };
         write_simple(stream, 200, "text/plain", body.as_bytes()).await;
@@ -649,23 +664,70 @@ async fn read_head(
     }
 }
 
-/// Reads one request. Its token is checked once its headers are in, before its body (up to
-/// [`MAX_BODY`]) is read: only the conversation's CLI makes Studio read that much.
+/// How a request's headers say its body is framed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Framing {
+    /// No body: no `transfer-encoding`, and no `content-length` or one of 0.
+    None,
+    Length(usize),
+    Chunked,
+    /// A body whose end cannot be told: a `transfer-encoding` that does not end with `chunked`,
+    /// or a `content-length` that is not one number.
+    Unreadable,
+}
+
+impl Framing {
+    /// Read from the headers alone, before any of the body is.
+    fn of(headers: &[(String, String)]) -> Self {
+        let values = |name: &str| -> Vec<&str> {
+            headers
+                .iter()
+                .filter(|(key, _)| key == name)
+                .flat_map(|(_, value)| value.split(','))
+                .map(str::trim)
+                .collect()
+        };
+        let encodings = values("transfer-encoding");
+        if !encodings.is_empty() {
+            // A transfer coding decides over a length; only one that ends with `chunked` says
+            // where a request's body ends.
+            return match encodings.last() {
+                Some(last) if last.eq_ignore_ascii_case("chunked") => Self::Chunked,
+                _ => Self::Unreadable,
+            };
+        }
+        let lengths = values("content-length");
+        let Some(first) = lengths.first() else {
+            return Self::None;
+        };
+        let digits = !first.is_empty() && first.bytes().all(|byte| byte.is_ascii_digit());
+        match first.parse::<usize>() {
+            Ok(0) if digits && lengths.iter().all(|other| other == first) => Self::None,
+            Ok(length) if digits && lengths.iter().all(|other| other == first) => {
+                Self::Length(length)
+            }
+            // A length past the largest number is still a body too large to read.
+            Err(_) if digits => Self::Length(usize::MAX),
+            _ => Self::Unreadable,
+        }
+    }
+}
+
+/// Reads one request, its body last. The health probe carries no token and may carry no body:
+/// one that declares a body is refused without a byte of it read. Every other request's token
+/// is checked once its headers are in, before its body (up to [`MAX_BODY`]) is read: only the
+/// conversation's CLI makes Studio read that much. Its line and headers must be in by
+/// `head_by`.
 async fn read_request(
     stream: &mut (impl AsyncRead + Unpin),
     token: &str,
+    head_by: Instant,
 ) -> Result<Request, ReadFailure> {
     let mut buffer = Vec::with_capacity(8 * 1024);
     let mut chunk = [0u8; 8 * 1024];
-    let head_end = {
-        let head = futures::FutureExt::fuse(read_head(stream, &mut buffer));
-        let late = futures::FutureExt::fuse(smol::Timer::after(HEAD_WITHIN));
-        futures::pin_mut!(head, late);
-        futures::select! {
-            end = head => end,
-            _ = late => Err(ReadFailure::Gone),
-        }
-    }?;
+    let head_end = by(head_by, read_head(stream, &mut buffer))
+        .await
+        .unwrap_or(Err(ReadFailure::Gone))?;
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut parsed = httparse::Request::new(&mut headers);
     match parsed.parse(&buffer[..head_end]) {
@@ -691,12 +753,28 @@ async fn read_request(
         })
         .collect();
     let path = target.split('?').next().unwrap_or_default();
+    let framing = Framing::of(&headers);
+    if is_health(&method, path) {
+        if framing != Framing::None {
+            return Err(ReadFailure::Answer(
+                400,
+                "bad_request",
+                "Studio: the health probe carries no body.".into(),
+            ));
+        }
+        return Ok(Request {
+            method,
+            target,
+            headers,
+            body: Vec::new(),
+        });
+    }
     let authorized = headers
         .iter()
         .find(|(name, _)| name == "authorization")
         .and_then(|(_, value)| value.strip_prefix("Bearer "))
         .is_some_and(|sent| same(sent.as_bytes(), token.as_bytes()));
-    if !authorized && !is_health(&method, path) {
+    if !authorized {
         return Err(ReadFailure::Answer(
             401,
             "unauthorized",
@@ -704,33 +782,33 @@ async fn read_request(
         ));
     }
     let mut rest = buffer[head_end..].to_vec();
-    let chunked = headers.iter().any(|(name, value)| {
-        name == "transfer-encoding" && value.to_ascii_lowercase().contains("chunked")
-    });
-    let length = headers
-        .iter()
-        .find(|(name, _)| name == "content-length")
-        .and_then(|(_, value)| value.parse::<usize>().ok());
-    let body = if chunked {
-        read_chunked(stream, rest).await?
-    } else if let Some(length) = length {
-        if length > MAX_BODY {
-            return Err(too_large());
-        }
-        while rest.len() < length {
-            let read = stream
-                .read(&mut chunk)
-                .await
-                .map_err(|_| ReadFailure::Gone)?;
-            if read == 0 {
-                return Err(ReadFailure::Gone);
+    let body = match framing {
+        Framing::None => Vec::new(),
+        Framing::Chunked => read_chunked(stream, rest).await?,
+        Framing::Length(length) => {
+            if length > MAX_BODY {
+                return Err(too_large());
             }
-            rest.extend_from_slice(&chunk[..read]);
+            while rest.len() < length {
+                let read = stream
+                    .read(&mut chunk)
+                    .await
+                    .map_err(|_| ReadFailure::Gone)?;
+                if read == 0 {
+                    return Err(ReadFailure::Gone);
+                }
+                rest.extend_from_slice(&chunk[..read]);
+            }
+            rest.truncate(length);
+            rest
         }
-        rest.truncate(length);
-        rest
-    } else {
-        Vec::new()
+        Framing::Unreadable => {
+            return Err(ReadFailure::Answer(
+                400,
+                "bad_request",
+                "Studio: the request's body could not be read.".into(),
+            ));
+        }
     };
     Ok(Request {
         method,
@@ -1496,6 +1574,148 @@ mod tests {
         });
     }
 
+    /// A connection that gives a request's line and headers in its first read, then as much body
+    /// as it is asked for, counting what it gave.
+    struct Declaring {
+        head: Vec<u8>,
+        body_read: usize,
+    }
+
+    impl AsyncRead for Declaring {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buffer: &mut [u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if !self.head.is_empty() {
+                let given = buffer.len().min(self.head.len());
+                buffer[..given].copy_from_slice(&self.head[..given]);
+                self.head.drain(..given);
+                return std::task::Poll::Ready(Ok(given));
+            }
+            buffer.fill(b'x');
+            self.body_read += buffer.len();
+            std::task::Poll::Ready(Ok(buffer.len()))
+        }
+    }
+
+    /// Studio reads a body only for a request with the session's token. The health probe, which
+    /// carries none, and a request with no token or another, are refused once their headers are
+    /// in, whatever body they declare, without a byte of it read: any local process can send
+    /// them. The probe without a body is answered, and a request with the token has its body
+    /// read.
+    #[test]
+    fn only_a_request_with_the_token_has_its_body_read() {
+        let read = |head: &str| {
+            let mut stream = Declaring {
+                head: head.as_bytes().to_vec(),
+                body_read: 0,
+            };
+            let read = smol::block_on(read_request(
+                &mut stream,
+                "the-token",
+                Instant::now() + HEAD_WITHIN,
+            ));
+            let status = match read {
+                Ok(_) => 200,
+                Err(ReadFailure::Answer(status, ..)) => status,
+                Err(ReadFailure::Gone) => 0,
+            };
+            (status, stream.body_read)
+        };
+        let large = format!("content-length: {MAX_BODY}");
+        for (request, status) in [
+            (
+                format!("GET /healthz HTTP/1.1\r\nhost: x\r\n{large}\r\n\r\n"),
+                400,
+            ),
+            (
+                "HEAD /healthz HTTP/1.1\r\nhost: x\r\ntransfer-encoding: chunked\r\n\r\n".into(),
+                400,
+            ),
+            (
+                format!(
+                    "GET /healthz HTTP/1.1\r\nhost: x\r\nauthorization: Bearer the-token\r\n\
+                     {large}\r\n\r\n"
+                ),
+                400,
+            ),
+            (
+                "GET /healthz HTTP/1.1\r\nhost: x\r\ncontent-length: many\r\n\r\n".into(),
+                400,
+            ),
+            (
+                "GET /healthz HTTP/1.1\r\nhost: x\r\ncontent-length: 0\r\n\r\n".into(),
+                200,
+            ),
+            ("GET /healthz HTTP/1.1\r\nhost: x\r\n\r\n".into(), 200),
+            (
+                format!("POST /graphs/knowledge/load HTTP/1.1\r\nhost: x\r\n{large}\r\n\r\n"),
+                401,
+            ),
+            (
+                format!(
+                    "POST /graphs/knowledge/load HTTP/1.1\r\nhost: x\r\n\
+                     authorization: Bearer wrong\r\n{large}\r\n\r\n"
+                ),
+                401,
+            ),
+            (
+                "POST /graphs/knowledge/load HTTP/1.1\r\nhost: x\r\nauthorization: Bearer \
+                 wrong\r\ntransfer-encoding: chunked\r\n\r\n"
+                    .into(),
+                401,
+            ),
+        ] {
+            assert_eq!(read(&request), (status, 0), "{request}");
+        }
+        // What the stream counts is read: a request with the token has the body it declares
+        // read, and one that declares a body it cannot frame is refused.
+        let (status, body_read) = read(
+            "POST /graphs/knowledge/load HTTP/1.1\r\nhost: x\r\nauthorization: Bearer \
+             the-token\r\ncontent-length: 100000\r\n\r\n",
+        );
+        assert_eq!(status, 200);
+        assert!(body_read >= 100_000, "{body_read}");
+        for framing in ["content-length: 5, 6", "transfer-encoding: gzip"] {
+            let request = format!(
+                "POST /graphs/knowledge/load HTTP/1.1\r\nhost: x\r\nauthorization: Bearer \
+                 the-token\r\n{framing}\r\n\r\n"
+            );
+            assert_eq!(read(&request), (400, 0), "{framing}");
+        }
+    }
+
+    /// One bound, from a connection's opening, covers its handshake and its request's head: a
+    /// process that takes most of it to finish the handshake, then sends nothing, is let go when
+    /// it ends, not a second bound later.
+    #[test]
+    fn a_connection_is_let_go_one_bound_after_it_opens() {
+        smol::block_on(async {
+            let (client, _) = upstream();
+            let mut gateway = Gateway::bind().unwrap();
+            let cli = Cli::of(&gateway);
+            let (events_tx, _events) = mpsc::unbounded();
+            let _serve = smol::spawn(gateway.serve(client, sandbox(), events_tx));
+            let opened = Instant::now();
+            let tcp = TcpStream::connect(("127.0.0.1", cli.port)).await.unwrap();
+            smol::Timer::after(HEAD_WITHIN * 2 / 3).await;
+            // The handshake, late, and then nothing: what ends is the gateway's close, or the
+            // handshake itself when its time ran out first.
+            let closed = by(opened + HEAD_WITHIN * 3, async {
+                if let Ok(stream) = cli.tls.connect(crate::gateway_tls::loopback(), tcp).await {
+                    read_all(stream).await;
+                }
+            })
+            .await;
+            let held = opened.elapsed();
+            assert!(closed.is_some(), "the gateway never let it go");
+            // A bound of its own for the head would have held it a whole one past the
+            // handshake, five thirds of one in all.
+            assert!(held < HEAD_WITHIN * 4 / 3, "held for {held:?}");
+        });
+    }
+
     #[test]
     fn the_gateway_checks_the_session_then_forwards_reads_and_approved_writes() {
         smol::block_on(async {
@@ -1531,8 +1751,24 @@ mod tests {
             let declared = "POST /graphs/knowledge/load HTTP/1.1\r\nhost: x\r\n\
                 authorization: Bearer wrong\r\ncontent-length: 50000000\r\n\r\n"
                 .to_owned();
-            let (status, _, _) = call(cli.clone(), declared).await;
+            let soon = || Instant::now() + std::time::Duration::from_secs(5);
+            let (status, _, _) = by(soon(), call(cli.clone(), declared))
+                .await
+                .expect("a refused request's body is not waited for");
             assert_eq!(status, 401);
+            // Nor is a health probe's, which carries no token: one that declares a body, as large
+            // as a load may carry, is refused at once, the body never read.
+            for framing in [
+                format!("content-length: {MAX_BODY}"),
+                "transfer-encoding: chunked".to_owned(),
+            ] {
+                let probe = format!("GET /healthz HTTP/1.1\r\nhost: x\r\n{framing}\r\n\r\n");
+                let (status, _, body) = by(soon(), call(cli.clone(), probe))
+                    .await
+                    .expect("the probe's body is not waited for");
+                assert_eq!(status, 400, "{framing}: {body}");
+                assert!(body.contains("carries no body"), "{body}");
+            }
             let (status, _, body) = call(
                 cli.clone(),
                 post("/graphs/knowledge/query", &token, None, "{}"),
@@ -1782,9 +2018,12 @@ mod tests {
                 .write_all(post("/graphs/knowledge/query", &token, Some(CONTRACT), body).as_bytes())
                 .await
                 .unwrap();
-            let answer = within(std::time::Duration::from_secs(30), read_all(plain))
-                .await
-                .expect("the gateway closes a connection that does not speak TLS");
+            let answer = by(
+                Instant::now() + std::time::Duration::from_secs(30),
+                read_all(plain),
+            )
+            .await
+            .expect("the gateway closes a connection that does not speak TLS");
             assert!(
                 !String::from_utf8_lossy(&answer).contains("HTTP/"),
                 "{answer:?}"
