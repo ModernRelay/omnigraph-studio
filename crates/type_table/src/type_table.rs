@@ -24,6 +24,7 @@ mod write;
 
 use gpui::{App, AppContext as _, Context, Entity, Window};
 use gq_language::{Filter, FilterOp};
+use graph_store::GraphSession;
 use serde_json::Value;
 use studio_actions::graph::{
     BrowseType, OpenBlob, OpenNode, OpenNodePage, OpenTextEditor, OpenType, PeekNode, UndoDelete,
@@ -44,10 +45,11 @@ use types_list::TypesList;
 /// `PeekNode`, `OpenBlob`, `OpenTextEditor`, `UndoDelete`). Its keys are in `assets/keymaps/`
 /// (`TypeTable`, `TypeTable && editing`).
 pub fn init(cx: &mut App) {
-    // A Blob tab comes back with the value it showed, at the commit it read it at.
+    // A Blob tab comes back with the value it showed, at the commit it read it at, writing to
+    // the branch it wrote to.
     studio_workspace::register_item_kind(cx, "blob", |data, workspace, window, cx| {
-        if let Some(action) = saved_blob(data) {
-            open_blob(workspace, &action, window, cx);
+        if let Some(saved) = saved_blob(data) {
+            open_blob(workspace, &saved.open, saved.branch, window, cx);
         }
     });
     // A node's page comes back at the head, or at the commit it held.
@@ -143,7 +145,7 @@ pub fn init(cx: &mut App) {
             undo_delete(workspace, action, cx);
         });
         workspace.register_action(|workspace, action: &OpenBlob, window, cx| {
-            open_blob(workspace, action, window, cx);
+            open_blob(workspace, action, None, window, cx);
         });
         workspace.register_action(|workspace, action: &OpenType, window, cx| {
             let filter = action.filter_id.clone().map(|id| match &action.via {
@@ -354,41 +356,89 @@ fn open_node_page(
     });
 }
 
-/// The Blob tab a saved one names ([`BlobView`]'s `serialize`): its value, the commit it read
-/// at, and whether it holds that commit. One saved without saying whether it holds its commit
-/// does not come back.
-fn saved_blob(data: &Value) -> Option<OpenBlob> {
+/// A Blob tab as saved ([`BlobView`]'s `serialize`): the value it opens, and the branch it
+/// writes to.
+struct SavedBlob {
+    open: OpenBlob,
+    /// `None` only for a tab held at a commit, which writes nowhere.
+    branch: Option<String>,
+}
+
+/// The Blob tab a saved one names: its value, the commit it read at, whether it holds that
+/// commit, and the branch it writes to. One saved without saying whether it holds its commit
+/// does not come back, nor one that writes without saying where: it would write to the branch
+/// the window shows, which the commit it reads may not be on.
+fn saved_blob(data: &Value) -> Option<SavedBlob> {
     let text = |key: &str| data.get(key).and_then(Value::as_str).map(str::to_owned);
-    Some(OpenBlob {
+    let open = OpenBlob {
         type_name: text("type_name")?,
         id: text("id")?,
         property: text("property")?,
         edge: data.get("edge").and_then(Value::as_bool).unwrap_or(false),
         at_commit: text("at_commit"),
         held: data.get("held")?.as_bool()?,
-    })
+    };
+    let held = open.held && open.at_commit.is_some();
+    let branch = text("branch");
+    if branch.is_none() && !held {
+        return None;
+    }
+    Some(SavedBlob { open, branch })
 }
 
-/// Opens a Blob value in a tab of its own, or shows the tab it is in.
+/// The value `action` opens.
+fn blob_cell(action: &OpenBlob) -> graph_client::BlobCell {
+    graph_client::BlobCell {
+        edge: action.edge,
+        type_name: action.type_name.clone(),
+        id: action.id.clone(),
+        property: action.property.clone(),
+    }
+}
+
+/// The tab `action` opens, on `branch` when it is given (one restored on the branch it was
+/// saved on), else on the session's.
+fn blob_view(
+    session: Entity<GraphSession>,
+    action: &OpenBlob,
+    branch: Option<String>,
+    window: &mut Window,
+    cx: &mut Context<BlobView>,
+) -> BlobView {
+    let view = BlobView::new(
+        session,
+        blob_cell(action),
+        action.at_commit.clone(),
+        action.held,
+        window,
+        cx,
+    );
+    match branch {
+        Some(branch) => view.on_branch(branch),
+        None => view,
+    }
+}
+
+/// Opens a Blob value in a tab of its own, or shows the tab it is in: the one for its commit
+/// and for the branch it writes to, `branch` or the session's.
 fn open_blob(
     workspace: &mut Workspace,
     action: &OpenBlob,
+    branch: Option<String>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
     let Some(session) = workspace.session().cloned() else {
         return;
     };
-    let cell = graph_client::BlobCell {
-        edge: action.edge,
-        type_name: action.type_name.clone(),
-        id: action.id.clone(),
-        property: action.property.clone(),
-    };
-    let (snapshot, held) = (action.at_commit.clone(), action.held);
-    let key = BlobView::key(&cell, snapshot.as_deref(), held);
+    let writes_to = branch
+        .clone()
+        .unwrap_or_else(|| session.read(cx).branch.clone());
+    let at = action.at_commit.as_deref();
+    let key = BlobView::key(&blob_cell(action), at, action.held, &writes_to);
+    let action = action.clone();
     workspace.open_item(key, window, cx, move |window, cx| {
-        BlobView::new(session, cell, snapshot, held, window, cx)
+        blob_view(session, &action, branch, window, cx)
     });
 }
 

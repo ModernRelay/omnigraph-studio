@@ -98,8 +98,12 @@ pub struct BlobView {
     /// The tab holds `snapshot`, read-only (opened from a view held at a commit). Otherwise it
     /// reads the value there and writes on its branch, bound to the value it read.
     held: bool,
-    /// The branch the tab read the value on, which a file chosen or dropped is stored on.
+    /// The branch the tab read the value on, which a file chosen or dropped is stored on, and
+    /// only there: it is saved with the tab and comes back with it ([`Self::on_branch`]).
     branch: String,
+    /// `branch` was given rather than taken from the session: a tab that comes back on the
+    /// branch it was saved on reads that branch's head, not the one the window shows.
+    branch_given: bool,
     /// For a tab opened at the branch head, the commit the head was when it first read: the
     /// value is read there, every range of it and a save, so nothing that lands on the branch
     /// meanwhile, and no other branch the window moves to, comes into what it shows or saves.
@@ -128,8 +132,9 @@ pub struct BlobView {
     /// nothing until they are shown.
     _load: Option<Task<()>>,
     _export: Option<Task<()>>,
-    /// Draws the tab again when what the credential may do is read, which Choose File and Clear
-    /// follow, and when the schema is, which a tab opened at the head reads the head with.
+    /// Draws the tab again when what the credential may do is read, or the branch list, which
+    /// Choose File and Clear follow, and when the schema is, which a tab opened at the head
+    /// reads the head with.
     _session: Subscription,
 }
 
@@ -146,7 +151,10 @@ impl BlobView {
             .detach();
         let branch = session.read(cx).branch.clone();
         let events = cx.subscribe(&session, |_, _, event: &SessionEvent, cx| {
-            if let SessionEvent::AccessChanged | SessionEvent::SchemaChanged = event {
+            if let SessionEvent::AccessChanged
+            | SessionEvent::BranchesChanged
+            | SessionEvent::SchemaChanged = event
+            {
                 cx.notify();
             }
         });
@@ -156,6 +164,7 @@ impl BlobView {
             held: held && snapshot.is_some(),
             snapshot,
             branch,
+            branch_given: false,
             opened_at: None,
             own_commit: None,
             meta: None,
@@ -176,13 +185,23 @@ impl BlobView {
         }
     }
 
-    /// One tab per value at the head, per value and held commit, and per value and the commit
-    /// a view at the head read it at.
-    pub fn key(cell: &BlobCell, snapshot: Option<&str>, held: bool) -> String {
+    /// The tab on `branch` rather than the session's: one that comes back after a restart
+    /// writes to the branch it was saved on, whichever the window shows, and reads that
+    /// branch's head when it had not read one yet.
+    pub fn on_branch(mut self, branch: String) -> Self {
+        self.branch = branch;
+        self.branch_given = true;
+        self
+    }
+
+    /// One tab per value held at a commit, and per value and the branch it writes to, at that
+    /// branch's head or at the commit a view at the head read it at: a tab never writes to
+    /// another branch than the one it was opened for.
+    pub fn key(cell: &BlobCell, snapshot: Option<&str>, held: bool, branch: &str) -> String {
         let at = match (snapshot, held) {
-            (None, _) => "head".to_owned(),
+            (None, _) => format!("head:{branch}"),
             (Some(commit), true) => commit.to_owned(),
-            (Some(commit), false) => format!("head@{commit}"),
+            (Some(commit), false) => format!("head@{commit}:{branch}"),
         };
         format!(
             "blob:{}:{}:{}:{}:{at}",
@@ -534,10 +553,26 @@ impl BlobView {
         })
     }
 
+    /// Why nothing can be written on the tab's branch, or `None` while it can or the server
+    /// decides: the branch list the session read last no longer holds it (deleted since the
+    /// tab was saved, or elsewhere since it opened), or the credential may not change it.
+    fn branch_refusal(&self, cx: &App) -> Option<String> {
+        if let Loadable::Loaded(branches) = &self.session.read(cx).branches
+            && !branches.contains(&self.branch)
+        {
+            return Some(format!(
+                "{} no longer exists, so nothing is written here. Open the value from a \
+                 table on another branch to change it.",
+                self.branch
+            ));
+        }
+        crate::write::change_refusal(&self.session, &self.branch, cx)
+    }
+
     /// Why the value cannot take a file here, or `None` when it can.
     fn write_refusal(&self, cx: &App) -> Option<String> {
         let schema = self.session.read(cx).schema_model();
-        let denied = crate::write::change_refusal(&self.session, &self.branch, cx);
+        let denied = self.branch_refusal(cx);
         blob_write::write_refusal(
             schema.as_deref(),
             &self.cell,
@@ -549,7 +584,7 @@ impl BlobView {
     /// Why the value cannot be cleared here, or `None` when it can.
     fn clear_refusal(&self, cx: &App) -> Option<String> {
         let schema = self.session.read(cx).schema_model();
-        let denied = crate::write::change_refusal(&self.session, &self.branch, cx);
+        let denied = self.branch_refusal(cx);
         blob_write::clear_refusal(
             schema.as_deref(),
             &self.cell,
@@ -1088,7 +1123,15 @@ impl Item for BlobView {
     }
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
-        Some(Self::key(&self.cell, self.snapshot.as_deref(), self.held).into())
+        Some(
+            Self::key(
+                &self.cell,
+                self.snapshot.as_deref(),
+                self.held,
+                &self.branch,
+            )
+            .into(),
+        )
     }
 
     /// The tab's dot shows while a file is being stored or the value cleared.
@@ -1108,6 +1151,9 @@ impl Item for BlobView {
                 // and binds a write to it, not to the one its write replaced.
                 "at_commit": self.reading_at(),
                 "held": self.held,
+                // And the branch that commit is read for, which it writes to: it comes back
+                // there, not on the branch the window shows then.
+                "branch": self.branch,
             }),
         })
     }
@@ -1261,11 +1307,13 @@ impl Render for BlobView {
                     self._load = Some(load);
                 }
                 // Opened at the head, the value is the session's branch's, which a write goes
-                // to: the head is read first with the schema's probe, so this waits for the
-                // schema, and is drawn again when it comes.
+                // to, or the branch the tab was saved on: the head is read first with the
+                // schema's probe, so this waits for the schema, and is drawn again when it comes.
                 None => {
                     let session = self.session.read(cx);
-                    self.branch = session.branch.clone();
+                    if !self.branch_given {
+                        self.branch = session.branch.clone();
+                    }
                     match &session.schema {
                         Loadable::Loaded(schema) => {
                             let probe = builder::head_probe(schema);
@@ -1585,13 +1633,18 @@ mod tests {
         view.update(cx, |view, cx| {
             assert_eq!(view.write_refusal(cx), None);
             assert_eq!(view.clear_refusal(cx), None);
-            let key = |at: Option<&str>, held: bool| BlobView::key(&doc(), at, held);
+            let key = |at: Option<&str>, held: bool| BlobView::key(&doc(), at, held, "main");
             assert_eq!(
                 view.dedupe_key(cx).as_deref(),
                 Some(key(Some("c1"), false).as_str())
             );
             assert_ne!(key(Some("c1"), false), key(Some("c1"), true));
             assert_ne!(key(Some("c1"), false), key(None, false));
+            // A tab that writes is one per branch; one held writes nowhere.
+            let on_fix = |at: Option<&str>, held: bool| BlobView::key(&doc(), at, held, "fix");
+            assert_ne!(key(Some("c1"), false), on_fix(Some("c1"), false));
+            assert_ne!(key(None, false), on_fix(None, false));
+            assert_eq!(key(Some("c1"), true), on_fix(Some("c1"), true));
         });
         let file = crate::test_support::upload_file("from-head.txt", b"new", None);
         view.update(cx, |view, cx| view.upload(file, cx));
@@ -1611,8 +1664,15 @@ mod tests {
     /// read, and the tab moves to that save's commit and value, as the landing of its own write
     /// moves it (`written`); the upload carries the ETag read there and is stored. Bound when
     /// the file was chosen, it named the value the tab no longer showed and was refused as
-    /// changed. The tab sends one write at a time and follows no other view's, so this test
-    /// moves it itself: nothing it does today moves what it shows while a file is read.
+    /// changed.
+    ///
+    /// No call of the tab's reaches that state, so this test sets it by hand: `send` refuses a
+    /// second write while one is out (`saving`), a write that lands (`written`) empties `meta`
+    /// until the value is read again, which `send` refuses too, and the tab follows no other
+    /// view's writes. What is set is what `written` and the read after it leave. The binding
+    /// guards a tab that comes to follow other writes; the table's upload, which does see its
+    /// own writes land meanwhile, is driven through
+    /// `table::tests::a_tables_upload_is_bound_where_its_values_hold_as_it_goes`.
     #[gpui::test]
     async fn a_tabs_upload_is_bound_to_what_the_tab_shows_as_it_is_sent(
         cx: &mut gpui::TestAppContext,
@@ -1958,23 +2018,11 @@ mod tests {
         });
         assert_eq!(saved.data["at_commit"], "c3");
         assert_eq!(saved.data["held"], false);
+        assert_eq!(saved.data["branch"], "main");
 
-        let action = crate::saved_blob(&saved.data).expect("the tab comes back");
-        let cell = BlobCell {
-            edge: action.edge,
-            type_name: action.type_name.clone(),
-            id: action.id.clone(),
-            property: action.property.clone(),
-        };
+        let back = crate::saved_blob(&saved.data).expect("the tab comes back");
         let (restored, cx) = cx.add_window_view(|window, cx| {
-            BlobView::new(
-                session,
-                cell,
-                action.at_commit.clone(),
-                action.held,
-                window,
-                cx,
-            )
+            crate::blob_view(session, &back.open, back.branch, window, cx)
         });
         cx.run_until_parked();
         let stored = blobs.get("Person/p1/doc").unwrap();
@@ -2006,6 +2054,90 @@ mod tests {
             crate::saved_blob(&old).is_none(),
             "the old shape stays closed"
         );
+    }
+
+    /// A restored tab writes to the branch it was saved on, whichever branch the window shows
+    /// then: it reads that branch's commit, and a write bound to a value read there belongs on
+    /// it. Before, it took the session's branch, so it read main's value and stored the file on
+    /// fix. A branch gone since says so, and nothing is sent; a tab that writes and was saved
+    /// without its branch does not come back, while one held at a commit, which writes nowhere,
+    /// does.
+    #[gpui::test]
+    async fn a_restored_tab_writes_only_to_the_branch_it_was_saved_on(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, blobs) = crate::test_support::session_with_blobs(DOCS, cx);
+        let read = blobs.set("Person/p1/doc", b"old");
+        session.update(cx, |session, cx| session.reload_branches(cx));
+        let (view, view_cx) = cx.add_window_view(|window, cx| {
+            BlobView::new(session.clone(), doc(), Some("c1".into()), false, window, cx)
+        });
+        view_cx.run_until_parked();
+        let saved = view.read_with(view_cx, |view, cx| view.serialize(cx).unwrap());
+        assert_eq!(saved.data["branch"], "main");
+        // The window is on fix when the tab comes back.
+        session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        cx.run_until_parked();
+        /// The tab `data` saves, back as the workspace restores it.
+        fn restore<'a>(
+            session: &Entity<GraphSession>,
+            data: &serde_json::Value,
+            cx: &'a mut gpui::TestAppContext,
+        ) -> (Entity<BlobView>, &'a mut gpui::VisualTestContext) {
+            let back = crate::saved_blob(data).expect("the tab comes back");
+            let session = session.clone();
+            let (restored, cx) = cx.add_window_view(|window, cx| {
+                crate::blob_view(session, &back.open, back.branch, window, cx)
+            });
+            cx.run_until_parked();
+            (restored, cx)
+        }
+
+        let (restored, restored_cx) = restore(&session, &saved.data, cx);
+        let file = crate::test_support::upload_file("restored-branch.txt", b"new", None);
+        restored.update(restored_cx, |view, cx| {
+            assert_eq!(view.branch, "main");
+            assert_eq!(view.write_refusal(cx), None);
+            let key = BlobView::key(&doc(), Some("c1"), false, "main");
+            assert_eq!(view.dedupe_key(cx).as_deref(), Some(key.as_str()));
+            view.upload(file, cx);
+        });
+        restored_cx.run_until_parked();
+        let writes = blobs.writes.lock().unwrap().clone();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].branch, "main", "where it was saved, not fix");
+        assert_eq!(writes[0].if_match.as_deref(), Some(read.as_str()));
+
+        let mut gone = saved.data.clone();
+        gone["branch"] = "gone".into();
+        let (restored, restored_cx) = restore(&session, &gone, cx);
+        let file = crate::test_support::upload_file("restored-gone.txt", b"newer", None);
+        restored.update(restored_cx, |view, cx| {
+            let refusal = view.write_refusal(cx).unwrap_or_default();
+            assert!(refusal.starts_with("gone no longer exists"), "{refusal}");
+            assert_eq!(view.clear_refusal(cx), Some(refusal.clone()));
+            view.upload(file, cx);
+        });
+        restored_cx.run_until_parked();
+        assert_eq!(blobs.writes.lock().unwrap().len(), 1, "nothing sent");
+        restored.read_with(restored_cx, |view, _| {
+            assert!(matches!(
+                &view.edit,
+                Some(BlobEdit::Failed { notice, .. })
+                    if notice.message.starts_with("gone no longer exists")
+            ));
+        });
+
+        let mut unsaid = saved.data.clone();
+        unsaid.as_object_mut().unwrap().remove("branch");
+        assert!(crate::saved_blob(&unsaid).is_none(), "writes, but to where");
+        unsaid["held"] = true.into();
+        let held = crate::saved_blob(&unsaid).expect("held, it writes nowhere");
+        assert_eq!(held.branch, None);
     }
 
     /// One judgement of what a value is, which the peek, the tab and a saved file's name share:
