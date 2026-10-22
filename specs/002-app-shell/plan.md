@@ -71,8 +71,11 @@ more are open; ⌃⌘] and ⌃⌘[ step through them. Closing a graph saves its 
 again brings them back) and shows the one opened before; a graph with a write still running
 stays open, so the write's outcome is never dropped. The same holds for its window and for
 Studio: closing a window or quitting while one of its graphs has a write running is refused
-with a toast in that window, which comes forward. Toasts follow the shown graph; a parked
-graph's writes still land in its activity log. A parked graph's tab that asks to close (a
+with a toast in that window, which comes forward. A write's outcome is toasted in its window
+whichever of the window's graphs is shown: a parked graph's toast starts with the graph's name
+("people: Delete Person ada · committed to main") and its follow-up acts on that graph, and
+its writes land in its activity log too. Other notices about a graph (its branch gone) show
+only while it is shown. A parked graph's tab that asks to close (a
 conversation deleted in another window) closes there, with a pane it leaves empty unless it is
 the graph's only one, so the graph shows without it when shown again (since 2026-10-21; before,
 the request was ignored, since only the shown graph's panes were searched). A parked graph asks after no branch head and no
@@ -147,7 +150,7 @@ title bar; Ragnor's choice over a Zed-style title bar) over one status bar acros
   opened fresh read its saved docks.
 - Tabs, after Zed's tab bar. A strip's tabs scroll when they do not fit, and the active tab is
   brought into view when it changes. The active pane's strip ends with three buttons: "+" (New
-  Query, Open Query File…, Go to Type or Node…, History), a split menu (Split Right, Left, Up,
+  Query, Open Query File…, Go to Node…, History), a split menu (Split Right, Left, Up,
   Down; `studio::SplitLeft` and `SplitUp` are new) and zoom. A middle click closes a tab that is
   not pinned. A tab drags: dropped on a tab it takes that place within its group (pinned or
   not); dropped after a strip's tabs it goes to the end of that pane, moving between panes; and
@@ -481,7 +484,12 @@ and a 97 % fill let the text behind show through.
 ### Notifications
 
 - Silent success for routine work. A toast only after a durable publish, with one follow-up
-  ("Committed to feature-x · View commit"); 10 s, paused on hover.
+  ("Committed to feature-x · View commit"); 10 s, paused on hover. Four show at once. A fifth
+  takes away the oldest toast with no follow-up, else the oldest with one, but never one that
+  offers Undo, which only it offers, nor an error, which stays until dismissed: while every
+  toast shown is one of those, the stack grows past four, and the next other toast takes the
+  place of the one before it (since 2026-10-21; before, the oldest went whatever it was, so an
+  agent's four commits within a delete's ten seconds took its Undo away).
 - A write's follow-up (View commit, Undo, Open history) names the graph written to, by its
   server's address and id as tabs identify it, and the branch, and acts there whatever the
   window shows when it is pressed: the window shows that graph on that branch first, bringing
@@ -825,7 +833,8 @@ than styling one-off elements.
   muted, 30 px), drawn by Studio rather than Zed's table, whose header padded it to 42 px; the
   key's header and the others scroll sideways with the rows. Each header ends in its column menu (⋯, the right-click menu) while hovered; the key
   cell ends in the row's Peek while the row is hovered. 28 px rows split by hairlines, every
-  cell ruled on its right, cells 12 px in either side, the cursor as a ring and the selected row
+  cell but the last column's ruled on its right, as every header is, cells 12 px in either
+  side, the cursor as a ring and the selected row
   on its fill. Dense enough to scan a page at a glance; an 18 px borderless tag or chip still
   sits inside a row. Sidebar rows are 26 px, feed rows 36 px; every list takes its height from
   `ds::size`, never its own constant. Query results keep the grid header of
@@ -889,12 +898,14 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | A full toast stack keeps an Undo and an error | `studio_workspace` `an_undo_and_an_error_stay_when_toasts_overflow` (an error, a delete with Undo, an info toast, then four commits; then two more errors and two commits); run again with the oldest toast taken away, as before | The info went first, then the oldest commits: the error, the Undo and the two newest commits showed. With four kept toasts the stack grew to five, the newest commit taking the place of the one before it. Taking the oldest away left only the four commits, the error and the Undo gone |
+| 2026-10-21 | Spec text matches the code | `studio_workspace` `watch_graph` (every open graph's outcomes toasted, a parked one's named; a missing branch's notice only while shown); `type_table` `table.rs` (the header's `ruled`, `index < last`, and the data cell's `border_r_1`, `col + 1 < columns.len()`) | "Toasts follow the shown graph" and "every cell ruled on its right" were not what the code does; both read as it does now |
 | 2026-10-21 | A graph reopened behind sends nothing until first shown | `graph_store` at `43ad4f3`: `a_graph_opened_behind_asks_nothing_until_first_shown`, `a_503_recheck_waits_for_the_graph_to_show_and_keeps_what_it_holds`; `studio` `lib.rs` opens a window's other graphs with `open_session_behind` before `Workspace::add_session_behind` | Written here from that commit and its tests, read against the code |
 | 2026-10-21 | A commit's toast, Undo among them, is offered while other writes of its graph are out | `studio_workspace` `a_commit_is_toasted_while_another_write_of_its_graph_is_out` (a write held out with `writes_in_flight`, then a delete that can be undone and a cell's save logged); run again with `toast_outcomes`' earlier condition put back; a read of `graph_store` `GraphSession::finish_write`, the one caller of `log_outcome`, and of review's `queue_fix`/`send_next_fix` (one fix out at a time) | Both toasted, "Delete Person ada · committed to main" with Undo and the save with View commit. With the earlier condition, neither: a commit waited until no write of its graph was out. The folding never folded a review's run of fixes, which lands one fix at a time with none out, only other views' and the agent's writes |
 | 2026-10-21 | Toasts are told apart by the outcome, not by their text | `studio_workspace` `outcomes_described_alike_are_toasted_each_with_its_own_follow_up` (two deletes "Delete Person ada" at c2 and c3, then two unknown outcomes of "Edit Person ada", on fix and on main); run again with the text check put back | Four toasts: each Undo bound to its own commit, each unknown one naming its branch and its Open history bound to people on that branch. With the text check, the second delete was dropped (3 toasts), so the first toast's Undo would have put back c2 for both |
 | 2026-10-21 | A parked graph's tab closes when it asks | `studio_workspace` `a_parked_graphs_tab_closes_when_it_asks` (notes with a tab in each of two panes, parked behind people; the second tab emits `ItemEvent::Close`); run again with the Close arm ignoring tabs it does not find among the shown panes | Shown again, notes had its first tab only, in one pane. Before, both tabs and both panes came back |
 | 2026-10-21 | A settings list keeps its comments and the entries set aside | `studio_settings` `a_list_keeps_its_comments_and_the_entries_set_aside` (a graph's views: one set aside, one kept, a comment above each; a view saved, one changed, then both deleted), `a_list_edit_keeps_the_comments_between_its_entries` (the agent's command with a comment after its first entry: an entry added, changed, removed), `entries_set_aside_are_named_by_their_place_in_the_text` (two views set aside before one that fits) | The view set aside and both comments stayed through the save and the change, new entries written at the list's own indent; after the deletes the view set aside and its comment stayed under the graph's key. The command's comment stayed through all three. The second view set aside was named `views[1]`, where before it read `views[0]`, its place in the document once the first was taken out. Before, `diff` wrote a changed list whole, dropping the view set aside and every comment inside the list |
-| 2026-10-21 | Dead code removed | `ItemHandle::boxed_clone` (no caller: the only `boxed_clone` calls left are `Action`'s); `StudioSettings::parse` kept only under `test-support` for `crates/studio/tests/settings_apply.rs`, its one remaining caller, outside this change's files, while `studio_settings`' own tests read through `StudioSettings::read` with no problems (`read_clean`) | Builds and tests as before |
+| 2026-10-21 | Dead code removed | `ItemHandle::boxed_clone` (no caller: the only `boxed_clone` calls left are `Action`'s); `StudioSettings::parse`, a second way to read the file, deleted in `749286f` once its last caller, `studio` `settings_apply`, read through `StudioSettings::read` and asserted no problem, as `studio_settings`' own tests do (`read_clean`) | Builds and tests as before; no source names `StudioSettings::parse` |
 | 2026-10-21 | The activity log says where a held write is | `graph_store` `a_held_write_is_logged_held_and_moves_no_head` (a mutation `as commit`, one `as unattached branch` and a `branch merge … as commit` statement, answered with `unpublished` and `unattached` commits), `a_write_without_a_commit_names_none` (`OutcomeKind::written` by `CommitKind`); `studio` `a_held_write_says_it_is_on_no_branch`; at `7fd9cc9` the server answers such writes with the commit's `kind` (`CommitKindOutput`) | Before, `send_write` passed only a `published` commit, so all three logged `Committed { commit: None }` and read "… committed to ⑂ main" with no commit; the merge's on release. Now each is `Held` with its commit, on the branch it was sent to, no head moves and no `Committed` event; the row reads "was held as commit OPOSALAA to publish to ⑂ main" or "was saved as snapshot APSHOTAA". A commit of a kind this build does not know is an unknown outcome. Not yet seen in the running app |
 | 2026-10-21 | A 403 on one graph leaves another graph's access as read | `graph_client` `a_refusal_on_a_graph_is_counted_for_that_graph_alone` (`GraphClient::refusals(graph)`, by the id in `graphs/{id}/…`, escaped or not: `a_path_segment_reads_its_escapes`); `graph_store` `access_is_read_per_branch_and_again_after_a_refusal`, extended with a `notes` session on the same connection | Before, the client counted 403s for the whole server, so a refusal on `knowledge` made the `notes` session forget its answer and read `/access` again, and an answer in flight landed nowhere. Now `knowledge` reads its access again after its 403, and `notes`, asked again, asks nothing and still allows reading |
 | 2026-10-21 | Parking a graph lets go of its server's watch | `graph_store` `the_head_watch_sees_other_writers_commits_while_a_window_is_active`, extended (`Connection::watched`) | Watched while shown; parked, no watch; shown again, watched again |

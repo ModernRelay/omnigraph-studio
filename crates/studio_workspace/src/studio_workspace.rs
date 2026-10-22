@@ -115,12 +115,22 @@ struct Toast {
     hovered: bool,
 }
 
+impl Toast {
+    /// Whether the toast stays when the stack is full ([`Workspace::make_room`]): an error,
+    /// which stays until dismissed, and an Undo, which only this toast offers.
+    fn kept(&self) -> bool {
+        self.kind == ToastKind::Error || self.action.as_ref().is_some_and(|f| f.undoes)
+    }
+}
+
 struct FollowUp {
     label: SharedString,
     action: Box<dyn Action>,
     /// The write's graph and branch, which the action acts on whatever the window shows when
     /// it is run; `None` for one that acts where the window is ("Open settings").
     on: Option<WrittenTo>,
+    /// It puts back what a write took (Undo), which nothing but this toast offers.
+    undoes: bool,
 }
 
 /// Where a write went: its graph, by its server's address and id as tabs identify a graph,
@@ -1231,10 +1241,13 @@ impl Workspace {
             ),
             OutcomeKind::Refused { .. } => return self.show_toast(ToastKind::Error, text, cx),
         };
+        let undoes = matches!(latest.outcome, OutcomeKind::Committed { .. })
+            && latest.follow_up == Some(graph_store::FollowUp::UndoDelete);
         let follow_up = FollowUp {
             label,
             action,
             on: Some(written_to),
+            undoes,
         };
         self.push_toast(kind, text.into(), Some(follow_up), cx);
     }
@@ -2150,6 +2163,7 @@ impl Workspace {
             label: label.into(),
             action,
             on: None,
+            undoes: false,
         };
         self.push_toast(kind, message.into(), Some(follow_up), cx);
     }
@@ -2193,11 +2207,7 @@ impl Workspace {
     ) {
         let id = self.next_toast;
         self.next_toast += 1;
-        // A few at a time, the oldest going first: an error stays until closed, and many
-        // would cover the window.
-        if self.toasts.len() >= TOASTS_SHOWN {
-            self.toasts.remove(0);
-        }
+        self.make_room();
         let remaining = match kind {
             ToastKind::Error => None,
             ToastKind::Info | ToastKind::Success => Some(TOAST_DURATION),
@@ -2243,6 +2253,25 @@ impl Workspace {
             }
         })
         .detach();
+    }
+
+    /// Makes room for one more toast within [`TOASTS_SHOWN`], past which they would cover the
+    /// window: the oldest toast that is not kept ([`Toast::kept`]) goes, one with no follow-up
+    /// before one with. An Undo and an error are never taken away: while every toast
+    /// shown is one of those, the stack grows past the limit, and the next toast that is not
+    /// kept takes the place of the one before it.
+    fn make_room(&mut self) {
+        if self.toasts.len() < TOASTS_SHOWN {
+            return;
+        }
+        let gone = self
+            .toasts
+            .iter()
+            .position(|toast| !toast.kept() && toast.action.is_none())
+            .or_else(|| self.toasts.iter().position(|toast| !toast.kept()));
+        if let Some(gone) = gone {
+            self.toasts.remove(gone);
+        }
     }
 
     pub fn dismiss_toast(&mut self, id: usize, cx: &mut Context<Self>) {
@@ -3085,10 +3114,7 @@ impl Workspace {
                                     Box::new(studio_actions::graph::OpenQueryFile::default()),
                                 )
                                 .separator()
-                                .action(
-                                    "Go to Type or Node…",
-                                    Box::new(studio_actions::workspace::GoTo),
-                                )
+                                .action("Go to Node…", Box::new(studio_actions::workspace::GoTo))
                                 .action("History", Box::new(studio_actions::graph::OpenHistory))
                         }))
                     }),
@@ -6421,6 +6447,84 @@ mod tests {
                     Some("View commit".into())
                 ),
             ]
+        );
+    }
+
+    /// A full stack takes away a toast with no follow-up first, then the oldest with one, but
+    /// never an Undo or an error: an agent's four commits after a delete leave the delete's
+    /// Undo up, and a stack of nothing but those grows rather than lose one.
+    #[gpui::test]
+    fn an_undo_and_an_error_stay_when_toasts_overflow(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+        });
+        let people = idle_session("http://b.test", "people", cx);
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update(cx, |workspace, cx| {
+            workspace.graph_order.push(people.entity_id());
+            workspace.subscribe_session(people.clone(), cx);
+        });
+        let toast = |kind: ToastKind, text: &str, cx: &mut gpui::VisualTestContext| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_toast(kind, text.to_owned(), cx)
+            });
+        };
+        let commit = |n: usize, follow_up, cx: &mut gpui::VisualTestContext| {
+            let description = match follow_up {
+                Some(_) => "Delete Person ada".to_owned(),
+                None => format!("Agent write {n}"),
+            };
+            let outcome = OutcomeKind::Committed {
+                commit: Some(format!("c{n}")),
+            };
+            log_outcome(&people, &description, outcome, follow_up, cx);
+        };
+        let shown = |cx: &mut gpui::VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .toasts
+                    .iter()
+                    .map(|toast| toast.message.to_string())
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        toast(ToastKind::Error, "A write to people is still running.", cx);
+        commit(2, Some(graph_store::FollowUp::UndoDelete), cx);
+        toast(
+            ToastKind::Info,
+            "The branch fix is gone, so main is shown.",
+            cx,
+        );
+        for n in 3..7 {
+            commit(n, None, cx);
+        }
+        assert_eq!(
+            shown(cx),
+            [
+                "A write to people is still running.",
+                "Delete Person ada · committed to main",
+                "Agent write 5 · committed to main",
+                "Agent write 6 · committed to main",
+            ],
+            "the info went first, then the oldest commits"
+        );
+
+        toast(ToastKind::Error, "Second error", cx);
+        toast(ToastKind::Error, "Third error", cx);
+        commit(7, None, cx);
+        commit(8, None, cx);
+        assert_eq!(
+            shown(cx),
+            [
+                "A write to people is still running.",
+                "Delete Person ada · committed to main",
+                "Second error",
+                "Third error",
+                "Agent write 8 · committed to main",
+            ],
+            "kept toasts fill the stack, which grows by the one after them"
         );
     }
 
