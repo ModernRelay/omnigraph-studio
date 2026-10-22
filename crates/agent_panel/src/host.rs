@@ -1617,41 +1617,21 @@ fn without_variables(
     Ok(("/usr/bin/env".into(), wrapped))
 }
 
-/// OmniGraph's variables among `names`, every `OMNIGRAPH_*` one, except those the agent's own
-/// settings set: tokens for other servers (`OMNIGRAPH_MR_BEARER_TOKEN`), a local server's
-/// token list and the CLI's addressing alike. Windows reads a variable by its name in any case,
-/// so there `fold_case` matches names in any ASCII case: `omnigraph_profile` is the profile the
-/// CLI reads.
+/// OmniGraph's variables among `names`, every `OMNIGRAPH_*` one ([`crate::scrub`]), except
+/// those the agent's own settings set. Windows reads a variable by its name in any case, so
+/// there `fold_case` matches names in any ASCII case.
 fn credential_variables(
     names: impl Iterator<Item = std::ffi::OsString>,
     configured: &std::collections::BTreeMap<String, String>,
     fold_case: bool,
 ) -> Vec<String> {
-    let same = |a: &str, b: &str| {
-        if fold_case {
-            a.eq_ignore_ascii_case(b)
-        } else {
-            a == b
-        }
-    };
-    let mut found: Vec<String> = names
-        .filter_map(|name| name.into_string().ok())
-        .filter(|name| is_omnigraph_variable(name, fold_case))
-        .filter(|name| !configured.keys().any(|key| same(key, name)))
-        .collect();
-    found.sort();
-    found
+    let kept: Vec<&str> = configured.keys().map(String::as_str).collect();
+    crate::scrub::removed(names, &kept, fold_case)
 }
 
-/// Whether a variable is one of OmniGraph's (`OMNIGRAPH_…`), its name in any ASCII case when
-/// `fold_case`, as Windows reads names.
-pub(crate) fn is_omnigraph_variable(name: &str, fold_case: bool) -> bool {
-    if fold_case {
-        name.to_ascii_uppercase().starts_with("OMNIGRAPH_")
-    } else {
-        name.starts_with("OMNIGRAPH_")
-    }
-}
+/// Whether a variable is one of OmniGraph's, as [`crate::scrub`] says; `omnigraph_run` asks it
+/// here (`cli_home`).
+pub(crate) use crate::scrub::is_omnigraph_variable;
 
 #[cfg(test)]
 mod credential_tests {

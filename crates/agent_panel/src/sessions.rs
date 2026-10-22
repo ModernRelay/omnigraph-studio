@@ -206,6 +206,26 @@ impl AgentSessions {
         }
     }
 
+    /// Whether the conversation's agent branch, `branch`, exists, as a write that ended after
+    /// its tab closed found: the record learns it only while it still writes to that branch.
+    pub fn set_branch_created(
+        &mut self,
+        session: &str,
+        branch: &str,
+        created: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.update(
+            session,
+            |record| {
+                if record.branch == branch {
+                    record.branch_created = created;
+                }
+            },
+            cx,
+        );
+    }
+
     /// The agent's title, which replaces any earlier one.
     pub fn set_title(&mut self, session: &str, title: String, cx: &mut Context<Self>) {
         self.update(session, |record| record.title = Some(title), cx);
@@ -712,6 +732,19 @@ mod tests {
                 format!("{second}-3")
             );
             assert_eq!(store.unused_branch("server/notes", second.into()), second);
+        });
+        // A write that ended after its tab closed records that its branch exists, only while
+        // the conversation still writes to that branch.
+        store.update(cx, |store, cx| {
+            store.set_branch_created("same-a", second, true, cx);
+            store.set_branch_created("same-b", second, true, cx);
+            assert!(store.get("same-a").unwrap().branch_created);
+            assert!(
+                !store.get("same-b").unwrap().branch_created,
+                "another branch"
+            );
+            store.set_branch_created("same-a", second, false, cx);
+            assert!(!store.get("same-a").unwrap().branch_created, "deleted");
         });
         studio_settings::writes_done();
         std::fs::remove_dir_all(&dir).ok();

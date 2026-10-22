@@ -56,6 +56,93 @@ pub const PRESETS: &[(&str, &[&str])] = &[
 const UNKNOWN_OUTCOME: &str = "The server did not confirm this change. It was not retried; \
 check the branch history before the agent tries it again.";
 
+/// What the card of a write still waiting for the person says when the agent stops.
+const STOPPED_UNSENT: &str = "Not sent: the agent stopped before you decided.";
+
+/// The write card the approval keys answer: the one waiting longest. A permission request of
+/// the agent's own is answered only by its buttons: there the agent's "always" option is a
+/// lasting rule of its own, which ⌘⌥Y, Always on this branch for a write, must not pick
+/// unseen.
+fn keyed_write(entries: &[Entry]) -> Option<usize> {
+    entries.iter().position(
+        |entry| matches!(entry, Entry::Write(card) if matches!(card.state, WriteState::Waiting(_))),
+    )
+}
+
+/// What a forwarded write's outcome is applied to: its card, what it is, and the agent's branch
+/// it went to with that branch's base.
+#[derive(Debug, Clone)]
+struct SentWrite {
+    card: u64,
+    kind: WriteKind,
+    creates: Creates,
+    branch: String,
+    base: String,
+}
+
+/// Whether a write that may create the agent's branch made it: a branch create that went
+/// through, or a load given `from` whose answer says it did.
+fn makes_branch(creates: Creates, seen: &Seen) -> bool {
+    match creates {
+        Creates::Always => matches!(seen, Seen::Written { .. }),
+        Creates::IfMissing => matches!(
+            seen,
+            Seen::Written {
+                branch_created: true,
+                ..
+            }
+        ),
+        Creates::Never => false,
+    }
+}
+
+/// Whether the agent's branch exists after a write of `kind` that ended so, when the outcome
+/// says: one that went through on the branch leaves it there, made now or before, and a delete
+/// that went through takes it away.
+fn branch_after(kind: WriteKind, seen: &Seen) -> Option<bool> {
+    matches!(seen, Seen::Written { .. }).then_some(kind != WriteKind::BranchDelete)
+}
+
+/// What a write's card shows once it ended: its commit on the branch, a commit no branch shows,
+/// one of a kind this build does not know (whether the branch moved is not known), no commit
+/// (a branch made or deleted, a mutation that matched nothing), a stored query that read, the
+/// server's refusal, or no confirmation.
+fn card_state(seen: &Seen, made_branch: bool) -> WriteState {
+    match seen {
+        Seen::Written {
+            commit: Some((commit, CommitKind::Published)),
+            nodes,
+            edges,
+            ..
+        } => WriteState::Committed {
+            commit: commit.clone(),
+            nodes: *nodes,
+            edges: *edges,
+        },
+        Seen::Written {
+            commit: Some((commit, kind @ (CommitKind::Unpublished | CommitKind::Unattached))),
+            ..
+        } => WriteState::Unpublished {
+            commit: commit.clone(),
+            kind: *kind,
+        },
+        Seen::Written {
+            commit: Some((commit, _)),
+            ..
+        } => WriteState::Unknown {
+            commit: Some(commit.clone()),
+        },
+        Seen::Written { commit: None, .. } => WriteState::Done(if made_branch {
+            "Branch created".into()
+        } else {
+            "Done".into()
+        }),
+        Seen::Read => WriteState::Done("Read; nothing written".into()),
+        Seen::Refused(message) => WriteState::Refused(message.clone()),
+        Seen::Unknown(_) => WriteState::Unknown { commit: None },
+    }
+}
+
 /// Hands the gateway its decision. An approval it can no longer take, the CLI having given up
 /// meanwhile, records that nothing was sent, rather than being dropped and taken for a write
 /// whose outcome is unknown.
@@ -68,13 +155,12 @@ fn hand_over(decide: oneshot::Sender<Option<OnOutcome>>, approval: Option<OnOutc
 /// A gateway write's outcome, as Studio's activity records it: by its commit's kind, as Studio's
 /// own writes are ([`OutcomeKind::written`]). A commit on the agent's branch is committed there;
 /// one written `as commit` or `as unattached branch` is held, with its commit, and moves no
-/// branch; one of a kind this build does not know leaves whether a branch moved unknown.
+/// branch; one of a kind this build does not know leaves whether a branch moved unknown. A
+/// stored query that read wrote nothing, as a mutation that matched nothing.
 fn outcome_kind(seen: &Seen) -> OutcomeKind {
     match seen {
-        Seen::Committed { commit, .. } => {
-            OutcomeKind::written(commit.clone().map(|commit| (commit, CommitKind::Published)))
-        }
-        Seen::Unpublished { commit, kind } => OutcomeKind::written(Some((commit.clone(), *kind))),
+        Seen::Written { commit, .. } => OutcomeKind::written(commit.clone()),
+        Seen::Read => OutcomeKind::Committed { commit: None },
         Seen::Refused(message) => OutcomeKind::Refused {
             message: message.clone(),
         },
@@ -181,8 +267,29 @@ enum State {
 struct AgentBranch {
     name: String,
     base: String,
+    /// Whether the branch exists, as the conversation's record keeps it.
     created: bool,
+    /// The changes the agent committed on it since the conversation opened in this tab.
     changes: usize,
+}
+
+impl AgentBranch {
+    /// The branch of a conversation coming back: its record's, with whether it exists.
+    fn resumed(saved: &SessionRecord, base: String) -> Self {
+        Self {
+            name: saved.branch.clone(),
+            base,
+            created: saved.branch_created,
+            changes: 0,
+        }
+    }
+
+    /// Whether the composer's notice offers Review: once the branch exists, made in this tab
+    /// or before. How many changes it shows counts only those made since the conversation
+    /// opened here.
+    fn offers_review(&self) -> bool {
+        self.created
+    }
 }
 
 enum Decision {
@@ -202,7 +309,12 @@ enum WriteState {
         edges: i64,
     },
     Refused(String),
-    Unknown,
+    /// Whether it went through is not known: the server's answer was lost or confirms nothing,
+    /// or it names `commit`, of a kind this build does not know, so whether the branch moved is
+    /// not known.
+    Unknown {
+        commit: Option<String>,
+    },
     Rejected,
     /// A write that made no commit of its own went through, such as creating a branch.
     Done(String),
@@ -215,8 +327,10 @@ enum WriteState {
 }
 
 /// The card of a write the agent's CLI sends through the gateway (spec 013): what it does, the
-/// branch it writes and the base it creates that branch from, and where it is.
+/// branch it writes and the base it creates that branch from, and where it is. `id` is the
+/// panel's own for it, which its outcome finds it by.
 struct WriteCard {
+    id: u64,
     summary: String,
     query: String,
     params: Option<Map<String, Value>>,
@@ -258,12 +372,15 @@ enum Entry {
         id: String,
         title: String,
         status: ToolCallStatus,
-        /// The arguments the agent called it with, as it reported them.
+        /// The arguments the agent called it with, as it reported them, for Studio's own tools
+        /// (an `omnigraph_run` query shows from them); another tool's only while small
+        /// ([`kept_input`]).
         input: Option<Value>,
         /// Which of Studio's tools it is, by what the agent's adapter said when it was called.
         studio: Option<StudioTool>,
-        /// What the call returned, as the agent reported it (its content's text, else its raw
-        /// output): a query's rows show from it as a record card.
+        /// What one of Studio's tools returned, as the agent reported it (its content's text,
+        /// else its raw output): a query's rows show from it as a record card. Another tool's is
+        /// not kept: its row shows only its title and how it went.
         output: Option<String>,
     },
     Plan(Vec<(String, PlanEntryStatus)>),
@@ -296,9 +413,12 @@ enum Block {
         lead: bool,
         ends: bool,
     },
+    /// `on_card`: a write card of its turn shows its text ([`query_on_card`]), so the call is
+    /// its line alone.
     Query {
         index: usize,
         lead: bool,
+        on_card: bool,
     },
     Activity {
         start: usize,
@@ -395,15 +515,44 @@ impl Entries {
         }
     }
 
-    /// Brings the hashes up to the entries.
-    fn rehash(&mut self) {
+    /// Brings the hashes up to the entries. Returns the first entry that is new or changed since
+    /// the last time: every entry before it is as it was then.
+    fn rehash(&mut self) -> usize {
         self.hashes.truncate(self.stale_from.min(self.list.len()));
-        for entry in &self.list[self.hashes.len()..] {
+        let changed = self.hashes.len();
+        for entry in &self.list[changed..] {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             hash_entry(entry, &mut hasher);
             self.hashes.push(std::hash::Hasher::finish(&hasher));
         }
         self.stale_from = self.list.len();
+        changed
+    }
+
+    /// The card of write `card`, wherever the thread holds it now; none once the thread was
+    /// shown again without it (the agent replayed the conversation after a restart).
+    fn write_card(&mut self, card: u64) -> Option<&mut WriteCard> {
+        let index = self
+            .list
+            .iter()
+            .position(|entry| matches!(entry, Entry::Write(write) if write.id == card))?;
+        match self.get_mut(index) {
+            Some(Entry::Write(write)) => Some(write),
+            _ => None,
+        }
+    }
+
+    /// Settles the write cards still waiting for the person as the agent stops: the gateway
+    /// that would send them went with it, so nothing was sent. A write already sent runs to its
+    /// end, and its card hears how ([`AgentPanel::record_outcome`]).
+    fn stop_writes(&mut self) {
+        self.change_each(|entry| match entry {
+            Entry::Write(card) if matches!(card.state, WriteState::Waiting(_)) => {
+                card.state = WriteState::Refused(STOPPED_UNSENT.into());
+                true
+            }
+            _ => false,
+        });
     }
 
     /// What entry `index` shows, as of the last [`Entries::rehash`].
@@ -467,7 +616,10 @@ fn hash_entry(entry: &Entry, hasher: &mut impl std::hash::Hasher) {
                     3u8.hash(hasher);
                     reason.hash(hasher);
                 }
-                WriteState::Unknown => 4u8.hash(hasher),
+                WriteState::Unknown { commit } => {
+                    4u8.hash(hasher);
+                    commit.hash(hasher);
+                }
                 WriteState::Rejected => 5u8.hash(hasher),
                 WriteState::Done(label) => {
                     6u8.hash(hasher);
@@ -589,6 +741,9 @@ struct Host {
     _socket: ToolSocket,
     /// The conversation's CLI home (spec 013); its session token goes with it.
     cli_home: Option<std::sync::Arc<CliHome>>,
+    /// Sends the conversation's MCP instructions once Studio has chosen its CLI, which they
+    /// describe ([`AgentPanel::cli_chosen`]).
+    instructions: Option<oneshot::Sender<String>>,
     _tasks: Vec<Task<()>>,
 }
 
@@ -725,10 +880,15 @@ pub struct AgentPanel {
     /// command killed) when its call is cancelled, at Stop and with a new session.
     runs: std::collections::HashMap<u64, CliRun>,
     next_run: u64,
-    /// The card of each write the gateway forwards, by the gateway's id: the entry, what the
-    /// write is, and whether it creates the agent's branch (a branch create; a load `--from`
-    /// when its answer says so).
-    gateway_cards: std::collections::HashMap<u64, (usize, WriteKind, Creates)>,
+    /// The card of each write the gateway holds, by the gateway's id: the card's own id, for a
+    /// write the CLI gave up before the person decided.
+    gateway_cards: std::collections::HashMap<u64, u64>,
+    /// The id the next write card takes; never reused, so a write's outcome finds its own card
+    /// after a restart showed the conversation again.
+    next_card: u64,
+    /// The fold count the thread's blocks were last measured with: a fold changes what every
+    /// block of it shows.
+    synced_folds: Option<u64>,
 }
 
 impl EventEmitter<ItemEvent> for AgentPanel {}
@@ -905,6 +1065,8 @@ impl AgentPanel {
             runs: std::collections::HashMap::new(),
             next_run: 1,
             gateway_cards: std::collections::HashMap::new(),
+            next_card: 0,
+            synced_folds: None,
         };
         panel.sync_setup_state(cx);
         panel
@@ -966,12 +1128,7 @@ impl AgentPanel {
         let base = self.session.read(cx).branch.clone();
         // A resumed conversation keeps writing to its branch.
         let branch = match &saved {
-            Some(saved) => AgentBranch {
-                name: saved.branch.clone(),
-                base,
-                created: saved.branch_created,
-                changes: 0,
-            },
+            Some(saved) => AgentBranch::resumed(saved, base),
             None => AgentBranch {
                 name: self.sessions.read(cx).unused_branch(
                     &graph_key,
@@ -1066,10 +1223,11 @@ impl AgentPanel {
                 true,
             );
         }
-        let instructions = cli_home
-            .as_ref()
-            .map(|home| home.instructions(None))
-            .unwrap_or_default();
+        // The conversation's MCP instructions say what its CLI is and whether the agent's shell
+        // can run it, which Studio knows once it has chosen one (`cli_chosen`); `initialize`
+        // waits for them. Without a CLI home there are none.
+        let (instructions_tx, instructions) = oneshot::channel::<String>();
+        let instructions_tx = cli_home.is_some().then_some(instructions_tx);
 
         self.cwd = Some(cwd.clone());
         let launch = SessionLaunch {
@@ -1098,7 +1256,7 @@ impl AgentPanel {
             return;
         }
 
-        let serve = cx.background_spawn(socket.serve(tools_tx, instructions));
+        let serve = cx.background_spawn(socket.serve(tools_tx, instructions.shared()));
         let mut tasks = Vec::new();
         if let Some(gateway_serve) = gateway_serve {
             tasks.push(cx.background_spawn(gateway_serve));
@@ -1155,6 +1313,7 @@ impl AgentPanel {
             _connection: connection,
             _socket: socket,
             cli_home,
+            instructions: instructions_tx,
             _tasks: tasks,
         });
         self.state = State::Starting;
@@ -1200,19 +1359,7 @@ impl AgentPanel {
         self.setting_option = None;
         self.options_changed();
         self.entries.cancel_permissions();
-        self.entries.change_each(|entry| match entry {
-            Entry::Write(card) if matches!(card.state, WriteState::Waiting(_)) => {
-                card.state = WriteState::Rejected;
-                true
-            }
-            // A write on its way runs to its end, but its card no longer hears how: the
-            // session's activity records it.
-            Entry::Write(card) if matches!(card.state, WriteState::Running) => {
-                card.state = WriteState::Unknown;
-                true
-            }
-            _ => false,
-        });
+        self.entries.stop_writes();
         self.gateway_cards.clear();
     }
 
@@ -1492,12 +1639,13 @@ impl AgentPanel {
             SessionUpdate::ToolCall(call) => {
                 let studio =
                     StudioTool::of(self.adapter, call.meta.as_ref(), call.raw_input.as_ref());
-                let output = tool_output(&call.content, call.raw_output.as_ref());
+                let output =
+                    studio.and_then(|_| tool_output(&call.content, call.raw_output.as_ref()));
                 self.entries.push(Entry::Tool {
                     id: call.tool_call_id.to_string(),
                     title: call.title,
                     status: call.status,
-                    input: call.raw_input,
+                    input: kept_input(studio, call.raw_input),
                     studio,
                     output,
                 });
@@ -1517,13 +1665,6 @@ impl AgentPanel {
                     ..
                 }) = at.and_then(|at| self.entries.get_mut(at))
                 {
-                    let reported = tool_output(
-                        update.fields.content.as_deref().unwrap_or_default(),
-                        update.fields.raw_output.as_ref(),
-                    );
-                    if reported.is_some() {
-                        *output = reported;
-                    }
                     if let Some(new_title) = update.fields.title.clone() {
                         *title = new_title;
                     }
@@ -1538,7 +1679,16 @@ impl AgentPanel {
                         );
                     }
                     if let Some(new_input) = update.fields.raw_input {
-                        *input = Some(new_input);
+                        *input = kept_input(*studio, Some(new_input));
+                    }
+                    if studio.is_some() {
+                        let reported = tool_output(
+                            update.fields.content.as_deref().unwrap_or_default(),
+                            update.fields.raw_output.as_ref(),
+                        );
+                        if reported.is_some() {
+                            *output = reported;
+                        }
                     }
                 }
             }
@@ -1815,42 +1965,14 @@ impl AgentPanel {
         self.has_draft || self.queue.holds_messages() || self.pending_index().is_some()
     }
 
+    /// Answers the write card at `index`, which its buttons and keys do.
     fn decide(&mut self, index: usize, decision: Decision, cx: &mut Context<Self>) {
-        match self.entries.get_mut(index) {
-            Some(Entry::Write(card)) => {
-                if let WriteState::Waiting(_) = card.state {
-                    let WriteState::Waiting(reply) =
-                        std::mem::replace(&mut card.state, WriteState::Running)
-                    else {
-                        return;
-                    };
-                    reply.send(decision).ok();
-                }
-            }
-            Some(Entry::Permission(card)) => {
-                let wanted: &[PermissionOptionKind] = match decision {
-                    Decision::Allow => &[PermissionOptionKind::AllowOnce],
-                    Decision::AllowAlways => &[
-                        PermissionOptionKind::AllowAlways,
-                        PermissionOptionKind::AllowOnce,
-                    ],
-                    Decision::Reject => &[
-                        PermissionOptionKind::RejectOnce,
-                        PermissionOptionKind::RejectAlways,
-                    ],
-                };
-                let option = wanted
-                    .iter()
-                    .find_map(|kind| card.options.iter().position(|o| o.kind == *kind));
-                match option {
-                    // Answered as a click on that option is.
-                    Some(option) => return self.choose_option(index, option, cx),
-                    None => {
-                        card.cancel();
-                    }
-                }
-            }
-            _ => {}
+        if let Some(Entry::Write(card)) = self.entries.get_mut(index)
+            && let WriteState::Waiting(_) = card.state
+            && let WriteState::Waiting(reply) =
+                std::mem::replace(&mut card.state, WriteState::Running)
+        {
+            reply.send(decision).ok();
         }
         cx.notify();
     }
@@ -1870,19 +1992,19 @@ impl AgentPanel {
     }
 
     fn allow(&mut self, _: &Allow, _window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(index) = self.pending_index() {
+        if let Some(index) = keyed_write(&self.entries) {
             self.decide(index, Decision::Allow, cx);
         }
     }
 
     fn allow_always(&mut self, _: &AllowAlways, _window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(index) = self.pending_index() {
+        if let Some(index) = keyed_write(&self.entries) {
             self.decide(index, Decision::AllowAlways, cx);
         }
     }
 
     fn reject(&mut self, _: &Reject, _window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(index) = self.pending_index() {
+        if let Some(index) = keyed_write(&self.entries) {
             self.decide(index, Decision::Reject, cx);
         }
     }
@@ -1897,9 +2019,7 @@ impl AgentPanel {
             cancelled,
         } = request;
         match ToolCall::parse(&name, &arguments) {
-            Ok(ToolCall::Cli) => {
-                reply.send(self.cli_instructions()).ok();
-            }
+            Ok(ToolCall::Cli) => self.answer_cli(reply, cx),
             Ok(ToolCall::Run { args, save_to }) => {
                 self.run_cli(&args, save_to.as_deref(), reply, cancelled, cx);
             }
@@ -1915,11 +2035,10 @@ impl AgentPanel {
     fn apply_gateway(&mut self, event: GatewayEvent, cx: &mut Context<Self>) {
         match event {
             GatewayEvent::Write { id, write, decide } => self.gateway_write(id, write, decide, cx),
-            GatewayEvent::Finished { id, outcome } => self.gateway_finished(id, outcome, cx),
             GatewayEvent::Abandoned { id } => {
-                if let Some((index, ..)) = self.gateway_cards.remove(&id) {
+                if let Some(card) = self.gateway_cards.remove(&id) {
                     self.set_write_state(
-                        index,
+                        card,
                         WriteState::Refused(
                             "Not sent: the CLI stopped waiting before you decided.".into(),
                         ),
@@ -1944,7 +2063,8 @@ impl AgentPanel {
             return;
         };
         let ask = StudioSettings::get(cx).agent.ask_before_writes && !self.always_allow;
-        let index = self.entries.len();
+        let card = self.next_card;
+        self.next_card += 1;
         let (state, waiting) = if ask {
             let (reply, decision) = oneshot::channel();
             (WriteState::Waiting(reply), Some(decision))
@@ -1952,6 +2072,7 @@ impl AgentPanel {
             (WriteState::Running, None)
         };
         self.entries.push(Entry::Write(WriteCard {
+            id: card,
             summary: write.summary.clone(),
             query: write.query.clone().unwrap_or_default(),
             params: write.params.clone(),
@@ -1960,19 +2081,18 @@ impl AgentPanel {
             creates_from: (write.creates_branch == Creates::Always).then(|| branch.base.clone()),
             state,
         }));
-        self.gateway_cards
-            .insert(id, (index, write.kind, write.creates_branch));
-        // A write that makes or deletes the agent's branch reads the branch list again, and so
-        // does a load that may make it: the session takes that from the request, as only the
-        // session can drop the history it holds for a branch made again under its name.
-        let (branch, description, moves_branches) = (
-            branch.name.clone(),
-            format!("Agent CLI: {}", write.summary),
-            write.creates_branch != Creates::Never || write.kind == WriteKind::BranchDelete,
-        );
+        self.gateway_cards.insert(id, card);
+        let sent = SentWrite {
+            card,
+            kind: write.kind,
+            creates: write.creates_branch,
+            branch: branch.name.clone(),
+            base: branch.base.clone(),
+        };
+        let description = format!("Agent CLI: {}", write.summary);
         match waiting {
             None => {
-                let approval = self.record_outcome(branch, description, moves_branches, cx);
+                let approval = self.record_outcome(sent, description, cx);
                 hand_over(decide, Some(approval));
             }
             Some(decision) => {
@@ -1989,11 +2109,9 @@ impl AgentPanel {
                             if let Some(Decision::Reject) = decision {
                                 // Nothing is sent, so no outcome comes for the card.
                                 this.gateway_cards.remove(&id);
-                                this.set_write_state(index, WriteState::Rejected, cx);
+                                this.set_write_state(sent.card, WriteState::Rejected, cx);
                             }
-                            allow.then(|| {
-                                this.record_outcome(branch, description, moves_branches, cx)
-                            })
+                            allow.then(|| this.record_outcome(sent, description, cx))
                         })
                         .ok()
                         .flatten();
@@ -2008,95 +2126,85 @@ impl AgentPanel {
 
     /// What records a write the person let the agent's CLI send, from the moment it is sent:
     /// the session counts it among the writes in flight and logs its outcome with Studio's own,
-    /// though this conversation stops before it ends.
+    /// and the write's card and the agent's branch learn how it ended. The gateway runs a sent
+    /// write to its end though the agent stops or the conversation restarts meanwhile, so the
+    /// outcome reaches them then too; with the tab closed, the conversation's record still
+    /// learns whether the branch exists.
     fn record_outcome(
         &self,
-        branch: String,
+        sent: SentWrite,
         description: String,
-        creates_branch: bool,
         cx: &mut Context<Self>,
     ) -> OnOutcome {
+        // A write that makes or deletes the agent's branch reads the branch list again, and so
+        // does a load that may make it: the session takes that from the request, as only the
+        // session can drop the history it holds for a branch made again under its name.
+        let moves_branches = sent.creates != Creates::Never || sent.kind == WriteKind::BranchDelete;
         let write = self.session.update(cx, |session, cx| {
-            session.external_write(branch, description, creates_branch, cx)
+            session.external_write(sent.branch.clone(), description, moves_branches, cx)
         });
-        Box::new(move |seen: &Seen| write.finish(outcome_kind(seen)))
+        let (heard, outcome) = oneshot::channel::<Seen>();
+        let (sessions, conversation) = (self.sessions.clone(), self.session_id.clone());
+        cx.spawn(async move |this, cx| {
+            // Dropped unheard only as Studio quits with the write on its way, which the session
+            // records as unknown too.
+            let seen = outcome.await.unwrap_or_else(|_| {
+                Seen::Unknown("Studio stopped before the server answered.".into())
+            });
+            let shown = this.update(cx, |this, cx| this.write_finished(&sent, &seen, cx));
+            if shown.is_err()
+                && let (Some(conversation), Some(exists)) =
+                    (conversation, branch_after(sent.kind, &seen))
+            {
+                sessions.update(cx, |sessions, cx| {
+                    sessions.set_branch_created(&conversation, &sent.branch, exists, cx)
+                });
+            }
+        })
+        .detach();
+        Box::new(move |seen: &Seen| {
+            write.finish(outcome_kind(seen));
+            heard.send(seen.clone()).ok();
+        })
     }
 
-    fn gateway_finished(&mut self, id: u64, outcome: Seen, cx: &mut Context<Self>) {
-        let Some((index, kind, creates_branch)) = self.gateway_cards.remove(&id) else {
-            return;
-        };
-        let went_through = matches!(outcome, Seen::Committed { .. });
-        // Whether this write made the agent's branch: a load given `from` says in its answer.
-        let made_branch = match creates_branch {
-            Creates::Always => went_through,
-            Creates::IfMissing => matches!(
-                outcome,
-                Seen::Committed {
-                    branch_created: true,
-                    ..
-                }
-            ),
-            Creates::Never => false,
-        };
-        let state = match &outcome {
-            Seen::Committed {
-                commit: Some(commit),
-                nodes,
-                edges,
-                ..
-            } => WriteState::Committed {
-                commit: commit.clone(),
-                nodes: *nodes,
-                edges: *edges,
-            },
-            Seen::Committed { commit: None, .. } => WriteState::Done(if made_branch {
-                "Branch created".into()
-            } else {
-                "Done".into()
-            }),
-            Seen::Unpublished { commit, kind } => WriteState::Unpublished {
-                commit: commit.clone(),
-                kind: *kind,
-            },
-            Seen::Refused(message) => WriteState::Refused(message.clone()),
-            Seen::Unknown(_) => WriteState::Unknown,
-        };
-        if made_branch
-            && let (Some(Entry::Write(card)), Some(branch)) =
-                (self.entries.get_mut(index), &self.branch)
-        {
-            card.creates_from = Some(branch.base.clone());
+    /// A write the agent's CLI sent has ended: its card shows how, while the thread holds it,
+    /// and the agent's branch learns whether it exists now and what it holds, while this tab
+    /// still writes to it (a tab that started a new conversation with another agent writes to
+    /// another branch).
+    fn write_finished(&mut self, sent: &SentWrite, seen: &Seen, cx: &mut Context<Self>) {
+        let made_branch = makes_branch(sent.creates, seen);
+        if let Some(card) = self.entries.write_card(sent.card) {
+            if made_branch {
+                card.creates_from = Some(sent.base.clone());
+            }
+            card.state = card_state(seen, made_branch);
         }
-        let mut created = false;
-        if let Some(branch) = &mut self.branch {
-            // A write that may make the branch and went through leaves it there, made now or
-            // before.
-            if went_through && creates_branch != Creates::Never && !branch.created {
-                branch.created = true;
-                created = true;
-            }
-            // The agent deleted its branch: there is nothing to review, and its next write
-            // makes it again.
-            if went_through && kind == WriteKind::BranchDelete && branch.created {
-                branch.created = false;
-                branch.changes = 0;
-                created = true;
-            }
-            if matches!(
-                outcome,
-                Seen::Committed {
-                    commit: Some(_),
-                    ..
+        if let Some(branch) = self
+            .branch
+            .as_mut()
+            .filter(|branch| branch.name == sent.branch)
+        {
+            let was = branch.created;
+            if let Some(exists) = branch_after(sent.kind, seen) {
+                branch.created = exists;
+                // Deleted, there is nothing to review, and the next write makes it again.
+                if !exists {
+                    branch.changes = 0;
                 }
-            ) {
+            }
+            if let Seen::Written {
+                commit: Some((_, CommitKind::Published)),
+                ..
+            } = seen
+            {
                 branch.changes += 1;
             }
+            if branch.created != was {
+                self.remember_session(cx);
+            }
         }
-        if created {
-            self.remember_session(cx);
-        }
-        self.set_write_state(index, state, cx);
+        cx.notify();
     }
 
     /// Studio found (or did not find) a CLI that speaks the graph's API for this conversation.
@@ -2109,9 +2217,17 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         let contract = graph_client::CONTRACT;
-        self.cli_ready = Some(matches!(choice, cli_home::CliChoice::Chosen { .. }));
+        let chosen = matches!(choice, cli_home::CliChoice::Chosen { .. });
+        self.cli_ready = Some(chosen);
         for waiting in self.cli_waiting.drain(..) {
             waiting.send(()).ok();
+        }
+        // The MCP instructions say what was chosen, as the `omnigraph_cli` tool does: no CLI,
+        // one the agent's shell cannot run, or the wrapper's path.
+        if let Some(host) = self.host.as_mut()
+            && let (Some(instructions), Some(home)) = (host.instructions.take(), &host.cli_home)
+        {
+            instructions.send(home.instructions(Some(chosen))).ok();
         }
         match choice {
             cli_home::CliChoice::Chosen {
@@ -2321,6 +2437,35 @@ impl AgentPanel {
         .detach();
     }
 
+    /// Answers `omnigraph_cli` once Studio has chosen the conversation's CLI, since what it
+    /// says depends on the choice; a call made before waits for it.
+    fn answer_cli(&mut self, reply: oneshot::Sender<(String, bool)>, cx: &mut Context<Self>) {
+        let has_home = self
+            .host
+            .as_ref()
+            .is_some_and(|host| host.cli_home.is_some());
+        if self.cli_ready.is_some() || !has_home {
+            reply.send(self.cli_instructions()).ok();
+            return;
+        }
+        let (ready, known) = oneshot::channel();
+        self.cli_waiting.push(ready);
+        cx.spawn(async move |this, cx| {
+            if known.await.is_err() {
+                reply
+                    .send((
+                        "The conversation ended before Studio chose its omnigraph CLI.".into(),
+                        true,
+                    ))
+                    .ok();
+                return;
+            }
+            this.update(cx, |this, _| reply.send(this.cli_instructions()).ok())
+                .ok();
+        })
+        .detach();
+    }
+
     /// What the `omnigraph_cli` tool answers: this conversation's CLI, or why it has none.
     fn cli_instructions(&self) -> (String, bool) {
         match self.host.as_ref().and_then(|host| host.cli_home.as_ref()) {
@@ -2335,15 +2480,16 @@ impl AgentPanel {
         }
     }
 
-    fn set_write_state(&mut self, index: usize, state: WriteState, cx: &mut Context<Self>) {
-        if let Some(Entry::Write(card)) = self.entries.get_mut(index) {
+    /// Sets the state of write card `card`, while the thread holds it.
+    fn set_write_state(&mut self, card: u64, state: WriteState, cx: &mut Context<Self>) {
+        if let Some(card) = self.entries.write_card(card) {
             card.state = state;
         }
         cx.notify();
     }
 
     fn review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(branch) = self.branch.as_ref().filter(|b| b.created) else {
+        let Some(branch) = self.branch.as_ref().filter(|b| b.offers_review()) else {
             return;
         };
         let name = branch.name.clone();
@@ -2857,6 +3003,33 @@ fn turn_ends(entries: &[Entry], working: bool) -> Vec<usize> {
     ends
 }
 
+/// The most of another tool's input, as JSON, the thread keeps: its row shows only its title and
+/// how it went, and Claude's Read and Write tools carry whole files.
+const FOREIGN_INPUT_BYTES: usize = 4 * 1024;
+
+/// What the thread keeps of a tool call's input: all of it for Studio's own tools, and of
+/// another tool only an input within [`FOREIGN_INPUT_BYTES`], so a call an update names
+/// Studio's later still has its arguments.
+fn kept_input(studio: Option<StudioTool>, input: Option<Value>) -> Option<Value> {
+    /// Takes bytes up to a limit, then refuses, so measuring a large input stops there.
+    struct Within(usize);
+    impl std::io::Write for Within {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_sub(bytes.len())
+                .ok_or_else(|| std::io::Error::other("past the limit"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let input = input?;
+    let small = || serde_json::to_writer(Within(FOREIGN_INPUT_BYTES), &input).is_ok();
+    (studio.is_some() || small()).then_some(input)
+}
+
 /// What a tool call returned, as its agent reports it: the text of its content blocks (Claude's
 /// adapter sends an MCP tool's result so), else its raw output, a string as it is and other JSON
 /// as its text. `None` when it reported neither.
@@ -2917,6 +3090,15 @@ fn gutter_row(icon: Option<Icon>, content: impl IntoElement) -> Div {
         .child(div().flex_1().min_w_0().child(content))
 }
 
+/// An `omnigraph_run` call's subcommand and the query text it gives with `-e`, read without
+/// copying them.
+fn query_text(entry: &Entry) -> Option<(&str, &str)> {
+    let args = run_args(entry)?;
+    let command = args.first()?.as_str()?;
+    let at = args.iter().position(|arg| arg.as_str() == Some("-e"))?;
+    Some((command, args.get(at + 1)?.as_str()?))
+}
+
 /// An `omnigraph_run` call shown with its query: the subcommand ("query", "mutate"), the
 /// query text given with `-e`, and the other arguments on one line.
 fn shown_query(entry: &Entry) -> Option<(String, String, String)> {
@@ -2965,7 +3147,7 @@ fn query_on_card(entries: &[Entry], index: usize) -> bool {
     let Some(entry @ Entry::Tool { status, .. }) = entries.get(index) else {
         return false;
     };
-    let Some((command, text, _)) = shown_query(entry) else {
+    let Some((command, text)) = query_text(entry) else {
         return false;
     };
     let text = text.trim();
@@ -2975,7 +3157,7 @@ fn query_on_card(entries: &[Entry], index: usize) -> bool {
             Entry::User(_) => break,
             Entry::Write(card) if card.query.trim() == text => return true,
             Entry::Tool { .. }
-                if shown_query(later).is_some_and(|(_, again, _)| again.trim() == text) =>
+                if query_text(later).is_some_and(|(_, again)| again.trim() == text) =>
             {
                 break;
             }
@@ -2983,6 +3165,96 @@ fn query_on_card(entries: &[Entry], index: usize) -> bool {
         }
     }
     running && command == "mutate"
+}
+
+/// The thread's blocks for `entries`, made again from the turn the first new or changed entry,
+/// `changed`, falls in; the turns before keep their blocks from `shown`, which was made from
+/// the entries as they still are there. Returns the blocks and how many were kept.
+///
+/// That holds because a turn's blocks read only its own entries and whether a message of the
+/// person's follows it: no block spans a message of the person's, a query's card is looked for
+/// only up to the next one, and only the last turn can still be under way. The person's last
+/// message before `changed` is unchanged and was there before, so every turn before it was
+/// followed by it then and now.
+fn thread_blocks(
+    shown: &[Block],
+    entries: &[Entry],
+    changed: usize,
+    working: bool,
+    exited: bool,
+) -> (Vec<Block>, usize) {
+    let cut = entries[..changed.min(entries.len())]
+        .iter()
+        .rposition(|entry| matches!(entry, Entry::User(_)))
+        .unwrap_or(0);
+    let kept = shown
+        .iter()
+        .take_while(|block| match block {
+            Block::Entry { index, .. } | Block::Query { index, .. } => *index < cut,
+            Block::Activity { start, .. } => *start < cut,
+            Block::Exited => false,
+        })
+        .count();
+    let mut blocks = shown[..kept].to_vec();
+    blocks.extend(blocks_from(entries, cut, working));
+    if exited {
+        blocks.push(Block::Exited);
+    }
+    (blocks, kept)
+}
+
+/// The blocks of `entries` from `start` on, where a turn begins (a message of the person's, or
+/// the first entry). As in Delta: the agent's mark once per turn, and each run of tool calls
+/// and thoughts as one line that opens to its steps.
+fn blocks_from(entries: &[Entry], start: usize, working: bool) -> Vec<Block> {
+    let ends: std::collections::HashSet<usize> = turn_ends(&entries[start..], working)
+        .into_iter()
+        .map(|end| start + end)
+        .collect();
+    let mut blocks = Vec::new();
+    let mut marked = false;
+    let mut index = start;
+    while index < entries.len() {
+        let entry = &entries[index];
+        match entry {
+            Entry::Tool { .. } if shows_query(entry) => {
+                blocks.push(Block::Query {
+                    index,
+                    lead: !marked,
+                    on_card: query_on_card(entries, index),
+                });
+                marked = true;
+                index += 1;
+                continue;
+            }
+            Entry::Tool { .. } | Entry::Thought(_) => {
+                let start = index;
+                while index < entries.len() && is_folded_step(&entries[index]) {
+                    index += 1;
+                }
+                blocks.push(Block::Activity {
+                    start,
+                    end: index,
+                    lead: !marked,
+                });
+                marked = true;
+                continue;
+            }
+            Entry::User(_) => marked = false,
+            _ => {}
+        }
+        let lead = matches!(entry, Entry::Agent(_)) && !marked;
+        if matches!(entry, Entry::Agent(_)) {
+            marked = true;
+        }
+        blocks.push(Block::Entry {
+            index,
+            lead,
+            ends: ends.contains(&index),
+        });
+        index += 1;
+    }
+    blocks
 }
 
 /// Whether an entry folds into a run's summary line: thoughts, and tool calls other than the
@@ -3066,8 +3338,9 @@ impl Render for AgentPanel {
             _ => {
                 let key = self.thread_key();
                 if self.synced_thread != Some(key) {
-                    self.sync_markdown(cx);
-                    self.sync_thread();
+                    let changed = self.entries.rehash();
+                    self.sync_markdown(changed, cx);
+                    self.sync_thread(changed);
                     self.synced_thread = Some(key);
                 }
                 self.render_thread(window, cx).into_any_element()
@@ -3303,13 +3576,15 @@ impl AgentPanel {
     }
 
     /// Brings each agent reply's markdown up to its text: new replies get an entity, a growing
-    /// one appends what streamed in since.
-    fn sync_markdown(&mut self, cx: &mut Context<Self>) {
-        self.markdown
-            .retain(|index, _| matches!(self.entries.get(*index), Some(Entry::Agent(_))));
+    /// one appends what streamed in since. The entries before `changed` are as they were when
+    /// their markdown last took them in.
+    fn sync_markdown(&mut self, changed: usize, cx: &mut Context<Self>) {
+        self.markdown.retain(|index, _| {
+            *index < changed || matches!(self.entries.get(*index), Some(Entry::Agent(_)))
+        });
         self._markdown_watch
             .retain(|index, _| self.markdown.contains_key(index));
-        for (index, entry) in self.entries.iter().enumerate() {
+        for (index, entry) in self.entries.iter().enumerate().skip(changed) {
             let Entry::Agent(text) = entry else { continue };
             match self.markdown.get_mut(&index) {
                 Some((markdown, taken)) if text.len() >= *taken => {
@@ -3332,58 +3607,6 @@ impl AgentPanel {
                 }
             }
         }
-    }
-
-    /// The thread's blocks in order. As in Delta: the agent's mark once per turn, and each run
-    /// of tool calls and thoughts as one line that opens to its steps.
-    fn blocks(&self) -> Vec<Block> {
-        let ends = turn_ends(&self.entries, matches!(self.state, State::Prompting { .. }));
-        let mut blocks = Vec::new();
-        let mut marked = false;
-        let mut index = 0;
-        while index < self.entries.len() {
-            let entry = &self.entries[index];
-            match entry {
-                Entry::Tool { .. } if shows_query(entry) => {
-                    blocks.push(Block::Query {
-                        index,
-                        lead: !marked,
-                    });
-                    marked = true;
-                    index += 1;
-                    continue;
-                }
-                Entry::Tool { .. } | Entry::Thought(_) => {
-                    let start = index;
-                    while index < self.entries.len() && is_folded_step(&self.entries[index]) {
-                        index += 1;
-                    }
-                    blocks.push(Block::Activity {
-                        start,
-                        end: index,
-                        lead: !marked,
-                    });
-                    marked = true;
-                    continue;
-                }
-                Entry::User(_) => marked = false,
-                _ => {}
-            }
-            let lead = matches!(entry, Entry::Agent(_)) && !marked;
-            if matches!(entry, Entry::Agent(_)) {
-                marked = true;
-            }
-            blocks.push(Block::Entry {
-                index,
-                lead,
-                ends: ends.contains(&index),
-            });
-            index += 1;
-        }
-        if matches!(self.state, State::Exited { .. }) {
-            blocks.push(Block::Exited);
-        }
-        blocks
     }
 
     /// The turn entry `index` is in: from the person's message before it to the next one.
@@ -3453,7 +3676,6 @@ impl AgentPanel {
             Block::Entry { index, .. } => index..index + 1,
             Block::Query { index, .. } => {
                 self.folded_queries.contains(&index).hash(&mut hasher);
-                query_on_card(&self.entries, index).hash(&mut hasher);
                 index..index + 1
             }
             Block::Activity { start, end, .. } => {
@@ -3474,16 +3696,34 @@ impl AgentPanel {
         hasher.finish()
     }
 
-    /// Brings the list up to the thread: the blocks between those it starts and ends with as
-    /// last drawn are measured again; the others keep their heights, and the scroll stays.
-    fn sync_thread(&mut self) {
-        self.entries.rehash();
-        let blocks: Vec<(Block, u64)> = self
-            .blocks()
+    /// Brings the list up to the thread, whose entries from `changed` on are new or changed: the
+    /// blocks are made again from that entry's turn on ([`thread_blocks`]), and the blocks
+    /// between those the list starts and ends with as last drawn are measured again; the others
+    /// keep their heights, and the scroll stays. A streamed token costs its own turn, not the
+    /// whole conversation.
+    fn sync_thread(&mut self, changed: usize) {
+        let shown: Vec<Block> = self.shown_blocks.iter().map(|(block, _)| *block).collect();
+        let (blocks, kept) = thread_blocks(
+            &shown,
+            &self.entries,
+            changed,
+            matches!(self.state, State::Prompting { .. }),
+            matches!(self.state, State::Exited { .. }),
+        );
+        // A kept block shows what it showed, unless a fold changed since.
+        let refold = self.synced_folds != Some(self.folds);
+        let blocks: Vec<(Block, u64)> = blocks
             .into_iter()
             .enumerate()
-            .map(|(position, block)| (block, self.fingerprint(&block, position == 0)))
+            .map(|(position, block)| {
+                let fingerprint = match self.shown_blocks.get(position) {
+                    Some((_, fingerprint)) if position < kept && !refold => *fingerprint,
+                    _ => self.fingerprint(&block, position == 0),
+                };
+                (block, fingerprint)
+            })
             .collect();
+        self.synced_folds = Some(self.folds);
         studio_ui::rows::sync(&self.thread, &mut self.shown_blocks, blocks);
     }
 
@@ -3543,8 +3783,12 @@ impl AgentPanel {
                 Some(entry) => self.render_entry(index, entry, lead, window, cx),
                 None => div().into_any_element(),
             },
-            Block::Query { index, lead } => match self.entries.get(index) {
-                Some(entry) => self.render_query_call(index, entry, lead, cx),
+            Block::Query {
+                index,
+                lead,
+                on_card,
+            } => match self.entries.get(index) {
+                Some(entry) => self.render_query_call(index, entry, lead, on_card, cx),
                 None => div().into_any_element(),
             },
             Block::Activity { start, end, lead } => {
@@ -3668,6 +3912,7 @@ impl AgentPanel {
         index: usize,
         entry: &Entry,
         lead: bool,
+        on_card: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Entry::Tool { status, .. } = entry else {
@@ -3686,7 +3931,6 @@ impl AgentPanel {
         } = &*card;
         let running = matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress);
         let failed = matches!(status, ToolCallStatus::Failed);
-        let on_card = query_on_card(&self.entries, index);
         let folded = on_card || self.folded_queries.contains(&index);
         let header = h_flex()
             .id(("query-call", index))
@@ -4008,9 +4252,9 @@ impl AgentPanel {
                 })
                 .children(params)
         });
-        // The keys answer the card waiting longest; only that card shows them, so a key never
-        // answers a card other than the one it is shown on.
-        let keyed = self.pending_index() == Some(index);
+        // The keys answer the write card waiting longest; only that card shows them, so a key
+        // never answers a card other than the one it is shown on ([`keyed_write`]).
+        let keyed = keyed_write(&self.entries) == Some(index);
         let key = |action: &dyn gpui::Action, cx: &App| {
             keyed.then(|| KeyBinding::for_action_in(action, &focus, cx))
         };
@@ -4068,11 +4312,19 @@ impl AgentPanel {
                         "Refused".into(),
                         Some(message.clone()),
                     ),
-                    WriteState::Unknown => (
+                    WriteState::Unknown { commit } => (
                         Some(IconName::Warning),
                         Color::Warning,
                         "Outcome unknown".into(),
-                        Some(UNKNOWN_OUTCOME.into()),
+                        Some(match commit {
+                            None => UNKNOWN_OUTCOME.into(),
+                            Some(commit) => format!(
+                                "The server wrote commit {commit}, of a kind Studio does not \
+                                 know, so whether {} moved is not known. Check its history \
+                                 before the agent tries it again.",
+                                card.branch
+                            ),
+                        }),
                     ),
                     WriteState::Done(label) => {
                         (Some(IconName::Check), Color::Success, label.clone(), None)
@@ -4087,15 +4339,10 @@ impl AgentPanel {
                                  branch shows and which never publishes, so {} did not change.",
                                 card.branch
                             ),
-                            CommitKind::Unpublished => format!(
+                            _ => format!(
                                 "The server held this write as commit {commit}, which no \
                                  branch shows, so {} did not change. Publishing it is yours, \
                                  outside Studio.",
-                                card.branch
-                            ),
-                            _ => format!(
-                                "The server held this write as commit {commit}, which no \
-                                 branch shows, so {} did not change.",
                                 card.branch
                             ),
                         }),
@@ -4407,8 +4654,9 @@ impl AgentPanel {
 
     /// The notice strip on the composer's card (spec 011), one line for each state that holds
     /// the conversation up or follows from it, or none: the context window nearly full (the
-    /// gauge, how full and how many tokens), then the agent's branch once it holds changes
-    /// (its name, how many, and Review).
+    /// gauge, how full and how many tokens), then the agent's branch once it exists, though it
+    /// was made before the conversation came back (its name, how many changes the agent
+    /// committed on it since, when any, and Review).
     fn render_notices(&self, cx: &mut Context<Self>) -> Option<Div> {
         let mut lines = Vec::new();
         if let Some(usage) = self.usage.as_ref().filter(|usage| usage.size > 0) {
@@ -4439,16 +4687,21 @@ impl AgentPanel {
                 );
             }
         }
-        if let Some(branch) = self.branch.as_ref().filter(|b| b.created && b.changes > 0) {
+        if let Some(branch) = self.branch.as_ref().filter(|b| b.offers_review()) {
             lines.push(
                 ds::notice_line()
                     .child(ds::meta(IconName::GitBranch, branch.name.clone()))
-                    .child(
-                        div()
-                            .id("agent-changes")
-                            .tooltip(Tooltip::text("Changes committed on the agent's branch"))
-                            .child(ds::meta(IconName::Pencil, branch.changes.to_string())),
-                    )
+                    .when(branch.changes > 0, |line| {
+                        line.child(
+                            div()
+                                .id("agent-changes")
+                                .tooltip(Tooltip::text(
+                                    "Changes the agent committed on its branch since this \
+                                     conversation opened",
+                                ))
+                                .child(ds::meta(IconName::Pencil, branch.changes.to_string())),
+                        )
+                    })
                     .child(div().flex_1())
                     .child(
                         ds::toolbar_button("review", "Review")
@@ -4536,6 +4789,7 @@ mod tests {
         };
         let card = |state| {
             Entry::Write(WriteCard {
+                id: 0,
                 summary: "Mutation".into(),
                 query: format!("{text}\n"),
                 params: None,
@@ -4710,16 +4964,19 @@ mod tests {
 
     /// An agent's write is logged as Studio's own writes are, by its commit's kind: one written
     /// `as commit` is held as a proposal and one written `as unattached branch` as a snapshot,
-    /// each with its commit and no branch moved; one on the agent's branch is committed there.
+    /// each with its commit and no branch moved; one on the agent's branch is committed there;
+    /// one of a kind this build does not know leaves its outcome unknown, and its card says so.
+    /// A stored query that read wrote nothing, and is not logged as committed.
     #[test]
     fn an_agents_held_write_is_logged_as_held() {
         use graph_store::HeldAs;
-        let held = |kind| {
-            outcome_kind(&Seen::Unpublished {
-                commit: "c3".into(),
-                kind,
-            })
+        let written = |commit: Option<(&str, CommitKind)>| Seen::Written {
+            commit: commit.map(|(id, kind)| (id.to_owned(), kind)),
+            nodes: 1,
+            edges: 0,
+            branch_created: false,
         };
+        let held = |kind| outcome_kind(&written(Some(("c3", kind))));
         assert_eq!(
             held(CommitKind::Unpublished),
             OutcomeKind::Held {
@@ -4738,21 +4995,244 @@ mod tests {
             matches!(held(CommitKind::Other), OutcomeKind::Unknown { reason } if reason.contains("c3")),
             "a kind Studio does not know leaves the branch's move unknown"
         );
-        let committed = |commit: Option<&str>| {
-            outcome_kind(&Seen::Committed {
-                commit: commit.map(str::to_owned),
-                nodes: 1,
-                edges: 0,
-                branch_created: false,
-            })
-        };
+        assert!(matches!(
+            card_state(&written(Some(("c3", CommitKind::Other))), false),
+            WriteState::Unknown { commit: Some(commit) } if commit == "c3"
+        ));
         assert_eq!(
-            committed(Some("c2")),
+            outcome_kind(&written(Some(("c2", CommitKind::Published)))),
             OutcomeKind::Committed {
                 commit: Some("c2".into())
             }
         );
-        assert_eq!(committed(None), OutcomeKind::Committed { commit: None });
+        assert_eq!(
+            outcome_kind(&written(None)),
+            OutcomeKind::Committed { commit: None }
+        );
+        assert_eq!(
+            outcome_kind(&Seen::Read),
+            OutcomeKind::Committed { commit: None },
+            "logged as writing nothing, never as a commit"
+        );
+        assert!(
+            matches!(card_state(&Seen::Read, false), WriteState::Done(label) if label.contains("nothing written"))
+        );
+    }
+
+    fn write_card(id: u64, state: WriteState) -> Entry {
+        Entry::Write(WriteCard {
+            id,
+            summary: "Mutation".into(),
+            query: String::new(),
+            params: None,
+            branch: "agent/x".into(),
+            creates_from: None,
+            state,
+        })
+    }
+
+    /// The approval keys answer only a write card, the one waiting longest, which shows them: a
+    /// permission request of the agent's own waiting above it is answered by its own buttons,
+    /// so ⌘⌥Y never picks the agent's lasting rule unseen.
+    #[test]
+    fn the_keys_answer_only_the_write_card_that_shows_them() {
+        let (reply, _asked) = oneshot::channel();
+        let permission = Entry::Permission(PermissionCard {
+            title: "rm -rf build".into(),
+            options: Vec::new(),
+            reply: Some(reply),
+            answer: None,
+        });
+        let waiting = || WriteState::Waiting(oneshot::channel().0);
+        let entries = [
+            Entry::User("change it".into()),
+            permission,
+            write_card(0, WriteState::Running),
+            write_card(1, waiting()),
+            write_card(2, waiting()),
+        ];
+        assert!(entries[1].waits(), "the permission card waits first");
+        assert_eq!(keyed_write(&entries), Some(3));
+        assert_eq!(
+            keyed_write(&entries[..3]),
+            None,
+            "a permission card alone takes no key"
+        );
+    }
+
+    /// A write sent before the agent stopped runs on, and its card waits to hear how rather than
+    /// saying its outcome is unknown; one still waiting for the person was never sent. The
+    /// outcome finds its card by its own id after the thread changed around it, and the agent's
+    /// branch learns whether it exists.
+    #[test]
+    fn a_write_sent_before_the_agent_stopped_still_shows_its_outcome() {
+        let mut entries = Entries::default();
+        entries.push(Entry::User("change it".into()));
+        entries.push(write_card(7, WriteState::Running));
+        entries.push(write_card(8, WriteState::Waiting(oneshot::channel().0)));
+        entries.stop_writes();
+        let state = |entries: &Entries, at: usize| match &entries[at] {
+            Entry::Write(card) => match &card.state {
+                WriteState::Running => "running".to_owned(),
+                WriteState::Refused(text) => text.clone(),
+                WriteState::Committed { commit, .. } => format!("committed {commit}"),
+                WriteState::Done(label) => label.clone(),
+                _ => "other".to_owned(),
+            },
+            _ => "not a card".to_owned(),
+        };
+        assert_eq!(state(&entries, 1), "running");
+        assert_eq!(state(&entries, 2), STOPPED_UNSENT);
+        // The conversation went on; the outcome lands on its own card.
+        let said = entries.take_from(0);
+        entries.push(Entry::Notice {
+            text: "Resumed".into(),
+            error: false,
+        });
+        entries.extend(said);
+        let committed = Seen::Written {
+            commit: Some(("c9".into(), CommitKind::Published)),
+            nodes: 1,
+            edges: 0,
+            branch_created: false,
+        };
+        let card = entries.write_card(7).expect("the card, moved");
+        card.state = card_state(&committed, false);
+        assert_eq!(state(&entries, 2), "committed c9");
+        assert!(entries.write_card(9).is_none());
+        // What it says of the agent's branch.
+        assert_eq!(branch_after(WriteKind::Mutate, &committed), Some(true));
+        assert_eq!(
+            branch_after(WriteKind::BranchDelete, &committed),
+            Some(false)
+        );
+        assert_eq!(
+            branch_after(WriteKind::Load, &Seen::Unknown("lost".into())),
+            None
+        );
+        let created = |branch_created| Seen::Written {
+            commit: None,
+            nodes: 0,
+            edges: 0,
+            branch_created,
+        };
+        assert!(makes_branch(Creates::Always, &created(false)));
+        assert!(makes_branch(Creates::IfMissing, &created(true)));
+        assert!(!makes_branch(Creates::IfMissing, &created(false)));
+        assert!(!makes_branch(
+            Creates::Always,
+            &Seen::Refused("exists".into())
+        ));
+        assert!(
+            matches!(card_state(&created(false), true), WriteState::Done(label) if label == "Branch created")
+        );
+    }
+
+    /// A conversation that comes back offers Review of its branch when its record says the
+    /// branch exists, though no change was committed since it opened here.
+    #[test]
+    fn a_resumed_conversation_offers_review_of_a_branch_it_made_before() {
+        let record = |branch_created| SessionRecord {
+            session: "s1".into(),
+            graph: "server/crm".into(),
+            agent: "claude".into(),
+            title: None,
+            title_override: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            branch: "agent/20261021-101500".into(),
+            branch_created,
+            pinned: false,
+            archived: false,
+            cwd: PathBuf::from("/tmp/agent"),
+        };
+        let resumed = AgentBranch::resumed(&record(true), "main".into());
+        assert_eq!(resumed.name, "agent/20261021-101500");
+        assert_eq!(resumed.changes, 0);
+        assert!(resumed.offers_review());
+        assert!(!AgentBranch::resumed(&record(false), "main".into()).offers_review());
+    }
+
+    /// Only Studio's own tools keep what they were given whole: another tool's input is kept
+    /// only while small, and a file it carries is not.
+    #[test]
+    fn only_studios_tools_keep_what_they_were_given() {
+        let file = serde_json::json!({"file_path": "/x", "content": "x".repeat(64 * 1024)});
+        let small = serde_json::json!({"command": "ls"});
+        assert_eq!(kept_input(None, Some(file.clone())), None);
+        assert_eq!(kept_input(None, Some(small.clone())), Some(small));
+        assert_eq!(
+            kept_input(Some(StudioTool::Run), Some(file.clone())),
+            Some(file)
+        );
+        assert_eq!(kept_input(Some(StudioTool::Run), None), None);
+    }
+
+    /// A streamed token lands in the last turn, and only that turn's blocks are made again:
+    /// the earlier turns keep theirs, and the blocks are those a rebuild of the whole thread
+    /// makes. A change in an earlier turn makes its turn's blocks and the later ones again.
+    #[test]
+    fn streaming_into_the_last_turn_keeps_the_earlier_turns_blocks() {
+        let query = || Entry::Tool {
+            id: "q".into(),
+            title: String::new(),
+            status: ToolCallStatus::Completed,
+            input: Some(serde_json::json!({"args": ["query", "-e", "query q() {}", "--json"]})),
+            studio: Some(StudioTool::Run),
+            output: None,
+        };
+        let mut entries = Entries::default();
+        for entry in [
+            Entry::User("first".into()),
+            Entry::Agent("one".into()),
+            query(),
+            Entry::Thought("hm".into()),
+            Entry::User("second".into()),
+            Entry::Agent("tw".into()),
+        ] {
+            entries.push(entry);
+        }
+        let whole = |entries: &Entries, working| thread_blocks(&[], entries, 0, working, false).0;
+        let changed = entries.rehash();
+        assert_eq!(changed, 0);
+        let (blocks, kept) = thread_blocks(&[], &entries, changed, true, false);
+        assert_eq!(kept, 0);
+        let first_turn = blocks
+            .iter()
+            .take_while(|block| !matches!(block, Block::Entry { index: 4, .. }))
+            .count();
+        assert_eq!(
+            first_turn, 4,
+            "the message, the reply, the query and the thought"
+        );
+
+        if let Some(Entry::Agent(text)) = entries.last_mut() {
+            text.push('o');
+        }
+        let changed = entries.rehash();
+        assert_eq!(changed, 5);
+        let (again, kept) = thread_blocks(&blocks, &entries, changed, true, false);
+        assert_eq!(kept, first_turn, "the first turn's blocks are kept");
+        assert_eq!(again, whole(&entries, true));
+
+        // The turn ends: still only the last turn is made again, now with its actions.
+        let (ended, kept) = thread_blocks(&again, &entries, entries.len(), false, true);
+        assert_eq!(kept, first_turn);
+        assert_eq!(ended[..ended.len() - 1], whole(&entries, false)[..]);
+        assert_eq!(ended.last(), Some(&Block::Exited));
+
+        // A change in the first turn (a write card's outcome, a tool's status) makes it again.
+        entries.change_each(|entry| match entry {
+            Entry::Thought(text) => {
+                text.push('m');
+                true
+            }
+            _ => false,
+        });
+        let changed = entries.rehash();
+        let (rebuilt, kept) = thread_blocks(&ended, &entries, changed, false, false);
+        assert_eq!(kept, 0);
+        assert_eq!(rebuilt, whole(&entries, false));
     }
 
     #[test]

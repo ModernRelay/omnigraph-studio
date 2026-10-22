@@ -22,7 +22,7 @@ use serde::Deserialize as _;
 use serde_json::{Value, json};
 use smol::net::{TcpListener, TcpStream};
 
-use crate::gateway_rules::{self, Incoming, Sandbox, Verdict, WriteSummary};
+use crate::gateway_rules::{self, Incoming, Sandbox, Verdict, WriteKind, WriteSummary};
 use crate::requester::Starters;
 
 /// The most a request's line and headers may take.
@@ -53,14 +53,12 @@ const FORWARDED_HEADERS: &[&str] = &[
 #[derive(Debug)]
 pub enum GatewayEvent {
     /// A write for the agent's branch waits for `decide`: `Some` sends it, with what records
-    /// its outcome.
+    /// its outcome (constitution III).
     Write {
         id: u64,
         write: WriteSummary,
         decide: oneshot::Sender<Option<OnOutcome>>,
     },
-    /// How a forwarded write ended (constitution III).
-    Finished { id: u64, outcome: Seen },
     /// The CLI stopped waiting before the write was decided (its command timed out or was
     /// stopped): nothing was sent, and nothing will be.
     Abandoned { id: u64 },
@@ -74,24 +72,31 @@ pub type OnOutcome = Box<dyn FnOnce(&Seen) + Send>;
 /// What an approved write that was not sent, because the CLI stopped waiting, records.
 pub const NOT_SENT: &str = "The agent's CLI stopped waiting, so nothing was sent.";
 
+/// What an approved write that was not sent, because the conversation stopped before the
+/// gateway took the approval, records.
+pub const NOT_SENT_STOPPED: &str = "The conversation stopped before the write was sent, so \
+                                    nothing was sent.";
+
 /// A forwarded write's outcome, as the gateway saw the server's answer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Seen {
-    Committed {
-        commit: Option<String>,
+    /// The server answered with the write's receipt. `commit` is the commit it names, with the
+    /// commit's kind as Studio's own writes read it: a commit of the agent's branch
+    /// (`Published`), one no branch shows (`Unpublished`, `Unattached`: a stored mutation
+    /// written `as commit` or `as unattached branch`, whose text the gateway never sees), or one
+    /// of a kind this build does not know (`Other`), which leaves whether the branch moved
+    /// unknown. `None` when the write published no commit (a branch created or deleted, a
+    /// merge already up to date, a mutation that matched nothing).
+    Written {
+        commit: Option<(String, CommitKind)>,
         nodes: i64,
         edges: i64,
         /// A load's answer says it created its branch (`branch_created`).
         branch_created: bool,
     },
-    /// The server held the write as a commit no branch shows (a stored mutation written `as
-    /// commit` or `as unattached branch`, whose text the gateway never sees): it went through,
-    /// and the agent's branch did not move. `kind` says what the commit is: a proposal
-    /// (`Unpublished`), a snapshot (`Unattached`), or one this build does not know (`Other`).
-    Unpublished {
-        commit: String,
-        kind: CommitKind,
-    },
+    /// The server answered a stored query with a read's rows: the caller did not say whether
+    /// the query writes, and it reads. Nothing was written.
+    Read,
     Refused(String),
     Unknown(String),
 }
@@ -298,7 +303,9 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
             // outlive a command stopped by its process id, its connection open.
             let starters = Starters::of(stream.peer_addr().ok(), stream.local_addr().ok()).await;
             let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
+            let kind = write.kind;
             let (decide, decision) = oneshot::channel();
+            let mut decision = Decision(decision);
             if shared
                 .events
                 .unbounded_send(GatewayEvent::Write { id, write, decide })
@@ -327,12 +334,11 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
                     ) {}
                 }
             };
-            let (decision, gone, stopped) = (
-                futures::FutureExt::fuse(decision),
+            let (gone, stopped) = (
                 futures::FutureExt::fuse(gone),
                 futures::FutureExt::fuse(starters.ended()),
             );
-            futures::pin_mut!(decision, gone, stopped);
+            futures::pin_mut!(gone, stopped);
             let decided = futures::select! {
                 decided = decision => Ok(decided),
                 () = gone => Err(Undecided::Gone),
@@ -343,11 +349,7 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
                 Err(undecided) => {
                     // An approval that came as the CLI gave up is not sent: it says so, rather
                     // than being dropped and taken for a write whose outcome is unknown.
-                    if let Some(Ok(Some(on_outcome))) =
-                        futures::FutureExt::now_or_never(decision.as_mut())
-                    {
-                        on_outcome(&Seen::Refused(NOT_SENT.into()));
-                    }
+                    decision.abandon();
                     shared
                         .events
                         .unbounded_send(GatewayEvent::Abandoned { id })
@@ -380,16 +382,13 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
             // Once sent, a write runs to its end in a task of its own, and its outcome is
             // recorded: the conversation stopping, or the CLI going, would otherwise drop it
             // halfway with the server perhaps committing it unseen.
-            let (client, events) = (shared.client.clone(), shared.events.clone());
+            let client = shared.client.clone();
             let forward = forward_request(&request, None);
             let (reply_tx, reply_rx) = oneshot::channel();
             smol::spawn(async move {
                 let response = client.forward(forward).await;
-                let (outcome, reply) = read_write_answer(response).await;
+                let (outcome, reply) = read_write_answer(response, kind).await;
                 on_outcome(&outcome);
-                events
-                    .unbounded_send(GatewayEvent::Finished { id, outcome })
-                    .ok();
                 reply_tx.send(reply).ok();
             })
             .detach();
@@ -398,6 +397,49 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
             if let Ok(Some((status, headers, body))) = reply_rx.await {
                 write_buffered(&mut stream, status, &headers, &body).await;
             }
+        }
+    }
+}
+
+/// The person's decision on a write, as the gateway waits for it. Dropped with an approval it
+/// never took (the conversation stopped as the person allowed the write), the approval records
+/// that nothing was sent, rather than being dropped with it and taken for a write whose outcome
+/// is unknown.
+struct Decision(oneshot::Receiver<Option<OnOutcome>>);
+
+impl Decision {
+    /// Takes no decision after this: an approval sent before records that nothing was sent,
+    /// and one sent after finds nobody to take it, and records so itself (the panel's
+    /// `hand_over`).
+    fn abandon(&mut self) {
+        self.0.close();
+        if let Ok(Some(Some(approval))) = self.0.try_recv() {
+            approval(&Seen::Refused(NOT_SENT.into()));
+        }
+    }
+}
+
+impl Future for Decision {
+    type Output = Result<Option<OnOutcome>, oneshot::Canceled>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+impl futures::future::FusedFuture for Decision {
+    fn is_terminated(&self) -> bool {
+        self.0.is_terminated()
+    }
+}
+
+impl Drop for Decision {
+    fn drop(&mut self) {
+        if let Ok(Some(Some(approval))) = self.0.try_recv() {
+            approval(&Seen::Refused(NOT_SENT_STOPPED.into()));
         }
     }
 }
@@ -435,9 +477,10 @@ fn forward_request(request: &Request, body: Option<Vec<u8>>) -> ForwardRequest {
     }
 }
 
-/// Reads a write's answer whole, and what it says happened.
+/// Reads a write's answer whole, and what it says happened to a write of `kind`.
 async fn read_write_answer(
     response: Result<graph_client::ForwardResponse, String>,
+    kind: WriteKind,
 ) -> (Seen, Option<(StatusCode, HeaderMap, Vec<u8>)>) {
     let mut response = match response {
         Ok(response) => response,
@@ -465,7 +508,7 @@ async fn read_write_answer(
     // confirms nothing.
     let outcome = match graph_client::judge_write(response.status, contract, &body) {
         WriteOutcome::Committed(body) => match serde_json::from_slice::<Value>(body) {
-            Ok(json) => seen_committed(&json),
+            Ok(json) => seen_written(&json, kind),
             Err(error) => Seen::Unknown(format!("the success response could not be read: {error}")),
         },
         WriteOutcome::Refused(error) => Seen::Refused(error.body.error),
@@ -474,48 +517,49 @@ async fn read_write_answer(
     (outcome, Some((response.status, response.headers, body)))
 }
 
-/// What a write's success answer says it did.
-fn seen_committed(json: &Value) -> Seen {
-    let commit = json.get("commit").filter(|commit| !commit.is_null());
-    if let Some(commit) = commit
-        && let Some(kind) = held_kind(commit)
-    {
-        return Seen::Unpublished {
-            commit: id_of(commit).unwrap_or_default(),
-            kind,
-        };
+/// What a success answer to a write of `kind` says it did. A write's receipt names its commit
+/// in `commit` (null when it published none: `ChangeOutput`, the loads', Blob and merge
+/// receipts); a branch's create or delete answers with the branch's `name` and no commit. A
+/// stored query that reads answers with a read's rows (`ReadOutput`), whose `graph_commit_id`
+/// is the commit it read at, not one it made. Any other answer confirms nothing.
+fn seen_written(json: &Value, kind: WriteKind) -> Seen {
+    let receipt = match kind {
+        WriteKind::BranchCreate | WriteKind::BranchDelete => json.get("name").is_some(),
+        _ => json.get("commit").is_some(),
+    };
+    if !receipt {
+        if kind == WriteKind::StoredQuery && json.get("rows").is_some() {
+            return Seen::Read;
+        }
+        return Seen::Unknown("the success response is not the write's receipt".into());
     }
-    Seen::Committed {
-        commit: commit.and_then(id_of).or_else(|| id_of(json)),
+    let commit = match json.get("commit").filter(|commit| !commit.is_null()) {
+        None => None,
+        Some(commit) => match commit.get("graph_commit_id").and_then(Value::as_str) {
+            Some(id) if !id.is_empty() => Some((id.to_owned(), kind_of(commit))),
+            _ => {
+                return Seen::Unknown("the receipt names a commit without its id".into());
+            }
+        },
+    };
+    Seen::Written {
+        commit,
         nodes: count_of(json, "affected_nodes", "nodes"),
         edges: count_of(json, "affected_edges", "edges"),
         branch_created: json.get("branch_created").and_then(Value::as_bool) == Some(true),
     }
 }
 
-/// A commit's id (`graph_commit_id`), in a write's `commit` or at its top level.
-fn id_of(json: &Value) -> Option<String> {
-    json.get("graph_commit_id")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-}
-
-/// The kind of a write's commit when no branch shows it, `None` when it is one of a branch's
-/// history. The commit's `kind` decides, as it does for Studio's own writes: a proposal
-/// (`unpublished`) or a snapshot (`unattached`) is readable by its id and shown by no branch. A
-/// kind this build does not know is held as that unknown kind when the commit says `published:
-/// false`, and is on the branch otherwise; a commit with no kind is a proposal when it says
-/// `published: false`, as the server reads a receipt written before commits had kinds.
-fn held_kind(commit: &Value) -> Option<CommitKind> {
-    let says_held = commit.get("published").and_then(Value::as_bool) == Some(false);
-    let kind = commit
-        .get("kind")
-        .map(|kind| CommitKind::deserialize(kind).unwrap_or(CommitKind::Other));
-    match kind {
-        Some(CommitKind::Published) => None,
-        Some(kind @ (CommitKind::Unpublished | CommitKind::Unattached)) => Some(kind),
-        Some(CommitKind::Other) => says_held.then_some(CommitKind::Other),
-        None => says_held.then_some(CommitKind::Unpublished),
+/// A commit's kind, read as Studio's own writes read it: its `kind`, a kind this build does not
+/// know being `Other`. A receipt written before commits had kinds has none; the server reads one
+/// that says `published: false` as a proposal, and so does Studio.
+fn kind_of(commit: &Value) -> CommitKind {
+    match commit.get("kind") {
+        Some(kind) => CommitKind::deserialize(kind).unwrap_or(CommitKind::Other),
+        None if commit.get("published").and_then(Value::as_bool) == Some(false) => {
+            CommitKind::Unpublished
+        }
+        None => CommitKind::Published,
     }
 }
 
@@ -1077,8 +1121,8 @@ mod tests {
             release.send(()).unwrap();
             assert_eq!(
                 outcome.await.unwrap(),
-                super::Seen::Committed {
-                    commit: Some("c9".into()),
+                super::Seen::Written {
+                    commit: Some(("c9".into(), CommitKind::Published)),
                     nodes: 1,
                     edges: 0,
                     branch_created: false,
@@ -1138,12 +1182,13 @@ mod tests {
     }
 
     /// A write's success answer says what it did, as Studio's own writes read theirs: its
-    /// commit and counts, whether a load created its branch, a commit no branch shows (a stored
-    /// mutation held `as commit` or `as unattached branch`), or, a body that cannot be read,
-    /// nothing confirmed.
+    /// commit with the commit's kind and its counts, whether a load created its branch, and a
+    /// branch's create or delete, which publish none. A stored query that reads wrote nothing,
+    /// though its rows name the commit they were read at. An answer that is no write's receipt,
+    /// or a body that cannot be read, confirms nothing.
     #[test]
     fn a_writes_success_answer_says_what_it_did() {
-        let answer = |body: &str| {
+        let answer = |kind: WriteKind, body: &str| {
             let mut headers = HeaderMap::new();
             headers.append(CONTRACT_HEADER, CONTRACT.parse().unwrap());
             let response = graph_client::ForwardResponse {
@@ -1151,39 +1196,64 @@ mod tests {
                 headers,
                 body: AsyncBody::from(body.to_owned()),
             };
-            smol::block_on(super::read_write_answer(Ok(response))).0
+            smol::block_on(super::read_write_answer(Ok(response), kind)).0
         };
-        let committed =
-            |commit: Option<&str>, nodes, edges, branch_created| super::Seen::Committed {
-                commit: commit.map(str::to_owned),
+        let written = |commit: Option<(&str, CommitKind)>, nodes, edges, branch_created| {
+            super::Seen::Written {
+                commit: commit.map(|(id, kind)| (id.to_owned(), kind)),
                 nodes,
                 edges,
                 branch_created,
-            };
+            }
+        };
+        let mutation = |commit: &str| {
+            format!(
+                r#"{{"branch":"b","query_name":"m","affected_nodes":1,"affected_edges":0,
+                    "commit":{commit}}}"#
+            )
+        };
         assert_eq!(
             answer(
+                WriteKind::Mutate,
                 r#"{"branch":"b","query_name":"m","affected_nodes":2,"affected_edges":1,
                     "commit":{"graph_commit_id":"c1","kind":"published","published":true}}"#
             ),
-            committed(Some("c1"), 2, 1, false)
+            written(Some(("c1", CommitKind::Published)), 2, 1, false)
         );
         for (created, expected) in [("true", true), ("false", false)] {
             assert_eq!(
-                answer(&format!(
-                    r#"{{"branch":"b","branch_created":{created},"mode":"append",
-                        "nodes":[{{"entities_loaded":3}},{{"entities_loaded":4}}],"edges":[],
-                        "commit":{{"graph_commit_id":"c2","kind":"published"}}}}"#
-                )),
-                committed(Some("c2"), 7, 0, expected)
+                answer(
+                    WriteKind::Load,
+                    &format!(
+                        r#"{{"branch":"b","branch_created":{created},"mode":"append",
+                            "nodes":[{{"entities_loaded":3}},{{"entities_loaded":4}}],"edges":[],
+                            "commit":{{"graph_commit_id":"c2","kind":"published"}}}}"#
+                    )
+                ),
+                written(Some(("c2", CommitKind::Published)), 7, 0, expected)
             );
         }
-        // A branch created through the API publishes no commit.
+        // A branch created or deleted through the API publishes no commit, and a mutation that
+        // matched nothing names none.
         assert_eq!(
-            answer(r#"{"uri":"u","from":"main","name":"b","commit":null}"#),
-            committed(None, 0, 0, false)
+            answer(
+                WriteKind::BranchCreate,
+                r#"{"uri":"u","from":"main","name":"b","from_commit_id":"c0"}"#
+            ),
+            written(None, 0, 0, false)
         );
-        // A commit no branch shows carries its kind: a proposal, a snapshot, one of a kind this
-        // build does not know, and, with no kind, a proposal as the server reads one.
+        assert_eq!(
+            answer(WriteKind::BranchDelete, r#"{"uri":"u","name":"b"}"#),
+            written(None, 0, 0, false)
+        );
+        assert_eq!(
+            answer(WriteKind::Mutate, &mutation("null")),
+            written(None, 1, 0, false)
+        );
+        // The commit's kind is read as Studio's own writes read it: a proposal, a snapshot, one
+        // of a kind this build does not know, said held or not, and, with no kind, a proposal
+        // when it says `published: false`, as the server reads one. The kind decides over
+        // `published`.
         for (commit, kind) in [
             (
                 r#"{"graph_commit_id":"c3","kind":"unpublished","published":false}"#,
@@ -1198,44 +1268,103 @@ mod tests {
                 CommitKind::Other,
             ),
             (
+                r#"{"graph_commit_id":"c3","kind":"pending"}"#,
+                CommitKind::Other,
+            ),
+            (
                 r#"{"graph_commit_id":"c3","published":false}"#,
                 CommitKind::Unpublished,
             ),
+            (
+                r#"{"graph_commit_id":"c3","kind":"published","published":false}"#,
+                CommitKind::Published,
+            ),
         ] {
             assert_eq!(
-                answer(&format!(
-                    r#"{{"branch":"b","query_name":"m","affected_nodes":1,"affected_edges":0,
-                        "commit":{commit}}}"#
-                )),
-                super::Seen::Unpublished {
-                    commit: "c3".into(),
-                    kind,
-                },
+                answer(WriteKind::StoredQuery, &mutation(commit)),
+                written(Some(("c3", kind)), 1, 0, false),
                 "{commit}"
             );
         }
-        // The kind decides over `published`, and a kind this build does not know, not said to
-        // be held, is on the branch.
-        for commit in [
-            r#"{"graph_commit_id":"c4","kind":"published","published":false}"#,
-            r#"{"graph_commit_id":"c4","kind":"pending"}"#,
+        // A stored query that reads answers with rows: nothing was written, whatever commit
+        // they were read at.
+        assert_eq!(
+            answer(
+                WriteKind::StoredQuery,
+                r#"{"query_name":"people","target":{"branch":"agent/x"},"row_count":1,
+                    "rows":[{"n":1}],"graph_commit_id":"c5"}"#
+            ),
+            super::Seen::Read
+        );
+        // Rows are no receipt of any other write, and an answer with neither confirms nothing.
+        for (kind, body) in [
+            (WriteKind::Mutate, r#"{"rows":[],"graph_commit_id":"c5"}"#),
+            (WriteKind::StoredQuery, r#"{"graph_commit_id":"c5"}"#),
+            (WriteKind::BranchCreate, r#"{"graph_commit_id":"c5"}"#),
+            (WriteKind::Mutate, &mutation(r#"{"kind":"published"}"#)),
         ] {
-            assert_eq!(
-                answer(&format!(
-                    r#"{{"branch":"b","query_name":"m","affected_nodes":1,"affected_edges":0,
-                        "commit":{commit}}}"#
-                )),
-                committed(Some("c4"), 1, 0, false),
-                "{commit}"
+            assert!(
+                matches!(answer(kind, body), super::Seen::Unknown(_)),
+                "{kind:?} {body}"
             );
         }
         for unreadable in ["", "done", "{\"commit\":"] {
             assert!(
-                matches!(answer(unreadable), super::Seen::Unknown(reason)
+                matches!(answer(WriteKind::Mutate, unreadable), super::Seen::Unknown(reason)
                     if reason.contains("could not be read")),
                 "{unreadable:?}"
             );
         }
+    }
+
+    /// An approval the gateway never took, because the conversation stopped as the person
+    /// allowed the write, records that nothing was sent; so does one taken as the CLI gave up.
+    #[test]
+    fn an_approval_the_gateway_never_took_records_that_nothing_was_sent() {
+        let recorded = || {
+            let heard: Arc<Mutex<Option<super::Seen>>> = Arc::default();
+            let record = heard.clone();
+            let approval: OnOutcome = Box::new(move |seen: &super::Seen| {
+                *record.lock().unwrap() = Some(seen.clone());
+            });
+            (heard, approval)
+        };
+        let (heard, approval) = recorded();
+        let (decide, decision) = oneshot::channel();
+        let decision = Decision(decision);
+        assert!(decide.send(Some(approval)).is_ok());
+        drop(decision);
+        assert_eq!(
+            *heard.lock().unwrap(),
+            Some(super::Seen::Refused(NOT_SENT_STOPPED.into()))
+        );
+
+        let (heard, approval) = recorded();
+        let (decide, decision) = oneshot::channel();
+        let mut decision = Decision(decision);
+        assert!(decide.send(Some(approval)).is_ok());
+        decision.abandon();
+        drop(decision);
+        assert_eq!(
+            *heard.lock().unwrap(),
+            Some(super::Seen::Refused(NOT_SENT.into())),
+            "said once, as the CLI gave up"
+        );
+        // Abandoned first, a later approval finds nobody to take it.
+        let (_, approval) = recorded();
+        let (decide, decision) = oneshot::channel();
+        let mut decision = Decision(decision);
+        decision.abandon();
+        assert!(decide.send(Some(approval)).is_err());
+        // One the gateway took is not said again.
+        let (heard, approval) = recorded();
+        let (decide, decision) = oneshot::channel();
+        let mut decision = Decision(decision);
+        assert!(decide.send(Some(approval)).is_ok());
+        let taken = smol::block_on(&mut decision);
+        drop(decision);
+        assert!(matches!(taken, Ok(Some(_))));
+        assert_eq!(*heard.lock().unwrap(), None);
     }
 
     /// A read whose answer breaks off partway closes without the chunked stream's end: the CLI
@@ -1414,7 +1543,7 @@ mod tests {
                 port,
                 post("/graphs/knowledge/mutate", &token, Some(CONTRACT), write),
             ));
-            let Some(GatewayEvent::Write { decide, id, .. }) = events.next().await else {
+            let Some(GatewayEvent::Write { decide, .. }) = events.next().await else {
                 panic!("no write event")
             };
             let recorded: Arc<Mutex<Option<super::Seen>>> = Arc::default();
@@ -1429,24 +1558,16 @@ mod tests {
             assert_eq!(status, 200);
             assert!(head.contains(&format!("{CONTRACT_HEADER}: {CONTRACT}")));
             assert!(body.contains("\"graph_commit_id\":\"c9\""), "{body}");
-            let Some(GatewayEvent::Finished {
-                id: finished,
-                outcome,
-            }) = events.next().await
-            else {
-                panic!("no outcome")
-            };
-            assert_eq!(finished, id);
+            // Its outcome was recorded before the answer went back to the CLI.
             assert_eq!(
-                outcome,
-                super::Seen::Committed {
-                    commit: Some("c9".into()),
+                recorded.lock().unwrap().clone(),
+                Some(super::Seen::Written {
+                    commit: Some(("c9".into(), CommitKind::Published)),
                     nodes: 2,
                     edges: 1,
                     branch_created: false,
-                }
+                })
             );
-            assert_eq!(recorded.lock().unwrap().as_ref(), Some(&outcome));
             assert_eq!(seen.lock().unwrap().len(), 2);
 
             // The CLI gives up before the person decides (its command timed out): the write is
@@ -1494,6 +1615,27 @@ mod tests {
             let (status, _, body) = call(port, huge).await;
             assert_eq!(status, 413, "{body}");
             assert_eq!(seen.lock().unwrap().len(), 3, "nothing was sent");
+
+            // A stored query the CLI runs as a read on the agent's branch is forwarded as a
+            // read: no card, and its answer streams back.
+            let read = futures::FutureExt::fuse(call(
+                port,
+                post(
+                    "/graphs/knowledge/queries/people",
+                    &token,
+                    Some(CONTRACT),
+                    r#"{"params":{},"branch":"agent/20261013-101500","expect_mutation":false}"#,
+                ),
+            ));
+            let write = futures::FutureExt::fuse(events.next());
+            futures::pin_mut!(read, write);
+            let (status, _, body) = futures::select! {
+                read = read => read,
+                _ = write => panic!("a stored read was judged a write"),
+            };
+            assert_eq!(status, 200);
+            assert_eq!(body, r#"{"rows":[{"n":200}]}"#);
+            assert_eq!(seen.lock().unwrap().len(), 4);
         });
     }
 }
@@ -1573,16 +1715,15 @@ mod end_to_end {
         let outcomes: Arc<std::sync::Mutex<Vec<(String, super::Seen)>>> = Arc::default();
         let kept = outcomes.clone();
         let _person = smol::spawn(async move {
-            let mut summaries = std::collections::HashMap::new();
             while let Some(event) = events.next().await {
                 match event {
-                    GatewayEvent::Write { id, write, decide } => {
-                        summaries.insert(id, write.summary);
-                        decide.send(Some(Box::new(|_: &super::Seen| {}))).ok();
-                    }
-                    GatewayEvent::Finished { id, outcome } => {
-                        let summary = summaries.remove(&id).unwrap_or_default();
-                        kept.lock().unwrap().push((summary, outcome));
+                    GatewayEvent::Write { write, decide, .. } => {
+                        let (kept, summary) = (kept.clone(), write.summary);
+                        decide
+                            .send(Some(Box::new(move |outcome: &super::Seen| {
+                                kept.lock().unwrap().push((summary, outcome.clone()));
+                            })))
+                            .ok();
                     }
                     GatewayEvent::Abandoned { .. } => {}
                 }
@@ -1716,8 +1857,8 @@ mod end_to_end {
         );
         assert!(matches!(
             outcomes[1].1,
-            super::Seen::Committed {
-                commit: Some(_),
+            super::Seen::Written {
+                commit: Some((_, CommitKind::Published)),
                 nodes: 1,
                 ..
             }

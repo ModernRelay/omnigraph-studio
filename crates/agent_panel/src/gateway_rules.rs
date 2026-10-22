@@ -119,6 +119,18 @@ fn graph_route(request: &Incoming<'_>, sandbox: &Sandbox, graph: &str, rest: &[&
         {
             return Verdict::Read;
         }
+        // A stored query its caller says reads (`omnigraph query <name>` sends `expect_mutation:
+        // false`) runs only if it reads: the server refuses one that writes when the caller says
+        // it does not. So it is a read, on any graph and branch, the agent's own included.
+        ("POST", ["queries", _])
+            if request
+                .json
+                .and_then(|json| json.get("expect_mutation"))
+                .and_then(Value::as_bool)
+                == Some(false) =>
+        {
+            return Verdict::Read;
+        }
         _ => {}
     }
     if decode(graph) != sandbox.graph {
@@ -303,6 +315,8 @@ fn graph_route(request: &Incoming<'_>, sandbox: &Sandbox, graph: &str, rest: &[&
                 creates_branch: Creates::Never,
             })
         }
+        // One that may write (`omnigraph mutate <name>`, or a caller that does not say) is a
+        // write on the agent's branch; its answer says whether it wrote.
         ("POST", ["queries", name]) | ("POST", ["queries", name, "if-graph-commit"]) => {
             if on_agent_branch(json_str(request.json, "branch")) {
                 return Verdict::Write(WriteSummary {
@@ -719,8 +733,11 @@ mod tests {
         )));
     }
 
+    /// A stored query the CLI sends as a read (`omnigraph query <name>`, `expect_mutation:
+    /// false`) is a read wherever it runs, the agent's branch and another graph included: the
+    /// server refuses it if it writes. One that may write is a write on the agent's branch.
     #[test]
-    fn stored_queries_read_elsewhere_and_commits_are_never_published() {
+    fn a_stored_read_is_a_read_anywhere_and_commits_are_never_published() {
         let read = verdict(
             "POST",
             "/graphs/knowledge/queries/people",
@@ -731,17 +748,52 @@ mod tests {
             read,
             Verdict::ReadWith(json!({"params": {}, "branch": "main", "expect_mutation": false}))
         );
+        for (graph, branch) in [
+            ("knowledge", AGENT),
+            ("knowledge", "main"),
+            ("other", AGENT),
+        ] {
+            assert_eq!(
+                verdict(
+                    "POST",
+                    &format!("/graphs/{graph}/queries/people"),
+                    &[],
+                    Some(json!({"params": {}, "branch": branch, "expect_mutation": false}))
+                ),
+                Verdict::Read,
+                "{graph} {branch}"
+            );
+        }
+        for body in [
+            json!({"branch": AGENT}),
+            json!({"branch": AGENT, "expect_mutation": true}),
+            json!({"branch": AGENT, "expect_mutation": null}),
+        ] {
+            assert!(
+                matches!(
+                    verdict(
+                        "POST",
+                        "/graphs/knowledge/queries/retitle",
+                        &[],
+                        Some(body.clone())
+                    ),
+                    Verdict::Write(WriteSummary {
+                        kind: WriteKind::StoredQuery,
+                        ..
+                    })
+                ),
+                "{body}"
+            );
+        }
+        // The conditional route runs stored mutations only: it stays a write.
         assert!(matches!(
             verdict(
                 "POST",
-                "/graphs/knowledge/queries/retitle",
+                "/graphs/knowledge/queries/retitle/if-graph-commit",
                 &[],
-                Some(json!({"branch": AGENT}))
+                Some(json!({"branch": AGENT, "expect_mutation": false}))
             ),
-            Verdict::Write(WriteSummary {
-                kind: WriteKind::StoredQuery,
-                ..
-            })
+            Verdict::Write(_)
         ));
         assert!(refused(&verdict(
             "POST",

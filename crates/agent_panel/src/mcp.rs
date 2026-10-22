@@ -15,11 +15,20 @@ Use it for everything: `schema show` first, then `query`, and `mutate` or `load`
 branch, which the person reviews before it reaches theirs. Run it in your shell by the path \
 omnigraph_cli gives you, or with omnigraph_run when your shell has no network.";
 
+/// The conversation's instructions while Studio is still choosing its CLI: what the CLI is,
+/// and whether the agent's shell can run it, are not known yet.
+pub(crate) const STILL_CHOOSING: &str = "Studio is still choosing this conversation's omnigraph \
+CLI. Call the omnigraph_cli tool for its path, your branch and the rules before you run an \
+omnigraph command.";
+
 /// What to do with one incoming line.
 #[derive(Debug, PartialEq)]
 pub enum Incoming {
     /// Send this reply.
     Reply(Value),
+    /// Answer `initialize` ([`initialize`]) with the conversation's instructions as they are
+    /// when it arrives, at this revision.
+    Initialize { id: Value, version: &'static str },
     /// Run a tool and send [`tool_reply`] with the same id. `progress` is the client's
     /// progress token, for [`progress`] notifications while the call runs.
     CallTool {
@@ -35,9 +44,8 @@ pub enum Incoming {
     Nothing,
 }
 
-/// Answers one line. `conversation` is appended to the server's instructions: what this
-/// conversation's `omnigraph` CLI is and which branch is the agent's (spec 013).
-pub fn handle(line: &str, conversation: &str) -> Incoming {
+/// Answers one line.
+pub fn handle(line: &str) -> Incoming {
     let message: Value = match serde_json::from_str(line) {
         Ok(message) => message,
         Err(_) => return Incoming::Reply(error(Value::Null, -32700, "Parse error")),
@@ -66,25 +74,11 @@ pub fn handle(line: &str, conversation: &str) -> Incoming {
     match method {
         "initialize" => {
             let requested = params.get("protocolVersion").and_then(Value::as_str);
-            let version = requested
-                .filter(|version| PROTOCOL_VERSIONS.contains(version))
-                .unwrap_or(PROTOCOL_VERSIONS[0]);
-            Incoming::Reply(result(
-                id,
-                json!({
-                    "protocolVersion": version,
-                    "capabilities": { "tools": { "listChanged": false } },
-                    "serverInfo": {
-                        "name": "omnigraph-studio",
-                        "version": env!("CARGO_PKG_VERSION"),
-                    },
-                    "instructions": if conversation.is_empty() {
-                        INSTRUCTIONS.to_owned()
-                    } else {
-                        format!("{INSTRUCTIONS}\n\n{conversation}")
-                    },
-                }),
-            ))
+            let version = PROTOCOL_VERSIONS
+                .iter()
+                .find(|version| requested == Some(**version))
+                .unwrap_or(&PROTOCOL_VERSIONS[0]);
+            Incoming::Initialize { id, version }
         }
         "ping" => Incoming::Reply(result(id, json!({}))),
         "tools/list" => Incoming::Reply(result(id, json!({ "tools": tools::definitions() }))),
@@ -106,6 +100,28 @@ pub fn handle(line: &str, conversation: &str) -> Incoming {
         },
         _ => Incoming::Reply(error(id, -32601, "Method not found")),
     }
+}
+
+/// The answer to `initialize` at `version`. `conversation` is appended to the server's
+/// instructions: what this conversation's `omnigraph` CLI is and which branch is the agent's
+/// (spec 013).
+pub fn initialize(id: Value, version: &str, conversation: &str) -> Value {
+    result(
+        id,
+        json!({
+            "protocolVersion": version,
+            "capabilities": { "tools": { "listChanged": false } },
+            "serverInfo": {
+                "name": "omnigraph-studio",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+            "instructions": if conversation.is_empty() {
+                INSTRUCTIONS.to_owned()
+            } else {
+                format!("{INSTRUCTIONS}\n\n{conversation}")
+            },
+        }),
+    )
 }
 
 /// A tool's result. An error result is still a JSON-RPC success, as MCP specifies, so the
@@ -142,13 +158,13 @@ mod tests {
 
     #[test]
     fn initialize_echoes_a_known_revision_and_offers_the_newest_otherwise() {
-        let initialize = |version: &str, conversation: &str| match handle(
-            &format!(
-                r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"{version}"}}}}"#
-            ),
-            conversation,
-        ) {
-            Incoming::Reply(reply) => reply["result"].clone(),
+        let initialize = |version: &str, conversation: &str| match handle(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"{version}"}}}}"#
+        )) {
+            Incoming::Initialize { id, version } => {
+                assert_eq!(id, json!(1));
+                super::initialize(id, version, conversation)["result"].clone()
+            }
             other => panic!("{other:?}"),
         };
         assert_eq!(
@@ -170,8 +186,7 @@ mod tests {
 
     #[test]
     fn lists_tools_and_routes_calls() {
-        let Incoming::Reply(list) =
-            handle(r#"{"jsonrpc":"2.0","id":"a","method":"tools/list"}"#, "")
+        let Incoming::Reply(list) = handle(r#"{"jsonrpc":"2.0","id":"a","method":"tools/list"}"#)
         else {
             panic!()
         };
@@ -184,8 +199,7 @@ mod tests {
         assert_eq!(names, ["omnigraph_cli", "omnigraph_run",]);
         assert_eq!(
             handle(
-                r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"omnigraph_run"}}"#,
-                ""
+                r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"omnigraph_run"}}"#
             ),
             Incoming::CallTool {
                 id: json!(7),
@@ -197,8 +211,7 @@ mod tests {
         // The client's progress token comes with the call.
         assert_eq!(
             handle(
-                r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"omnigraph_run","arguments":{"args":[]},"_meta":{"progressToken":"p1"}}}"#,
-                ""
+                r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"omnigraph_run","arguments":{"args":[]},"_meta":{"progressToken":"p1"}}}"#
             ),
             Incoming::CallTool {
                 id: json!(8),
@@ -212,37 +225,32 @@ mod tests {
     #[test]
     fn notifications_and_responses_get_no_reply_and_unknown_methods_an_error() {
         assert_eq!(
-            handle(
-                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
-                ""
-            ),
+            handle(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#),
             Incoming::Nothing
         );
         assert_eq!(
-            handle(r#"{"jsonrpc":"2.0","id":3,"result":{}}"#, ""),
+            handle(r#"{"jsonrpc":"2.0","id":3,"result":{}}"#),
             Incoming::Nothing
         );
         // A cancelled call is named, so what it started stops.
         assert_eq!(
             handle(
-                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":8,"reason":"timeout"}}"#,
-                ""
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":8,"reason":"timeout"}}"#
             ),
             Incoming::Cancelled { id: json!(8) }
         );
         let Incoming::Reply(reply) =
-            handle(r#"{"jsonrpc":"2.0","id":4,"method":"resources/list"}"#, "")
+            handle(r#"{"jsonrpc":"2.0","id":4,"method":"resources/list"}"#)
         else {
             panic!()
         };
         assert_eq!(reply["error"]["code"], -32601);
         // A batch is answered, not left to wait.
-        let Incoming::Reply(reply) = handle(r#"[{"jsonrpc":"2.0","id":5,"method":"ping"}]"#, "")
-        else {
+        let Incoming::Reply(reply) = handle(r#"[{"jsonrpc":"2.0","id":5,"method":"ping"}]"#) else {
             panic!()
         };
         assert_eq!(reply["error"]["code"], -32600);
-        let Incoming::Reply(reply) = handle("not json", "") else {
+        let Incoming::Reply(reply) = handle("not json") else {
             panic!()
         };
         assert_eq!(reply["error"]["code"], -32700);

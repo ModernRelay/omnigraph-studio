@@ -200,15 +200,14 @@ impl ToolSocket {
         })
     }
 
-    /// Serves connections until the returned future is dropped.
-    /// `instructions` are this conversation's, appended to the server's in `initialize`.
+    /// Serves connections until the returned future is dropped. `instructions` are this
+    /// conversation's, appended to the server's in `initialize` as they are when it arrives.
     pub fn serve(
         &mut self,
         tools: mpsc::UnboundedSender<ToolRequest>,
-        instructions: String,
+        instructions: Instructions,
     ) -> impl Future<Output = ()> + Send + 'static {
         let listener = self.listener.take();
-        let instructions: std::sync::Arc<str> = instructions.into();
         async move {
             let Some(listener) = listener else { return };
             serve_each(
@@ -219,6 +218,34 @@ impl ToolSocket {
             )
             .await;
         }
+    }
+}
+
+/// A conversation's instructions, which `initialize` appends to the server's. They say what the
+/// conversation's CLI is and whether the agent's shell can run it, so they are known only once
+/// Studio has chosen the CLI: the panel sends them then. Dropped unsent (the conversation
+/// ended), there are none.
+pub type Instructions = futures::future::Shared<oneshot::Receiver<String>>;
+
+/// How long `initialize` waits for a conversation's instructions before it answers that Studio
+/// is still choosing the CLI: a CLI that answers its version check is chosen well within it,
+/// and an agent's MCP server should answer its start promptly.
+const INSTRUCTIONS_WITHIN: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(200)
+} else {
+    std::time::Duration::from_secs(5)
+};
+
+/// The conversation's instructions as `initialize` gives them: what Studio chose, once it has;
+/// while it is still choosing after [`INSTRUCTIONS_WITHIN`], that it is, so the agent is never
+/// told of a CLI it may not get.
+async fn instructions_now(instructions: Instructions) -> String {
+    let chosen = instructions.fuse();
+    let late = FutureExt::fuse(smol::Timer::after(INSTRUCTIONS_WITHIN));
+    futures::pin_mut!(chosen, late);
+    futures::select! {
+        chosen = chosen => chosen.unwrap_or_default(),
+        _ = late => mcp::STILL_CHOOSING.to_owned(),
     }
 }
 
@@ -293,7 +320,7 @@ async fn serve_connection(
     reader: impl AsyncRead + Unpin + Send + 'static,
     mut writer: impl AsyncWrite + Unpin + Send + 'static,
     tools: mpsc::UnboundedSender<ToolRequest>,
-    instructions: std::sync::Arc<str>,
+    instructions: Instructions,
 ) {
     let (replies_tx, mut replies_rx) = mpsc::unbounded::<Value>();
     let write = smol::spawn(async move {
@@ -321,9 +348,20 @@ async fn serve_connection(
         if line.trim().is_empty() {
             continue;
         }
-        match mcp::handle(line, &instructions) {
+        match mcp::handle(line) {
             Incoming::Reply(reply) => {
                 replies_tx.unbounded_send(reply).ok();
+            }
+            // Answered on its own, as a call is, once the instructions are known.
+            Incoming::Initialize { id, version } => {
+                let (replies_tx, instructions) = (replies_tx.clone(), instructions.clone());
+                calls.retain(|call| !call.is_finished());
+                calls.push(smol::spawn(async move {
+                    let conversation = instructions_now(instructions).await;
+                    replies_tx
+                        .unbounded_send(mcp::initialize(id, version, &conversation))
+                        .ok();
+                }));
             }
             Incoming::Nothing => {}
             Incoming::Cancelled { id } => {
@@ -462,7 +500,8 @@ mod tests {
         smol::block_on(async {
             let mut socket = ToolSocket::bind(&socket_dir()).expect("bind the tool socket");
             let (tools_tx, mut tools_rx) = mpsc::unbounded();
-            let _serve = smol::spawn(socket.serve(tools_tx, String::new()));
+            let (_chosen, instructions) = oneshot::channel();
+            let _serve = smol::spawn(socket.serve(tools_tx, instructions.shared()));
             let path = socket.path.clone();
             let stream = smol::unblock(move || sys::BlockingStream::connect(path))
                 .await
@@ -497,6 +536,73 @@ mod tests {
                 progress.windows(2).all(|pair| pair[0] < pair[1]),
                 "{progress:?}"
             );
+        });
+    }
+
+    /// `initialize` gives the conversation's instructions as they are when it arrives: those
+    /// Studio sends once it has chosen the CLI, though they come after the agent asked; and,
+    /// while Studio is still choosing past the wait, that it is, naming no CLI.
+    #[test]
+    fn initialize_answers_with_what_studio_chose_when_it_asks() {
+        async fn initialize(
+            send: impl FnOnce(oneshot::Sender<String>) -> Option<oneshot::Sender<String>>,
+            after: Option<std::time::Duration>,
+        ) -> String {
+            let mut socket = ToolSocket::bind(&socket_dir()).expect("bind the tool socket");
+            let (tools_tx, _tools_rx) = mpsc::unbounded();
+            let (chosen, instructions) = oneshot::channel();
+            let _serve = smol::spawn(socket.serve(tools_tx, instructions.shared()));
+            let later = send(chosen);
+            let path = socket.path.clone();
+            let stream = smol::unblock(move || sys::BlockingStream::connect(path))
+                .await
+                .unwrap();
+            let mut writer = smol::Unblock::new(stream.try_clone().unwrap());
+            let mut lines = BufReader::new(smol::Unblock::new(stream)).lines();
+            let call = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#;
+            writer
+                .write_all(format!("{call}\n").as_bytes())
+                .await
+                .unwrap();
+            // Studio chooses after the agent asked, or is still choosing when it is answered.
+            let choosing = match (later, after) {
+                (Some(later), Some(after)) => {
+                    smol::Timer::after(after).await;
+                    later
+                        .send("Your CLI is /home/.studio/omnigraph.".into())
+                        .ok();
+                    None
+                }
+                (later, _) => later,
+            };
+            let answer: Value =
+                serde_json::from_str(&lines.next().await.unwrap().unwrap()).unwrap();
+            drop(choosing);
+            assert_eq!(answer["id"], 1);
+            answer["result"]["instructions"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+        smol::block_on(async {
+            let chosen = "Your CLI is /home/.studio/omnigraph.";
+            let before = initialize(
+                |sender| {
+                    sender.send(chosen.into()).ok();
+                    None
+                },
+                None,
+            )
+            .await;
+            assert!(before.ends_with(chosen), "{before}");
+            let after = initialize(Some, Some(INSTRUCTIONS_WITHIN / 4)).await;
+            assert!(after.ends_with(chosen), "{after}");
+            let choosing = initialize(Some, None).await;
+            assert!(choosing.ends_with(mcp::STILL_CHOOSING), "{choosing}");
+            assert!(!choosing.contains(".studio"), "{choosing}");
+            // A conversation that ended before it chose has none of its own.
+            let ended = initialize(|_| None, None).await;
+            assert_eq!(ended, mcp::INSTRUCTIONS);
         });
     }
 

@@ -138,7 +138,10 @@ a shell call with its command): Claude's `_meta.claudeCode.toolName` is
 its id alone (codex-acp 2.2.2), so a call is also Studio's when its first update said so.
 Another adapter's calls are never Studio's.
 Any other request (file edits, shell commands) shows a card with the agent's own options;
-closing the panel answers `Cancelled`.
+closing the panel answers `Cancelled`. Only its buttons answer it (since 2026-10-21): ⌘Y, ⌘⌥Y and
+⌘⌥N answer the write card that waits longest and shows them, never an agent's request, whose
+"always" option is a lasting rule of the agent's own that ⌘⌥Y ("Always on this branch" for a
+write) must not pick unseen.
 
 ### Thread
 
@@ -165,9 +168,14 @@ no retry or rating, so there is none. The plan as a list with each entry's statu
 of a turn sit 12 px apart and a new question opens 16 px more. Other updates are ignored. The
 thread is a list that lays out only the blocks in view, as Zed's agent thread is: a block is
 measured again only when what it shows changes (or its markdown finishes parsing), so a long
-conversation costs what its visible part costs. It follows the newest reply while it is scrolled
+conversation costs what its visible part costs. The blocks are made again from the turn of the
+first entry that changed (`thread_blocks`), so a streamed token costs its own turn, not every
+turn before it; a block never spans a message of the person's, and a turn's blocks read only its
+own entries and whether a message follows it. It follows the newest reply while it is scrolled
 to its end; a person reading further up stays where they are, and sending a message returns to
-the end.
+the end. A tool call keeps its input and result only when it is Studio's (a query and its rows
+show from them); another tool's row shows its title and how it went, so its result is not kept,
+nor its input past 4 KiB (`kept_input`): Claude's Read and Write calls carry whole files.
 
 The composer, after the reference chat's (since 2026-10-21): a card (`ds::composer_card`)
 holding the message and, on one line at its end, the controls that send it, under the thread's
@@ -176,7 +184,9 @@ reaches ("Reads knowledge at main · writes only to a branch of its own", which 
 composer's tooltip). A notice strip attached to the card's top (`ds::notice_strip`) holds what
 the conversation's state asks of the person, a line each, and is not drawn otherwise: the
 context window at 85 % or more (the gauge, "88% of the context window used", the token counts),
-and after the first committed change the agent's branch ("`agent/<stamp>` · ✎ N · **Review**");
+and, once the agent's branch exists, the branch ("`agent/<stamp>` · ✎ N · **Review**"), also
+when it was made before the conversation came back (the record's `branch_created`), with ✎ N
+the changes committed on it since the conversation opened in the tab, shown when there are any;
 Review switches the session to the agent branch and opens spec 008's review. The composer's
 gutter mark and the banner across the panel are gone. Queued messages sit above the card.
 
@@ -289,7 +299,9 @@ and Delta's sidebar.
 - A right click on a row offers Rename, Pin or Unpin, Archive or Restore, and Delete…. Rename
   edits the title in place (↩ or leaving the field keeps it, ⎋ drops it); the person's title
   wins over the agent's, and an empty one gives the agent's back. Delete… asks first, in a
-  dialog: Studio forgets the conversation and its open tab closes, and the agent deletes it with
+  dialog confirmed by typing the conversation's title as the list shows it, since neither Studio
+  nor the agent can bring it back (constitution IV; since 2026-10-21, before which ↵ confirmed
+  it): Studio forgets the conversation and its open tab closes, and the agent deletes it with
   `session/delete` when it can (otherwise the note says why); the graph and the agent's branch
   are not touched. Filter in the title line opens a field on the rows' edge (⎋ closes it); it
   matches titles and agent names and looks through the archive too. "Import from the agent"
@@ -361,6 +373,12 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | The approval keys answer only the write card that shows them | `agent_panel` `the_keys_answer_only_the_write_card_that_shows_them` | Before, ⌘Y, ⌘⌥Y and ⌘⌥N answered the oldest waiting card of any kind (`pending_index`), which could be a permission card that showed no keys: with a Bash request waiting above a write card, ⌘Y allowed the shell command and ⌘⌥Y picked the agent's AllowAlways, a lasting rule. Now they answer the oldest waiting write card (`keyed_write`), which alone shows them; a permission card with no write card under it takes no key, and is answered by its buttons |
+| 2026-10-21 | A write sent before the agent stopped shows its real outcome, and the branch it made is kept | `agent_panel` `a_write_sent_before_the_agent_stopped_still_shows_its_outcome`, `sessions` `conversations_are_kept_per_graph_newest_first` (extended with `set_branch_created`) | Before, stopping the agent marked a running write's card "Outcome unknown" ("the server did not confirm this change") though the gateway ran the write on and the session logged how it ended, and the panel stopped listening, so a branch that write made was never saved and Review was gone after a resume. Now the card keeps running until the outcome comes through what records the write (the gateway's `GatewayEvent::Finished` is gone), finds its card by its own id after the thread changed, and the branch learns whether it exists and is saved; with the tab closed, the conversation's record still learns it. A card still waiting for the person says "Not sent: the agent stopped before you decided", not "Rejected" |
+| 2026-10-21 | A conversation that comes back offers Review of a branch it made before | `agent_panel` `a_resumed_conversation_offers_review_of_a_branch_it_made_before` | Before, the strip needed a change committed in this tab (`changes > 0`), and a resumed conversation starts at 0. Now it shows once the branch exists; ✎ N shows the changes made since the conversation opened, when there are any |
+| 2026-10-21 | A streamed token makes only its own turn's blocks again | `agent_panel` `streaming_into_the_last_turn_keeps_the_earlier_turns_blocks` (the blocks equal a rebuild of the whole thread after a token, a turn's end and a change in an earlier turn), `a_write_shows_its_query_once_on_its_card`, `a_changed_entry_changes_its_hash_and_no_other` | Before, every chunk built every block (with `ends.contains` over a list of turn ends, so entries × turns) and its fingerprint, and each query block's `query_on_card` copied the later queries' texts, twice a frame (fingerprint and render). Now the turns before the changed entry's keep their blocks and fingerprints, the turn ends are a set, a query block carries whether its text is on a card, and `query_on_card` reads the texts without copying. Not measured on a long conversation here |
+| 2026-10-21 | Another tool's file is not kept for the conversation's life | `agent_panel` `only_studios_tools_keep_what_they_were_given` | Before, every tool call kept its `rawInput` and result, though only Studio's `omnigraph_run` reads them; a Read or Write call kept a whole file, and each rehash serialised it. Now another tool keeps neither its result nor an input past 4 KiB |
+| 2026-10-21 | A conversation is deleted only with its title typed | `agent_panel` `a_conversation_is_deleted_only_with_its_title_typed` | Before, ↵ deleted it, though the dialog said it cannot be undone (constitution IV). Now the dialog holds a field, Delete is disabled until the title is typed whole, and ↵ with other words marks the field. Not seen in the running app |
 | 2026-10-21 | An agent's write held `as commit` or `as unattached branch` is logged as held, as Studio's own are | `agent_panel` `an_agents_held_write_is_logged_as_held` (the panel's `outcome_kind` through `OutcomeKind::written`) and `a_writes_success_answer_says_what_it_did`, extended (the gateway's `Seen::Unpublished` carries the commit's kind: `unpublished`, `unattached`, a kind this build does not know, and no kind with `published: false`; a `published` kind with `published: false`, and an unknown kind not said to be held, are on the branch) | Before, the gateway kept no kind and the panel logged a held write as `Committed { commit: None }`, so the activity log said "committed to agent/…" for a proposal or a snapshot. Now a proposal is logged held as its commit, to publish to the agent's branch, a snapshot as saved, and an unknown kind leaves whether a branch moved unknown, as for Studio's own writes. The card's tooltip says a snapshot never publishes |
 | 2026-10-21 | A write's query shows once, on its card | `agent_panel` `a_write_shows_its_query_once_on_its_card`; offscreen snapshots with the test agent, light and dark, before and after ("list people, then make a change") | Before, the retitle query showed highlighted under "Mutate retitle" with its `--branch` line, then again on the Mutation card. Now a call whose text a write card in its turn carries, or a `mutate` still running (its card on the way or waiting for Allow, which shows the text), is its line alone, with no fold; one that ended with no card shows its text. A waiting approval could not be rendered offscreen: the headless dispatcher never parks while the CLI's command waits, so the snapshot does not finish |
 | 2026-10-21 | A query's rows show as a record card, a finished turn ends in its actions, and the composer is a card with its notices on a strip | Offscreen snapshots with the test agent (now in the Claude adapter's wire format) in a scratch data folder against a scratch dev server: "list people, summarize as markdown" and "list people, then make a change", light and dark; `agent_panel` `a_querys_rows_are_read_from_what_its_call_returned`, `a_tool_call_keeps_the_result_its_agent_reported`, `a_turn_ends_at_its_last_reply` | "3 rows · main" over p.name and p.title for three people, and "1 row" for the count; Copy and "5 tool calls" under the last reply; after the change the strip read "agent/20261021-122659 · ✎ 1 · Review". Before, the test agent's calls read as "Used 1 tool" (its adapter was not recognised) and its count as -1 (it parsed Studio's answer with the CLI's stderr in it) |
@@ -414,3 +432,12 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 - 2026-10-20 · Setting the sessions file aside was not checked: when the rename failed, or when
   the file could not be read at all (not UTF-8, or held by another program), the next save
   wrote over the file Studio promised to keep. Such a file is now never saved over.
+- 2026-10-21 · The approval keys answered the oldest waiting card of any kind, so with an agent's
+  permission request waiting above a write card ⌘Y allowed the request and ⌘⌥Y granted the
+  agent's lasting rule, on a card that showed no keys. They now answer write cards alone.
+- 2026-10-21 · Stopping the agent called a write already sent "Outcome unknown", though it ran on
+  and its outcome was logged; a branch it made was not saved, and a resumed conversation lost its
+  Review. The card now hears the outcome, the branch is saved, and Review shows once the branch
+  exists.
+- 2026-10-21 · Deleting a conversation, which cannot be undone, was confirmed with ↵. It is now
+  confirmed by typing its title.
