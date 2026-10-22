@@ -4,8 +4,8 @@
 use gpui::{App, Menu, MenuItem, OsAction, SystemMenuType};
 use studio_actions::agent::OpenAgent;
 use studio_actions::graph::{
-    CreateBranch, MergeBranch, NewQuery, OpenCanvas, OpenHistory, OpenInspector, OpenOntology,
-    OpenQueryFile, OpenSchema, ReviewBranch,
+    CreateBranch, NewQuery, OpenCanvas, OpenHistory, OpenInspector, OpenOntology, OpenQueryFile,
+    OpenSchema, ReviewBranch,
 };
 use studio_actions::query::{Save, SaveAs};
 use studio_actions::workspace::{
@@ -52,7 +52,7 @@ pub fn set(cx: &mut App) {
         ]),
         Menu::new("View").items([
             MenuItem::action("Command Palette", ToggleCommandPalette),
-            MenuItem::action("Go to Type or Node…", GoTo),
+            MenuItem::action("Go to Node…", GoTo),
             MenuItem::separator(),
             MenuItem::action("Back", GoBack),
             MenuItem::action("Forward", GoForward),
@@ -81,7 +81,6 @@ pub fn set(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Create Branch…", CreateBranch),
             MenuItem::action("Review Branch", ReviewBranch),
-            MenuItem::action("Merge Branch…", MergeBranch),
         ]),
         Menu::new("Help").items([
             MenuItem::action("Keyboard Shortcuts", ShowKeyBindings),

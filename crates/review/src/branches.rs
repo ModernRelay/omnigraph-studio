@@ -15,9 +15,7 @@ use gpui::{
 use graph_client::WriteOutcome;
 use graph_client::api::{BranchStartRefusalOutput, BranchStartRefusalReason, CommitOutput};
 use graph_store::{AccessAction, AccessScope, BranchStart, GraphSession, SessionEvent};
-use studio_actions::graph::{
-    CreateBranch, CreateBranchAt, DeleteBranch, MergeBranch, ReviewBranch,
-};
+use studio_actions::graph::{CreateBranch, CreateBranchAt, DeleteBranch, ReviewBranch};
 use studio_ui::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::{ds, now_micros, relative_time, short_commit_id};
 use studio_workspace::{Workspace, WorkspaceEvent};
@@ -934,19 +932,13 @@ impl Render for DeleteBranchModal {
 
 /// Registers the branch actions on a workspace.
 pub fn register(workspace: &mut Workspace) {
-    // A merge is made from the review, which holds it: both open the review of the branch.
-    fn review_current(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    // A merge is made from the review, which holds it.
+    workspace.register_action(|workspace, _: &ReviewBranch, window, cx| {
         let Some(session) = workspace.session() else {
             return;
         };
         let branch = session.read(cx).branch.clone();
         open_review(workspace, branch, TARGET.into(), window, cx);
-    }
-    workspace.register_action(|workspace, _: &ReviewBranch, window, cx| {
-        review_current(workspace, window, cx)
-    });
-    workspace.register_action(|workspace, _: &MergeBranch, window, cx| {
-        review_current(workspace, window, cx)
     });
     workspace.register_action(|workspace, _: &CreateBranch, window, cx| {
         let Some(session) = workspace.session().cloned() else {

@@ -152,7 +152,7 @@ pub mod graph {
         [
             /// Open a new query tab.
             NewQuery,
-            /// Open the branch review against main.
+            /// Open the review of the current branch against main, where it is merged.
             ReviewBranch,
             /// Open the commit history.
             OpenHistory,
@@ -166,8 +166,6 @@ pub mod graph {
             CreateBranch,
             /// Delete the current branch.
             DeleteBranch,
-            /// Open the review of the current branch against main, to merge it there.
-            MergeBranch,
         ]
     );
 
