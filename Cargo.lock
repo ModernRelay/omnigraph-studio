@@ -10081,11 +10081,17 @@ name = "studio_update"
 version = "0.2.1"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "cargo-packager-updater",
  "flate2",
+ "futures",
+ "gpui",
+ "http_client",
+ "log",
  "rustix",
  "semver",
  "serde_json",
+ "studio_settings",
  "tar",
  "tempfile",
 ]
