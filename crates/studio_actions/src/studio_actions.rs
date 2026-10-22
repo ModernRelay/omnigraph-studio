@@ -14,11 +14,11 @@ pub mod workspace {
         [
             /// Open the command palette.
             ToggleCommandPalette,
-            /// Go to a type, or find a node by its id or label.
+            /// Find a node by its id or name.
             GoTo,
             /// Open Studio's settings.
             OpenSettings,
-            /// Switch the active tab to another branch.
+            /// Switch the window's graph to another branch.
             SwitchBranch,
             /// Open a new window.
             NewWindow,
@@ -26,7 +26,8 @@ pub mod workspace {
             ShowKeyBindings,
             /// Show Studio's log file in the file manager.
             RevealLog,
-            /// Show or hide GPUI's frame-time overlay, in a build with the `perf` feature.
+            /// Step GPUI's frame-time overlay through its views and off again, in a build
+            /// with the `perf` feature.
             ToggleFrameOverlay,
             /// Go back to the previous location.
             GoBack,
@@ -50,7 +51,8 @@ pub mod workspace {
             ToggleZoom,
             /// Connect to a server or open a graph.
             OpenGraph,
-            /// Reload the schema, branches and counts of the open graph.
+            /// Read the open graph's schema, branches and counts again, and the view in
+            /// focus.
             Refresh,
         ]
     );
@@ -63,9 +65,8 @@ pub mod workspace {
         pub url: String,
     }
 
-    /// Show a panel in its dock, as its button in the status bar does: `types`, `explore`,
-    /// `queries`, `branches`, `agent-conversations`, `inspector`, `nodes`, `history`,
-    /// `activity`.
+    /// Show a panel in its dock and give it the keyboard: `types`, `explore`, `queries`,
+    /// `branches`, `agent-conversations`, `inspector`, `nodes`, `history`, `activity`.
     #[derive(Clone, Debug, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
     #[action(namespace = studio)]
     pub struct ActivatePanel {
@@ -84,13 +85,13 @@ pub mod workspace {
         [
             /// Activate the last tab.
             ActivateLastItem,
-            /// Split the document area, with a copy of the active tab on the right.
+            /// Split the active pane, with a copy of the active tab on the right.
             SplitRight,
-            /// Split the document area, with a copy of the active tab below.
+            /// Split the active pane, with a copy of the active tab below.
             SplitDown,
-            /// Split the document area, with a copy of the active tab on the left.
+            /// Split the active pane, with a copy of the active tab on the left.
             SplitLeft,
-            /// Split the document area, with a copy of the active tab above.
+            /// Split the active pane, with a copy of the active tab above.
             SplitUp,
             /// Move to the next pane of a split.
             ActivateNextPane,
@@ -100,9 +101,10 @@ pub mod workspace {
             TogglePinTab,
             /// Keep the active preview tab, so the next preview opens beside it.
             KeepPreviewTab,
-            /// Close every unpinned tab of the pane except the active one.
+            /// Close every unpinned tab of the pane except the active one, keeping tabs with
+            /// unsaved work.
             CloseOtherItems,
-            /// Close every unpinned tab of the pane.
+            /// Close every unpinned tab of the pane, keeping tabs with unsaved work.
             CloseAllItems,
             /// Show the next graph open in this window.
             ActivateNextGraph,
@@ -148,17 +150,17 @@ pub mod graph {
     actions!(
         studio_graph,
         [
-            /// Open the query editor.
+            /// Open a new query tab.
             NewQuery,
             /// Open the branch review against main.
             ReviewBranch,
             /// Open the commit history.
             OpenHistory,
-            /// Open the graph explorer: the canvas around the nodes being explored.
+            /// Open the canvas: the nodes being explored and their relationships.
             OpenCanvas,
-            /// Open the ontology: the graph's types and relationships as a map.
+            /// Open the ontology: the graph's types in domains, one type at a time.
             OpenOntology,
-            /// Open the inspector for the graph's storage.
+            /// Open the storage inspector: the server's health and the graph's storage.
             OpenInspector,
             /// Create a branch from the current branch.
             CreateBranch,
@@ -216,7 +218,7 @@ pub mod graph {
         pub links: Vec<(usize, usize)>,
     }
 
-    /// Browse a type's rows in the Nodes panel under the canvas.
+    /// Browse a type's rows in the Nodes panel, in the bottom dock.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph)]
     pub struct BrowseType {
@@ -252,7 +254,7 @@ pub mod graph {
         pub at_commit: Option<String>,
     }
 
-    /// Open one node in the inspector and the relationship tree.
+    /// Open one node in the inspector and the Explore panel.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph)]
     pub struct OpenNode {
@@ -367,35 +369,35 @@ pub mod table {
             MoveRight,
             /// Edit the selected cell.
             EditCell,
-            /// Save the cell being edited.
+            /// Save the cell being edited, or apply the filter being typed.
             ConfirmEdit,
             /// Keep the cell being edited as a draft, to save with the others in one commit.
             StageEdit,
             /// Save every draft in the table as one commit.
             SaveDrafts,
-            /// Highlight the next value the filter's value field offers.
+            /// Highlight the next value the field being typed in offers.
             SelectNextSuggestion,
-            /// Highlight the previous value the filter's value field offers.
+            /// Highlight the previous value the field being typed in offers.
             SelectPreviousSuggestion,
             /// Cancel the edit, or step back one level.
             Cancel,
-            /// Show the selected row in the inspector.
+            /// Show the selected row in the inspector, or hide it.
             PeekRow,
             /// Open the selected row's node as a page.
             OpenRowPage,
             /// Explore the graph from the row under the cursor, on the canvas.
             ExploreRow,
-            /// Reload the table from the branch head.
+            /// Read the table again: from the branch head, or at the commit it is held at.
             RefreshTable,
             /// Add a row.
             InsertRow,
-            /// Delete the selected row.
+            /// Delete the marked rows, or the row under the cursor, after asking.
             DeleteRow,
             /// Copy the selected cell's value.
             CopyCell,
             /// Add a filter on the selected column.
             AddFilter,
-            /// Show only rows whose selected column equals the selected cell's value.
+            /// Add a filter for the selected cell's value.
             FilterBySelection,
             /// Remove every filter from the table.
             ClearFilters,
@@ -552,11 +554,11 @@ pub mod review {
     actions!(
         studio_review,
         [
-            /// Go to the next change.
+            /// Go to the next card: a node or relationship that changed.
             NextChange,
-            /// Go to the previous change.
+            /// Go to the previous card.
             PreviousChange,
-            /// Mark the current change reviewed and go to the next.
+            /// Mark the current card reviewed, every change on it, and go to the next.
             AcceptAndNext,
             /// Revert the current change and go to the next.
             RevertAndNext,
@@ -574,7 +576,7 @@ pub mod canvas {
     actions!(
         studio_canvas,
         [
-            /// Fit the graph to the window.
+            /// Fit the graph, or an image, to its view.
             FitToWindow,
             /// Zoom in.
             ZoomIn,
@@ -620,7 +622,7 @@ pub mod ontology {
     actions!(
         studio_ontology,
         [
-            /// Back to the type in focus before, or to the domains.
+            /// Go back to the type in focus before, or to the domains.
             Back,
             /// Show the domains.
             ShowDomains,
@@ -642,7 +644,8 @@ pub mod agent {
     actions!(
         studio_agent,
         [
-            /// Open the agent panel.
+            /// Open the agent: its open tab, else the graph's last conversation, else a new
+            /// one.
             OpenAgent,
             /// Send the message in the agent composer; while the agent works, queue it.
             Send,

@@ -2,8 +2,9 @@
 //! binding, fuzzy filtered and ranked by recent use, plus the graph's types, nodes found by id
 //! or name, queries (open tabs, saved files, stored queries and their aliases) and branches.
 //! Scope tabs narrow it (All ⌘1, Types ⌘2, Nodes ⌘3, Queries ⌘4, Branches ⌘5, Commands ⌘6);
-//! Tab hands the text to the agent. ⌘K opens All, ⌘P Nodes, ⌘⇧B Branches; `?` opens the
-//! keyboard shortcuts available where the person is.
+//! Tab hands the text to the agent. ⌘K opens All, ⌘P Nodes, ⌘⇧B Branches, and in an open
+//! palette ⌘P and ⌘⇧B change the scope and keep the text; `?` opens the keyboard shortcuts
+//! available where the person is.
 //!
 //! Layer 5 (`docs/architecture.md`). Plan: `specs/002-app-shell/plan.md`.
 //!
@@ -37,7 +38,7 @@ use studio_workspace::{ToastKind, Workspace};
 use ui::HighlightedLabel;
 use ui::prelude::*;
 
-use found::{Answers, Found};
+use found::{Answers, Found, node_key};
 use matching::humanize_action_name;
 use matching::{Candidate, Group, Pattern, Ranked, normalize_query, rank};
 use studio_workspace::{ModalPlacement, ModalView};
@@ -303,6 +304,17 @@ impl Row {
             | Row::Alias { action, .. } => Some(action.as_ref()),
             Row::Branch { .. } | Row::Tab { .. } | Row::MoreTypes { .. } => None,
         }
+    }
+
+    /// Whether running the row puts it in the recent list, which ranks the fixed rows. An open
+    /// tab is not a destination to remember across launches, and a found node is listed in the
+    /// order its type answered, never by recent use: remembered, it would only push rows that
+    /// are ranked out of the list's 50.
+    fn remembered(&self) -> bool {
+        !matches!(
+            self,
+            Row::Tab { .. } | Row::Node { .. } | Row::MoreTypes { .. }
+        )
     }
 }
 
@@ -698,7 +710,7 @@ impl CommandPalette {
             };
             self.candidates.push(Candidate {
                 label: shown,
-                key: format!("node:{type_name}:{id}"),
+                key: node_key(type_name, id),
                 group: Group::Node,
             });
             self.rows.push(Row::Node {
@@ -762,6 +774,38 @@ impl CommandPalette {
         }
     }
 
+    /// ⌘P in an open palette: its Nodes scope, keeping the text. Handled here, so it stops
+    /// before the workspace, whose toggle would close the palette and drop the text.
+    fn go_to(&mut self, _: &GoTo, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_scope(Scope::Nodes, Box::new(GoTo), window, cx);
+    }
+
+    /// ⌘⇧B in an open palette: its Branches scope, keeping the text.
+    fn switch_branch(&mut self, _: &SwitchBranch, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_scope(Scope::Branches, Box::new(SwitchBranch), window, cx);
+    }
+
+    /// Shows `scope` for an action that opens the picker there. The key sheet has no scopes:
+    /// it closes, and `action` runs where the person was, so the picker takes its place.
+    fn open_scope(
+        &mut self,
+        scope: Scope,
+        action: Box<dyn Action>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.mode != Mode::Keys {
+            self.set_scope(scope, window, cx);
+            return;
+        }
+        match &self.previous_focus {
+            Some(focus) => window.focus(focus, cx),
+            None => window.blur(cx),
+        }
+        cx.emit(DismissEvent);
+        window.dispatch_action(action, cx);
+    }
+
     /// Tab: the text goes to the agent as a question (spec 011's Ask).
     fn ask_agent(&mut self, _: &AskAgent, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.query.read(cx).text(cx).trim().to_owned();
@@ -802,13 +846,14 @@ impl CommandPalette {
             })
             .collect();
         self.matches.extend(found);
-        // The branch picker starts on the branch the window is on.
+        // The branch picker starts on the branch the window is on; every other scope on its
+        // first row, so ↵ after ⌘K never switches to the branch already shown.
+        let on_branches = self.mode == Mode::Picker(Scope::Branches) && query.is_empty();
         self.selected = self
             .matches
             .iter()
             .position(|ranked| {
-                query.is_empty()
-                    && matches!(self.rows[ranked.index], Row::Branch { current: true, .. })
+                on_branches && matches!(self.rows[ranked.index], Row::Branch { current: true, .. })
             })
             .unwrap_or(0);
         self.scroll_to_selected(cx);
@@ -959,8 +1004,7 @@ impl CommandPalette {
             Row::Tab { id, .. } => Some(*id),
             _ => None,
         };
-        // A tab is not a destination to remember across launches.
-        if tab.is_none() {
+        if row.remembered() {
             recent::record(&self.candidates[ranked.index].key, cx);
         }
         match &self.previous_focus {
@@ -1434,6 +1478,8 @@ impl Render for CommandPalette {
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::show_scope))
+            .on_action(cx.listener(Self::go_to))
+            .on_action(cx.listener(Self::switch_branch))
             .on_action(cx.listener(Self::ask_agent))
             // The reference palette, on Tower's corners: a grey tray holding white inset
             // panels, the search in one and each group of results in its own under its name,
@@ -1567,7 +1613,7 @@ mod tests {
                         "graph_commit_id": "c1",
                     })
                 } else {
-                    json!({ "branches": ["main"] })
+                    json!({ "branches": ["feature", "main"] })
                 };
                 Ok(Response::builder()
                     .status(200)
@@ -1945,6 +1991,91 @@ mod tests {
                 .iter()
                 .all(|shown| matches!(shown, Shown::Row { .. }))
         );
+    }
+
+    /// ⌘⇧B opens on the branch the window is on; ⌘K, and every other scope, on its first row,
+    /// so ↵ straight after ⌘K never switches to the branch already shown.
+    #[gpui::test]
+    async fn only_the_branch_picker_starts_on_the_current_branch(cx: &mut TestAppContext) {
+        let session = session(cx);
+        let (palette, cx) = palette(Scope::All, session, cx);
+        let selected = |cx: &mut VisualTestContext| {
+            palette.read_with(cx, |palette, _| (palette.selected, palette.selected_key()))
+        };
+        assert!(listed(&palette, cx).contains(&"branch:main".to_owned()));
+        assert_eq!(selected(cx), (0, Some("type:Person".to_owned())));
+
+        palette.update_in(cx, |palette, window, cx| {
+            palette.set_scope(Scope::Branches, window, cx)
+        });
+        assert_eq!(listed(&palette, cx), ["branch:feature", "branch:main"]);
+        assert_eq!(selected(cx), (1, Some("branch:main".to_owned())));
+
+        palette.update_in(cx, |palette, window, cx| {
+            palette.set_scope(Scope::All, window, cx)
+        });
+        assert_eq!(selected(cx).0, 0);
+    }
+
+    /// Opening a found node leaves the recent list alone: nothing ranks a node by it, so a
+    /// remembered node would only push out the rows that are ranked. A type opened is
+    /// remembered.
+    #[gpui::test]
+    async fn a_found_node_opened_is_not_remembered(cx: &mut TestAppContext) {
+        let session = session(cx);
+        let (palette, cx) = palette(Scope::Nodes, session, cx);
+        type_text(&palette, "Ad", cx);
+        cx.executor().advance_clock(NODE_SEARCH_DELAY);
+        cx.run_until_parked();
+        assert_eq!(listed(&palette, cx), ["node:Person:ada"]);
+        palette.update_in(cx, |palette, window, cx| palette.run_selected(window, cx));
+        cx.run_until_parked();
+        assert!(cx.update(|_, cx| recent::keys(cx)).is_empty());
+
+        palette.update_in(cx, |palette, window, cx| {
+            palette.set_scope(Scope::Types, window, cx);
+            palette
+                .query
+                .update(cx, |query, cx| query.set_text("", window, cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(listed(&palette, cx), ["type:Person"]);
+        palette.update_in(cx, |palette, window, cx| palette.run_selected(window, cx));
+        cx.run_until_parked();
+        assert_eq!(cx.update(|_, cx| recent::keys(cx)), ["type:Person"]);
+    }
+
+    /// ⌘P and ⌘⇧B in an open picker change its scope and keep the text. The palette handles
+    /// them, so they never reach the workspace, whose toggle would close it.
+    #[gpui::test]
+    async fn go_to_and_switch_branch_in_the_picker_keep_the_text(cx: &mut TestAppContext) {
+        let session = session(cx);
+        let (palette, cx) = palette(Scope::All, session, cx);
+        let reached = Rc::new(Cell::new(0));
+        cx.update(|_, cx| {
+            let go_to = reached.clone();
+            cx.on_action(move |_: &GoTo, _| go_to.set(go_to.get() + 1));
+            let switch = reached.clone();
+            cx.on_action(move |_: &SwitchBranch, _| switch.set(switch.get() + 1));
+        });
+        palette.update_in(cx, |palette, window, cx| {
+            window.focus(&palette.query.focus_handle(cx), cx)
+        });
+        type_text(&palette, "mai", cx);
+        let state = |cx: &mut VisualTestContext| {
+            palette.read_with(cx, |palette, cx| {
+                (palette.mode, palette.query.read(cx).text(cx))
+            })
+        };
+
+        cx.dispatch_action(GoTo);
+        cx.run_until_parked();
+        assert_eq!(state(cx), (Mode::Picker(Scope::Nodes), "mai".to_owned()));
+        cx.dispatch_action(SwitchBranch);
+        cx.run_until_parked();
+        assert_eq!(state(cx), (Mode::Picker(Scope::Branches), "mai".to_owned()));
+        assert_eq!(listed(&palette, cx), ["branch:main"]);
+        assert_eq!(reached.get(), 0, "the workspace was not asked");
     }
 
     #[test]
