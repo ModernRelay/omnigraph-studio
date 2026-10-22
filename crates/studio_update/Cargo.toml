@@ -1,0 +1,14 @@
+[package]
+name = "studio_update"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/studio_update.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

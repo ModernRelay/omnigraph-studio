@@ -9945,6 +9945,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "studio_update"
+version = "0.2.1"
+
+[[package]]
 name = "studio_workspace"
 version = "0.2.1"
 dependencies = [
