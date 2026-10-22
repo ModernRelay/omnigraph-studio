@@ -638,7 +638,8 @@ than styling one-off elements.
   not to rounded corners. The `ds` test `nested_radii_are_concentric` holds every pair at every
   base the setting allows.
 - **Round ends only for buttons with a label.** A text button, a labelled menu trigger (a
-  select, the composer's agent picker) and a filter chip are pills (`Shape::Pill`); everything
+  select, the composer's agent picker), a filter chip and a property's value, which a click
+  edits or copies, are pills (`Shape::Pill`); everything
   else takes the scale's corner: icon buttons (`Shape::Rounded`), fields, segments and tabs,
   the status bar's pickers and panel buttons, floating bars and the buttons set into them
   (`ds::bar_button`), chips, key caps and icon tiles (`xs`), inset panels
@@ -691,13 +692,20 @@ than styling one-off elements.
   (the type table's header icon) and its name, muted, in a label column a row tall
   (`size::PROPERTY_ROW`, 32 px, a palette row's), then its value in a `ds::property_value`,
   which centres the value's first line in that height, so a wrapping list keeps its first line
-  level with the label. A value is boxed (`ds::value_box`, `ds::value_text`): the document's
-  fill inside the controls' hairline, the `xs` corner of a tag, `size::VALUE` (22 px, a bar
-  button's) tall, its text on one line and cut at the box's end rather than broken mid-word.
-  A list's items and a relationship's neighbours sit side by side in a `ds::value_list`, a
-  neighbour as `ds::node_value` (its type's mark and name), ending in `ds::value_add` (a raised
-  "+" at a value's height). A long text sits under a `ds::fold` (its name, muted, and a
-  chevron). A boolean is the `ds::switch`, an enum its menu's trigger.
+  level with the label. A value is a pill (`ds::value_box`, `ds::value_text`): the document's
+  fill inside the controls' hairline, round ends since a click edits or copies it,
+  `size::VALUE` (22 px, a bar button's) tall, its text on one line and cut at the pill's end
+  rather than broken mid-word. A list's items sit side by side in a `ds::value_list`; a node
+  as a value (an edge's endpoint) is `ds::node_value`, its type's mark and its name. A long
+  text sits under a `ds::fold` (its name, muted, and a chevron). A boolean is the
+  `ds::switch`, an enum its menu's trigger, `ds::value_select` (a select's pill at a value's
+  height, its chevron at its end).
+- **Relationships are rows, not values.** A relationship's neighbours are nodes to go to, and
+  a group may hold many, so they are listed rather than boxed: a `ds::fold_row` (the fold's
+  title and chevron as a sidebar row, the rest of the row for its count and its "+") over a
+  `ds::SidebarRow` per neighbour, `flush` on the panel's margin so its type mark sits on the
+  property icons' edge. A neighbour's `ds::value_remove` (a quiet ×) is the row's action,
+  over its end under the pointer; the group's "+" sits in its header.
 - **Control chips** (since 2026-10-21, after the reference toolbar). A toolbar's controls are
   `ds::control_chip`s, the filter pill's family: one raised pill (`shadow-custom`, 26 px) holding
   a quiet `ds::chip_button` (its icon, its label and, while set, what it is set to in the
@@ -998,6 +1006,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 | 2026-10-14 | Review findings on the footer, settings fields and controls | `studio` `typing_not_yet_written_outlives_the_values_drawn_again` (fails on the earlier show logic); `studio_workspace` `leaving_the_window_pauses_the_cpu_reading` (fails without the mark on leaving); `studio_ui` `a_pill_button_keeps_the_focus_and_the_click` (fails without it: the click reached the surface around it) and `controls_draw_at_their_sizes` (a float bar's buttons 22 px, inside its border) | All pass. The settings test runs on `studio_settings::init_test`, settings in memory that refuse every write, so no test reaches `settings.json` |
 | 2026-10-13 | A panic message loses quoted text | `studio` test `a_panic_message_loses_the_text_it_quotes` | ``'é'`` and `` `Ada Lovelace's notes` `` become `'…'` and `` `…` ``; messages over 300 characters are cut |
 | 2026-10-21 | The type table is flush in its document and ends at its last column; an agent's write shows its query once | Offscreen snapshots (1440×900 at 2×) against a scratch dev server and the test agent, light and dark, before and after: Person, Project (narrower than the page), Company, Person at 2400×700, and "list people, then make a change"; `agent_panel` `a_write_shows_its_query_once_on_its_card` | Before, the table was a card inset in the page, a second border; its "empty strip" after `tags` was the first 12 px of the next column (`contributes`), the cell's own inset, cut at the card's edge. After, the grid runs from the document's edge under the toolbar, the key's text on the toolbar title's 16 px; a grid narrower than the page ends at its last column with no rule after it (Project ends 26 px short of the edge, the page plain there), and a wider one scrolls with its last column unruled. The chat showed the retitle query twice, highlighted under "Mutate retitle" with its `--branch` line and again on the Mutation card; the call's line is now "Mutate retitle" alone over the card |
+| 2026-10-21 | A property's value is a pill and a relationship's neighbours are rows | `studio_ui` `property_and_control_parts_draw_at_their_sizes` (a fold row and a flush row 26 px, on one edge, one under the other); offscreen snapshots of the Design system tab (1440 × 2400 at 2×) and of person-000001's peek, at rest and with the pointer on a neighbour and on a group's header | Values in pills beside muted labels; "knows → Person ⌄ … 4" over four rows of a mark and a name; the × over a row's end and the "+" before the count only under the pointer |
 | 2026-10-21 | Property rows and control chips are design-system parts | `studio_ui` `property_and_control_parts_draw_at_their_sizes` (a property row 32 px, its boxed value 22, a switch and a wrapping list's first line level with the label, a chip 26 with its button centred, the "+" a value's height); clippy `-D warnings`; design tokens; offscreen snapshots of the Design system tab (1440 px wide at 2×, light and dark) | The gallery's inspector card shows boxed values, a long email cut at its box's end, a switch, a list of tags wrapping under its first line with its "+", a relationship's neighbours with their type marks, and a fold; its chips row reads Views, "Columns 3 hidden ×", "Sort name ×", "Filters 2 ×" and Row beside a filter pill, the value in the accent in both themes. The switch first sat 7 px high, outside a property value |
 | 2026-10-21 | The palette, the agent's composer and the type table follow the three reference frames on the design system | Offscreen snapshots (1440×900 at 2×) against a scratch dev server, light, dark and glass, before and after, cropped at 2× beside the references; `studio_ui` `key_caps_are_one_box_per_key`, `a_row_knows_its_place_in_its_panel`, `controls_draw_at_their_sizes` (a tile, a segment and the grid's cells at their tokens), `values_pick_their_kind_icon`; `command_palette` `rows_are_grouped_by_kind_until_text_is_typed`; `agent_panel` `a_querys_rows_are_read_from_what_its_call_returned`, `a_tool_call_keeps_the_result_its_agent_reported`, `a_turn_ends_at_its_last_reply` | The palette is a tray of inset panels, its groups named while nothing is typed and counted once text is, rows led by tiles with their keys as caps; the inset panels' corners stayed square until each end was drawn as tall as its corner (GPUI clamps a corner to half its box). The type table's header was 42 px under Zed's padding; Studio's own header row is 30. In a dark theme a darker header fill did not show, so the header takes the well's ink |
 

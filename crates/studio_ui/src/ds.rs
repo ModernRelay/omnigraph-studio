@@ -1223,6 +1223,8 @@ pub struct SidebarRow {
     /// Shown in place of `end` while the row is hovered: pin, archive.
     actions: Option<AnyElement>,
     selected: bool,
+    /// On its panel's margin rather than inset from the panel's edge ([`SidebarRow::flush`]).
+    flush: bool,
     tooltip: Option<TooltipBuilder>,
     on_click: Option<ClickHandler>,
 }
@@ -1240,9 +1242,17 @@ impl SidebarRow {
             end: None,
             actions: None,
             selected: false,
+            flush: false,
             tooltip: None,
             on_click: None,
         }
+    }
+
+    /// In a panel with a margin of its own (an inspector's), the row on that margin, its start
+    /// a [`property_row`]'s icon's edge: a node's neighbours under their group.
+    pub fn flush(mut self) -> Self {
+        self.flush = true;
+        self
     }
 
     /// Small buttons that take the trailing value's place while the row is hovered.
@@ -1313,8 +1323,13 @@ impl RenderOnce for SidebarRow {
             .id(self.id)
             .relative()
             .h(px(size::SIDEBAR_ROW))
-            .mx(px(space::SM))
-            .px(px(space::SM))
+            .map(|row| {
+                if self.flush {
+                    row.px(px(space::XS))
+                } else {
+                    row.mx(px(space::SM)).px(px(space::SM))
+                }
+            })
             .gap(px(space::MD))
             .items_center()
             .rounded(px(radii(cx).sm))
@@ -2610,18 +2625,19 @@ pub fn property_value() -> Div {
 }
 
 /// A boxed value in a [`property_row`]: the document's fill inside the controls' hairline
-/// (`surface::control_border`), the extra-small corner as a tag's, [`size::VALUE`] tall and
-/// no wider than its row. What it holds is the caller's ([`value_text`], [`node_value`]).
+/// (`surface::control_border`), [`size::VALUE`] tall and no wider than its row, with round
+/// ends, since a click edits or copies it (spec 002, "Round ends only for buttons with a
+/// label"). What it holds is the caller's ([`value_text`], [`node_value`]).
 pub fn value_box(cx: &App) -> Div {
     h_flex()
         .flex_none()
         .max_w_full()
         .min_w_0()
         .h(px(size::VALUE))
-        .px(px(space::SM))
+        .px(px(space::MD))
         .gap(px(space::XS))
         .items_center()
-        .rounded(px(radii(cx).xs))
+        .rounded_full()
         .bg(surface::document(cx))
         .border_1()
         .border_color(surface::control_border(cx))
@@ -2650,18 +2666,25 @@ pub fn node_value(type_name: &str, label: impl Into<SharedString>, cx: &App) -> 
         )
 }
 
-/// Values side by side, wrapping onto more lines: a list's items, a relationship's neighbours,
-/// and the [`value_add`] after them.
+/// Values side by side, wrapping onto more lines: a list's items.
 pub fn value_list() -> Div {
     h_flex().w_full().flex_wrap().gap(px(space::XS))
 }
 
-/// The button after a [`value_list`] that adds a value: a "+" raised as the values are boxed,
-/// at their height.
-pub fn value_add(id: impl Into<ElementId>) -> IconButton {
-    IconButton::new(id, IconName::Plus)
+/// A value chosen from a menu (an enum's), as its menu's trigger: a select, so a raised pill
+/// (spec 002, "Round ends only for buttons with a label") at a value's height, its chevron at
+/// its end.
+pub fn value_select(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
+    button(id, label)
         .size(ButtonSize::Default)
         .variant(crate::button::Variant::Outline)
+        .end_icon(Icon::new(IconName::ChevronDown))
+}
+
+/// The × that removes a value (a neighbour's relationship): a row's icon button, quiet, shown
+/// over its row's end under the pointer ([`SidebarRow::actions`]).
+pub fn value_remove(id: impl Into<ElementId>) -> IconButton {
+    row_icon_button(id, IconName::Close).icon_color(Color::Muted)
 }
 
 /// A section of an object that folds (a long text, a long list): its name, muted, and a
@@ -2678,6 +2701,25 @@ pub fn fold(id: impl Into<ElementId>, title: impl Into<SharedString>, open: bool
         } else {
             IconName::ChevronRight
         }))
+}
+
+/// A [`fold`] as a row over the rows it folds (a relationship's neighbours): a sidebar row's
+/// height on its panel's margin, its title and chevron, then the rest of the row for what the
+/// caller ends it with (a count, an add button).
+pub fn fold_row(
+    id: impl Into<ElementId>,
+    title: impl Into<SharedString>,
+    open: bool,
+    cx: &App,
+) -> Stateful<Div> {
+    let hover = surface::hover(cx);
+    fold(id, title, open)
+        .w_full()
+        .h(px(size::SIDEBAR_ROW))
+        .px(px(space::XS))
+        .rounded(px(radii(cx).sm))
+        .hover(move |style| style.bg(hover))
+        .child(div().flex_1())
 }
 
 /// A card, as Zed draws a tool call: a tinted header, a body and a footer of actions. Compose

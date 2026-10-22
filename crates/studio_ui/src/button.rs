@@ -801,10 +801,23 @@ mod tests {
                         .on_clear("Clear the filters", |_, _, _| {}),
                     ),
                 )
+                // A relationship's header over its neighbours' rows.
                 .child(
-                    div()
-                        .debug_selector(|| "value-add".into())
-                        .child(ds::value_add("add")),
+                    div().w(gpui::px(240.)).child(
+                        v_flex()
+                            .child(
+                                ds::fold_row("fold", "knows → Person", true, cx)
+                                    .debug_selector(|| "fold-row".into())
+                                    .child(ds::text::meta("4")),
+                            )
+                            .child(
+                                div().debug_selector(|| "neighbour".into()).child(
+                                    ds::SidebarRow::new("neighbour", "Barbara Dahl")
+                                        .flush()
+                                        .start(crate::type_mark("Person", "Barbara Dahl", cx)),
+                                ),
+                            ),
+                    ),
                 )
                 .child(
                     div().w(gpui::px(240.)).child(
@@ -874,10 +887,17 @@ mod tests {
             f32::from(chip.bottom() - chip_button.bottom()),
             "the button centred in its chip"
         );
+        // A group's header and its neighbours are rows of one height, on one edge.
+        let fold = bounds(cx, "fold-row");
+        let neighbour = bounds(cx, "neighbour");
+        assert_eq!(f32::from(fold.size.height), ds::size::SIDEBAR_ROW);
+        assert_eq!(f32::from(neighbour.size.height), ds::size::SIDEBAR_ROW);
         assert_eq!(
-            f32::from(bounds(cx, "value-add").size.height),
-            ds::size::VALUE
+            fold.left(),
+            neighbour.left(),
+            "a flush row on its panel's margin"
         );
+        assert_eq!(neighbour.top(), fold.bottom());
         // A switch, shorter than a boxed value, sits level with its label too.
         let row = bounds(cx, "switch-row");
         let switch = bounds(cx, "switch");

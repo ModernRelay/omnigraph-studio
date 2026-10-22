@@ -53,12 +53,12 @@ pub const NEIGHBOUR_LIMIT: u32 = 8;
 /// next (constitution IX).
 const PAGE_NEIGHBOURS: u32 = 50;
 
-/// Where a relationship group's children start: under the group's arrow, past its inset and
-/// disclosure chevron.
-const CHILD_INDENT: f32 = space::XS + studio_ui::ds::size::DISCLOSURE + space::SM;
-
 /// The widest a page's text runs: the design system's reading width, as settings' is.
 const PAGE_WIDTH: f32 = studio_ui::ds::size::READING_WIDTH;
+
+/// The longest a text with words runs in its property's box; a longer one is shown under its
+/// name at the full width, where it wraps, rather than cut at the box's end.
+const BOXED_TEXT: usize = 40;
 
 /// Debounce before relationship counts are read, so moving the cursor quickly through rows
 /// does not send a burst of reads.
@@ -439,6 +439,8 @@ pub struct NodePeek {
     /// The relationship groups with no neighbours are listed too; by default they fold into
     /// one row at the end.
     show_empty: bool,
+    /// The long texts folded under their names, by property.
+    folded: HashSet<String>,
     /// The node's drafts being saved together.
     saving_drafts: bool,
     /// Why the drafts' last save did not land; the second press of Discard drops them.
@@ -683,6 +685,7 @@ impl NodePeek {
             drafts_notice: None,
             confirm_discard: false,
             show_empty: false,
+            folded: HashSet::new(),
             scope: Some(scope),
             list: ListState::new(0, ListAlignment::Top, px(DRAW_AHEAD)),
             list_items: Vec::new(),
@@ -3792,6 +3795,10 @@ impl NodePeek {
         self.plain_text.retain(|name, _| wanted.contains(name));
     }
 
+    /// The node's properties, after the reference meeting card's body (spec 014): a row per
+    /// property, its kind and its name, then its value boxed (a list's items each boxed, an
+    /// enum its select, a truth value its switch); then each text longer than a box holds,
+    /// under its name, which folds it, at the full width.
     fn render_properties(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let values = match &self.values {
             Loadable::Loaded(values) => values,
@@ -3802,191 +3809,351 @@ impl NodePeek {
                 return studio_ui::ds::text::muted("Reading…").into_any_element();
             }
         };
-        let hover = studio_ui::ds::surface::hover(cx);
         let properties = self
             .schema
             .as_deref()
             .map(|schema| listed_properties(schema, &self.subject))
             .unwrap_or_default();
-        let label_width = if self.page {
-            studio_ui::ds::size::FIELD_LABEL_WIDE
-        } else {
-            studio_ui::ds::size::FIELD_LABEL
-        };
-        let refusal = self.change_refusal(cx);
+        let (rows, texts): (Vec<_>, Vec<_>) =
+            properties
+                .into_iter()
+                .enumerate()
+                .partition(|(_, property)| {
+                    !self.reads_long(property, values.get(&property.name).unwrap_or(&NULL))
+                });
         // Pulled out by the rows' hover inset, as a relationship group's rows are.
         v_flex()
             .mx(px(-space::XS))
             .gap(px(space::XXS))
             .children(
-                properties
+                rows.into_iter()
+                    .map(|(index, property)| self.render_property(index, property, window, cx)),
+            )
+            .children(
+                texts
                     .into_iter()
-                    .enumerate()
-                    .map(|(index, property)| {
-                        let name = property.name.as_str();
-                        let ty = property.display_type();
-                        // Borrowed: this runs at every draw, and a text value can be long.
-                        let value = values.get(name).unwrap_or(&NULL);
-                        let title = match name {
-                            FROM_COLUMN => "from".to_owned(),
-                            TO_COLUMN => "to".to_owned(),
-                            _ => name.to_owned(),
-                        };
-                        let copied = self.copied.as_deref() == Some(name);
-                        let editable = self.edits_property(property, cx);
-                        // A value the credential may not change says so where it would edit.
-                        let refused = refusal
-                            .as_ref()
-                            .filter(|_| property.editable_in_cell() && !editable);
-                        let editing = self.edits.contains_key(name);
-                        let saving =
-                            self.saving.contains(name) || self.saving_elsewhere.contains(name);
-                        // An unsaved value shows what was typed, with a dot, and opens on a click.
-                        let draft = (editable && !editing && !saving)
-                            .then(|| self.draft_of(name, cx))
-                            .flatten();
-                        // An enum is a menu of its values and a boolean a switch, each saving
-                        // as it is chosen; other values open an editor on a click.
-                        let picker = (editable && !editing && !saving && draft.is_none())
-                            .then(|| self.render_picker(index, property, value, cx))
-                            .flatten();
-                        let opens_editor = editable && picker.is_none() && !editing && !saving;
-                        let body = match (self.edits.get(name), picker) {
-                            _ if let Some(then) = self.absent.get(name) => studio_ui::ds::text::muted(
-                                absence_text(then, true),
-                            )
-                            .into_any_element(),
-                            (Some(edit), _) => self.render_field_edit(edit, window, cx),
-                            (None, _) if draft.is_some() => {
-                                let text = draft.as_ref().map_or("", |d| d.text.as_str());
-                                h_flex()
-                                    .gap(px(space::SM))
-                                    .child(
-                                        studio_ui::ds::text::body(if text.trim().is_empty() { "—".to_owned() } else { studio_ui::text::first_line(text) }),
-                                    )
-                                    .child(Indicator::dot().color(Color::Accent))
-                                    .into_any_element()
-                            }
-                            (None, Some(picker)) => picker,
-                            (None, None) => {
-                                self.render_value(name, Some(property), value, window, cx)
-                            }
-                        };
-                        // Only a click's own: the copy reads the value as it is then.
-                        let edit_property = opens_editor.then(|| property.clone());
-                        let copy_name = name.to_owned();
-                        // Text opens in the editor from a button the row shows on hover.
-                        let expands = opens_editor && reads_as_markdown(property);
-                        let group = SharedString::from(format!("peek-property-{index}"));
-                        let expand_name = name.to_owned();
-                        h_flex()
-                            .id(("peek-property", index))
-                            .group(group.clone())
-                            .px(px(space::XS))
-                            .py(px(space::XXS))
-                            .gap(px(space::MD))
-                            .items_start()
-                            .rounded(px(studio_ui::ds::radii(cx).sm))
-                            .when(!editing, |row| row.hover(move |s| s.bg(hover)))
-                            .when(opens_editor || !editable, |row| row.cursor_pointer())
-                            .when(!editing, |row| {
-                                row.tooltip(Tooltip::text(if draft.is_some() {
-                                    format!(
-                                        "Not saved; it holds “{}”. Click to edit; ⌘S saves this node's changes together",
-                                        display_value(Some(property), value)
-                                    )
-                                } else if opens_editor {
-                                    format!("{ty} · click to edit")
-                                } else if editable {
-                                    ty.clone()
-                                } else if let Some(reason) = refused {
-                                    format!("{ty} · {reason} · click to copy")
-                                } else {
-                                    format!("{ty} · click to copy")
-                                }))
-                            })
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                if let Some(property) = edit_property.clone() {
-                                    this.start_edit(property, window, cx);
-                                } else if !editable {
-                                    this.copy(copy_name.clone(), cx)
-                                }
-                            }))
-                            .child(
-                                div()
-                                    .w(px(label_width))
-                                    .flex_none()
-                                    .pt(px(if editing {
-                                        space::SM
-                                    } else {
-                                        0.
-                                    }))
-                                    .child(
-                                        studio_ui::ds::text::muted(title)
-                                            .truncate(),
-                                    ),
-                            )
-                            .child(div().flex_1().min_w_0().child(body))
-                            .when(expands, |row| {
-                                row.child(
-                                    studio_ui::ds::row_icon_button(
-                                        ("peek-open-editor", index),
-                                        IconName::Maximize,
-                                    )
-                                    .icon_color(Color::Muted)
-                                    .visible_on_hover(group.clone())
-                                    .tooltip(Tooltip::text("Open in the editor"))
-                                    .on_click(cx.listener(
-                                        move |this, _, window, cx| {
-                                            cx.stop_propagation();
-                                            this.expand(&expand_name, window, cx)
-                                        },
-                                    )),
-                                )
-                            })
-                            .when(saving, |row| {
-                                row.child(
-                                    div()
-                                        .id(("peek-saving", index))
-                                        .pt(px(space::SM))
-                                        .tooltip(Tooltip::text("Saving…"))
-                                        .child(Indicator::dot().color(Color::Warning)),
-                                )
-                            })
-                            .when(copied, |d| {
-                                d.child(
-                                    studio_ui::ds::text::meta("Copied")
-                                        .color(Color::Success),
-                                )
-                            })
-                    }),
+                    .map(|(index, property)| self.render_long_text(index, property, window, cx)),
             )
             .into_any_element()
     }
 
-    /// A value as it reads: markdown when it has markup, else a label.
-    fn render_value(
+    /// Whether a property's value is shown as a text under its name rather than boxed in a
+    /// row: a text with markup, or one longer than a box holds and with words to wrap at (an
+    /// email or an id stays in its box, cut at its end).
+    fn reads_long(&self, property: &gq_language::Property, value: &Value) -> bool {
+        reads_as_markdown(property)
+            && (self.markdown.contains_key(&property.name)
+                || value.as_str().is_some_and(|text| {
+                    text.contains(char::is_whitespace) && text.chars().count() > BOXED_TEXT
+                }))
+    }
+
+    /// What a property's row or text shows of its state, and what a click on it does.
+    fn property_state(
         &self,
-        name: &str,
-        property: Option<&gq_language::Property>,
-        value: &Value,
+        index: usize,
+        property: &gq_language::Property,
+        cx: &mut Context<Self>,
+    ) -> PropertyState {
+        let name = property.name.as_str();
+        let value = self
+            .values
+            .loaded()
+            .and_then(|values| values.get(name))
+            .unwrap_or(&NULL);
+        let ty = property.display_type();
+        let editable = self.edits_property(property, cx);
+        // A value the credential may not change says so where it would edit.
+        let refused = self
+            .change_refusal(cx)
+            .filter(|_| property.editable_in_cell() && !editable);
+        let editing = self.edits.contains_key(name);
+        let saving = self.saving.contains(name) || self.saving_elsewhere.contains(name);
+        // An unsaved value shows what was typed, with a dot, and opens on a click.
+        let draft = (editable && !editing && !saving)
+            .then(|| self.draft_of(name, cx))
+            .flatten();
+        // An enum is a menu of its values and a boolean a switch, each saving as it is chosen;
+        // other values open an editor on a click.
+        let picker = (editable && !editing && !saving && draft.is_none())
+            .then(|| self.render_picker(index, property, value, cx))
+            .flatten();
+        let opens_editor = editable && picker.is_none() && !editing && !saving;
+        // A boxed value may be cut at its box's end: the tooltip has it whole.
+        let whole = (!value.is_null()).then(|| display_value(Some(property), value));
+        let tooltip = (!editing).then(|| {
+            let what = if draft.is_some() {
+                format!(
+                    "Not saved; it holds “{}”. Click to edit; ⌘S saves this node's changes together",
+                    display_value(Some(property), value)
+                )
+            } else if opens_editor {
+                format!("{ty} · click to edit")
+            } else if editable {
+                ty.clone()
+            } else if let Some(reason) = &refused {
+                format!("{ty} · {reason} · click to copy")
+            } else {
+                format!("{ty} · click to copy")
+            };
+            match &whole {
+                Some(whole) if draft.is_none() => format!("{whole}\n{what}"),
+                _ => what,
+            }
+        });
+        PropertyState {
+            editable,
+            editing,
+            saving,
+            draft,
+            picker,
+            opens_editor,
+            tooltip,
+            copied: self.copied.as_deref() == Some(name),
+        }
+    }
+
+    /// A property's row: its kind and its name, then its value as [`Self::property_state`]
+    /// says, and its state (saving, copied) or its "Open in the editor" after it.
+    fn render_property(
+        &self,
+        index: usize,
+        property: &gq_language::Property,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        match self.markdown.get(name) {
-            // GPUI's text takes its size from the element around it, so the labels' size is
-            // set there too.
-            Some((_, view)) => div()
-                .text_size(studio_ui::ds::text::body_size(cx))
-                .child(MarkdownElement::new(view.clone(), value_style(window, cx)))
+        let name = property.name.as_str();
+        let value = self
+            .values
+            .loaded()
+            .and_then(|values| values.get(name))
+            .unwrap_or(&NULL);
+        let mut state = self.property_state(index, property, cx);
+        let body = match self.edits.get(name) {
+            _ if let Some(then) = self.absent.get(name) => {
+                studio_ui::ds::text::muted(absence_text(then, true)).into_any_element()
+            }
+            Some(edit) => self.render_field_edit(edit, window, cx),
+            None if let Some(draft) = &state.draft => {
+                let text = draft.text.as_str();
+                h_flex()
+                    .gap(px(space::SM))
+                    .min_w_0()
+                    .child(studio_ui::ds::value_text(
+                        if text.trim().is_empty() {
+                            "—".to_owned()
+                        } else {
+                            studio_ui::text::first_line(text)
+                        },
+                        cx,
+                    ))
+                    .child(Indicator::dot().color(Color::Accent))
+                    .into_any_element()
+            }
+            None => match state.picker.take() {
+                Some(picker) => picker,
+                None => self.render_value(Some(property), value, cx),
+            },
+        };
+        let group = SharedString::from(format!("peek-property-{index}"));
+        let editing = state.editing;
+        let title = match name {
+            FROM_COLUMN => "from".to_owned(),
+            TO_COLUMN => "to".to_owned(),
+            _ => name.to_owned(),
+        };
+        // A field being edited is a control's height: centred in the row as a value is.
+        let value_slot = studio_ui::ds::property_value()
+            .when(editing, |slot| {
+                slot.py(px((studio_ui::ds::size::PROPERTY_ROW
+                    - studio_ui::ds::size::CONTROL)
+                    / 2.))
+            })
+            .child(body);
+        let row = studio_ui::ds::property_row(property_icon(property), title, self.label_width())
+            .id(("peek-property", index))
+            .group(group.clone())
+            .px(px(space::XS))
+            .rounded(px(studio_ui::ds::radii(cx).sm))
+            .child(value_slot);
+        self.property_interaction(row, index, property, &state, group, cx)
+            .into_any_element()
+    }
+
+    /// A text longer than a box holds (spec 014): its kind and its name, which fold it, and
+    /// the text under them at the full width, as markdown when it has markup; a click on the
+    /// text edits or copies it as a row's does.
+    fn render_long_text(
+        &self,
+        index: usize,
+        property: &gq_language::Property,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let name = property.name.as_str();
+        let value = self
+            .values
+            .loaded()
+            .and_then(|values| values.get(name))
+            .unwrap_or(&NULL);
+        let state = self.property_state(index, property, cx);
+        let open = !self.folded.contains(name) || state.editing;
+        let fold_name = name.to_owned();
+        let body = match self.edits.get(name) {
+            _ if let Some(then) = self.absent.get(name) => {
+                studio_ui::ds::text::muted(absence_text(then, true)).into_any_element()
+            }
+            Some(edit) => self.render_field_edit(edit, window, cx),
+            None if let Some(draft) = &state.draft => h_flex()
+                .gap(px(space::SM))
+                .items_start()
+                .child(studio_ui::ds::text::body(draft.text.clone()))
+                .child(Indicator::dot().color(Color::Accent))
                 .into_any_element(),
-            None => studio_ui::ds::text::body(display_value(property, value))
-                .color(if value.is_null() {
-                    Color::Disabled
-                } else {
-                    Color::Default
-                })
+            None => match self.markdown.get(name) {
+                // GPUI's text takes its size from the element around it, so the labels' size
+                // is set there too.
+                Some((_, view)) => div()
+                    .text_size(studio_ui::ds::text::body_size(cx))
+                    .child(MarkdownElement::new(view.clone(), value_style(window, cx)))
+                    .into_any_element(),
+                None => studio_ui::ds::text::body(display_value(Some(property), value))
+                    .into_any_element(),
+            },
+        };
+        let group = SharedString::from(format!("peek-property-{index}"));
+        let head = h_flex()
+            .h(px(studio_ui::ds::size::PROPERTY_ROW))
+            .gap(px(space::SM))
+            .items_center()
+            .child(studio_ui::ds::icon::meta(property_icon(property)))
+            .child(
+                studio_ui::ds::fold(("peek-fold", index), name.to_owned(), open)
+                    .tooltip(Tooltip::text(if open { "Fold" } else { "Unfold" }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        if !this.folded.remove(&fold_name) {
+                            this.folded.insert(fold_name.clone());
+                        }
+                        cx.notify();
+                    })),
+            );
+        let text = v_flex()
+            .id(("peek-property", index))
+            .group(group.clone())
+            .w_full()
+            .px(px(space::XS))
+            .pb(px(space::XS))
+            .rounded(px(studio_ui::ds::radii(cx).sm))
+            .child(head)
+            .when(open, |text| text.child(div().w_full().child(body)));
+        self.property_interaction(text, index, property, &state, group, cx)
+            .into_any_element()
+    }
+
+    /// What a property's row or text does and shows beside its value: the hover fill, the
+    /// tooltip, a click that edits or copies, and its "Open in the editor", saving dot and
+    /// "Copied".
+    fn property_interaction(
+        &self,
+        element: gpui::Stateful<Div>,
+        index: usize,
+        property: &gq_language::Property,
+        state: &PropertyState,
+        group: SharedString,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let hover = studio_ui::ds::surface::hover(cx);
+        let name = property.name.as_str();
+        // Only a click's own: the copy reads the value as it is then.
+        let edit_property = state.opens_editor.then(|| property.clone());
+        let copy_name = name.to_owned();
+        let editable = state.editable;
+        // Text opens in the editor from a button the row shows on hover.
+        let expands = state.opens_editor && reads_as_markdown(property);
+        let expand_name = name.to_owned();
+        // Beside the value, level with the row's first line.
+        let beside = || {
+            div()
+                .h(px(studio_ui::ds::size::PROPERTY_ROW))
+                .flex()
+                .items_center()
+        };
+        element
+            .when(!state.editing, |row| row.hover(move |s| s.bg(hover)))
+            .when(state.opens_editor || !editable, |row| row.cursor_pointer())
+            .when_some(state.tooltip.clone(), |row, tooltip| {
+                row.tooltip(Tooltip::text(tooltip))
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if let Some(property) = edit_property.clone() {
+                    this.start_edit(property, window, cx);
+                } else if !editable {
+                    this.copy(copy_name.clone(), cx)
+                }
+            }))
+            .when(expands, |row| {
+                row.child(
+                    beside().child(
+                        studio_ui::ds::row_icon_button(
+                            ("peek-open-editor", index),
+                            IconName::Maximize,
+                        )
+                        .icon_color(Color::Muted)
+                        .visible_on_hover(group.clone())
+                        .tooltip(Tooltip::text("Open in the editor"))
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.expand(&expand_name, window, cx)
+                            },
+                        )),
+                    ),
+                )
+            })
+            .when(state.saving, |row| {
+                row.child(
+                    beside().child(
+                        div()
+                            .id(("peek-saving", index))
+                            .tooltip(Tooltip::text("Saving…"))
+                            .child(Indicator::dot().color(Color::Warning)),
+                    ),
+                )
+            })
+            .when(state.copied, |row| {
+                row.child(beside().child(studio_ui::ds::text::meta("Copied").color(Color::Success)))
+            })
+    }
+
+    /// A short value boxed: a list's items each in their box, none a muted dash.
+    fn render_value(
+        &self,
+        property: Option<&gq_language::Property>,
+        value: &Value,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match value {
+            Value::Null => studio_ui::ds::text::body("—")
+                .color(Color::Disabled)
                 .into_any_element(),
+            Value::Array(items) => studio_ui::ds::value_list()
+                .children(
+                    items
+                        .iter()
+                        .map(|item| studio_ui::ds::value_text(studio_ui::format_value(item), cx)),
+                )
+                .into_any_element(),
+            _ => studio_ui::ds::value_text(display_value(property, value), cx).into_any_element(),
+        }
+    }
+
+    /// The label column of a property row: a page's is wider, at a document's width.
+    fn label_width(&self) -> f32 {
+        if self.page {
+            studio_ui::ds::size::FIELD_LABEL_WIDE
+        } else {
+            studio_ui::ds::size::FIELD_LABEL
         }
     }
 
@@ -4008,20 +4175,15 @@ impl NodePeek {
             let nullable = property.nullable;
             let property = property.clone();
             let shown = current.clone().unwrap_or_else(|| "—".into());
-            // The menu's label on the values' edge: the button's own padding sits outside it.
+            // A select, raised as the values are boxed, on their edge.
             return Some(
                 div()
-                    .ml(px(-space::XS))
                     .child(
                         PopoverMenu::new(SharedString::from(format!("peek-enum-{index}")))
-                            .trigger(
-                                studio_ui::ds::row_button(
-                                    SharedString::from(format!("peek-enum-button-{index}")),
-                                    shown,
-                                )
-                                .style(ButtonStyle::Subtle)
-                                .end_icon(Icon::new(IconName::ChevronDown)),
-                            )
+                            .trigger(studio_ui::ds::value_select(
+                                SharedString::from(format!("peek-enum-button-{index}")),
+                                shown,
+                            ))
                             .anchor(gpui::Anchor::TopLeft)
                             .menu(move |window, cx| {
                                 let (this, property, options, current) = (
@@ -4223,19 +4385,11 @@ impl NodePeek {
 
     /// The row the groups with no neighbours fold into, with how many; a click shows them.
     fn render_empty_row(&self, cx: &mut Context<Self>) -> AnyElement {
-        let hover = studio_ui::ds::surface::hover(cx);
         let folded = (0..self.groups.len())
             .filter(|&index| self.place(index) == Place::Folded)
             .count();
         let open = self.show_empty;
-        h_flex()
-            .id("peek-empty-groups")
-            .px(px(space::XS))
-            .py(px(space::XXS))
-            .gap(px(space::SM))
-            .rounded(px(studio_ui::ds::radii(cx).sm))
-            .hover(move |s| s.bg(hover))
-            .cursor_pointer()
+        studio_ui::ds::fold_row("peek-empty-groups", "Empty", open, cx)
             .tooltip(Tooltip::text(if open {
                 "Hide the relationships with none"
             } else {
@@ -4245,28 +4399,27 @@ impl NodePeek {
                 this.show_empty = !this.show_empty;
                 cx.notify();
             }))
-            .child(studio_ui::ds::icon::meta(if open {
-                IconName::ChevronDown
-            } else {
-                IconName::ChevronRight
-            }))
-            .child(studio_ui::ds::text::muted("Empty"))
-            .child(div().flex_1())
-            .child(
-                studio_ui::ds::text::muted(studio_ui::group_count(folded as i64)).buffer_font(cx),
-            )
+            .child(studio_ui::ds::text::meta(studio_ui::group_count(
+                folded as i64,
+            )))
             .into_any_element()
     }
 
-    /// One relationship group: its header (direction, name, the other type, "+", the count),
-    /// then an open search, its notice and, when open, its neighbours.
+    /// One relationship group: a fold row (its name, the way it points and the other type,
+    /// its count, its "+") over its neighbours, one row each; an open search and its notice
+    /// under the header. Unlike a property's values, neighbours are rows: each is a node to
+    /// go to, and a group may hold many.
     fn render_group(&self, index: usize, cx: &mut Context<Self>) -> Div {
-        let hover = studio_ui::ds::surface::hover(cx);
         let group = &self.groups[index];
-        let icon = match group.group.direction {
-            Direction::Outgoing => IconName::ArrowRight,
-            Direction::Incoming => IconName::ArrowLeft,
+        let arrow = match group.group.direction {
+            Direction::Outgoing => "→",
+            Direction::Incoming => "←",
         };
+        let title = format!(
+            "{} {arrow} {}",
+            gq_language::traversal_name(&group.group.edge),
+            group.group.other_type
+        );
         // Until its count is read a group says nothing about what it holds.
         let count = match &group.count {
             Loadable::Loaded(n) => studio_ui::group_count(*n),
@@ -4281,33 +4434,15 @@ impl NodePeek {
         let add = self
             .edits_relationships()
             .then(|| self.render_add_button(index, header_group.clone(), cx));
-        let header = h_flex()
-            .id(("peek-group", index))
+        let header = studio_ui::ds::fold_row(("peek-group", index), title, group.expanded, cx)
             .group(header_group)
-            .px(px(space::XS))
-            .py(px(space::XXS))
-            .gap(px(space::SM))
-            .rounded(px(studio_ui::ds::radii(cx).sm))
-            .hover(move |s| s.bg(hover))
-            .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(index, cx)))
             .when_some(failed, |d, error| d.tooltip(Tooltip::text(error)))
-            .child(studio_ui::ds::icon::meta(if group.expanded {
-                IconName::ChevronDown
-            } else {
-                IconName::ChevronRight
-            }))
-            .child(studio_ui::ds::icon::meta(icon))
-            .child(studio_ui::ds::text::body(gq_language::traversal_name(
-                &group.group.edge,
-            )))
-            .child(studio_ui::ds::text::muted(group.group.other_type.clone()))
-            .child(div().flex_1())
             .when(self.edge_writes.contains(&index), |header| {
                 header.child(Indicator::dot().color(Color::Warning))
             })
             .children(add)
-            .child(studio_ui::ds::text::muted(count).buffer_font(cx));
+            .child(studio_ui::ds::text::meta(count));
         let adding = self
             .adding
             .as_ref()
@@ -4315,7 +4450,7 @@ impl NodePeek {
             .map(|adding| self.render_add_row(adding, cx));
         // An unknown outcome offers History, where it is settled.
         let notice = self.group_notices.get(&index).map(|notice| {
-            div().pl(px(CHILD_INDENT)).child(blob_write::notice_row(
+            div().pl(px(space::XS)).child(blob_write::notice_row(
                 format!("peek-group-notice-{index}"),
                 notice,
                 None,
@@ -4329,6 +4464,8 @@ impl NodePeek {
             .children(adding)
             .children(notice)
             .children(body)
+            // Room under an open group's rows before the next header.
+            .when(group.expanded, |group| group.pb(px(space::XS)))
     }
 
     /// A group's "+": a search for the node to relate; a relationship that needs properties
@@ -4360,10 +4497,11 @@ impl NodePeek {
             format!("Add a {}", group.other_type)
         };
         let edge = group.edge.clone();
+        // In the group's header, quiet; in the peek, shown under the pointer.
         studio_ui::ds::row_icon_button(("peek-add", index), IconName::Plus)
             .icon_color(Color::Muted)
-            .disabled(refused.is_some())
             .when(!self.page, |button| button.visible_on_hover(header))
+            .disabled(refused.is_some())
             .tooltip(Tooltip::text(tooltip))
             .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
@@ -4429,7 +4567,7 @@ impl NodePeek {
                 cx.listener(|this, _: &menu::Confirm, window, cx| this.confirm_add(window, cx)),
             )
             .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| this.cancel_add(cx)))
-            .pl(px(CHILD_INDENT))
+            .pl(px(space::XS))
             .py(px(space::XS))
             .gap(px(space::XS))
             .child(
@@ -4442,14 +4580,15 @@ impl NodePeek {
             .into_any_element()
     }
 
-    /// A neighbour's ×, shown under the pointer: the first press asks, the second removes the
-    /// relationship (the node stays).
+    /// A neighbour's ×, at its chip's end, muted as the reference card's trailing marks are:
+    /// the first press asks, the second removes the relationship (the node stays). Always
+    /// shown: a chip cannot keep room for a button it shows only under the pointer without
+    /// looking padded.
     fn render_remove(
         &self,
         index: usize,
         n: usize,
         edge_id: String,
-        row: SharedString,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let asked = self.removing.as_deref() == Some(edge_id.as_str());
@@ -4470,30 +4609,26 @@ impl NodePeek {
             .into_any_element();
         }
         let refused = self.change_refusal(cx);
-        studio_ui::ds::row_icon_button(
-            SharedString::from(format!("peek-remove-{index}-{n}")),
-            IconName::Close,
-        )
-        .icon_color(Color::Muted)
-        .disabled(refused.is_some())
-        .visible_on_hover(row)
-        .tooltip(Tooltip::text(
-            refused.unwrap_or_else(|| format!("Remove this {edge}")),
-        ))
-        .on_click(cx.listener(move |this, _, window, cx| {
-            cx.stop_propagation();
-            this.press_remove(index, edge_id.clone(), window, cx)
-        }))
-        .into_any_element()
+        studio_ui::ds::value_remove(SharedString::from(format!("peek-remove-{index}-{n}")))
+            .disabled(refused.is_some())
+            .tooltip(Tooltip::text(
+                refused.unwrap_or_else(|| format!("Remove this {edge}")),
+            ))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.press_remove(index, edge_id.clone(), window, cx)
+            }))
+            .into_any_element()
     }
 
+    /// An open group's neighbours, a row each: its type's mark and its name; a click peeks it,
+    /// ⌘-click opens its page, and its × (under the pointer, held once pressed) removes the
+    /// relationship. Past the ones read, "+N more".
     fn render_neighbours(&self, index: usize, group: &Group, cx: &mut Context<Self>) -> AnyElement {
-        let hover = studio_ui::ds::surface::hover(cx);
         match &group.neighbours {
-            Loadable::Loaded(neighbours) if neighbours.is_empty() => div()
-                .pl(px(CHILD_INDENT))
-                .child(studio_ui::ds::text::meta("None at this commit"))
-                .into_any_element(),
+            Loadable::Loaded(neighbours) if neighbours.is_empty() => {
+                group_note(studio_ui::ds::text::meta("None at this commit"))
+            }
             Loadable::Loaded(neighbours) => {
                 let more = match &group.count {
                     Loadable::Loaded(n) if *n > neighbours.len() as i64 => {
@@ -4505,97 +4640,67 @@ impl NodePeek {
                 let at_commit = self.held_commit();
                 let show_more = more.map(|more| {
                     let label = format!("+{} more", studio_ui::group_count(more));
+                    let row = studio_ui::ds::SidebarRow::new(
+                        SharedString::from(format!("peek-more-{index}")),
+                        if self.page && group.more.is_some() {
+                            "Reading…".to_owned()
+                        } else {
+                            label
+                        },
+                    )
+                    .flush()
+                    .muted(true)
+                    .icon(IconName::Ellipsis);
                     if self.page {
-                        let reading = group.more.is_some();
-                        studio_ui::ds::row_button(
-                            SharedString::from(format!("peek-more-{index}")),
-                            if reading {
-                                "Reading…".to_owned()
-                            } else {
-                                label
-                            },
-                        )
-                        .style(ButtonStyle::Subtle)
-                        .disabled(reading)
-                        .on_click(cx.listener(move |this, _, _, cx| this.show_more(index, cx)))
-                        .into_any_element()
+                        row.on_click(cx.listener(move |this, _, _, cx| this.show_more(index, cx)))
                     } else {
                         // The peek shows the first few; the page lists them all.
                         let open = self.open_page_action();
-                        div()
-                            .id(SharedString::from(format!("peek-more-{index}")))
-                            .px(px(space::XS))
-                            .cursor_pointer()
-                            .tooltip(Tooltip::text("Open the node's page to see them all"))
+                        row.end(studio_ui::ds::text::meta("Open page"))
+                            .tooltip("Open the node's page to see them all")
                             .on_click(move |_, window, cx| {
                                 if let Some(open) = open.clone() {
                                     window.dispatch_action(Box::new(open), cx)
                                 }
                             })
-                            .child(studio_ui::ds::text::meta(format!("{label} · Open page")))
-                            .into_any_element()
                     }
                 });
                 let removes = self.edits_relationships();
                 v_flex()
-                    .pl(px(CHILD_INDENT - space::XS))
                     .children(neighbours.iter().enumerate().map(|(n, neighbour)| {
                         let (peek, page) = node_actions(&other, &neighbour.id, at_commit.clone());
-                        let row_group = SharedString::from(format!("peek-neighbour-{index}-{n}"));
-                        let remove = neighbour
-                            .edge_id
+                        let label = neighbour
+                            .label
                             .clone()
-                            .filter(|_| removes)
-                            .map(|edge_id| {
-                                self.render_remove(index, n, edge_id, row_group.clone(), cx)
-                            });
-                        h_flex()
-                            .id(SharedString::from(format!("peek-neighbour-{index}-{n}")))
-                            .group(row_group)
-                            .px(px(space::XS))
-                            .py(px(space::XXS))
-                            .gap(px(space::MD))
-                            .rounded(px(studio_ui::ds::radii(cx).sm))
-                            .hover(move |s| s.bg(hover))
-                            .cursor_pointer()
-                            .tooltip(Tooltip::text(format!(
-                                "Peek {} · ⌘-click opens its page",
-                                neighbour.id
-                            )))
-                            .on_click(move |event, window, cx| {
-                                if event.modifiers().platform {
-                                    window.dispatch_action(Box::new(page.clone()), cx)
-                                } else {
-                                    window.dispatch_action(Box::new(peek.clone()), cx)
-                                }
-                            })
-                            .child(studio_ui::type_swatch(&other, cx))
-                            .child(
-                                studio_ui::ds::text::body(
-                                    neighbour
-                                        .label
-                                        .clone()
-                                        .unwrap_or_else(|| neighbour.id.clone()),
-                                )
-                                .truncate(),
-                            )
-                            .when(neighbour.label.is_some(), |d| {
-                                d.child(studio_ui::ds::text::meta(neighbour.id.clone()).truncate())
-                            })
-                            .child(div().flex_1())
-                            .children(remove)
+                            .unwrap_or_else(|| neighbour.id.clone());
+                        let row = studio_ui::ds::SidebarRow::new(
+                            SharedString::from(format!("peek-neighbour-{index}-{n}")),
+                            label.clone(),
+                        )
+                        .flush()
+                        .start(studio_ui::type_mark(&other, &label, cx))
+                        .tooltip(format!("Peek {} · ⌘-click opens its page", neighbour.id))
+                        .on_click(move |event, window, cx| {
+                            if event.modifiers().platform {
+                                window.dispatch_action(Box::new(page.clone()), cx)
+                            } else {
+                                window.dispatch_action(Box::new(peek.clone()), cx)
+                            }
+                        });
+                        match neighbour.edge_id.clone().filter(|_| removes) {
+                            // Pressed once, "Remove" stays until it is pressed again.
+                            Some(edge_id) if self.removing.as_deref() == Some(edge_id.as_str()) => {
+                                row.end(self.render_remove(index, n, edge_id, cx))
+                            }
+                            Some(edge_id) => row.actions(self.render_remove(index, n, edge_id, cx)),
+                            None => row,
+                        }
                     }))
                     .children(show_more)
                     .into_any_element()
             }
-            Loadable::Failed(error) => div()
-                .pl(px(CHILD_INDENT))
-                .child(studio_ui::ds::text::error_note(error.clone()))
-                .into_any_element(),
-            _ => div()
-                .pl(px(CHILD_INDENT))
-                .child(studio_ui::ds::text::meta("Reading…"))
-                .into_any_element(),
+            Loadable::Failed(error) => group_note(studio_ui::ds::text::error_note(error.clone())),
+            _ => group_note(studio_ui::ds::text::meta("Reading…")),
         }
     }
 
@@ -4609,41 +4714,43 @@ impl NodePeek {
         let values = self.values.loaded()?;
         let hover = studio_ui::ds::surface::hover(cx);
         let at_commit = self.held_commit();
-        let endpoint = |label: &'static str, ty: &String, key: &str| {
+        let label_width = self.label_width();
+        let endpoint = |label: &'static str, icon: IconName, ty: &String, key: &str| {
             let id = values.get(key).and_then(Value::as_str)?.to_owned();
             let (peek, page) = node_actions(ty, &id, at_commit.clone());
             Some(
-                h_flex()
-                    .id(label)
+                studio_ui::ds::property_row(icon, label, label_width)
                     .px(px(space::XS))
-                    .py(px(space::XXS))
-                    .gap(px(space::MD))
-                    .rounded(px(studio_ui::ds::radii(cx).sm))
-                    .hover(move |s| s.bg(hover))
-                    .cursor_pointer()
-                    .tooltip(Tooltip::text(format!("Peek {id} · ⌘-click opens its page")))
-                    .on_click(move |event, window, cx| {
-                        if event.modifiers().platform {
-                            window.dispatch_action(Box::new(page.clone()), cx)
-                        } else {
-                            window.dispatch_action(Box::new(peek.clone()), cx)
-                        }
-                    })
                     .child(
-                        div()
-                            .w(px(studio_ui::ds::size::SHORT_LABEL))
-                            .child(studio_ui::ds::text::muted(label)),
-                    )
-                    .child(studio_ui::type_swatch(ty, cx))
-                    .child(studio_ui::ds::text::body(id))
-                    .child(studio_ui::ds::text::meta(ty.clone())),
+                        studio_ui::ds::property_value().child(
+                            studio_ui::ds::node_value(ty, id.clone(), cx)
+                                .id(label)
+                                .hover(move |s| s.bg(hover))
+                                .cursor_pointer()
+                                .tooltip(Tooltip::text(format!(
+                                    "Peek {id} · {ty} · ⌘-click opens its page"
+                                )))
+                                .on_click(move |event, window, cx| {
+                                    if event.modifiers().platform {
+                                        window.dispatch_action(Box::new(page.clone()), cx)
+                                    } else {
+                                        window.dispatch_action(Box::new(peek.clone()), cx)
+                                    }
+                                }),
+                        ),
+                    ),
             )
         };
         Some(
             v_flex()
                 .gap(px(space::XXS))
-                .children(endpoint("from", from_type, FROM_COLUMN))
-                .children(endpoint("to", to_type, TO_COLUMN))
+                .children(endpoint(
+                    "from",
+                    IconName::ArrowLeft,
+                    from_type,
+                    FROM_COLUMN,
+                ))
+                .children(endpoint("to", IconName::ArrowRight, to_type, TO_COLUMN))
                 .into_any_element(),
         )
     }
@@ -4817,6 +4924,18 @@ fn neighbours_from(rows: &Value) -> Vec<Neighbour> {
         .unwrap_or_default()
 }
 
+/// A line under a relationship group in place of its rows (none, reading, a failure), on the
+/// rows' labels' edge.
+fn group_note(note: Label) -> AnyElement {
+    div()
+        .min_h(px(studio_ui::ds::size::SIDEBAR_ROW))
+        .pl(px(space::XS + studio_ui::ds::size::ROW_ICON + space::MD))
+        .flex()
+        .items_center()
+        .child(note)
+        .into_any_element()
+}
+
 fn section(title: &'static str) -> impl IntoElement {
     div()
         .pt(px(space::MD))
@@ -4948,8 +5067,11 @@ impl NodePeek {
                 } else {
                     head.pt(px(space::XL)).gap(px(space::SM))
                 };
+                // A hairline between the node's own values and its relationships, as the
+                // reference card rules its details from its participants.
                 head.when(self.shows_relationships(), |head| {
-                    head.child(section("Relationships"))
+                    head.child(h_flex().pt(px(space::MD)).child(studio_ui::ds::rule_h(cx)))
+                        .child(section("Relationships"))
                 })
                 .into_any_element()
             }
@@ -5073,16 +5195,9 @@ impl NodePeek {
                     }),
             )
             .children(drafts_bar)
-            .children(
-                endpoints.map(|endpoints| {
-                    v_flex()
-                        .child(section("Endpoints"))
-                        .child(div().mx(px(-space::XS)).child(endpoints))
-                }),
-            )
-            .when(has_properties, |d| {
-                d.child(section("Properties")).child(properties)
-            })
+            // An edge's endpoints and every property are rows, labelled; they need no heading.
+            .children(endpoints.map(|endpoints| div().mx(px(-space::XS)).child(endpoints)))
+            .when(has_properties, |d| d.child(properties))
             .when(!self.blobs.is_empty(), |d| {
                 d.child(section("Blobs")).child(self.render_blobs(cx))
             })
@@ -5105,6 +5220,37 @@ pub(crate) fn absence_text(then: &PropertyThen, capital: bool) -> String {
             .unwrap_or_default()
     } else {
         text
+    }
+}
+
+/// What a property's row or text shows of its state, and what a click on it does
+/// (`NodePeek::property_state`).
+struct PropertyState {
+    editable: bool,
+    editing: bool,
+    saving: bool,
+    draft: Option<DraftEntry>,
+    /// An enum's select or a boolean's switch, which writes as it is chosen.
+    picker: Option<AnyElement>,
+    opens_editor: bool,
+    tooltip: Option<String>,
+    copied: bool,
+}
+
+/// The icon of a property's kind, as its column's header and its row show it: an enum's
+/// values, text, a truth value, a number, a time, a vector or a Blob.
+pub(crate) fn property_icon(property: &gq_language::Property) -> IconName {
+    use gq_language::ScalarKind;
+    if property.enum_values.is_some() {
+        return IconName::ListTodo;
+    }
+    match property.kind {
+        ScalarKind::Text => IconName::CaseSensitive,
+        ScalarKind::Bool => IconName::Check,
+        ScalarKind::Integer | ScalarKind::Float => IconName::Hash,
+        ScalarKind::Date | ScalarKind::DateTime => IconName::Clock,
+        ScalarKind::Vector => IconName::Sparkle,
+        ScalarKind::Blob => IconName::File,
     }
 }
 
@@ -5202,6 +5348,29 @@ mod tests {
             view.save_field("name", window, cx);
         });
         cx.run_until_parked();
+    }
+
+    /// A text longer than its box holds, with words to wrap at, is shown under its name at the
+    /// full width; a short one, or one without words to wrap at (an email, an id), stays boxed
+    /// and is cut at its box's end (spec 014).
+    #[gpui::test]
+    async fn a_long_text_leaves_its_box_and_a_short_one_stays(cx: &mut TestAppContext) {
+        let (view, cx) = page(session(PEOPLE, cx), cx);
+        view.read_with(cx, |view, _| {
+            let name = view.property_named("name").unwrap();
+            assert!(!view.reads_long(name, &json!("Ada Lovelace")));
+            assert!(
+                !view.reads_long(
+                    name,
+                    &json!("ada.lovelace.countess.of.lovelace@analytical-engine.org")
+                ),
+                "no words to wrap at"
+            );
+            assert!(view.reads_long(
+                name,
+                &json!("Wrote the first published algorithm meant for a machine")
+            ));
+        });
     }
 
     /// A saved field shows its new value, and the view moves to its own commit without

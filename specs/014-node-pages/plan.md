@@ -93,6 +93,19 @@ Four parts, built in this order; each lands on its own.
   spec 004 stores and clears a value; every relationship as a section with its count, read
   in pages of 50 (IX), with "Show more"; for an edge, its endpoints and properties. Back and
   Forward walk pages as any tab.
+- **How a property reads**, on the page and in the peek alike, from spec 002's property rows
+  (`studio_ui::ds::property_row` and the values in pills): each property is a row, its type's
+  icon and its name in a label column, its value in a pill beside it, with no heading over
+  them. A list's elements are pills that wrap. A text longer than a pill holds, with words to
+  wrap at, leaves its row: it shows under its name, which folds it, at the full width; an email
+  or an id stays in its pill and is cut at the pill's end, its whole value in the tooltip. An
+  edge's endpoints are rows (← from, → to) whose values are nodes. An enum's menu, a switch, a
+  field being edited, a draft's dot and the states beside a row (saving, Copied, Open in the
+  editor) keep the row's height.
+- **How a relationship reads**: under a rule and "Relationships", each group is a fold row,
+  "knows → Person ⌄" (← for one pointing at this node) with its count at the end, over its
+  neighbours, a row each: its type's mark and its name, a click peeking it. Under the pointer
+  a row shows its × and a header its "+" (the page shows the "+" always).
 - **Keys, the same on every surface**:
   - Space peeks, and shows the right dock when it is hidden (an explicit request, unlike
     passive selection, which still never reopens a dock the person closed).
@@ -201,12 +214,13 @@ Four parts, built in this order; each lands on its own.
   row after the rest, with their number; opening it lists them beneath it, each with its "+",
   so the rows above do not move. A listed group whose last neighbour is removed moves under the
   empty row; one added to from there moves up once it has a neighbour.
-- **Built so far**: a group's "+" (always on the page, under the pointer in the peek) opens a
+- **Built so far**: a group's "+" (§1 says where it sits) opens a
   search over the other type, eight matches by name or id; ↑↓ choose and ↵ adds, written at
   once as one commit with this node at the end its group points from. On an outgoing
   `@card(..1)` group with a neighbour, ↵ replaces it: the old one is removed first, then the new
-  one added, two commits (rule D2). A neighbour's × (under the pointer) turns into "Remove" on
-  the first press and removes the relationship on the second; the node stays. Neighbour rows
+  one added, two commits (rule D2). A neighbour's × turns into "Remove" on
+  the first press, which stays shown, and removes the relationship on the second; the node
+  stays. Neighbour rows
   now carry their edge's id (`$e.@id as edge_id` in the neighbours read). A relationship type
   that needs properties is added from its own table, which the "+" opens. A refusal or a write
   that matched nothing stays on the group with its reason; the group is read again at the
@@ -263,6 +277,7 @@ Four parts, built in this order; each lands on its own.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | A property reads as a row with its value in a pill; a long text leaves its pill; a relationship lists its neighbours as rows | `type_table` `a_long_text_leaves_its_box_and_a_short_one_stays` (a name, an email-like value with no words to wrap at, a sentence); `studio_ui` `property_and_control_parts_draw_at_their_sizes`; the 163 other `type_table` tests unchanged (fields, drafts, conflicts, relationship writes, Blob slots); offscreen snapshots of person-000001's peek in the dev graph, at rest and with the pointer on a neighbour and on a header, and of keyset-paging in the `notes` graph | Name, email and dates in pills beside their icons; tags wrapped as pills; "contributes → Project", "knows → Person" and "worksAt → Company" over rows of marks and names, the × and the "+" only under the pointer; the note's body under a "body" fold at the full width. A first pass boxed neighbours as values with their × and "+" always shown, which read as clutter beside the reference |
 | 2026-10-21 | A field open when the view follows another branch stays a draft there | `type_table` `open_fields_stay_drafts_on_the_branch_a_page_leaves` (name refused with a 403 and opened again with its notice, title being typed), failing with the fields cleared as before; `peek` `a_refused_field_opens_again_with_its_text_and_reason` (the peek going keeps the refused text) unchanged | After the session moved to fix, main held name "Ada Lovelace" bound to "Ada" and title "Countess" bound to null, fix none, and no field stayed open. Before, both texts were lost: a field with a notice stays open after a blur, so nothing else had kept it |
 | 2026-10-20 | A draft retyped elsewhere while its save is out stands | `graph_store` `drafts_wait_with_their_branch` (settled only as it went out); `type_table` `a_save_that_lands_after_a_branch_switch_keeps_the_new_branchs_draft` (a landed and a refused cell save over a retyped draft), `a_batch_reads_its_rows_again_in_one_read` and `peek` `a_conflict_is_bound_to_the_value_read_at_the_head` (a batch's and a node's drafts read again) | The retyped draft keeps its text after the save lands or is refused, and no editor reopens over it; a draft unchanged since the save settles as before |
 | 2026-10-18 | A node's relationship groups are read as their rows are drawn | `type_table` `only_the_groups_drawn_are_read_and_scrolling_reads_the_rest_once` (60 groups on a 480 × 360 page, then scrolled to the end), `a_peek_reads_only_what_the_table_did_not`, `relationships_with_none_fold_away_until_asked_for`; offscreen snapshots against a local server holding a made-up graph whose Person takes part in 72 relationship groups, with the server's read requests counted | The table alone took 13 requests and the table with a row's peek 37, where the peek used to read all 72 groups and the node. Opening the page took 31 requests; scrolled to its end, 79, each group read once. Groups read as empty kept their rows, and small ones opened once read |

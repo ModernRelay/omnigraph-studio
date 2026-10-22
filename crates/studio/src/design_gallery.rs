@@ -409,8 +409,9 @@ impl Render for DesignGallery {
                         .child(ds::property_value().child(ds::value_text("1985-01-11", cx))),
                 )
                 .child(
-                    ds::property_row(IconName::ListTodo, "status", label)
-                        .child(ds::property_value().child(ds::value_text("confirmed", cx))),
+                    ds::property_row(IconName::ListTodo, "status", label).child(
+                        ds::property_value().child(ds::value_select("g-status", "confirmed")),
+                    ),
                 )
                 .child(ds::property_row(IconName::Check, "active", label).child(
                     ds::property_value().child(ds::switch("g-active", ToggleState::Selected, cx)),
@@ -421,20 +422,40 @@ impl Render for DesignGallery {
                             ds::value_list()
                                 .child(ds::value_text("databases", cx))
                                 .child(ds::value_text("security", cx))
-                                .child(ds::value_text("graphs", cx))
-                                .child(ds::value_add("g-add-tag")),
+                                .child(ds::value_text("graphs", cx)),
                         ),
                     ),
                 )
                 .child(div().py(px(space::MD)).flex().child(ds::rule_h(cx)))
-                .child(text::muted("knows → Person · 4"))
+                // A relationship's neighbours are rows under its fold, not values: each is a
+                // node to go to. The × shows under the pointer.
                 .child(
-                    ds::value_list()
-                        .child(ds::node_value("Person", "Shafi Wirth", cx))
-                        .child(ds::node_value("Person", "Barbara Dahl", cx))
-                        .child(ds::node_value("Person", "Yukihiro Knuth", cx))
-                        .child(ds::node_value("Person", "Frances Lamarr", cx))
-                        .child(ds::value_add("g-add-knows")),
+                    v_flex()
+                        .mx(px(-space::XS))
+                        .child(
+                            ds::fold_row("g-knows", "knows → Person", true, cx)
+                                .child(text::meta("4")),
+                        )
+                        .children(
+                            [
+                                "Shafi Wirth",
+                                "Barbara Dahl",
+                                "Yukihiro Knuth",
+                                "Frances Lamarr",
+                            ]
+                            .into_iter()
+                            .enumerate()
+                            .map(|(n, name)| {
+                                ds::SidebarRow::new(("g-knows", n), name)
+                                    .flush()
+                                    .start(studio_ui::type_mark("Person", name, cx))
+                                    .actions(ds::value_remove(("g-remove", n)))
+                            }),
+                        )
+                        .child(
+                            ds::fold_row("g-works", "worksAt → Company", false, cx)
+                                .child(text::meta("1")),
+                        ),
                 )
                 .child(
                     div()
@@ -881,7 +902,7 @@ impl Render for DesignGallery {
                 chips,
             ))
             .child(section(
-                "Property rows · boxed values, lists, neighbours, folds",
+                "Property rows · values, lists, relationships, folds",
                 div().w(px(size::INSPECTOR_WIDTH)).child(properties),
             ))
             .child(section("Buttons", buttons))
