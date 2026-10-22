@@ -115,7 +115,12 @@ stay put), IX (paged, virtualized).
   a restart reading where it read: past its own write, at that write's commit (since
   2026-10-21; before, at the commit it opened at, showing the value its write replaced and
   refusing its next write as changed elsewhere). A tab saved before it said whether it holds its
-  commit does not come back. Elsewhere than macOS, a PDF opens in the system's viewer.
+  commit does not come back. A tab that writes comes back writing to the branch it was saved on,
+  whichever the window shows, and one tab writes to one branch; a branch gone since disables
+  Choose File and Clear, saying so, and nothing is sent; one saved before it named its branch
+  does not come back (since 2026-10-21; before, a restored tab wrote to the window's branch,
+  bound to a value read on the branch it was saved on). Elsewhere than macOS, a PDF opens in
+  the system's viewer.
 - A Blob value takes a file (R1, `PUT`/`DELETE /graphs/{id}/blob`): "Choose File…" opens the
   system's picker, and a file dropped from the file manager does the same, on the Blob tab
   (its status bar, the whole tab as the drop target, and "Choose File…" in an empty value's
@@ -171,7 +176,9 @@ stay put), IX (paged, virtualized).
   Every page, section and group count is tagged with the pin it was sent at; one that lands
   after the table's own write moved the pin is read again at the new pin, never shown under it
   (since 2026-10-21; before, a page read before a save landed showed the old value, a deleted
-  row came back and an inserted one never showed).
+  row came back and an inserted one never showed). A pin carried forward to a head that changed
+  nothing the table reads (spec 015) leaves a read out as it was, and it lands (since
+  2026-10-21; before, it was sent again at every such move).
 - Sorted, a read that shows no row and is not the last (the rows with a value ran out) reads
   the rows without one at once (since 2026-10-21; before, a table whose rows all lacked the
   sort's value said it had none).
@@ -263,10 +270,11 @@ disclosure). An open section reads its first 10 rows when its line comes into vi
 N more of M" (or "Show N more" when the page holds the rest) reads a page, all keyset pages narrowed with `title = $value` (or `is null`) and
 pinned to the table's commit, in the table's sort. A closed section reads nothing. A section's
 read whose line is more than a screen from the lines drawn is dropped, freeing its slot (a
-connection has 8), and reads again when its line returns; rows a read puts in above the lines
-in view move the scroll with them, so those lines stay where they are (since 2026-10-21). Every
-read is engine-side, so the counts are right at any size. Edge tables group by their own
-properties the same way.
+connection has 8), and reads as many rows again when its line returns, a "Show more" page as a
+first read (before 2026-10-21 a dropped "Show more" never read again); rows a read puts in
+above the lines in view move the scroll with them, so those lines stay where they are (since
+2026-10-21). Every read is engine-side, so the counts are right at any size. Edge tables group
+by their own properties the same way.
 
 A node table also groups by a relationship ("people by company"): the Group menu lists the
 table's relationships after its properties, as does a relationship column's header menu. One
@@ -405,10 +413,12 @@ by their place and make their tooltips only when shown; and the grouped line lis
 once a frame. Blob cells are read once scrolling has paused for 120 ms, for the rows the lines
 then drawn show and the Blob columns drawn (grouped, a folded section's rows are on no line;
 since 2026-10-21, before which the span from the first row drawn to the last was read, and
-every Blob column); reads still out for cells scrolled away, up, down or sideways, are dropped
-and asked again when they return. Relationship cells read the rows of the lines near those
-drawn alike. Moving through a filter's offered values notifies its field, which draws the
-table around it and leaves the grid as it was (since 2026-10-21). A
+every Blob column). A section folded or opened puts other rows on the lines drawn, as rows put
+in or taken out do, and they are read (since 2026-10-21; before, they showed a grey "Blob"
+and Choose File refused until a scroll); reads still out for cells scrolled away, up, down or
+sideways, are dropped and asked again when they return. Relationship cells read the rows of the
+lines near those drawn alike. Moving through a filter's offered values notifies its field, which
+draws the table around it and leaves the grid as it was (since 2026-10-21). A
 new order or filter at the same commit keeps the relationship cells and Blob cells already
 read and reads only rows not seen yet; the counts it asks for again come from the session's
 kept answers.
@@ -442,6 +452,11 @@ kept answers.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | Folding a section reads the cells of the rows it moves into the lines drawn | `type_table` `folding_a_section_reads_the_cells_of_the_rows_it_brings_into_view` (two open sections of 300 rows, a Blob column and two relationship columns; the first folded), failing with the fold's reset undone | The lines drawn were the same before and after; the second section's first row had its Blob and relationships read. Undone, neither was |
+| 2026-10-21 | A read out when the pin moves to a head that changed nothing it reads lands | `type_table` `a_read_out_when_a_commit_to_another_type_moves_the_pin_lands` (another writer's Note at c2 while a Person page is read at c1), failing with every pin move counted as the table's own; `a_read_sent_before_the_tables_own_write_landed_is_read_again_at_its_commit`, extended (one read sent again) | The page landed once, the pin at c2, one request. Undone, the table sent it again, which the session answered without a request from c1's kept answer (`GraphSession::read`, carry-forward), so the test counts the table's sends: the request is sent again only where the session no longer keeps that answer or cannot tell every commit since |
+| 2026-10-21 | A "Show more" dropped away from the view reads again when its line returns | `type_table` `a_show_more_dropped_away_from_the_view_reads_again_when_its_line_returns` (section 0 with 2 of 12 rows and a page out, 150 folded sections after it, scrolled to the end and back), failing with the dropped read's size undone | Dropped at the end with its 100 rows noted; back at the top, one read of `limit 100` for its value. Undone, nothing was read: only a section with no rows read again |
+| 2026-10-21 | A restored Blob tab writes to the branch it was saved on | `type_table` `a_restored_tab_writes_only_to_the_branch_it_was_saved_on` (saved on main, restored with the window on fix; saved on `gone`; saved without its branch), `a_restored_tab_reads_and_binds_where_its_own_write_left_it` (now through `saved_blob` and `blob_view`, as the workspace restores), `a_tab_from_a_view_at_the_head_stores_a_file_bound_to_what_it_read`, extended (one key per branch, a held tab's alike) | The file went to main bound to the ETag read there; `gone` read "gone no longer exists" on Choose File and Clear and sent nothing; a writing tab saved without its branch did not come back, a held one did |
+| 2026-10-21 | A table's upload is bound as it goes, through the table | `type_table` `a_tables_upload_is_bound_where_its_values_hold_as_it_goes`, rewritten to upload: the table's insert of p3 with a Blob value lands on its pin while p1's file is read (every ETag of the type moved), then, in a second table, the window moves to fix instead; failing with the binding taken when the file was chosen | The first carried p1's ETag at the insert's commit and stored the file; the second went to main bound to what the cell showed when chosen. Bound when chosen, the first carried `"e1"`, read at c1, while p1 held `"e3"`: a 412. The Blob tab's test still sets its state by hand: no call of the tab's reaches it (its note says why) |
 | 2026-10-21 | The peek and the Blob tab bind an upload as it is sent | `type_table` `a_slot_upload_is_bound_to_what_the_view_shows_as_it_is_sent` (the peek's table saves p1's `scan` at c2 while a file for `doc` is read), `a_tabs_upload_is_bound_to_what_the_tab_shows_as_it_is_sent` (the tab comes to show a save of its cell at c2 while the file is read), each failing with the binding taken when the file was chosen | Both writes carried the ETag read at c2 and stored the file at c3. Bound when chosen, each sent the ETag read at c1 (the peek `"e2"`, the tab `"e1"`), which the server refuses with a 412, though the value each would replace was the one it showed then. `blob_write::upload`, which bound when chosen, is gone. The tab sends one write at a time and follows no other view's, so its test moves it to c2 itself |
 | 2026-10-21 | A delete chain deeper than the rounds followed says so | `graph_store` `a_chain_deeper_than_the_rounds_followed_is_refused_for_its_depth` (`Link` needing the one before, 40 and 31 long), failing with the round limit's old `TooMany` | 40 long: 32 rounds read, `PlanError::TooDeep`, "at least 32 steps deep", no "1,000"; 31 long: planned with 31 dependents, the 32nd round finding none. The dialog shows the plan error's own sentence, the read failure's "Studio could not read what depends on it" included. The edge delete's Undo cap is `deletes::UNDO_CAP`, the constant Undo reads to |
 | 2026-10-21 | The toolbar's controls are chips that say what they are set to and clear | `type_table` tests (179) unchanged; `studio_ui` `property_and_control_parts_draw_at_their_sizes` (a chip 26 px, its button centred); offscreen snapshots of Person (1440×900 at 2×, a scratch HOME so no config toast covers the toolbar): at rest, the Sort menu open, "name" chosen, then its × | At rest six pills, Views to Row, and Refresh. The Sort menu listed name, title, email and born, with Ascending and Descending disabled until an order was set; choosing name read "Sort name ↑ ×", put the header's arrow on name and ordered the rows from Ada Allen; the × read "Sort" again and the rows returned to id order. A ↓ icon beside "name ↑" contradicted it, so Sort's icon is ⇕ |
