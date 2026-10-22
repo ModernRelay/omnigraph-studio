@@ -1032,6 +1032,7 @@ mod tests {
                         type_name: type_name.map(str::to_owned),
                     })
                 }),
+                challenge: None,
             })
         };
         assert!(is_parentless(&refused(Some((ParentlessCommit, None)))));

@@ -13,9 +13,9 @@ mod client;
 
 pub use api::{CommitChanges, ErrorOutput};
 pub use client::{
-    ApiErrorSummary, BlobAt, BlobCell, BlobMeta, FeedAt, ForwardRequest, ForwardResponse,
-    GraphClient, HistoricalGap, MergePreview, PropertyThen, ReadError, ServerHealth, judge_write,
-    server_root,
+    ApiErrorSummary, BlobAt, BlobCell, BlobMeta, Challenge, FeedAt, ForwardRequest,
+    ForwardResponse, GraphClient, HistoricalGap, MergePreview, PropertyThen, ReadError,
+    ServerHealth, judge_write, server_root,
 };
 pub use http_client::{
     AsyncBody,

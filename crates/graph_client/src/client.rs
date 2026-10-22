@@ -70,6 +70,128 @@ pub struct ApiErrorSummary {
     /// Why a commit's changes could not be compared with its parent's (a 409), and the type
     /// at a schema boundary. Boxed, so every read's error stays small.
     pub change_diff_refusal: Option<Box<crate::api::ChangeDiffRefusalOutput>>,
+    /// The `Bearer` challenge a 401 carried (`WWW-Authenticate`), which a server sends with
+    /// every 401 since OmniGraph #1122; `None` otherwise, and from an older server.
+    pub challenge: Option<Box<Challenge>>,
+}
+
+/// A `WWW-Authenticate` challenge: its scheme and its parameters, as RFC 9110 §11.6.1 writes
+/// them. OmniGraph sends `Bearer`, with `error="invalid_token"` when it refused the token a
+/// request carried, and `resource_metadata="<url>"` when it takes OAuth sign-in (OmniGraph RFC
+/// 1017, A1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Challenge {
+    pub scheme: String,
+    /// Each parameter's name, lower-cased, and its value, unquoted.
+    pub params: Vec<(String, String)>,
+}
+
+impl Challenge {
+    /// The value of the parameter `name`, which is matched in any case.
+    pub fn param(&self, name: &str) -> Option<&str> {
+        self.params
+            .iter()
+            .find(|(param, _)| param.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// Whether the server refused the token the request carried (`error="invalid_token"`),
+    /// rather than finding none.
+    pub fn token_refused(&self) -> bool {
+        self.param("error") == Some("invalid_token")
+    }
+
+    /// Where the server's protected-resource metadata is, when it takes OAuth sign-in.
+    pub fn resource_metadata(&self) -> Option<&str> {
+        self.param("resource_metadata")
+    }
+
+    /// The challenges in one `WWW-Authenticate` value, in order. A parameter is `name=token` or
+    /// `name="quoted"`; a word with no `=` after it starts the next challenge.
+    pub fn parse_all(value: &str) -> Vec<Challenge> {
+        let bytes = value.as_bytes();
+        let mut at = 0;
+        let skip = |at: &mut usize, also_commas: bool| {
+            while *at < bytes.len()
+                && (bytes[*at] == b' '
+                    || bytes[*at] == b'\t'
+                    || (also_commas && bytes[*at] == b','))
+            {
+                *at += 1;
+            }
+        };
+        let word = |at: &mut usize| {
+            let start = *at;
+            while *at < bytes.len() && !b" \t,=".contains(&bytes[*at]) {
+                *at += 1;
+            }
+            value[start..*at].to_owned()
+        };
+        let mut challenges = Vec::new();
+        loop {
+            skip(&mut at, true);
+            let scheme = word(&mut at);
+            if scheme.is_empty() {
+                break;
+            }
+            let mut challenge = Challenge {
+                scheme,
+                params: Vec::new(),
+            };
+            loop {
+                skip(&mut at, true);
+                let before = at;
+                let name = word(&mut at);
+                skip(&mut at, false);
+                if name.is_empty() || bytes.get(at) != Some(&b'=') {
+                    at = before;
+                    break;
+                }
+                at += 1;
+                skip(&mut at, false);
+                let value = if bytes.get(at) == Some(&b'"') {
+                    at += 1;
+                    let mut unquoted = String::new();
+                    let mut chars = value[at..].char_indices();
+                    let mut end = value.len() - at;
+                    while let Some((index, c)) = chars.next() {
+                        match c {
+                            '"' => {
+                                end = index + 1;
+                                break;
+                            }
+                            '\\' => {
+                                if let Some((_, escaped)) = chars.next() {
+                                    unquoted.push(escaped);
+                                }
+                            }
+                            c => unquoted.push(c),
+                        }
+                    }
+                    at += end;
+                    unquoted
+                } else {
+                    word(&mut at)
+                };
+                challenge.params.push((name.to_ascii_lowercase(), value));
+            }
+            challenges.push(challenge);
+            if at >= bytes.len() {
+                break;
+            }
+        }
+        challenges
+    }
+
+    /// The `Bearer` challenge among a response's `WWW-Authenticate` values, if any.
+    fn bearer(headers: &HeaderMap) -> Option<Challenge> {
+        headers
+            .get_all(http_client::http::header::WWW_AUTHENTICATE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(Challenge::parse_all)
+            .find(|challenge| challenge.scheme.eq_ignore_ascii_case("bearer"))
+    }
 }
 
 /// What a read at a commit was refused for because the commit predates the current schema: a
@@ -791,6 +913,7 @@ impl GraphClient {
                     code: None,
                     diagnostic: None,
                     change_diff_refusal: None,
+                    challenge: None,
                 }))
             }
             _ => Err(refusal(&raw)),
@@ -1355,19 +1478,26 @@ fn check_contract(raw: &RawResponse) -> Result<(), ReadError> {
 /// server sent it ([`check_contract`]).
 fn refusal(raw: &RawResponse) -> ReadError {
     match check_contract(raw) {
-        Ok(()) => ReadError::Refused(summary(raw.status, &raw.body)),
+        Ok(()) => ReadError::Refused(summary(raw)),
         Err(error) => error,
     }
 }
 
-fn summary(status: StatusCode, body: &[u8]) -> ApiErrorSummary {
-    match serde_json::from_slice::<ErrorOutput>(body) {
+/// A refusal's summary: its body, and a 401's challenge.
+fn summary(raw: &RawResponse) -> ApiErrorSummary {
+    let status = raw.status;
+    let challenge = (status == StatusCode::UNAUTHORIZED)
+        .then(|| Challenge::bearer(&raw.headers))
+        .flatten()
+        .map(Box::new);
+    match serde_json::from_slice::<ErrorOutput>(&raw.body) {
         Ok(error) => ApiErrorSummary {
             status: status.as_u16(),
             message: error.error,
             code: error.code,
             diagnostic: error.diagnostic,
             change_diff_refusal: error.change_diff_refusal.map(Box::new),
+            challenge,
         },
         Err(_) => ApiErrorSummary {
             status: status.as_u16(),
@@ -1378,6 +1508,7 @@ fn summary(status: StatusCode, body: &[u8]) -> ApiErrorSummary {
             code: None,
             diagnostic: None,
             change_diff_refusal: None,
+            challenge,
         },
     }
 }
@@ -2490,6 +2621,7 @@ mod tests {
                 code: None,
                 diagnostic: None,
                 change_diff_refusal: None,
+                challenge: None,
             }
             .historical_gap()
         };
@@ -2993,5 +3125,57 @@ mod tests {
         let error = GraphClient::new("localhost:8080", None, http.clone()).unwrap_err();
         assert!(error.to_string().contains("http://"), "{error}");
         assert!(GraphClient::new("http://localhost:8080", None, http).is_ok());
+    }
+
+    /// A 401 carries the server's `Bearer` challenge (OmniGraph #1122): whether it refused the
+    /// token sent, and where its protected-resource metadata is; another status, or a 401
+    /// without the header (an older server), carries none.
+    #[test]
+    fn a_401_carries_its_bearer_challenge() {
+        let refused = |status: u16, challenge: Option<&'static str>| {
+            let http = FakeHttpClient::create(move |_request| async move {
+                let mut builder = Response::builder()
+                    .status(status)
+                    .header(CONTRACT_HEADER, CONTRACT);
+                if let Some(challenge) = challenge {
+                    builder = builder.header("www-authenticate", challenge);
+                }
+                Ok(builder
+                    .body(AsyncBody::from(r#"{"error":"unauthorized","code":"unauthorized"}"#))
+                    .unwrap())
+            });
+            match block_on(client(http).graphs()) {
+                Err(ReadError::Refused(summary)) => summary.challenge,
+                other => panic!("{other:?}"),
+            }
+        };
+        let challenge = refused(
+            401,
+            Some(
+                r#"Bearer error="invalid_token", resource_metadata="https://g.test/.well-known/oauth-protected-resource/mcp""#,
+            ),
+        )
+        .unwrap();
+        assert!(challenge.token_refused());
+        assert_eq!(
+            challenge.resource_metadata(),
+            Some("https://g.test/.well-known/oauth-protected-resource/mcp")
+        );
+        let none_sent = refused(401, Some("Bearer")).unwrap();
+        assert!(!none_sent.token_refused());
+        assert_eq!(none_sent.resource_metadata(), None);
+        assert_eq!(refused(401, None), None);
+        assert_eq!(refused(403, Some("Bearer")), None);
+
+        // Several challenges in one value, a quoted escape, and names in any case.
+        let all = Challenge::parse_all(
+            r#"Basic realm="a, b", Bearer ERROR=invalid_token, error_description="say \"no\"""#,
+        );
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].scheme, "Basic");
+        assert_eq!(all[0].param("realm"), Some("a, b"));
+        assert_eq!(all[1].scheme, "Bearer");
+        assert!(all[1].token_refused());
+        assert_eq!(all[1].param("error_description"), Some(r#"say "no""#));
     }
 }
