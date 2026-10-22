@@ -24,6 +24,12 @@ if [[ "${1:-}" == "--reset" ]]; then
   rm -rf "$DATA"
 fi
 
+# Every CLI call runs in a home of its own, outside the cluster root: the operator's ~/.omnigraph
+# may hold a config this build cannot read, which stops even a direct `cluster apply`.
+home=$(mktemp -d)
+trap 'rm -rf "$home"' EXIT
+export OMNIGRAPH_HOME=$home
+
 # The whole output, then its first line: with `| head -1` the CLI can panic writing its second
 # line into a closed pipe, which `pipefail` turns into a failed start.
 version=$("$CLI" version)
@@ -75,10 +81,11 @@ OMNIGRAPH_SERVER_BEARER_TOKENS_JSON="{\"act-dev\":\"$TOKEN\"}" \
   "$SERVER" --cluster "$DATA" --bind "$BIND" &
 server=$!
 # The CLI sends a token only to a target its config names, never from OMNIGRAPH_BEARER_TOKEN, so
-# the seed loads run in a home of their own that names this server, outside the cluster root.
-home=$(mktemp -d)
+# the seed loads find this server named in the home's config.
 printf 'target_config_version: 1\ntargets:\n  dev: { kind: server, endpoint: "http://%s", credential: dev }\n' "$BIND" > "$home/config.yaml"
-trap 'kill $server 2>/dev/null; rm -rf "$home"' EXIT INT TERM
+# Only EXIT: bash runs it when a signal ends the script too, and a trapped INT or TERM would let the
+# script carry on after the server is gone.
+trap 'kill $server 2>/dev/null; rm -rf "$home"' EXIT
 
 # Asked only while the server runs: one that exited (the address taken meanwhile, a cluster it
 # cannot open) is reported as having exited, not as a server that answers no contract.
@@ -112,9 +119,9 @@ fi
 
 if [[ $fresh == 1 ]]; then
   [[ -f "$ROOT/dev/seed.jsonl" ]] || python3 "$ROOT/script/dev-seed.py" > "$ROOT/dev/seed.jsonl"
-  OMNIGRAPH_HOME=$home OMNIGRAPH_TOKEN_DEV=$TOKEN "$CLI" load --target dev --graph knowledge \
+  OMNIGRAPH_TOKEN_DEV=$TOKEN "$CLI" load --target dev --graph knowledge \
     --data "$ROOT/dev/seed.jsonl" --mode overwrite --yes > /dev/null
-  OMNIGRAPH_HOME=$home OMNIGRAPH_TOKEN_DEV=$TOKEN "$CLI" load --target dev --graph notes \
+  OMNIGRAPH_TOKEN_DEV=$TOKEN "$CLI" load --target dev --graph notes \
     --data "$ROOT/dev/notes-seed.jsonl" --mode overwrite --yes > /dev/null
   rm -f "$pending"
   echo "Loaded dev/seed.jsonl into knowledge and dev/notes-seed.jsonl into notes."

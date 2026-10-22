@@ -23,7 +23,9 @@ how to open them. To build from source instead, see below.
 
 Requirements:
 
-- Rust 1.98.1, installed by `rust-toolchain.toml`.
+- Rust 1.98.1, installed by `rust-toolchain.toml`. With Homebrew's `rustup`, put
+  `$(brew --prefix rustup)/bin` first on `PATH`: its `cargo` otherwise runs the first `rustc` on
+  `PATH`, such as Homebrew's `rust`, whatever its version.
 - CMake, which builds wasmtime's C API for Zed's tree-sitter (`brew install cmake` on macOS).
 - macOS: the Command Line Tools (GPUI compiles its Metal shaders when Studio starts); full
   Xcode to compile them into a release build (`script/bundle-mac`). Linux: the Wayland, X11 and
@@ -48,6 +50,10 @@ It stops, saying which, when either binary speaks another contract: the CLI by i
 OMNIGRAPH_STUDIO_SERVER=http://127.0.0.1:8787 OMNIGRAPH_STUDIO_TOKEN=dev-token \
   OMNIGRAPH_STUDIO_GRAPH=knowledge cargo run
 ```
+
+Or both in one step: `script/dev` starts `script/dev-server` unless a server already answers at
+its address, runs Studio on `knowledge` once the graphs are seeded, and stops the server it
+started when Studio quits. Its arguments go to `cargo run` (`script/dev --release`).
 
 A clean debug build takes about 2.5 minutes on an Apple M5 Pro and about 8 GB of `target/`; a
 release build (`cargo run --release`) about 10 minutes.

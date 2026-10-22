@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Run Studio on the development graphs in one step: start script/dev-server unless a server
+# already answers at its address, open `knowledge` once both graphs are seeded, and stop the
+# server it started when Studio quits.
+#
+#   script/dev               # cargo run
+#   script/dev --release     # arguments go to `cargo run`
+#
+# OMNIGRAPH_BIN, OMNIGRAPH_SERVER_BIN, STUDIO_DEV_DATA and STUDIO_DEV_BIND reach script/dev-server;
+# OMNIGRAPH_STUDIO_GRAPH=notes opens the other graph.
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+BIND=${STUDIO_DEV_BIND:-127.0.0.1:8787}
+
+if curl -s -o /dev/null --max-time 2 "http://$BIND/healthz"; then
+  echo "Using the server already at http://$BIND; it keeps running after Studio quits."
+else
+  log=$(mktemp)
+  "$ROOT/script/dev-server" > "$log" 2>&1 &
+  server=$!
+  trap 'kill "$server" 2>/dev/null || true; wait "$server" 2>/dev/null || true; rm -f "$log"' EXIT
+  trap 'exit 130' INT TERM
+  # dev-server says "Serving" once both graphs are seeded, and exits on any error before it.
+  until grep -q '^Serving ' "$log"; do
+    if ! kill -0 "$server" 2>/dev/null; then
+      cat "$log" >&2
+      exit 1
+    fi
+    sleep 0.5
+  done
+  grep -E '^(Serving|Loaded|Released) ' "$log"
+fi
+
+cd "$ROOT"
+OMNIGRAPH_STUDIO_SERVER="http://$BIND" OMNIGRAPH_STUDIO_TOKEN=dev-token \
+  OMNIGRAPH_STUDIO_GRAPH="${OMNIGRAPH_STUDIO_GRAPH:-knowledge}" cargo run "$@"
