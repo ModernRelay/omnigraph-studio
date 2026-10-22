@@ -152,8 +152,10 @@ Checked at main `97788d37` by reading the CLI's source (`operator_schema.rs` and
   published when this was written; until then the agent has no CLI (spec 013, as decided).
 - **The version signal** (E34, #1127): `version --json` still reports `protocols.target: 1`, as
   before the change.
-- Studio's reading of the person's own operator file (`graph_store::cli_config`, spec 003) still
-  reads the `target_config_version` form; it is open.
+- Studio's reading of the person's own operator file (`graph_store::cli_config`, spec 003) read
+  the `target_config_version` form. Closed on 2026-10-21: Studio parses neither form and asks the
+  CLI (`target list`, `target inspect`, `credentials status`, `credentials export`), choosing
+  it by its protocols and those commands (spec 003).
 
 ## The changes
 

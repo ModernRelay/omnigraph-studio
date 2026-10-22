@@ -127,9 +127,9 @@ a 412 reopens the draft.
 Until the `omnigraph studio` launcher exists (deferred, `docs/deferred-engine-changes.md`),
 Studio connects to running servers:
 
-1. Servers from `~/.omnigraph/config.yaml` (or `$OMNIGRAPH_HOME`), with tokens resolved as the
-   CLI resolves them: `OMNIGRAPH_TOKEN_<NAME>`, then `[<name>] token = …` in
-   `$OMNIGRAPH_HOME/credentials`.
+1. The server targets the OmniGraph CLI lists (`omnigraph target list --json`), each token
+   exported by the CLI through a pipe (`omnigraph credentials export --target NAME`) and kept in
+   memory: Studio parses neither the operator file nor any credential source (spec 003).
 2. A server added by URL and token in Studio, with the token kept in the OS keychain.
 3. A local graph is opened by serving it first (`omnigraph-server --cluster <dir>`); Studio
    does not open storage itself.
