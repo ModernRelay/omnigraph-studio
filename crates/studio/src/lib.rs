@@ -9,6 +9,7 @@ pub mod logging;
 mod menus;
 mod open_graph;
 mod settings_view;
+mod update_status;
 
 use std::collections::HashSet;
 
@@ -18,7 +19,9 @@ use gpui::{
     WindowHandle, WindowOptions, px, size,
 };
 use graph_store::{ConnectionRegistry, open_session, open_session_behind};
+use studio_actions::update::{CheckForUpdates, DownloadUpdate, RestartToUpdate, ViewReleaseNotes};
 use studio_actions::workspace::{NewWindow, OpenGraph, OpenLink, OpenSettings, Quit, RevealLog};
+use studio_update::{UpdateState, Updater};
 use studio_workspace::{SavedGraph, SavedWindow, ToastKind, Workspace};
 
 pub use open_graph::OpenGraphModal;
@@ -30,6 +33,8 @@ pub fn init(cx: &mut App) {
     studio_theme::init_themes(cx);
     editor::init(cx);
     graph_store::init(cx);
+    // After `graph_store`, whose HTTP client it sends through (spec 017).
+    studio_update::init(cx);
     keymaps::load(cx);
 
     command_palette::init(cx);
@@ -78,7 +83,30 @@ pub fn init(cx: &mut App) {
         })
         .ok();
     });
+    cx.on_action(|_: &CheckForUpdates, cx| {
+        if let Some(updater) = Updater::global(cx) {
+            updater.update(cx, |updater, cx| updater.check(cx));
+        }
+    });
+    cx.on_action(|_: &ViewReleaseNotes, cx| {
+        if let Some(updater) = Updater::global(cx) {
+            let url = updater.read(cx).release_notes_url();
+            cx.open_url(&url);
+        }
+    });
     menus::set(cx);
+    // The app menu offers Restart to Update once an update is ready.
+    if let Some(updater) = Updater::global(cx) {
+        let mut ready = false;
+        cx.observe(&updater, move |updater, cx| {
+            let now = matches!(updater.read(cx).state(), UpdateState::Ready { .. });
+            if now != ready {
+                ready = now;
+                menus::set(cx);
+            }
+        })
+        .detach();
+    }
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else { return };
         let handle = cx.entity().downgrade();
@@ -93,6 +121,25 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &OpenSettings, window, cx| {
             open_settings(workspace, window, cx);
         });
+        if let Some(updater) = Updater::global(cx) {
+            let status = cx.new(|cx| update_status::UpdateStatus::new(updater, cx));
+            workspace.set_status_item(status.into(), cx);
+        }
+        // Offered only when they can run (constitution VIII). Deferred, as Quit is: the window
+        // is held while the action dispatches, and restarting may ask in it.
+        workspace.register_action_when(
+            |_, cx| update_is(cx, |state| matches!(state, UpdateState::Ready { .. })),
+            |_, _: &RestartToUpdate, _, cx| cx.defer(|cx| studio_workspace::restart(false, cx)),
+        );
+        workspace.register_action_when(
+            |_, cx| update_is(cx, |state| matches!(state, UpdateState::Available { .. })),
+            |_, _: &DownloadUpdate, _, cx| {
+                if let Some(updater) = Updater::global(cx) {
+                    let url = updater.read(cx).download_url();
+                    cx.open_url(&url);
+                }
+            },
+        );
         // GPUI's frame-time overlay exists only with its `profiler` feature, which the `perf`
         // feature turns on: frame times, then their distribution, then hidden again.
         workspace.register_action(
@@ -122,6 +169,11 @@ pub fn init(cx: &mut App) {
         });
     })
     .detach();
+}
+
+/// Whether the updater's state is one `test` accepts.
+fn update_is(cx: &App, test: impl Fn(&UpdateState) -> bool) -> bool {
+    Updater::global(cx).is_some_and(|updater| test(updater.read(cx).state()))
 }
 
 /// Opens the design system's gallery tab, or shows the one open.

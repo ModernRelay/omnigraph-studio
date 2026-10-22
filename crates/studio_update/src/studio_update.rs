@@ -165,6 +165,11 @@ impl Updater {
         &self.state
     }
 
+    /// The version running.
+    pub fn running(&self) -> &Version {
+        &self.options.running
+    }
+
     /// Checks on a schedule while `on` (`studio.auto_update`): half a minute after launch, then
     /// hourly. A development build never does.
     pub fn set_automatic(&mut self, on: bool, cx: &mut Context<Self>) {
@@ -458,16 +463,16 @@ fn key_from(text: &str) -> Option<String> {
 /// Starts the updater for this Studio: after `graph_store::init`, whose HTTP client it sends
 /// through, and `studio_settings::init`, whose `studio.auto_update` it follows.
 pub fn init(cx: &mut App) {
-    let exe = std::env::current_exe().ok();
-    // A bundle's path on macOS; GPUI gives the executable's folder for a bare binary.
-    let bundle = cx
-        .app_path()
+    let installed = std::env::current_exe()
         .ok()
+        .is_some_and(|exe| studio_settings::is_release_build(&exe));
+    // A bundle's path, asked only of an installed Studio on macOS: GPUI gives the executable's
+    // folder for a bare binary, and a test platform has no answer.
+    let bundle = (installed && cfg!(target_os = "macos"))
+        .then(|| cx.app_path().ok())
+        .flatten()
         .filter(|path| path.extension().is_some_and(|extension| extension == "app"));
-    let release_build = exe
-        .as_deref()
-        .is_some_and(studio_settings::is_release_build)
-        && (cfg!(not(target_os = "macos")) || bundle.is_some());
+    let release_build = installed && (cfg!(not(target_os = "macos")) || bundle.is_some());
     let options = Options {
         running: Version::parse(env!("CARGO_PKG_VERSION"))
             .expect("the workspace version is semver"),
