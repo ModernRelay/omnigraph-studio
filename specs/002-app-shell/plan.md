@@ -84,11 +84,13 @@ branch list, and its server's health is checked only while something else shows 
 at once when a poll came meanwhile. A graph a start reopens behind the shown one is opened
 parked and sends nothing, its first reads included (schema, branch list, counts, stored
 queries, access), until first shown. A 503's recheck due while it is parked waits for the
-show, and refreshes what is held rather than blanking it (since 2026-10-21). Each window's graphs (server URL, graph,
-branch, and the one shown) and bounds are written to the owner-only `session.json` as they
-change, in the order the windows opened. The next start reopens every window that has a graph
-on a server still known, where it was, showing the graph it showed; with none it opens one
-window asking for a graph. Closing a window forgets it, unless it was the last one open: that
+show, and refreshes what is held rather than blanking it (since 2026-10-21). Each window's graphs (their CLI target
+by name, graph, branch, and the one shown) and bounds are written to the owner-only
+`session.json` as they change, in the order the windows opened; a graph's tabs and drafts are
+kept by its target's name and its id too (since 2026-10-22; before, by its server's address,
+which a window saved then names instead, so it is not reopened). The next start reopens every
+window that has a graph on a target the CLI still lists, where it was, showing the graph it
+showed; with none it opens one window asking for a graph. Closing a window forgets it, unless it was the last one open: that
 one comes back at the next start, or when the Dock icon is clicked with no window open, until
 another window opens. Quitting keeps every window. A new window (⌘⇧N) asks for a graph; it
 opens where the last moved window was. A `session.json` from before held one window's graphs
@@ -454,8 +456,9 @@ and a 97 % fill let the text behind show through.
 
 ### Files, logs and the data directory
 
-- Every file Studio keeps (the workspace and session files, window bounds, settings, saved
-  servers, recent commands, the agent's conversation index, saved queries) is written through
+- Every file Studio keeps (the workspace and session files, window bounds, settings, the graph
+  ids remembered per CLI target, recent commands, the agent's conversation index, saved
+  queries) is written through
   `studio_settings::write_atomic`: a temporary file beside the target, synced, then renamed over
   it. A crash or a full disk leaves the old file or the new one, never an empty one. Studio's
   own files are owner-only (`0600`); a query file the person chose keeps its mode, and a link
@@ -938,6 +941,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-22 | Saved windows reopen by CLI target | `studio` `a_graph_two_windows_listed_reopens_in_the_first`, extended: a window with a graph on a target no longer listed and one saved by its server's address (`server_url`); `studio_workspace` `persistence` tests with `target` | The listed target's graphs reopen as before; the other window is not reopened. `SavedGraph` holds `target`, and the workspace files are keyed by target and graph |
 | 2026-10-21 | A log folder or `keymap.json` that cannot be made is said | `studio` `a_log_folder_that_cannot_be_made_is_said` (a log file present, absent, and under a file where its folder would be); the keymap button's error path by reading `settings_view.rs` `show_keymap_file` | The blocked folder reads "The log folder could not be made at …/blocker/logs: " and the system's reason, and goes to a toast, deferred past the window's dispatch as a link's notice is; a `keymap.json` write that fails is logged and toasted with its path. Before, the first did nothing and the second only logged. The keymap toast is not driven by a test |
 | 2026-10-21 | The saved recent list is read as it was written | `command_palette` `saved_keys_follow_those_run` (it replaces `saved_keys_follow_those_run_and_drop_found_nodes`: a list saved after a key was run, then 55 more keys) | The saved keys followed `type:Person` in their own order, each once, up to the 50 kept. No key is dropped on reading: Studio records no `node:` key, and the filter for the ones an earlier build saved is gone with `found::is_node_key` |
 | 2026-10-21 | A full toast stack keeps an Undo and an error | `studio_workspace` `an_undo_and_an_error_stay_when_toasts_overflow` (an error, a delete with Undo, an info toast, then four commits; then two more errors and two commits); run again with the oldest toast taken away, as before | The info went first, then the oldest commits: the error, the Undo and the two newest commits showed. With four kept toasts the stack grew to five, the newest commit taking the place of the one before it. Taking the oldest away left only the four commits, the error and the Undo gone |
@@ -1028,6 +1032,11 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 | 2026-10-21 | The palette, the agent's composer and the type table follow the three reference frames on the design system | Offscreen snapshots (1440×900 at 2×) against a scratch dev server, light, dark and glass, before and after, cropped at 2× beside the references; `studio_ui` `key_caps_are_one_box_per_key`, `a_row_knows_its_place_in_its_panel`, `controls_draw_at_their_sizes` (a tile, a segment and the grid's cells at their tokens), `values_pick_their_kind_icon`; `command_palette` `rows_are_grouped_by_kind_until_text_is_typed`; `agent_panel` `a_querys_rows_are_read_from_what_its_call_returned`, `a_tool_call_keeps_the_result_its_agent_reported`, `a_turn_ends_at_its_last_reply` | The palette is a tray of inset panels, its groups named while nothing is typed and counted once text is, rows led by tiles with their keys as caps; the inset panels' corners stayed square until each end was drawn as tall as its corner (GPUI clamps a corner to half its box). The type table's header was 42 px under Zed's padding; Studio's own header row is 30. In a dark theme a darker header fill did not show, so the header takes the well's ink |
 
 ## Corrections
+
+- 2026-10-22 · Saved windows and each graph's saved tabs were keyed by the server's address,
+  from Studio's own server list. Studio keeps no server list now (spec 003): a graph is kept by
+  its CLI target's name and its id, and a window that names a target the CLI no longer lists,
+  or an address (saved before), is not reopened. Nothing converts the old files.
 
 - 2026-10-16 · Switching graphs in a window kept the docks of the graph shown before: a graph's
   saved docks were read only when it opened fresh. Showing a parked graph now applies its own.

@@ -235,24 +235,15 @@ pub async fn read_targets(dir: Option<&Path>, programs: &[PathBuf]) -> CliTarget
 /// reopens find the CLI's servers. Past it the targets are listed at the next check.
 pub const START_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// [`read_targets`], given [`START_TIMEOUT`] at most.
-pub async fn read_targets_at_start(dir: Option<&Path>, programs: &[PathBuf]) -> CliTargets {
+/// [`read_targets`], given [`START_TIMEOUT`] at most: `None` past it.
+pub async fn read_targets_at_start(dir: Option<&Path>, programs: &[PathBuf]) -> Option<CliTargets> {
     use futures::FutureExt as _;
     let read = read_targets(dir, programs).fuse();
     let timer = smol::Timer::after(START_TIMEOUT).fuse();
     futures::pin_mut!(read, timer);
     futures::select! {
-        read = read => read,
-        _ = timer => CliTargets {
-            servers: None,
-            errors: vec![format!(
-                "the OmniGraph CLI did not list its targets within {} s of Studio's start; Studio \
-                 lists them again",
-                START_TIMEOUT.as_secs()
-            )],
-            watched: Vec::new(),
-            managed: Vec::new(),
-        },
+        read = read => Some(read),
+        _ = timer => None,
     }
 }
 
@@ -481,7 +472,8 @@ fn land(name: &str, value: &Value, watched: &mut Vec<PathBuf>) -> Result<CliServ
         auth,
         proxy,
         alternatives: Vec::new(),
-        revision: format!("{value} {:?}", stamp(&file)),
+        // The name too: an entry renamed is listed alike, and its token is asked for by name.
+        revision: format!("{name} {value} {:?}", stamp(&file)),
     })
 }
 

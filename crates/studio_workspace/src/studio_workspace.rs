@@ -603,11 +603,11 @@ impl Workspace {
         )
     }
 
-    /// The server URL and graph id the open session belongs to.
+    /// The CLI target and graph id the open session's state is saved under.
     fn graph_key(&self, cx: &App) -> Option<(String, String)> {
         self.session
             .as_ref()
-            .map(|session| graph_key_of(session, cx))
+            .map(|session| saved_key_of(session, cx))
     }
 
     fn snapshot(&self, cx: &App) -> SavedWorkspace {
@@ -662,7 +662,7 @@ impl Workspace {
                 .map(|(session, _)| {
                     let session = session.read(cx);
                     SavedGraph {
-                        server_url: session.connection.read(cx).server.url.clone(),
+                        target: session.connection.read(cx).server.name.clone(),
                         graph: session.graph_id.clone(),
                         branch: session.branch.clone(),
                     }
@@ -861,8 +861,8 @@ impl Workspace {
     pub fn add_session_behind(&mut self, session: Entity<GraphSession>, cx: &mut Context<Self>) {
         let saved = persistence::restore_enabled()
             .then(|| {
-                let (url, graph) = graph_key_of(&session, cx);
-                persistence::load(&url, &graph)
+                let (target, graph) = saved_key_of(&session, cx);
+                persistence::load(&target, &graph)
             })
             .flatten();
         self.add_behind(session, saved, cx);
@@ -4094,6 +4094,14 @@ fn graph_key_of(session: &Entity<GraphSession>, cx: &App) -> (String, String) {
     (url, session.graph_id.clone())
 }
 
+/// The key a graph's tabs and drafts are saved under: its CLI target's name and its id, as the
+/// saved windows name it (spec 002).
+fn saved_key_of(session: &Entity<GraphSession>, cx: &App) -> (String, String) {
+    let session = session.read(cx);
+    let target = session.connection.read(cx).server.name.clone();
+    (target, session.graph_id.clone())
+}
+
 /// The button on a committed write's toast: Undo for a delete Studio can put back (History
 /// still holds the commit), else the commit.
 fn committed_follow_up(
@@ -4298,7 +4306,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ToggleZoom, window, cx| this.toggle_zoom(window, cx)))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| {
                 if let Some(session) = &this.session {
-                    session.update(cx, |s, cx| s.reload(cx));
+                    session.update(cx, |s, cx| s.refresh(cx));
                 }
             }));
         for registration in self.actions.clone() {

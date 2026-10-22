@@ -1,6 +1,9 @@
-//! Every server Studio knows: from the CLI config, added in Studio, or from the environment.
+//! Every server Studio knows: the server targets the OmniGraph CLI lists, and, for development
+//! and tests, one from the environment. Studio keeps no server list or token of its own
+//! (OmniGraph RFC 1017): a server is added as a CLI target, through the CLI
+//! ([`ConnectionRegistry::add_target`]).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,11 +13,8 @@ use http_client::HttpClient;
 use serde::{Deserialize, Serialize};
 
 use crate::cli_config::{self, CliAlias, CliAuth, CliServer, CliTargets, FileStamp, ManagedTarget};
-use crate::cli_tokens::{self, CliTokenSource, TokenSource};
+use crate::cli_tokens::{self, CliTokenSource, Token, TokenSource};
 use crate::connection::{Connection, ServerEntry, ServerSource};
-
-/// The keychain user name Studio stores server tokens under.
-const KEYCHAIN_USER: &str = "omnigraph-studio";
 
 /// How often the CLI's files are checked for a change, as Studio's settings file is.
 const OPERATOR_POLL: Duration = Duration::from_secs(2);
@@ -25,20 +25,13 @@ type ProxiedHttp = Arc<dyn Fn(&str) -> anyhow::Result<Arc<dyn HttpClient>> + Sen
 /// Makes the token source of a CLI server whose token the CLI gives; none for an anonymous one.
 type TokenSources = Arc<dyn Fn(&CliServer) -> Option<Arc<dyn TokenSource>> + Send + Sync>;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct SavedServers {
+/// The graph ids opened on each CLI target, by the target's name, which Studio remembers so the
+/// Open dialog offers them again when a token may not list the server's graphs. It names no
+/// server: the CLI's targets are the only ones.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct KnownGraphs {
     #[serde(default)]
-    servers: Vec<SavedServer>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SavedServer {
-    name: String,
-    url: String,
-    /// `cli` for a CLI server whose remembered graphs Studio keeps, `studio` for one added here.
-    source: String,
-    #[serde(default)]
-    graphs: Vec<String>,
+    targets: BTreeMap<String, Vec<String>>,
 }
 
 /// What a CLI server was when the CLI's targets were last listed.
@@ -52,7 +45,7 @@ struct CliKept {
 
 pub struct ConnectionRegistry {
     pub connections: Vec<Entity<Connection>>,
-    /// Servers named in the environment or saved by Studio that could not be added at start.
+    /// The environment's server, when it could not be added at start.
     start_errors: Vec<String>,
     http: Arc<dyn HttpClient>,
     proxied: ProxiedHttp,
@@ -73,11 +66,10 @@ pub struct ConnectionRegistry {
     cli_errors: Vec<String>,
     /// The managed targets the CLI last listed, refused until Studio has its own sign-in.
     managed: Vec<ManagedTarget>,
-    /// Servers saved by Studio and not connected this run, since another connection has their
-    /// address (the environment's): they stay in the saved list.
-    kept_saved: Vec<SavedServer>,
-    /// The saved list may be written: `false` when `servers.json` could not be read and could
-    /// not be set aside either, so no save this run writes over what it holds.
+    /// The graph ids remembered for each CLI target, as last read or saved.
+    known: KnownGraphs,
+    /// Whether the remembered graphs are written to the data directory: Studio's, not a
+    /// test's.
     saving: bool,
     _watch: Option<Task<()>>,
 }
@@ -89,67 +81,48 @@ impl Global for GlobalRegistry {}
 /// Studio's data directory; one rule for the whole app, kept in `studio_settings`.
 pub use studio_settings::data_dir;
 
-fn saved_path() -> PathBuf {
-    data_dir().join("servers.json")
+fn known_graphs_path() -> PathBuf {
+    data_dir().join("known_graphs.json")
 }
 
-/// Studio's saved servers as read at start, whether the list may be written over, and what
-/// the person is told once when the file could not be used.
-struct LoadedServers {
-    saved: SavedServers,
-    saving: bool,
-    notice: Option<String>,
+/// The graph ids remembered at `path`: none when the file is not there or cannot be read, which
+/// the next save replaces.
+fn load_known_graphs(path: &Path) -> KnownGraphs {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
 }
 
-/// The servers saved at `path`. A file that cannot be read or parsed is set aside beside
-/// itself before anything replaces it, as the workspace's files are, so the next save keeps
-/// what it held: every server added in Studio, whose tokens the keychain still holds. One
-/// that cannot be set aside is never written over. Either way the person is told, once.
-fn load_saved_at(path: &Path) -> LoadedServers {
-    let read = std::fs::read_to_string(path).map_err(|error| (error.kind(), error.to_string()));
-    let reason = match read {
-        Ok(text) => match serde_json::from_str(&text) {
-            Ok(saved) => {
-                return LoadedServers {
-                    saved,
-                    saving: true,
-                    notice: None,
-                };
+/// A target name for a server added at `url` with no name given: its host, each character a
+/// target name cannot hold made `-`, starting with a letter as a name must.
+fn name_for(url: &str) -> String {
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_default();
+    let name: String = host
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "_.-".contains(c) {
+                c
+            } else {
+                '-'
             }
-            Err(error) => error.to_string(),
-        },
-        Err((std::io::ErrorKind::NotFound, _)) => {
-            return LoadedServers {
-                saved: SavedServers::default(),
-                saving: true,
-                notice: None,
-            };
-        }
-        Err((_, error)) => error,
-    };
-    let (saving, notice) = match studio_settings::set_aside(path) {
-        Some(aside) => (
-            true,
-            format!(
-                "Studio's saved servers could not be read ({reason}), so it starts without them; \
-                 the file is kept as {}",
-                aside.display()
-            ),
-        ),
-        None => (
-            false,
-            format!(
-                "Studio's saved servers could not be read ({reason}) or moved aside, so it starts \
-                 without them and saves no server over {} this run",
-                path.display()
-            ),
-        ),
-    };
-    LoadedServers {
-        saved: SavedServers::default(),
-        saving,
-        notice: Some(notice),
+        })
+        .collect();
+    if name.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        name
+    } else {
+        format!("server-{name}")
     }
+}
+
+/// Whether `name` is a CLI target name: `[A-Za-z][A-Za-z0-9_.-]*`.
+fn valid_target_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
 }
 
 /// The HTTP client for a CLI target whose requests go through the proxy at `url`
@@ -192,13 +165,8 @@ impl ConnectionRegistry {
         let operator_dir = cli_config::operator_dir();
         let mut this = Self::empty(http, operator_dir.clone());
         this.proxied = Arc::new(proxied_client);
-        let LoadedServers {
-            saved,
-            saving,
-            notice,
-        } = load_saved_at(&saved_path());
-        this.saving = saving;
-        this.start_errors.extend(notice);
+        this.known = load_known_graphs(&known_graphs_path());
+        this.saving = true;
 
         if let Ok(url) = std::env::var("OMNIGRAPH_STUDIO_SERVER") {
             let url = graph_client::server_root(&url).unwrap_or(url);
@@ -219,49 +187,6 @@ impl ConnectionRegistry {
             }
         }
 
-        // Studio's own servers before the CLI's: an address is one connection (spec 003), and
-        // one added here keeps it when a CLI target comes to name it too. Each address was
-        // saved as `add_server` checked it, scheme included.
-        for saved in saved
-            .servers
-            .iter()
-            .filter(|s| s.source == "studio")
-            .cloned()
-        {
-            if let Some(other) = this.connected_at(&saved.url, cx) {
-                this.start_errors.push(format!(
-                    "{}: Studio connects to {} already as '{other}', and keeps one connection \
-                     per address; the server stays saved",
-                    saved.name, saved.url
-                ));
-                this.kept_saved.push(saved);
-                continue;
-            }
-            let read = cx.read_credentials(&saved.url);
-            let entry = ServerEntry {
-                name: saved.name,
-                url: saved.url,
-                source: ServerSource::Studio,
-                known_graphs: saved.graphs,
-            };
-            // Listed at once, so the windows a start reopens find it and a save made while the
-            // keychain is read keeps it; it connects once its token is in.
-            let name = entry.name.clone();
-            let connection = match this.add_connection(entry, None, cx) {
-                Ok(connection) => connection,
-                Err(error) => {
-                    this.start_errors.push(format!("{name}: {error}"));
-                    continue;
-                }
-            };
-            let wait = connection.update(cx, |connection, _| connection.await_token());
-            cx.spawn(async move |_, cx| {
-                let read = read.await;
-                connection.update(cx, |connection, cx| connection.token_read(wait, read, cx));
-            })
-            .detach();
-        }
-
         // Listed before the windows a start reopens look for the CLI's servers, within
         // `START_TIMEOUT`; each asks the CLI for its token when it connects. The stamp is taken
         // before the listing.
@@ -273,22 +198,18 @@ impl ConnectionRegistry {
         let stamp = cli_config::stamp(&this.watched);
         this.cli_places = cli_tokens::candidates();
         this.cli_stamp = cli_config::stamp(&this.cli_places);
-        let targets = smol::block_on(cli_config::read_targets_at_start(
+        match smol::block_on(cli_config::read_targets_at_start(
             operator_dir.as_deref(),
             &this.cli_places,
-        ));
-        this.keep_stamp(stamp, &targets.watched);
-        this.apply_cli_targets(targets, &saved, cx);
+        )) {
+            Some(targets) => {
+                this.keep_stamp(stamp, &targets.watched);
+                this.apply_cli_targets(targets, cx);
+            }
+            None => this.listing_unfinished(),
+        }
         this.watch_cli_targets(cx);
         this
-    }
-
-    /// The name of the connection at `url`, when there is one.
-    fn connected_at(&self, url: &str, cx: &App) -> Option<String> {
-        self.connections.iter().find_map(|connection| {
-            let server = &connection.read(cx).server;
-            (server.url == url).then(|| server.name.clone())
-        })
     }
 
     fn empty(http: Arc<dyn HttpClient>, operator_dir: Option<PathBuf>) -> Self {
@@ -307,8 +228,8 @@ impl ConnectionRegistry {
             cli_kept: HashMap::new(),
             cli_errors: Vec::new(),
             managed: Vec::new(),
-            kept_saved: Vec::new(),
-            saving: true,
+            known: KnownGraphs::default(),
+            saving: false,
             _watch: None,
         }
     }
@@ -320,8 +241,7 @@ impl ConnectionRegistry {
         &self.cli_errors
     }
 
-    /// The servers named in the environment or saved by Studio that could not be added at
-    /// start, each by its name and why.
+    /// The environment's server, when it could not be added at start, and why.
     pub fn start_errors(&self) -> &[String] {
         &self.start_errors
     }
@@ -338,6 +258,17 @@ impl ConnectionRegistry {
     /// (spec 003).
     pub fn aliases_for(&self, _server: &str, _graph: &str) -> Vec<CliAlias> {
         Vec::new()
+    }
+
+    /// Notes that the CLI did not list its targets within the bound at start: the operator file
+    /// stays watched, with no stamp, so the first check lists them.
+    fn listing_unfinished(&mut self) {
+        self.operator_stamp = Vec::new();
+        self.keep_cli_errors(vec![format!(
+            "the OmniGraph CLI did not list its targets within {} s of Studio's start; Studio \
+             lists them again",
+            cli_config::START_TIMEOUT.as_secs()
+        )]);
     }
 
     /// Keeps `stamp`, taken of the watched files before the listing, as the stamp of the files
@@ -396,7 +327,7 @@ impl ConnectionRegistry {
                     .update(cx, |this, cx| {
                         this.cli_stamp = cli_stamp;
                         this.keep_stamp(stamp, &targets.watched);
-                        let changed = this.apply_cli_targets(targets, &SavedServers::default(), cx);
+                        let changed = this.apply_cli_targets(targets, cx);
                         if cli_moved {
                             this.ask_cli_tokens_again(cx);
                         }
@@ -424,18 +355,13 @@ impl ConnectionRegistry {
     /// anything changed. An address is one server (spec 003), so a CLI server is its address: a
     /// target renamed on the same endpoint renames the connection in place, which the windows
     /// open on it keep. A new address is a new connection, with the graphs Studio remembered for
-    /// it (`saved`, by address, else by name) or for the name at the address it left; an
+    /// its target's name, or for the name at the address it left; an
     /// address no longer listed leaves the list (a window open on it keeps its connection); a
     /// target whose entry or token file changed asks the CLI for its token again; a target's
     /// graph is added. Targets that could not be listed change no server. What could not be
     /// listed or used, a server that cannot be added included, is a change only when it differs
     /// from what was kept.
-    fn apply_cli_targets(
-        &mut self,
-        targets: CliTargets,
-        saved: &SavedServers,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    fn apply_cli_targets(&mut self, targets: CliTargets, cx: &mut Context<Self>) -> bool {
         let CliTargets {
             servers,
             mut errors,
@@ -476,9 +402,9 @@ impl ConnectionRegistry {
             .retain(|url, _| named.iter().any(|(named, _)| *named == url));
         for server in servers {
             let url = server.url.clone();
-            // An address Studio reaches already as a server of its own (added in Studio, or the
-            // environment's) is that connection: a second would open its graphs twice, and the
-            // graph keys, window restore and links would each find either.
+            // An address Studio reaches already as the environment's server is that connection:
+            // a second would open its graphs twice, and window restore and links would each find
+            // either.
             let other = self.connections.iter().find_map(|connection| {
                 let entry = &connection.read(cx).server;
                 (entry.url == url && entry.source != ServerSource::Cli).then(|| entry.name.clone())
@@ -527,13 +453,7 @@ impl ConnectionRegistry {
                 .iter()
                 .find(|entry| entry.name == server.name)
                 .map(|entry| entry.known_graphs.clone())
-                .or_else(|| {
-                    let saved_cli = || saved.servers.iter().filter(|saved| saved.source == "cli");
-                    saved_cli()
-                        .find(|saved| saved.url == url)
-                        .or_else(|| saved_cli().find(|saved| saved.name == server.name))
-                        .map(|saved| saved.graphs.clone())
-                })
+                .or_else(|| self.known.targets.get(&server.name).cloned())
                 .unwrap_or_default();
             for graph in remembered {
                 if !graphs.contains(&graph) {
@@ -595,50 +515,74 @@ impl ConnectionRegistry {
         Ok(connection)
     }
 
-    /// Adds a server by URL. The token goes to the OS keychain; the list to Studio's data
-    /// directory.
-    pub fn add_server(
+    /// Adds the server at `url` as the CLI target `name` (its host when none is given), through
+    /// the CLI: `target add`, and `credentials set` for a token, which the CLI keeps in its own
+    /// secure store. Studio writes neither the CLI's file nor the token. The targets are listed
+    /// again at once, and the new target's connection is the answer. An address Studio connects
+    /// to already is that connection, and nothing is added. A refusal is the CLI's own words.
+    pub fn add_target(
         &mut self,
         name: String,
         url: String,
         token: Option<String>,
-        graphs: Vec<String>,
         cx: &mut Context<Self>,
-    ) -> anyhow::Result<Entity<Connection>> {
-        let url = graph_client::server_root(&url).map_err(anyhow::Error::msg)?;
-        // An address listed already is that server: a second connection to it would open its
-        // graphs twice, each window writing the same saved tabs over the other's.
+    ) -> Task<Result<Entity<Connection>, String>> {
+        let url = match graph_client::server_root(&url) {
+            Ok(url) => url,
+            Err(error) => return Task::ready(Err(error)),
+        };
         if let Some(existing) = self
             .connections
             .iter()
             .find(|connection| connection.read(cx).server.url == url)
             .cloned()
         {
-            if let Some(token) = token {
-                self.update_token(&existing, token, cx);
-            }
-            return Ok(existing);
+            return Task::ready(Ok(existing));
         }
-        let entry = ServerEntry {
-            name,
-            url: url.clone(),
-            source: ServerSource::Studio,
-            known_graphs: graphs,
+        let name = match name.trim() {
+            "" => name_for(&url),
+            name => name.to_owned(),
         };
-        let connection = self
-            .add_connection(entry, token.clone(), cx)
-            .map_err(anyhow::Error::msg)?;
-        if let Some(token) = &token {
-            Self::save_token(&connection, &url, token, cx);
+        if !valid_target_name(&name) {
+            return Task::ready(Err(format!(
+                "“{name}” cannot be a CLI target's name: it starts with a letter and holds only                  letters, digits, `.`, `_` and `-`"
+            )));
         }
-        self.save(cx);
-        cx.notify();
-        Ok(connection)
+        let token = token
+            .map(|token| token.trim().to_owned())
+            .filter(|token| !token.is_empty())
+            .map(Token::typed);
+        let dir = self.operator_dir.clone();
+        let places = self.cli_places.clone();
+        cx.spawn(async move |this, cx| {
+            let (added, targets) = {
+                let (name, url) = (name.clone(), url.clone());
+                cx.background_executor()
+                    .spawn(async move {
+                        let added =
+                            cli_tokens::add_server_target(&places, &name, &url, token).await;
+                        let targets = cli_config::read_targets(dir.as_deref(), &places).await;
+                        (added, targets)
+                    })
+                    .await
+            };
+            this.update(cx, |this, cx| {
+                this.keep_stamp(cli_config::stamp(&targets.watched), &targets.watched);
+                if this.apply_cli_targets(targets, cx) {
+                    this.save(cx);
+                    cx.notify();
+                }
+                added?;
+                this.find(&name, cx).ok_or_else(|| {
+                    format!("The CLI added the target '{name}', but does not list it")
+                })
+            })
+            .map_err(|error| error.to_string())?
+        })
     }
 
-    /// Replaces a server's token and reconnects. A server Studio added keeps it in the keychain;
-    /// for a CLI server it lasts until Refresh or a change to its target asks the CLI again,
-    /// since Studio never writes the CLI's files.
+    /// Replaces a server's token for this run and reconnects: for a CLI server until Refresh or
+    /// a change to its target asks the CLI again, since Studio writes none of the CLI's files.
     pub fn update_token(
         &mut self,
         connection: &Entity<Connection>,
@@ -646,60 +590,30 @@ impl ConnectionRegistry {
         cx: &mut Context<Self>,
     ) {
         let token = token.trim().to_owned();
-        let (url, source) = {
+        connection.update(cx, |connection, cx| connection.set_token(Some(token), cx));
+    }
+
+    /// Writes the graph ids remembered for each CLI target to the data directory.
+    pub fn save(&mut self, cx: &App) {
+        let mut known = self.known.clone();
+        for connection in &self.connections {
             let server = &connection.read(cx).server;
-            (server.url.clone(), server.source)
-        };
-        connection.update(cx, |connection, cx| {
-            connection.set_token(Some(token.clone()), cx)
-        });
-        if source == ServerSource::Studio {
-            Self::save_token(connection, &url, &token, cx);
+            if server.source == ServerSource::Cli {
+                known
+                    .targets
+                    .insert(server.name.clone(), server.known_graphs.clone());
+            }
         }
-    }
-
-    /// Saves `token` for the server at `url` in the OS keychain. A save that fails is kept on
-    /// the connection ([`Connection::token_unsaved`]): the token lasts this run only.
-    fn save_token(connection: &Entity<Connection>, url: &str, token: &str, cx: &mut Context<Self>) {
-        let write = cx.write_credentials(url, KEYCHAIN_USER, token.as_bytes());
-        let connection = connection.clone();
-        cx.spawn(async move |_, cx| {
-            let saved = write.await.map_err(|error| error.to_string());
-            connection.update(cx, |connection, cx| connection.token_saved(saved, cx));
-        })
-        .detach();
-    }
-
-    /// Writes Studio-added servers and remembered graph ids to the data directory, those not
-    /// connected this run among them; nothing over a file that could not be read and stayed
-    /// where it was.
-    pub fn save(&self, cx: &App) {
+        if known == self.known {
+            return;
+        }
+        self.known = known;
         if !self.saving {
             return;
         }
-        let servers = self
-            .connections
-            .iter()
-            .filter_map(|connection| {
-                let server = &connection.read(cx).server;
-                let source = match server.source {
-                    ServerSource::Studio => "studio",
-                    ServerSource::Cli => "cli",
-                    ServerSource::Environment => return None,
-                };
-                Some(SavedServer {
-                    name: server.name.clone(),
-                    url: server.url.clone(),
-                    source: source.into(),
-                    graphs: server.known_graphs.clone(),
-                })
-            })
-            .chain(self.kept_saved.iter().cloned())
-            .collect();
-        let saved = SavedServers { servers };
-        if let Ok(text) = serde_json::to_string_pretty(&saved) {
+        if let Ok(text) = serde_json::to_string_pretty(&self.known) {
             studio_settings::write_atomic_in_turn(
-                saved_path(),
+                known_graphs_path(),
                 text.into_bytes(),
                 studio_settings::Access::Private,
             );
@@ -842,9 +756,7 @@ mod tests {
         files: CliTargets,
         cx: &mut TestAppContext,
     ) -> bool {
-        registry.update(cx, |registry, cx| {
-            registry.apply_cli_targets(files, &SavedServers::default(), cx)
-        })
+        registry.update(cx, |registry, cx| registry.apply_cli_targets(files, cx))
     }
 
     fn find(
@@ -934,17 +846,25 @@ mod tests {
         assert_eq!(token_sent(&a, &sent, cx).as_deref(), Some("Bearer typed"));
         assert!(cli.asked().is_empty());
 
-        // Adding an address listed already is that server again, not a second connection.
+        // Adding an address listed already is that server again, and nothing is asked of the
+        // CLI; a name a target cannot have is refused before the CLI is asked.
         let count = registry.read_with(cx, |registry, _| registry.connections.len());
         let again = registry.update(cx, |registry, cx| {
-            registry
-                .add_server("mine".into(), "http://a.test".into(), None, Vec::new(), cx)
-                .unwrap()
+            registry.add_target("mine".into(), "http://a.test".into(), None, cx)
         });
-        assert_eq!(again, a);
+        assert_eq!(again.await, Ok(a.clone()));
         assert_eq!(
             registry.read_with(cx, |registry, _| registry.connections.len()),
             count
+        );
+        let refused = registry.update(cx, |registry, cx| {
+            registry.add_target("1st".into(), "https://new.test".into(), None, cx)
+        });
+        assert!(
+            refused
+                .await
+                .unwrap_err()
+                .contains("cannot be a CLI target's name")
         );
 
         // A new address is a new connection; a server no longer named leaves; a new one joins.
@@ -993,12 +913,16 @@ mod tests {
         registry.read_with(cx, |registry, _| assert_eq!(registry.cli_errors().len(), 1));
         assert!(!apply(&registry, with_bad(), cx), "nothing else changed");
 
-        // A server added in Studio keeps its address: a CLI target naming it later is not a
+        // The environment's server keeps its address: a CLI target naming it later is not a
         // second connection, and is said; one whose CLI server moved there drops its old one.
         let mine = registry.update(cx, |registry, cx| {
-            registry
-                .add_server("mine".into(), "http://d.test".into(), None, Vec::new(), cx)
-                .unwrap()
+            let entry = ServerEntry {
+                name: "mine".into(),
+                url: "http://d.test".into(),
+                source: ServerSource::Environment,
+                known_graphs: Vec::new(),
+            };
+            registry.add_connection(entry, None, cx).unwrap()
         });
         let at_d = |cx: &mut TestAppContext| {
             registry.read_with(cx, |registry, cx| {
@@ -1056,11 +980,17 @@ mod tests {
                     .collect::<Vec<_>>()
             })
         };
-        apply(
-            &registry,
-            files(vec![server("old", "http://a.test", "1")]),
-            cx,
-        );
+        // Listed as the CLI lists them: the same entry under another name.
+        let listed = |name: &str| {
+            let mut targets = serde_json::Map::new();
+            targets.insert(
+                name.to_owned(),
+                serde_json::json!({"kind": "server", "endpoint": "http://a.test/",
+                    "auth": {"provider": "token", "source": {"store": {}}}}),
+            );
+            cli_config::servers_from(&targets)
+        };
+        apply(&registry, listed("old"), cx);
         let open = at_a(cx).pop().unwrap();
         open.update(cx, |connection, cx| {
             connection.remember_graph("knowledge");
@@ -1069,7 +999,7 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(token_sent(&open, &sent, cx).as_deref(), Some("Bearer one"));
 
-        let renamed = || files(vec![server("new", "http://a.test", "renamed")]);
+        let renamed = || listed("new");
         assert!(apply(&registry, renamed(), cx));
         cx.run_until_parked();
         assert_eq!(at_a(cx), vec![open.clone()], "one connection, the one held");
@@ -1145,46 +1075,98 @@ mod tests {
         assert_eq!(token_sent(&connection, &sent, cx).as_deref(), Some(""));
     }
 
-    /// A `servers.json` that cannot be parsed is set aside before anything replaces it, and the
-    /// person is told where it went; a missing one is an empty list, said nothing of.
-    #[test]
-    fn an_unreadable_server_list_is_set_aside_and_said() {
-        let dir = std::env::temp_dir().join(format!("studio-servers-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("servers.json");
-
-        let missing = load_saved_at(&path);
-        assert!(missing.saving && missing.notice.is_none());
-        assert!(missing.saved.servers.is_empty());
-
-        std::fs::write(
-            &path,
-            r#"{"servers":[{"name":"mine","url":"http://a.test","source":"studio"}]}"#,
-        )
-        .unwrap();
-        let read = load_saved_at(&path);
-        assert_eq!(read.saved.servers.len(), 1);
-        assert!(read.saving && read.notice.is_none());
-
-        std::fs::write(&path, r#"{"servers":[{"name":"mine","#).unwrap();
-        let broken = load_saved_at(&path);
-        assert!(broken.saved.servers.is_empty());
-        assert!(broken.saving, "set aside, so a save loses nothing");
-        let notice = broken.notice.expect("the person is told");
-        assert!(!path.exists());
-        let aside: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .collect();
-        assert_eq!(aside.len(), 1);
-        assert!(notice.contains(&aside[0].display().to_string()), "{notice}");
-        assert_eq!(
-            std::fs::read_to_string(&aside[0]).unwrap(),
-            r#"{"servers":[{"name":"mine","#,
-            "kept as it was"
+    /// The graph ids opened on a CLI target are remembered by its name: a target listed later
+    /// knows them, and a save keeps every CLI target's. The environment's server is not
+    /// remembered. A file that cannot be read remembers nothing.
+    #[gpui::test]
+    async fn graphs_are_remembered_by_target(cx: &mut TestAppContext) {
+        let (http, _) = answering();
+        let cli = Arc::new(FakeCli::default());
+        let registry = registry_with(http, &cli, cx);
+        registry.update(cx, |registry, _| {
+            registry
+                .known
+                .targets
+                .insert("a".into(), vec!["remembered".into()]);
+        });
+        apply(
+            &registry,
+            files(vec![server("a", "http://a.test", "1")]),
+            cx,
         );
+        let a = find(&registry, "a", cx).unwrap();
+        a.update(cx, |connection, _| {
+            assert_eq!(connection.server.known_graphs, ["remembered"]);
+            connection.remember_graph("typed");
+        });
+        registry.update(cx, |registry, cx| {
+            let entry = ServerEntry {
+                name: "environment".into(),
+                url: "http://env.test".into(),
+                source: ServerSource::Environment,
+                known_graphs: vec!["env".into()],
+            };
+            registry.add_connection(entry, None, cx).unwrap();
+            registry.save(cx);
+            assert_eq!(
+                registry.known.targets.get("a").cloned(),
+                Some(vec!["remembered".to_owned(), "typed".to_owned()])
+            );
+            assert!(!registry.known.targets.contains_key("environment"));
+        });
+
+        let dir = std::env::temp_dir().join(format!("studio-known-graphs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known_graphs.json");
+        assert_eq!(load_known_graphs(&path), KnownGraphs::default());
+        std::fs::write(&path, r#"{"targets":{"a":["g"]}}"#).unwrap();
+        assert_eq!(
+            load_known_graphs(&path).targets.get("a").cloned(),
+            Some(vec!["g".to_owned()])
+        );
+        std::fs::write(&path, "{").unwrap();
+        assert_eq!(load_known_graphs(&path), KnownGraphs::default());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A start past its bound for the listing keeps the operator file watched, unstamped, so
+    /// the first check lists the targets, rather than never again.
+    #[gpui::test]
+    async fn a_start_past_its_bound_lists_at_the_first_check(cx: &mut TestAppContext) {
+        let (http, _) = answering();
+        let dir = std::env::temp_dir().join(format!("studio-unlisted-{}", std::process::id()));
+        let registry = cx.new(|_| ConnectionRegistry::empty(http, Some(dir.clone())));
+        registry.update(cx, |registry, cx| {
+            registry.watched = vec![cli_config::config_path(&dir)];
+            registry.listing_unfinished();
+            registry.watch_cli_targets(cx);
+        });
+        let said = |cx: &mut TestAppContext| {
+            registry.read_with(cx, |registry, _| registry.cli_errors().to_vec())
+        };
+        assert!(said(cx)[0].contains("did not list its targets within 5 s"));
+        cx.executor().advance_clock(OPERATOR_POLL);
+        cx.run_until_parked();
+        // Listed with no CLI where it looks (a test's registry has no places): said so now.
+        let after = said(cx);
+        assert!(
+            after[0].contains("found no OmniGraph CLI it can drive"),
+            "{after:?}"
+        );
+    }
+
+    /// A server added with no name takes its host as its target's name, made into one a target
+    /// can have.
+    #[test]
+    fn a_server_added_with_no_name_is_named_by_its_host() {
+        assert_eq!(name_for("https://graph.example.com"), "graph.example.com");
+        assert_eq!(name_for("http://127.0.0.1:8787"), "server-127.0.0.1");
+        assert_eq!(name_for("http://[::1]:8787"), "server----1-");
+        for name in ["a", "graph.example.com", "dev_2", "x-y"] {
+            assert!(valid_target_name(name), "{name}");
+        }
+        for name in ["", "1st", "-x", "a b", "a/b"] {
+            assert!(!valid_target_name(name), "{name}");
+        }
     }
 }

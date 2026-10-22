@@ -83,6 +83,11 @@ pub(crate) const HELPER_MARGIN: Duration = Duration::from_secs(15);
 pub struct Token(String);
 
 impl Token {
+    /// A token the person typed into Studio, handed to the CLI to keep (`credentials set`).
+    pub(crate) fn typed(token: String) -> Self {
+        Self(token)
+    }
+
     pub(crate) fn into_string(self) -> String {
         self.0
     }
@@ -142,6 +147,23 @@ pub(crate) fn candidates() -> Vec<PathBuf> {
 /// What each program Studio looked at was found to be, with its file's stamp then: a program is
 /// probed again only when its file changes, so a connect runs only the commands it needs.
 type Probed = (PathBuf, FileStamp, Result<FoundCli, String>);
+
+/// Why a program is not the CLI Studio runs: its own answer, which stands while its file does
+/// not change (`lasting`), or a run that did not end (a timeout, a program that could not
+/// start), which is asked again next time.
+struct Unfit {
+    why: String,
+    lasting: bool,
+}
+
+impl Unfit {
+    fn lasting(why: impl Into<String>) -> Self {
+        Self {
+            why: why.into(),
+            lasting: true,
+        }
+    }
+}
 static PROBED: Mutex<Vec<Probed>> = Mutex::new(Vec::new());
 
 /// The first of `programs` that is an OmniGraph CLI Studio can drive: one that reports
@@ -176,7 +198,9 @@ pub(crate) async fn find_cli(programs: &[PathBuf]) -> Result<FoundCli, String> {
             Some(probed) => probed,
             None => {
                 let probed = probe(program).await;
-                if let (Some(stamp), Ok(mut held)) = (stamp, PROBED.lock()) {
+                let lasting = probed.as_ref().err().is_none_or(|unfit| unfit.lasting);
+                let probed = probed.map_err(|unfit| unfit.why);
+                if lasting && let (Some(stamp), Ok(mut held)) = (stamp, PROBED.lock()) {
                     held.retain(|(path, _, _)| path != program);
                     held.push((program.clone(), stamp, probed.clone()));
                 }
@@ -201,17 +225,31 @@ pub(crate) async fn find_cli(programs: &[PathBuf]) -> Result<FoundCli, String> {
 }
 
 /// `program` as the CLI Studio runs, or why it is not one.
-async fn probe(program: &Path) -> Result<FoundCli, String> {
-    let json = run(
+async fn probe(program: &Path) -> Result<FoundCli, Unfit> {
+    let transient = |unrun: Unrun| Unfit {
+        why: match unrun {
+            Unrun::Timeout | Unrun::Busy => {
+                "did not answer `version --json` in time, and is asked again".to_owned()
+            }
+            Unrun::Failed(error) => format!("could not be run ({error}), and is asked again"),
+        },
+        lasting: false,
+    };
+    let ran = run(
         || command(program, &[], &["version", "--json"]),
         READ_TIMEOUT,
         MAX_ANSWER_BYTES,
     )
     .await
-    .ok()
-    .filter(|ran| ran.status.success())
-    .and_then(|ran| serde_json::from_slice::<Value>(&ran.stdout).ok())
-    .ok_or("answers no `version --json` (older than OmniGraph 0.14, or not its CLI)")?;
+    .map_err(transient)?;
+    let json = Some(ran)
+        .filter(|ran| ran.status.success())
+        .and_then(|ran| serde_json::from_slice::<Value>(&ran.stdout).ok())
+        .ok_or_else(|| {
+            Unfit::lasting(
+                "answers no `version --json` (older than OmniGraph 0.14, or not its CLI)",
+            )
+        })?;
     let version = json
         .get("version")
         .and_then(Value::as_str)
@@ -222,29 +260,32 @@ async fn probe(program: &Path) -> Result<FoundCli, String> {
         match reported.and_then(Value::as_u64) {
             Some(number) if known.contains(&number) => {}
             Some(number) => {
-                return Err(format!(
+                return Err(Unfit::lasting(format!(
                     "is {version}, whose {protocol} protocol {number} Studio does not know"
-                ));
+                )));
             }
             None => {
-                return Err(format!(
+                return Err(Unfit::lasting(format!(
                     "is {version}, which reports no {protocol} protocol"
-                ));
+                )));
             }
         }
     }
     for words in COMMANDS {
         let mut args: Vec<&str> = words.to_vec();
         args.push("--help");
-        let there = run(
+        let ran = run(
             || command(program, &[], &args),
             READ_TIMEOUT,
             MAX_ANSWER_BYTES,
         )
         .await
-        .is_ok_and(|ran| ran.status.success());
-        if !there {
-            return Err(format!("is {version}, which has no `{}`", words.join(" ")));
+        .map_err(transient)?;
+        if !ran.status.success() {
+            return Err(Unfit::lasting(format!(
+                "is {version}, which has no `{}`",
+                words.join(" ")
+            )));
         }
     }
     Ok(FoundCli {
@@ -275,6 +316,76 @@ pub(crate) async fn inspect_target(
     json_answer(cli, &[], &args).await
 }
 
+/// Adds the server target `name` at `endpoint` to the person's operator configuration through
+/// the CLI (`target add NAME`, the target's entry on its standard input): with `token`, kept in
+/// the CLI's secure store (`auth: {provider: token, source: {store: {}}}`, then `credentials set
+/// --target NAME --stdin --replace` with the token on its standard input); without one,
+/// anonymous. Studio writes neither the file nor the token itself. A refusal is the CLI's own
+/// words; a target whose token the CLI would not keep is removed again (`target remove`).
+pub(crate) async fn add_server_target(
+    programs: &[PathBuf],
+    name: &str,
+    endpoint: &str,
+    token: Option<Token>,
+) -> Result<(), String> {
+    let cli = find_cli(programs).await?;
+    let auth = match token {
+        Some(_) => serde_json::json!({"provider": "token", "source": {"store": {}}}),
+        None => serde_json::json!({"provider": "anonymous"}),
+    };
+    let entry = serde_json::json!({"kind": "server", "endpoint": endpoint, "auth": auth});
+    let entry = entry.to_string();
+    say(
+        &cli,
+        &["target", "add", name, "--json"],
+        Some(entry.as_bytes()),
+    )
+    .await?;
+    let Some(token) = token else {
+        return Ok(());
+    };
+    let mut input = token.into_string().into_bytes();
+    input.push(b'\n');
+    let set = [
+        "credentials",
+        "set",
+        "--target",
+        name,
+        "--stdin",
+        "--replace",
+    ];
+    if let Err(refused) = say(&cli, &set, Some(&input)).await {
+        let removed = say(&cli, &["target", "remove", name, "--json"], None).await;
+        return Err(match removed {
+            Ok(()) => format!("{refused}; the target was removed again"),
+            Err(left) => format!("{refused}; the target stays, without a token ({left})"),
+        });
+    }
+    Ok(())
+}
+
+/// Runs `args` with `cli`, `input` on its standard input, for its success alone: what it printed
+/// is not read, and a failure is what it said.
+async fn say(cli: &FoundCli, args: &[&str], input: Option<&[u8]>) -> Result<(), String> {
+    let asked = format!("`omnigraph {}`", args.join(" "));
+    match run_with(
+        || command(&cli.path, &[], args),
+        input,
+        READ_TIMEOUT,
+        MAX_ANSWER_BYTES,
+    )
+    .await
+    {
+        Ok(ran) if ran.status.success() => Ok(()),
+        Ok(ran) => Err(format!(
+            "{} ({asked}, {})",
+            said(&ran.stderr),
+            exit(&ran.status)
+        )),
+        Err(unrun) => Err(unrun.said(&cli.path, &asked, READ_TIMEOUT)),
+    }
+}
+
 /// What `cli` prints as JSON for `args`, or what it says when it refuses: a refusal asked for as
 /// JSON comes on standard output as `{"error": …, "code": …}`, any other failure on standard
 /// error.
@@ -288,18 +399,7 @@ async fn json_answer(cli: &FoundCli, kept: &[String], args: &[&str]) -> Result<V
     .await
     {
         Ok(ran) => ran,
-        Err(Unrun::Timeout) => {
-            return Err(format!(
-                "the OmniGraph CLI did not answer {asked} within {} s, and was stopped",
-                READ_TIMEOUT.as_secs()
-            ));
-        }
-        Err(Unrun::Failed(error)) => {
-            return Err(format!(
-                "Studio could not run the OmniGraph CLI at {} ({asked}): {error}",
-                shown(&cli.path)
-            ));
-        }
+        Err(unrun) => return Err(unrun.said(&cli.path, &asked, READ_TIMEOUT)),
     };
     let json = serde_json::from_slice::<Value>(&ran.stdout).ok();
     if ran.status.success() {
@@ -409,12 +509,7 @@ impl CliTokenSource {
                     self.timeout.as_secs()
                 ));
             }
-            Err(Unrun::Failed(error)) => {
-                return Err(format!(
-                    "Studio could not run the OmniGraph CLI at {} ({asked}): {error}",
-                    shown(&cli.path)
-                ));
-            }
+            Err(unrun) => return Err(unrun.said(&cli.path, &asked, self.timeout)),
         };
         if !ran.status.success() {
             // What it printed is never shown: it may be part of a token.
@@ -516,7 +611,30 @@ struct Ran {
 /// Why a run gave no output.
 enum Unrun {
     Timeout,
+    /// Another of Studio's commands held the CLI ([`TURN`]) past this one's timeout.
+    Busy,
     Failed(String),
+}
+
+impl Unrun {
+    /// What the person reads of a run asked as `asked` with `cli`, past `timeout`.
+    fn said(self, cli: &Path, asked: &str, timeout: Duration) -> String {
+        match self {
+            Unrun::Timeout => format!(
+                "the OmniGraph CLI did not answer {asked} within {} s, and was stopped",
+                timeout.as_secs()
+            ),
+            Unrun::Busy => format!(
+                "the OmniGraph CLI was busy with another of Studio's commands for {} s, so \
+                 {asked} was not run",
+                timeout.as_secs()
+            ),
+            Unrun::Failed(error) => format!(
+                "Studio could not run the OmniGraph CLI at {} ({asked}): {error}",
+                shown(cli)
+            ),
+        }
+    }
 }
 
 /// Studio's turn at the CLI: one of its runs at a time. The CLI takes its operator home's locks
@@ -543,10 +661,29 @@ async fn run(
     timeout: Duration,
     limit: usize,
 ) -> Result<Ran, Unrun> {
-    let _turn = TURN.lock().await;
+    run_with(make, None, timeout, limit).await
+}
+
+/// [`run`], with `input` as the command's standard input when there is one: a target's entry
+/// for `target add`, a token for `credentials set`, never on its command line.
+async fn run_with(
+    make: impl Fn() -> std::process::Command,
+    input: Option<&[u8]>,
+    timeout: Duration,
+    limit: usize,
+) -> Result<Ran, Unrun> {
+    // The wait for a turn counts toward the timeout: a credential helper that runs long holds
+    // every other command back only that long.
+    let turn = TURN.lock().fuse();
+    let waited = smol::Timer::after(timeout).fuse();
+    futures::pin_mut!(turn, waited);
+    let _turn = futures::select! {
+        turn = turn => turn,
+        _ = waited => return Err(Unrun::Busy),
+    };
     let mut retries = 0;
     loop {
-        let ran = run_once(make(), timeout, limit).await?;
+        let ran = run_once(make(), input, timeout, limit).await?;
         let locked =
             !ran.status.success() && String::from_utf8_lossy(&ran.stderr).contains(LOCK_REFUSED);
         if !locked || retries == LOCK_RETRIES {
@@ -557,19 +694,34 @@ async fn run(
     }
 }
 
-/// [`run`], once.
+/// [`run_with`], once.
 async fn run_once(
     command: std::process::Command,
+    input: Option<&[u8]>,
     timeout: Duration,
     limit: usize,
 ) -> Result<Ran, Unrun> {
     let mut child = smol::process::Command::from(command)
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .map_err(|error| Unrun::Failed(error.to_string()))?;
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        use futures::AsyncWriteExt as _;
+        // Small (an entry, a token), so it fits the pipe before anything is read; the pipe is
+        // closed after it, which ends the command's input.
+        stdin
+            .write_all(input)
+            .await
+            .map_err(|error| Unrun::Failed(error.to_string()))?;
+        drop(stdin);
+    }
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
         return Err(Unrun::Failed("its output could not be read".to_owned()));
     };
@@ -758,6 +910,15 @@ case "$*" in
   *" --help")
     [ -f "$dir/no-$1-$2" ] && {{ echo "error: unrecognized subcommand '$1'" >&2; exit 2; }}
     echo "Usage: omnigraph $1 $2"; exit 0 ;;
+  "target add "*" --json")
+    [ -f "$dir/refuse-add" ] && {{ printf 'Error: \n   0: \033[91mtarget already exists\033[0m\n' >&2; exit 1; }}
+    cat > "$dir/added-$3.json"; echo '{{"registered":"'"$3"'"}}'; exit 0 ;;
+  "credentials set --target "*" --stdin --replace")
+    [ -f "$dir/refuse-set" ] && {{ printf 'Error: \n   0: set requires provider: token with source: store\n' >&2; exit 1; }}
+    cat > "$dir/token-$4.input"; tr -d '\n' < "$dir/token-$4.input" > "$dir/token-$4"; rm "$dir/token-$4.input"
+    echo "credential installed; server validity unverified"; exit 0 ;;
+  "target remove "*" --json")
+    rm -f "$dir/added-$3.json"; echo '{{"removed":"'"$3"'","credentials_preserved":true}}'; exit 0 ;;
   "target list --json")
     if [ -f "$dir/list-refused.json" ]; then cat "$dir/list-refused.json"; exit 2; fi
     cat "$dir/targets.json"; exit 0 ;;
@@ -1209,8 +1370,14 @@ exit 64
         cli.write("slow-slow", "");
         let mut slow = cli.source("slow", "https://slow.example.com/", CliCredential::Store);
         slow.timeout = Duration::from_millis(300);
+        // Stopped, or, when other tests' commands held the CLI past the timeout, not run: either
+        // way not waited for, as the stand-in would give its token after 5 s.
         let stopped = smol::block_on(slow.token()).unwrap_err();
-        assert!(stopped.contains("gave no token within 0 s"), "{stopped}");
+        assert!(
+            stopped.contains("gave no token within 0 s")
+                || stopped.contains("busy with another of Studio's commands"),
+            "{stopped}"
+        );
         assert!(!stopped.contains("secret-slow"));
     }
 
@@ -1267,6 +1434,193 @@ exit 64
         std::fs::create_dir(&held).unwrap();
         let refused = smol::block_on(source.token()).unwrap_err();
         assert!(refused.contains(LOCK_REFUSED), "{refused}");
+    }
+
+    /// A program that could not be run, or did not answer in time, is asked again at the next
+    /// look; only its own answer is kept while its file does not change.
+    #[test]
+    fn a_program_that_did_not_answer_is_asked_again() {
+        let cli = StandIn::new("transient");
+        // Runs through an interpreter that is not there yet, so it cannot start.
+        let shell = cli.dir.join("shell");
+        let program = cli.dir.join("late");
+        let script = std::fs::read_to_string(&cli.program).unwrap().replacen(
+            "#!/bin/sh",
+            &format!("#!{}", shell.display()),
+            1,
+        );
+        std::fs::write(&program, script).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let programs = vec![program.clone()];
+        let first = smol::block_on(find_cli(&programs)).unwrap_err();
+        assert!(first.contains("could not be run"), "{first}");
+        std::os::unix::fs::symlink("/bin/sh", &shell).unwrap();
+        let found = smol::block_on(find_cli(&programs)).unwrap();
+        assert_eq!(found.path, program);
+    }
+
+    /// The wait for a turn at the CLI counts toward a command's timeout: a command another of
+    /// Studio's holds back past it is not run, and says so.
+    #[test]
+    fn a_command_held_back_past_its_timeout_is_not_run() {
+        let cli = StandIn::new("busy");
+        let held = smol::block_on(TURN.lock());
+        let program = cli.program.clone();
+        let waiting = std::thread::spawn(move || {
+            smol::block_on(run(
+                || command(&program, &[], &["version", "--json"]),
+                Duration::from_millis(200),
+                MAX_ANSWER_BYTES,
+            ))
+            .map(|ran| ran.status.success())
+            .map_err(|unrun| unrun.said(&program, "`omnigraph version --json`", Duration::ZERO))
+        });
+        let answer = waiting.join().unwrap();
+        drop(held);
+        let said = answer.unwrap_err();
+        assert!(
+            said.contains("busy with another of Studio's commands"),
+            "{said}"
+        );
+        assert!(cli.calls().is_empty(), "nothing was run");
+    }
+
+    /// The CLI runs with none of Studio's OmniGraph variables but `OMNIGRAPH_HOME` and the one
+    /// its target's source names: checked in a process of its own, started with such variables
+    /// set, so no other test's environment changes.
+    #[test]
+    fn the_export_runs_without_studios_omnigraph_variables() {
+        let checked = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "cli_tokens::tests::export_environment_in_its_own_process",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("OMNIGRAPH_STUDIO_TEST_SECRET", "studios-own-secret")
+            .env("OMNIGRAPH_STUDIO_TEST_KEPT", "kept-for-its-target")
+            .env("OMNIGRAPH_HOME", std::env::temp_dir())
+            .output()
+            .unwrap();
+        let printed = String::from_utf8_lossy(&checked.stdout);
+        assert!(checked.status.success(), "{printed}");
+        assert!(printed.contains("environment checked"), "{printed}");
+    }
+
+    /// Run by [`the_export_runs_without_studios_omnigraph_variables`] in a process whose
+    /// environment holds OmniGraph variables; run alone it checks nothing.
+    #[test]
+    #[ignore = "child: run by the_export_runs_without_studios_omnigraph_variables"]
+    fn export_environment_in_its_own_process() {
+        if std::env::var_os("OMNIGRAPH_STUDIO_TEST_SECRET").is_none() {
+            return;
+        }
+        let cli = StandIn::new("environment");
+        cli.server("stored", "https://store.example.com/");
+        cli.write("token-stored", "secret-stored-token");
+        let source = cli.source(
+            "stored",
+            "https://store.example.com/",
+            CliCredential::Environment {
+                variable: "OMNIGRAPH_STUDIO_TEST_KEPT".into(),
+            },
+        );
+        smol::block_on(source.token()).unwrap();
+        let exported = std::fs::read_to_string(cli.dir.join("export-env")).unwrap();
+        let mut names: Vec<&str> = exported.lines().collect();
+        names.sort();
+        assert_eq!(names, ["OMNIGRAPH_HOME", "OMNIGRAPH_STUDIO_TEST_KEPT"]);
+        println!("environment checked");
+    }
+
+    /// A server is added through the CLI: `target add` takes the target's entry on its standard
+    /// input, and `credentials set` the token, which reaches no command line; one with no token
+    /// is anonymous. A refusal is the CLI's words; a token the CLI would not keep removes the
+    /// target again.
+    #[test]
+    fn a_server_is_added_through_the_cli() {
+        let cli = StandIn::new("add");
+        let added = |name: &str| -> serde_json::Value {
+            serde_json::from_str(
+                &std::fs::read_to_string(cli.dir.join(format!("added-{name}.json"))).unwrap(),
+            )
+            .unwrap()
+        };
+        smol::block_on(add_server_target(
+            &cli.programs(),
+            "work",
+            "https://graph.example.com",
+            Some(Token::typed("secret-typed-token".into())),
+        ))
+        .unwrap();
+        assert_eq!(
+            added("work"),
+            serde_json::json!({"kind": "server", "endpoint": "https://graph.example.com",
+                "auth": {"provider": "token", "source": {"store": {}}}})
+        );
+        assert_eq!(
+            std::fs::read_to_string(cli.dir.join("token-work")).unwrap(),
+            "secret-typed-token"
+        );
+        let calls: Vec<_> = cli
+            .calls()
+            .into_iter()
+            .filter(|call| !call.ends_with("--help") && call != "version --json")
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                "target add work --json",
+                "credentials set --target work --stdin --replace"
+            ]
+        );
+        assert!(cli.files_holding("secret-typed-token").is_empty());
+
+        smol::block_on(add_server_target(
+            &cli.programs(),
+            "open",
+            "http://127.0.0.1:8787",
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            added("open")["auth"],
+            serde_json::json!({"provider": "anonymous"})
+        );
+        assert!(
+            cli.calls()
+                .iter()
+                .all(|call| !call.starts_with("credentials set"))
+        );
+
+        cli.write("refuse-set", "");
+        let refused = smol::block_on(add_server_target(
+            &cli.programs(),
+            "plain",
+            "https://plain.example.com",
+            Some(Token::typed("secret-plain".into())),
+        ))
+        .unwrap_err();
+        assert!(
+            refused.starts_with("set requires provider: token with source: store")
+                && refused.ends_with("the target was removed again"),
+            "{refused}"
+        );
+        assert!(!cli.dir.join("added-plain.json").exists());
+        assert!(!refused.contains("secret-plain"));
+
+        cli.write("refuse-add", "");
+        let refused = smol::block_on(add_server_target(
+            &cli.programs(),
+            "work",
+            "https://graph.example.com",
+            None,
+        ))
+        .unwrap_err();
+        assert_eq!(
+            refused,
+            "target already exists (`omnigraph target add work --json`, exit 1)"
+        );
     }
 
     /// The CLI's export prints the token and a newline; anything else is refused.
@@ -1479,7 +1833,34 @@ exit 64
             assert!(connection.refused_with_token);
             assert_eq!(connection.label(), "Token refused");
         });
-        stale.update(cx, |connection, cx| connection.refresh(cx));
+        stale.update(cx, |connection, cx| connection.refresh_token(cx));
+        cx.run_until_parked();
+        assert_eq!(asked(&source), 1, "Refresh asks again");
+    }
+
+    /// Opening a graph asks the CLI for the token once, at the connect: its first reads do not
+    /// ask again, nor does a reload, and a token typed in stands through them; only the
+    /// person's Refresh asks again.
+    #[gpui::test]
+    async fn opening_a_graph_asks_the_cli_once(cx: &mut TestAppContext) {
+        let (connection, source, _) = connection_with(vec![Ok("good")], cx);
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        let session = cx.update(|cx| {
+            crate::open_session(connection.clone(), "knowledge".into(), "main".into(), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(asked(&source), 1, "the connect's ask alone");
+        session.update(cx, |session, cx| session.reload(cx));
+        cx.run_until_parked();
+        assert_eq!(asked(&source), 0, "a reload asks nothing");
+
+        connection.update(cx, |connection, cx| {
+            connection.set_token(Some("typed".into()), cx)
+        });
+        session.update(cx, |session, cx| session.reload(cx));
+        cx.run_until_parked();
+        assert_eq!(asked(&source), 0, "the token typed stands");
+        session.update(cx, |session, cx| session.refresh(cx));
         cx.run_until_parked();
         assert_eq!(asked(&source), 1, "Refresh asks again");
     }
@@ -1509,7 +1890,7 @@ exit 64
             assert_eq!(connection.state, ConnectionState::Ready);
             assert_eq!(connection.token_unread, None);
         });
-        connection.update(cx, |connection, cx| connection.refresh(cx));
+        connection.update(cx, |connection, cx| connection.refresh_token(cx));
         cx.run_until_parked();
         assert_eq!(asked(&source), 1);
         connection.read_with(cx, |connection, _| {

@@ -87,9 +87,9 @@ fn workspaces_dir() -> PathBuf {
     studio_settings::data_dir().join("workspaces")
 }
 
-/// A file name for a server and graph: a stable FNV-1a hash, so URLs need no escaping.
-fn key(server_url: &str, graph: &str) -> String {
-    let hash = format!("{server_url}\n{graph}")
+/// A file name for a CLI target and graph: a stable FNV-1a hash, so names need no escaping.
+fn key(target: &str, graph: &str) -> String {
+    let hash = format!("{target}\n{graph}")
         .bytes()
         .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
             (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
@@ -97,8 +97,9 @@ fn key(server_url: &str, graph: &str) -> String {
     format!("{hash:016x}.json")
 }
 
-pub(crate) fn load(server_url: &str, graph: &str) -> Option<SavedWorkspace> {
-    let path = workspaces_dir().join(key(server_url, graph));
+/// The saved state of `graph` on the CLI target `target`.
+pub(crate) fn load(target: &str, graph: &str) -> Option<SavedWorkspace> {
+    let path = workspaces_dir().join(key(target, graph));
     let text = std::fs::read_to_string(&path).ok()?;
     match serde_json::from_str(&text) {
         Ok(saved) => Some(saved),
@@ -113,12 +114,12 @@ pub(crate) fn load(server_url: &str, graph: &str) -> Option<SavedWorkspace> {
 
 /// Saves a graph's tabs and drafts, unless restoring is off: a run that did not read them
 /// (the snapshot tool) must not replace them.
-pub(crate) fn save(server_url: &str, graph: &str, saved: &SavedWorkspace) {
+pub(crate) fn save(target: &str, graph: &str, saved: &SavedWorkspace) {
     if !saving() {
         return;
     }
     if let Ok(text) = serde_json::to_string_pretty(saved) {
-        write_private(&workspaces_dir().join(key(server_url, graph)), &text);
+        write_private(&workspaces_dir().join(key(target, graph)), &text);
     }
 }
 
@@ -141,9 +142,13 @@ pub struct SavedSession {
     pub shown: usize,
 }
 
+/// A graph a window had open, by its CLI target's name and its id (spec 002): a window whose
+/// target the CLI no longer lists is not reopened. A window saved by an earlier build, by its
+/// server's address, names no target and is not reopened either.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SavedGraph {
-    pub server_url: String,
+    #[serde(default)]
+    pub target: String,
     pub graph: String,
     pub branch: String,
 }
@@ -444,7 +449,7 @@ mod tests {
 
     fn graph(name: &str) -> SavedGraph {
         SavedGraph {
-            server_url: "https://example.test".into(),
+            target: "example".into(),
             graph: name.into(),
             branch: "main".into(),
         }

@@ -17,9 +17,8 @@ use crate::cli_tokens::{Token, TokenSource};
 pub enum ServerSource {
     /// A server target the OmniGraph CLI lists; its token, if any, is the CLI's to give.
     Cli,
-    /// Added in Studio; the token is in the OS keychain.
-    Studio,
-    /// `OMNIGRAPH_STUDIO_SERVER` in the environment, for development and tests.
+    /// `OMNIGRAPH_STUDIO_SERVER` in the environment, for development and tests; its token,
+    /// `OMNIGRAPH_STUDIO_TOKEN`, lasts the run.
     Environment,
 }
 
@@ -42,9 +41,8 @@ pub enum ConnectionState {
         served: Option<String>,
     },
     /// The server answered 401: the token sent was refused, or none was sent
-    /// ([`Connection::refused_with_token`] says which, and [`Connection::token_unread`] why
-    /// when the keychain did not give one). Also a server whose token source gave none, which
-    /// is asked nothing without one.
+    /// ([`Connection::refused_with_token`] says which). Also a server whose token source gave
+    /// none ([`Connection::token_unread`] says why), which is asked nothing without one.
     Unauthorized,
     Unreachable(String),
 }
@@ -98,11 +96,6 @@ pub struct ConnectionWatch {
     _alive: Rc<()>,
 }
 
-/// A read of the token from the keychain, asked for by [`Connection::await_token`]: its answer
-/// counts only while no token was set since ([`Connection::token_read`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TokenWait(u64);
-
 pub struct Connection {
     pub server: ServerEntry,
     client: GraphClient,
@@ -112,13 +105,8 @@ pub struct Connection {
     /// it. `None` until one answers, and after one fails.
     pub latency: Option<Duration>,
     pub graphs: GraphListing,
-    /// Why the token last typed for this server could not be saved to the OS keychain: it
-    /// lasts this run only. `None` once one is saved.
-    pub token_unsaved: Option<String>,
-    /// Why the token saved for this server could not be read from the OS keychain (locked,
-    /// access denied, no keychain service): Studio connects without one, which a server that
-    /// asks for none accepts. For a server with a token source, why the source gave none:
-    /// Studio then sends it nothing. `None` once a token is set.
+    /// Why the token source gave no token (the OmniGraph CLI's reason): Studio then sends the
+    /// server nothing. `None` once a token is set.
     pub token_unread: Option<String>,
     /// Whether the server refused the token of the request it answered with 401
     /// ([`ConnectionState::Unauthorized`]): its challenge says `error="invalid_token"`, or, from
@@ -145,12 +133,6 @@ pub struct Connection {
     _listing: Option<Task<()>>,
     /// The next health re-check (spec 003).
     _health_check: Option<Task<()>>,
-    /// The token is still being read (from the keychain): a connect waits for it, rather than
-    /// asking without one and being refused.
-    token_pending: bool,
-    /// How many tokens were set: a keychain read asked for before the last one answers too
-    /// late, and the token set since stands.
-    tokens_set: u64,
     /// One more holder than the watches held ([`ConnectionWatch`]): health is checked only
     /// while one is.
     watchers: Rc<()>,
@@ -167,14 +149,11 @@ impl EventEmitter<ConnectionEvent> for Connection {}
 
 impl Connection {
     /// The status-bar text for its state: a 401 to a request that carried no token says the
-    /// server asks for one (and that the keychain gave none, when it could not), rather than
-    /// that a token was refused.
+    /// server asks for one, and a token source that gave none says so, rather than that a token
+    /// was refused.
     pub fn label(&self) -> String {
         match (&self.state, &self.token_unread) {
-            (ConnectionState::Unauthorized, Some(_)) if self.token_source.is_some() => {
-                "No token from the CLI".into()
-            }
-            (ConnectionState::Unauthorized, Some(_)) => "Token not read from the keychain".into(),
+            (ConnectionState::Unauthorized, Some(_)) => "No token from the CLI".into(),
             (ConnectionState::Unauthorized, None) if !self.refused_with_token => {
                 "Asks for a token".into()
             }
@@ -196,7 +175,6 @@ impl Connection {
             health: None,
             latency: None,
             graphs: GraphListing::Unknown,
-            token_unsaved: None,
             token_unread: None,
             refused_with_token: false,
             has_token,
@@ -208,8 +186,6 @@ impl Connection {
             _task: None,
             _listing: None,
             _health_check: None,
-            token_pending: false,
-            tokens_set: 0,
             watchers: Rc::new(()),
             check_missed: false,
         })
@@ -221,6 +197,20 @@ impl Connection {
     pub(crate) fn with_token_source(mut self, source: Option<Arc<dyn TokenSource>>) -> Self {
         self.token_source = source;
         self
+    }
+
+    /// A connection whose token source never answers, so connecting it sends nothing: for the
+    /// tests of crates that show a server.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn wait_for_a_token(&mut self) {
+        struct Waiting;
+        impl TokenSource for Waiting {
+            fn token(&self) -> futures::future::BoxFuture<'static, Result<Token, String>> {
+                use futures::FutureExt as _;
+                futures::future::pending().boxed()
+            }
+        }
+        self.token_source = Some(Arc::new(Waiting));
     }
 
     /// Replaces where the token comes from (the CLI target changed) and asks it at once; with
@@ -257,13 +247,6 @@ impl Connection {
         if self.state != ConnectionState::Idle {
             self.ask_for_token(false, cx);
         }
-    }
-
-    /// The person's Refresh of a graph on this server: its token is asked for again, and a graph
-    /// list that could not be read is read again.
-    pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        self.refresh_token(cx);
-        self.list_graphs_again(cx);
     }
 
     /// Asks the token source for a token. For a connect (`connecting`), the connect goes on with
@@ -329,49 +312,6 @@ impl Connection {
         }
     }
 
-    /// Notes that the token is being read; [`Connection::token_read`] or
-    /// [`Connection::set_token`] ends the wait, and a connect asked for meanwhile goes then.
-    /// The read's answer is given back with the returned wait.
-    pub fn await_token(&mut self) -> TokenWait {
-        self.token_pending = true;
-        TokenWait(self.tokens_set)
-    }
-
-    /// Takes the token read from the OS keychain for `wait`, which is none when none was saved.
-    /// One that could not be read ends the wait too: Studio connects without a token and keeps
-    /// why ([`Connection::token_unread`]). A server that asks for one answers 401, and a token
-    /// typed in then connects. A token set since the read was asked for (typed in while the
-    /// keychain was slow to answer) is newer, and stands.
-    pub(crate) fn token_read(
-        &mut self,
-        wait: TokenWait,
-        read: anyhow::Result<Option<(String, Vec<u8>)>>,
-        cx: &mut Context<Self>,
-    ) {
-        if wait.0 != self.tokens_set {
-            return;
-        }
-        let (token, unread) = match read {
-            Ok(None) => (None, None),
-            Ok(Some((_, bytes))) => match String::from_utf8(bytes) {
-                Ok(token) => (Some(token), None),
-                Err(_) => (None, Some("the keychain's entry is not text".to_owned())),
-            },
-            Err(error) => (None, Some(error.to_string())),
-        };
-        self.replace_token(token, unread, cx);
-    }
-
-    /// Records how saving the token to the OS keychain ended ([`Connection::token_unsaved`]).
-    pub(crate) fn token_saved(&mut self, saved: Result<(), String>, cx: &mut Context<Self>) {
-        let unsaved = saved.err();
-        if unsaved != self.token_unsaved {
-            self.token_unsaved = unsaved;
-            cx.emit(ConnectionEvent::StateChanged);
-            cx.notify();
-        }
-    }
-
     pub(crate) fn client(&self) -> &GraphClient {
         &self.client
     }
@@ -420,15 +360,13 @@ impl Connection {
         self.replace_token(token, None, cx);
     }
 
-    /// Replaces the token, keeping `unread` as why the keychain did not give one.
+    /// Replaces the token, keeping `unread` as why the token source gave none.
     fn replace_token(
         &mut self,
         token: Option<String>,
         unread: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        self.token_pending = false;
-        self.tokens_set += 1;
         self.has_token = token.is_some();
         if self.client.set_token(token) {
             cx.emit(ConnectionEvent::CredentialChanged);
@@ -522,9 +460,6 @@ impl Connection {
         self._health_check = None;
         cx.emit(ConnectionEvent::StateChanged);
         cx.notify();
-        if self.token_pending {
-            return;
-        }
         // A server with a token source is asked nothing before the source answers.
         if !std::mem::take(&mut self.token_fresh) && self.asks_token_source() {
             self.ask_for_token(true, cx);
@@ -841,17 +776,13 @@ mod tests {
         }
     }
 
-    /// A connection whose token is still being read waits to connect, sending nothing it
-    /// would be refused; the token's arrival connects it, and the keychain's answer to that
-    /// read, coming after, is dropped. A cancel stops the check scheduled after a failure,
-    /// which would otherwise connect again.
+    /// A connection whose token source has not answered waits to connect, sending nothing it
+    /// would be refused; a token typed in connects it. A cancel stops the check scheduled
+    /// after a failure, which would otherwise connect again.
     #[gpui::test]
     async fn a_connect_waits_for_its_token_and_a_cancel_stays(cx: &mut TestAppContext) {
         let sent = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
         let seen = sent.clone();
-        // Whether the server answers a read sent without a token; it answers 401 otherwise.
-        let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let answers_anyone = open.clone();
         let http = FakeHttpClient::create(move |request| {
             let path = request.uri().path().to_owned();
             let token = request
@@ -859,23 +790,15 @@ mod tests {
                 .get("authorization")
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
-            let refused = token.is_none()
-                && !answers_anyone.load(std::sync::atomic::Ordering::SeqCst)
-                && !path.ends_with("/healthz");
             seen.lock().unwrap().push(token);
             async move {
-                let (status, body) = if path.ends_with("/healthz") {
-                    (
-                        200,
-                        r#"{"status":"ok","version":"0.14.0","internal_schema_version":16}"#,
-                    )
-                } else if refused {
-                    (401, r#"{"error":"unauthorized","code":"unauthorized"}"#)
+                let body = if path.ends_with("/healthz") {
+                    r#"{"status":"ok","version":"0.14.0","internal_schema_version":16}"#
                 } else {
-                    (200, r#"{"graphs":[]}"#)
+                    r#"{"graphs":[]}"#
                 };
                 Ok(Response::builder()
-                    .status(status)
+                    .status(200)
                     .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                     .body(AsyncBody::from(body))
                     .unwrap())
@@ -884,14 +807,13 @@ mod tests {
         let server = ServerEntry {
             name: "dev".into(),
             url: "http://127.0.0.1:8787".into(),
-            source: ServerSource::Studio,
+            source: ServerSource::Cli,
             known_graphs: Vec::new(),
         };
         let connection = cx.new(|_| Connection::new(server, None, http).unwrap());
-        let first_read = connection.update(cx, |connection, cx| {
-            let wait = connection.await_token();
+        connection.update(cx, |connection, cx| {
+            connection.wait_for_a_token();
             connection.connect(cx);
-            wait
         });
         cx.run_until_parked();
         connection.read_with(cx, |connection, _| {
@@ -914,18 +836,6 @@ mod tests {
                 .iter()
                 .all(|token| token.as_deref() == Some("Bearer t"))
         );
-        // The keychain answering after a token was set: the token set stands, and nothing is
-        // sent again with the keychain's.
-        sent.lock().unwrap().clear();
-        connection.update(cx, |connection, cx| {
-            let saved = ("omnigraph-studio".to_owned(), b"from-keychain".to_vec());
-            connection.token_read(first_read, Ok(Some(saved)), cx);
-        });
-        cx.run_until_parked();
-        assert!(
-            sent.lock().unwrap().is_empty(),
-            "the late answer is dropped"
-        );
 
         // A check is scheduled while ready; connecting and cancelling leave none behind.
         connection.update(cx, |connection, cx| {
@@ -934,53 +844,6 @@ mod tests {
             assert!(connection._health_check.is_none());
             assert_eq!(connection.state, ConnectionState::Idle);
         });
-
-        // A token the keychain could not give: the wait ends and Studio connects without one,
-        // keeping why. A server that asks for no token is ready.
-        let read_failed = |cx: &mut TestAppContext| {
-            sent.lock().unwrap().clear();
-            connection.update(cx, |connection, cx| {
-                let wait = connection.await_token();
-                connection.connect(cx);
-                connection.token_read(wait, Err(anyhow::anyhow!("the keychain is locked")), cx);
-            });
-            cx.run_until_parked();
-            let sent = sent.lock().unwrap();
-            assert!(!sent.is_empty(), "connected without the token");
-            assert!(sent.iter().all(Option::is_none), "no token sent");
-            drop(sent);
-            connection.read_with(cx, |connection, _| {
-                assert_eq!(
-                    connection.token_unread.as_deref(),
-                    Some("the keychain is locked")
-                );
-                connection.state.clone()
-            })
-        };
-        open.store(true, std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(read_failed(cx), ConnectionState::Ready);
-
-        // A server that asks for one answers 401; a token typed in connects and ends the
-        // keychain's reason. A token that could not be saved says so.
-        open.store(false, std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(read_failed(cx), ConnectionState::Unauthorized);
-        sent.lock().unwrap().clear();
-        connection.update(cx, |connection, cx| {
-            connection.set_token(Some("typed".into()), cx);
-            connection.token_saved(Err("access denied".into()), cx);
-        });
-        cx.run_until_parked();
-        connection.read_with(cx, |connection, _| {
-            assert_eq!(connection.state, ConnectionState::Ready);
-            assert_eq!(connection.token_unread, None);
-            assert_eq!(connection.token_unsaved.as_deref(), Some("access denied"));
-        });
-        assert!(
-            sent.lock()
-                .unwrap()
-                .iter()
-                .all(|token| token.as_deref() == Some("Bearer typed"))
-        );
     }
 
     /// A refused token stays refused through health checks, which pass without one: the
@@ -1013,7 +876,7 @@ mod tests {
         let server = ServerEntry {
             name: "dev".into(),
             url: "http://127.0.0.1:8787".into(),
-            source: ServerSource::Studio,
+            source: ServerSource::Cli,
             known_graphs: Vec::new(),
         };
         let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
@@ -1118,7 +981,7 @@ mod tests {
         let server = ServerEntry {
             name: "dev".into(),
             url: "http://127.0.0.1:8787".into(),
-            source: ServerSource::Studio,
+            source: ServerSource::Cli,
             known_graphs: Vec::new(),
         };
         let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
@@ -1185,7 +1048,7 @@ mod tests {
         let server = ServerEntry {
             name: "dev".into(),
             url: "http://127.0.0.1:8787".into(),
-            source: ServerSource::Studio,
+            source: ServerSource::Cli,
             known_graphs: Vec::new(),
         };
         let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());

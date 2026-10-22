@@ -234,17 +234,18 @@ fn new_workspace(window: &mut Window, cx: &mut App) -> Entity<Workspace> {
 /// The saved windows that still have a graph on a known server, with only those graphs.
 fn reopenable_windows(cx: &App) -> Vec<SavedWindow> {
     let registry = ConnectionRegistry::global(cx);
-    let known = |url: &str| {
+    let known = |target: &str| {
         registry
             .read(cx)
             .connections
             .iter()
-            .any(|connection| connection.read(cx).server.url == url)
+            .any(|connection| connection.read(cx).server.name == target)
     };
     reopenable(studio_workspace::load_windows(), known)
 }
 
-/// `windows` with only their graphs on servers `known` holds, the windows left with none dropped.
+/// `windows` with only their graphs on CLI targets `known` holds, the windows left with none
+/// dropped.
 /// A graph is open in one window at a time: its tabs and drafts are saved by graph, so two
 /// windows holding it would each write over the other's. One listed by two windows from an
 /// earlier session reopens in the first.
@@ -255,8 +256,7 @@ fn reopenable(windows: Vec<SavedWindow>, known: impl Fn(&str) -> bool) -> Vec<Sa
         .filter_map(|mut window| {
             let shown = window.session.graphs.get(window.session.shown).cloned();
             window.session.graphs.retain(|graph| {
-                known(&graph.server_url)
-                    && taken.insert((graph.server_url.clone(), graph.graph.clone()))
+                known(&graph.target) && taken.insert((graph.target.clone(), graph.graph.clone()))
             });
             window.session.shown = shown
                 .and_then(|shown| window.session.graphs.iter().position(|g| *g == shown))
@@ -279,7 +279,7 @@ fn reopen_window(
     for (index, graph) in saved.session.graphs.iter().enumerate() {
         let Some(connection) = connections
             .iter()
-            .find(|c| c.read(cx).server.url == graph.server_url)
+            .find(|c| c.read(cx).server.name == graph.target)
             .cloned()
         else {
             continue;
@@ -562,7 +562,9 @@ mod reopen_tests {
     use super::*;
 
     /// A graph two saved windows listed reopens in the first alone; the second shows what is
-    /// left, and a window left with nothing is not reopened.
+    /// left, and a window left with nothing is not reopened. Graphs are taken by their CLI
+    /// target: one on a target the CLI no longer lists, or saved by an earlier build by its
+    /// server's address, is not reopened.
     #[test]
     fn a_graph_two_windows_listed_reopens_in_the_first() {
         let window = |graphs: &[&str], shown: usize| -> SavedWindow {
@@ -570,7 +572,7 @@ mod reopen_tests {
                 "graphs": graphs
                     .iter()
                     .map(|graph| serde_json::json!({
-                        "server_url": "http://studio.test",
+                        "target": "studio",
                         "graph": graph,
                         "branch": "main",
                     }))
@@ -579,13 +581,22 @@ mod reopen_tests {
             }))
             .unwrap()
         };
+        let elsewhere: SavedWindow = serde_json::from_value(serde_json::json!({
+            "graphs": [
+                {"target": "gone", "graph": "crm", "branch": "main"},
+                {"server_url": "http://studio.test", "graph": "old", "branch": "main"},
+            ],
+            "shown": 0,
+        }))
+        .unwrap();
         let windows = reopenable(
             vec![
                 window(&["crm", "notes"], 0),
                 window(&["notes", "ops"], 1),
                 window(&["crm"], 0),
+                elsewhere,
             ],
-            |url| url == "http://studio.test",
+            |target| target == "studio",
         );
         let graphs: Vec<Vec<&str>> = windows
             .iter()

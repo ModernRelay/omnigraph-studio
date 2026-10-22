@@ -5,7 +5,7 @@
 use editor::{Editor, EditorEvent};
 use gpui::{
     App, Context, DismissEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Render,
-    SharedString, Subscription, WeakEntity, Window,
+    SharedString, Subscription, Task, WeakEntity, Window,
 };
 use graph_store::{
     Connection, ConnectionEvent, ConnectionRegistry, ConnectionState, ConnectionWatch,
@@ -44,6 +44,8 @@ pub struct OpenGraphModal {
     new_name: Entity<Editor>,
     new_url: Entity<Editor>,
     new_token: Entity<Editor>,
+    /// The server being added, while the CLI adds its target.
+    _adding: Option<Task<()>>,
     /// A replacement for a token the selected server refused.
     replacement_token: Entity<Editor>,
     error: Option<SharedString>,
@@ -99,7 +101,7 @@ impl OpenGraphModal {
         let graph_id = input("Graph id, for example knowledge", window, cx);
         let new_name = input("Name, for example dev", window, cx);
         let new_url = input("http://127.0.0.1:8787", window, cx);
-        let new_token = input("Token (stored in the keychain)", window, cx);
+        let new_token = input("Token (kept by the OmniGraph CLI)", window, cx);
         new_token.update(cx, |editor, cx| editor.set_masked(true, cx));
         let replacement_token = input("New token", window, cx);
         replacement_token.update(cx, |editor, cx| editor.set_masked(true, cx));
@@ -148,6 +150,7 @@ impl OpenGraphModal {
             new_url,
             new_token,
             replacement_token,
+            _adding: None,
             error: None,
             _subscriptions: subscriptions,
         };
@@ -352,8 +355,7 @@ impl OpenGraphModal {
 
     /// Makes `connection` the server chosen, by a click, the keyboard or the registry dropping
     /// the one chosen. A new token typed for another server is that server's alone: the field
-    /// and its error are cleared, so Update token never sends it to this server's address nor
-    /// saves it under this server's keychain entry.
+    /// and its error are cleared, so Update token never sends it to this server's address.
     fn choose(
         &mut self,
         connection: Option<Entity<Connection>>,
@@ -396,7 +398,7 @@ impl OpenGraphModal {
         if !listed {
             connection.update(cx, |connection, _| connection.remember_graph(&graph_id));
             if let Some(registry) = ConnectionRegistry::try_global(cx) {
-                registry.read(cx).save(cx);
+                registry.update(cx, |registry, cx| registry.save(cx));
             }
         }
         if let Some(workspace) = self.workspace.upgrade() {
@@ -428,15 +430,16 @@ impl OpenGraphModal {
         cx.emit(DismissEvent);
     }
 
+    /// Adds the server typed as a CLI target, through the CLI (`target add`, and `credentials
+    /// set` for a token, which the CLI keeps): Studio keeps no server of its own. The CLI's
+    /// refusal is shown as it said it.
     fn add_server(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self._adding.is_some() {
+            return;
+        }
         let name = self.new_name.read(cx).text(cx);
         let url = self.new_url.read(cx).text(cx);
         let token = self.new_token.read(cx).text(cx);
-        let name = if name.trim().is_empty() {
-            url.clone()
-        } else {
-            name.trim().to_owned()
-        };
         let token = (!token.trim().is_empty()).then(|| token.trim().to_owned());
         let registry = ConnectionRegistry::global(cx);
         let listed: Vec<_> = registry
@@ -445,34 +448,42 @@ impl OpenGraphModal {
             .iter()
             .map(|connection| connection.entity_id())
             .collect();
-        let result = registry.update(cx, |registry, cx| {
-            registry.add_server(name, url, token, Vec::new(), cx)
-        });
-        match result {
-            // An address listed already is that server, which a new token reconnects itself:
-            // it is selected, followed and connected once, as it was.
-            Ok(connection) if listed.contains(&connection.entity_id()) => {
-                let name = connection.read(cx).server.name.clone();
-                self.select(connection, window, cx);
-                self.error = Some(format!("{name} has that address already.").into());
-                cx.notify();
-            }
-            Ok(connection) => {
-                // Followed now, before the registry's notice reaches the dialog.
-                self.follow(registry.read(cx).connections.clone(), window, cx);
-                connection.update(cx, |c, cx| c.connect(cx));
-                self.select(connection, window, cx);
-                // A second server is typed fresh, not added again from the first one's fields.
-                for editor in [&self.new_name, &self.new_url, &self.new_token] {
-                    editor.update(cx, |editor, cx| editor.set_text("", window, cx));
+        let adding = registry.update(cx, |registry, cx| registry.add_target(name, url, token, cx));
+        self.error = Some("Adding the target through the OmniGraph CLI…".into());
+        cx.notify();
+        self._adding = Some(cx.spawn_in(window, async move |this, cx| {
+            let added = adding.await;
+            this.update_in(cx, |this, window, cx| {
+                this._adding = None;
+                this.error = None;
+                match added {
+                    // An address listed already is that server: it is selected, followed and
+                    // connected once, as it was.
+                    Ok(connection) if listed.contains(&connection.entity_id()) => {
+                        let name = connection.read(cx).server.name.clone();
+                        this.select(connection, window, cx);
+                        this.error = Some(format!("{name} has that address already.").into());
+                    }
+                    Ok(connection) => {
+                        // Followed now, before the registry's notice reaches the dialog.
+                        let registry = ConnectionRegistry::global(cx);
+                        this.follow(registry.read(cx).connections.clone(), window, cx);
+                        connection.update(cx, |c, cx| c.connect(cx));
+                        this.select(connection, window, cx);
+                        // A second server is typed fresh, not added again from these fields.
+                        for editor in [&this.new_name, &this.new_url, &this.new_token] {
+                            editor.update(cx, |editor, cx| editor.set_text("", window, cx));
+                        }
+                        window.focus(&this.graph_id.focus_handle(cx), cx);
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("The server was not added: {error}").into());
+                    }
                 }
-                window.focus(&self.graph_id.focus_handle(cx), cx);
-            }
-            Err(error) => {
-                self.error = Some(format!("That address is not valid: {error}").into());
                 cx.notify();
-            }
-        }
+            })
+            .ok();
+        }));
     }
 
     fn update_token(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -512,8 +523,7 @@ impl OpenGraphModal {
                         let color = connection_color(&c.state);
                         let selected = self.selected.as_ref() == Some(&connection);
                         let source = match c.server.source {
-                            ServerSource::Cli => "CLI config",
-                            ServerSource::Studio => "added in Studio",
+                            ServerSource::Cli => "CLI target",
                             ServerSource::Environment => "environment",
                         };
                         MenuRow::new(("server", index))
@@ -552,15 +562,9 @@ impl OpenGraphModal {
         let c = connection.read(cx);
         let status = server_status(c);
         let state = c.state.clone();
-        // A token typed in replaces one the server refused, or one the keychain would not give
-        // to a server that asks for one.
+        // A token typed in replaces one the server refused, or one the CLI would not give to a
+        // server that asks for one.
         let asks_token = state == ConnectionState::Unauthorized;
-        // Why the keychain gave no token, under a status that does not say it already.
-        let unread = c
-            .token_unread
-            .clone()
-            .filter(|_| state != ConnectionState::Unauthorized);
-        let unsaved = c.token_unsaved.clone();
         let token_tooltip = token_tooltip(c);
         let selected = connection.clone();
         let listing_note = match &c.graphs {
@@ -612,22 +616,6 @@ impl OpenGraphModal {
                         _ => row,
                     }),
             )
-            .children(unread.map(|reason| {
-                div()
-                    .px(px(space::MD))
-                    .child(studio_ui::ds::text::muted(format!(
-                        "Studio could not read the token from the keychain: {reason}. It \
-                         connects without one."
-                    )))
-            }))
-            .children(unsaved.map(|reason| {
-                div()
-                    .px(px(space::MD))
-                    .child(studio_ui::ds::text::muted(format!(
-                        "The token could not be saved to the keychain: {reason}. It lasts until \
-                     Studio quits."
-                    )))
-            }))
             .when(asks_token, |pane| {
                 pane.child(
                     h_flex()
@@ -740,22 +728,17 @@ impl OpenGraphModal {
     }
 }
 
-/// What the chosen server's line says of its state. A 401 says what it was an answer to: a
-/// token the keychain would not give, no token at all (a server Studio has none configured
-/// for asks for one), or the token sent. A CLI server the CLI gave no token is asked nothing,
-/// and says why.
+/// What the chosen server's line says of its state. A 401 says what it was an answer to: no
+/// token at all (a server Studio has none configured for asks for one), or the token sent. A
+/// CLI server the CLI gave no token is asked nothing, and says why.
 fn server_status(c: &Connection) -> String {
     match (&c.state, &c.token_unread) {
         (ConnectionState::Unreachable(error), _) => {
             format!("Could not reach the server: {error}")
         }
-        (ConnectionState::Unauthorized, Some(reason)) if c.token_from_cli() => {
+        (ConnectionState::Unauthorized, Some(reason)) => {
             format!("The OmniGraph CLI gave no token for this server: {reason}")
         }
-        (ConnectionState::Unauthorized, Some(reason)) => format!(
-            "The server asks for a token, and Studio could not read it from the keychain: \
-             {reason}"
-        ),
         (ConnectionState::Unauthorized, None) if !c.refused_with_token => {
             "This server asks for a token; none is configured for it.".into()
         }
@@ -764,12 +747,10 @@ fn server_status(c: &Connection) -> String {
     }
 }
 
-/// What Update token does with the token typed: a server added in Studio keeps it in the
-/// keychain; a CLI server's lasts this run, and the CLI's own command keeps one for both, as
-/// one from the environment lasts this run.
+/// What Update token does with the token typed: it lasts this run, and for a CLI server the
+/// CLI's own command keeps one for the CLI and Studio.
 fn token_tooltip(c: &Connection) -> String {
     match c.server.source {
-        ServerSource::Studio => "Stored in the keychain and used from now on.".into(),
         ServerSource::Cli => format!(
             "Used until Studio quits. To keep one for the CLI and Studio, pipe it to `omnigraph \
              credentials set --target {} --stdin`.",
@@ -874,7 +855,7 @@ mod tests {
         );
         let connection = session.read_with(cx, |session, _| session.connection.clone());
         connection.update(cx, |connection, _| {
-            connection.await_token();
+            connection.wait_for_a_token();
             for graph in graphs {
                 connection.remember_graph(graph);
             }
@@ -1028,8 +1009,8 @@ mod tests {
     }
 
     /// A 401 to a request that carried no token says the server asks for one, not that it
-    /// refused one; Update token names no command the CLI lacks, and keeps a Studio server's
-    /// token in the keychain.
+    /// refused one; a CLI server the CLI gave no token says why; Update token names the CLI's
+    /// own command, and no command the CLI lacks.
     #[gpui::test]
     fn a_server_sent_no_token_is_said_to_ask_for_one(cx: &mut TestAppContext) {
         let connection = server(&[], cx);
@@ -1054,6 +1035,18 @@ mod tests {
                 "Token refused".to_owned()
             )
         );
+        connection.update(cx, |connection, _| {
+            connection.token_unread = Some("No credential is configured for 'cloud'".into());
+        });
+        assert_eq!(
+            said(false, cx),
+            (
+                "The OmniGraph CLI gave no token for this server: No credential is configured \
+                 for 'cloud'"
+                    .to_owned(),
+                "No token from the CLI".to_owned()
+            )
+        );
         let tooltip = |source: ServerSource, cx: &mut TestAppContext| {
             connection.update(cx, |connection, _| {
                 connection.server.source = source;
@@ -1067,10 +1060,6 @@ mod tests {
             "{cli}"
         );
         assert!(!cli.contains("login"), "{cli}");
-        assert_eq!(
-            tooltip(ServerSource::Studio, cx),
-            "Stored in the keychain and used from now on."
-        );
     }
 
     /// A reload that replaces a server (a new address in the CLI config) is followed: the new
