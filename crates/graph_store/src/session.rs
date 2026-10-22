@@ -627,6 +627,14 @@ pub(crate) struct Pending<V: 'static> {
     ticket: u64,
 }
 
+/// Wanted while some view's task still holds the read: dropping every asker's task stops it,
+/// and nothing would file its answer.
+impl<V: Clone + 'static> crate::memo::Pend for Pending<V> {
+    fn wanted(&self) -> bool {
+        self.read.upgrade().is_some()
+    }
+}
+
 pub struct GraphSession {
     pub connection: Entity<Connection>,
     pub graph_id: String,

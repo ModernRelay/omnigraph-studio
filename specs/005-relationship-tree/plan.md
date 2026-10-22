@@ -115,7 +115,8 @@ on the canvas. Typing filters the visible rows.
   is still out unless the row was opened since, and that is read again if it opens later
   (since 2026-10-21; before, a Person's 92 counts went out for every row rested on and ran to
   the end). A read stopped before it answered shows nothing, so it makes no change count
-  toward "Newer data" and the feed is not asked about its types (spec 015's read scope).
+  toward "Newer data" and the feed is not asked about its types (spec 015's read scope), and
+  it takes no answer's place in the session's memo (since 2026-10-22, spec 015).
 - What the exploration holds stays bounded: a finished read lets go of its task, and once it
   holds more counts, neighbour lists, values and labels than its bound, those no open path
   reaches (rows read ahead and never opened, what was below a subtree closed whole) are let
@@ -152,6 +153,7 @@ on the canvas. Typing filters the visible rows.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-22 | Reads left by a read ahead take no answer's place in the memo | `graph_store` `memo::a_read_nobody_waits_for_goes_before_any_answer` (spec 015) | Five reads each left as the next started kept a 2-entry memo's answer, one read held at the end. Before, each stayed until the entry cap let it go after every answer |
 | 2026-10-21 | A read out when the pin moved past a commit that changed nothing it reads stands | `graph_store` `an_answer_at_a_commit_the_pin_was_carried_past_stands` (root at c1; another writer changes a Company at c2, so the pin moves to c2; a page and a count answered at c1, sent at c1; a page answered at c9, sent at c1) | The c1 page shows its neighbour and the c1 count 5, with the pin at c2; the c9 answer fails. Before, `pinned_at` refused every answer not at the current pin, so a slow group expanded before another writer's unrelated commit showed "The server answered at commit c1, not at c2" until Retry |
 | 2026-10-21 | A new token reads what the tree shows again | `graph_store` `a_new_token_reads_what_the_exploration_shows_again` (a server answering the root by token: the old one sees Ada, the new one nothing; `Connection::set_token`) | At once the label Ada is gone and the root is not loaded; then one node read goes under the new token and the root reads "No Person with key ada at this commit.", the pin still c1. Before, the exploration had no arm for `SessionEvent::CredentialChanged`: what the old token read stayed beside what the new one read |
 | 2026-10-21 | Reads ahead are bounded and stop when the pointer moves on | `graph_store` `what_is_read_ahead_stops_when_the_pointer_moves_on` (20 relationships; a server that never answers reads about p2), `what_nothing_open_reaches_is_let_go`; `relationship_tree` calls `Exploration::end_prefetch` when the pointer leaves a row | Resting on p2: 8 counts Loading and 8 reads out; leaving: 0 out, no count kept, no task. p3's 8 answered counts stay after leaving, its tasks gone, the flattening the same `Arc`; resting on p4 stops p2's still out. The unreachable counts, lists and labels go and the root's, an open group's and one being read stay. Before, all 20 went out, ran on, kept their tasks, and each answer re-flattened the tree |

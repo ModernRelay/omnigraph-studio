@@ -288,7 +288,11 @@ A first cut of parts 1 and 4, ahead of the shared cache:
   to 4,096; the release buffer is not built. A read still under way weighs nothing and is what
   identical asks share, so the byte budget never lets one go; the count of 4,096 lets one go
   only once no answer is left to (since 2026-10-21; before, a slow read pushed out mid-flight
-  was sent again at the next identical ask, and its answer was kept for nobody).
+  was sent again at the next identical ask, and its answer was kept for nobody). A read every
+  asker dropped (a row read ahead and left, rows scrolled past, a search typed on) is not
+  held: a lookup finds nothing for it, and over the count such reads go before any answer
+  (since 2026-10-22; before, each stayed until the count let it go after every answer, so each
+  took an answer's place).
 - Seeding: a generated query may say what its rows also answer at the same commit and schema
   (`builder::Seeds`). A whole-node page's rows answer each row's `node_by_id`, so a node page
   or peek opened from a table at the session's known head reads nothing for the node; a page's
@@ -408,6 +412,7 @@ commit can be cleaned up; measure first).
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-22 | A read nobody waits for goes before any answer | `graph_store` `memo::a_read_nobody_waits_for_goes_before_any_answer` (a 3-entry memo: an answer, a read waited for, a read left, then an answer; a 2-entry memo of an answer and five reads each left as the next starts, then two waited for), failing with the sweep undone; `session.rs` says a `Pending` is wanted while its weak handle upgrades (`memo::Pend`) | The read left went, and the oldest answer and the read waited for stayed; left too, the read went when looked up. The five left reads never pushed the answer out, and one stayed held; the two waited for then went after it. Undone, the oldest answer went first. The sweep goes through the reads under way alone, which the memo keeps by when they were last used |
 | 2026-10-21 | The byte budget never lets a read under way go | `graph_store` `memo::the_byte_budget_never_lets_a_read_under_way_go` (a 10-byte memo: an answer, a read started, two 6-byte answers, then a 30-byte one; a 4-entry memo of two reads and three answers; a 2-entry memo of three reads); `session.rs` `share`, which finds a read under way only in its memo slot | The read stayed through both budget evictions and kept its answer when it came; the older answers went, and the heaviest stayed alone beside the read. Over the count, the oldest answer went before either read, and with only reads, the oldest read. Before, `put` let the least recently used go whatever it held, the read under way among them |
 | 2026-10-21 | A lost merge has one record, the session's outcome log | `review` `a_review_opened_after_the_one_that_merged_closed_starts_from_the_log`, `settling_a_lost_merge_in_one_review_lets_another_merge`; `graph_store` `the_activity_log_keeps_the_newest_writes`, extended (spec 008's validation log) | Pass. A review opened after the one that merged closed, and one open beside it, start from and settle by the log's entry alone; the review's own per-session record (a global keyed by session) is gone |
 | 2026-10-21 | Seeds never push out an answer that was read | `graph_store` `seeded_answers_never_push_out_an_answer_that_was_read` (an answer read at c1, then 5,120 node answers seeded at c1 through `GraphSession::seed`); `a_page_read_at_a_commit_answers_its_nodes` still passing with the seed forgotten from its own memo | The read answer is still held; 1,024 seeds are kept, and at most 1,024 seed commit families. Before, seeds went into the 4,096-entry `pinned_reads` and the read answer went first |
