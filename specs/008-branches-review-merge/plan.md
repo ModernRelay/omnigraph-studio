@@ -122,7 +122,10 @@ place), X (designed on 0.13; the better routes are deferred).
 - A credential the access route refuses changes on the branch (spec 002) writes nothing from
   the review: Edit and every Revert are disabled with the refusal as their tooltip, and ↵ and
   ⌥⌘Z are not registered (since 2026-10-21). A new token reads the review again, its names and
-  dry run included; nothing read with the old one shows meanwhile (since 2026-10-21).
+  dry run included; nothing read with the old one shows meanwhile, nor after a read the new
+  token is refused: the cards, the counts, the banners and the scope menu's commits go with the
+  review read, and a scope change reads the merge base again. Reviewed marks stay, and a fix
+  asked for and not back is still sent, bound as it was (since 2026-10-21).
 - Every fix is a write on the branch, bound with `/mutate/if-graph-commit` to the reviewed head
   or to the commit of the fix before it; a 412 says the branch moved and offers Refresh. Fixes
   go one at a time, so a second one asked for quickly is bound to the first's commit, and each
@@ -153,14 +156,24 @@ place), X (designed on 0.13; the better routes are deferred).
   entity, and the message. Resolution happens on the source branch with ordinary edits; then
   merge again.
 - After merging, Studio confirms the target's history contains the merge (a verified
-  merge), reading it a page at a time from its head for at most its newest 10,000 commits. A
-  merge not in them is not confirmed: "Not confirmed: the newest 10,000 commits of main's
+  merge), reading it a page at a time from its head for at most its newest 10,000 commits, and
+  only down to the target's head as Studio checked it just before sending the merge: a merge
+  that lands publishes a commit of the target above that head, so a read that reaches it
+  without the merge has read every commit the merge can be, and reads as not shown (since
+  2026-10-21; before, a merge that never landed on a target of more than 10,000 commits read
+  20 pages, "not reached", at every Refresh). A merge not in the pages read is not confirmed: "Not confirmed: the newest 10,000 commits of main's
   history do not show it, and Studio read no further; open History to check." A lost merge
   response read the same way stays unknown, never "merge again". Merge stays off while that
   history is read and while what was read cannot tell ("… Studio did not retry, and Merge stays
   off until main's history settles it: open History to check, or Refresh to read it again."):
-  a second merge would cancel the read and be sent while the first may still land. Refresh
-  reads the history again, never the merge. History read to its end without the merge lets
+  a second merge would cancel the read and be sent while the first may still land. Revert and
+  Edit stay off with it, saying a merge may be running: a fix could land on either side of the
+  merge (since 2026-10-21). Refresh reads the history again, never the merge. The lost merge,
+  with the head it was sent for and the target's head before it, is kept for the session's
+  reviews of the same branches: one opened again, or open elsewhere and read again, starts from
+  it and reads the history for it, offering neither Merge nor a fix meanwhile (since
+  2026-10-21). The session's outcome log cannot carry this today: it names the branches only in
+  its description and records neither head, so the review keeps its own record. History read to its end without the merge lets
   Merge run again, saying the first may still land ("… does not show it yet, but the merge may
   still land. Studio did not retry; open History to check before merging again."), and a merge
   it shows ends the review's merging as a committed one does (since 2026-10-21).
@@ -216,6 +229,9 @@ place), X (designed on 0.13; the better routes are deferred).
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | A lost merge keeps the fixes off too, and a reopened review keeps Merge off | `review` `a_lost_merge_keeps_merge_off_until_history_settles_it`, extended: Revert while main's history cannot be read; a second review of feature into main opened after the lost merge; a Refresh after it settles | Revert is refused ("A merge is running, or may be") and no `/mutate` is sent; the reopened review starts from the lost merge, reads main's history for it, and sends neither the merge nor a fix; settled as not shown, fixes and Merge are offered again, and a Refresh after that forgets it, so a review opened since starts idle. Before, Revert stayed on while the banner said Merge stays off, and a reopened tab offered Merge at once |
+| 2026-10-21 | A lost merge is looked for only above the target's head before it | `review` `a_lost_merge_is_looked_for_only_above_the_head_it_was_sent_over` (main of 10,501 commits, its head m10500 when the merge was checked, the merge answered 504 and never landed) | One page of main read, the merge not shown, Merge offered again. Before, 20 pages and "not reached", repeated at every Refresh, so Merge stayed off in that tab for good |
+| 2026-10-21 | A new token leaves nothing the old one read | `review` `a_new_credential_reads_the_review_again`, extended: the new token refused the merge base | At once and after the refused read: no review data, cards, rows, scope-menu commits, names, dry run or bound head; the review reads as failed; the person's reviewed mark is kept; allowed again, a scope change reads the merge base. Before, the old token's counts, banners and scope menu stayed, for good after a refused read, and a scope change reused the old token's merge base and commits |
 | 2026-10-21 | A lost merge is never sent twice | `review` `a_lost_merge_keeps_merge_off_until_history_settles_it` (a merge answered 504 through a gateway, main's history first unreadable, then readable without the merge) | While the history is read, and while it cannot tell (`Unread`), Merge is off and `merge` sends nothing; a Refresh reads main's history again and no second merge; read to its end without the merge, Merge runs again with "may still land". Before, Merge stayed on under "reading main's history…": a click replaced the merge task, cancelling the read, and sent a second merge |
 | 2026-10-21 | A fast-forward of the reviewed head is not said to take more | `review` `a_merge_of_a_head_newer_than_the_review_says_so`, extended to `fast_forward` answers whose commit's merged parent is f2 (the reviewed head) or f3 | `beyond_review` false for f2, true for f3, as for a merge commit. Before, a fast-forward compared the new target commit's own id with the reviewed head, which never match: every fast-forward warned |
 | 2026-10-21 | A switch of graph shows none of the previous graph's branch details | `review` `a_switch_of_graph_shows_none_of_the_previous_graphs_details` (graph A's head reads out when the list switches to graph B, whose branches are not read yet) | No details until B's branches are read, then B's main at b1 by act-b1. Before, A's read landed after the switch and named A's head, actor and time on B's rows |

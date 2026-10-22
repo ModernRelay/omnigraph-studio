@@ -8,8 +8,9 @@ use std::time::Duration;
 use change_cards::{CardLines, CardRows, Row};
 use editor::{Editor, EditorEvent};
 use gpui::{
-    AnyElement, App, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    ListAlignment, ListState, Render, SharedString, Subscription, Task, WeakEntity, Window, list,
+    AnyElement, App, AsyncApp, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
+    Global, ListAlignment, ListState, Render, SharedString, Subscription, Task, WeakEntity, Window,
+    list,
 };
 use gq_language::SchemaModel;
 use graph_client::api::{
@@ -128,9 +129,57 @@ enum MergeState {
         reason: String,
         /// What the target's history shows of it.
         landed: Check,
-        /// The branch head the merge was sent for, which the target's history is read for.
-        head: Option<String>,
+        /// What the merge was sent for, which the target's history is read for.
+        sent: Sent,
     },
+}
+
+/// What a merge was sent for: the branch head it merges, and the target's head when Studio
+/// checked the branch just before sending it. A merge that lands publishes a commit of the
+/// target above that head, so the target's history is read for it only down to there.
+#[derive(Debug, Clone, Default)]
+struct Sent {
+    head: Option<String>,
+    before: Option<String>,
+}
+
+/// Merges whose response was lost, by the session they were sent through, as the target's
+/// history last showed them. A review of the same branches opened again, in this window or
+/// another, starts from there and reads the history again, and none offers Merge, or a fix, while
+/// the first merge may still land. This is Studio's memory of its own writes, kept while Studio
+/// runs (a session's entity id is never reused, so a closed session's entries are never read):
+/// the session's outcome log names the branches only in its words, and neither the head a merge
+/// was sent for nor the target's head before it, which settling it needs.
+#[derive(Default)]
+struct LostMerges(HashMap<EntityId, Vec<LostMerge>>);
+
+impl Global for LostMerges {}
+
+#[derive(Debug, Clone)]
+struct LostMerge {
+    source: String,
+    target: String,
+    reason: String,
+    landed: Check,
+    sent: Sent,
+}
+
+impl LostMerge {
+    /// Whether it may still land: its history is being read, or what was read could not tell.
+    fn may_land(&self) -> bool {
+        matches!(
+            self.landed,
+            Check::Reading | Check::NotReached | Check::Unread
+        )
+    }
+
+    fn state(&self) -> MergeState {
+        MergeState::Unknown {
+            reason: self.reason.clone(),
+            landed: self.landed,
+            sent: self.sent.clone(),
+        }
+    }
 }
 
 /// The indexes of `changes` in order of type and id, for [`ReviewData::change_to`].
@@ -583,6 +632,9 @@ impl ReviewView {
             _fix_task: None,
             _subscriptions: vec![subscription, search_subscription],
         };
+        // Read as any Refresh is: a merge of these branches whose response was lost and may
+        // still land, sent from a review closed since or open elsewhere, is where this one
+        // starts.
         view.reload(cx);
         view
     }
@@ -599,7 +651,27 @@ impl ReviewView {
     /// The session reads under a new token, which may see less than the one the cards, their
     /// names and the dry run were read with: none of them shows while the review is read again
     /// under it, the names included, which a Refresh otherwise keeps.
+    ///
+    /// Everything the old token read goes: the cards, the counts, the banners and the scope
+    /// menu's commits with the review it read, and the merge base and commits since the fork a
+    /// scope change would take. A read the new token is refused leaves none of it. Reviewed
+    /// marks are the person's and stay. A fix asked for and not back is still sent, bound to the
+    /// head the one before it left, and the server judges it under the new token.
     fn credential_changed(&mut self, cx: &mut Context<Self>) {
+        self.keep_marks();
+        self.data = None;
+        self.cards.clear();
+        self.rows.clear();
+        self.headers.clear();
+        self.list_state.reset(0);
+        self.selected = None;
+        self.searched = Searched::default();
+        self.summary.clear();
+        self._search_task = None;
+        self._regroup_task = None;
+        if self.fixes_running == 0 {
+            self.bound_head = None;
+        }
         self.names.clear();
         self._names_task = None;
         self.preview = Preview::Unread;
@@ -673,14 +745,8 @@ impl ReviewView {
         self.data.as_ref().and_then(|d| d.head.clone())
     }
 
-    /// Reads the review again from the branch head. Reviewed marks are kept.
-    pub fn reload(&mut self, cx: &mut Context<Self>) {
-        self.read_again(None, cx);
-    }
-
-    /// Reads the review again: from the merge base and the commits since the fork in `held`,
-    /// read for heads the branch and its target still stand at, else from the branch head.
-    fn read_again(&mut self, held: Option<ForkRead>, cx: &mut Context<Self>) {
+    /// Keeps the cards' reviewed marks for the review read next ([`mark_of`]).
+    fn keep_marks(&mut self) {
         for (state, mark) in self
             .cards
             .iter()
@@ -692,17 +758,37 @@ impl ReviewView {
                 self.reviewed_keys.remove(mark);
             }
         }
+    }
+
+    /// Reads the review again from the branch head. Reviewed marks are kept.
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.read_again(None, cx);
+    }
+
+    /// Reads the review again: from the merge base and the commits since the fork in `held`,
+    /// read for heads the branch and its target still stand at, else from the branch head.
+    fn read_again(&mut self, held: Option<ForkRead>, cx: &mut Context<Self>) {
+        self.keep_marks();
         self.load = LoadState::Loading { folded: 0 };
         self.newer = false;
         self.schema_moved_while_loading = false;
         self.show_conflicts = false;
         // A merge out keeps its state and its task. One whose lost response the target's
         // history did not settle is settled by reading that history again, never by merging
-        // again (constitution III).
-        if self.merge_unsettled() {
+        // again (constitution III); so is one another review of these branches sent, which
+        // may still land.
+        if !matches!(self.merge, MergeState::Unknown { .. }) && !self.merging() {
+            match self.lost_merge(cx).filter(|lost| lost.may_land()).cloned() {
+                Some(lost) => {
+                    self.merge = lost.state();
+                    self.settle_merge(cx);
+                }
+                None => self.set_merge(MergeState::Idle, cx),
+            }
+        } else if self.merge_unsettled() {
             self.settle_merge(cx);
         } else if !self.merging() {
-            self.merge = MergeState::Idle;
+            self.set_merge(MergeState::Idle, cx);
         }
         let session = self.session.clone();
         let branch = self.branch.clone();
@@ -1164,7 +1250,7 @@ impl ReviewView {
         if self.cards.get(ix)?.fix.done() || self.change_refusal(cx).is_some() {
             return None;
         }
-        if self.merging() || self.branch_deleted {
+        if self.merge_may_land(cx) || self.branch_deleted {
             let reason = if self.branch_deleted {
                 BRANCH_DELETED
             } else {
@@ -1253,30 +1339,100 @@ impl ReviewView {
         )
     }
 
+    /// A merge is out, or its lost response is not settled, this review's or another's of these
+    /// branches: either may still land, so a fix now could land on either side of it, and the
+    /// fixes wait, as Merge does.
+    fn merge_may_land(&self, cx: &App) -> bool {
+        self.merging()
+            || self.merge_unsettled()
+            || self.lost_merge(cx).is_some_and(LostMerge::may_land)
+    }
+
+    /// The lost merge of these branches the session's reviews know of ([`LostMerges`]).
+    fn lost_merge<'a>(&self, cx: &'a App) -> Option<&'a LostMerge> {
+        cx.try_global::<LostMerges>()?
+            .0
+            .get(&self.session.entity_id())?
+            .iter()
+            .find(|lost| lost.source == self.branch && lost.target == self.target)
+    }
+
+    /// Sets the merge's state, keeping a lost merge's for the session's other reviews of these
+    /// branches, and for this one opened again ([`LostMerges`]). A review that held one and
+    /// leaves it, settled, forgets it, as does a new merge.
+    fn set_merge(&mut self, state: MergeState, cx: &mut Context<Self>) {
+        let held = matches!(self.merge, MergeState::Unknown { .. });
+        let session = self.session.entity_id();
+        let lost = &mut cx.default_global::<LostMerges>().0;
+        let merges = lost.entry(session).or_default();
+        let at = merges
+            .iter()
+            .position(|lost| lost.source == self.branch && lost.target == self.target);
+        match (&state, at) {
+            (
+                MergeState::Unknown {
+                    reason,
+                    landed,
+                    sent,
+                },
+                at,
+            ) => {
+                let kept = LostMerge {
+                    source: self.branch.clone(),
+                    target: self.target.clone(),
+                    reason: reason.clone(),
+                    landed: *landed,
+                    sent: sent.clone(),
+                };
+                match at {
+                    Some(at) => merges[at] = kept,
+                    None => merges.push(kept),
+                }
+            }
+            (MergeState::Checking, Some(at)) => {
+                merges.remove(at);
+            }
+            (_, Some(at)) if held => {
+                merges.remove(at);
+            }
+            _ => {}
+        }
+        if merges.is_empty() {
+            lost.remove(&session);
+        }
+        self.merge = state;
+    }
+
     /// Reads the target's history again for a merge whose response was lost, which the history
     /// read before did not settle: never by merging again (constitution III).
     fn settle_merge(&mut self, cx: &mut Context<Self>) {
-        let MergeState::Unknown { reason, head, .. } = &self.merge else {
+        let MergeState::Unknown { reason, sent, .. } = &self.merge else {
             return;
         };
-        let (reason, head) = (reason.clone(), head.clone());
-        self.merge = MergeState::Unknown {
-            reason: reason.clone(),
-            landed: Check::Reading,
-            head: head.clone(),
-        };
+        let (reason, sent) = (reason.clone(), sent.clone());
+        self.set_merge(
+            MergeState::Unknown {
+                reason: reason.clone(),
+                landed: Check::Reading,
+                sent: sent.clone(),
+            },
+            cx,
+        );
         let session = self.session.clone();
         let (branch, target) = (self.branch.clone(), self.target.clone());
         self._merge_task = Some(cx.spawn(async move |this, cx| {
-            let landed = merge_landed(&session, &branch, &target, head.as_deref(), cx).await;
+            let landed = merge_landed(&session, &branch, &target, &sent, cx).await;
             this.update(cx, |this, cx| {
                 // The merge may have deleted the branch: the session reads the branches again.
                 this.session.update(cx, |s, cx| s.reload_branches(cx));
-                this.merge = MergeState::Unknown {
-                    reason,
-                    landed,
-                    head,
-                };
+                this.set_merge(
+                    MergeState::Unknown {
+                        reason,
+                        landed,
+                        sent,
+                    },
+                    cx,
+                );
                 this.writes_settled(cx);
                 cx.emit(ItemEvent::UpdateTab);
                 cx.notify();
@@ -1401,7 +1557,7 @@ impl ReviewView {
     fn open_edit(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         // As the button is: a card fixed already shows values its fix replaced, an edit during a
         // merge could land on either side of it, and a credential refused changes writes none.
-        if self.merging()
+        if self.merge_may_land(cx)
             || self.cards.get(ix).is_none_or(|card| card.fix.done())
             || self.change_refusal(cx).is_some()
         {
@@ -1437,7 +1593,7 @@ impl ReviewView {
         changes: Vec<(String, Value, Value)>,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        if self.merging() {
+        if self.merge_may_land(cx) {
             return Err(MERGE_RUNNING.into());
         }
         if self.branch_deleted {
@@ -1632,7 +1788,7 @@ impl ReviewView {
     }
 
     fn writes_settled(&mut self, cx: &mut Context<Self>) {
-        if !self.merging() {
+        if !self.merge_may_land(cx) {
             // A fix refused while the merge was out may be asked for again; one that would
             // write to a branch the merge deleted is refused when asked.
             for card in &mut self.cards {
@@ -1653,8 +1809,8 @@ impl ReviewView {
     }
 
     /// Whether Merge may run ([`Self::merge_blocked`]).
-    fn mergeable(&self) -> bool {
-        self.merge_blocked().is_none()
+    fn mergeable(&self, cx: &App) -> bool {
+        self.merge_blocked(cx).is_none()
     }
 
     /// Why Merge may not run now, for its tooltip (constitution VI); `None` for a review of the
@@ -1663,7 +1819,7 @@ impl ReviewView {
     /// beside it; a review being read shows a head nobody has seen; a fix still out would land
     /// on either side of the merge; a review of one commit has not shown what else the merge
     /// takes.
-    fn merge_blocked(&self) -> Option<String> {
+    fn merge_blocked(&self, cx: &App) -> Option<String> {
         Some(match &self.merge {
             MergeState::Checking | MergeState::Merging => {
                 format!("Merging {} into {}…", self.branch, self.target)
@@ -1687,6 +1843,12 @@ impl ReviewView {
                 landed: Check::Shown,
                 ..
             } => "This review's merge is done: Refresh to read the branch again".to_owned(),
+            // Another review of these branches sent a merge whose response was lost.
+            _ if self.lost_merge(cx).is_some_and(LostMerge::may_land) => format!(
+                "A merge of {} into {} sent before may have landed: Refresh to read {}'s \
+                 history again",
+                self.branch, self.target, self.target
+            ),
             _ if !matches!(self.load, LoadState::Ready) => "The review is not read yet".to_owned(),
             _ if self.fixes_running > 0 => "A fix is out: merge once it is back".to_owned(),
             _ if self.scope.is_some() => {
@@ -1722,10 +1884,10 @@ impl ReviewView {
     /// Merges the branch into the target after checking the branch still sits at the head this
     /// review holds. The outcome is shown, then confirmed against the target's history.
     pub fn merge(&mut self, cx: &mut Context<Self>) {
-        if !self.mergeable() || self.merge_refusal(cx).is_some() {
+        if !self.mergeable(cx) || self.merge_refusal(cx).is_some() {
             return;
         }
-        self.merge = MergeState::Checking;
+        self.set_merge(MergeState::Checking, cx);
         self.show_conflicts = false;
         cx.notify();
         let session = self.session.clone();
@@ -1734,8 +1896,8 @@ impl ReviewView {
         let bound = self.bound_head.clone();
         self._merge_task = Some(cx.spawn(async move |this, cx| {
             let read = session.update(cx, |session, cx| session.merge_base(&branch, &target, cx));
-            let head = match read.await {
-                Ok(base) => Some(base.source_commit_id),
+            let (head, before) = match read.await {
+                Ok(base) => (Some(base.source_commit_id), Some(base.target_commit_id)),
                 Err(error) => {
                     this.update(cx, |this, cx| {
                         this.merge = MergeState::Refused(format!(
@@ -1822,6 +1984,7 @@ impl ReviewView {
                         &target,
                         commit.as_deref(),
                         bound.as_deref(),
+                        before.as_deref(),
                         cx,
                     )
                     .await;
@@ -1838,23 +2001,30 @@ impl ReviewView {
                     _ => MergeState::Refused(error.body.error),
                 },
                 WriteOutcome::Unknown { reason } => {
+                    let sent = Sent {
+                        head: bound,
+                        before,
+                    };
                     // Merge stays off while this read is out: a second merge would cancel it.
+                    // The review's tab opened again starts from here too.
                     this.update(cx, |this, cx| {
-                        this.merge = MergeState::Unknown {
-                            reason: reason.clone(),
-                            landed: Check::Reading,
-                            head: bound.clone(),
-                        };
+                        this.set_merge(
+                            MergeState::Unknown {
+                                reason: reason.clone(),
+                                landed: Check::Reading,
+                                sent: sent.clone(),
+                            },
+                            cx,
+                        );
                         cx.notify();
                     })
                     .ok();
                     // Settle by reading history, never by merging again (constitution III).
-                    let landed =
-                        merge_landed(&session, &branch, &target, bound.as_deref(), cx).await;
+                    let landed = merge_landed(&session, &branch, &target, &sent, cx).await;
                     MergeState::Unknown {
                         reason,
                         landed,
-                        head: bound,
+                        sent,
                     }
                 }
             };
@@ -1865,7 +2035,7 @@ impl ReviewView {
                 if matches!(state, MergeState::Unknown { .. }) {
                     this.session.update(cx, |s, cx| s.reload_branches(cx));
                 }
-                this.merge = state;
+                this.set_merge(state, cx);
                 this.writes_settled(cx);
                 cx.emit(ItemEvent::UpdateTab);
                 cx.notify();
@@ -1906,7 +2076,7 @@ impl ReviewView {
     fn render_header(&self, cx: &mut Context<Self>) -> AnyElement {
         let border = studio_ui::ds::surface::rule(cx);
         let focus = self.focus_handle.clone();
-        let mergeable = self.mergeable();
+        let mergeable = self.mergeable(cx);
         let merge_refused = self.merge_refusal(cx);
         let delete_refused = self.delete_refusal(cx);
         let merge_button = studio_ui::ds::toolbar_button(
@@ -1934,7 +2104,7 @@ impl ReviewView {
             // A disabled Merge says why (constitution VI).
             let title = merge_refused
                 .clone()
-                .or_else(|| self.merge_blocked())
+                .or_else(|| self.merge_blocked(cx))
                 .unwrap_or_else(|| "Merge after checking the branch has not moved".to_owned());
             move |_, cx| Tooltip::with_meta(title.clone(), None, cli.clone(), cx)
         })
@@ -2040,9 +2210,11 @@ impl ReviewView {
                     .into_any_element(),
             );
         }
+        // Only over cards read: without them there is nothing the fixes moved past.
         let own_head = self
             .bound_head
             .as_ref()
+            .filter(|_| self.data.is_some())
             .filter(|head| Some(*head) != self.reviewed_head().as_ref());
         if let (Some(head), false) = (own_head, self.newer) {
             banners.push(
@@ -2503,7 +2675,7 @@ impl ReviewView {
         let refused = self.change_refusal(cx);
         if let Some(own) = group.change {
             let state = &self.cards[own];
-            let done = state.fix.done() || self.merging();
+            let done = state.fix.done() || self.merge_may_land(cx);
             if self.editable(own, cx) {
                 let branch = self.branch.clone();
                 let focus = focus.clone();
@@ -2590,8 +2762,9 @@ impl ReviewView {
                     .clone()
                     .or_else(|| state.revert_blocked.clone())
                     .or_else(|| was.and_then(|was| was.revert_blocked.clone()));
-                let done =
-                    state.fix.done() || was.is_some_and(|was| was.fix.done()) || self.merging();
+                let done = state.fix.done()
+                    || was.is_some_and(|was| was.fix.done())
+                    || self.merge_may_land(cx);
                 let reviewed = state.reviewed && was.is_none_or(|was| was.reviewed);
                 let fix = match was {
                     Some(was) if state.fix == FixState::Idle => was.fix.clone(),
@@ -3450,18 +3623,27 @@ async fn read_commit_review(
     Ok(data)
 }
 
-/// After a lost merge response: whether the target holds the source head.
+/// After a lost merge response: whether the target holds the source head the merge was sent for.
 async fn merge_landed(
     session: &Entity<GraphSession>,
     source: &str,
     target: &str,
-    source_head: Option<&str>,
+    sent: &Sent,
     cx: &mut AsyncApp,
 ) -> Check {
-    if source_head.is_none() {
+    if sent.head.is_none() {
         return Check::Unread;
     }
-    merge_shown(session, source, target, None, source_head, cx).await
+    merge_shown(
+        session,
+        source,
+        target,
+        None,
+        sent.head.as_deref(),
+        sent.before.as_deref(),
+        cx,
+    )
+    .await
 }
 
 /// Whether the target shows the merge of `source_head` (or the merge commit `commit`). The source
@@ -3469,14 +3651,17 @@ async fn merge_landed(
 /// already there. When the merge base has moved past it (more of the source was merged since),
 /// the target's history is read from its head, where a merge just made is, a page at a time
 /// for at most [`FORK_PAGES`] pages: the merge commit, or a commit carrying the source head. A
-/// merge not in them is not confirmed ([`Check::NotReached`]), rather than looked for in the
-/// rest of the history.
+/// merge publishes a commit of the target above the head the target had before it was sent
+/// (`before`), so a read that reaches that head without it has read every commit the merge can
+/// be ([`Check::NotShown`]). A merge not in the pages read is not confirmed
+/// ([`Check::NotReached`]), rather than looked for in the rest of the history.
 async fn merge_shown(
     session: &Entity<GraphSession>,
     source: &str,
     target: &str,
     commit: Option<&str>,
     source_head: Option<&str>,
+    before: Option<&str>,
     cx: &mut AsyncApp,
 ) -> Check {
     // The source head being the merge base, or the target at the merge commit, proves it. So
@@ -3501,6 +3686,10 @@ async fn merge_shown(
         };
         if shows(&page) {
             return Check::Shown;
+        }
+        // Below here is older than the merge.
+        if before.is_some_and(|before| page.iter().any(|c| c.graph_commit_id == before)) {
+            return Check::NotShown;
         }
     }
     if pages.done {
@@ -4005,14 +4194,24 @@ pub(crate) mod tests {
         }
     }
 
+    /// What a lost merge was sent for: `head`, over a target head not known.
+    fn sent(head: &str) -> Sent {
+        Sent {
+            head: Some(head.into()),
+            before: None,
+        }
+    }
+
     /// A merge request's body when it is a dry run.
     const DRY_RUN: &str = "\"dry_run\":true";
 
-    /// A merge whose response was lost keeps Merge off while main's history is read for it, and
-    /// while what was read does not settle it: a second merge would cancel that read and be
-    /// sent while the first may still land. A Refresh reads the history again, never the merge.
-    /// History read to its end without the merge lets Merge run again, saying the first may
-    /// still land.
+    /// A merge whose response was lost keeps Merge, and every fix, off while main's history is
+    /// read for it, and while what was read does not settle it: a second merge would cancel that
+    /// read and be sent, and a fix could land on either side of it, while the first may still
+    /// land. A Refresh reads the history again, never the merge. A review of the same branches
+    /// opened again starts from the lost merge and reads for it too, so closing the tab does not
+    /// offer Merge again. History read to its end without the merge lets Merge and the fixes run
+    /// again, saying the first may still land; a Refresh after that forgets it.
     #[gpui::test]
     async fn a_lost_merge_keeps_merge_off_until_history_settles_it(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
@@ -4036,25 +4235,32 @@ pub(crate) mod tests {
         };
         let (session, asked) =
             review_server_with(None, false, None, "f2", |_| (500, json!({})), lost, cx);
-        let (view, cx) = cx.add_window_view(|window, cx| {
-            ReviewView::new(session, "feature".into(), "main".into(), window, cx)
-        });
-        cx.run_until_parked();
+        let open = |cx: &mut gpui::TestAppContext| {
+            let session = session.clone();
+            let (view, cx) = cx.add_window_view(|window, cx| {
+                ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+            });
+            cx.run_until_parked();
+            (view, cx.clone())
+        };
+        let (view, mut window) = open(cx);
+        let cx = &mut window;
         let count = |route: &dyn Fn(&String) -> bool| {
             asked.lock().unwrap().iter().filter(|r| route(r)).count()
         };
         let merges = || count(&|r| r.contains("/branches/merge?") && !r.contains(DRY_RUN));
         let main_reads = || count(&|r| r.contains("/commits?branch=main"));
+        let writes = || count(&|r| r.contains("/mutate"));
 
         // While main's history is read for it, the merge is out.
         view.update(cx, |view, cx| {
             view.merge = MergeState::Unknown {
                 reason: "the server answered 504".into(),
                 landed: Check::Reading,
-                head: Some("f2".into()),
+                sent: Sent::default(),
             };
             assert!(view.merging());
-            assert!(!view.mergeable());
+            assert!(!view.mergeable(cx));
             view.merge(cx);
             assert!(matches!(
                 view.merge,
@@ -4065,7 +4271,7 @@ pub(crate) mod tests {
             ));
             // A Refresh meanwhile leaves the read out, and Merge off.
             view.reload(cx);
-            assert!(!view.mergeable());
+            assert!(!view.mergeable(cx));
             view.merge = MergeState::Idle;
         });
         cx.run_until_parked();
@@ -4076,24 +4282,51 @@ pub(crate) mod tests {
         view.update(cx, |view, cx| {
             assert!(
                 matches!(
-                    view.merge,
+                    &view.merge,
                     MergeState::Unknown {
                         landed: Check::Unread,
+                        sent,
                         ..
-                    }
+                    } if sent.head.as_deref() == Some("f2") && sent.before.as_deref() == Some("m2")
                 ),
                 "{:?}",
                 view.merge
             );
-            assert!(!view.mergeable());
+            assert!(!view.mergeable(cx));
             assert_eq!(
-                view.merge_blocked().as_deref(),
+                view.merge_blocked(cx).as_deref(),
                 Some("The merge sent before may have landed: Refresh to read main's history again")
             );
             view.merge(cx);
+            // Nor a fix: it could land on either side of the merge.
+            view.revert(0, cx);
+            assert_eq!(view.cards[0].fix, FixState::Refused(MERGE_RUNNING.into()));
+            assert_eq!(view.fixes_running, 0);
         });
         cx.run_until_parked();
         assert_eq!(merges(), 1, "not sent again");
+        assert_eq!(writes(), 0);
+
+        // The review opened again, as after its tab was closed: it starts from the lost merge,
+        // reads main's history for it, and offers neither Merge nor a fix.
+        let before = main_reads();
+        let (again, mut again_window) = open(cx);
+        let again_cx = &mut again_window;
+        again.update(again_cx, |again, cx| {
+            assert!(
+                matches!(again.merge, MergeState::Unknown { .. }),
+                "{:?}",
+                again.merge
+            );
+            assert!(!again.mergeable(cx));
+            again.merge(cx);
+            again.revert(0, cx);
+            assert_eq!(again.fixes_running, 0);
+        });
+        again_cx.run_until_parked();
+        assert!(main_reads() > before, "read for the merge again");
+        assert_eq!(merges(), 1, "not sent again");
+        assert_eq!(writes(), 0);
 
         // Readable now, and without the merge: a Refresh reads it, and Merge runs again.
         readable.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -4102,7 +4335,7 @@ pub(crate) mod tests {
         cx.run_until_parked();
         assert!(main_reads() > before, "main's history read again");
         assert_eq!(merges(), 1, "not sent again");
-        view.read_with(cx, |view, _| {
+        view.read_with(cx, |view, cx| {
             assert!(
                 matches!(
                     view.merge,
@@ -4114,7 +4347,8 @@ pub(crate) mod tests {
                 "{:?}",
                 view.merge
             );
-            assert!(view.mergeable());
+            assert!(view.mergeable(cx));
+            assert!(!view.merge_may_land(cx), "fixes are offered again");
         });
         assert_eq!(
             unknown_merge_words("the server answered 504", Check::NotShown, "main"),
@@ -4122,6 +4356,67 @@ pub(crate) mod tests {
              show it yet, but the merge may still land. Studio did not retry; open History to \
              check before merging again."
         );
+        // Read again after that, the review forgets it, and so does one opened since.
+        view.update(cx, |view, cx| view.reload(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.merge, MergeState::Idle))
+        });
+        let (third, third_window) = open(cx);
+        third.read_with(&third_window, |third, cx| {
+            assert!(matches!(third.merge, MergeState::Idle));
+            assert!(third.mergeable(cx));
+        });
+    }
+
+    /// A merge that lands publishes a commit of main above the head main had when Studio checked
+    /// the branch before sending it, so a lost merge is looked for only down to that head: on a
+    /// main of more than 10,000 commits, one that never landed reads one page and is not shown,
+    /// rather than 20 pages and "not reached", which would keep Merge off for good.
+    #[gpui::test]
+    async fn a_lost_merge_is_looked_for_only_above_the_head_it_was_sent_over(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let main = chain_of("m", FORK_BOUND + 501, None);
+        let base = json!({ "merge_base": listed("m1", None, None), "source": "feature", "source_commit_id": "f2", "target": "main", "target_commit_id": "m10500" });
+        let lost = move |path: &str, query: &str, sent: &str| {
+            if path.ends_with("/branches/merge") && !sent.contains(DRY_RUN) {
+                Some((504, json!({})))
+            } else if path.ends_with("/branches/merge-base") {
+                Some((200, base.clone()))
+            } else if path.ends_with("/commits") && query.contains("branch=main") {
+                Some((200, page_of(&main, query)))
+            } else {
+                None
+            }
+        };
+        let (session, asked) =
+            review_server_with(None, false, None, "f2", |_| (500, json!({})), lost, cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| view.merge(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(
+                matches!(
+                    view.merge,
+                    MergeState::Unknown {
+                        landed: Check::NotShown,
+                        ..
+                    }
+                ),
+                "{:?}",
+                view.merge
+            );
+            assert!(view.mergeable(cx));
+        });
+        assert_eq!(listings(&asked, "main"), 1);
     }
 
     /// A credential the access route refuses changes on the branch reverts and edits nothing
@@ -4180,46 +4475,82 @@ pub(crate) mod tests {
         );
     }
 
-    /// A new token may see less than the one the review was read with: the cards, the names and
-    /// the dry run read under the old one stop showing, and the review is read again under the
-    /// new one.
+    /// A new token may see less than the one the review was read with: nothing read under the
+    /// old one shows while the review is read again under the new one, not the cards, the
+    /// counts, the names, the dry run or the scope menu's commits, and none of it comes back
+    /// when the new token is refused the read. A scope change then reads the merge base again,
+    /// rather than take the one the old token read. Reviewed marks are the person's, and stay.
     #[gpui::test]
     async fn a_new_credential_reads_the_review_again(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
             studio_theme::init_test(cx);
             editor::init(cx);
         });
-        let (session, asked) = reviewed_server(false, cx);
+        let refused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let new_token = refused.clone();
+        // The new token is refused what the old one read.
+        let over = move |path: &str, _: &str, _: &str| {
+            (new_token.load(std::sync::atomic::Ordering::SeqCst)
+                && path.ends_with("/branches/merge-base"))
+            .then(|| (403, json!({ "error": "forbidden", "code": "forbidden" })))
+        };
+        let (session, asked) =
+            review_server_with(None, false, None, "f2", |_| (500, json!({})), over, cx);
         let (view, cx) = cx.add_window_view({
             let session = session.clone();
             |window, cx| ReviewView::new(session, "feature".into(), "main".into(), window, cx)
         });
         cx.run_until_parked();
-        view.update(cx, |view, _| {
+        let mark = view.update(cx, |view, cx| {
             assert!(matches!(view.preview, Preview::Merges(_)));
             view.names.insert(
                 ("Person".into(), "p9".into()),
                 "Read with the old token".into(),
             );
+            view.toggle_reviewed(0, cx);
+            let reviewed = view.cards.iter().position(|card| card.reviewed).unwrap();
+            view.data.as_ref().unwrap().marks[reviewed]
         });
+        refused.store(true, std::sync::atomic::Ordering::SeqCst);
         asked.lock().unwrap().clear();
         session.update(cx, |_, cx| cx.emit(SessionEvent::CredentialChanged));
-        view.read_with(cx, |view, _| {
+        let gone = |view: &ReviewView| {
+            assert!(view.data.is_none(), "the old token's review");
+            assert!(view.cards.is_empty() && view.rows.is_empty());
             assert!(
-                matches!(view.load, LoadState::Loading { .. }),
-                "no old cards"
+                view.scope_menu_input().0.is_empty(),
+                "the old token's commits"
             );
             assert!(view.names.is_empty());
             assert!(matches!(view.preview, Preview::Unread));
+            assert!(view.bound_head.is_none());
+        };
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.load, LoadState::Loading { .. }));
+            assert!(view.reviewed_keys.contains(&mark), "the person's mark");
+            gone(view);
         });
         cx.run_until_parked();
-        let asked = asked.lock().unwrap().clone();
-        for route in ["/branches/merge-base", "/changes?branch=feature"] {
-            assert!(
-                asked.iter().any(|r| r.contains(route)),
-                "{route}: {asked:?}"
-            );
-        }
+        let asked_now = std::mem::take(&mut *asked.lock().unwrap());
+        assert!(
+            asked_now.iter().any(|r| r.contains("/branches/merge-base")),
+            "{asked_now:?}"
+        );
+        view.read_with(cx, |view, cx| {
+            assert!(matches!(view.load, LoadState::Failed(_)), "refused");
+            gone(view);
+            assert!(view.held_fork_read(cx).is_none());
+        });
+
+        // Allowed again: a scope change reads the merge base, not the old token's.
+        refused.store(false, std::sync::atomic::Ordering::SeqCst);
+        view.update(cx, |view, cx| view.set_scope(Some("f1".into()), cx));
+        cx.run_until_parked();
+        let asked_now = std::mem::take(&mut *asked.lock().unwrap());
+        assert!(
+            asked_now.iter().any(|r| r.contains("/branches/merge-base")),
+            "{asked_now:?}"
+        );
         view.read_with(cx, |view, _| assert!(matches!(view.load, LoadState::Ready)));
     }
 
@@ -4340,7 +4671,7 @@ pub(crate) mod tests {
                 assert_eq!(branch, if delete { "main" } else { "feature" });
                 // The merge is the end: Merge is not offered again, and a deleted branch's
                 // review is neither watched nor opened again with the window.
-                assert!(!view.mergeable());
+                assert!(!view.mergeable(cx));
                 assert_eq!(view._head_watch.is_none(), delete);
                 assert_eq!(view.serialize(cx).is_none(), delete);
             });
@@ -4389,7 +4720,7 @@ pub(crate) mod tests {
         cx.run_until_parked();
         assert!(!cx.update(|window, cx| window.is_action_available(&Merge, cx)));
         view.update(cx, |view, cx| {
-            assert!(view.mergeable(), "the whole review is on screen");
+            assert!(view.mergeable(cx), "the whole review is on screen");
             assert_eq!(
                 view.merge_refusal(cx).as_deref(),
                 Some("Your credential may not merge feature into main")
@@ -5325,18 +5656,19 @@ pub(crate) mod tests {
                 "main",
                 Some("m3"),
                 Some("f2"),
+                None,
                 &mut async_cx
             )
             .await,
             Check::Shown
         );
         assert_eq!(
-            merge_landed(&session, "feature", "main", Some("f2"), &mut async_cx).await,
+            merge_landed(&session, "feature", "main", &sent("f2"), &mut async_cx).await,
             Check::Shown,
             "f2 was merged, though the merge base is f3 now"
         );
         assert_eq!(
-            merge_landed(&session, "feature", "main", Some("f9"), &mut async_cx).await,
+            merge_landed(&session, "feature", "main", &sent("f9"), &mut async_cx).await,
             Check::Shown,
             "the source is merged whole, and its heads with it"
         );
@@ -5359,7 +5691,7 @@ pub(crate) mod tests {
         );
         let mut async_cx = cx.to_async();
         assert_eq!(
-            merge_landed(&session, "feature", "main", Some("f9"), &mut async_cx).await,
+            merge_landed(&session, "feature", "main", &sent("f9"), &mut async_cx).await,
             Check::NotShown
         );
 
@@ -5372,6 +5704,7 @@ pub(crate) mod tests {
             "main",
             Some("m3"),
             Some("f2"),
+            None,
             &mut async_cx,
         )
         .await;
@@ -5400,7 +5733,7 @@ pub(crate) mod tests {
             cx,
         );
         let mut async_cx = cx.to_async();
-        let landed = merge_landed(&session, "feature", "main", Some("f2"), &mut async_cx).await;
+        let landed = merge_landed(&session, "feature", "main", &sent("f2"), &mut async_cx).await;
         assert_eq!(landed, Check::NotReached);
         assert_eq!(listings(&asked, "main"), FORK_PAGES);
         let lost = unknown_merge_words("the connection closed", landed, "main");
