@@ -16,6 +16,8 @@ pub mod workspace {
             ToggleCommandPalette,
             /// Find a node by its id or name.
             GoTo,
+            /// Show Omnigraph Studio's version.
+            About,
             /// Open Studio's settings.
             OpenSettings,
             /// Switch the window's graph to another branch.

@@ -10,7 +10,7 @@ use studio_actions::graph::{
 use studio_actions::query::{Save, SaveAs};
 use studio_actions::update::{CheckForUpdates, RestartToUpdate};
 use studio_actions::workspace::{
-    ActivateNextPane, ActivatePreviousPane, CloseActiveItem, CloseAllItems, CloseOtherItems,
+    About, ActivateNextPane, ActivatePreviousPane, CloseActiveItem, CloseAllItems, CloseOtherItems,
     GoBack, GoForward, GoTo, NewWindow, OpenGraph, OpenSettings, Quit, Refresh, RevealLog,
     ShowKeyBindings, SplitDown, SplitRight, SwitchBranch, ToggleActivity, ToggleCommandPalette,
     ToggleInspector, TogglePinTab, ToggleSidebar,
@@ -30,6 +30,8 @@ pub fn set(cx: &mut App) {
     };
     cx.set_menus([
         Menu::new("Omnigraph Studio").items([
+            MenuItem::action("About Omnigraph Studio", About),
+            MenuItem::separator(),
             MenuItem::action("Settings…", OpenSettings),
             update,
             MenuItem::separator(),
