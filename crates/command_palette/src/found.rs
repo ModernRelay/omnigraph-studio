@@ -23,12 +23,6 @@ pub(crate) fn node_key(type_name: &str, id: &str) -> String {
     format!("{NODE_KEY}{type_name}:{id}")
 }
 
-/// Whether `key` is a found node's row: one the palette lists in the order its type answered,
-/// never by recent use, so it is not remembered.
-pub(crate) fn is_node_key(key: &str) -> bool {
-    key.starts_with(NODE_KEY)
-}
-
 #[derive(Default)]
 pub(crate) struct Answers {
     /// Every answer while the palette is open, by type and text: text typed back to shows

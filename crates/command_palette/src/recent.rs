@@ -7,7 +7,6 @@ use std::path::PathBuf;
 use gpui::{App, AppContext as _, Global};
 use serde::{Deserialize, Serialize};
 
-use crate::found::is_node_key;
 use crate::matching::remember;
 
 const CAP: usize = 50;
@@ -48,10 +47,9 @@ pub fn load(cx: &mut App) {
 }
 
 /// Adds the saved keys after those recorded before the file arrived, which stay in front, up
-/// to the cap. Found nodes an earlier Studio remembered are dropped: nothing ranks them, and
-/// they held the places of rows that are ranked.
+/// to the cap.
 fn add_saved(keys: &mut Vec<String>, saved: Vec<String>) {
-    for key in saved.into_iter().filter(|key| !is_node_key(key)) {
+    for key in saved {
         if !keys.contains(&key) && keys.len() < CAP {
             keys.push(key);
         }
@@ -86,18 +84,18 @@ pub fn record(key: &str, cx: &mut App) {
 mod tests {
     use super::*;
 
-    /// The saved list follows what was run before it was read, and loses the found nodes an
-    /// earlier Studio kept, which nothing ranks.
+    /// The saved list follows what was run before it was read, in its own order, each key
+    /// once and no more than the cap.
     #[test]
-    fn saved_keys_follow_those_run_and_drop_found_nodes() {
+    fn saved_keys_follow_those_run() {
         let mut keys = vec!["type:Person".to_owned()];
-        let saved = [
-            "node:Person:ada",
-            "branch:feature",
-            "type:Person",
-            "node:Topic:x",
-        ];
+        let saved = ["branch:feature", "type:Person", "type:Topic"];
         add_saved(&mut keys, saved.map(str::to_owned).to_vec());
-        assert_eq!(keys, ["type:Person", "branch:feature"]);
+        assert_eq!(keys, ["type:Person", "branch:feature", "type:Topic"]);
+
+        let many = (0..CAP + 5).map(|n| format!("type:T{n}")).collect();
+        add_saved(&mut keys, many);
+        assert_eq!(keys.len(), CAP);
+        assert_eq!(keys[..3], ["type:Person", "branch:feature", "type:Topic"]);
     }
 }

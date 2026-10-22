@@ -27,13 +27,15 @@ use crate::session::GraphSession;
 /// The most dependents a delete from Studio takes; one that needs more is refused, so a click
 /// never removes an unbounded part of the graph.
 pub const MAX_DEPENDENTS: usize = 1000;
-/// Rounds of dependents of dependents before the chain is called too long.
+/// Rounds of dependents of dependents before the chain is called too long: each round reads
+/// one step further down it.
 const MAX_ROUNDS: usize = 32;
 /// Changes read per page when undoing: the most a page holds.
 const UNDO_PAGE: u32 = 8_192;
 /// The most changes Undo reads and puts back in one commit, as many as a review folds
-/// (constitution IX): a delete that removed more is refused before it is all held.
-const UNDO_CAP: usize = REVIEW_CHANGE_CAP;
+/// (constitution IX): a delete that removed more is refused before it is all held, and a delete
+/// that would remove more is confirmed by typing.
+pub const UNDO_CAP: usize = REVIEW_CHANGE_CAP;
 
 /// A node deleted because it needs one that is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,17 +85,31 @@ impl DeletePlan {
 /// Why a delete could not be planned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanError {
+    /// A read of what depends on the rows failed.
     Read(String),
+    /// More than [`MAX_DEPENDENTS`] nodes would go with the rows.
     TooMany,
+    /// Every one of [`MAX_ROUNDS`] rounds found nodes that need those found before it: the
+    /// chain of dependents goes at least that many steps deep, and may go further.
+    TooDeep,
 }
 
 impl std::fmt::Display for PlanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PlanError::Read(message) => f.write_str(message),
+            PlanError::Read(message) => {
+                write!(f, "Studio could not read what depends on it. {message}")
+            }
             PlanError::TooMany => write!(
                 f,
-                "More than {MAX_DEPENDENTS} other nodes need these. Delete them in the query \
+                "More than {} other nodes need these. Delete them in the query editor, where \
+                 the whole delete is written out.",
+                studio_ui::group_digits(MAX_DEPENDENTS)
+            ),
+            PlanError::TooDeep => write!(
+                f,
+                "Nodes that need these are needed by others in turn, at least {MAX_ROUNDS} \
+                 steps deep, and Studio follows the chain no further. Delete them in the query \
                  editor, where the whole delete is written out."
             ),
         }
@@ -195,7 +211,7 @@ pub fn plan_node_delete(
             }
             grown = next;
         }
-        Err(PlanError::TooMany)
+        Err(PlanError::TooDeep)
     })
 }
 
@@ -588,6 +604,118 @@ mod tests {
             reads
                 .iter()
                 .all(|read| !read["query"].as_str().unwrap().contains("knows"))
+        );
+    }
+
+    /// A chain of dependents longer than the rounds Studio follows is refused for its depth,
+    /// not for its size: forty links, each needing the one before, stop after 32 rounds with
+    /// 32 found, and the refusal says the chain goes at least 32 steps deep. Before, it said
+    /// more than 1,000 nodes need them. A chain of 31 ends within the rounds and is planned.
+    #[gpui::test]
+    async fn a_chain_deeper_than_the_rounds_followed_is_refused_for_its_depth(
+        cx: &mut TestAppContext,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const LINKS: &str = "node Link {\n  slug: String @key\n}\n\
+            edge Next: Link -> Link @card(1..)\n";
+        // How long the chain is: link `n` needs link `n - 1`, down to `l0`.
+        let depth = Arc::new(AtomicUsize::new(40));
+        let rounds = Arc::new(AtomicUsize::new(0));
+        let (chain, counted) = (depth.clone(), rounds.clone());
+        let http = FakeHttpClient::create(move |request| {
+            let (chain, counted) = (chain.clone(), counted.clone());
+            async move {
+                let path = request.uri().path().to_owned();
+                let mut body = Vec::new();
+                use futures::AsyncReadExt as _;
+                request.into_body().read_to_end(&mut body).await.ok();
+                let body = if path.ends_with("/schema") {
+                    serde_json::json!({ "schema_source": LINKS })
+                } else if path.ends_with("/query") {
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    let rows = match request["name"].as_str() {
+                        Some("studio_required_dependents") => {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            // The link that needs the furthest one gone, while the chain goes on.
+                            let furthest = request["params"]["gone"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|id| id.as_str()?.strip_prefix('l')?.parse().ok())
+                                .max()
+                                .unwrap_or(0usize);
+                            let next = furthest + 1;
+                            if next <= chain.load(Ordering::SeqCst) {
+                                serde_json::json!([{ "id": format!("l{next}") }])
+                            } else {
+                                serde_json::json!([])
+                            }
+                        }
+                        Some("studio_edge_count") => serde_json::json!([{ "n": 0 }]),
+                        _ => serde_json::json!([]),
+                    };
+                    serde_json::json!({
+                        "query_name": "q",
+                        "target": {"branch": null, "snapshot": "c1"},
+                        "row_count": rows.as_array().unwrap().len(),
+                        "columns": ["id"],
+                        "rows": rows,
+                        "graph_commit_id": "c1",
+                    })
+                } else {
+                    serde_json::json!({ "branches": ["main"] })
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let schema = Arc::new(SchemaModel::parse(LINKS).unwrap());
+        // Each plan on a session of its own: a session answers a read at a commit it has
+        // answered before from what it kept.
+        let plan = |cx: &mut TestAppContext| {
+            let server = ServerEntry {
+                name: "dev".into(),
+                url: "http://127.0.0.1:8787".into(),
+                source: ServerSource::Environment,
+                known_graphs: Vec::new(),
+            };
+            let http = http.clone();
+            let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+            let session =
+                cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+            cx.run_until_parked();
+            let plan = cx.update(|cx| {
+                plan_node_delete(
+                    session,
+                    schema.clone(),
+                    "Link".into(),
+                    vec!["l0".into()],
+                    Some("c1".into()),
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+            futures::executor::block_on(plan)
+        };
+
+        let refused = plan(cx).unwrap_err();
+        assert_eq!(refused, PlanError::TooDeep);
+        assert_eq!(rounds.swap(0, Ordering::SeqCst), MAX_ROUNDS);
+        let message = refused.to_string();
+        assert!(message.contains("at least 32 steps deep"), "{message}");
+        assert!(!message.contains("1,000"), "{message}");
+
+        depth.store(31, Ordering::SeqCst);
+        let planned = plan(cx).unwrap();
+        assert_eq!(planned.dependents.len(), 31);
+        assert_eq!(
+            rounds.load(Ordering::SeqCst),
+            32,
+            "the last round found none"
         );
     }
 

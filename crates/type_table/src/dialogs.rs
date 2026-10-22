@@ -12,8 +12,8 @@ use gpui::{
     Task, WeakEntity, Window,
 };
 use gq_language::{BuiltQuery, Property, ScalarKind, SchemaModel, builder};
-use graph_store::deletes::{self, DeletePlan};
-use graph_store::{DraftKey, FollowUp, GraphSession, Loadable, REVIEW_CHANGE_CAP};
+use graph_store::deletes::{self, DeletePlan, UNDO_CAP};
+use graph_store::{DraftKey, FollowUp, GraphSession, Loadable};
 use serde_json::{Map, Value};
 use ui::prelude::*;
 
@@ -954,14 +954,13 @@ impl DeleteRowModal {
         };
         if edges {
             // A relationship delete removes the relationships picked and nothing else, so what
-            // Undo would put back is counted here: no more than it puts back in one commit, the
-            // most a review folds.
+            // Undo would put back is counted here: no more than it puts back in one commit.
             let picked = this.targets.len();
-            let past_cap = (picked > REVIEW_CHANGE_CAP).then(|| {
+            let past_cap = (picked > UNDO_CAP).then(|| {
                 format!(
                     "It removes {} relationships, more than the {} Undo puts back in one commit.",
                     studio_ui::group_digits(picked),
-                    studio_ui::group_digits(REVIEW_CHANGE_CAP)
+                    studio_ui::group_digits(UNDO_CAP)
                 )
             });
             let unrestorable = this.schema.edge(&this.type_name).and_then(|edge| {
@@ -1179,12 +1178,10 @@ impl DeleteRowModal {
                     .child(studio_ui::ds::text::muted("Finding what depends on it…"))
                     .into_any_element(),
             ),
-            Loadable::Failed(error) => Some(
-                studio_ui::ds::text::error(format!(
-                    "Studio could not read what depends on it. {error}"
-                ))
-                .into_any_element(),
-            ),
+            // The plan's own sentence: a read that failed, or a delete too large or too deep.
+            Loadable::Failed(error) => {
+                Some(studio_ui::ds::text::error(error.clone()).into_any_element())
+            }
             Loadable::Loaded(plan) if plan.dependents.is_empty() => None,
             Loadable::Loaded(plan) => {
                 let hidden = plan.dependents.len().saturating_sub(DEPENDENTS_NAMED);
@@ -1599,7 +1596,7 @@ mod tests {
             )
             .unwrap(),
         );
-        for (picked, typed) in [(REVIEW_CHANGE_CAP, false), (REVIEW_CHANGE_CAP + 1, true)] {
+        for (picked, typed) in [(UNDO_CAP, false), (UNDO_CAP + 1, true)] {
             let targets: Vec<DeleteTarget> = (0..picked)
                 .map(|i| DeleteTarget {
                     id: format!("e{i}"),
