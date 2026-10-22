@@ -173,6 +173,27 @@ mod tests {
         );
     }
 
+    /// The guide teaches the operator configuration the agent's CLI reads, OmniGraph's
+    /// version-1 file, and none of the target-only format before it, which that CLI refuses.
+    #[test]
+    fn the_guide_teaches_the_operator_configuration_the_agents_cli_reads() {
+        for (name, text) in FILES {
+            for retired in [
+                "target_config_version",
+                "OMNIGRAPH_TOKEN_",
+                "credential get",
+            ] {
+                assert!(!text.contains(retired), "{name} teaches `{retired}`");
+            }
+        }
+        let guide = FILES
+            .iter()
+            .find(|(name, _)| *name == "GUIDE.md")
+            .unwrap()
+            .1;
+        assert!(guide.contains("`version: 1` document"));
+    }
+
     #[test]
     fn writes_the_skill_for_each_agent_and_removes_only_its_own_stale_files() {
         let cwd = std::env::temp_dir().join(format!("studio-skill-{}", std::process::id()));
