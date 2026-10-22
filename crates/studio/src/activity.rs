@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use gpui::{Context, Entity, Render, Subscription, Task, WeakEntity, Window, uniform_list};
 use graph_store::{GraphSession, HeldAs, OutcomeEntry, OutcomeKind, SessionEvent};
+use studio_actions::graph::OpenHistory;
 use studio_workspace::{Workspace, WorkspaceEvent};
 use ui::prelude::*;
 
@@ -92,6 +93,18 @@ impl ActivityLog {
             }
         }));
     }
+
+    /// Opens History on `branch`, where a write whose outcome nobody knows went: whether it
+    /// landed is read there (constitution III). The graph is the one the window shows, whose
+    /// writes the log lists; the window moves to the branch first, as a toast's Open history
+    /// did before errors folded into the log.
+    fn open_history(&mut self, branch: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        session.update(cx, |session, cx| session.set_branch(branch, cx));
+        window.dispatch_action(Box::new(OpenHistory), cx);
+    }
 }
 
 impl Render for ActivityLog {
@@ -122,7 +135,11 @@ impl Render for ActivityLog {
                 range
                     .filter_map(|index| {
                         let entry = outcomes.get(outcomes.len().checked_sub(index + 1)?)?;
-                        Some(activity_row(index, entry))
+                        let row = activity_row(index, entry);
+                        Some(match history_to_check(entry) {
+                            Some(branch) => row.action(open_history_button(index, branch, cx)),
+                            None => row,
+                        })
                     })
                     .collect()
             }),
@@ -202,6 +219,30 @@ fn said(entry: &OutcomeEntry) -> Said {
             tooltip: Some(format!("{reason}. Check History before trying again.")),
         },
     }
+}
+
+/// The branch whose History a write's row opens: an outcome nobody knows is settled by reading
+/// the history of the branch it went to (constitution III). Every other outcome is known, and
+/// its row offers nothing.
+fn history_to_check(entry: &OutcomeEntry) -> Option<&str> {
+    match entry.outcome {
+        OutcomeKind::Unknown { .. } => Some(&entry.branch),
+        _ => None,
+    }
+}
+
+/// An unknown outcome's row button: History on its branch ([`ActivityLog::open_history`]).
+fn open_history_button(index: usize, branch: &str, cx: &Context<ActivityLog>) -> impl IntoElement {
+    let branch = branch.to_owned();
+    div()
+        .debug_selector(move || format!("activity-open-history-{index}"))
+        .child(
+            studio_ui::ds::row_button(("activity-open-history", index), "Open history")
+                .variant(studio_ui::ds::Variant::Ghost)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_history(branch.clone(), window, cx)
+                })),
+        )
 }
 
 /// One write in the feed, after the reference frames: a status dot, what was written, the
@@ -329,5 +370,71 @@ mod tests {
         session.update(cx, |_, cx| cx.emit(SessionEvent::ActivityChanged));
         cx.run_until_parked();
         assert_eq!(renders(&log, cx), after);
+    }
+
+    /// A write whose outcome nobody knows offers its branch's History in its row, as its toast
+    /// did before errors folded into the log: pressed, the window moves to the branch the write
+    /// went to and History opens there. A refused write's row offers nothing. Before, the row
+    /// only said to check History in its tooltip.
+    #[gpui::test]
+    async fn an_unknown_outcome_opens_its_branchs_history(cx: &mut TestAppContext) {
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+        });
+        let (session, served) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n}\n",
+            |_| serde_json::json!([]),
+            cx,
+        );
+        served.lock().unwrap().branches.push("fix".into());
+        cx.run_until_parked();
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        // The graph and branch the window shows each time History is opened.
+        let opened: Rc<RefCell<Vec<(String, String)>>> = Rc::default();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.set_session(session.clone(), window, cx);
+            let handle = cx.entity().downgrade();
+            let log = cx.new(|cx| ActivityLog::new(handle, Some(session.clone()), window, cx));
+            workspace.set_activity_view(log.into(), cx);
+            let opened = opened.clone();
+            workspace.register_action(move |workspace, _: &OpenHistory, _, cx| {
+                let shown = workspace.session().unwrap().read(cx);
+                let at = (shown.graph_id.clone(), shown.branch.clone());
+                opened.borrow_mut().push(at);
+            });
+        });
+        // Two writes to fix while main is shown: one refused, then one nobody knows the
+        // outcome of, which the log lists first.
+        let outcomes = [
+            OutcomeKind::Refused {
+                message: "policy denied".into(),
+            },
+            OutcomeKind::Unknown {
+                reason: "the connection closed".into(),
+            },
+        ];
+        for outcome in outcomes {
+            let write = session.update(cx, |session, cx| {
+                session.external_write("fix".into(), "Rename Ada".into(), false, cx)
+            });
+            write.finish(outcome);
+        }
+        cx.dispatch_action(studio_actions::workspace::ActivatePanel {
+            id: "activity".into(),
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("activity-open-history-1").is_none(),
+            "a refusal offers nothing"
+        );
+        let button = cx
+            .debug_bounds("activity-open-history-0")
+            .expect("the unknown outcome's Open history");
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let graph = session.read_with(cx, |session, _| session.graph_id.clone());
+        assert_eq!(*opened.borrow(), [(graph, "fix".to_owned())]);
     }
 }

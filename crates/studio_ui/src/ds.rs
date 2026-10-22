@@ -2911,7 +2911,7 @@ pub fn row_rule(row: Div, cx: &App) -> Div {
 
 /// One entry of an activity feed, written as structure rather than a sentence: a status dot,
 /// who (icon and name), what they did (muted), the object (underlined), where (icon and name),
-/// and when, right-aligned.
+/// and when, right-aligned, with the entry's one follow-up after it when it has one.
 #[derive(IntoElement)]
 pub struct ActivityRow {
     id: ElementId,
@@ -2925,6 +2925,7 @@ pub struct ActivityRow {
     place: Option<SharedString>,
     when: SharedString,
     tooltip: Option<SharedString>,
+    action: Option<AnyElement>,
 }
 
 impl ActivityRow {
@@ -2947,11 +2948,19 @@ impl ActivityRow {
             place: None,
             when: when.into(),
             tooltip: None,
+            action: None,
         }
     }
 
     pub fn status(mut self, status: Status) -> Self {
         self.status = status;
+        self
+    }
+
+    /// The entry's one follow-up (an unknown outcome's "Open history"), after the time: a
+    /// [`row_button`], which sits in the row as a tag does.
+    pub fn action(mut self, action: impl IntoElement) -> Self {
+        self.action = Some(action.into_any_element());
         self
     }
 
@@ -3009,7 +3018,8 @@ impl RenderOnce for ActivityRow {
                     .map(|place| text::body(place).single_line().truncate()),
             )
             .child(div().flex_1())
-            .child(text::meta(self.when).single_line());
+            .child(text::meta(self.when).single_line())
+            .children(self.action);
         let row = row_rule(row, cx);
         div()
             .id(self.id)
