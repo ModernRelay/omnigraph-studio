@@ -8,7 +8,7 @@
 //! - `credentials` (`0600`) holds the gateway's session token, never the person's, bound to the
 //!   gateway's address;
 //! - `omnigraph` (`0700`) runs the CLI Studio found with that directory as `OMNIGRAPH_HOME`,
-//!   loopback outside any proxy, and no other OmniGraph token in its environment: a shell
+//!   loopback outside any proxy, and no other OmniGraph variable in its environment: a shell
 //!   script on Unix, a batch file `omnigraph.cmd` on Windows ([`Wrapper`]).
 //!
 //! The agent learns the wrapper's path from its conversation's MCP instructions and the
@@ -149,12 +149,12 @@ impl CliHome {
 
     /// The chosen CLI as `omnigraph_run` starts it, in `dir`: the private home, loopback
     /// outside any proxy, and none of Studio's own OmniGraph variables (its tokens, profile or
-    /// home), so it speaks only to this conversation's gateway.
+    /// home; [`crate::scrub`]), so it speaks only to this conversation's gateway.
     fn command(&self, cli: &Path, dir: &Path) -> std::process::Command {
         let mut command = std::process::Command::new(cli);
         for (name, _) in std::env::vars_os() {
             // Windows reads a variable by its name in any case.
-            if crate::host::is_omnigraph_variable(&name.to_string_lossy(), cfg!(windows)) {
+            if crate::scrub::is_omnigraph_variable(&name.to_string_lossy(), cfg!(windows)) {
                 command.env_remove(name);
             }
         }
@@ -503,17 +503,17 @@ pub fn no_cli_text(contract: &str, found: &[(PathBuf, CliFacts)]) -> String {
     text
 }
 
-/// Subcommands `omnigraph_run` passes on: the ones that speak to a server, which the gateway
-/// then checks. Storage, cluster, policy and login commands do not run on a server anyway.
-const RUN_COMMANDS: &[&str] = &[
-    "query", "mutate", "load", "branch", "snapshot", "export", "blob", "commit", "changes",
-    "schema", "graphs", "version", "lint",
+/// Flags that would choose another destination, actor, configuration or profile than the
+/// conversation's. [`RUN_TABLE`] lists none of them, so each is refused like any flag it does
+/// not list, with this reason. Studio names the gateway itself, so `--target` is refused even
+/// naming `studio`.
+const RUN_FORBIDDEN: &[&str] = &[
+    "--target",
+    "--as",
+    "--operator-config",
+    "--profile",
+    "--config",
 ];
-/// What `lint` may take: it checks queries against a schema file offline, never a graph.
-const LINT_FLAGS: &[&str] = &["--query", "--schema", "--json"];
-/// Flags that would choose another destination or actor than the conversation's. Studio names
-/// the gateway itself, so `--target` is refused even naming `studio`.
-const RUN_FORBIDDEN: &[&str] = &["--target", "--as"];
 /// Flags whose value is a file the CLI reads or writes; it must be in the working directory.
 const RUN_PATH_FLAGS: &[&str] = &[
     "--query",
@@ -523,6 +523,415 @@ const RUN_PATH_FLAGS: &[&str] = &[
     "--out",
     "--schema",
 ];
+
+/// What a flag `omnigraph_run` passes takes after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Takes {
+    /// Nothing: a switch, such as `--json`.
+    Nothing,
+    /// One value: the next argument, or the text after `=`.
+    Value,
+}
+
+/// What a command `omnigraph_run` runs speaks to, which decides what Studio adds to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reach {
+    /// Nothing: `lint` checks files offline and `version` reads the CLI itself. The CLI refuses
+    /// `--target` on both, so none is added.
+    Offline,
+    /// The server, not a graph on it (`graphs list`): Studio adds `--target studio`, and the CLI
+    /// refuses `--graph`.
+    Server,
+    /// A graph on the server: Studio adds `--target studio`, and `--graph` names the graph, the
+    /// conversation's unless the agent names another. Either way the request goes to the
+    /// gateway, which takes writes on the conversation's graph only.
+    Graph,
+}
+
+/// A command `omnigraph_run` runs: the words that name it, how many positional arguments it
+/// takes, and every flag it passes to it, with what each takes.
+struct RunCommand {
+    words: &'static [&'static str],
+    positionals: usize,
+    flags: &'static [(&'static str, Takes)],
+    reach: Reach,
+}
+
+impl RunCommand {
+    /// What `flag` takes here, or `None` when `omnigraph_run` does not pass it.
+    fn takes(&self, flag: &str) -> Option<Takes> {
+        if flag == "--graph" {
+            return (self.reach == Reach::Graph).then_some(Takes::Value);
+        }
+        self.flags
+            .iter()
+            .find(|(name, _)| *name == flag)
+            .map(|(_, takes)| *takes)
+    }
+
+    fn flag_names(&self) -> Vec<&'static str> {
+        let mut names: Vec<&str> = self.flags.iter().map(|(name, _)| *name).collect();
+        if self.reach == Reach::Graph {
+            names.push("--graph");
+        }
+        names
+    }
+}
+
+/// The commands `omnigraph_run` runs, and every flag it passes to each. The CLI runs in Studio's
+/// process, outside the agent's sandbox, so an argument this table does not name is refused,
+/// not passed. Every flag here chooses what a command reads or writes; none chooses where the
+/// CLI connects, which configuration, profile, home or credentials it uses, or a program it
+/// runs. An operator file can name a credential command the CLI runs before any request, so
+/// `--operator-config` and the like would run the agent's program outside its sandbox, and a
+/// flag a later CLI adds stays refused until it is listed here. `--page-token` stays out with
+/// every flag named for a token: the commands that take it read every page without it. `--yes`
+/// passes where the CLI asks before a destructive write, which it refuses with no terminal,
+/// and `omnigraph_run` gives it none. The gateway still decides each write.
+const RUN_TABLE: &[RunCommand] = &[
+    RunCommand {
+        words: &["query"],
+        positionals: 1,
+        flags: &[
+            ("-e", Takes::Value),
+            ("--query-string", Takes::Value),
+            ("--query", Takes::Value),
+            ("--params", Takes::Value),
+            ("--params-file", Takes::Value),
+            ("--branch", Takes::Value),
+            ("--snapshot", Takes::Value),
+            ("--set", Takes::Value),
+            ("--format", Takes::Value),
+            ("--json", Takes::Nothing),
+        ],
+        reach: Reach::Graph,
+    },
+    RunCommand {
+        words: &["mutate"],
+        positionals: 1,
+        flags: &[
+            ("-e", Takes::Value),
+            ("--query-string", Takes::Value),
+            ("--query", Takes::Value),
+            ("--params", Takes::Value),
+            ("--params-file", Takes::Value),
+            ("--branch", Takes::Value),
+            ("--if-commit", Takes::Value),
+            ("--set", Takes::Value),
+            ("--json", Takes::Nothing),
+            ("--yes", Takes::Nothing),
+        ],
+        reach: Reach::Graph,
+    },
+    RunCommand {
+        words: &["load"],
+        positionals: 0,
+        flags: &[
+            ("--data", Takes::Value),
+            ("--branch", Takes::Value),
+            ("--from", Takes::Value),
+            ("--mode", Takes::Value),
+            ("--set", Takes::Value),
+            ("--json", Takes::Nothing),
+            ("--yes", Takes::Nothing),
+        ],
+        reach: Reach::Graph,
+    },
+    RunCommand {
+        words: &["branch", "create"],
+        positionals: 1,
+        flags: &[
+            ("--from", Takes::Value),
+            ("--from-commit", Takes::Value),
+            ("--json", Takes::Nothing),
+        ],
+        reach: Reach::Graph,
+    },
+    RunCommand {
+        words: &["branch", "list"],
+        positionals: 0,
+        flags: &[("--json", Takes::Nothing)],
+        reach: Reach::Graph,
+    },
+    RunCommand {
+        words: &["branch", "delete"],
+        positionals: 1,
+        flags: &[("--json", Takes::Nothing), ("--yes", Takes::Nothing)],
+        reach: Reach::Graph,
+    },
+    RunCommand {
+        words: &["branch", "merge"],
+        positionals: 1,
+        flags: &[
+            ("--into", Takes::Value),
+            ("--delete-branch", Takes::Nothing),
+            ("--as-commit", Takes::Nothing),
+            ("--dry-run", Takes::Nothing),
+            ("--set", Takes::Value),
+            ("--json", Takes::Nothing),
+        ],
+        reach: Reach::Graph,
+    },
+    RunCommand {
+        words: &["branch", "diff"],
+        positionals: 1,
+        flags: &[
+            ("--into", Takes::Value),
+            ("--limit", Takes::Value),
+            ("--kind", Takes::Value),
+            ("--type", Takes::Value),
+            ("--op", Takes::Value),
+            ("--json", Takes::Nothing),
+        ],
+        reach: Reach::Graph,
+    },
+    RunCommand {
+        words: &["branch", "merge-base"],
+        positionals: 1,
+        flags: &[("--into", Takes::Value), ("--json", Takes::Nothing)],
+        reach: Reach::Graph,
+    },
+    RunCommand {
+        words: &["snapshot"],
+        positionals: 0,
+        flags: &[("--branch", Takes::Value), ("--json", Takes::Nothing)],
+        reach: Reach::Graph,
+    },
+    RunCommand {
+        words: &["export"],
+        positionals: 0,
+        flags: &[("--branch", Takes::Value), ("--type", Takes::Value)],
+        reach: Reach::Graph,
+    },
+    RunCommand {
+        words: &["blob", "get"],
+        positionals: 4,
+        flags: &[
+            ("--branch", Takes::Value),
+            ("--snapshot", Takes::Value),
+            ("--offset", Takes::Value),
+            ("--length", Takes::Value),
+            ("--out", Takes::Value),
+        ],
+        reach: Reach::Graph,
+    },
+    RunCommand {
+        words: &["blob", "stat"],
+        positionals: 4,
+        flags: &[
+            ("--branch", Takes::Value),
+            ("--snapshot", Takes::Value),
+            ("--json", Takes::Nothing),
+        ],
+        reach: Reach::Graph,
+    },
+    RunCommand {
+        words: &["blob", "put"],
+        positionals: 4,
+        flags: &[
+            ("--branch", Takes::Value),
+            ("--file", Takes::Value),
+            ("--if-match", Takes::Value),
+            ("--json", Takes::Nothing),
+        ],
+        reach: Reach::Graph,
+    },
+    RunCommand {
+        words: &["blob", "clear"],
+        positionals: 4,
+        flags: &[
+            ("--branch", Takes::Value),
+            ("--if-match", Takes::Value),
+            ("--json", Takes::Nothing),
+        ],
+        reach: Reach::Graph,
+    },
+    RunCommand {
+        words: &["commit", "list"],
+        positionals: 0,
+        flags: &[
+            ("--branch", Takes::Value),
+            ("--unpublished", Takes::Nothing),
+            ("--unattached", Takes::Nothing),
+            ("--limit", Takes::Value),
+            ("--json", Takes::Nothing),
+        ],
+        reach: Reach::Graph,
+    },
+    RunCommand {
+        words: &["commit", "show"],
+        positionals: 1,
+        flags: &[("--json", Takes::Nothing)],
+        reach: Reach::Graph,
+    },
+    RunCommand {
+        words: &["commit", "changes"],
+        positionals: 1,
+        flags: &[
+            ("--limit", Takes::Value),
+            ("--kind", Takes::Value),
+            ("--type", Takes::Value),
+            ("--op", Takes::Value),
+            ("--set", Takes::Value),
+            ("--json", Takes::Nothing),
+        ],
+        reach: Reach::Graph,
+    },
+    // The gateway refuses both; the CLI reports its refusal as not started.
+    RunCommand {
+        words: &["commit", "publish"],
+        positionals: 1,
+        flags: &[("--json", Takes::Nothing)],
+        reach: Reach::Graph,
+    },
+    RunCommand {
+        words: &["commit", "drop"],
+        positionals: 1,
+        flags: &[("--json", Takes::Nothing), ("--yes", Takes::Nothing)],
+        reach: Reach::Graph,
+    },
+    RunCommand {
+        words: &["changes", "poll"],
+        positionals: 0,
+        flags: &[
+            ("--branch", Takes::Value),
+            ("--cursor", Takes::Value),
+            ("--start", Takes::Value),
+            ("--limit", Takes::Value),
+            ("--kind", Takes::Value),
+            ("--type", Takes::Value),
+            ("--op", Takes::Value),
+            ("--set", Takes::Value),
+            ("--json", Takes::Nothing),
+        ],
+        reach: Reach::Graph,
+    },
+    RunCommand {
+        words: &["changes", "baseline"],
+        positionals: 0,
+        flags: &[
+            ("--branch", Takes::Value),
+            ("--kind", Takes::Value),
+            ("--type", Takes::Value),
+            ("--op", Takes::Value),
+            ("--out", Takes::Value),
+            ("--json", Takes::Nothing),
+        ],
+        reach: Reach::Graph,
+    },
+    RunCommand {
+        words: &["schema", "show"],
+        positionals: 0,
+        flags: &[("--json", Takes::Nothing)],
+        reach: Reach::Graph,
+    },
+    RunCommand {
+        words: &["graphs", "list"],
+        positionals: 0,
+        flags: &[("--json", Takes::Nothing), ("--discovery", Takes::Nothing)],
+        reach: Reach::Server,
+    },
+    RunCommand {
+        words: &["version"],
+        positionals: 0,
+        flags: &[("--json", Takes::Nothing)],
+        reach: Reach::Offline,
+    },
+    // `lint` checks queries against a schema file offline, never a graph: a positional storage
+    // URI would make Studio open storage itself.
+    RunCommand {
+        words: &["lint"],
+        positionals: 0,
+        flags: &[
+            ("--query", Takes::Value),
+            ("--schema", Takes::Value),
+            ("--json", Takes::Nothing),
+        ],
+        reach: Reach::Offline,
+    },
+];
+
+/// The command `args` start with, by its words.
+fn run_command(args: &[String]) -> Result<&'static RunCommand, String> {
+    let named: Vec<&RunCommand> = RUN_TABLE
+        .iter()
+        .filter(|command| command.words[0] == args[0])
+        .collect();
+    if named.is_empty() {
+        let mut names: Vec<&str> = RUN_TABLE.iter().map(|command| command.words[0]).collect();
+        names.dedup();
+        return Err(format!(
+            "omnigraph_run runs {}; `{}` is not one of them.",
+            names.join(", "),
+            args[0]
+        ));
+    }
+    if let Some(command) = named.iter().find(|command| {
+        args.len() >= command.words.len()
+            && command
+                .words
+                .iter()
+                .zip(args)
+                .all(|(word, arg)| word == arg)
+    }) {
+        return Ok(command);
+    }
+    // The CLI reads its own flags between the words too.
+    if let Some(arg) = args.get(1).filter(|arg| arg.starts_with('-')) {
+        return Err(refused_flag(split_flag(arg).0, None));
+    }
+    let each: Vec<String> = named
+        .iter()
+        .map(|command| format!("`{}`", command.words.join(" ")))
+        .collect();
+    Err(format!(
+        "Of `{}`, omnigraph_run runs {}.",
+        args[0],
+        each.join(", ")
+    ))
+}
+
+/// A flag argument as the CLI's parser reads it: its name, and the value given with it, after
+/// `=` (`--name=value`) or, for a one-letter flag, joined to it (`-evalue`, `-e=value`).
+fn split_flag(arg: &str) -> (&str, Option<&str>) {
+    if arg.starts_with("--") {
+        return match arg.split_once('=') {
+            Some((flag, value)) => (flag, Some(value)),
+            None => (arg, None),
+        };
+    }
+    // The parser takes the rest of a one-letter flag's argument as its value, without a
+    // leading `=`.
+    let end = arg.char_indices().nth(2).map_or(arg.len(), |(at, _)| at);
+    let (flag, rest) = arg.split_at(end);
+    (
+        flag,
+        (!rest.is_empty()).then(|| rest.strip_prefix('=').unwrap_or(rest)),
+    )
+}
+
+/// Why `omnigraph_run` does not pass `flag` to `command`, or before a command's words when
+/// `None`.
+fn refused_flag(flag: &str, command: Option<&RunCommand>) -> String {
+    if RUN_FORBIDDEN.contains(&flag) {
+        return format!(
+            "`{flag}` is not passed: this conversation's CLI speaks only to Studio, with Studio's \
+             own configuration, and Studio adds `--target studio` itself."
+        );
+    }
+    match command {
+        None => format!(
+            "`{flag}` is not passed: start with the command, such as [\"branch\", \"create\", …], \
+             and give its flags after it."
+        ),
+        Some(command) => format!(
+            "`{flag}` is not passed to `{words}`: omnigraph_run passes only {flags}.",
+            words = command.words.join(" "),
+            flags = command.flag_names().join(", "),
+        ),
+    }
+}
+
 /// The most output `omnigraph_run` returns in its answer; more is cut, with a pointer to
 /// `save_to`, so a large result does not fill the agent's context.
 pub const RUN_INLINE_MAX: usize = 100 * 1024;
@@ -566,78 +975,89 @@ where
 
 /// Checks the arguments the agent gave `omnigraph_run` (spec 013): the CLI runs in Studio's
 /// process, outside the agent's sandbox, so it may only speak to this conversation's gateway
-/// and touch files in the conversation's working directory. Returns the arguments to run, with
-/// `--target studio` (and the conversation's graph unless one is named) added.
+/// and touch files in the conversation's working directory. The arguments are read as the
+/// CLI's parser reads them, and each must be one [`RUN_TABLE`] lists for its command. Returns
+/// the arguments to run, with `--target studio` (and the conversation's graph unless one is
+/// named) added where the command speaks to a server.
 pub fn check_run_args(args: &[String], cwd: &Path, graph: &str) -> Result<RunPlan, String> {
-    let Some(command) = args.first() else {
+    let Some(first) = args.first() else {
         return Err("Pass the omnigraph arguments, for example [\"query\", \"-e\", \"…\"].".into());
     };
-    if command == "omnigraph" {
+    if first == "omnigraph" {
         return Err(
             "Leave out the program name: start with the subcommand, such as \"query\".".into(),
         );
     }
-    if !RUN_COMMANDS.contains(&command.as_str()) {
-        return Err(format!(
-            "omnigraph_run runs {}; `{command}` is not one of them.",
-            RUN_COMMANDS.join(", ")
-        ));
+    // The CLI reads its own flags before the command's words too.
+    if first.starts_with('-') {
+        return Err(refused_flag(split_flag(first).0, None));
     }
-    if (command == "schema" && args.get(1).map(String::as_str) != Some("show"))
-        || (command == "graphs" && args.get(1).map(String::as_str) != Some("list"))
-    {
-        return Err(format!("Only `{command} show`/`list` read through Studio."));
-    }
-    // `lint` reads a schema file, not the graph: a positional storage URI would make Studio
-    // open storage directly, so only its file flags pass, and no target is added.
-    let lint = command == "lint";
-    if lint {
-        let mut rest = args[1..].iter();
-        while let Some(arg) = rest.next() {
-            let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
-            if !LINT_FLAGS.contains(&flag) {
-                return Err(format!(
-                    "`lint` takes only --query, --schema and --json; save the schema with \
-                     `schema show` (save_to) and lint against that file. `{arg}` is not passed."
-                ));
-            }
-            if flag != "--json" && !arg.contains('=') {
-                rest.next();
-            }
-        }
-        if !args.iter().any(|arg| arg.starts_with("--schema")) {
-            return Err("`lint` needs --schema <file>: save it first with `schema show`.".into());
-        }
-    }
-    let mut checked = Vec::with_capacity(args.len() + 4);
+    let command = run_command(args)?;
+    let words = command.words.join(" ");
+    let mut checked: Vec<String> = command
+        .words
+        .iter()
+        .map(|word| (*word).to_owned())
+        .collect();
     let mut files = Vec::new();
     let mut has_graph = false;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        let (flag, inline) = match arg.split_once('=') {
-            Some((flag, value)) if flag.starts_with("--") => (flag, Some(value.to_owned())),
-            _ => (arg.as_str(), None),
-        };
-        if RUN_FORBIDDEN.contains(&flag) {
-            return Err(format!(
-                "`{flag}` is not passed: this conversation's CLI speaks only to Studio, which adds \
-                 `--target studio` itself."
-            ));
+    let mut has_schema = false;
+    let mut positionals = 0;
+    let mut rest = args[command.words.len()..].iter();
+    while let Some(arg) = rest.next() {
+        // After `--` the parser reads every argument as a value, the flags Studio adds too.
+        if arg == "--" {
+            return Err(
+                "`--` is not passed: give each flag by itself, and a value that starts with `-` \
+                 after `=`, as `--params=-1`."
+                    .into(),
+            );
         }
-        if flag == "--graph" {
-            has_graph = true;
+        // The parser reads `-` alone, like anything not starting with `-`, as a value.
+        if !arg.starts_with('-') || arg == "-" {
+            positionals += 1;
+            if positionals > command.positionals {
+                let count = match command.positionals {
+                    0 => "no argument".to_owned(),
+                    1 => "one argument".to_owned(),
+                    n => format!("{n} arguments"),
+                };
+                return Err(format!(
+                    "`{words}` takes {count} besides its flags; omnigraph_run passes no more."
+                ));
+            }
+            checked.push(arg.clone());
+            continue;
         }
-        if RUN_PATH_FLAGS.contains(&flag) {
-            let value = match inline {
-                Some(value) => value,
-                None => {
-                    index += 1;
-                    args.get(index)
-                        .cloned()
-                        .ok_or_else(|| format!("`{flag}` needs a path."))?
+        let (flag, inline) = split_flag(arg);
+        let takes = command
+            .takes(flag)
+            .ok_or_else(|| refused_flag(flag, Some(command)))?;
+        has_graph |= flag == "--graph";
+        has_schema |= flag == "--schema";
+        let value = match (takes, inline) {
+            (Takes::Nothing, None) => {
+                checked.push(arg.clone());
+                continue;
+            }
+            (Takes::Nothing, Some(_)) => return Err(format!("`{flag}` takes no value.")),
+            (Takes::Value, Some(value)) => value.to_owned(),
+            (Takes::Value, None) => {
+                let value = rest
+                    .next()
+                    .ok_or_else(|| format!("`{flag}` needs a value."))?;
+                // The parser reads a next argument that starts with `-` as a flag of its own,
+                // not as this one's value.
+                if value.starts_with('-') && value != "-" {
+                    return Err(format!(
+                        "`{flag}` needs a value: give one that starts with `-` after `=`, as \
+                         `{flag}=…`."
+                    ));
                 }
-            };
+                value.clone()
+            }
+        };
+        if RUN_PATH_FLAGS.contains(&flag) {
             let file = RunFile {
                 parts: inside(cwd, &value)?,
                 output: flag == "--out",
@@ -646,16 +1066,20 @@ pub fn check_run_args(args: &[String], cwd: &Path, graph: &str) -> Result<RunPla
             // Filled in with the staged copy's path when the run starts.
             files.push((checked.len(), file));
             checked.push(value);
-        } else {
+        } else if inline.is_some() {
             checked.push(arg.clone());
+        } else {
+            checked.extend([arg.clone(), value]);
         }
-        index += 1;
     }
-    if !lint {
+    if command.words == ["lint"] && !has_schema {
+        return Err("`lint` needs --schema <file>: save it first with `schema show`.".into());
+    }
+    if command.reach != Reach::Offline {
         checked.extend(["--target".to_owned(), "studio".to_owned()]);
-        if !has_graph {
-            checked.extend(["--graph".to_owned(), graph.to_owned()]);
-        }
+    }
+    if command.reach == Reach::Graph && !has_graph {
+        checked.extend(["--graph".to_owned(), graph.to_owned()]);
     }
     Ok(RunPlan {
         args: checked,
@@ -1014,26 +1438,16 @@ const WRAPPER_NAME: &str = if cfg!(windows) {
     "omnigraph"
 };
 
-/// Variables the wrapper removes from the CLI's environment by the start of their name: tokens
-/// kept for other targets (`OMNIGRAPH_TOKEN_<NAME>`), which the CLI would send to them.
-const WRAPPER_UNSET_PREFIXES: &[&str] = &["OMNIGRAPH_TOKEN_"];
-
-/// Variables the wrapper removes by name: a token the CLI's older releases read, and its profile
-/// and control-plane addressing, which would choose another destination.
-const WRAPPER_UNSET: &[&str] = &[
-    "OMNIGRAPH_BEARER_TOKEN",
-    "OMNIGRAPH_PROFILE",
-    "OMNIGRAPH_CONTROL_TOKEN",
-    "OMNIGRAPH_CONTROL_API",
-];
-
 /// The hosts put first in the CLI's `NO_PROXY`, so it reaches the gateway outside any proxy.
 const LOOPBACK: &str = "127.0.0.1,localhost";
 
 /// What the agent's `omnigraph` wrapper does, the one account both scripts are written from
-/// ([`posix_script`], [`cmd_script`]), so only their syntax differs. Run, it removes the
-/// variables of [`WRAPPER_UNSET_PREFIXES`] and [`WRAPPER_UNSET`] from the CLI's environment,
-/// sets `OMNIGRAPH_HOME` to `home`, its own folder, puts [`LOOPBACK`] first in `NO_PROXY` (and
+/// ([`posix_script`], [`cmd_script`]), so only their syntax differs. Run, it removes every
+/// OmniGraph variable from the CLI's environment, each whose name starts with
+/// [`crate::scrub::PREFIX`], as `omnigraph_run` and the agent's launch do, so no token kept for
+/// another target, profile, home or control-plane address the agent's environment holds reaches
+/// the conversation's CLI. Then it sets `OMNIGRAPH_HOME` to `home`, its own folder, puts
+/// [`LOOPBACK`] first in `NO_PROXY` (and
 /// `no_proxy`), and runs `cli` with the agent's arguments as they came. Refusing, it runs
 /// nothing and says `why`.
 enum Wrapper<'a> {
@@ -1077,20 +1491,17 @@ fn posix_script(wrapper: &Wrapper<'_>) -> String {
          # Written by OmniGraph Studio for one agent conversation (spec 013): the omnigraph\n\
          # CLI, pointed at Studio's gateway for this conversation.\n",
     );
-    for prefix in WRAPPER_UNSET_PREFIXES {
-        script.push_str(&format!(
-            "for name in $(env | sed -n 's/^\\({prefix}[A-Za-z0-9_]*\\)=.*/\\1/p'); do unset \
-             \"$name\"; done\n"
-        ));
-    }
+    // Only names a shell can hold match: `unset` of any other would end the script, and the CLI
+    // reads none.
     script.push_str(&format!(
-        "unset {unset}\n\
+        "for name in $(env | sed -n 's/^\\({prefix}[A-Za-z0-9_]*\\)=.*/\\1/p'); do \
+         unset \"$name\"; done\n\
          OMNIGRAPH_HOME={home}\n\
          NO_PROXY=\"{LOOPBACK}${{NO_PROXY:+,$NO_PROXY}}\"\n\
          no_proxy=\"$NO_PROXY\"\n\
          export OMNIGRAPH_HOME NO_PROXY no_proxy\n\
          exec {cli} \"$@\"\n",
-        unset = WRAPPER_UNSET.join(" "),
+        prefix = crate::scrub::PREFIX,
         home = shell_quote(&home.to_string_lossy()),
         cli = shell_quote(&cli.to_string_lossy()),
     ));
@@ -1149,14 +1560,10 @@ fn cmd_script(wrapper: &Wrapper<'_>) -> String {
     ];
     // `set NAME` lists every variable whose name starts with NAME, in any case, as Windows
     // reads names.
-    for prefix in WRAPPER_UNSET_PREFIXES {
-        lines.push(format!(
-            "for /f \"delims==\" %%N in ('set {prefix} 2^>nul') do set \"%%N=\""
-        ));
-    }
-    for name in WRAPPER_UNSET {
-        lines.push(format!("set \"{name}=\""));
-    }
+    lines.push(format!(
+        "for /f \"delims==\" %%N in ('set {prefix} 2^>nul') do set \"%%N=\"",
+        prefix = crate::scrub::PREFIX,
+    ));
     lines.extend([
         // The batch file's own folder, without its last `\`.
         "set \"OMNIGRAPH_HOME=%~dp0\"".to_owned(),
@@ -1465,6 +1872,15 @@ mod tests {
         let out = check(&["blob", "get", "--out=data/picture.png"]).unwrap();
         assert_eq!(out.args[2], "--out");
         assert_eq!(out.files, vec![(3, file(&["data", "picture.png"], true))]);
+        // `version` takes no target and `graphs list` no graph: the CLI refuses them there.
+        assert_eq!(
+            check(&["version", "--json"]).unwrap().args,
+            args(&["version", "--json"])
+        );
+        assert_eq!(
+            check(&["graphs", "list", "--json"]).unwrap().args,
+            args(&["graphs", "list", "--json", "--target", "studio"])
+        );
 
         for refused in [
             &["init", "--store", "x"][..],
@@ -1493,6 +1909,182 @@ mod tests {
             assert!(check(refused).is_err(), "{refused:?} was let through");
         }
         std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// `omnigraph_run` passes only the flags its table lists for each command, read as the CLI's
+    /// parser reads them. An operator file can name a program the CLI runs before any request,
+    /// so a flag that chooses the CLI's configuration, profile, target or actor is refused
+    /// wherever it stands: before the command's words, between them, after them, with its value
+    /// after `=`, as another flag's value, or after `--`. So is a flag the table does not know.
+    #[test]
+    fn run_passes_only_the_flags_studio_knows() {
+        let cwd = Path::new("/work");
+        let words = |list: &[&str]| list.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        let refusal = |case: &[String]| {
+            check_run_args(case, cwd, "knowledge").expect_err(&format!("{case:?} was let through"))
+        };
+        for (flag, value) in [
+            ("--operator-config", "/abs/agent.yaml"),
+            ("--profile", "work"),
+            ("--as", "someone"),
+            ("--target", "studio"),
+            ("--config", "deploy"),
+        ] {
+            let joined = format!("{flag}={value}");
+            for case in [
+                words(&[flag, value, "query", "-e", "q"]),
+                words(&[&joined, "query", "-e", "q"]),
+                words(&["query", "-e", "q", flag, value]),
+                words(&["query", "-e", "q", &joined]),
+                words(&["branch", flag, value, "create", "agent/x"]),
+                words(&["branch", "create", "agent/x", &joined]),
+                words(&["mutate", "-e", "q", "--branch", "agent/x", flag, value]),
+            ] {
+                let error = refusal(&case);
+                assert!(error.contains(&format!("`{flag}`")), "{case:?}: {error}");
+                assert!(error.contains("adds `--target studio`"), "{error}");
+            }
+            // As another flag's value the CLI reads it as a flag, and after `--` it would take
+            // the flags Studio adds as values.
+            let error = refusal(&words(&["query", "--params", &joined]));
+            assert!(error.contains("`--params` needs a value"), "{error}");
+            let error = refusal(&words(&["branch", "list", "--", &joined]));
+            assert!(error.contains("`--` is not passed"), "{error}");
+        }
+
+        for (case, named) in [
+            (words(&["query", "--frobnicate"]), "--frobnicate"),
+            (words(&["query", "--frobnicate=1"]), "--frobnicate"),
+            (words(&["query", "-x"]), "-x"),
+            (words(&["query", "--help"]), "--help"),
+            // Another command's flag, a global one where the CLI refuses it, a token.
+            (words(&["export", "--json"]), "--json"),
+            (words(&["version", "--graph", "g"]), "--graph"),
+            (words(&["graphs", "list", "--graph", "g"]), "--graph"),
+            (
+                words(&["commit", "list", "--page-token", "t"]),
+                "--page-token",
+            ),
+        ] {
+            let error = refusal(&case);
+            assert!(
+                error.contains(&format!("`{named}` is not passed to `"))
+                    && error.contains("passes only"),
+                "{case:?}: {error}"
+            );
+        }
+        let error = refusal(&words(&["--help"]));
+        assert!(error.contains("`--help` is not passed"), "{error}");
+
+        for (case, says) in [
+            (words(&["query", "--json=yes"]), "`--json` takes no value"),
+            (words(&["query", "-e"]), "`-e` needs a value"),
+            (words(&["branch", "create", "a", "b"]), "takes one argument"),
+            (words(&["load", "rows.jsonl"]), "takes no argument"),
+            (words(&["branch"]), "omnigraph_run runs `branch create`"),
+        ] {
+            let error = refusal(&case);
+            assert!(error.contains(says), "{case:?}: {error}");
+        }
+
+        // The parser takes what is joined to `-e` as its value, as Studio does: a query's text,
+        // however it reads.
+        for joined in ["-e--operator-config=/abs/agent.yaml", "-e=query q() {}"] {
+            let plan = check_run_args(&words(&["query", joined]), cwd, "knowledge").unwrap();
+            assert_eq!(
+                plan.args,
+                words(&[
+                    "query",
+                    joined,
+                    "--target",
+                    "studio",
+                    "--graph",
+                    "knowledge"
+                ])
+            );
+        }
+    }
+
+    /// Every flag the table lists for a command passes to it, as `--flag value` and as
+    /// `--flag=value`, with as many positional arguments as the command takes; Studio adds the
+    /// target where the command speaks to a server. No listed flag is one that chooses where the
+    /// CLI connects or what it is configured with, and every file flag takes a value.
+    #[test]
+    fn every_flag_studio_knows_passes() {
+        let cwd = Path::new("/work");
+        for path_flag in RUN_PATH_FLAGS {
+            let takes: Vec<_> = RUN_TABLE
+                .iter()
+                .filter_map(|c| c.takes(path_flag))
+                .collect();
+            assert!(
+                !takes.is_empty() && takes.iter().all(|t| *t == Takes::Value),
+                "{path_flag}"
+            );
+        }
+        for command in RUN_TABLE {
+            let name = command.words.join(" ");
+            let mut given: Vec<String> = command.words.iter().map(|w| (*w).to_owned()).collect();
+            given.extend((0..command.positionals).map(|n| format!("p{n}")));
+            let mut joined = given.clone();
+            let mut joined_expected = given.clone();
+            let mut file_count = 0;
+            for flag in command.flag_names() {
+                assert!(!RUN_FORBIDDEN.contains(&flag), "{name}: {flag}");
+                for word in [
+                    "token",
+                    "target",
+                    "config",
+                    "profile",
+                    "home",
+                    "proxy",
+                    "tls",
+                    "cert",
+                    "auth",
+                    "endpoint",
+                    "credential",
+                    "server",
+                    "store",
+                    "exec",
+                    "command",
+                ] {
+                    assert!(!flag.contains(word), "{name}: `{flag}` names {word}");
+                }
+                match command.takes(flag) {
+                    Some(Takes::Nothing) => {
+                        given.push(flag.to_owned());
+                        joined.push(flag.to_owned());
+                        joined_expected.push(flag.to_owned());
+                    }
+                    Some(Takes::Value) => {
+                        let path = RUN_PATH_FLAGS.contains(&flag);
+                        let value = if path { "data/file.txt" } else { "v" };
+                        file_count += usize::from(path);
+                        given.extend([flag.to_owned(), value.to_owned()]);
+                        joined.push(format!("{flag}={value}"));
+                        // A file's value becomes an argument of its own, which the staged
+                        // copy's path replaces when the run starts.
+                        if path {
+                            joined_expected.extend([flag.to_owned(), value.to_owned()]);
+                        } else {
+                            joined_expected.push(format!("{flag}={value}"));
+                        }
+                    }
+                    None => panic!("{name}: `{flag}` is listed but not taken"),
+                }
+            }
+            // `--graph` is among the flags given, so the conversation's is not added.
+            let added = match command.reach {
+                Reach::Offline => Vec::new(),
+                Reach::Server | Reach::Graph => vec!["--target".to_owned(), "studio".to_owned()],
+            };
+            for (case, expected) in [(&given, &given), (&joined, &joined_expected)] {
+                let plan = check_run_args(case, cwd, "knowledge")
+                    .unwrap_or_else(|error| panic!("{case:?}: {error}"));
+                assert_eq!(plan.args, [expected.clone(), added.clone()].concat());
+                assert_eq!(plan.files.len(), file_count, "{case:?}");
+            }
+        }
     }
 
     /// The agent can change a part of a path into a link after the check: Studio stages each
@@ -1741,16 +2333,27 @@ mod tests {
         );
         assert!(script.contains(&format!("OMNIGRAPH_HOME='{}'", home.dir.display())));
 
-        // The wrapper runs with its own home, loopback outside any proxy, and no other token.
+        // The wrapper runs with its own home, loopback outside any proxy, and no other OmniGraph
+        // variable, one the CLI does not read today included.
         home.use_cli(Path::new("/usr/bin/env")).unwrap();
         let output = std::process::Command::new(&home.command)
             .env("OMNIGRAPH_TOKEN_PERSONAL", "secret")
             .env("OMNIGRAPH_BEARER_TOKEN", "secret")
+            .env("OMNIGRAPH_FOO", "secret")
+            .env("OMNIGRAPH_HOME", "/elsewhere")
             .env("NO_PROXY", "corp.example")
+            .env("STUDIO_TEST_KEPT", "kept")
             .output()
             .unwrap();
         let env = String::from_utf8_lossy(&output.stdout);
-        assert!(!env.contains("secret"), "{env}");
+        assert!(
+            !env.contains("secret") && !env.contains("/elsewhere"),
+            "{env}"
+        );
+        for line in env.lines().filter(|line| line.starts_with("OMNIGRAPH_")) {
+            assert!(line.starts_with("OMNIGRAPH_HOME="), "{line}");
+        }
+        assert!(env.contains("STUDIO_TEST_KEPT=kept"), "{env}");
         assert!(
             env.contains("NO_PROXY=127.0.0.1,localhost,corp.example"),
             "{env}"
@@ -1838,8 +2441,7 @@ mod tests {
             "#!/bin/sh\n\
              # Written by OmniGraph Studio for one agent conversation (spec 013): the omnigraph\n\
              # CLI, pointed at Studio's gateway for this conversation.\n\
-             for name in $(env | sed -n 's/^\\(OMNIGRAPH_TOKEN_[A-Za-z0-9_]*\\)=.*/\\1/p'); do unset \"$name\"; done\n\
-             unset OMNIGRAPH_BEARER_TOKEN OMNIGRAPH_PROFILE OMNIGRAPH_CONTROL_TOKEN OMNIGRAPH_CONTROL_API\n\
+             for name in $(env | sed -n 's/^\\(OMNIGRAPH_[A-Za-z0-9_]*\\)=.*/\\1/p'); do unset \"$name\"; done\n\
              OMNIGRAPH_HOME='/data/agent/graphs/g/.studio/agent-x'\n\
              NO_PROXY=\"127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}\"\n\
              no_proxy=\"$NO_PROXY\"\n\
@@ -1857,11 +2459,7 @@ mod tests {
             "rem Written by OmniGraph Studio for one agent conversation (spec 013): the omnigraph",
             "rem CLI, pointed at Studio's gateway for this conversation.",
             "setlocal EnableExtensions DisableDelayedExpansion",
-            "for /f \"delims==\" %%N in ('set OMNIGRAPH_TOKEN_ 2^>nul') do set \"%%N=\"",
-            "set \"OMNIGRAPH_BEARER_TOKEN=\"",
-            "set \"OMNIGRAPH_PROFILE=\"",
-            "set \"OMNIGRAPH_CONTROL_TOKEN=\"",
-            "set \"OMNIGRAPH_CONTROL_API=\"",
+            "for /f \"delims==\" %%N in ('set OMNIGRAPH_ 2^>nul') do set \"%%N=\"",
             "set \"OMNIGRAPH_HOME=%~dp0\"",
             "set \"OMNIGRAPH_HOME=%OMNIGRAPH_HOME:~0,-1%\"",
             "if defined NO_PROXY (set \"NO_PROXY=127.0.0.1,localhost,%NO_PROXY%\") else set \
@@ -1869,9 +2467,6 @@ mod tests {
             "\"C:\\Users\\ada\\.local\\bin\\omnigraph.exe\" %*",
         ];
         assert_eq!(cmd, lines.map(|line| format!("{line}\r\n")).concat());
-        for name in WRAPPER_UNSET_PREFIXES.iter().chain(WRAPPER_UNSET) {
-            assert!(posix.contains(name) && cmd.contains(name), "{name}");
-        }
     }
 
     /// The batch file quotes every path it names, doubling `%`, the one character cmd reads
@@ -2055,6 +2650,7 @@ mod tests {
             "no_proxy": var("NO_PROXY"),
             "token": var("OMNIGRAPH_TOKEN_PERSONAL"),
             "bearer": var("OMNIGRAPH_BEARER_TOKEN"),
+            "foo": var("OMNIGRAPH_FOO"),
             "kept": var("STUDIO_TEST_KEPT"),
         });
         println!("cli {seen}");
@@ -2112,6 +2708,7 @@ mod tests {
             .env(STAND_IN, "1")
             .env("OMNIGRAPH_TOKEN_PERSONAL", "secret")
             .env("OMNIGRAPH_BEARER_TOKEN", "secret")
+            .env("omnigraph_foo", "secret")
             .env("NO_PROXY", "corp.example")
             .env("STUDIO_TEST_KEPT", "kept")
             .output()
@@ -2130,8 +2727,9 @@ mod tests {
         assert_eq!(seen["args"], serde_json::json!(given));
         assert_eq!(seen["home"], serde_json::json!(home.dir.to_str().unwrap()));
         assert_eq!(seen["no_proxy"], "127.0.0.1,localhost,corp.example");
+        // `omnigraph_foo` is `OMNIGRAPH_FOO` to Windows.
         assert!(
-            seen["token"].is_null() && seen["bearer"].is_null(),
+            seen["token"].is_null() && seen["bearer"].is_null() && seen["foo"].is_null(),
             "{seen}"
         );
         assert_eq!(seen["kept"], "kept");

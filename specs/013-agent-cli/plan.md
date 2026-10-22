@@ -153,15 +153,15 @@ Studio writes the credentials file in the CLI's own format, so the token never p
 process; the CLI sends it only to requests under `endpoint`. The CLI must have targets
 (OmniGraph #1090): Studio writes no other form.
 
-`omnigraph` (`0700`) is a wrapper: it unsets every `OMNIGRAPH_TOKEN_*`,
-`OMNIGRAPH_BEARER_TOKEN`, `OMNIGRAPH_PROFILE` and `OMNIGRAPH_CONTROL_*`, sets `OMNIGRAPH_HOME` to
+`omnigraph` (`0700`) is a wrapper: it unsets every `OMNIGRAPH_*` variable (`scrub::PREFIX`), as
+`omnigraph_run` removes them, then sets `OMNIGRAPH_HOME` to
 the directory, puts `127.0.0.1,localhost` in `NO_PROXY`, and runs the chosen CLI. The agent runs
 it by absolute path, so neither an environment filter nor a shell snapshot that reorders PATH
 can change what the CLI reads.
 
 On Windows the wrapper is the batch file `omnigraph.cmd`, written from the same account of what
 it does as the shell script (`cli_home::Wrapper`), so only the syntax differs. It removes the
-same variables (`set OMNIGRAPH_TOKEN_` lists each of that prefix, in any case), sets
+same variables (`set OMNIGRAPH_` lists each of that prefix, in any case), sets
 `OMNIGRAPH_HOME` to its own folder (`%~dp0`), prefixes `NO_PROXY` (one variable with `no_proxy`
 there) and runs the CLI with `%*`. Windows starts a batch file through `cmd /c`, which reads the
 caller's command line first: it expands `%NAME%` and, outside double quotes, acts on `&`, `|`,
@@ -211,7 +211,8 @@ The ACP crate can add variables to the agent's process but not remove them, and 
 removes every `OMNIGRAPH_*` variable Studio holds, unless `agent.env` sets it: the CLI's
 tokens and addressing, and tokens kept for other servers (`OMNIGRAPH_MR_BEARER_TOKEN`) or a local
 server's token list alike (in any case on Windows). The prefix is matched in one place,
-`agent_panel::scrub` (since 2026-10-21), which the agent's launch calls; a variable OmniGraph
+`agent_panel::scrub` (since 2026-10-21), which the agent's launch, `omnigraph_run` and the
+wrapper use; a variable OmniGraph
 adds later is removed without a list to keep. Cloud variables (`AWS_*`, `AZURE_*`, Google's) stay: the
 agent may need them for its model, as Claude Code on Bedrock does. This closes the gap where the
 agent inherited the person's graph tokens. With none of these variables set, the agent starts as
@@ -352,16 +353,27 @@ and cards apply, because the CLI still speaks to the gateway.
   not in the temporary directory, which a sandboxed agent may write. The folder goes with the
   conversation.
 
-- Studio adds `--target studio` and `--graph <graph>` unless the arguments name a graph, and
-  refuses `--target`, even naming `studio`, since Studio adds it, and `--as`, so a call cannot
-  leave the gateway. The flags #1090 removed (`--server`, `--store`, `--profile` and the rest)
-  are refused by the CLI itself. `--config` passes: on a CLI with targets it names source files, for `cluster`
-  commands only, which `omnigraph_run` does not run.
-- Commands: `query`, `mutate`, `load`, `branch`, `snapshot`, `export`, `blob`, `commit`,
-  `changes`, `schema show`, `graphs list`, `version` and `lint`. Anything else is refused before
-  running. `lint` checks queries against a schema file offline (`--query`, `--schema`, `--json`
-  only, no target added): `lint` takes no target, and a positional storage URI
-  would make Studio open storage itself.
+- Studio passes each command only the flags it lists for it (`cli_home::RUN_TABLE`): those that
+  choose what the command reads or writes, and `--yes` where the CLI asks before a destructive
+  write, which it refuses with no terminal. Every other argument is refused before running,
+  wherever it stands: before the command's words, between them, after them, with its value
+  after `=`, as another flag's value, or after `--`. Arguments are read as the CLI's parser
+  reads them: a value that starts with `-` goes after `=`, and text joined to `-e` is its value.
+  An operator file can name a credential command that the CLI runs before any request
+  (`auth: {provider: exec, …}`, OmniGraph main since #1115), so `--operator-config`, `--profile`,
+  `--config`, `--target` (even naming `studio`) and `--as` would let the agent run a program
+  outside its sandbox with Studio's environment, or leave the gateway; a list of refused flags
+  would also pass every flag a later CLI adds. `--page-token` is left out with every flag named
+  for a token: `branch diff`, `commit changes` and `commit list` read every page without it.
+- Studio adds `--target studio` to every command but `lint` and `version`, which the CLI
+  refuses it on, and `--graph <graph>` unless the arguments name a graph, except to
+  `graphs list`, which takes none.
+- Commands: `query`, `mutate`, `load`, `branch create|list|delete|merge|diff|merge-base`,
+  `snapshot`, `export`, `blob get|stat|put|clear`, `commit list|show|changes|publish|drop`
+  (the gateway refuses the last two), `changes poll|baseline`, `schema show`, `graphs list`,
+  `version` and `lint`. Anything else is refused before running. `lint` checks queries against a
+  schema file offline (`--query`, `--schema`, `--json` only, no target added): a positional
+  storage URI would make Studio open storage itself.
 - Files given to `--query`, `--data`, `--params-file`, `--file`, `--out` and `--schema`, and
   `save_to`, must be inside the working directory (relative, or absolute under it, never
   through `..`, and never under `.studio`, which holds Studio's files for the conversation), so
@@ -450,6 +462,7 @@ same write would split the cards and the rules.
 | Codex gets network only when the person allows it | Always enable it; always refuse the CLI to Codex | Enabling it opens all network; refusing it gives up the CLI where the person accepts the risk |
 | The CLI is the only graph tool; `omnigraph_run` runs it for agents without network | Keep spec 011's schema, query and propose tools beside the CLI | The CLI covers every served route and composes; the old tools were a subset with their own write path. One path keeps one set of rules and cards |
 | `omnigraph_run` takes an argument list and runs the chosen CLI without a shell, from a private home | A command string run by a shell; running the agent's wrapper | A list cannot smuggle a second command or a redirect, and the allowlist and file checks read the same arguments the CLI gets |
+| `omnigraph_run` passes each command only the flags Studio lists for it, read as the CLI's parser reads them | Refuse a list of flags that leave the gateway (`--target`, `--as`) and pass the rest | The CLI runs outside the agent's sandbox with Studio's environment. A list of refusals passes every flag a later CLI adds: `--operator-config` (#1115) names a file whose credential command the CLI runs, which made `omnigraph_run` run the agent's program |
 | Long calls report MCP progress and answer within four minutes with a run number | Raise the agent's timeout | A timeout is the agent's setting and differs by agent. codex-acp drops a per-server `tool_timeout_sec`; setting it means declaring the server in `CODEX_CONFIG` instead of ACP `mcpServers`. A run number works for every agent |
 
 ## Deferred
@@ -531,6 +544,8 @@ CLI is the one they trust).
 | 2026-10-21 | `initialize` says what Studio chose, not what it guessed at launch | `socket` `initialize_answers_with_what_studio_chose_when_it_asks` (instructions sent before and after the agent asked, none within the wait, and a conversation that ended); `mcp` `initialize_echoes_a_known_revision_and_offers_the_newest_otherwise` | Before, the instructions were made at launch as `instructions(None)`, before the CLI was chosen, so with no CLI found, or on Windows with a CLI at a path the batch file cannot hold, the agent was told the wrapper was its CLI. Now they are made when `initialize` arrives, from the choice (`instructions(Some(chosen))`), and while Studio is still choosing past 5 s they say so |
 | 2026-10-21 | An approval the gateway never took says nothing was sent | `gateway` `an_approval_the_gateway_never_took_records_that_nothing_was_sent` | An approval handed to a gateway that stopped before reading it was dropped with it, and recorded as unknown. The gateway's `Decision` now records "nothing was sent" for it, and for one taken as the CLI gave up, once |
 | 2026-10-21 | The agent's launch removes OmniGraph's variables through one shared match | `agent_panel` `scrub::every_name_with_omnigraphs_prefix_is_omnigraphs`, `scrub::what_is_removed_is_every_omnigraph_variable_but_those_kept`, `the_agent_starts_without_omnigraph_credentials` | `OMNIGRAPH_` matched whole at the start of the name, in any ASCII case only on Windows (`OMNIGRAPHX`, `XOMNIGRAPH_TOKEN` and `OMNIGRAPHé_` are not); `omnigraph_run` (`cli_home`) still reads it through `host::is_omnigraph_variable`, a re-export of `scrub`'s |
+| 2026-10-21 | `omnigraph_run` passes only the flags Studio lists, wherever an agent puts another | `agent_panel` `run_passes_only_the_flags_studio_knows`, `every_flag_studio_knows_passes`, `run_arguments_stay_on_the_gateway_and_in_the_working_directory`; OmniGraph `origin/main` at `ff542202` (`cli.rs`, `commands/*/args.rs`); the installed `omnigraph` 0.14.0-edge+50283ce, its `--help` for each command compared with the table by a script; by hand, the same CLI with a home as Studio writes it | `--operator-config`, `--profile`, `--as`, `--target` and `--config`, with a value or after `=`, refused before the command, between its words and after them; as another flag's value and after `--` too; an unknown flag, another command's flag and `--page-token` refused, each named. Every listed flag passes in both forms. The table has every flag of each command the CLI's help lists, but the global ones and `--page-token`, and the same number of positional arguments. The CLI refused `version --target` and `graphs list --graph` (`argument_conflict`), which Studio had added, so both failed before; it reads a following `--json` as a flag, not `--params`'s value, and text joined to `-e`, `--operator-config=…` included, as the query |
+| 2026-10-21 | The wrapper removes every OmniGraph variable, as `omnigraph_run` does | `agent_panel` `a_conversation_home_holds_its_config_token_and_wrapper`, `both_wrappers_are_written_from_one_account`; `the_batch_file_runs_the_cli_with_every_argument_as_given` (Windows only, with `omnigraph_foo` in another case; not run here) | `OMNIGRAPH_FOO`, a token and an `OMNIGRAPH_HOME` of the caller's gone, the wrapper's own home set, another variable kept; the batch file lists `set OMNIGRAPH_` |
 
 ## Corrections
 
@@ -542,6 +557,15 @@ CLI is the one they trust).
 - 2026-10-21 · The MCP instructions were made at launch, before the CLI was chosen, and told the
   agent the wrapper was its CLI when none fit or its shell could not run the one chosen. They are
   now made when the agent asks, from the choice.
+- 2026-10-21 · `omnigraph_run` refused only `--target` and `--as` and passed every other flag as
+  given. OmniGraph main added `--operator-config FILE` (#1115), whose file can give the target
+  `studio` a credential command the CLI runs before any request, so an agent could have run
+  its own program outside its sandbox, with Studio's environment. Each command now passes only
+  the flags Studio lists for it. The wrapper removed a fixed list of OmniGraph variables; it now
+  removes every `OMNIGRAPH_*` variable by `scrub`'s prefix, as `omnigraph_run` and the agent's
+  launch do. `version` and `graphs list`,
+  which the CLI refused with the target or graph Studio added, now run.
+
 - 2026-10-20 · The launcher's search for a program read every PATH entry, and an empty or
   relative one (`a;;b`, a trailing `;`) resolved against its working directory, which the doc
   said was never searched. It now reads only absolute entries, and a name found on none does

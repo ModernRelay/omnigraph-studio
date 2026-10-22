@@ -1629,10 +1629,6 @@ fn credential_variables(
     crate::scrub::removed(names, &kept, fold_case)
 }
 
-/// Whether a variable is one of OmniGraph's, as [`crate::scrub`] says; `omnigraph_run` asks it
-/// here (`cli_home`).
-pub(crate) use crate::scrub::is_omnigraph_variable;
-
 #[cfg(test)]
 mod credential_tests {
     use super::*;
