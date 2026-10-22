@@ -131,7 +131,9 @@ fi
 OMNIGRAPH_SERVER_BEARER_TOKENS_JSON="{\"act-dev\":\"$TOKEN\"}" \
   "$SERVER" --cluster "$DATA" --bind "$BIND" &
 server=$!
-trap 'kill $server 2>/dev/null; rm -rf "$home"' EXIT INT TERM
+# Only EXIT: bash runs it when a signal ends the script too, and a trapped INT or TERM would let the
+# script carry on after the server is gone.
+trap 'kill $server 2>/dev/null; rm -rf "$home"' EXIT
 
 # Asked only while the server runs: one that exited (the address taken meanwhile, a cluster it
 # cannot open) is reported as having exited, not as a server that answers no contract.
