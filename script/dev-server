@@ -2,14 +2,17 @@
 # Serve Studio's development graphs on http://127.0.0.1:8787 (`knowledge`, and a small `notes`
 # graph for trying more than one graph in a window).
 # Token `dev-token` resolves to actor `act-dev`, which the dev policy allows to do everything.
+# Studio reaches it as its environment server (OMNIGRAPH_STUDIO_SERVER, OMNIGRAPH_STUDIO_TOKEN).
 #
 #   script/dev-server            # first run applies the cluster and loads dev/seed.jsonl
 #   script/dev-server --reset    # start again from an empty graph
 #
-# Needs an OmniGraph that speaks HTTP contract 0.14 (`omnigraph` and `omnigraph-server`; until 0.14
-# is released, the edge build `edge-20261020-7fd9cc9` or later, named by OMNIGRAPH_BIN and
-# OMNIGRAPH_SERVER_BIN when not on PATH). Both are checked: the CLI's `version --json`, and the
-# contract header of the started server's /healthz.
+# Needs OmniGraph's `omnigraph` and `omnigraph-server`, on PATH or named by OMNIGRAPH_BIN and
+# OMNIGRAPH_SERVER_BIN: a CLI from OmniGraph main ff542202 or later, as Studio needs (until 0.14
+# is released, an edge build such as `edge-20261022-7fff9df`), and a server that speaks HTTP
+# contract 0.14 (`edge-20261020-7fd9cc9` or later). Both are checked: the CLI by its
+# `version --json` and its own check of the operator file this script writes, the started
+# server by the contract header its /healthz answers with.
 # Data lives in dev/.data; 0.14 stamps it format 16 on its first write, which 0.13 cannot open.
 set -euo pipefail
 
@@ -19,6 +22,7 @@ BIND=${STUDIO_DEV_BIND:-127.0.0.1:8787}
 CLI=${OMNIGRAPH_BIN:-omnigraph}
 SERVER=${OMNIGRAPH_SERVER_BIN:-omnigraph-server}
 TOKEN=dev-token
+NEEDS_CLI="dev-server needs an OmniGraph CLI from main ff542202 or later, as Studio does (an edge build such as edge-20261022-7fff9df until 0.14 is released)"
 
 if [[ "${1:-}" == "--reset" ]]; then
   rm -rf "$DATA"
@@ -28,9 +32,35 @@ fi
 # line into a closed pipe, which `pipefail` turns into a failed start.
 version=$("$CLI" version)
 version=${version%%$'\n'*}
-contract=$("$CLI" version --json | python3 -c 'import json,sys; print(json.load(sys.stdin).get("http_contract", ""))')
-if [[ "$contract" != 0.14 ]]; then
-  echo "dev-server needs an OmniGraph that speaks HTTP contract 0.14 (edge-20261020-7fd9cc9 or later); found: $version (set OMNIGRAPH_BIN and OMNIGRAPH_SERVER_BIN)" >&2
+# The contract and the protocols Studio's connections require of a CLI (`PROTOCOLS` in
+# crates/graph_store/src/cli_tokens.rs). Prints why the CLI is not one, or nothing. Builds from
+# main f7db38da to just before ff542202 report the same and read this script's file, so they
+# pass: they serve the dev graphs, though Studio's agent refuses them.
+# shellcheck disable=SC2016 # the backticks are the message's, not a command
+unfit=$("$CLI" version --json 2> /dev/null | python3 -c '
+import json, sys
+try:
+    facts = json.load(sys.stdin)
+except ValueError:
+    facts = None
+if not isinstance(facts, dict):
+    print("answers no `version --json`")
+    sys.exit()
+if facts.get("http_contract") != "0.14":
+    print("speaks HTTP contract %s" % facts.get("http_contract"))
+    sys.exit()
+protocols = facts.get("protocols") or {}
+for name, known in (("target", (1, 2)), ("credential", (1, 2)), ("access", (1,))):
+    number = protocols.get(name)
+    if number is None:
+        print("reports no %s protocol" % name)
+        sys.exit()
+    if type(number) is not int or number not in known:
+        print("reports %s protocol %s, which Studio does not drive" % (name, number))
+        sys.exit()
+' || true)
+if [[ -n "$unfit" ]]; then
+  echo "$NEEDS_CLI; $version $unfit (set OMNIGRAPH_BIN)" >&2
   exit 1
 fi
 
@@ -42,42 +72,77 @@ if curl -s -o /dev/null --max-time 2 "http://$BIND/healthz"; then
   exit 1
 fi
 
+# The CLI runs in an operator home of its own, so the person's ~/.omnigraph and credentials take
+# no part: a version-1 operator file whose one target, `dev`, is the data directory as a direct
+# root, which a direct target names by an absolute file:// URI. The seeds are loaded through it
+# before the server starts; a direct target needs no token.
+home=$(mktemp -d)
+trap 'rm -rf "$home"' EXIT
+uri=$(python3 -c 'import json, pathlib, sys; print(json.dumps(pathlib.Path(sys.argv[1]).resolve().as_uri()))' "$DATA")
+printf 'version: 1\ntargets:\n  dev: {kind: direct, scope: root, uri: %s}\n' "$uri" > "$home/config.yaml"
+og() { OMNIGRAPH_HOME=$home "$CLI" "$@"; }
+
+# A CLI with those protocols from before OmniGraph's version-1 operator configuration has no
+# `config validate`, which its parser says, and could not read the file.
+if ! said=$(og config validate 2>&1); then
+  echo "$NEEDS_CLI; $version refused the operator file dev-server writes: ${said%%$'\n'*} (set OMNIGRAPH_BIN)" >&2
+  exit 1
+fi
+
+# Runs the CLI with its output kept, shown only when it fails: the target line it prints, and its
+# advice on the lock it keeps, are this script's to act on.
+quietly() {
+  local out
+  if ! out=$(og "$@" 2>&1); then
+    printf '%s\n' "$out" >&2
+    echo "dev-server: omnigraph $* failed; its output is above" >&2
+    exit 1
+  fi
+}
+
+# A direct apply or load keeps the cluster lock when it ends, and a server stopped without
+# shutting down (killed, or its shell closed) leaves its own behind. Nothing else uses this
+# directory, so a lock whose process is gone is released; a live one means another server is
+# running. Says so unless asked to be quiet.
+release_exited_lock() {
+  local lock pid
+  [[ -f "$DATA/__cluster/lock.json" ]] || return 0
+  read -r lock pid < <(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["lock_id"], d.get("pid", ""))' "$DATA/__cluster/lock.json")
+  if [[ -n "$pid" ]] && ! kill -0 "$pid" 2> /dev/null; then
+    quietly cluster force-unlock "$lock" --target dev
+    if [[ "${1:-}" != quiet ]]; then
+      echo "Released the cluster lock of a process that is gone (pid $pid)." >&2
+    fi
+  fi
+}
+
 # The seeds are loaded once, after the first apply. The marker stands from the apply until both
-# loads are done, so a run that stops between them (the address taken meanwhile, a load that
-# failed) seeds at the next run instead of serving empty graphs for good. A data directory
-# from before the marker existed is taken as seeded.
+# loads are done, so a run that stops between them (a load that failed, the script stopped)
+# seeds at the next run instead of serving empty graphs for good. A data directory from before
+# the marker existed is taken as seeded.
 pending="$DATA/.seed-pending"
 if [[ ! -d "$DATA/__cluster" ]]; then
   mkdir -p "$DATA"
   touch "$pending"
   cp "$ROOT"/dev/cluster/*.yaml "$ROOT"/dev/cluster/*.pg "$DATA"/
-  (cd "$DATA" && "$CLI" cluster apply --config . --target . > /dev/null)
-  # A direct apply keeps the cluster lock; nothing else uses this directory, so release it.
-  lock=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["lock_id"])' "$DATA/__cluster/lock.json")
-  (cd "$DATA" && "$CLI" cluster force-unlock "$lock" --target . > /dev/null)
+  quietly cluster apply --config "$DATA" --target dev
+  release_exited_lock quiet
 fi
-fresh=0
-if [[ -f "$pending" ]]; then
-  fresh=1
-fi
+release_exited_lock
 
-# A server stopped without shutting down (killed, or its shell closed) leaves its lock behind.
-# Release a lock whose process is gone; a live one means another server is running.
-if [[ -f "$DATA/__cluster/lock.json" ]]; then
-  read -r lock pid < <(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["lock_id"], d.get("pid", ""))' "$DATA/__cluster/lock.json")
-  if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
-    (cd "$DATA" && "$CLI" cluster force-unlock "$lock" --target . > /dev/null)
-    echo "Released the lock of a stopped server (pid $pid)." >&2
-  fi
+if [[ -f "$pending" ]]; then
+  [[ -f "$ROOT/dev/seed.jsonl" ]] || python3 "$ROOT/script/dev-seed.py" > "$ROOT/dev/seed.jsonl"
+  quietly load --target dev --graph knowledge --data "$ROOT/dev/seed.jsonl" --mode overwrite
+  release_exited_lock quiet
+  quietly load --target dev --graph notes --data "$ROOT/dev/notes-seed.jsonl" --mode overwrite
+  release_exited_lock quiet
+  rm -f "$pending"
+  echo "Loaded dev/seed.jsonl into knowledge and dev/notes-seed.jsonl into notes."
 fi
 
 OMNIGRAPH_SERVER_BEARER_TOKENS_JSON="{\"act-dev\":\"$TOKEN\"}" \
   "$SERVER" --cluster "$DATA" --bind "$BIND" &
 server=$!
-# The CLI sends a token only to a target its config names, never from OMNIGRAPH_BEARER_TOKEN, so
-# the seed loads run in a home of their own that names this server, outside the cluster root.
-home=$(mktemp -d)
-printf 'target_config_version: 1\ntargets:\n  dev: { kind: server, endpoint: "http://%s", credential: dev }\n' "$BIND" > "$home/config.yaml"
 trap 'kill $server 2>/dev/null; rm -rf "$home"' EXIT INT TERM
 
 # Asked only while the server runs: one that exited (the address taken meanwhile, a cluster it
@@ -108,16 +173,6 @@ if [[ "$served" != 0.14 ]]; then
   if [[ -n "$served" ]]; then answer="contract $served"; else answer="no contract"; fi
   echo "dev-server needs an omnigraph-server that speaks HTTP contract 0.14 (edge-20261020-7fd9cc9 or later); $SERVER answers $answer at http://$BIND/healthz (set OMNIGRAPH_SERVER_BIN)" >&2
   exit 1
-fi
-
-if [[ $fresh == 1 ]]; then
-  [[ -f "$ROOT/dev/seed.jsonl" ]] || python3 "$ROOT/script/dev-seed.py" > "$ROOT/dev/seed.jsonl"
-  OMNIGRAPH_HOME=$home OMNIGRAPH_TOKEN_DEV=$TOKEN "$CLI" load --target dev --graph knowledge \
-    --data "$ROOT/dev/seed.jsonl" --mode overwrite --yes > /dev/null
-  OMNIGRAPH_HOME=$home OMNIGRAPH_TOKEN_DEV=$TOKEN "$CLI" load --target dev --graph notes \
-    --data "$ROOT/dev/notes-seed.jsonl" --mode overwrite --yes > /dev/null
-  rm -f "$pending"
-  echo "Loaded dev/seed.jsonl into knowledge and dev/notes-seed.jsonl into notes."
 fi
 
 echo "Serving http://$BIND · graphs knowledge, notes · token $TOKEN (actor act-dev)"
