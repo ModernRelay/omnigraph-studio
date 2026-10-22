@@ -11,20 +11,24 @@
 //! logs or writes it, and sends it only to the endpoint of the target it was exported for.
 //!
 //! The CLI is chosen by what `version --json` reports ([`PROTOCOLS`]) and by the commands Studio
-//! runs being there ([`COMMANDS`]). It runs off the main thread with a timeout, one run at a time
-//! ([`TURN`]: the CLI refuses a second command on a home whose lock another holds), its standard
-//! input empty, and none of OmniGraph's variables but `OMNIGRAPH_HOME` and the one a target's own
-//! token source names ([`scrubbed`]). A token is asked for when its server connects, once more
-//! after a 401, and on Refresh (`Connection`), not on a timer: the secure store cannot be
-//! watched.
+//! runs being there ([`COMMANDS`]); what a program was found to be is remembered across launches
+//! until its file changes ([`Probes`]). It runs off the main thread with a timeout, one sequence
+//! of commands at a time ([`TURN`]: the CLI refuses a second command on a home whose lock
+//! another holds), its standard input empty, and none of OmniGraph's variables but
+//! `OMNIGRAPH_HOME` and the one a target's own token source names ([`scrubbed`]). A token is
+//! asked for when its server connects, once more after a 401, and on Refresh (`Connection`), not
+//! on a timer: the secure store cannot be watched.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use futures::channel::oneshot;
 use futures::future::BoxFuture;
 use futures::{AsyncReadExt as _, FutureExt as _};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::cli_config::{CliCredential, CliServer, FileStamp};
@@ -64,10 +68,13 @@ const MAX_TOKEN_BYTES: usize = 64 * 1024;
 /// How much of a JSON answer, or of what the CLI writes to standard error, is read.
 const MAX_ANSWER_BYTES: usize = 4 * 1024 * 1024;
 
-/// How long a CLI may take to answer a command that reads only its configuration. A test's
-/// stand-in is a shell script, which a loaded machine can take seconds to start.
+/// How long a CLI may take to answer a command that reads only its configuration, and how long a
+/// listing waits for its turn at the CLI. In tests, an hour: a stand-in is a shell script, which
+/// a loaded machine can take seconds to start and which waits for its turn behind every other
+/// test's, so no bound is reached by the machine being busy. Only a test that sets a short
+/// timeout of its own, on a stand-in that never answers, reaches one.
 pub(crate) const READ_TIMEOUT: Duration = if cfg!(test) {
-    Duration::from_secs(60)
+    Duration::from_secs(3600)
 } else {
     Duration::from_secs(10)
 };
@@ -106,12 +113,14 @@ impl std::fmt::Debug for Token {
 
 /// Where a connection's token comes from each time it is asked (`Connection`): on each connect,
 /// once more after a 401, and on Refresh. A failure says why, in words the person reads.
+/// `hurry` is raised while a window waits for the token: its ask goes before the others
+/// waiting for the CLI ([`TURN`]), however long it has waited already.
 pub trait TokenSource: Send + Sync + 'static {
-    fn token(&self) -> BoxFuture<'static, Result<Token, String>>;
+    fn token(&self, hurry: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, String>>;
 }
 
 /// The CLI Studio runs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct FoundCli {
     pub path: PathBuf,
     /// Its release, as `version --json` reports it.
@@ -144,9 +153,79 @@ pub(crate) fn candidates() -> Vec<PathBuf> {
     places
 }
 
-/// What each program Studio looked at was found to be, with its file's stamp then: a program is
-/// probed again only when its file changes, so a connect runs only the commands it needs.
-type Probed = (PathBuf, FileStamp, Result<FoundCli, String>);
+/// What a program Studio looked at was found to be, and its file's stamp then.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Probed {
+    path: PathBuf,
+    stamp: FileStamp,
+    found: Result<FoundCli, String>,
+}
+
+/// What each program Studio looked at was found to be, kept in Studio's data directory
+/// (`cli_probes.json`) as well as in memory, so a launch asks a program nothing it asked before:
+/// a program is probed again only when its file changes (its modification time, size or
+/// permissions), so a start and a connect run only the commands they need. A probe is five
+/// commands (`version --json` and four `--help`), tens of milliseconds at every start.
+struct Probes {
+    /// The file was read: at the first look of a run.
+    read: bool,
+    held: Vec<Probed>,
+}
+
+/// How many programs are remembered: the places Studio looks for the CLI, a few times over.
+const PROBES_KEPT: usize = 32;
+
+static PROBED: Mutex<Probes> = Mutex::new(Probes {
+    read: false,
+    held: Vec::new(),
+});
+
+fn probes_path() -> PathBuf {
+    studio_settings::data_dir().join("cli_probes.json")
+}
+
+impl Probes {
+    /// The programs remembered, read from the data directory at the first look; a file that
+    /// is not there or cannot be read remembers none, and the next probe replaces it.
+    fn lock() -> MutexGuard<'static, Probes> {
+        let mut probes = PROBED.lock().unwrap_or_else(PoisonError::into_inner);
+        if !std::mem::replace(&mut probes.read, true) {
+            probes.held = std::fs::read(probes_path())
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default();
+        }
+        probes
+    }
+
+    /// What `program` was found to be while its file had `stamp`.
+    fn find(&self, program: &Path, stamp: FileStamp) -> Option<Result<FoundCli, String>> {
+        self.held
+            .iter()
+            .find(|probed| probed.path == program && probed.stamp == stamp)
+            .map(|probed| probed.found.clone())
+    }
+
+    /// Remembers what `program` was found to be while its file had `stamp`, in place of what
+    /// it was before, and writes the list on the write thread.
+    fn keep(&mut self, program: &Path, stamp: FileStamp, found: Result<FoundCli, String>) {
+        self.held.retain(|probed| probed.path != program);
+        self.held.push(Probed {
+            path: program.to_owned(),
+            stamp,
+            found,
+        });
+        let excess = self.held.len().saturating_sub(PROBES_KEPT);
+        self.held.drain(..excess);
+        if let Ok(text) = serde_json::to_vec_pretty(&self.held) {
+            studio_settings::write_atomic_in_turn(
+                probes_path(),
+                text,
+                studio_settings::Access::Private,
+            );
+        }
+    }
+}
 
 /// Why a program is not the CLI Studio runs: its own answer, which stands while its file does
 /// not change (`lasting`), or a run that did not end (a timeout, a program that could not
@@ -164,11 +243,11 @@ impl Unfit {
         }
     }
 }
-static PROBED: Mutex<Vec<Probed>> = Mutex::new(Vec::new());
 
 /// The first of `programs` that is an OmniGraph CLI Studio can drive: one that reports
-/// [`PROTOCOLS`] and has [`COMMANDS`]. Otherwise why none is, naming each program found.
-pub(crate) async fn find_cli(programs: &[PathBuf]) -> Result<FoundCli, String> {
+/// [`PROTOCOLS`] and has [`COMMANDS`]. Otherwise why none is, naming each program found. A
+/// program is probed in the turn held, only when what it was found to be is not remembered.
+pub(crate) async fn find_cli(programs: &[PathBuf], turn: &Held) -> Result<FoundCli, String> {
     if !cfg!(unix) {
         return Err(
             "the OmniGraph CLI gives a token only through a Unix pipe, which this system \
@@ -189,20 +268,15 @@ pub(crate) async fn find_cli(programs: &[PathBuf]) -> Result<FoundCli, String> {
         }
         seen.push(canonical);
         let stamp = stamp_of(program);
-        let held = stamp.and_then(|stamp| {
-            PROBED.lock().ok()?.iter().find_map(|(path, at, probed)| {
-                (path == program && *at == stamp).then(|| probed.clone())
-            })
-        });
+        let held = stamp.and_then(|stamp| Probes::lock().find(program, stamp));
         let probed = match held {
             Some(probed) => probed,
             None => {
-                let probed = probe(program).await;
+                let probed = probe(program, turn).await;
                 let lasting = probed.as_ref().err().is_none_or(|unfit| unfit.lasting);
                 let probed = probed.map_err(|unfit| unfit.why);
-                if lasting && let (Some(stamp), Ok(mut held)) = (stamp, PROBED.lock()) {
-                    held.retain(|(path, _, _)| path != program);
-                    held.push((program.clone(), stamp, probed.clone()));
+                if lasting && let Some(stamp) = stamp {
+                    Probes::lock().keep(program, stamp, probed.clone());
                 }
                 probed
             }
@@ -224,11 +298,11 @@ pub(crate) async fn find_cli(programs: &[PathBuf]) -> Result<FoundCli, String> {
     ))
 }
 
-/// `program` as the CLI Studio runs, or why it is not one.
-async fn probe(program: &Path) -> Result<FoundCli, Unfit> {
+/// `program` as the CLI Studio runs, or why it is not one: its commands run in the turn held.
+async fn probe(program: &Path, turn: &Held) -> Result<FoundCli, Unfit> {
     let transient = |unrun: Unrun| Unfit {
         why: match unrun {
-            Unrun::Timeout | Unrun::Busy => {
+            Unrun::Timeout => {
                 "did not answer `version --json` in time, and is asked again".to_owned()
             }
             Unrun::Failed(error) => format!("could not be run ({error}), and is asked again"),
@@ -236,6 +310,7 @@ async fn probe(program: &Path) -> Result<FoundCli, Unfit> {
         lasting: false,
     };
     let ran = run(
+        turn,
         || command(program, &[], &["version", "--json"]),
         READ_TIMEOUT,
         MAX_ANSWER_BYTES,
@@ -275,6 +350,7 @@ async fn probe(program: &Path) -> Result<FoundCli, Unfit> {
         let mut args: Vec<&str> = words.to_vec();
         args.push("--help");
         let ran = run(
+            turn,
             || command(program, &[], &args),
             READ_TIMEOUT,
             MAX_ANSWER_BYTES,
@@ -295,25 +371,19 @@ async fn probe(program: &Path) -> Result<FoundCli, Unfit> {
 }
 
 /// The targets `target list --json` names: each name with its entry as the CLI describes it.
-pub(crate) async fn list_targets(cli: &FoundCli) -> Result<serde_json::Map<String, Value>, String> {
-    match json_answer(cli, &[], &["target", "list", "--json"]).await? {
+pub(crate) async fn list_targets(
+    cli: &FoundCli,
+    turn: &Held,
+) -> Result<serde_json::Map<String, Value>, String> {
+    match json_answer(cli, turn, &[], &["target", "list", "--json"]).await? {
         Value::Object(targets) => Ok(targets),
         _ => Err("`omnigraph target list --json` did not answer an object of targets".to_owned()),
     }
 }
 
-/// What `target inspect NAME --json` says of one target (`resolved`: with its managed profile
-/// expanded, `--resolved`), without a server or a secret.
-pub(crate) async fn inspect_target(
-    cli: &FoundCli,
-    name: &str,
-    resolved: bool,
-) -> Result<Value, String> {
-    let mut args = vec!["target", "inspect", name, "--json"];
-    if resolved {
-        args.push("--resolved");
-    }
-    json_answer(cli, &[], &args).await
+/// What `target inspect NAME --json` says of one target, without a server or a secret.
+async fn inspect_target(cli: &FoundCli, turn: &Held, name: &str) -> Result<Value, String> {
+    json_answer(cli, turn, &[], &["target", "inspect", name, "--json"]).await
 }
 
 /// Adds the server target `name` at `endpoint` to the person's operator configuration through
@@ -321,14 +391,17 @@ pub(crate) async fn inspect_target(
 /// the CLI's secure store (`auth: {provider: token, source: {store: {}}}`, then `credentials set
 /// --target NAME --stdin --replace` with the token on its standard input); without one,
 /// anonymous. Studio writes neither the file nor the token itself. A refusal is the CLI's own
-/// words; a target whose token the CLI would not keep is removed again (`target remove`).
+/// words; a target whose token the CLI would not keep is removed again (`target remove`). The
+/// commands run in one turn at the CLI.
 pub(crate) async fn add_server_target(
     programs: &[PathBuf],
     name: &str,
     endpoint: &str,
     token: Option<Token>,
 ) -> Result<(), String> {
-    let cli = find_cli(programs).await?;
+    let asked = format!("`omnigraph target add {name}`");
+    let turn = take_turn(&Arc::default(), READ_TIMEOUT, &asked).await?;
+    let cli = find_cli(programs, &turn).await?;
     let auth = match token {
         Some(_) => serde_json::json!({"provider": "token", "source": {"store": {}}}),
         None => serde_json::json!({"provider": "anonymous"}),
@@ -337,6 +410,7 @@ pub(crate) async fn add_server_target(
     let entry = entry.to_string();
     say(
         &cli,
+        &turn,
         &["target", "add", name, "--json"],
         Some(entry.as_bytes()),
     )
@@ -354,8 +428,8 @@ pub(crate) async fn add_server_target(
         "--stdin",
         "--replace",
     ];
-    if let Err(refused) = say(&cli, &set, Some(&input)).await {
-        let removed = say(&cli, &["target", "remove", name, "--json"], None).await;
+    if let Err(refused) = say(&cli, &turn, &set, Some(&input)).await {
+        let removed = say(&cli, &turn, &["target", "remove", name, "--json"], None).await;
         return Err(match removed {
             Ok(()) => format!("{refused}; the target was removed again"),
             Err(left) => format!("{refused}; the target stays, without a token ({left})"),
@@ -366,9 +440,15 @@ pub(crate) async fn add_server_target(
 
 /// Runs `args` with `cli`, `input` on its standard input, for its success alone: what it printed
 /// is not read, and a failure is what it said.
-async fn say(cli: &FoundCli, args: &[&str], input: Option<&[u8]>) -> Result<(), String> {
+async fn say(
+    cli: &FoundCli,
+    turn: &Held,
+    args: &[&str],
+    input: Option<&[u8]>,
+) -> Result<(), String> {
     let asked = format!("`omnigraph {}`", args.join(" "));
     match run_with(
+        turn,
         || command(&cli.path, &[], args),
         input,
         READ_TIMEOUT,
@@ -389,9 +469,15 @@ async fn say(cli: &FoundCli, args: &[&str], input: Option<&[u8]>) -> Result<(), 
 /// What `cli` prints as JSON for `args`, or what it says when it refuses: a refusal asked for as
 /// JSON comes on standard output as `{"error": …, "code": …}`, any other failure on standard
 /// error.
-async fn json_answer(cli: &FoundCli, kept: &[String], args: &[&str]) -> Result<Value, String> {
+async fn json_answer(
+    cli: &FoundCli,
+    turn: &Held,
+    kept: &[String],
+    args: &[&str],
+) -> Result<Value, String> {
     let asked = format!("`omnigraph {}`", args.join(" "));
     let ran = match run(
+        turn,
         || command(&cli.path, kept, args),
         READ_TIMEOUT,
         MAX_ANSWER_BYTES,
@@ -415,7 +501,7 @@ async fn json_answer(cli: &FoundCli, kept: &[String], args: &[&str]) -> Result<V
 }
 
 /// A CLI server's token: `credentials status`, then `credentials export`, then `target inspect`
-/// for its target, run with the CLI Studio finds.
+/// for its target, run with the CLI Studio finds, in one turn at the CLI.
 #[derive(Debug, Clone)]
 pub struct CliTokenSource {
     /// The target's name.
@@ -454,15 +540,21 @@ impl CliTokenSource {
         }
     }
 
-    async fn resolve(&self) -> Result<Token, String> {
+    /// The token, its commands run in one turn at the CLI, which waits for the turn as long as
+    /// the export may take: the turn goes to this ask before those nobody hurries while
+    /// `hurry` is raised.
+    async fn resolve(&self, hurry: Arc<AtomicBool>) -> Result<Token, String> {
         let programs = self.programs.clone().unwrap_or_else(candidates);
-        let cli = find_cli(&programs).await?;
+        let asked = format!("`omnigraph credentials export --target {}`", self.target);
+        let turn = take_turn(&hurry, self.timeout, &asked).await?;
+        let cli = find_cli(&programs, &turn).await?;
         let target = self.target.as_str();
         let kept = self.kept();
 
         // Whether a credential is there at all, read without the secret.
         let status = json_answer(
             &cli,
+            &turn,
             &kept,
             &["credentials", "status", "--target", target, "--json"],
         )
@@ -476,10 +568,10 @@ impl CliTokenSource {
             _ => {}
         }
 
-        let token = self.export(&cli, &kept).await?;
+        let token = self.export(&cli, &turn, &kept).await?;
 
         // The export read the configuration again: a token for another endpoint is dropped.
-        let inspected = inspect_target(&cli, target, false).await?;
+        let inspected = inspect_target(&cli, &turn, target).await?;
         let still = inspected.pointer("/target/kind").and_then(Value::as_str) == Some("server")
             && inspected
                 .pointer("/target/endpoint")
@@ -492,10 +584,11 @@ impl CliTokenSource {
     }
 
     /// Runs the export with `cli` and takes the token it prints.
-    async fn export(&self, cli: &FoundCli, kept: &[String]) -> Result<Token, String> {
+    async fn export(&self, cli: &FoundCli, turn: &Held, kept: &[String]) -> Result<Token, String> {
         let args = ["credentials", "export", "--target", self.target.as_str()];
         let asked = format!("`omnigraph credentials export --target {}`", self.target);
         let ran = match run(
+            turn,
             || command(&cli.path, kept, &args),
             self.timeout,
             MAX_TOKEN_BYTES + 1,
@@ -553,9 +646,9 @@ impl CliTokenSource {
 }
 
 impl TokenSource for CliTokenSource {
-    fn token(&self) -> BoxFuture<'static, Result<Token, String>> {
+    fn token(&self, hurry: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, String>> {
         let source = self.clone();
-        async move { source.resolve().await }.boxed()
+        async move { source.resolve(hurry).await }.boxed()
     }
 }
 
@@ -611,8 +704,6 @@ struct Ran {
 /// Why a run gave no output.
 enum Unrun {
     Timeout,
-    /// Another of Studio's commands held the CLI ([`TURN`]) past this one's timeout.
-    Busy,
     Failed(String),
 }
 
@@ -624,11 +715,6 @@ impl Unrun {
                 "the OmniGraph CLI did not answer {asked} within {} s, and was stopped",
                 timeout.as_secs()
             ),
-            Unrun::Busy => format!(
-                "the OmniGraph CLI was busy with another of Studio's commands for {} s, so \
-                 {asked} was not run",
-                timeout.as_secs()
-            ),
             Unrun::Failed(error) => format!(
                 "Studio could not run the OmniGraph CLI at {} ({asked}): {error}",
                 shown(cli)
@@ -637,11 +723,188 @@ impl Unrun {
     }
 }
 
-/// Studio's turn at the CLI: one of its runs at a time. The CLI takes its operator home's locks
-/// without waiting (`ConfigEditLock` takes `try_lock`), so two runs at once on one home refuse
-/// each other ("could not lock operator configuration"), as every server's token asked together
-/// did when the Open dialog connected them all.
-static TURN: smol::lock::Mutex<()> = smol::lock::Mutex::new(());
+/// Studio's turn at the CLI: one sequence of its commands at a time, held for the whole
+/// sequence (a token's `credentials status`, `credentials export` and `target inspect`; a
+/// listing; a target added). The CLI takes its operator home's locks without waiting
+/// (`ConfigEditLock` takes `try_lock`), so two commands at once on one home refuse each other
+/// ("could not lock operator configuration"), as every server's token asked together did when
+/// the Open dialog connected them all. A turn per command let those sequences interleave, so
+/// every token waited for nearly every other's commands. The sequences waiting take the turn in
+/// the order they asked, but one a window waits on (its `hurry` raised) goes first.
+static TURN: Turn = Turn::new();
+
+/// The queue for [`TURN`].
+struct Turn {
+    queue: Mutex<Queue>,
+}
+
+struct Queue {
+    /// A sequence holds the turn.
+    held: bool,
+    /// Numbers the sequences that waited.
+    asked: u64,
+    /// The sequences waiting, in the order they asked.
+    waiting: Vec<Waiter>,
+}
+
+/// A sequence waiting for the turn: given it through `give`.
+struct Waiter {
+    id: u64,
+    hurry: Arc<AtomicBool>,
+    give: oneshot::Sender<()>,
+}
+
+/// Studio's turn at the CLI, held by one sequence of commands: [`run`] runs a command only in
+/// it, and dropped it passes to the next sequence waiting.
+pub(crate) struct Held(&'static Turn);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.0.pass();
+    }
+}
+
+/// A sequence waiting for the turn. Dropped before it took the turn (its caller stopped
+/// waiting), it leaves the queue, or, given the turn meanwhile, passes it on: a turn given to a
+/// caller gone would otherwise be held by nobody, and every later command wait for it.
+struct Asking {
+    turn: &'static Turn,
+    id: u64,
+    /// Dropped after `drop` has run, so a turn given while it runs reaches this receiver.
+    given: oneshot::Receiver<()>,
+    taken: bool,
+}
+
+impl Drop for Asking {
+    fn drop(&mut self) {
+        if self.taken {
+            return;
+        }
+        let mut queue = self.turn.queue();
+        match queue.waiting.iter().position(|waiter| waiter.id == self.id) {
+            Some(at) => {
+                queue.waiting.remove(at);
+            }
+            // Out of the queue unasked: given the turn.
+            None => {
+                drop(queue);
+                self.turn.pass();
+            }
+        }
+    }
+}
+
+impl Turn {
+    const fn new() -> Self {
+        Self {
+            queue: Mutex::new(Queue {
+                held: false,
+                asked: 0,
+                waiting: Vec::new(),
+            }),
+        }
+    }
+
+    fn queue(&self) -> MutexGuard<'_, Queue> {
+        self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The turn, once the sequences before this one are done, or `None` past `bound`.
+    async fn take(&'static self, hurry: &Arc<AtomicBool>, bound: Duration) -> Option<Held> {
+        let mut asking = {
+            let mut queue = self.queue();
+            if !queue.held {
+                queue.held = true;
+                return Some(Held(self));
+            }
+            queue.asked += 1;
+            let id = queue.asked;
+            let (give, given) = oneshot::channel();
+            queue.waiting.push(Waiter {
+                id,
+                hurry: hurry.clone(),
+                give,
+            });
+            Asking {
+                turn: self,
+                id,
+                given,
+                taken: false,
+            }
+        };
+        let given = {
+            let given = (&mut asking.given).fuse();
+            let waited = smol::Timer::after(bound).fuse();
+            futures::pin_mut!(given, waited);
+            futures::select! {
+                _ = given => true,
+                // Given the turn as the bound passed, it is taken all the same.
+                _ = waited => !self.queue().waiting.iter().any(|waiter| waiter.id == asking.id),
+            }
+        };
+        if !given {
+            return None;
+        }
+        asking.taken = true;
+        Some(Held(self))
+    }
+
+    /// Gives the turn to the next sequence waiting, a hurried one first; with none, frees it.
+    fn pass(&self) {
+        let mut queue = self.queue();
+        loop {
+            let next = queue
+                .waiting
+                .iter()
+                .position(|waiter| waiter.hurry.load(Ordering::SeqCst))
+                .or((!queue.waiting.is_empty()).then_some(0));
+            let Some(next) = next else {
+                queue.held = false;
+                return;
+            };
+            let waiter = queue.waiting.remove(next);
+            if waiter.give.send(()).is_ok() {
+                return;
+            }
+        }
+    }
+
+    /// Whether the sequence asked with `hurry` waits for the turn.
+    #[cfg(test)]
+    fn waits_for(&self, hurry: &Arc<AtomicBool>) -> bool {
+        self.queue()
+            .waiting
+            .iter()
+            .any(|waiter| Arc::ptr_eq(&waiter.hurry, hurry))
+    }
+}
+
+/// Forgets the programs probed, as a new launch starts: the next look reads the data
+/// directory's file again.
+#[cfg(test)]
+fn forget_probes() {
+    let mut probes = PROBED.lock().unwrap_or_else(PoisonError::into_inner);
+    probes.read = false;
+    probes.held.clear();
+}
+
+/// Studio's turn at the CLI for one sequence of commands, waited for `bound` at most: one held
+/// back past it by another of Studio's (a credential helper that takes long) is not run, and
+/// says so, naming what it would have run (`asked`). While `hurry` is raised the sequence goes
+/// before those waiting that nobody hurries.
+pub(crate) async fn take_turn(
+    hurry: &Arc<AtomicBool>,
+    bound: Duration,
+    asked: &str,
+) -> Result<Held, String> {
+    TURN.take(hurry, bound).await.ok_or_else(|| {
+        format!(
+            "the OmniGraph CLI was busy with another of Studio's commands for {} s, so {asked} \
+             was not run",
+            bound.as_secs()
+        )
+    })
+}
 
 /// What the CLI says when another program holds its operator home's lock
 /// (`targets::ConfigEditLock::acquire`).
@@ -652,35 +915,28 @@ const LOCK_REFUSED: &str = "could not lock operator configuration";
 const LOCK_RETRIES: u32 = 4;
 const LOCK_PAUSE: Duration = Duration::from_millis(250);
 
-/// Runs the command `make` builds, in Studio's turn ([`TURN`]), with its standard input empty and
-/// its output read from pipes, at most `limit` bytes of standard output and
-/// [`MAX_ANSWER_BYTES`] of standard error. Past `timeout` the process is stopped. A run refused
-/// for another program's lock is made again, [`LOCK_RETRIES`] times at most.
+/// Runs the command `make` builds, in the turn its sequence holds at the CLI ([`TURN`]), with
+/// its standard input empty and its output read from pipes, at most `limit` bytes of standard
+/// output and [`MAX_ANSWER_BYTES`] of standard error. Past `timeout` the process is stopped. A
+/// run refused for another program's lock is made again, [`LOCK_RETRIES`] times at most.
 async fn run(
+    turn: &Held,
     make: impl Fn() -> std::process::Command,
     timeout: Duration,
     limit: usize,
 ) -> Result<Ran, Unrun> {
-    run_with(make, None, timeout, limit).await
+    run_with(turn, make, None, timeout, limit).await
 }
 
 /// [`run`], with `input` as the command's standard input when there is one: a target's entry
 /// for `target add`, a token for `credentials set`, never on its command line.
 async fn run_with(
+    _turn: &Held,
     make: impl Fn() -> std::process::Command,
     input: Option<&[u8]>,
     timeout: Duration,
     limit: usize,
 ) -> Result<Ran, Unrun> {
-    // The wait for a turn counts toward the timeout: a credential helper that runs long holds
-    // every other command back only that long.
-    let turn = TURN.lock().fuse();
-    let waited = smol::Timer::after(timeout).fuse();
-    futures::pin_mut!(turn, waited);
-    let _turn = futures::select! {
-        turn = turn => turn,
-        _ = waited => return Err(Unrun::Busy),
-    };
     let mut retries = 0;
     loop {
         let ran = run_once(make(), input, timeout, limit).await?;
@@ -901,7 +1157,8 @@ echo "$*" >> "$dir/calls"
 # The CLI's lock of its operator home, taken without waiting, as `ConfigEditLock` takes it.
 lock() {{
   [ -f "$dir/locking" ] || return 0
-  mkdir "$dir/lock" 2>/dev/null || {{ echo "Error: could not lock operator configuration: lock acquisition failed because the operation would block" >&2; exit 1; }}
+  # Held by another program, which lets go once it has refused one command when asked to.
+  mkdir "$dir/lock" 2>/dev/null || {{ [ -f "$dir/release-once" ] && rm "$dir/release-once" && rmdir "$dir/lock"; echo "Error: could not lock operator configuration: lock acquisition failed because the operation would block" >&2; exit 1; }}
   sleep 0.2
   rmdir "$dir/lock"
 }}
@@ -936,7 +1193,7 @@ case "$*" in
     [ -p /dev/stdout ] || {{ echo "credentials export requires stdout to be a pipe; terminals and regular files are refused" >&2; exit 1; }}
     if [ -f "$dir/fail-$4" ]; then cat "$dir/fail-$4"; printf 'Error: \n   0: \033[91m{{"type":"credential_missing","title":"no credential","detail":"no token is stored for %s"}}\033[0m\n' "$4" >&2; exit 1; fi
     [ -f "$dir/move-$4" ] && cp "$dir/move-$4" "$dir/inspect-$4.json"
-    [ -f "$dir/slow-$4" ] && sleep 5
+    [ -f "$dir/never-$4" ] && exec sleep 86400
     cat "$dir/token-$4"; echo; exit 0 ;;
 esac
 echo "error: unrecognized subcommand '$1'" >&2
@@ -986,12 +1243,20 @@ exit 64
             );
         }
 
+        /// The calls made since the last look, but the probe's (`version --json` and `--help`).
+        fn commands(&self) -> Vec<String> {
+            self.calls()
+                .into_iter()
+                .filter(|call| !call.ends_with("--help") && call != "version --json")
+                .collect()
+        }
+
         fn source(&self, name: &str, endpoint: &str, credential: CliCredential) -> CliTokenSource {
             CliTokenSource {
                 target: name.into(),
                 endpoint: endpoint.into(),
                 credential,
-                timeout: Duration::from_secs(60),
+                timeout: READ_TIMEOUT,
                 programs: Some(self.programs()),
             }
         }
@@ -1017,6 +1282,19 @@ exit 64
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.dir).ok();
         }
+    }
+
+    /// The CLI Studio would run of `programs`, found in a turn at the CLI of its own.
+    fn found(programs: &[PathBuf]) -> Result<FoundCli, String> {
+        smol::block_on(async {
+            let turn = take_turn(&Arc::default(), READ_TIMEOUT, "a look for the CLI").await?;
+            find_cli(programs, &turn).await
+        })
+    }
+
+    /// A token from `source`, asked as a connection nobody waits on asks.
+    fn token_of(source: &CliTokenSource) -> Result<Token, String> {
+        smol::block_on(source.token(Arc::default()))
     }
 
     /// A CLI is chosen only when it reports the target, credential and access protocols Studio
@@ -1051,7 +1329,7 @@ exit 64
         let unfit = [&old, &pre_access, &unknown, &no_status];
         let mut programs: Vec<PathBuf> = vec![missing, not_executable];
         programs.extend(unfit.iter().map(|stand_in| stand_in.program.clone()));
-        let why = smol::block_on(find_cli(&programs)).unwrap_err();
+        let why = found(&programs).unwrap_err();
         for said in [
             "answers no `version --json`",
             "is 0.14.0-edge+50283ce, which reports no access protocol",
@@ -1067,26 +1345,26 @@ exit 64
 
         programs.push(current.program.clone());
         programs.push(bumped.program.clone());
-        let found = smol::block_on(find_cli(&programs)).unwrap();
-        assert_eq!(found.path, current.program);
-        assert_eq!(found.version, "0.14.0-edge+7fff9df");
-        let found = smol::block_on(find_cli(&bumped.programs())).unwrap();
-        assert_eq!(found.version, "0.14.1");
+        let chosen = found(&programs).unwrap();
+        assert_eq!(chosen.path, current.program);
+        assert_eq!(chosen.version, "0.14.0-edge+7fff9df");
+        let chosen = found(&bumped.programs()).unwrap();
+        assert_eq!(chosen.version, "0.14.1");
         // Found again with no probe while the program is unchanged.
         bumped.calls();
-        smol::block_on(find_cli(&bumped.programs())).unwrap();
+        found(&bumped.programs()).unwrap();
         assert!(bumped.calls().is_empty());
 
-        let none = smol::block_on(find_cli(&[])).unwrap_err();
+        let none = found(&[]).unwrap_err();
         assert!(none.contains("no `omnigraph` is on PATH"), "{none}");
     }
 
     /// The targets are what `target list --json` says, in the shape the CLI at OmniGraph main
     /// `7fff9dfd` prints: server targets land on servers (an anonymous one with no token, the
     /// others with where their credential is), direct and managed targets are refused, each
-    /// with why, a managed target is kept as `target inspect --resolved` describes it, a custom
-    /// CA is not supported yet, and a second target on an address is named as an alternative. A
-    /// configuration the CLI refuses lists nothing, with the CLI's own words.
+    /// with why, a managed target is kept as the listing describes it with no other command, a
+    /// custom CA is not supported yet, and a second target on an address is named as an
+    /// alternative. A configuration the CLI refuses lists nothing, with the CLI's own words.
     #[test]
     fn the_targets_are_listed_as_the_cli_describes_them() {
         let cli = StandIn::new("targets");
@@ -1110,22 +1388,6 @@ exit 64
                 file = token_file.display()
             ),
         );
-        for (name, cluster, endpoint) in [
-            (
-                "cloud",
-                "c1",
-                r#","endpoint":"https://cluster.example.com/","default_graph":"crm""#,
-            ),
-            ("control", "c2", ""),
-        ] {
-            cli.write(
-                &format!("inspect-{name}-resolved.json"),
-                &format!(
-                    r#"{{"name":"{name}","target":{{"kind":"managed","profile":"work","cluster_id":"{cluster}","cluster_incarnation":"i{n}"{endpoint}}},"profile":{{"api":"https://platform.example.com/","organization_id":"org_example","auth":{{"provider":"omnigraph"}}}},"identity":{{"status":"unknown","source":"offline inspection"}}}}"#,
-                    n = &cluster[1..]
-                ),
-            );
-        }
         let home = cli.dir.join("home");
         let listed = smol::block_on(read_targets(Some(&home), &cli.programs()));
         let servers = listed.servers.clone().unwrap();
@@ -1189,7 +1451,8 @@ exit 64
         );
         assert_eq!(servers[4].alternatives, ["stored-too"]);
         assert_eq!(servers[0].endpoint, "https://env.example.com/og/");
-        assert_eq!(listed.watched, vec![home.join("config.yaml"), token_file]);
+        let watched: Vec<&PathBuf> = listed.watched.iter().map(|(path, _)| path).collect();
+        assert_eq!(watched, [&home.join("config.yaml"), &token_file]);
         let said = |name: &str| {
             listed
                 .errors
@@ -1212,11 +1475,10 @@ exit 64
                 (
                     target.name.as_str(),
                     target.profile.as_str(),
-                    target.api.as_str(),
-                    target.organization_id.as_str(),
                     target.cluster_id.as_str(),
                     target.cluster_incarnation.as_str(),
                     target.endpoint.as_deref(),
+                    target.default_graph.as_deref(),
                 )
             })
             .collect();
@@ -1226,33 +1488,18 @@ exit 64
                 (
                     "cloud",
                     "work",
-                    "https://platform.example.com/",
-                    "org_example",
                     "c1",
                     "i1",
-                    Some("https://cluster.example.com/")
+                    Some("https://cluster.example.com/"),
+                    Some("crm")
                 ),
-                (
-                    "control",
-                    "work",
-                    "https://platform.example.com/",
-                    "org_example",
-                    "c2",
-                    "i2",
-                    None
-                ),
+                ("control", "work", "c2", "i2", None, None),
             ]
         );
-        let calls = cli.calls();
-        assert!(
-            calls.contains(&"target list --json".to_owned()),
-            "{calls:?}"
-        );
-        assert!(
-            calls
-                .iter()
-                .all(|call| !call.starts_with("credentials") || call.ends_with("--help")),
-            "listing reads no credential: {calls:?}"
+        assert_eq!(
+            cli.commands(),
+            ["target list --json"],
+            "one command, which reads no credential"
         );
 
         // The CLI's own refusal of an old-format file, as it answers `--json`.
@@ -1281,14 +1528,11 @@ exit 64
         cli.server("stored", "https://store.example.com/");
         cli.write("token-stored", "secret-stored-token");
         let source = cli.source("stored", "https://store.example.com/", CliCredential::Store);
-        let token = smol::block_on(source.token()).unwrap();
+        let token = token_of(&source).unwrap();
         assert_eq!(format!("{token:?}"), "Token(…)");
         assert_eq!(token.into_string(), "secret-stored-token");
         assert_eq!(
-            cli.calls()
-                .into_iter()
-                .filter(|call| !call.ends_with("--help") && call != "version --json")
-                .collect::<Vec<_>>(),
+            cli.commands(),
             [
                 "credentials status --target stored --json",
                 "credentials export --target stored",
@@ -1309,11 +1553,9 @@ exit 64
             "move-moving",
             r#"{"name":"moving","target":{"kind":"server","endpoint":"https://elsewhere.example.com/","auth":{"provider":"token","source":{"store":{}}}}}"#,
         );
-        let moved = smol::block_on(
-            cli.source("moving", "https://store.example.com/", CliCredential::Store)
-                .token(),
-        )
-        .unwrap_err();
+        let moved =
+            token_of(&cli.source("moving", "https://store.example.com/", CliCredential::Store))
+                .unwrap_err();
         assert!(
             moved.contains("changed while Studio read its token"),
             "{moved}"
@@ -1323,17 +1565,15 @@ exit 64
 
     /// A refused export says the CLI's reason, without its colours or its note of the target,
     /// and never what it printed; a credential `credentials status` finds missing is said
-    /// without an export; an export past its time is stopped.
+    /// without an export; an export that never answers is stopped past its time.
     #[test]
     fn a_refused_export_says_why_and_never_the_token() {
         let cli = StandIn::new("refused");
         cli.server("stored", "https://store.example.com/");
         cli.write("fail-stored", "secret-half-printed");
-        let why = smol::block_on(
-            cli.source("stored", "https://store.example.com/", CliCredential::Store)
-                .token(),
-        )
-        .unwrap_err();
+        let why =
+            token_of(&cli.source("stored", "https://store.example.com/", CliCredential::Store))
+                .unwrap_err();
         assert_eq!(
             why,
             "no credential: no token is stored for stored (`omnigraph credentials export \
@@ -1344,16 +1584,13 @@ exit 64
         cli.server("filed", "https://file.example.com/");
         cli.status("filed", "https://file.example.com/", "unavailable");
         cli.calls();
-        let missing = smol::block_on(
-            cli.source(
-                "filed",
-                "https://file.example.com/",
-                CliCredential::File {
-                    path: "/tokens/filed".into(),
-                },
-            )
-            .token(),
-        )
+        let missing = token_of(&cli.source(
+            "filed",
+            "https://file.example.com/",
+            CliCredential::File {
+                path: "/tokens/filed".into(),
+            },
+        ))
         .unwrap_err();
         assert_eq!(
             missing,
@@ -1365,26 +1602,33 @@ exit 64
                 .all(|call| !call.starts_with("credentials export --target"))
         );
 
+        // Run in a turn the test holds, waited for as long as other tests' commands take, so
+        // only the export's own timeout can end it: the stand-in never answers.
         cli.server("slow", "https://slow.example.com/");
         cli.write("token-slow", "secret-slow");
-        cli.write("slow-slow", "");
+        cli.write("never-slow", "");
         let mut slow = cli.source("slow", "https://slow.example.com/", CliCredential::Store);
         slow.timeout = Duration::from_millis(300);
-        // Stopped, or, when other tests' commands held the CLI past the timeout, not run: either
-        // way not waited for, as the stand-in would give its token after 5 s.
-        let stopped = smol::block_on(slow.token()).unwrap_err();
-        assert!(
-            stopped.contains("gave no token within 0 s")
-                || stopped.contains("busy with another of Studio's commands"),
-            "{stopped}"
+        let stopped = smol::block_on(async {
+            let turn = take_turn(&Arc::default(), READ_TIMEOUT, "a test's export").await?;
+            let found = find_cli(&cli.programs(), &turn).await?;
+            slow.export(&found, &turn, &[])
+                .await
+                .map(Token::into_string)
+        })
+        .unwrap_err();
+        assert_eq!(
+            stopped,
+            "the OmniGraph CLI gave no token within 0 s (`omnigraph credentials export --target \
+             slow`), and was stopped"
         );
-        assert!(!stopped.contains("secret-slow"));
     }
 
     /// The CLI takes its operator home's lock without waiting, so two of its commands at once
     /// refuse each other. Every server's token asked together, as the Open dialog asks them,
-    /// each from a thread of its own, takes its turn and is given; a lock another program holds
-    /// is waited out a bounded number of times, then said.
+    /// each from a thread of its own, takes its turn and is given, its three commands run
+    /// together; a lock another program holds is waited out a bounded number of times, then
+    /// said.
     #[test]
     fn tokens_asked_together_take_turns_at_the_cli() {
         let cli = StandIn::new("turns");
@@ -1404,7 +1648,8 @@ exit 64
                     CliCredential::Store,
                 );
                 std::thread::spawn(move || {
-                    futures::executor::block_on(source.token()).map(Token::into_string)
+                    futures::executor::block_on(source.token(Arc::default()))
+                        .map(Token::into_string)
                 })
             })
             .collect();
@@ -1416,24 +1661,50 @@ exit 64
             given,
             names.map(|name| Ok(format!("secret-{name}"))).to_vec()
         );
+        // One target's status, export and inspect, then the next's: none waits for the
+        // others' commands between its own.
+        let commands = cli.commands();
+        let mut asked: Vec<String> = Vec::new();
+        for run in commands.chunks(3) {
+            let target = run[1].rsplit(' ').next().unwrap_or_default().to_owned();
+            assert_eq!(
+                run,
+                [
+                    format!("credentials status --target {target} --json"),
+                    format!("credentials export --target {target}"),
+                    format!("target inspect {target} --json"),
+                ],
+                "{commands:?}"
+            );
+            asked.push(target);
+        }
+        asked.sort();
+        assert_eq!(asked, names, "{commands:?}");
 
-        // Another program holds the lock for a moment, then forever.
+        // Another program holds the lock, and lets go once it has refused one command, which is
+        // made again; then it holds it for good, and every try is refused.
         let held = cli.dir.join("lock");
         std::fs::create_dir(&held).unwrap();
-        let releasing = held.clone();
-        let release = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(400));
-            std::fs::remove_dir(&releasing).unwrap();
-        });
+        cli.write("release-once", "");
         let source = cli.source("a", "https://a.example.com/", CliCredential::Store);
         assert_eq!(
-            smol::block_on(source.token()).map(Token::into_string),
+            token_of(&source).map(Token::into_string),
             Ok("secret-a".to_owned())
         );
-        release.join().unwrap();
+        let status = "credentials status --target a --json";
+        assert_eq!(
+            cli.commands(),
+            [
+                status,
+                status,
+                "credentials export --target a",
+                "target inspect a --json"
+            ]
+        );
         std::fs::create_dir(&held).unwrap();
-        let refused = smol::block_on(source.token()).unwrap_err();
+        let refused = token_of(&source).unwrap_err();
         assert!(refused.contains(LOCK_REFUSED), "{refused}");
+        assert_eq!(cli.commands().len(), 1 + LOCK_RETRIES as usize);
     }
 
     /// A program that could not be run, or did not answer in time, is asked again at the next
@@ -1452,29 +1723,99 @@ exit 64
         std::fs::write(&program, script).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         let programs = vec![program.clone()];
-        let first = smol::block_on(find_cli(&programs)).unwrap_err();
+        let first = found(&programs).unwrap_err();
         assert!(first.contains("could not be run"), "{first}");
         std::os::unix::fs::symlink("/bin/sh", &shell).unwrap();
-        let found = smol::block_on(find_cli(&programs)).unwrap();
-        assert_eq!(found.path, program);
+        assert_eq!(found(&programs).unwrap().path, program);
     }
 
-    /// The wait for a turn at the CLI counts toward a command's timeout: a command another of
-    /// Studio's holds back past it is not run, and says so.
+    /// What a program was found to be is remembered in Studio's data directory, so the next
+    /// launch asks it nothing while its file is unchanged; a program rewritten (upgraded) is
+    /// asked again.
+    #[test]
+    fn a_probe_is_remembered_across_launches() {
+        let cli = StandIn::new("remembered");
+        assert!(found(&cli.programs()).is_ok());
+        assert_eq!(cli.calls().len(), 5, "`version --json` and four `--help`");
+        // The next launch: nothing in memory, the data directory's file read again.
+        studio_settings::writes_done();
+        forget_probes();
+        assert!(found(&cli.programs()).is_ok());
+        assert!(cli.calls().is_empty(), "asked nothing");
+        let kept = std::fs::read_to_string(probes_path()).unwrap();
+        assert!(kept.contains("0.14.0-edge+7fff9df"), "{kept}");
+
+        // Upgraded in place: its stamp changed, so it is asked again.
+        let script = std::fs::read_to_string(&cli.program).unwrap();
+        std::fs::write(&cli.program, format!("{script}\n# upgraded\n")).unwrap();
+        assert!(found(&cli.programs()).is_ok());
+        assert_eq!(cli.calls().len(), 5);
+    }
+
+    /// The sequences waiting for the CLI take it in the order they asked, but one a window
+    /// waits on (`hurry` raised) goes before them, even raised after it started waiting.
+    #[test]
+    fn the_token_a_window_waits_on_goes_first() {
+        let cli = StandIn::new("hurry");
+        for name in ["early", "late", "shown"] {
+            cli.server(name, &format!("https://{name}.example.com/"));
+            cli.write(&format!("token-{name}"), &format!("secret-{name}"));
+        }
+        // Probed beforehand, so each ask is its own three commands.
+        assert!(found(&cli.programs()).is_ok());
+        cli.calls();
+        let held = smol::block_on(TURN.take(&Arc::default(), READ_TIMEOUT)).unwrap();
+        let shown = Arc::new(AtomicBool::new(false));
+        let mut threads = Vec::new();
+        for (name, hurry) in [
+            ("early", Arc::<AtomicBool>::default()),
+            ("late", Arc::default()),
+            ("shown", shown.clone()),
+        ] {
+            let source = cli.source(
+                name,
+                &format!("https://{name}.example.com/"),
+                CliCredential::Store,
+            );
+            let asking = hurry.clone();
+            threads.push(std::thread::spawn(move || {
+                futures::executor::block_on(source.token(hurry)).map(Token::into_string)
+            }));
+            // Queued before the next asks, so the order they asked in is known.
+            while !TURN.waits_for(&asking) {
+                std::thread::yield_now();
+            }
+        }
+        shown.store(true, Ordering::SeqCst);
+        drop(held);
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+        let exported: Vec<String> = cli
+            .commands()
+            .into_iter()
+            .filter(|call| call.starts_with("credentials export"))
+            .collect();
+        assert_eq!(
+            exported,
+            [
+                "credentials export --target shown",
+                "credentials export --target early",
+                "credentials export --target late",
+            ]
+        );
+    }
+
+    /// A token's ask waits for its turn at the CLI as long as its export may take: one another
+    /// of Studio's holds back past it is not run, and says so.
     #[test]
     fn a_command_held_back_past_its_timeout_is_not_run() {
         let cli = StandIn::new("busy");
-        let held = smol::block_on(TURN.lock());
-        let program = cli.program.clone();
-        let waiting = std::thread::spawn(move || {
-            smol::block_on(run(
-                || command(&program, &[], &["version", "--json"]),
-                Duration::from_millis(200),
-                MAX_ANSWER_BYTES,
-            ))
-            .map(|ran| ran.status.success())
-            .map_err(|unrun| unrun.said(&program, "`omnigraph version --json`", Duration::ZERO))
-        });
+        cli.server("stored", "https://store.example.com/");
+        let held = smol::block_on(TURN.take(&Arc::default(), READ_TIMEOUT)).unwrap();
+        let mut source = cli.source("stored", "https://store.example.com/", CliCredential::Store);
+        source.timeout = Duration::from_millis(200);
+        let waiting = std::thread::spawn(move || token_of(&source));
         let answer = waiting.join().unwrap();
         drop(held);
         let said = answer.unwrap_err();
@@ -1525,7 +1866,7 @@ exit 64
                 variable: "OMNIGRAPH_STUDIO_TEST_KEPT".into(),
             },
         );
-        smol::block_on(source.token()).unwrap();
+        token_of(&source).unwrap();
         let exported = std::fs::read_to_string(cli.dir.join("export-env")).unwrap();
         let mut names: Vec<&str> = exported.lines().collect();
         names.sort();
@@ -1562,13 +1903,8 @@ exit 64
             std::fs::read_to_string(cli.dir.join("token-work")).unwrap(),
             "secret-typed-token"
         );
-        let calls: Vec<_> = cli
-            .calls()
-            .into_iter()
-            .filter(|call| !call.ends_with("--help") && call != "version --json")
-            .collect();
         assert_eq!(
-            calls,
+            cli.commands(),
             [
                 "target add work --json",
                 "credentials set --target work --stdin --replace"
@@ -1710,7 +2046,7 @@ exit 64
     }
 
     impl TokenSource for Answers {
-        fn token(&self) -> BoxFuture<'static, Result<Token, String>> {
+        fn token(&self, _: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, String>> {
             self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut answers = self.answers.lock().unwrap();
             let answer = if answers.len() > 1 {
@@ -1942,7 +2278,7 @@ mod live_tests {
                     let source = CliTokenSource::for_server(server, credential);
                     let name = server.name.clone();
                     Some(std::thread::spawn(move || {
-                        let given = futures::executor::block_on(source.token())
+                        let given = futures::executor::block_on(source.token(Arc::default()))
                             .map(|token| token.into_string().len());
                         (name, given)
                     }))

@@ -78,13 +78,11 @@ pub struct ApiErrorSummary {
 /// A `WWW-Authenticate` challenge: its scheme and its parameters, as RFC 9110 §11.6.1 writes
 /// them. OmniGraph sends `Bearer`, with `error="invalid_token"` when it refused the token a
 /// request carried, and `resource_metadata="<url>"` when it takes OAuth sign-in (OmniGraph RFC
-/// 1017, A1).
+/// 1017, A1). A scheme's token68 payload (`Negotiate abc==`), which some schemes take in place
+/// of parameters, is read past and not kept: Studio speaks `Bearer` alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Challenge {
     pub scheme: String,
-    /// The scheme's token68 payload (`Negotiate abc==`), which some schemes take in place of
-    /// parameters.
-    pub token68: Option<String>,
     /// Each parameter's name, lower-cased, and its value, unquoted.
     pub params: Vec<(String, String)>,
 }
@@ -110,8 +108,8 @@ impl Challenge {
     }
 
     /// The challenges in one `WWW-Authenticate` value, in order. A parameter is `name=token` or
-    /// `name="quoted"`; a word followed only by `=`s is a token68 payload; a word with no `=`
-    /// after it starts the next challenge.
+    /// `name="quoted"`; a word followed only by `=`s is a token68 payload, read past so the
+    /// challenge after it is not lost; a word with no `=` after it starts the next challenge.
     pub fn parse_all(value: &str) -> Vec<Challenge> {
         let bytes = value.as_bytes();
         let mut at = 0;
@@ -140,7 +138,6 @@ impl Challenge {
             }
             let mut challenge = Challenge {
                 scheme,
-                token68: None,
                 params: Vec::new(),
             };
             loop {
@@ -155,11 +152,9 @@ impl Challenge {
                 at += 1;
                 // `word=`, `word==`: a token68, whose `=`s are padding, not a value.
                 if matches!(bytes.get(at), None | Some(b'=' | b',')) {
-                    let padding = at - 1;
                     while bytes.get(at) == Some(&b'=') {
                         at += 1;
                     }
-                    challenge.token68 = Some(format!("{name}{}", &value[padding..at]));
                     continue;
                 }
                 skip(&mut at, false);
@@ -411,7 +406,7 @@ pub fn server_root(input: &str) -> Result<String, String> {
 }
 
 /// Whether a URL can be a server's root: `http` or `https`, with a host, and no user name or
-/// password in it (a token goes in the keychain, never in the address).
+/// password in it (a token is given separately, never in the address).
 fn check_root(url: &Url) -> Result<(), String> {
     if !matches!(url.scheme(), "http" | "https") || url.cannot_be_a_base() || url.host().is_none() {
         return Err(format!(
@@ -3194,13 +3189,15 @@ mod tests {
         assert!(all[1].token_refused());
         assert_eq!(all[1].param("error_description"), Some(r#"say "no""#));
 
-        // A token68 payload before a Bearer challenge keeps the Bearer one.
+        // A token68 payload before a Bearer challenge keeps the Bearer one, and is no parameter.
         let all = Challenge::parse_all(r#"Negotiate abc==, Bearer error="invalid_token""#);
         assert_eq!(all.len(), 2, "{all:?}");
-        assert_eq!(all[0].token68.as_deref(), Some("abc=="));
+        assert_eq!(all[0].scheme, "Negotiate");
         assert!(all[0].params.is_empty());
+        assert_eq!(all[1].scheme, "Bearer");
         assert!(all[1].token_refused());
-        let one = Challenge::parse_all("Basic dXNlcg=");
-        assert_eq!(one[0].token68.as_deref(), Some("dXNlcg="));
+        let one = Challenge::parse_all("Basic dXNlcg=, Bearer");
+        assert_eq!(one.len(), 2, "{one:?}");
+        assert!(one[0].params.is_empty() && one[1].params.is_empty());
     }
 }

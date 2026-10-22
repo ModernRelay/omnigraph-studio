@@ -1,18 +1,24 @@
 //! Every server Studio knows: the server targets the OmniGraph CLI lists, and, for development
 //! and tests, one from the environment. Studio keeps no server list or token of its own
 //! (OmniGraph RFC 1017): a server is added as a CLI target, through the CLI
-//! ([`ConnectionRegistry::add_target`]).
+//! ([`ConnectionRegistry::add_target`]). The targets are listed off the main thread, at start and
+//! whenever the CLI's files change: a start shows its windows at once, and they find the CLI's
+//! servers once the first listing lands ([`ConnectionRegistry::when_listed`]).
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::FutureExt as _;
+use futures::channel::oneshot;
+use futures::future::BoxFuture;
 use gpui::{App, AppContext as _, Context, Entity, Global, Task};
 use http_client::HttpClient;
 use serde::{Deserialize, Serialize};
 
-use crate::cli_config::{self, CliAlias, CliAuth, CliServer, CliTargets, FileStamp, ManagedTarget};
+use crate::cli_config::{self, CliAlias, CliAuth, CliServer, CliTargets, FileStamp};
 use crate::cli_tokens::{self, CliTokenSource, Token, TokenSource};
 use crate::connection::{Connection, ServerEntry, ServerSource};
 
@@ -24,6 +30,11 @@ type ProxiedHttp = Arc<dyn Fn(&str) -> anyhow::Result<Arc<dyn HttpClient>> + Sen
 
 /// Makes the token source of a CLI server whose token the CLI gives; none for an anonymous one.
 type TokenSources = Arc<dyn Fn(&CliServer) -> Option<Arc<dyn TokenSource>> + Send + Sync>;
+
+/// Lists the targets of an operator home with the first CLI Studio can drive of the places
+/// given ([`cli_config::read_targets`]); run off the main thread.
+type Lister =
+    Arc<dyn Fn(Option<PathBuf>, Vec<PathBuf>) -> BoxFuture<'static, CliTargets> + Send + Sync>;
 
 /// The graph ids opened on each CLI target, by the target's name, which Studio remembers so the
 /// Open dialog offers them again when a token may not list the server's graphs. It names no
@@ -45,15 +56,21 @@ struct CliKept {
 
 pub struct ConnectionRegistry {
     pub connections: Vec<Entity<Connection>>,
-    /// The environment's server, when it could not be added at start.
-    start_errors: Vec<String>,
+    /// Why the environment's server could not be added at start, which stays one of the
+    /// [`Self::notices`] for the run.
+    environment_notice: Option<String>,
+    /// What the person is told about the servers: the environment's server not added, then
+    /// what the CLI's targets could not give when last listed. One list, each said as it
+    /// happened.
+    notices: Vec<String>,
     http: Arc<dyn HttpClient>,
     proxied: ProxiedHttp,
     token_sources: TokenSources,
+    lister: Lister,
     /// The operator home the CLI reads (`$OMNIGRAPH_HOME`, else `~/.omnigraph`).
     operator_dir: Option<PathBuf>,
     /// The files whose change lists the targets again (the operator file and the token files
-    /// the targets name), and their stamp before the last listing.
+    /// the targets name), and their stamp as the last listing saw them.
     watched: Vec<PathBuf>,
     operator_stamp: Vec<Option<FileStamp>>,
     /// The places Studio looks for the CLI, and their stamp: a CLI installed, upgraded or
@@ -62,10 +79,10 @@ pub struct ConnectionRegistry {
     cli_stamp: Vec<Option<FileStamp>>,
     /// Each CLI server as last listed, by its address.
     cli_kept: HashMap<String, CliKept>,
-    /// What the CLI's targets could not give when last listed.
-    cli_errors: Vec<String>,
-    /// The managed targets the CLI last listed, refused until Studio has its own sign-in.
-    managed: Vec<ManagedTarget>,
+    /// The CLI's targets have been listed once since Studio started; until then the CLI's
+    /// servers are not known, and what looks for one waits ([`Self::when_listed`]).
+    listed: bool,
+    listing_waiters: Vec<oneshot::Sender<()>>,
     /// The graph ids remembered for each CLI target, as last read or saved.
     known: KnownGraphs,
     /// Whether the remembered graphs are written to the data directory: Studio's, not a
@@ -78,11 +95,8 @@ struct GlobalRegistry(Entity<ConnectionRegistry>);
 
 impl Global for GlobalRegistry {}
 
-/// Studio's data directory; one rule for the whole app, kept in `studio_settings`.
-pub use studio_settings::data_dir;
-
 fn known_graphs_path() -> PathBuf {
-    data_dir().join("known_graphs.json")
+    studio_settings::data_dir().join("known_graphs.json")
 }
 
 /// The graph ids remembered at `path`: none when the file is not there or cannot be read, which
@@ -145,6 +159,11 @@ fn cli_token_source(server: &CliServer) -> Option<Arc<dyn TokenSource>> {
     }
 }
 
+/// The targets of the operator home in `dir`, as the CLI lists them.
+fn list_with_the_cli(dir: Option<PathBuf>, places: Vec<PathBuf>) -> BoxFuture<'static, CliTargets> {
+    async move { cli_config::read_targets(dir.as_deref(), &places).await }.boxed()
+}
+
 impl ConnectionRegistry {
     pub fn global(cx: &App) -> Entity<Self> {
         cx.global::<GlobalRegistry>().0.clone()
@@ -161,9 +180,73 @@ impl ConnectionRegistry {
         cx.set_global(GlobalRegistry(registry));
     }
 
+    /// Sets up a registry with no CLI and no servers, whose targets count as listed, for the
+    /// tests of crates that look for a server in it. Its servers answer a health check and a
+    /// graph list (of none), and every other request with a 404; it returns the host of each
+    /// request sent, in order. Servers join it with [`Self::add_server_for_tests`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn init_for_tests(cx: &mut App) -> (Entity<Self>, Arc<std::sync::Mutex<Vec<String>>>) {
+        let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let log = asked.clone();
+        let http = http_client::FakeHttpClient::create(move |request| {
+            let host = request.uri().host().unwrap_or_default().to_owned();
+            let path = request.uri().path().to_owned();
+            log.lock().unwrap().push(host);
+            async move {
+                let (status, body) = if path.ends_with("/healthz") {
+                    (
+                        200,
+                        r#"{"status":"ok","version":"0.14.0","internal_schema_version":16}"#,
+                    )
+                } else if path.ends_with("/graphs") {
+                    (200, r#"{"graphs":[]}"#)
+                } else {
+                    (404, r#"{"error":"not found","code":"not_found"}"#)
+                };
+                Ok(http_client::Response::builder()
+                    .status(status)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(http_client::AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let registry = cx.new(|_| Self::empty(http, None));
+        cx.set_global(GlobalRegistry(registry.clone()));
+        (registry, asked)
+    }
+
+    /// Adds a server named `name` at `url`, given `token`, as the environment's server is.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn add_server_for_tests(
+        &mut self,
+        name: &str,
+        url: &str,
+        token: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Entity<Connection> {
+        let entry = ServerEntry {
+            name: name.into(),
+            url: url.into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        self.add_connection(entry, token, cx)
+            .expect("a usable server address")
+    }
+
+    /// Holds the CLI's targets as not listed yet (`false`), as at a start, or lists them now
+    /// (`true`), so what waited for them goes on: for the tests of what a start opens.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_listed_for_tests(&mut self, listed: bool, cx: &mut Context<Self>) {
+        if listed {
+            self.finish_listing(cx);
+        } else {
+            self.listed = false;
+        }
+    }
+
     fn load(http: Arc<dyn HttpClient>, cx: &mut Context<Self>) -> Self {
-        let operator_dir = cli_config::operator_dir();
-        let mut this = Self::empty(http, operator_dir.clone());
+        let mut this = Self::empty(http, cli_config::operator_dir());
         this.proxied = Arc::new(proxied_client);
         this.known = load_known_graphs(&known_graphs_path());
         this.saving = true;
@@ -182,33 +265,16 @@ impl ConnectionRegistry {
                 known_graphs: graphs,
             };
             if let Err(error) = this.add_connection(entry, token, cx) {
-                this.start_errors
-                    .push(format!("OMNIGRAPH_STUDIO_SERVER: {error}"));
+                this.environment_notice = Some(format!(
+                    "The server OMNIGRAPH_STUDIO_SERVER names was not added: {error}"
+                ));
+                this.notices = this.environment_notice.iter().cloned().collect();
             }
         }
 
-        // Listed before the windows a start reopens look for the CLI's servers, within
-        // `START_TIMEOUT`; each asks the CLI for its token when it connects. The stamp is taken
-        // before the listing.
         this.token_sources = Arc::new(cli_token_source);
-        this.watched = operator_dir
-            .iter()
-            .map(|dir| cli_config::config_path(dir))
-            .collect();
-        let stamp = cli_config::stamp(&this.watched);
         this.cli_places = cli_tokens::candidates();
-        this.cli_stamp = cli_config::stamp(&this.cli_places);
-        match smol::block_on(cli_config::read_targets_at_start(
-            operator_dir.as_deref(),
-            &this.cli_places,
-        )) {
-            Some(targets) => {
-                this.keep_stamp(stamp, &targets.watched);
-                this.apply_cli_targets(targets, cx);
-            }
-            None => this.listing_unfinished(),
-        }
-        this.watch_cli_targets(cx);
+        this.start_listing(cx);
         this
     }
 
@@ -216,41 +282,33 @@ impl ConnectionRegistry {
         let same = http.clone();
         Self {
             connections: Vec::new(),
-            start_errors: Vec::new(),
+            environment_notice: None,
+            notices: Vec::new(),
             http,
             proxied: Arc::new(move |_| Ok(same.clone())),
             token_sources: Arc::new(|_| None),
+            lister: Arc::new(list_with_the_cli),
             operator_dir,
             watched: Vec::new(),
             operator_stamp: Vec::new(),
             cli_places: Vec::new(),
             cli_stamp: Vec::new(),
             cli_kept: HashMap::new(),
-            cli_errors: Vec::new(),
-            managed: Vec::new(),
+            listed: true,
+            listing_waiters: Vec::new(),
             known: KnownGraphs::default(),
             saving: false,
             _watch: None,
         }
     }
 
-    /// What the CLI's targets could not give when last listed: no CLI Studio can drive, a
-    /// configuration the CLI refuses, a target Studio does not connect to, and the alternatives
-    /// on an address.
-    pub fn cli_errors(&self) -> &[String] {
-        &self.cli_errors
-    }
-
-    /// The environment's server, when it could not be added at start, and why.
-    pub fn start_errors(&self) -> &[String] {
-        &self.start_errors
-    }
-
-    /// The managed targets the CLI lists, as `target inspect --resolved` describes them: refused
-    /// (each said in [`Self::cli_errors`]) until Studio has its own sign-in, which spec 016 builds
-    /// from these. Studio holds no token for them.
-    pub fn managed_targets(&self) -> &[ManagedTarget] {
-        &self.managed
+    /// What the person is told about the servers, oldest first: the environment's server when
+    /// it could not be added, then what the CLI's targets could not give when last listed (no
+    /// CLI Studio can drive, a configuration the CLI refuses, a target Studio does not connect
+    /// to, the other targets on an address). Each says what happened, and the workspace shows
+    /// each new one in a toast.
+    pub fn notices(&self) -> &[String] {
+        &self.notices
     }
 
     /// The CLI's aliases bound to `graph` on the CLI server named `server`: none, since the CLI
@@ -260,42 +318,80 @@ impl ConnectionRegistry {
         Vec::new()
     }
 
-    /// Notes that the CLI did not list its targets within the bound at start: the operator file
-    /// stays watched, with no stamp, so the first check lists them.
-    fn listing_unfinished(&mut self) {
-        self.operator_stamp = Vec::new();
-        self.keep_cli_errors(vec![format!(
-            "the OmniGraph CLI did not list its targets within {} s of Studio's start; Studio \
-             lists them again",
-            cli_config::START_TIMEOUT.as_secs()
-        )]);
+    /// Whether the CLI's targets have been listed since Studio started, so its servers are
+    /// known.
+    pub fn listed(&self) -> bool {
+        self.listed
     }
 
-    /// Keeps `stamp`, taken of the watched files before the listing, as the stamp of the files
-    /// the listing names (`watched`). A file named for the first time (a new token file) was
-    /// not stamped: the next check finds the stamp changed and lists once more, which changes
-    /// nothing unless that file changed meanwhile.
-    fn keep_stamp(&mut self, stamp: Vec<Option<FileStamp>>, watched: &[PathBuf]) {
-        if self.watched == watched {
-            self.operator_stamp = stamp;
-        } else {
-            self.watched = watched.to_vec();
-            self.operator_stamp = Vec::new();
+    /// Resolves once the CLI's targets have been listed since Studio started, at once when
+    /// they have been: the windows a start reopens, a link and the Open dialog look for the
+    /// CLI's servers then. A start lists them off the main thread, so its windows show first.
+    pub fn when_listed(&mut self) -> impl Future<Output = ()> + use<> {
+        let waiting = (!self.listed).then(|| {
+            let (listed, waiting) = oneshot::channel();
+            self.listing_waiters.push(listed);
+            waiting
+        });
+        async move {
+            if let Some(waiting) = waiting {
+                waiting.await.ok();
+            }
         }
     }
 
-    /// Lists the CLI's targets again whenever the operator file, a token file a target names, or
-    /// the CLI where Studio looks for it changes, so a target added there, a changed address or
-    /// a rotated token reaches Studio without a restart; a CLI installed, upgraded or removed
-    /// also asks every CLI server's token again. The CLI's secure store cannot be watched: a
-    /// token kept there is asked for again on connect, after a 401 and on Refresh.
+    /// Lists the CLI's targets off the main thread, at once and then whenever their files
+    /// change ([`Self::watch_cli_targets`]); until the first listing lands, the registry is not
+    /// [`Self::listed`].
+    fn start_listing(&mut self, cx: &mut Context<Self>) {
+        self.listed = false;
+        self.watched = self
+            .operator_dir
+            .iter()
+            .map(|dir| cli_config::config_path(dir))
+            .collect();
+        self.operator_stamp = Vec::new();
+        self.watch_cli_targets(cx);
+    }
+
+    /// The first listing landed: what waited for it goes on.
+    fn finish_listing(&mut self, cx: &mut Context<Self>) {
+        if std::mem::replace(&mut self.listed, true) {
+            return;
+        }
+        for listed in self.listing_waiters.drain(..) {
+            listed.send(()).ok();
+        }
+        cx.notify();
+    }
+
+    /// Keeps the files `targets` names as the watched ones, with the stamps the listing took
+    /// of them: the operator file's just before the CLI read it, a token file's as its target's
+    /// revision holds it. A file named for the first time is not listed again for being new,
+    /// only when it changes after the listing saw it.
+    fn keep_stamp(&mut self, targets: &CliTargets) {
+        let (watched, stamps) = targets.watched.iter().cloned().unzip();
+        self.watched = watched;
+        self.operator_stamp = stamps;
+    }
+
+    /// Lists the CLI's targets at once, then again whenever the operator file, a token file a
+    /// target names, or the CLI where Studio looks for it changes, so a target added there, a
+    /// changed address or a rotated token reaches Studio without a restart; a CLI installed,
+    /// upgraded or removed also asks every CLI server's token again. Each look and each listing
+    /// runs off the main thread. The CLI's secure store cannot be watched: a token kept there
+    /// is asked for again on connect, after a 401 and on Refresh.
     fn watch_cli_targets(&mut self, cx: &mut Context<Self>) {
         let dir = self.operator_dir.clone();
+        let lister = self.lister.clone();
         self._watch = Some(cx.spawn(async move |this, cx| {
+            let mut first = true;
             loop {
-                cx.background_executor().timer(OPERATOR_POLL).await;
-                let Ok((watched, places)) = this.update(cx, |this, _| {
-                    (this.watched.clone(), this.cli_places.clone())
+                if !std::mem::take(&mut first) {
+                    cx.background_executor().timer(OPERATOR_POLL).await;
+                }
+                let Ok((watched, places, listing)) = this.update(cx, |this, _| {
+                    (this.watched.clone(), this.cli_places.clone(), !this.listed)
                 }) else {
                     break;
                 };
@@ -314,27 +410,28 @@ impl ConnectionRegistry {
                 }) else {
                     break;
                 };
-                if !listed_files && !cli_moved {
+                if !listing && !listed_files && !cli_moved {
                     continue;
                 }
-                // The stamp is taken before the listing: a write during it changes the next one.
-                let at = dir.clone();
                 let targets = cx
                     .background_executor()
-                    .spawn(async move { cli_config::read_targets(at.as_deref(), &places).await })
+                    .spawn(lister(dir.clone(), places))
                     .await;
                 let alive = this
                     .update(cx, |this, cx| {
+                        // A CLI that moved since the start's listing asks every token again.
+                        let asks_again = cli_moved && !listing;
                         this.cli_stamp = cli_stamp;
-                        this.keep_stamp(stamp, &targets.watched);
+                        this.keep_stamp(&targets);
                         let changed = this.apply_cli_targets(targets, cx);
-                        if cli_moved {
+                        if asks_again {
                             this.ask_cli_tokens_again(cx);
                         }
                         if changed {
                             this.save(cx);
                             cx.notify();
                         }
+                        this.finish_listing(cx);
                     })
                     .is_ok();
                 if !alive {
@@ -366,13 +463,12 @@ impl ConnectionRegistry {
             servers,
             mut errors,
             watched: _,
-            managed,
+            managed: _,
         } = targets;
         let Some(servers) = servers else {
-            return self.keep_cli_errors(errors);
+            return self.keep_notices(errors);
         };
-        let mut changed = managed != self.managed;
-        self.managed = managed;
+        let mut changed = false;
         // An address that keeps its server keeps its connection only with the same proxy: the
         // client was made with it.
         let named: Vec<(&String, &Option<String>)> = servers
@@ -488,17 +584,27 @@ impl ConnectionRegistry {
                     self.cli_kept.insert(url, kept);
                     changed = true;
                 }
-                Err(error) => errors.push(error.to_string()),
+                Err(error) => errors.push(format!(
+                    "CLI target '{}' cannot be reached: {error}",
+                    server.name
+                )),
             }
         }
-        let errors_changed = self.keep_cli_errors(errors);
-        changed || errors_changed
+        let notices_changed = self.keep_notices(errors);
+        changed || notices_changed
     }
 
-    /// Keeps `errors` as what the CLI's targets could not give, and says whether they changed.
-    fn keep_cli_errors(&mut self, errors: Vec<String>) -> bool {
-        let changed = errors != self.cli_errors;
-        self.cli_errors = errors;
+    /// Keeps `errors`, what the CLI's targets could not give, as the notices after the
+    /// environment's, and says whether the notices changed.
+    fn keep_notices(&mut self, errors: Vec<String>) -> bool {
+        let notices: Vec<String> = self
+            .environment_notice
+            .iter()
+            .cloned()
+            .chain(errors)
+            .collect();
+        let changed = notices != self.notices;
+        self.notices = notices;
         changed
     }
 
@@ -545,7 +651,8 @@ impl ConnectionRegistry {
         };
         if !valid_target_name(&name) {
             return Task::ready(Err(format!(
-                "“{name}” cannot be a CLI target's name: it starts with a letter and holds only                  letters, digits, `.`, `_` and `-`"
+                "“{name}” cannot be a CLI target's name: it starts with a letter and holds only \
+                 letters, digits, `.`, `_` and `-`"
             )));
         }
         let token = token
@@ -554,6 +661,7 @@ impl ConnectionRegistry {
             .map(Token::typed);
         let dir = self.operator_dir.clone();
         let places = self.cli_places.clone();
+        let lister = self.lister.clone();
         cx.spawn(async move |this, cx| {
             let (added, targets) = {
                 let (name, url) = (name.clone(), url.clone());
@@ -561,13 +669,13 @@ impl ConnectionRegistry {
                     .spawn(async move {
                         let added =
                             cli_tokens::add_server_target(&places, &name, &url, token).await;
-                        let targets = cli_config::read_targets(dir.as_deref(), &places).await;
+                        let targets = lister(dir, places).await;
                         (added, targets)
                     })
                     .await
             };
             this.update(cx, |this, cx| {
-                this.keep_stamp(cli_config::stamp(&targets.watched), &targets.watched);
+                this.keep_stamp(&targets);
                 if this.apply_cli_targets(targets, cx) {
                     this.save(cx);
                     cx.notify();
@@ -631,9 +739,8 @@ impl ConnectionRegistry {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use futures::FutureExt as _;
-    use futures::future::BoxFuture;
     use gpui::TestAppContext;
     use http_client::http::Response;
     use http_client::{AsyncBody, FakeHttpClient};
@@ -669,7 +776,7 @@ mod tests {
     }
 
     impl TokenSource for FakeExport {
-        fn token(&self) -> BoxFuture<'static, Result<Token, String>> {
+        fn token(&self, _: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, String>> {
             self.cli.asked.lock().unwrap().push(self.target.clone());
             let token = self.cli.tokens.lock().unwrap().get(&self.target).cloned();
             let target = self.target.clone();
@@ -786,7 +893,7 @@ mod tests {
     /// the CLI when it connects, not when it is listed, and again when its target changes; a
     /// token typed into Studio stays until then; a new address is a new connection, servers
     /// come and go, and targets that cannot be listed keep every server and say why. An address
-    /// is one connection: a CLI target at the address of a server added in Studio is said, not
+    /// is one connection: a CLI target at the address of the environment's server is said, not
     /// connected. The CLI lists no aliases, so none is offered.
     #[gpui::test]
     async fn cli_servers_follow_the_cli_files(cx: &mut TestAppContext) {
@@ -897,7 +1004,7 @@ mod tests {
         ));
         assert!(find(&registry, "a", cx).is_some() && find(&registry, "c", cx).is_some());
         registry.read_with(cx, |registry, _| {
-            assert_eq!(registry.cli_errors(), ["the CLI refuses its configuration"])
+            assert_eq!(registry.notices(), ["the CLI refuses its configuration"])
         });
 
         // A server Studio cannot reach is said once; the same file read again changes nothing.
@@ -910,7 +1017,14 @@ mod tests {
         };
         assert!(apply(&registry, with_bad(), cx));
         assert!(find(&registry, "bad", cx).is_none());
-        registry.read_with(cx, |registry, _| assert_eq!(registry.cli_errors().len(), 1));
+        registry.read_with(cx, |registry, _| {
+            let said = registry.notices();
+            assert_eq!(said.len(), 1, "{said:?}");
+            assert!(
+                said[0].starts_with("CLI target 'bad' cannot be reached: "),
+                "{said:?}"
+            );
+        });
         assert!(!apply(&registry, with_bad(), cx), "nothing else changed");
 
         // The environment's server keeps its address: a CLI target naming it later is not a
@@ -946,11 +1060,11 @@ mod tests {
         assert_eq!(find(&registry, "mine", cx), Some(mine));
         registry.read_with(cx, |registry, _| {
             let said: Vec<_> = registry
-                .cli_errors()
+                .notices()
                 .iter()
                 .filter(|error| error.contains("one connection per address"))
                 .collect();
-            assert_eq!(said.len(), 1, "{:?}", registry.cli_errors());
+            assert_eq!(said.len(), 1, "{:?}", registry.notices());
             assert!(said[0].contains("'mine'"));
         });
 
@@ -1050,8 +1164,11 @@ mod tests {
         cx.run_until_parked();
         connection.read_with(cx, |connection, _| {
             assert_eq!(connection.state, crate::ConnectionState::Ready);
-            assert!(!connection.token_from_cli());
+            assert!(connection.token_ready(), "nothing to wait for");
         });
+        // Refresh asks no CLI of an anonymous target either.
+        connection.update(cx, |connection, cx| connection.refresh_token(cx));
+        cx.run_until_parked();
         assert!(cli.asked().is_empty());
         assert_eq!(token_sent(&connection, &sent, cx).as_deref(), Some(""));
 
@@ -1129,30 +1246,184 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A start past its bound for the listing keeps the operator file watched, unstamped, so
-    /// the first check lists the targets, rather than never again.
+    /// A CLI listing that answers when the test gives it its targets, and how many listings
+    /// were asked.
+    #[derive(Clone, Default)]
+    struct HeldListing {
+        answers: Arc<Mutex<Vec<oneshot::Receiver<CliTargets>>>>,
+        asked: Arc<AtomicUsize>,
+    }
+
+    impl HeldListing {
+        /// The next listing's answer, given by sending on what this returns.
+        fn next(&self) -> oneshot::Sender<CliTargets> {
+            let (give, given) = oneshot::channel();
+            self.answers.lock().unwrap().push(given);
+            give
+        }
+
+        fn lister(&self) -> Lister {
+            let held = self.clone();
+            Arc::new(move |_, _| {
+                held.asked.fetch_add(1, Ordering::SeqCst);
+                let given = {
+                    let mut answers = held.answers.lock().unwrap();
+                    (!answers.is_empty()).then(|| answers.remove(0))
+                };
+                async move {
+                    match given {
+                        Some(given) => given.await.unwrap_or_default(),
+                        None => CliTargets {
+                            servers: Some(Vec::new()),
+                            ..CliTargets::default()
+                        },
+                    }
+                }
+                .boxed()
+            })
+        }
+
+        fn asked(&self) -> usize {
+            self.asked.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A start lists the CLI's targets off the main thread: the registry is made at once,
+    /// knowing none of the CLI's servers, and what waits for them goes on once the listing
+    /// lands. Before, the start waited on the main thread for the CLI's seven commands.
     #[gpui::test]
-    async fn a_start_past_its_bound_lists_at_the_first_check(cx: &mut TestAppContext) {
+    async fn a_start_lists_the_targets_off_the_main_thread(cx: &mut TestAppContext) {
         let (http, _) = answering();
-        let dir = std::env::temp_dir().join(format!("studio-unlisted-{}", std::process::id()));
-        let registry = cx.new(|_| ConnectionRegistry::empty(http, Some(dir.clone())));
-        registry.update(cx, |registry, cx| {
-            registry.watched = vec![cli_config::config_path(&dir)];
-            registry.listing_unfinished();
-            registry.watch_cli_targets(cx);
+        let listing = HeldListing::default();
+        let answer = listing.next();
+        let dir = std::env::temp_dir().join(format!("studio-listing-{}", std::process::id()));
+        let registry = cx.new(|cx| {
+            let mut registry = ConnectionRegistry::empty(http, Some(dir.clone()));
+            registry.lister = listing.lister();
+            registry.start_listing(cx);
+            registry
         });
-        let said = |cx: &mut TestAppContext| {
-            registry.read_with(cx, |registry, _| registry.cli_errors().to_vec())
+        let listed = Arc::new(AtomicBool::new(false));
+        let waited = registry.update(cx, |registry, _| registry.when_listed());
+        let heard = listed.clone();
+        cx.background_executor
+            .spawn(async move {
+                waited.await;
+                heard.store(true, Ordering::SeqCst);
+            })
+            .detach();
+        cx.run_until_parked();
+        assert_eq!(listing.asked(), 1, "listed at once");
+        registry.read_with(cx, |registry, _| {
+            assert!(!registry.listed());
+            assert!(registry.connections.is_empty());
+        });
+        assert!(!listed.load(Ordering::SeqCst), "waiting for the listing");
+
+        answer
+            .send(files(vec![server("a", "http://a.test", "1")]))
+            .ok();
+        cx.run_until_parked();
+        assert!(listed.load(Ordering::SeqCst));
+        registry.read_with(cx, |registry, cx| {
+            assert!(registry.listed());
+            assert!(registry.find("a", cx).is_some());
+        });
+        // Listed already: what asks now goes on at once.
+        let again = registry.update(cx, |registry, _| registry.when_listed());
+        assert_eq!(again.now_or_never(), Some(()));
+    }
+
+    /// A listing that names a token file for the first time keeps the stamp it took of it: the
+    /// next checks list nothing until a file changes, then list once. Before, a new token file
+    /// was kept unstamped, and every start listed its targets again at the first check.
+    #[gpui::test]
+    async fn a_listing_keeps_the_stamps_it_took(cx: &mut TestAppContext) {
+        let (http, _) = answering();
+        let listing = HeldListing::default();
+        let dir = std::env::temp_dir().join(format!("studio-stamps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = cli_config::config_path(&dir);
+        let token = dir.join("token");
+        std::fs::write(&config, "version: 1\n").unwrap();
+        std::fs::write(&token, "one").unwrap();
+        // As `read_targets` takes them: the operator file and the token file a target names.
+        let listed = |config: &Path, token: &Path| CliTargets {
+            servers: Some(vec![server("a", "http://a.test", "1")]),
+            watched: [config, token]
+                .iter()
+                .map(|path| {
+                    (
+                        path.to_path_buf(),
+                        cli_config::stamp(&[path.to_path_buf()])[0],
+                    )
+                })
+                .collect(),
+            ..CliTargets::default()
         };
-        assert!(said(cx)[0].contains("did not list its targets within 5 s"));
+        listing.next().send(listed(&config, &token)).ok();
+        let registry = cx.new(|cx| {
+            let mut registry = ConnectionRegistry::empty(http, Some(dir.clone()));
+            registry.lister = listing.lister();
+            registry.start_listing(cx);
+            registry
+        });
+        cx.run_until_parked();
+        assert_eq!(listing.asked(), 1);
+        for _ in 0..3 {
+            cx.executor().advance_clock(OPERATOR_POLL);
+            cx.run_until_parked();
+        }
+        assert_eq!(listing.asked(), 1, "nothing changed");
+        registry.read_with(cx, |registry, _| {
+            assert_eq!(registry.watched, [config.clone(), token.clone()])
+        });
+
+        std::fs::write(&token, "rotated").unwrap();
+        listing.next().send(listed(&config, &token)).ok();
         cx.executor().advance_clock(OPERATOR_POLL);
         cx.run_until_parked();
-        // Listed with no CLI where it looks (a test's registry has no places): said so now.
-        let after = said(cx);
-        assert!(
-            after[0].contains("found no OmniGraph CLI it can drive"),
-            "{after:?}"
-        );
+        assert_eq!(listing.asked(), 2, "the token file changed");
+        cx.executor().advance_clock(OPERATOR_POLL);
+        cx.run_until_parked();
+        assert_eq!(listing.asked(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// What the person is told about the servers is one list, each notice saying what
+    /// happened: the environment's server not added stays first through every listing, then
+    /// what the CLI's targets could not give, which a listing replaces.
+    #[gpui::test]
+    async fn the_notices_are_one_list(cx: &mut TestAppContext) {
+        let (http, _) = answering();
+        let cli = Arc::new(FakeCli::default());
+        let registry = registry_with(http, &cli, cx);
+        registry.update(cx, |registry, _| {
+            registry.environment_notice =
+                Some("The server OMNIGRAPH_STUDIO_SERVER names was not added: bad".into());
+        });
+        let refused = CliTargets {
+            servers: None,
+            errors: vec!["The OmniGraph CLI (…) could not list its targets: refused".into()],
+            ..CliTargets::default()
+        };
+        assert!(apply(&registry, refused, cx));
+        let listed = CliTargets {
+            servers: Some(Vec::new()),
+            errors: vec!["CLI target 'disk' opens storage directly".into()],
+            ..CliTargets::default()
+        };
+        assert!(apply(&registry, listed.clone(), cx));
+        registry.read_with(cx, |registry, _| {
+            assert_eq!(
+                registry.notices(),
+                [
+                    "The server OMNIGRAPH_STUDIO_SERVER names was not added: bad",
+                    "CLI target 'disk' opens storage directly",
+                ]
+            )
+        });
+        assert!(!apply(&registry, listed, cx), "the same notices again");
     }
 
     /// A server added with no name takes its host as its target's name, made into one a target

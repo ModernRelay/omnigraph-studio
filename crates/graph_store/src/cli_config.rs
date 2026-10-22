@@ -11,9 +11,11 @@
 //! as (`target list --json` does not say which target is the default). The CLI's aliases are not
 //! read: the CLI has no command that lists them. Studio lists the targets again when the
 //! operator file, a token file a target names, or the CLI where Studio looks for it changes
-//! ([`stamp`]); it never writes or parses the file.
+//! ([`stamp`]); it never writes or parses the file. A listing is one turn at the CLI, and one
+//! command once the CLI is known: `target list --json`.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
@@ -69,62 +71,20 @@ pub enum CliCredential {
     Helper { timeout: Duration },
 }
 
-/// A managed cluster target, as `target inspect NAME --resolved --json` describes it with its
-/// profile. Studio refuses it until it has its own sign-in (spec 016 builds that client from
-/// these fields); it holds no token for it and never exports one.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// A managed cluster target, as `target list --json` describes it: refused until Studio has its
+/// own sign-in (spec 016 builds that client from these fields, and reads the profile's control
+/// plane itself). Studio holds no token for it and never exports one.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedTarget {
     /// The target's name.
-    #[serde(skip)]
     pub name: String,
     /// The profile it is pinned to.
     pub profile: String,
-    /// That profile's control-plane `api`.
-    #[serde(skip)]
-    pub api: String,
-    /// That profile's `organization_id`.
-    #[serde(skip)]
-    pub organization_id: String,
     pub cluster_id: String,
     pub cluster_incarnation: String,
     /// The cluster's data endpoint; none for a registration that is control-only.
-    #[serde(default)]
     pub endpoint: Option<String>,
-    #[serde(default)]
     pub default_graph: Option<String>,
-}
-
-/// The profile `target inspect --resolved` expands, with the fields a managed target needs.
-#[derive(Debug, Deserialize)]
-struct ResolvedProfile {
-    api: String,
-    organization_id: String,
-}
-
-/// A managed target from `target inspect NAME --resolved --json`.
-pub(crate) fn managed_from(inspected: &Value) -> Result<ManagedTarget, String> {
-    let read =
-        |error: serde_json::Error| format!("is described in a form Studio does not read ({error})");
-    let name = inspected
-        .get("name")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "is described with no name".to_owned())?;
-    let target = inspected
-        .get("target")
-        .filter(|target| target.get("kind").and_then(Value::as_str) == Some("managed"))
-        .ok_or_else(|| "is not described as a managed target".to_owned())?;
-    let mut managed: ManagedTarget = serde_json::from_value(target.clone()).map_err(read)?;
-    let profile: ResolvedProfile = serde_json::from_value(
-        inspected
-            .get("profile")
-            .cloned()
-            .ok_or_else(|| "is described without its profile".to_owned())?,
-    )
-    .map_err(read)?;
-    managed.name = name.to_owned();
-    managed.api = profile.api;
-    managed.organization_id = profile.organization_id;
-    Ok(managed)
 }
 
 /// A personal alias in the CLI's config: a name bound to a stored query on a target and graph,
@@ -172,15 +132,17 @@ pub struct CliTargets {
     pub servers: Option<Vec<CliServer>>,
     /// What could not be listed or used, each said once.
     pub errors: Vec<String>,
-    /// The files whose change can change a server or its token: the operator file, and the token
-    /// files the targets name.
-    pub watched: Vec<PathBuf>,
-    /// The managed targets, refused (in `errors`) but kept as the CLI describes them.
+    /// The files whose change can change a server or its token, the operator file and the
+    /// token files the targets name, each with its stamp ([`stamp`]) as the listing saw it: the
+    /// operator file's taken just before the CLI read it, a token file's as its target's
+    /// revision holds it. A later stamp that differs lists the targets again.
+    pub watched: Vec<(PathBuf, Option<FileStamp>)>,
+    /// The managed targets, refused (in `errors`) but kept as `target list` describes them.
     pub managed: Vec<ManagedTarget>,
 }
 
 /// Lists the targets of the operator home in `dir` with the first CLI of `programs` Studio can
-/// drive. No directory is no servers.
+/// drive, in one turn at the CLI. No directory is no servers.
 pub async fn read_targets(dir: Option<&Path>, programs: &[PathBuf]) -> CliTargets {
     let Some(dir) = dir else {
         return CliTargets {
@@ -192,10 +154,21 @@ pub async fn read_targets(dir: Option<&Path>, programs: &[PathBuf]) -> CliTarget
     let refused = |error: String| CliTargets {
         servers: None,
         errors: vec![error],
-        watched: vec![config.clone()],
+        watched: vec![(config.clone(), stamp_of(&config))],
         managed: Vec::new(),
     };
-    let cli = match cli_tokens::find_cli(programs).await {
+    let asked = "`omnigraph target list --json`";
+    let turn = match cli_tokens::take_turn(&Arc::default(), cli_tokens::READ_TIMEOUT, asked).await {
+        Ok(turn) => turn,
+        // Not listed, so the file is kept unstamped: the next check lists the targets again.
+        Err(busy) => {
+            return CliTargets {
+                watched: vec![(config.clone(), None)],
+                ..refused(format!("Studio could not list the CLI's targets: {busy}"))
+            };
+        }
+    };
+    let cli = match cli_tokens::find_cli(programs, &turn).await {
         Ok(cli) => cli,
         Err(why) => {
             return refused(format!(
@@ -203,48 +176,28 @@ pub async fn read_targets(dir: Option<&Path>, programs: &[PathBuf]) -> CliTarget
             ));
         }
     };
-    match cli_tokens::list_targets(&cli).await {
+    // Taken before the CLI reads the file: a write while it lists changes the next stamp.
+    let config_stamp = stamp_of(&config);
+    match cli_tokens::list_targets(&cli, &turn).await {
         Ok(targets) => {
             let mut read = servers_from(&targets);
-            read.watched.insert(0, config);
-            // A managed target's profile is in no listing: `target inspect --resolved` expands it.
-            let mut managed: Vec<&String> = targets
-                .iter()
-                .filter(|(_, entry)| entry.get("kind").and_then(Value::as_str) == Some("managed"))
-                .map(|(name, _)| name)
-                .collect();
-            managed.sort();
-            for name in managed {
-                let inspected = cli_tokens::inspect_target(&cli, name, true).await;
-                match inspected.and_then(|inspected| managed_from(&inspected)) {
-                    Ok(target) => read.managed.push(target),
-                    Err(why) => read.errors.push(format!("CLI target '{name}' {why}")),
-                }
-            }
+            read.watched.insert(0, (config, config_stamp));
             read
         }
-        Err(refusal) => refused(format!(
-            "the OmniGraph CLI ({}, {}) could not list its targets: {refusal}",
-            cli.path.display(),
-            cli.version
-        )),
+        Err(refusal) => CliTargets {
+            watched: vec![(config.clone(), config_stamp)],
+            ..refused(format!(
+                "The OmniGraph CLI ({}, {}) could not list its targets: {refusal}",
+                cli.path.display(),
+                cli.version
+            ))
+        },
     }
 }
 
-/// How long Studio waits at start for the CLI to list its targets, so the windows a start
-/// reopens find the CLI's servers. Past it the targets are listed at the next check.
-pub const START_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// [`read_targets`], given [`START_TIMEOUT`] at most: `None` past it.
-pub async fn read_targets_at_start(dir: Option<&Path>, programs: &[PathBuf]) -> Option<CliTargets> {
-    use futures::FutureExt as _;
-    let read = read_targets(dir, programs).fuse();
-    let timer = smol::Timer::after(START_TIMEOUT).fuse();
-    futures::pin_mut!(read, timer);
-    futures::select! {
-        read = read => Some(read),
-        _ = timer => None,
-    }
+/// The stamp of the one file at `path` ([`stamp`]).
+fn stamp_of(path: &Path) -> Option<FileStamp> {
+    stamp(&[path.to_owned()]).pop().flatten()
 }
 
 /// What a file's stamp holds: when it was last written, its size, and its permissions.
@@ -294,7 +247,15 @@ enum Entry {
         #[serde(default)]
         default_graph: Option<String>,
     },
-    Managed {},
+    Managed {
+        profile: String,
+        cluster_id: String,
+        cluster_incarnation: String,
+        #[serde(default)]
+        endpoint: Option<String>,
+        #[serde(default)]
+        default_graph: Option<String>,
+    },
     Direct {
         scope: String,
     },
@@ -356,17 +317,18 @@ enum Proxy {
     Environment,
 }
 
-/// The servers `targets` (a `target list --json` answer) land on, with what cannot be used and
-/// the token files to watch.
+/// The servers `targets` (a `target list --json` answer) land on, with what cannot be used, the
+/// token files to watch and the managed targets refused.
 pub(crate) fn servers_from(targets: &serde_json::Map<String, Value>) -> CliTargets {
     let mut errors: Vec<String> = Vec::new();
-    let mut watched: Vec<PathBuf> = Vec::new();
+    let mut watched: Vec<(PathBuf, Option<FileStamp>)> = Vec::new();
     let mut landed: Vec<CliServer> = Vec::new();
+    let mut managed: Vec<ManagedTarget> = Vec::new();
     let mut names: Vec<&String> = targets.keys().collect();
     names.sort();
     for name in names {
         let value = &targets[name];
-        match land(name, value, &mut watched) {
+        match land(name, value, &mut watched, &mut managed) {
             Ok(server) => landed.push(server),
             Err(why) => errors.push(format!("CLI target '{name}' {why}")),
         }
@@ -375,12 +337,18 @@ pub(crate) fn servers_from(targets: &serde_json::Map<String, Value>) -> CliTarge
         servers: Some(on_one_address(landed, &mut errors)),
         errors,
         watched,
-        managed: Vec::new(),
+        managed,
     }
 }
 
-/// The server the target `name`, described as `value`, lands on, or why it lands on none.
-fn land(name: &str, value: &Value, watched: &mut Vec<PathBuf>) -> Result<CliServer, String> {
+/// The server the target `name`, described as `value`, lands on, or why it lands on none. A
+/// token file it names is watched, with its stamp; a managed target is kept in `managed`.
+fn land(
+    name: &str,
+    value: &Value,
+    watched: &mut Vec<(PathBuf, Option<FileStamp>)>,
+    managed: &mut Vec<ManagedTarget>,
+) -> Result<CliServer, String> {
     let entry: Entry = serde_json::from_value(value.clone())
         .map_err(|error| format!("is described in a form Studio does not read ({error})"))?;
     let (endpoint, auth, transport, default_graph) = match entry {
@@ -396,7 +364,21 @@ fn land(name: &str, value: &Value, watched: &mut Vec<PathBuf>) -> Result<CliServ
                  storage or starts a server, and reaches graphs through server targets only"
             ));
         }
-        Entry::Managed {} => {
+        Entry::Managed {
+            profile,
+            cluster_id,
+            cluster_incarnation,
+            endpoint,
+            default_graph,
+        } => {
+            managed.push(ManagedTarget {
+                name: name.to_owned(),
+                profile,
+                cluster_id,
+                cluster_incarnation,
+                endpoint,
+                default_graph,
+            });
             return Err(
                 "is a managed cluster, which needs Studio's own sign-in; that is not \
                         built yet, and Studio does not borrow the CLI's managed token"
@@ -415,10 +397,7 @@ fn land(name: &str, value: &Value, watched: &mut Vec<PathBuf>) -> Result<CliServ
         } => CliAuth::Token(CliCredential::Environment { variable }),
         Auth::Token {
             source: Source::File(path),
-        } => {
-            watched.push(path.clone());
-            CliAuth::Token(CliCredential::File { path })
-        }
+        } => CliAuth::Token(CliCredential::File { path }),
         Auth::Exec { timeout } => {
             let seconds = timeout
                 .as_deref()
@@ -460,9 +439,14 @@ fn land(name: &str, value: &Value, watched: &mut Vec<PathBuf>) -> Result<CliServ
         }) => Some(url),
         _ => None,
     };
-    let file = match &auth {
-        CliAuth::Token(CliCredential::File { path }) => vec![path.clone()],
-        _ => Vec::new(),
+    // The token file's stamp is the one watched: a change after it asks for the token again.
+    let file_stamp = match &auth {
+        CliAuth::Token(CliCredential::File { path }) => {
+            let at = stamp_of(path);
+            watched.push((path.clone(), at));
+            Some(at)
+        }
+        _ => None,
     };
     Ok(CliServer {
         name: name.to_owned(),
@@ -473,7 +457,7 @@ fn land(name: &str, value: &Value, watched: &mut Vec<PathBuf>) -> Result<CliServ
         proxy,
         alternatives: Vec::new(),
         // The name too: an entry renamed is listed alike, and its token is asked for by name.
-        revision: format!("{name} {value} {:?}", stamp(&file)),
+        revision: format!("{name} {value} {file_stamp:?}"),
     })
 }
 

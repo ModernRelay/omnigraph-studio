@@ -107,6 +107,7 @@ fn open_stored(
         );
         return None;
     };
+    session.update(cx, |session, cx| session.want_stored_queries(cx));
     let entry = session
         .read(cx)
         .stored_query(&name)

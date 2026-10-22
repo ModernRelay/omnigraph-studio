@@ -646,8 +646,12 @@ pub struct GraphSession {
     /// frame.
     /// Row counts by kind and type: a node type and an edge type may share a name.
     dataset_counts: HashMap<(EntityKind, String), i64>,
-    /// The queries the server serves by name for this graph (spec 007), read with the schema.
+    /// The queries the server serves by name for this graph (spec 007): `NotLoaded` until a view
+    /// first wants them ([`Self::want_stored_queries`]), since the first screen shows none.
     pub stored_queries: Loadable<Arc<Vec<QueryCatalogEntry>>>,
+    /// A view wanted the catalog ([`Self::want_stored_queries`]): it is read with the graph from
+    /// then on, at a reload, a recheck and a new token.
+    stored_queries_wanted: bool,
     /// Every write's outcome, oldest first: the newest [`OUTCOMES`].
     pub outcomes: Vec<OutcomeEntry>,
     /// How many outcomes were ever logged, those dropped from [`Self::outcomes`] included: a
@@ -779,9 +783,10 @@ pub struct GraphSession {
     /// Whether a window shows the graph ([`Self::set_shown`]): a parked one asks after no head
     /// and no branch list, and holds no watch on its server.
     shown: bool,
-    /// The first reads were sent: the schema, the branch list, the type counts, the
-    /// stored-query catalog and what the credential may do. A session opened behind the graph
-    /// its window shows ([`Self::parked`]) sends them when it is first shown.
+    /// The first reads were sent: the schema, the branch list, the type counts, what the
+    /// credential may do, and the stored-query catalog once wanted. A session opened behind the
+    /// graph its window shows ([`Self::parked`]) sends them when it is first shown, and a shown
+    /// one when its connection's token is ready ([`Connection::token_ready`]).
     opened: bool,
     /// The wait after a 503 ended while the graph was parked: it is asked again when shown.
     recheck_owed: bool,
@@ -833,6 +838,7 @@ impl GraphSession {
             datasets: Loadable::NotLoaded,
             dataset_counts: HashMap::new(),
             stored_queries: Loadable::NotLoaded,
+            stored_queries_wanted: false,
             outcomes: Vec::new(),
             outcomes_logged: 0,
             reads_in_flight: 0,
@@ -905,10 +911,12 @@ impl GraphSession {
         session.credential = session.client(cx).credential_changes();
         session._connection_events = Some(cx.subscribe(
             &session.connection,
-            |this, _, event: &ConnectionEvent, cx| {
-                if *event == ConnectionEvent::CredentialChanged {
+            |this, _, event: &ConnectionEvent, cx| match event {
+                ConnectionEvent::CredentialChanged => {
                     this.sync_access(cx);
                 }
+                ConnectionEvent::TokenReady => this.open_when_ready(cx),
+                ConnectionEvent::StateChanged => {}
             },
         ));
         session.labels = session.chosen_labels(cx);
@@ -1055,11 +1063,13 @@ impl GraphSession {
     }
 
     /// Reads again, under a new token, what the session shows of the graph as the old one was
-    /// answered it: the type counts, the stored-query catalog and the branch list. The new
-    /// token's policy may refuse it what the old one read, so none of it shows meanwhile: each
-    /// is being read, and views hear it, and [`SessionEvent::CredentialChanged`] tells views
-    /// that read the server themselves. A branch the new token's list does not hold is left, as
-    /// any branch the list no longer holds is; drafts on it stay.
+    /// answered it: the type counts, the stored-query catalog (once wanted) and the branch
+    /// list; and every read a 401 could have refused under the old one: the schema, when none
+    /// is held. The new token's policy may refuse it what the old one read, so none of it shows
+    /// meanwhile: each is being read, and views hear it, and [`SessionEvent::CredentialChanged`]
+    /// tells views that read the server themselves. A branch the new token's list does not hold
+    /// is left, as any branch the list no longer holds is; drafts on it stay. A schema held is
+    /// kept: the server answers it alike to every credential that may read the graph.
     ///
     /// A parked graph (one no window shows, [`Self::set_shown`]) asks the server nothing: it
     /// lets go of the old token's answers and the reads still out under it, and reads under the
@@ -1074,17 +1084,29 @@ impl GraphSession {
         // Not kept while it is read: it is the old token's.
         self.branches = Loadable::Loading;
         if self.shown {
+            // Refused under the old token, or still out under it.
+            if !matches!(self.schema, Loadable::Loaded(_)) {
+                self.reload_schema(cx);
+            }
             self.reload_counts(cx);
-            self.reload_stored_queries(cx);
+            if self.stored_queries_wanted {
+                self.reload_stored_queries(cx);
+            }
             self.read_branches(None, cx);
         } else {
             self.datasets = Loadable::Loading;
             self.dataset_counts.clear();
-            self.stored_queries = Loadable::Loading;
+            if self.stored_queries_wanted {
+                self.stored_queries = Loadable::Loading;
+            }
             self._datasets_task = None;
             self._stored_queries_task = None;
             self._branches_task = None;
             self.branch_recheck = None;
+            if !matches!(self.schema, Loadable::Loaded(_)) {
+                self._schema_task = None;
+                self.reloading_schema = false;
+            }
             self.credential_owed = true;
         }
         cx.emit(SessionEvent::CountsChanged);
@@ -1171,9 +1193,9 @@ impl GraphSession {
     }
 
     /// Asks a graph that answered 503 again, refreshing what is held rather than letting it
-    /// go: the schema, the branch list, the type counts and the stored-query catalog held stay
-    /// shown while they are read, and stay if the graph still cannot answer; what was never
-    /// read is read.
+    /// go: the schema, the branch list, the type counts and the stored-query catalog (once
+    /// wanted) held stay shown while they are read, and stay if the graph still cannot answer;
+    /// what was never read is read.
     fn recheck_available(&mut self, cx: &mut Context<Self>) {
         if matches!(self.schema, Loadable::Loaded(_)) {
             self.recheck_schema(None, cx);
@@ -1182,18 +1204,34 @@ impl GraphSession {
         }
         self.read_branches(None, cx);
         self.refresh_counts(cx);
-        self.read_stored_queries(true, cx);
+        if self.stored_queries_wanted {
+            self.read_stored_queries(true, cx);
+        }
     }
 
-    /// Reloads the schema, the branch list, the type counts and the stored queries, and reads
-    /// the server's graph list again if it could not be read before.
+    /// Reloads the schema, the branch list, the type counts and the stored queries (once a view
+    /// wanted them), and reads the server's graph list again if it could not be read before.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.reload_schema(cx);
         self.reload_branches(cx);
         self.reload_counts(cx);
-        self.reload_stored_queries(cx);
+        if self.stored_queries_wanted {
+            self.reload_stored_queries(cx);
+        }
         self.connection
             .update(cx, |connection, cx| connection.list_graphs_again(cx));
+    }
+
+    /// A view shows the stored-query catalog (the Queries panel, the palette's queries, a
+    /// stored query's tab): it is read now, unless it is held or being read, and with the graph
+    /// from then on. A graph not yet read, or parked, reads it with its first reads, or when
+    /// shown again. The catalog is not read before: the first screen shows none of it, and on
+    /// a graph with many stored queries it is the largest of the first reads.
+    pub fn want_stored_queries(&mut self, cx: &mut Context<Self>) {
+        self.stored_queries_wanted = true;
+        if self.opened && self.shown && matches!(self.stored_queries, Loadable::NotLoaded) {
+            self.read_stored_queries(false, cx);
+        }
     }
 
     /// The person's Refresh: [`Self::reload`], and a CLI server's token asked of the CLI again
@@ -1205,9 +1243,11 @@ impl GraphSession {
             .update(cx, |connection, cx| connection.refresh_token(cx));
     }
 
-    /// Reads the graph's stored-query catalog. A graph without stored queries answers an empty
-    /// one; a 404 is a graph the server no longer serves, and shows as a failure.
+    /// Reads the graph's stored-query catalog, which a view wants from then on. A graph
+    /// without stored queries answers an empty one; a 404 is a graph the server no longer
+    /// serves, and shows as a failure.
     pub fn reload_stored_queries(&mut self, cx: &mut Context<Self>) {
+        self.stored_queries_wanted = true;
         self.read_stored_queries(false, cx);
     }
 
@@ -1708,20 +1748,20 @@ impl GraphSession {
         }));
     }
 
-    /// This graph's one key: its server's address and its id, as its tabs are kept
-    /// ([`studio_settings::overrides_key`]). Its settings (spec 002), its saved queries' folder
-    /// and its agent conversations are filed under it.
+    /// This graph's one key for what Studio saves of it: its CLI target's name and its id,
+    /// `<target>/<graph>` ([`studio_settings::overrides_key`]). Its settings (spec 002), its tabs
+    /// and drafts, its saved queries' folder and its agent conversations are filed under it.
     pub fn overrides_key(&self, cx: &App) -> String {
-        studio_settings::overrides_key(&self.connection.read(cx).server.url, &self.graph_id)
+        studio_settings::overrides_key(&self.connection.read(cx).server.name, &self.graph_id)
     }
 
     /// The browsing limits in effect for this graph: its overrides in the settings, else the
     /// shared ones.
     pub fn options(&self, cx: &App) -> studio_settings::GraphOptions {
-        let server = &self.connection.read(cx).server.url;
+        let target = &self.connection.read(cx).server.name;
         match cx.try_global::<studio_settings::StudioSettings>() {
-            Some(settings) => settings.for_graph(server, &self.graph_id),
-            None => studio_settings::StudioSettings::default().for_graph(server, &self.graph_id),
+            Some(settings) => settings.for_graph(target, &self.graph_id),
+            None => studio_settings::StudioSettings::default().for_graph(target, &self.graph_id),
         }
     }
 
@@ -2263,6 +2303,7 @@ impl GraphSession {
     /// again, it reads what those owe, and asks after its heads at once when a poll came
     /// meanwhile, as a window's activation does. A session opened behind ([`Self::parked`])
     /// sends its first reads when first shown; one made with [`Self::new`] is shown already.
+    /// Either sends them only once its connection's token is ready ([`Self::open_when_ready`]).
     pub fn set_shown(&mut self, shown: bool, cx: &mut Context<Self>) {
         if self.shown == shown {
             return;
@@ -2273,18 +2314,8 @@ impl GraphSession {
             return;
         }
         self._connection_watch = Some(self.connection.update(cx, |c, cx| c.watch(cx)));
-        if !std::mem::replace(&mut self.opened, true) {
-            // The first reads cover whatever a token, a refusal or a poll owed meanwhile, and
-            // the schema's answer asks after the heads.
-            self.credential_owed = false;
-            self.access_owed = false;
-            self.recheck_owed = false;
-            self.names_owed = false;
-            self.head_check_missed = false;
-            self.credential = self.client(cx).credential_changes();
-            self.reload(cx);
-            let branch = AccessScope::branch(&self.branch);
-            self.read_access(branch, cx);
+        if !self.opened {
+            self.open_when_ready(cx);
             return;
         }
         // Its nodes named otherwise while parked: views read under the new names now.
@@ -2304,9 +2335,42 @@ impl GraphSession {
         if std::mem::take(&mut self.recheck_owed) {
             self.recheck_available(cx);
         }
+        // A view wanted the catalog while parked.
+        if self.stored_queries_wanted && matches!(self.stored_queries, Loadable::NotLoaded) {
+            self.read_stored_queries(false, cx);
+        }
         if cx.active_window().is_some() && std::mem::take(&mut self.head_check_missed) {
             self.check_heads(cx);
         }
+    }
+
+    /// Sends the first reads of a graph a window shows, once its connection's token is ready
+    /// ([`Connection::token_ready`]): the CLI gives a server's token some tens or hundreds of
+    /// milliseconds after the connection asks, and a read sent before carries none, so the
+    /// server refuses it (401). Until then the window waits for the token, which the CLI serves
+    /// first ([`Connection::wait_for_token`]), and [`ConnectionEvent::TokenReady`] brings the
+    /// session here again.
+    fn open_when_ready(&mut self, cx: &mut Context<Self>) {
+        if self.opened || !self.shown {
+            return;
+        }
+        if !self.connection.read(cx).token_ready() {
+            self.connection
+                .update(cx, |connection, cx| connection.wait_for_token(cx));
+            return;
+        }
+        self.opened = true;
+        // The first reads cover whatever a token, a refusal or a poll owed meanwhile, and the
+        // schema's answer asks after the heads.
+        self.credential_owed = false;
+        self.access_owed = false;
+        self.recheck_owed = false;
+        self.names_owed = false;
+        self.head_check_missed = false;
+        self.credential = self.client(cx).credential_changes();
+        self.reload(cx);
+        let branch = AccessScope::branch(&self.branch);
+        self.read_access(branch, cx);
     }
 
     /// Whether a window shows the graph ([`Self::set_shown`]).
@@ -5654,6 +5718,11 @@ mod tests {
         assert!(asked.lock().unwrap().is_empty(), "{:?}", asked.lock());
         assert!(!connection.read_with(cx, |connection, _| connection.watched()));
 
+        // A view wants the catalog while the graph is parked: it is read with the first reads.
+        session.update(cx, |session, cx| session.want_stored_queries(cx));
+        cx.run_until_parked();
+        assert!(asked.lock().unwrap().is_empty(), "{:?}", asked.lock());
+
         session.update(cx, |session, cx| session.set_shown(true, cx));
         cx.run_until_parked();
         let sent = std::mem::take(&mut *asked.lock().unwrap());
@@ -5682,7 +5751,10 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let (session, _, asked, failing) = parked_graph(cx);
-        session.update(cx, |session, cx| session.set_shown(true, cx));
+        session.update(cx, |session, cx| {
+            session.set_shown(true, cx);
+            session.want_stored_queries(cx);
+        });
         cx.run_until_parked();
         let held = |cx: &mut TestAppContext| {
             session.read_with(cx, |session, _| {
@@ -5981,20 +6053,26 @@ mod tests {
         assert!(watched(cx), "shown again, it watches again");
     }
 
-    /// The stored-query catalog is read with the graph, and a server without one has an empty
-    /// catalog. A stored read goes to the session's branch and says it expects a read; a stored
-    /// write goes to the branch it names, says it expects a write, and is logged like any write,
-    /// its commit the branch head.
+    /// The stored-query catalog is read when a view first wants it, not with the graph's first
+    /// reads, and once: a server without one has an empty catalog. A stored read goes to the
+    /// session's branch and says it expects a read; a stored write goes to the branch it names,
+    /// says it expects a write, and is logged like any write, its commit the branch head.
     #[gpui::test]
-    async fn stored_queries_are_read_with_the_graph_and_run_by_name(cx: &mut TestAppContext) {
+    async fn stored_queries_are_read_when_wanted_and_run_by_name(cx: &mut TestAppContext) {
         use futures::AsyncReadExt as _;
+        use std::sync::atomic::AtomicUsize;
         let sent: Arc<std::sync::Mutex<Vec<(String, Value)>>> = Arc::default();
         let log = sent.clone();
         let serves = Arc::new(AtomicBool::new(true));
         let serving = serves.clone();
+        let catalogs = Arc::new(AtomicUsize::new(0));
+        let counted = catalogs.clone();
         let http = FakeHttpClient::create(move |request| {
             let path = request.uri().path().to_owned();
             let (log, serving) = (log.clone(), serving.clone());
+            if path.ends_with("/queries") {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
             async move {
                 let mut bytes = Vec::new();
                 request.into_body().read_to_end(&mut bytes).await.ok();
@@ -6047,6 +6125,24 @@ mod tests {
             .new(|cx| GraphSession::new(connection.clone(), "knowledge".into(), "main".into(), cx));
         cx.run_until_parked();
         session.read_with(cx, |session, _| {
+            assert!(matches!(session.stored_queries, Loadable::NotLoaded))
+        });
+        assert_eq!(
+            catalogs.load(Ordering::SeqCst),
+            0,
+            "not read with the graph"
+        );
+        session.update(cx, |session, cx| session.reload(cx));
+        cx.run_until_parked();
+        assert_eq!(catalogs.load(Ordering::SeqCst), 0, "nor at a reload");
+
+        // The Queries panel, the palette or a stored query's tab wants it: read once.
+        for _ in 0..2 {
+            session.update(cx, |session, cx| session.want_stored_queries(cx));
+            cx.run_until_parked();
+        }
+        assert_eq!(catalogs.load(Ordering::SeqCst), 1);
+        session.read_with(cx, |session, _| {
             let names: Vec<_> = session
                 .stored_queries
                 .loaded()
@@ -6057,6 +6153,10 @@ mod tests {
             assert_eq!(names, ["find", "add"]);
             assert!(session.stored_query("add").unwrap().mutation);
         });
+        // Wanted once, it is read with the graph from then on.
+        session.update(cx, |session, cx| session.reload(cx));
+        cx.run_until_parked();
+        assert_eq!(catalogs.load(Ordering::SeqCst), 2);
 
         let read = session.update(cx, |session, cx| {
             session.invoke_stored_read("find", Some(serde_json::json!({ "name": "Ada" })), None, cx)
@@ -6887,8 +6987,12 @@ mod tests {
         let (release, wait) = oneshot::channel::<()>();
         *gate.lock().unwrap() = Some(wait);
         let connection = cx.new(|_| Connection::new(server, Some("ro".into()), http).unwrap());
-        let session = cx
-            .new(|cx| GraphSession::new(connection.clone(), "knowledge".into(), "main".into(), cx));
+        let session = cx.new(|cx| {
+            let mut session =
+                GraphSession::new(connection.clone(), "knowledge".into(), "main".into(), cx);
+            session.want_stored_queries(cx);
+            session
+        });
         cx.run_until_parked();
         let change = |cx: &mut TestAppContext| {
             session.read_with(cx, |session, _| session.allows_here(AccessAction::Change))
@@ -7021,6 +7125,160 @@ mod tests {
         assert!(heard.contains(&SessionEvent::CredentialChanged));
         session.read_with(cx, |session, _| {
             assert_eq!(session.count_of(EntityKind::Node, "Person"), Some(7));
+        });
+    }
+
+    /// A graph shown while its connection's token is still on its way from the CLI sends
+    /// nothing until the token is there, then reads it all, the schema included, with no
+    /// Refresh. Before, its first reads went out with no token and were refused (401), and a new
+    /// token read the counts, the catalog and the branch list again but not the schema, so a
+    /// window a start reopened stayed empty until Refresh. A schema a 401 refused is read again
+    /// when the token changes, as every read a 401 could have refused is.
+    #[gpui::test]
+    async fn the_first_reads_wait_for_the_token_and_the_schema_loads(cx: &mut TestAppContext) {
+        use futures::AsyncReadExt as _;
+        use serde_json::json;
+
+        use crate::cli_tokens::{Token, TokenSource};
+
+        /// A token source that answers when the test gives it its token.
+        struct Gated(std::sync::Mutex<Option<oneshot::Receiver<&'static str>>>);
+        impl TokenSource for Gated {
+            fn token(
+                &self,
+                _: Arc<AtomicBool>,
+            ) -> futures::future::BoxFuture<'static, Result<Token, String>> {
+                let gate = self.0.lock().unwrap().take();
+                async move {
+                    match gate {
+                        Some(gate) => gate.await.map(Token::new).map_err(|_| "gone".into()),
+                        None => Ok(Token::new("good")),
+                    }
+                }
+                .boxed()
+            }
+        }
+
+        // Answers the token `good` alone; every graph read is listed with its token.
+        let asked: Arc<std::sync::Mutex<Vec<(String, String)>>> = Arc::default();
+        let log = asked.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let token = request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            let log = log.clone();
+            async move {
+                let mut bytes = Vec::new();
+                request.into_body().read_to_end(&mut bytes).await.ok();
+                let read = path.rsplit('/').next().unwrap_or_default().to_owned();
+                if path.contains("/graphs/knowledge") {
+                    log.lock().unwrap().push((read.clone(), token.clone()));
+                }
+                let (status, body) = if read == "healthz" {
+                    (
+                        200,
+                        json!({ "status": "ok", "version": "0.14.0", "internal_schema_version": 16 }),
+                    )
+                } else if token != "Bearer good" {
+                    (
+                        401,
+                        json!({ "error": "unauthorized", "code": "unauthorized" }),
+                    )
+                } else {
+                    let body = match read.as_str() {
+                        "graphs" => json!({ "graphs": [] }),
+                        "schema" => {
+                            json!({ "schema_source": "node Person {\n  slug: String @key\n}\n" })
+                        }
+                        "snapshot" => json!({ "graph_branch": "main", "graph_manifest_version": 3,
+                            "internal_schema_version": 16, "datasets": [] }),
+                        "access" => json!({ "graph_id": "knowledge", "actor": "act-ada",
+                            "graph_wide": ["read"], "branch": "main", "actions": ["read"] }),
+                        "branches" => json!({ "branches": ["main"] }),
+                        _ => json!({ "query_name": "studio_head", "target": { "branch": "main" },
+                            "row_count": 0, "columns": [], "rows": [], "graph_commit_id": "c1" }),
+                    };
+                    (200, body)
+                };
+                let response = Response::builder()
+                    .status(status)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT);
+                let response = if status == 401 {
+                    response.header("www-authenticate", "Bearer")
+                } else {
+                    response
+                };
+                Ok(response.body(AsyncBody::from(body.to_string())).unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "personal".into(),
+            url: "https://graph.test".into(),
+            source: ServerSource::Cli,
+            known_graphs: Vec::new(),
+        };
+        let (give, gate) = oneshot::channel();
+        let source: Arc<dyn TokenSource> = Arc::new(Gated(std::sync::Mutex::new(Some(gate))));
+        let connection = cx.new(|_| {
+            Connection::new(server.clone(), None, http.clone())
+                .unwrap()
+                .with_token_source(Some(source))
+        });
+        // As a start reopens a window: the server connects, then its graph is shown at once.
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        let session =
+            cx.update(|cx| open_session(connection.clone(), "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "nothing sent without the token: {:?}",
+            asked.lock()
+        );
+        assert!(matches!(
+            session.read_with(cx, |session, _| session.schema.clone()),
+            Loadable::NotLoaded
+        ));
+
+        give.send("good").ok();
+        cx.run_until_parked();
+        let sent = std::mem::take(&mut *asked.lock().unwrap());
+        assert!(
+            sent.iter().all(|(_, token)| token == "Bearer good"),
+            "every read carried the token: {sent:?}"
+        );
+        for read in ["schema", "snapshot", "branches", "access"] {
+            assert!(
+                sent.iter().any(|(sent, _)| sent == read),
+                "{read}: {sent:?}"
+            );
+        }
+        session.read_with(cx, |session, _| {
+            assert!(session.schema_model().is_some(), "with no Refresh");
+            assert!(matches!(session.branches, Loadable::Loaded(_)));
+        });
+
+        // A token the server refuses leaves the schema unread; the next token reads it again.
+        let refused = cx.new(|_| Connection::new(server, Some("stale".into()), http).unwrap());
+        let session =
+            cx.update(|cx| open_session(refused.clone(), "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        assert!(matches!(
+            session.read_with(cx, |session, _| session.schema.clone()),
+            Loadable::Failed(_)
+        ));
+        asked.lock().unwrap().clear();
+        refused.update(cx, |connection, cx| {
+            connection.set_token(Some("good".into()), cx)
+        });
+        cx.run_until_parked();
+        let sent = std::mem::take(&mut *asked.lock().unwrap());
+        assert!(sent.iter().any(|(sent, _)| sent == "schema"), "{sent:?}");
+        session.read_with(cx, |session, _| {
+            assert!(session.schema_model().is_some(), "with no Refresh")
         });
     }
 

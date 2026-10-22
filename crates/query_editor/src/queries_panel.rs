@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use gpui::{
-    Action, Context, Entity, FocusHandle, Focusable, ListAlignment, ListState, Render,
+    Action, Context, Entity, EntityId, FocusHandle, Focusable, ListAlignment, ListState, Render,
     Subscription, Task, WeakEntity, Window, list,
 };
 use graph_store::{GraphSession, Loadable, SessionEvent};
@@ -32,6 +32,10 @@ pub struct QueriesPanel {
     /// and go. Shown while the panel has the keyboard.
     selected: Option<RowKey>,
     _session_subscription: Option<Subscription>,
+    /// The graph whose stored-query catalog the panel has asked for. The catalog is read only
+    /// once a view wants it, and the panel wants it when it is drawn, so a hidden panel reads
+    /// nothing.
+    catalog_asked: Option<EntityId>,
     /// The folder's latest listing: an earlier one, of another graph's folder perhaps, is
     /// dropped rather than landing after it.
     _listing: Option<Task<()>>,
@@ -142,6 +146,7 @@ impl QueriesPanel {
             focus_handle,
             selected: None,
             _session_subscription: None,
+            catalog_asked: None,
             _listing: None,
             _subscriptions: subscriptions,
         };
@@ -383,6 +388,12 @@ impl QueriesPanel {
 
 impl Render for QueriesPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(session) = self.session.clone()
+            && self.catalog_asked != Some(session.entity_id())
+        {
+            self.catalog_asked = Some(session.entity_id());
+            cx.defer(move |cx| session.update(cx, |session, cx| session.want_stored_queries(cx)));
+        }
         let rows = self.panel_rows(cx);
         studio_ui::rows::sync(&self.list_state, &mut self.rows, rows);
         let selected = self.selected_row();
@@ -515,12 +526,12 @@ mod tests {
     /// The panel takes the keyboard: ↓ and ↑ move among the rows that open a query, passing
     /// over the Stored header and stopping at either end, and ↵ opens the row selected as a
     /// click does, a saved file and a stored query alike. The selection stays on its query
-    /// while the rows above it change.
+    /// while the rows above it change. Nothing reads the catalog before the panel is drawn:
+    /// drawing it asks for it.
     #[gpui::test]
     async fn the_rows_are_selected_and_opened_by_keys(cx: &mut TestAppContext) {
         cx.update(studio_theme::init_test);
         let session = session(cx);
-        session.update(cx, |session, cx| session.reload_stored_queries(cx));
         cx.run_until_parked();
         let opened: Arc<Mutex<Vec<String>>> = Arc::default();
         cx.update(|cx| {

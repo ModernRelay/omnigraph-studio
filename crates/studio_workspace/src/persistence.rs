@@ -1,6 +1,6 @@
-//! What a workspace remembers between runs (spec 002): the window's bounds, and per server and
-//! graph the open tabs, the active tab and which panels are shown. Plain JSON under Studio's
-//! data directory; no database.
+//! What a workspace remembers between runs (spec 002): the window's bounds, and per graph (its
+//! one key, `<target>/<graph>`) the open tabs, the active tab and which panels are shown. Plain
+//! JSON under Studio's data directory; no database.
 //!
 //! A tab is remembered only if its item returns [`SavedItem`] from `Item::serialize`, and comes
 //! back only if a feature registered its kind with [`register_item_kind`]. A query tab keeps its
@@ -87,19 +87,18 @@ fn workspaces_dir() -> PathBuf {
     studio_settings::data_dir().join("workspaces")
 }
 
-/// A file name for a CLI target and graph: a stable FNV-1a hash, so names need no escaping.
-fn key(target: &str, graph: &str) -> String {
-    let hash = format!("{target}\n{graph}")
-        .bytes()
-        .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-        });
+/// A file name for a graph's key (`<target>/<graph>`, `studio_settings::overrides_key`): a
+/// stable FNV-1a hash, so names need no escaping.
+fn file_name(key: &str) -> String {
+    let hash = key.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
     format!("{hash:016x}.json")
 }
 
-/// The saved state of `graph` on the CLI target `target`.
-pub(crate) fn load(target: &str, graph: &str) -> Option<SavedWorkspace> {
-    let path = workspaces_dir().join(key(target, graph));
+/// The saved state of the graph whose key is `key`.
+pub(crate) fn load(key: &str) -> Option<SavedWorkspace> {
+    let path = workspaces_dir().join(file_name(key));
     let text = std::fs::read_to_string(&path).ok()?;
     match serde_json::from_str(&text) {
         Ok(saved) => Some(saved),
@@ -114,12 +113,12 @@ pub(crate) fn load(target: &str, graph: &str) -> Option<SavedWorkspace> {
 
 /// Saves a graph's tabs and drafts, unless restoring is off: a run that did not read them
 /// (the snapshot tool) must not replace them.
-pub(crate) fn save(target: &str, graph: &str, saved: &SavedWorkspace) {
+pub(crate) fn save(key: &str, saved: &SavedWorkspace) {
     if !saving() {
         return;
     }
     if let Ok(text) = serde_json::to_string_pretty(saved) {
-        write_private(&workspaces_dir().join(key(target, graph)), &text);
+        write_private(&workspaces_dir().join(file_name(key)), &text);
     }
 }
 
@@ -143,11 +142,9 @@ pub struct SavedSession {
 }
 
 /// A graph a window had open, by its CLI target's name and its id (spec 002): a window whose
-/// target the CLI no longer lists is not reopened. A window saved by an earlier build, by its
-/// server's address, names no target and is not reopened either.
+/// target the CLI no longer lists is not reopened.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SavedGraph {
-    #[serde(default)]
     pub target: String,
     pub graph: String,
     pub branch: String,
@@ -492,6 +489,13 @@ mod tests {
         assert_eq!(parse_session(&text), Some(windows));
         assert_eq!(parse_session("{}"), Some(Vec::new()));
         assert_eq!(parse_session("not json"), None);
+        // An earlier build's file names its graphs by their server's address: it is set aside.
+        assert_eq!(
+            parse_session(
+                r#"{"windows":[{"graphs":[{"server_url":"http://a","graph":"g","branch":"main"}]}]}"#
+            ),
+            None
+        );
     }
 
     #[test]
@@ -576,9 +580,9 @@ mod tests {
 
     #[test]
     fn keys_are_stable_and_distinct() {
-        assert_eq!(key("http://a", "g"), key("http://a", "g"));
-        assert_ne!(key("http://a", "g"), key("http://a", "h"));
-        assert_ne!(key("http://a", "g"), key("http://b", "g"));
+        assert_eq!(file_name("a/g"), file_name("a/g"));
+        assert_ne!(file_name("a/g"), file_name("a/h"));
+        assert_ne!(file_name("a/g"), file_name("b/g"));
     }
 
     #[test]

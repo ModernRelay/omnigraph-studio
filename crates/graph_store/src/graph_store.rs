@@ -43,7 +43,7 @@ pub use entity_groups::{
 pub use exploration::*;
 pub use fixes::{RevertUnavailable, revert_query};
 pub use graph_client::api::{AccessAction, EntityKind};
-pub use registry::{ConnectionRegistry, data_dir};
+pub use registry::ConnectionRegistry;
 pub use session::{
     BranchStart, DraftEntry, DraftKey, ExternalWrite, FollowUp, GraphSession, HeadWatch, HeldAs,
     Loadable, MergeEntry, MergeSent, MergeSettled, OutcomeEntry, OutcomeKind, ServerState,

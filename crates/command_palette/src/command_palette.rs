@@ -27,7 +27,7 @@ use gpui::{
 };
 use gq_language::SchemaModel;
 use gq_language::builder::{node_search, search_matches};
-use graph_store::{EntityKind, GraphSession, Loadable};
+use graph_store::{EntityKind, GraphSession, Loadable, SessionEvent};
 use serde_json::Value;
 use studio_actions::agent::Ask;
 use studio_actions::graph::{OpenNode, OpenQueryFile, OpenStoredQuery, OpenType};
@@ -404,6 +404,9 @@ pub(crate) struct CommandPalette {
     /// What each node type answered, shown again or narrowed without a read.
     answers: Answers,
     _subscription: Subscription,
+    /// The graph's stored-query catalog, which the graph reads when a view first wants it:
+    /// heard while it is being read, so its queries are listed when it lands.
+    _catalog: Option<Subscription>,
 }
 
 impl EventEmitter<DismissEvent> for CommandPalette {}
@@ -443,10 +446,23 @@ impl CommandPalette {
             &mut rows,
             &mut candidates,
         );
+        let mut catalog = None;
         if let (Some(session), Mode::Picker(_)) = (&session, mode) {
             add_type_rows(session, window, cx, &mut rows, &mut candidates);
             add_branch_rows(session, cx, &mut rows, &mut candidates);
             add_stored_rows(session, window, cx, &mut rows, &mut candidates);
+            if session.read(cx).stored_queries.loaded().is_none() {
+                session.update(cx, |session, cx| session.want_stored_queries(cx));
+                catalog = Some(cx.subscribe_in(
+                    session,
+                    window,
+                    |this, session, event: &SessionEvent, window, cx| {
+                        if let SessionEvent::StoredQueriesChanged = event {
+                            this.add_stored(session, window, cx);
+                        }
+                    },
+                ));
+            }
             for (id, title, first_line) in queries {
                 candidates.push(Candidate {
                     label: if first_line.is_empty() {
@@ -502,6 +518,7 @@ impl CommandPalette {
             answers: Answers::default(),
             _saved: None,
             _subscription: subscription,
+            _catalog: catalog,
         };
         if read_saved {
             let read = cx.background_spawn(async move { saved.read() });
@@ -512,6 +529,29 @@ impl CommandPalette {
         }
         palette.update_matches(cx);
         palette
+    }
+
+    /// Lists the graph's stored queries with the fixed rows, once its catalog is read: the
+    /// first palette asks for it.
+    fn add_stored(
+        &mut self,
+        session: &Entity<GraphSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if session.read(cx).stored_queries.loaded().is_none() {
+            return;
+        }
+        self._catalog = None;
+        let (mut rows, mut candidates) = (Vec::new(), Vec::new());
+        add_stored_rows(session, window, cx, &mut rows, &mut candidates);
+        let selected = self.selected_key();
+        let at = self.fixed;
+        self.fixed += rows.len();
+        self.rows.splice(at..at, rows);
+        self.candidates.splice(at..at, candidates);
+        self.update_matches(cx);
+        self.select_key(selected, cx);
     }
 
     /// Lists the saved query files with the fixed rows, before any node found.
@@ -1866,7 +1906,8 @@ mod tests {
         );
     }
 
-    /// The Queries scope lists the graph's stored queries, each runnable from the keyboard.
+    /// The Queries scope lists the graph's stored queries, each runnable from the keyboard. The
+    /// graph reads its catalog when the first palette asks for it, not as it opens.
     #[gpui::test]
     async fn stored_queries_are_listed_in_the_queries_scope(cx: &mut TestAppContext) {
         let catalog = json!([
@@ -1875,6 +1916,10 @@ mod tests {
         ]);
         let find: Find = Box::new(|_| (json!([]), Duration::ZERO));
         let (session, _) = served(PEOPLE, catalog, find, cx);
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| {
+            assert!(matches!(session.stored_queries, Loadable::NotLoaded))
+        });
         let (palette, cx) = palette(Scope::Queries, session, cx);
         assert_eq!(
             listed(&palette, cx),

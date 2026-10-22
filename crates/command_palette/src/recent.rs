@@ -25,7 +25,7 @@ struct Saved {
 }
 
 fn path() -> PathBuf {
-    graph_store::data_dir().join("command-palette.json")
+    studio_settings::data_dir().join("command-palette.json")
 }
 
 /// Starts reading the saved list. The palette ranks without it until it arrives.

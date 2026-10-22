@@ -116,6 +116,10 @@ struct Toast {
     /// How many errors this toast stands for, folded into it off a full stack
     /// ([`Workspace::make_room`]); 0 for a toast that stands for itself.
     folded: usize,
+    /// The graph the toast is about (a write's outcome, a fold of a graph's errors); `None` for
+    /// one about no graph (a notice about the servers, a file not written). Errors fold only
+    /// with errors about the same graph.
+    graph: Option<GraphAt>,
 }
 
 impl Toast {
@@ -126,34 +130,47 @@ impl Toast {
         self.kind == ToastKind::Error || self.action.as_ref().is_some_and(|f| f.undoes)
     }
 
-    /// The toast that stands for `count` errors folded off a full stack. It stays until
-    /// dismissed, as they would have, and opens the activity log, which lists each write's
-    /// refusal and unknown outcome with its reason.
-    fn folded_errors(id: usize, count: usize) -> Self {
+    /// The toast that stands for `count` errors about `graph` folded off a full stack. It stays
+    /// until dismissed, as they would have. A graph's fold opens that graph's activity log,
+    /// showing the graph first whatever the window shows then: the log lists each of its
+    /// writes' refusals and unknown outcomes with their reasons, and an unknown outcome's
+    /// branch history is checked from there. Errors about no graph are in no activity log, so
+    /// their fold offers nothing to open.
+    fn folded_errors(id: usize, count: usize, graph: Option<GraphAt>) -> Self {
+        let action = graph.as_ref().map(|at| FollowUp {
+            label: "Open activity".into(),
+            action: Box::new(studio_actions::workspace::ActivatePanel {
+                id: ACTIVITY_PANEL.into(),
+            }),
+            on: Some(WrittenTo {
+                server_url: at.server_url.clone(),
+                graph: at.graph.clone(),
+                branch: None,
+            }),
+            undoes: false,
+        });
         Self {
             id,
             kind: ToastKind::Error,
-            message: folded_errors_text(count),
-            action: Some(FollowUp {
-                label: "Open activity".into(),
-                action: Box::new(studio_actions::workspace::ActivatePanel {
-                    id: ACTIVITY_PANEL.into(),
-                }),
-                on: None,
-                undoes: false,
-            }),
+            message: folded_errors_text(count, graph.as_ref()),
+            action,
             remaining: None,
             hovered: false,
             folded: count,
+            graph,
         }
     }
 }
 
-/// The text of the toast that stands for `count` errors folded off the stack, which takes the
-/// place of the oldest of them: so they are earlier than every error still shown. A fold starts
-/// at two, the fewest that makes room.
-fn folded_errors_text(count: usize) -> SharedString {
-    format!("{count} earlier errors").into()
+/// The text of the toast that stands for `count` errors about `graph` folded off the stack,
+/// which takes the place of the oldest of them: so they are earlier than every error about it
+/// still shown. It names its graph, as a parked graph's toast does, since each graph's errors
+/// fold apart. A fold starts at two, the fewest that makes room.
+fn folded_errors_text(count: usize, graph: Option<&GraphAt>) -> SharedString {
+    match graph {
+        Some(at) => format!("{}: {count} earlier errors", at.graph).into(),
+        None => format!("{count} earlier errors").into(),
+    }
 }
 
 struct FollowUp {
@@ -166,13 +183,31 @@ struct FollowUp {
     undoes: bool,
 }
 
-/// Where a write went: its graph, by its server's address and id as tabs identify a graph,
-/// and its branch.
+/// Where a write went: its graph, by its server's address and id as the window finds an open
+/// graph ([`Workspace::open_session_for`]), and its branch; `None` for a follow-up about the
+/// graph as a whole (a fold of its errors), which leaves the graph on its branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WrittenTo {
     server_url: String,
     graph: String,
-    branch: String,
+    branch: Option<String>,
+}
+
+impl WrittenTo {
+    fn graph_at(&self) -> GraphAt {
+        GraphAt {
+            server_url: self.server_url.clone(),
+            graph: self.graph.clone(),
+        }
+    }
+}
+
+/// A graph a toast is about, as the window finds an open graph: its server's address and its
+/// id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GraphAt {
+    server_url: String,
+    graph: String,
 }
 
 /// How long a success or info toast stays (spec 002); hovering pauses it.
@@ -271,8 +306,9 @@ pub struct Workspace {
     lights_shown: bool,
     /// The settings file problem last shown, so a toast appears once per problem.
     settings_error: Option<String>,
-    /// What the CLI's files could not give, and the servers not added at start, as last shown.
-    cli_errors: Vec<String>,
+    /// The registry's notices about the servers ([`ConnectionRegistry::notices`]), as last
+    /// shown.
+    server_notices: Vec<String>,
     _settings_subscription: Subscription,
     /// Studio's memory and CPU for the status bar while `studio.show_performance` is on (the
     /// default), read every two seconds while the window is in front.
@@ -432,11 +468,12 @@ impl Workspace {
                 this.update(cx, |this, cx| this.save_bounds(cx)).ok();
             }));
         });
-        // So are the CLI's files when they cannot be read (servers read before stand meanwhile).
+        // So is each notice about the servers: the CLI's targets that cannot be listed or used
+        // (servers read before stand meanwhile), the environment's server not added.
         let registry = ConnectionRegistry::try_global(cx);
         let registry_subscription = registry.as_ref().map(|registry| {
             cx.observe(registry, |this, registry, cx| {
-                this.show_cli_errors(&registry, cx)
+                this.show_server_notices(&registry, cx)
             })
         });
         // The window's graphs ask after their branch heads at once when it becomes active and a
@@ -486,7 +523,7 @@ impl Workspace {
             traffic_lights: None,
             lights_shown: cfg!(target_os = "macos"),
             settings_error: None,
-            cli_errors: Vec::new(),
+            server_notices: Vec::new(),
             _settings_subscription: settings_subscription,
             performance: None,
             window_active: window.is_window_active(),
@@ -512,7 +549,7 @@ impl Workspace {
             _item_subscriptions: Vec::new(),
         };
         if let Some(registry) = registry {
-            this.show_cli_errors(&registry, cx);
+            this.show_server_notices(&registry, cx);
         }
         this.watch_performance(cx);
         this
@@ -603,8 +640,8 @@ impl Workspace {
         )
     }
 
-    /// The CLI target and graph id the open session's state is saved under.
-    fn graph_key(&self, cx: &App) -> Option<(String, String)> {
+    /// The key the shown graph's tabs and drafts are saved under ([`saved_key_of`]).
+    fn saved_key(&self, cx: &App) -> Option<String> {
         self.session
             .as_ref()
             .map(|session| saved_key_of(session, cx))
@@ -686,7 +723,7 @@ impl Workspace {
     /// Writes the workspace's state shortly after it stops changing.
     fn save_if_changed(&mut self, cx: &mut Context<Self>) {
         self.save_open_graphs(cx);
-        let Some((url, graph)) = self.graph_key(cx) else {
+        let Some(key) = self.saved_key(cx) else {
             return;
         };
         let snapshot = self.snapshot(cx);
@@ -696,7 +733,7 @@ impl Workspace {
         self.saved = Some(snapshot.clone());
         self._save = Some(cx.spawn(async move |_, cx| {
             cx.background_executor().timer(SAVE_DELAY).await;
-            persistence::save(&url, &graph, &snapshot);
+            persistence::save(&key, &snapshot);
         }));
     }
 
@@ -733,10 +770,10 @@ impl Workspace {
 
     /// Reopens the tabs and panels remembered for the open graph.
     fn restore(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((url, graph)) = self.graph_key(cx) else {
+        let Some(key) = self.saved_key(cx) else {
             return;
         };
-        if let Some(saved) = persistence::load(&url, &graph) {
+        if let Some(saved) = persistence::load(&key) {
             self.restore_saved(saved, window, cx);
         }
     }
@@ -831,7 +868,7 @@ impl Workspace {
         // A graph the window has open keeps its session, its tabs and its place among the
         // graphs: it is shown, on the branch the new session is for. A second session for it
         // would leave its tabs on the first, and a write in flight unseen.
-        let (url, graph) = graph_key_of(&session, cx);
+        let (url, graph) = address_of(&session, cx);
         if let Some(open) = self.open_session_for(&url, &graph, cx) {
             let branch = session.read(cx).branch.clone();
             open.update(cx, |open, cx| open.set_branch(branch, cx));
@@ -860,10 +897,7 @@ impl Workspace {
     /// left as it is.
     pub fn add_session_behind(&mut self, session: Entity<GraphSession>, cx: &mut Context<Self>) {
         let saved = persistence::restore_enabled()
-            .then(|| {
-                let (target, graph) = saved_key_of(&session, cx);
-                persistence::load(&target, &graph)
-            })
+            .then(|| persistence::load(&saved_key_of(&session, cx)))
             .flatten();
         self.add_behind(session, saved, cx);
     }
@@ -874,7 +908,7 @@ impl Workspace {
         saved: Option<SavedWorkspace>,
         cx: &mut Context<Self>,
     ) {
-        let (url, graph) = graph_key_of(&session, cx);
+        let (url, graph) = address_of(&session, cx);
         if self.open_session_for(&url, &graph, cx).is_some() {
             return;
         }
@@ -952,13 +986,13 @@ impl Workspace {
     /// Writes the shown graph's state now, rather than after the save delay, when a save is
     /// waiting or the state is not what was last written.
     fn save_now(&mut self, cx: &mut Context<Self>) {
-        let Some((url, graph)) = self.graph_key(cx) else {
+        let Some(key) = self.saved_key(cx) else {
             return;
         };
         let pending = self._save.take().is_some();
         let snapshot = self.snapshot(cx);
         if pending || self.saved.as_ref() != Some(&snapshot) {
-            persistence::save(&url, &graph, &snapshot);
+            persistence::save(&key, &snapshot);
             self.saved = Some(snapshot);
         }
     }
@@ -1034,9 +1068,9 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The session this window has open for `graph` on the server at `url`. A graph is matched
-    /// by its server's address, as its saved state is kept, so one open under another name the
-    /// CLI gives that server is the same graph.
+    /// The session this window has open for `graph` on the server at `url`. A graph open is
+    /// matched by its server's address, as a link and the Open dialog name it: an address is
+    /// one connection, which a target renamed on it keeps, so the graph stays the same one.
     pub fn open_session_for(
         &self,
         url: &str,
@@ -1224,7 +1258,7 @@ impl Workspace {
     /// of writes it belongs to. A graph not shown names itself.
     fn toast_outcomes(&mut self, session: &Entity<GraphSession>, cx: &mut Context<Self>) {
         let id = session.entity_id();
-        let (server_url, _) = graph_key_of(session, cx);
+        let (server_url, _) = address_of(session, cx);
         let read = session.read(cx);
         let logged = read.outcomes_logged;
         let seen = self.outcomes_toasted.insert(id, logged).unwrap_or(logged);
@@ -1236,7 +1270,7 @@ impl Workspace {
             let written_to = WrittenTo {
                 server_url: server_url.clone(),
                 graph: graph.clone(),
-                branch: entry.branch.clone(),
+                branch: Some(entry.branch.clone()),
             };
             self.toast_outcome(entry, written_to, !shown, cx);
         }
@@ -1272,17 +1306,21 @@ impl Workspace {
                 "Open history".into(),
                 Box::new(OpenHistory),
             ),
-            OutcomeKind::Refused { .. } => return self.show_toast(ToastKind::Error, text, cx),
+            OutcomeKind::Refused { .. } => {
+                let graph = Some(written_to.graph_at());
+                return self.push_toast(ToastKind::Error, text.into(), None, graph, cx);
+            }
         };
         let undoes = matches!(latest.outcome, OutcomeKind::Committed { .. })
             && latest.follow_up == Some(graph_store::FollowUp::UndoDelete);
+        let graph = Some(written_to.graph_at());
         let follow_up = FollowUp {
             label,
             action,
             on: Some(written_to),
             undoes,
         };
-        self.push_toast(kind, text.into(), Some(follow_up), cx);
+        self.push_toast(kind, text.into(), Some(follow_up), graph, cx);
     }
 
     /// Runs a toast's follow-up. One about a write acts on the graph and branch written to,
@@ -1315,7 +1353,9 @@ impl Workspace {
                 return;
             };
             switched = self.session.as_ref() != Some(&session);
-            session.update(cx, |session, cx| session.set_branch(on.branch, cx));
+            if let Some(branch) = on.branch {
+                session.update(cx, |session, cx| session.set_branch(branch, cx));
+            }
             self.show_graph(session.entity_id(), window, cx);
             // Actions reach the window's handlers along the focus path of the frame drawn last,
             // which has no tab of the graph just shown: dispatched from the window, they do.
@@ -2168,8 +2208,8 @@ impl Workspace {
         true
     }
 
-    #[cfg(test)]
-    fn has_modal(&self) -> bool {
+    /// Whether a modal is open: a window waiting to ask for a graph does not ask over one.
+    pub fn has_modal(&self) -> bool {
         self.modal.is_some()
     }
 
@@ -2179,7 +2219,7 @@ impl Workspace {
         message: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
-        self.push_toast(kind, message.into(), None, cx);
+        self.push_toast(kind, message.into(), None, None, cx);
     }
 
     /// A toast with one follow-up button, such as "Open settings" (spec 002), run where the
@@ -2198,7 +2238,7 @@ impl Workspace {
             on: None,
             undoes: false,
         };
-        self.push_toast(kind, message.into(), Some(follow_up), cx);
+        self.push_toast(kind, message.into(), Some(follow_up), None, cx);
     }
 
     fn show_settings_error(&mut self, cx: &mut Context<Self>) {
@@ -2218,24 +2258,29 @@ impl Workspace {
         }
     }
 
-    /// Names each new error from the CLI's files, and each problem with the servers at start,
-    /// in a toast that stays until dismissed.
-    fn show_cli_errors(&mut self, registry: &Entity<ConnectionRegistry>, cx: &mut Context<Self>) {
-        let registry = registry.read(cx);
-        let errors = server_notices(registry.cli_errors(), registry.start_errors());
-        for error in &errors {
-            if !self.cli_errors.contains(error) {
-                self.show_toast(ToastKind::Error, error.clone(), cx);
+    /// Names each new notice about the servers ([`ConnectionRegistry::notices`]) in a toast
+    /// that stays until dismissed, in its own words.
+    fn show_server_notices(
+        &mut self,
+        registry: &Entity<ConnectionRegistry>,
+        cx: &mut Context<Self>,
+    ) {
+        let notices = registry.read(cx).notices().to_vec();
+        for notice in &notices {
+            if !self.server_notices.contains(notice) {
+                self.show_toast(ToastKind::Error, notice.clone(), cx);
             }
         }
-        self.cli_errors = errors;
+        self.server_notices = notices;
     }
 
+    /// Shows a toast, about `graph` when it is about one.
     fn push_toast(
         &mut self,
         kind: ToastKind,
         message: SharedString,
         action: Option<FollowUp>,
+        graph: Option<GraphAt>,
         cx: &mut Context<Self>,
     ) {
         let id = self.next_toast;
@@ -2253,6 +2298,7 @@ impl Workspace {
             remaining,
             hovered: false,
             folded: 0,
+            graph,
         });
         cx.notify();
         if remaining.is_none() {
@@ -2314,27 +2360,40 @@ impl Workspace {
         }
     }
 
-    /// One toast fewer by folding errors: the oldest error shown on its own joins the toast
-    /// that counts errors folded, or, with none up, the two oldest become that toast, in the
-    /// older's place. Fewer than that up, nothing folds.
+    /// One toast fewer by folding one graph's errors: the oldest error shown on its own that
+    /// can fold joins the toast that counts its graph's errors folded, or, with none up, it and
+    /// the next of its graph's errors shown alone become that toast, in the older's place.
+    /// Errors about no graph fold only with each other. With no two errors of one graph up,
+    /// nothing folds. A fold stands for one graph, so its Open activity shows that graph's log,
+    /// where each of the errors folded is listed.
     fn fold_oldest_error(&mut self) {
         let alone = |toast: &Toast| toast.kind == ToastKind::Error && toast.folded == 0;
-        let Some(oldest) = self.toasts.iter().position(alone) else {
-            return;
-        };
-        if let Some(fold) = self.toasts.iter_mut().find(|toast| toast.folded > 0) {
-            fold.folded += 1;
-            fold.message = folded_errors_text(fold.folded);
-            self.toasts.remove(oldest);
-            return;
+        for oldest in 0..self.toasts.len() {
+            if !alone(&self.toasts[oldest]) {
+                continue;
+            }
+            let graph = self.toasts[oldest].graph.clone();
+            if let Some(fold) = self
+                .toasts
+                .iter_mut()
+                .find(|toast| toast.folded > 0 && toast.graph == graph)
+            {
+                fold.folded += 1;
+                fold.message = folded_errors_text(fold.folded, graph.as_ref());
+                self.toasts.remove(oldest);
+                return;
+            }
+            let next = self.toasts[oldest + 1..]
+                .iter()
+                .position(|toast| alone(toast) && toast.graph == graph);
+            if let Some(next) = next {
+                self.toasts.remove(oldest + 1 + next);
+                let id = self.next_toast;
+                self.next_toast += 1;
+                self.toasts[oldest] = Toast::folded_errors(id, 2, graph);
+                return;
+            }
         }
-        let Some(next) = self.toasts[oldest + 1..].iter().position(alone) else {
-            return;
-        };
-        self.toasts.remove(oldest + 1 + next);
-        let id = self.next_toast;
-        self.next_toast += 1;
-        self.toasts[oldest] = Toast::folded_errors(id, 2);
     }
 
     pub fn dismiss_toast(&mut self, id: usize, cx: &mut Context<Self>) {
@@ -4045,22 +4104,6 @@ impl Workspace {
     }
 }
 
-/// The toasts' texts for what the CLI's files could not give and for the servers' problems at
-/// start. A start problem is a server named with why it was not added or not connected, or
-/// Studio's saved list that could not be read: a prefix saying a server was not added would be
-/// untrue of the list, so it names only when.
-fn server_notices(cli_errors: &[String], start_errors: &[String]) -> Vec<String> {
-    cli_errors
-        .iter()
-        .map(|error| format!("OmniGraph CLI config: {error}"))
-        .chain(
-            start_errors
-                .iter()
-                .map(|error| format!("Servers at start: {error}")),
-        )
-        .collect()
-}
-
 /// Takes pane `id` out of a graph's split tree and panes, shown or parked; when it was
 /// `active`, its neighbour in reading order becomes active. False for the graph's last pane,
 /// which stays.
@@ -4087,19 +4130,20 @@ fn take_pane(
     true
 }
 
-/// The server and graph a session's saved state is kept under.
-fn graph_key_of(session: &Entity<GraphSession>, cx: &App) -> (String, String) {
+/// The server address and graph id an open graph is found by in memory
+/// ([`Workspace::open_session_for`]): what a link, the Open dialog and a toast's follow-up name.
+/// Nothing is saved under it.
+fn address_of(session: &Entity<GraphSession>, cx: &App) -> (String, String) {
     let session = session.read(cx);
     let url = session.connection.read(cx).server.url.clone();
     (url, session.graph_id.clone())
 }
 
-/// The key a graph's tabs and drafts are saved under: its CLI target's name and its id, as the
-/// saved windows name it (spec 002).
-fn saved_key_of(session: &Entity<GraphSession>, cx: &App) -> (String, String) {
-    let session = session.read(cx);
-    let target = session.connection.read(cx).server.name.clone();
-    (target, session.graph_id.clone())
+/// The key a graph's tabs and drafts are saved under: the graph's one key, its CLI target's
+/// name and its id (`GraphSession::overrides_key`), as the saved windows name the graph and its
+/// settings, saved queries and conversations are filed (spec 002).
+fn saved_key_of(session: &Entity<GraphSession>, cx: &App) -> String {
+    session.read(cx).overrides_key(cx)
 }
 
 /// The button on a committed write's toast: Undo for a delete Studio can put back (History
@@ -6670,7 +6714,7 @@ mod tests {
             shown,
             [
                 (
-                    "10 earlier errors".to_owned(),
+                    "people: 10 earlier errors".to_owned(),
                     Some("Open activity".to_owned())
                 ),
                 (
@@ -6700,6 +6744,122 @@ mod tests {
                 "Open activity shows the activity log"
             );
             assert_eq!(workspace.toasts.len(), 3, "and the folded toast goes");
+        });
+    }
+
+    /// Errors fold by graph: a fold stands for one graph's errors and names it, and its Open
+    /// activity shows that graph first, so the log it opens lists the errors it counts. An
+    /// outcome nobody knows folded with them is in that log, with its branch. Before, one fold
+    /// took every graph's errors, and its Open activity showed whichever graph was shown.
+    #[gpui::test]
+    fn errors_fold_by_graph_and_open_their_graphs_activity(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+        });
+        let notes = idle_session("http://a.test", "notes", cx);
+        let people = idle_session("http://b.test", "people", cx);
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update(cx, |workspace, cx| {
+            workspace.graph_order.push(people.entity_id());
+            workspace.subscribe_session(people.clone(), cx);
+            workspace.add_behind(notes.clone(), None, cx);
+            for id in ["nodes", ACTIVITY_PANEL] {
+                let view = cx.new(|_| Field);
+                workspace.add_panel(
+                    PanelPosition::Bottom,
+                    id,
+                    id,
+                    IconName::Table,
+                    view.into(),
+                    cx,
+                );
+            }
+            workspace.activate_panel("nodes", cx);
+        });
+        let refuse =
+            |session: &Entity<GraphSession>, n: usize, cx: &mut gpui::VisualTestContext| {
+                let outcome = OutcomeKind::Refused {
+                    message: "the policy denies it".into(),
+                };
+                log_outcome(session, &format!("Write {n}"), outcome, None, cx);
+            };
+        let shown = |cx: &mut gpui::VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .toasts
+                    .iter()
+                    .map(|toast| toast.message.to_string())
+                    .collect::<Vec<_>>()
+            })
+        };
+        refuse(&notes, 1, cx);
+        log_outcome(
+            &notes,
+            "Write 2",
+            OutcomeKind::Unknown {
+                reason: "the connection closed".into(),
+            },
+            None,
+            cx,
+        );
+        refuse(&people, 3, cx);
+        refuse(&people, 4, cx);
+        // The stack is full of errors: the oldest of one graph fold, apart from the other's.
+        refuse(&people, 5, cx);
+        refuse(&people, 6, cx);
+        refuse(&notes, 7, cx);
+        let refused =
+            |n: usize| format!("Write {n} · refused: the policy denies it. Nothing was written.");
+        assert_eq!(
+            shown(cx),
+            [
+                "notes: 2 earlier errors".to_owned(),
+                "people: 3 earlier errors".to_owned(),
+                refused(6),
+                format!("notes: {}", refused(7)),
+            ]
+        );
+
+        // The notes fold's Open activity shows notes, whose log holds what it counts.
+        let fold = workspace.read_with(cx, |workspace, _| workspace.toasts[0].id);
+        workspace.update_in(cx, |workspace, window, cx| {
+            window.focus(&workspace.focus_handle, cx)
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.run_follow_up(fold, window, cx)
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            let session = workspace.session().unwrap().read(cx);
+            assert_eq!(session.graph_id, "notes", "the fold's graph is shown");
+            assert_eq!(session.branch, "main");
+            let logged: Vec<_> = session
+                .outcomes
+                .iter()
+                .map(|entry| entry.description.as_str())
+                .collect();
+            assert_eq!(logged, ["Write 1", "Write 2", "Write 7"]);
+            assert!(matches!(
+                session.outcomes[1].outcome,
+                OutcomeKind::Unknown { .. }
+            ));
+            assert_eq!(
+                (workspace.bottom.open, workspace.bottom.active_id()),
+                (true, Some(ACTIVITY_PANEL.into())),
+                "Open activity shows the activity log"
+            );
+        });
+        // Errors about no graph fold only with each other, and offer nothing to open.
+        workspace.update(cx, |workspace, cx| {
+            workspace.toasts.clear();
+            for n in 1..=5 {
+                workspace.show_toast(ToastKind::Error, format!("Notice {n}"), cx);
+            }
+            let fold = &workspace.toasts[0];
+            assert_eq!(fold.message.as_ref(), "2 earlier errors");
+            assert!(fold.action.is_none());
         });
     }
 
@@ -6770,30 +6930,12 @@ mod tests {
                 let follow_up = toast.action.as_ref().unwrap();
                 assert_eq!(follow_up.label.as_ref(), "Open history");
                 let on = follow_up.on.as_ref().unwrap();
-                assert_eq!((on.graph.as_str(), on.branch.as_str()), ("people", branch));
+                assert_eq!(
+                    (on.graph.as_str(), on.branch.as_deref()),
+                    ("people", Some(branch))
+                );
             }
         });
-    }
-
-    /// A saved list that could not be read is not called a server that could not be added.
-    #[test]
-    fn a_start_notice_says_only_what_happened() {
-        let notices = server_notices(
-            &["config.yaml: could not parse".into()],
-            &[
-                "Studio's saved servers could not be read (bad), so it starts without them".into(),
-                "dev: the address is not valid".into(),
-            ],
-        );
-        assert_eq!(
-            notices,
-            [
-                "OmniGraph CLI config: config.yaml: could not parse",
-                "Servers at start: Studio's saved servers could not be read (bad), so it starts \
-                 without them",
-                "Servers at start: dev: the address is not valid",
-            ]
-        );
     }
 
     /// A tab of a parked graph that asks to close (a conversation deleted in another window)

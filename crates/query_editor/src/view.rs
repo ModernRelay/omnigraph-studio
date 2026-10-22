@@ -846,6 +846,8 @@ impl QueryEditor {
             gone: false,
             pending: Map::new(),
         };
+        // A restored tab is made before anything asked for the catalog it reads its query from.
+        session.update(cx, |session, cx| session.want_stored_queries(cx));
         let mut this = Self::build(number, session, Some(stored), None, window, cx);
         this.sync_stored_params(window, cx);
         // Opened before the catalog was read, or after the query left it.

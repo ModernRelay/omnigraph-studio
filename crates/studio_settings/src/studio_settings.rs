@@ -282,12 +282,12 @@ impl TypeNaming {
     }
 }
 
-/// A graph's one key: its server's address and its id, `<server url>/<graph id>`, as a window
-/// keeps the graph's tabs. Its `graphs` settings, its saved queries' folder ([`queries_dir`])
-/// and its agent conversations are kept under it, so a server renamed in the CLI's config
-/// keeps them all.
-pub fn overrides_key(server_url: &str, graph: &str) -> String {
-    format!("{}/{graph}", server_url.trim_end_matches('/'))
+/// A graph's one key for everything Studio saves of it: its CLI target's name and its id,
+/// `<target>/<graph id>` (a target's name holds no `/`). Its `graphs` settings, its tabs and
+/// drafts, its saved queries' folder ([`queries_dir`]) and its agent conversations are kept
+/// under it, as the windows a start reopens name the graph.
+pub fn overrides_key(target: &str, graph: &str) -> String {
+    format!("{target}/{graph}")
 }
 
 /// The agent the agent panel runs (spec 011): a program and its arguments, and extra
@@ -608,9 +608,9 @@ impl StudioSettings {
         self.graphs.retain(|_, overrides| !overrides.is_empty());
     }
 
-    /// The limits in effect for `graph` on the server at `server_url`.
-    pub fn for_graph(&self, server_url: &str, graph: &str) -> GraphOptions {
-        let own = self.graphs.get(&overrides_key(server_url, graph));
+    /// The limits in effect for `graph` on the CLI target `target`.
+    pub fn for_graph(&self, target: &str, graph: &str) -> GraphOptions {
+        let own = self.graphs.get(&overrides_key(target, graph));
         let pick = |get: fn(&GraphOverrides) -> Option<u32>, fallback: u32| {
             own.and_then(get).unwrap_or(fallback)
         };
@@ -1174,19 +1174,14 @@ mod tests {
         let settings = read_clean(
             r#"{
                 "studio": {"canvas_max_nodes": 3000},
-                "graphs": {"http://127.0.0.1:8787/knowledge": {"tree_page_size": 10}}
+                "graphs": {"dev/knowledge": {"tree_page_size": 10}}
             }"#,
         );
-        let dev = settings.for_graph("http://127.0.0.1:8787", "knowledge");
+        let dev = settings.for_graph("dev", "knowledge");
         assert_eq!(dev.tree_page_size, 10, "the graph's own value");
         assert_eq!(dev.canvas_max_nodes, 3000, "else the shared value");
-        assert_eq!(
-            settings.for_graph("http://127.0.0.1:8787/", "knowledge"),
-            dev,
-            "a trailing slash names the same server"
-        );
-        let other = settings.for_graph("https://prod.example", "knowledge");
-        assert_eq!(other.tree_page_size, 50, "a key names one server's graph");
+        let other = settings.for_graph("prod", "knowledge");
+        assert_eq!(other.tree_page_size, 50, "a key names one target's graph");
     }
 
     #[test]
@@ -1234,9 +1229,9 @@ mod tests {
 
     #[test]
     fn query_folders_are_safe_names_per_graph() {
-        let dir = queries_dir(&overrides_key("http://127.0.0.1:8787", "knowledge"));
+        let dir = queries_dir(&overrides_key("dev.example.com", "knowledge"));
         assert!(
-            dir.ends_with("queries/http_~~127.0.0.1_8787~knowledge"),
+            dir.ends_with("queries/dev.example.com~knowledge"),
             "{dir:?}"
         );
         assert!(queries_dir("http://a b/g").ends_with("queries/http_~~a_b~g"));

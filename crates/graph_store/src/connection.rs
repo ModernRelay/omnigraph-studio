@@ -2,6 +2,7 @@
 
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui::{Context, EventEmitter, Task};
@@ -88,6 +89,9 @@ pub enum ConnectionEvent {
     /// The token was replaced by another: what was read with the old one, and what it was
     /// allowed to do, is to be read again.
     CredentialChanged,
+    /// The connection knows the token its requests carry: its token source answered, or a token
+    /// was given ([`Connection::token_ready`]). A graph's first reads wait for it.
+    TokenReady,
 }
 
 /// Held by whatever shows a server (a window's graph, the Open dialog): its health is checked
@@ -125,6 +129,12 @@ pub struct Connection {
     token_fresh: bool,
     /// The source was asked again after a 401, which it is once until a connect is ready.
     asked_after_refusal: bool,
+    /// The source has answered since it was set, with a token or why it gave none: requests
+    /// sent from then carry what it gave ([`Connection::token_ready`]).
+    token_answered: bool,
+    /// Raised while a window waits for the source's answer ([`Connection::wait_for_token`]):
+    /// the CLI serves this ask before the others waiting for it. Lowered when it answers.
+    hurry: Arc<AtomicBool>,
     /// The source asked again while the connection stands (after a 401, on Refresh, for a
     /// changed target).
     _asking: Option<Task<()>>,
@@ -182,6 +192,8 @@ impl Connection {
             token_given: false,
             token_fresh: false,
             asked_after_refusal: false,
+            token_answered: false,
+            hurry: Arc::default(),
             _asking: None,
             _task: None,
             _listing: None,
@@ -205,7 +217,10 @@ impl Connection {
     pub fn wait_for_a_token(&mut self) {
         struct Waiting;
         impl TokenSource for Waiting {
-            fn token(&self) -> futures::future::BoxFuture<'static, Result<Token, String>> {
+            fn token(
+                &self,
+                _: Arc<AtomicBool>,
+            ) -> futures::future::BoxFuture<'static, Result<Token, String>> {
                 use futures::FutureExt as _;
                 futures::future::pending().boxed()
             }
@@ -230,9 +245,24 @@ impl Connection {
         }
     }
 
-    /// Whether its token comes from the OmniGraph CLI (`credentials export`).
-    pub fn token_from_cli(&self) -> bool {
-        self.token_source.is_some()
+    /// Whether requests sent now carry the token they would carry once the token source has
+    /// answered: the connection has no source (a server given its token, an anonymous CLI
+    /// target), a token was given, or the source has answered since it was set. A graph's first
+    /// reads wait until it does ([`ConnectionEvent::TokenReady`]), so they are not sent without
+    /// the token the CLI is about to give.
+    pub fn token_ready(&self) -> bool {
+        !self.asks_token_source() || self.token_answered
+    }
+
+    /// A window waits for this connection's token: its ask goes before the CLI's other work
+    /// waiting, and a connection never connected connects, which asks for it. Nothing changes
+    /// once the token is ready.
+    pub fn wait_for_token(&mut self, cx: &mut Context<Self>) {
+        if self.token_ready() {
+            return;
+        }
+        self.hurry.store(true, Ordering::SeqCst);
+        self.connect_if_idle(cx);
     }
 
     /// Asks the token source again, as the person's Refresh does: a token typed in no longer
@@ -255,8 +285,9 @@ impl Connection {
         let Some(source) = self.token_source.clone() else {
             return;
         };
+        let hurry = self.hurry.clone();
         let asking = cx.spawn(async move |this, cx| {
-            let answer = cx.background_executor().spawn(source.token()).await;
+            let answer = cx.background_executor().spawn(source.token(hurry)).await;
             this.update(cx, |this, cx| this.token_answered(answer, connecting, cx))
                 .ok();
         });
@@ -277,6 +308,12 @@ impl Connection {
     ) {
         if !connecting {
             self._asking = None;
+        }
+        let was_ready = self.token_ready();
+        self.token_answered = true;
+        self.hurry.store(false, Ordering::SeqCst);
+        if !was_ready {
+            cx.emit(ConnectionEvent::TokenReady);
         }
         match answer {
             Ok(token) => {
@@ -356,7 +393,11 @@ impl Connection {
     /// (spec 003): a token source is not asked over it until Refresh. Requests made after this
     /// use it, and a connection in use checks again; one not yet used connects when it is.
     pub fn set_token(&mut self, token: Option<String>, cx: &mut Context<Self>) {
+        let was_ready = self.token_ready();
         self.token_given = true;
+        if !was_ready {
+            cx.emit(ConnectionEvent::TokenReady);
+        }
         self.replace_token(token, None, cx);
     }
 
