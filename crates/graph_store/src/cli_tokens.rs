@@ -10,7 +10,10 @@
 //! newline to a pipe and refuses a terminal or a file. So an environment variable, a token file,
 //! the CLI's secure store and a credential helper are each resolved by OmniGraph's own code
 //! (OmniGraph RFC 1017, "Static tokens for clients"). Studio keeps a token in memory only, never
-//! logs or writes it, and sends it only to the endpoint of the target it was exported for.
+//! logs or writes it, and sends it only to the endpoint of the target it was exported for. Only
+//! the export needs a Unix pipe: on Windows the CLI refuses every export, so Studio there finds
+//! the CLI and lists its targets as on Unix, and uses only those that take no token
+//! ([`crate::cli_config::Platform`]).
 //!
 //! Studio looks for the CLI where [`candidates`] says: first the one Studio's settings name
 //! (`omnigraph_cli`, [`configured`]), then on `PATH` and in the install folders. A program is the
@@ -306,15 +309,10 @@ impl Unfit {
 }
 
 /// The first of `programs` that is an OmniGraph CLI Studio can drive for its servers
-/// ([`probe`]). Otherwise why none is, naming each program found.
+/// ([`probe`]), on every system: only `credentials export` needs a Unix pipe, so where there is
+/// none the CLI still lists its targets, and a target that takes a token is refused as it is
+/// listed ([`crate::cli_config::Platform`]). Otherwise why none is, naming each program found.
 pub(crate) async fn find_cli(programs: &[PathBuf], turn: &Held) -> Result<FoundCli, String> {
-    if !cfg!(unix) {
-        return Err(
-            "the OmniGraph CLI gives a token only through a Unix pipe, which this system \
-                    does not have"
-                .to_owned(),
-        );
-    }
     let mut unfit: Vec<String> = Vec::new();
     for program in installed(programs) {
         match probe(&program, turn).await {
@@ -1231,7 +1229,7 @@ mod tests {
     use http_client::{AsyncBody, FakeHttpClient, Response};
 
     use super::*;
-    use crate::cli_config::{CliAuth, read_targets};
+    use crate::cli_config::{CliAuth, Platform, read_targets};
     use crate::connection::{Connection, ConnectionState, ServerEntry, ServerSource};
 
     /// What `version --json` reports at OmniGraph main `7fff9dfd` (`0.14.0-edge+7fff9df`).
@@ -1492,7 +1490,9 @@ exit 64
     /// others with where their credential is), direct and managed targets are refused, each
     /// with why, a managed target is kept as the listing describes it with no other command, a
     /// custom CA is not supported yet, and a second target on an address is named as an
-    /// alternative. A configuration the CLI refuses lists nothing, with the CLI's own words.
+    /// alternative. Where the CLI exports no token (Windows), the CLI is found and the targets
+    /// listed alike, and each server target that takes a token is refused with why. A
+    /// configuration the CLI refuses lists nothing, with the CLI's own words.
     #[test]
     fn the_targets_are_listed_as_the_cli_describes_them() {
         let cli = StandIn::new("targets");
@@ -1517,7 +1517,7 @@ exit 64
             ),
         );
         let home = cli.dir.join("home");
-        let listed = smol::block_on(read_targets(Some(&home), &cli.programs()));
+        let listed = smol::block_on(read_targets(Some(&home), &cli.programs(), Platform::Unix));
         let servers = listed.servers.clone().unwrap();
         let shown: Vec<_> = servers
             .iter()
@@ -1630,12 +1630,65 @@ exit 64
             "one command, which reads no credential"
         );
 
+        // Where the CLI exports no token (Windows), the same CLI is found and the same targets
+        // listed with the same one command: the anonymous ones land, `stored-too` now the one
+        // target on its address, and each that takes a token is refused with why, after any
+        // refusal that holds on every system, its token file not watched.
+        let windows = smol::block_on(read_targets(Some(&home), &cli.programs(), Platform::Other));
+        let landed: Vec<_> = windows
+            .servers
+            .clone()
+            .unwrap()
+            .into_iter()
+            .map(|server| (server.name, server.auth, server.alternatives))
+            .collect();
+        assert_eq!(
+            landed,
+            [
+                ("open".to_owned(), CliAuth::Anonymous, vec![]),
+                ("stored-too".to_owned(), CliAuth::Anonymous, vec![]),
+            ]
+        );
+        for name in ["envy", "filed", "helped", "stored"] {
+            let refused = format!(
+                "CLI target '{name}' takes a token, and the OmniGraph CLI gives a token only \
+                 through a Unix pipe, so Studio on Windows cannot use this target yet"
+            );
+            assert!(
+                windows.errors.contains(&refused),
+                "{name}: {:?}",
+                windows.errors
+            );
+        }
+        for (name, said) in [
+            ("disk", "opens storage directly"),
+            ("rooted", "scope root"),
+            ("cloud", "managed cluster"),
+            ("control", "managed cluster"),
+            ("strategy", "does not support yet"),
+        ] {
+            assert!(
+                windows
+                    .errors
+                    .iter()
+                    .any(|error| error.starts_with(&format!("CLI target '{name}'"))
+                        && error.contains(said)),
+                "{name}: {:?}",
+                windows.errors
+            );
+        }
+        assert_eq!(windows.errors.len(), 9, "{:?}", windows.errors);
+        assert_eq!(windows.managed, listed.managed);
+        let watched: Vec<&PathBuf> = windows.watched.iter().map(|(path, _)| path).collect();
+        assert_eq!(watched, [&home.join("config.yaml")]);
+        assert_eq!(cli.commands(), ["target list --json"]);
+
         // The CLI's own refusal of an old-format file, as it answers `--json`.
         cli.write(
             "list-refused.json",
             r#"{"error":"target_config_invalid: operator config '/h/config.yaml': legacy target_config_version is unsupported; write a version: 1 operator document using docs/user/cli/targets.md#upgrade-from-the-old-format; there is no automatic importer","code":"target_config_invalid"}"#,
         );
-        let refused = smol::block_on(read_targets(Some(&home), &cli.programs()));
+        let refused = smol::block_on(read_targets(Some(&home), &cli.programs(), Platform::Unix));
         assert_eq!(refused.servers, None);
         assert_eq!(refused.errors.len(), 1);
         assert!(
@@ -2449,11 +2502,32 @@ mod variable_tests {
     }
 }
 
+/// What holds on every system, Windows included, where the stand-in CLI (a shell script) cannot
+/// run.
+#[cfg(test)]
+mod every_system_tests {
+    use super::*;
+
+    /// The CLI is looked for on every system: with no program where Studio looks, Studio says
+    /// so, never that the system has no Unix pipe. Before, every system but Unix was refused
+    /// before a program was looked at, so a Windows Studio listed no CLI target at all.
+    #[test]
+    fn the_cli_is_looked_for_on_every_system() {
+        let why = smol::block_on(async {
+            let turn = take_turn(&Arc::default(), READ_TIMEOUT, "a look for the CLI").await?;
+            find_cli(&[], &turn).await
+        })
+        .unwrap_err();
+        assert!(why.contains("no `omnigraph` is on PATH"), "{why}");
+        assert!(!why.contains("Unix pipe"), "{why}");
+    }
+}
+
 /// Against the person's own CLI and operator home, which CI has neither.
 #[cfg(all(test, unix))]
 mod live_tests {
     use super::*;
-    use crate::cli_config::{CliAuth, operator_dir, read_targets};
+    use crate::cli_config::{CliAuth, Platform, operator_dir, read_targets};
 
     /// Every server target that takes a token is given one when all are asked at once, each
     /// from a thread of its own, as the Open dialog asks them. Only the tokens' lengths are
@@ -2463,7 +2537,11 @@ mod live_tests {
                 operator home with server targets whose credentials are configured"]
     fn every_server_target_is_given_its_token_when_asked_together() {
         let dir = operator_dir();
-        let listed = smol::block_on(read_targets(dir.as_deref(), &candidates()));
+        let listed = smol::block_on(read_targets(
+            dir.as_deref(),
+            &candidates(),
+            Platform::CURRENT,
+        ));
         let servers = listed.servers.expect("the CLI lists its targets");
         let threads: Vec<_> = servers
             .iter()

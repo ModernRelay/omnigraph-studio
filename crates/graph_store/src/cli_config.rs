@@ -3,16 +3,17 @@
 //! Studio reads no operator configuration itself: `omnigraph target list --json`, run with the
 //! CLI Studio chose ([`crate::cli_tokens`]), says what the targets are, without a server or a
 //! secret. A `server` target lands on a server, an anonymous one sending no token and any other
-//! taking its token from the CLI's `credentials export`. A `direct` target is refused: Studio
-//! never opens storage or starts a server. A `managed` cluster is refused until Studio has its own
-//! sign-in: it does not borrow the CLI's managed token (OmniGraph RFC 1017, "One server model" and
-//! A2). An address is one server: of the targets on one endpoint, Studio connects as the first by
-//! name and names the others, each an identity of its own, as alternatives it does not connect
-//! as (`target list --json` does not say which target is the default). The CLI's aliases are not
-//! read: the CLI has no command that lists them. Studio lists the targets again when the
-//! operator file, a token file a target names, or the CLI where Studio looks for it changes
-//! ([`stamp`]); it never writes or parses the file. A listing is one turn at the CLI, and one
-//! command once the CLI is known: `target list --json`.
+//! taking its token from the CLI's `credentials export`, which gives one only on a Unix system:
+//! elsewhere (Windows) a target that takes a token is refused, with why ([`Platform`]). A
+//! `direct` target is refused: Studio never opens storage or starts a server. A `managed` cluster
+//! is refused until Studio has its own sign-in: it does not borrow the CLI's managed token
+//! (OmniGraph RFC 1017, "One server model" and A2). An address is one server: of the targets on
+//! one endpoint, Studio connects as the first by name and names the others, each an identity of
+//! its own, as alternatives it does not connect as (`target list --json` does not say which
+//! target is the default). The CLI's aliases are not read: the CLI has no command that lists
+//! them. Studio lists the targets again when the operator file, a token file a target names, or
+//! the CLI where Studio looks for it changes ([`stamp`]); it never writes or parses the file. A
+//! listing is one turn at the CLI, and one command once the CLI is known: `target list --json`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -70,6 +71,37 @@ pub enum CliCredential {
     /// `provider: exec`: a credential helper the CLI runs, given this long.
     Helper { timeout: Duration },
 }
+
+/// Whether the system Studio runs on lets the OmniGraph CLI give it a token. Every command Studio
+/// runs to find the CLI and list and check its targets (`version --json`, `target list --json`,
+/// `target inspect`, `credentials status`) reads no secret and runs on every system; only
+/// `credentials export`, the one way the CLI gives Studio a token, needs a Unix pipe. At OmniGraph
+/// main `242ab02f`, its check of its standard output (`commands::targets::stdout_is_pipe`) asks
+/// whether `/dev/stdout` is a FIFO on Unix and is `false` on every other system, with no named
+/// pipe or other route, so on Windows the CLI refuses every export, whatever Studio connects to
+/// its standard output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    /// A Unix system (macOS, Linux): the CLI exports a token to a pipe.
+    Unix,
+    /// Any other (Windows): the CLI exports no token, so a server target that takes one is
+    /// refused, with why, as a direct or managed target is; an anonymous one is used as on Unix.
+    Other,
+}
+
+impl Platform {
+    /// The system Studio runs on.
+    pub const CURRENT: Self = if cfg!(unix) { Self::Unix } else { Self::Other };
+
+    /// Whether the CLI gives Studio a server target's token here (`credentials export`).
+    pub fn exports_tokens(self) -> bool {
+        self == Self::Unix
+    }
+}
+
+/// Why Studio uses no server target that takes a token where the CLI exports none
+/// ([`Platform::Other`]).
+pub(crate) const PIPE_ONLY: &str = "the OmniGraph CLI gives a token only through a Unix pipe";
 
 /// A managed cluster target, as `target list --json` describes it: refused until Studio has its
 /// own sign-in (spec 016 builds that client from these fields, and reads the profile's control
@@ -133,8 +165,13 @@ pub struct CliTargets {
 }
 
 /// Lists the targets of the operator home in `dir` with the first CLI of `programs` Studio can
-/// drive, in one turn at the CLI. No directory is no servers.
-pub async fn read_targets(dir: Option<&Path>, programs: &[PathBuf]) -> CliTargets {
+/// drive, in one turn at the CLI, as they land on `platform` ([`servers_from`]). No directory is
+/// no servers.
+pub async fn read_targets(
+    dir: Option<&Path>,
+    programs: &[PathBuf],
+    platform: Platform,
+) -> CliTargets {
     let Some(dir) = dir else {
         return CliTargets {
             servers: Some(Vec::new()),
@@ -171,7 +208,7 @@ pub async fn read_targets(dir: Option<&Path>, programs: &[PathBuf]) -> CliTarget
     let config_stamp = stamp_of(&config);
     match cli_tokens::list_targets(&cli, &turn).await {
         Ok(targets) => {
-            let mut read = servers_from(&targets);
+            let mut read = servers_from(&targets, platform);
             read.watched.insert(0, (config, config_stamp));
             read
         }
@@ -308,9 +345,12 @@ enum Proxy {
     Environment,
 }
 
-/// The servers `targets` (a `target list --json` answer) land on, with what cannot be used, the
-/// token files to watch and the managed targets refused.
-pub(crate) fn servers_from(targets: &serde_json::Map<String, Value>) -> CliTargets {
+/// The servers `targets` (a `target list --json` answer) land on, on `platform`, with what cannot
+/// be used, the token files to watch and the managed targets refused.
+pub(crate) fn servers_from(
+    targets: &serde_json::Map<String, Value>,
+    platform: Platform,
+) -> CliTargets {
     let mut errors: Vec<String> = Vec::new();
     let mut watched: Vec<(PathBuf, Option<FileStamp>)> = Vec::new();
     let mut landed: Vec<CliServer> = Vec::new();
@@ -319,7 +359,7 @@ pub(crate) fn servers_from(targets: &serde_json::Map<String, Value>) -> CliTarge
     names.sort();
     for name in names {
         let value = &targets[name];
-        match land(name, value, &mut watched, &mut managed) {
+        match land(name, value, platform, &mut watched, &mut managed) {
             Ok(server) => landed.push(server),
             Err(why) => errors.push(format!("CLI target '{name}' {why}")),
         }
@@ -332,11 +372,13 @@ pub(crate) fn servers_from(targets: &serde_json::Map<String, Value>) -> CliTarge
     }
 }
 
-/// The server the target `name`, described as `value`, lands on, or why it lands on none. A
-/// token file it names is watched, with its stamp; a managed target is kept in `managed`.
+/// The server the target `name`, described as `value`, lands on, on `platform`, or why it lands
+/// on none. A token file it names is watched, with its stamp; a managed target is kept in
+/// `managed`.
 fn land(
     name: &str,
     value: &Value,
+    platform: Platform,
     watched: &mut Vec<(PathBuf, Option<FileStamp>)>,
     managed: &mut Vec<ManagedTarget>,
 ) -> Result<CliServer, String> {
@@ -430,6 +472,13 @@ fn land(
         }) => Some(url),
         _ => None,
     };
+    // Last, so a target refused on every system says that instead, and before its token file is
+    // watched, since nothing here reads it.
+    if matches!(auth, CliAuth::Token(_)) && !platform.exports_tokens() {
+        return Err(format!(
+            "takes a token, and {PIPE_ONLY}, so Studio on Windows cannot use this target yet"
+        ));
+    }
     // The token file's stamp is the one watched: a change after it asks for the token again.
     let file_stamp = match &auth {
         CliAuth::Token(CliCredential::File { path }) => {

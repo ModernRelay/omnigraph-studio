@@ -18,7 +18,7 @@ use gpui::{App, AppContext as _, Context, Entity, Global, Task};
 use http_client::HttpClient;
 use serde::{Deserialize, Serialize};
 
-use crate::cli_config::{self, CliAuth, CliServer, CliTargets, FileStamp};
+use crate::cli_config::{self, CliAuth, CliServer, CliTargets, FileStamp, Platform};
 use crate::cli_tokens::{self, CliTokenSource, Token, TokenSource};
 use crate::connection::{Connection, ServerEntry, ServerSource};
 
@@ -32,9 +32,11 @@ type ProxiedHttp = Arc<dyn Fn(&str) -> anyhow::Result<Arc<dyn HttpClient>> + Sen
 type TokenSources = Arc<dyn Fn(&CliServer) -> Option<Arc<dyn TokenSource>> + Send + Sync>;
 
 /// Lists the targets of an operator home with the first CLI Studio can drive of the places
-/// given ([`cli_config::read_targets`]); run off the main thread.
-type Lister =
-    Arc<dyn Fn(Option<PathBuf>, Vec<PathBuf>) -> BoxFuture<'static, CliTargets> + Send + Sync>;
+/// given, as they land on the platform given ([`cli_config::read_targets`]); run off the main
+/// thread.
+type Lister = Arc<
+    dyn Fn(Option<PathBuf>, Vec<PathBuf>, Platform) -> BoxFuture<'static, CliTargets> + Send + Sync,
+>;
 
 /// The graph ids opened on each CLI target, by the target's name, which Studio remembers so the
 /// Open dialog offers them again when a token may not list the server's graphs. It names no
@@ -67,6 +69,10 @@ pub struct ConnectionRegistry {
     proxied: ProxiedHttp,
     token_sources: TokenSources,
     lister: Lister,
+    /// Whether the CLI gives Studio a token here: the system Studio runs on, but in a test. Where
+    /// it gives none (Windows), a target that takes a token is refused as it is listed, and Add
+    /// server takes no token.
+    platform: Platform,
     /// The operator home the CLI reads (`$OMNIGRAPH_HOME`, else `~/.omnigraph`).
     operator_dir: Option<PathBuf>,
     /// The files whose change lists the targets again (the operator file and the token files
@@ -163,9 +169,13 @@ fn cli_token_source(server: &CliServer) -> Option<Arc<dyn TokenSource>> {
     }
 }
 
-/// The targets of the operator home in `dir`, as the CLI lists them.
-fn list_with_the_cli(dir: Option<PathBuf>, places: Vec<PathBuf>) -> BoxFuture<'static, CliTargets> {
-    async move { cli_config::read_targets(dir.as_deref(), &places).await }.boxed()
+/// The targets of the operator home in `dir`, as the CLI lists them, landed on `platform`.
+fn list_with_the_cli(
+    dir: Option<PathBuf>,
+    places: Vec<PathBuf>,
+    platform: Platform,
+) -> BoxFuture<'static, CliTargets> {
+    async move { cli_config::read_targets(dir.as_deref(), &places, platform).await }.boxed()
 }
 
 impl ConnectionRegistry {
@@ -311,6 +321,7 @@ impl ConnectionRegistry {
             proxied: Arc::new(move |_| Ok(same.clone())),
             token_sources: Arc::new(|_| None),
             lister: Arc::new(list_with_the_cli),
+            platform: Platform::CURRENT,
             operator_dir,
             watched: Vec::new(),
             operator_stamp: Vec::new(),
@@ -407,8 +418,13 @@ impl ConnectionRegistry {
                 if !std::mem::take(&mut first) {
                     cx.background_executor().timer(OPERATOR_POLL).await;
                 }
-                let Ok((watched, places, listing)) = this.update(cx, |this, _| {
-                    (this.watched.clone(), this.cli_places.clone(), !this.listed)
+                let Ok((watched, places, listing, platform)) = this.update(cx, |this, _| {
+                    (
+                        this.watched.clone(),
+                        this.cli_places.clone(),
+                        !this.listed,
+                        this.platform,
+                    )
                 }) else {
                     break;
                 };
@@ -432,7 +448,7 @@ impl ConnectionRegistry {
                 }
                 let targets = cx
                     .background_executor()
-                    .spawn(lister(dir.clone(), places))
+                    .spawn(lister(dir.clone(), places, platform))
                     .await;
                 let alive = this
                     .update(cx, |this, cx| {
@@ -643,6 +659,8 @@ impl ConnectionRegistry {
     /// secure store. Studio writes neither the CLI's file nor the token. The targets are listed
     /// again at once, and the new target's connection is the answer. An address Studio connects
     /// to already is that connection, and nothing is added. A refusal is the CLI's own words.
+    /// Where the CLI gives Studio no token (Windows), a token is refused before the CLI is asked:
+    /// Studio could not use the target it would add.
     pub fn add_target(
         &mut self,
         name: String,
@@ -676,6 +694,14 @@ impl ConnectionRegistry {
             .map(|token| token.trim().to_owned())
             .filter(|token| !token.is_empty())
             .map(Token::typed);
+        let platform = self.platform;
+        if token.is_some() && !platform.exports_tokens() {
+            return Task::ready(Err(format!(
+                "{}, so Studio on Windows cannot use a server that needs a token yet; leave the \
+                 token empty to add one that needs none",
+                cli_config::PIPE_ONLY
+            )));
+        }
         let dir = self.operator_dir.clone();
         let places = self.cli_places.clone();
         let lister = self.lister.clone();
@@ -686,7 +712,7 @@ impl ConnectionRegistry {
                     .spawn(async move {
                         let added =
                             cli_tokens::add_server_target(&places, &name, &url, token).await;
-                        let targets = lister(dir, places).await;
+                        let targets = lister(dir, places, platform).await;
                         (added, targets)
                     })
                     .await
@@ -834,22 +860,27 @@ mod tests {
         (http, sent)
     }
 
+    /// The token sources of CLI servers whose tokens `cli` gives.
+    fn exported_by(cli: &Arc<FakeCli>) -> TokenSources {
+        let cli = cli.clone();
+        Arc::new(move |server: &CliServer| match server.auth {
+            CliAuth::Anonymous => None,
+            CliAuth::Token(_) => Some(Arc::new(FakeExport {
+                target: server.name.clone(),
+                cli: cli.clone(),
+            }) as Arc<dyn TokenSource>),
+        })
+    }
+
     /// A registry whose CLI servers take their tokens from `cli`.
     fn registry_with(
         http: Arc<dyn HttpClient>,
         cli: &Arc<FakeCli>,
         cx: &mut TestAppContext,
     ) -> Entity<ConnectionRegistry> {
-        let cli = cli.clone();
         cx.new(|_| {
             let mut registry = ConnectionRegistry::empty(http, None);
-            registry.token_sources = Arc::new(move |server: &CliServer| match server.auth {
-                CliAuth::Anonymous => None,
-                CliAuth::Token(_) => Some(Arc::new(FakeExport {
-                    target: server.name.clone(),
-                    cli: cli.clone(),
-                }) as Arc<dyn TokenSource>),
-            });
+            registry.token_sources = exported_by(cli);
             registry
         })
     }
@@ -1107,7 +1138,7 @@ mod tests {
                     .collect::<Vec<_>>()
             })
         };
-        // Listed as the CLI lists them: the same entry under another name.
+        // Listed as the CLI lists them on Unix: the same entry under another name.
         let listed = |name: &str| {
             let mut targets = serde_json::Map::new();
             targets.insert(
@@ -1115,7 +1146,7 @@ mod tests {
                 serde_json::json!({"kind": "server", "endpoint": "http://a.test/",
                     "auth": {"provider": "token", "source": {"store": {}}}}),
             );
-            cli_config::servers_from(&targets)
+            cli_config::servers_from(&targets, Platform::Unix)
         };
         apply(&registry, listed("old"), cx);
         let open = at_a(cx).pop().unwrap();
@@ -1205,6 +1236,120 @@ mod tests {
         assert_eq!(token_sent(&connection, &sent, cx).as_deref(), Some(""));
     }
 
+    /// Where the CLI gives Studio no token (Windows, whose CLI writes a token only to a Unix
+    /// pipe and refuses every export), the CLI's targets are listed all the same, through the
+    /// registry's own listing: an anonymous target connects and sends no token, and each that
+    /// takes one is refused with why, as a direct target is, and is neither connected nor asked
+    /// for a token. Add server refuses a token before the CLI is asked. The same listing on Unix
+    /// lands every server target.
+    #[gpui::test]
+    async fn without_token_export_only_anonymous_targets_connect(cx: &mut TestAppContext) {
+        let (http, sent) = answering();
+        let cli = Arc::new(FakeCli::default());
+        cli.give("stored", "secret-stored");
+        let targets: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "disk": {"kind": "direct", "scope": "graph", "uri": "file:///tmp/graph.omni"},
+                "envy": {"kind": "server", "endpoint": "https://env.example.com/",
+                    "auth": {"provider": "token", "source": {"env": "OMNIGRAPH_STUDIO_TEST"}}},
+                "filed": {"kind": "server", "endpoint": "https://file.example.com/",
+                    "auth": {"provider": "token", "source": {"file": "/tokens/filed"}}},
+                "helped": {"kind": "server", "endpoint": "https://exec.example.com/",
+                    "auth": {"provider": "exec", "command": ["/bin/false"], "timeout": "5s"}},
+                "open": {"kind": "server", "endpoint": "http://127.0.0.1:8787/",
+                    "auth": {"provider": "anonymous"}, "default_graph": "knowledge"},
+                "stored": {"kind": "server", "endpoint": "https://store.example.com/",
+                    "auth": {"provider": "token", "source": {"store": {}}}},
+            }))
+            .unwrap();
+        // The platform each listing was given.
+        let given: Arc<Mutex<Vec<Platform>>> = Arc::default();
+        let dir = std::env::temp_dir().join(format!("studio-no-export-{}", std::process::id()));
+        let registry = cx.new(|cx| {
+            let mut registry = ConnectionRegistry::empty(http, Some(dir.clone()));
+            registry.platform = Platform::Other;
+            registry.token_sources = exported_by(&cli);
+            let (targets, given) = (targets.clone(), given.clone());
+            registry.lister = Arc::new(move |_, _, platform| {
+                given.lock().unwrap().push(platform);
+                let listed = cli_config::servers_from(&targets, platform);
+                async move { listed }.boxed()
+            });
+            registry.start_listing(cx);
+            registry
+        });
+        cx.run_until_parked();
+        assert_eq!(*given.lock().unwrap(), [Platform::Other]);
+        let names = |cx: &mut TestAppContext| {
+            registry.read_with(cx, |registry, cx| {
+                let connections = registry.connections.iter();
+                connections
+                    .map(|connection| connection.read(cx).server.name.clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert!(registry.read_with(cx, |registry, _| registry.listed()));
+        assert_eq!(names(cx), ["open"]);
+
+        let open = find(&registry, "open", cx).unwrap();
+        open.update(cx, |connection, cx| connection.connect(cx));
+        cx.run_until_parked();
+        open.read_with(cx, |connection, _| {
+            assert_eq!(connection.state, crate::ConnectionState::Ready);
+            assert_eq!(connection.server.known_graphs, ["knowledge"]);
+        });
+        assert_eq!(token_sent(&open, &sent, cx).as_deref(), Some(""));
+
+        registry.read_with(cx, |registry, _| {
+            let notices = registry.notices();
+            for name in ["envy", "filed", "helped", "stored"] {
+                let refused = format!(
+                    "CLI target '{name}' takes a token, and the OmniGraph CLI gives a token only \
+                     through a Unix pipe, so Studio on Windows cannot use this target yet"
+                );
+                assert!(notices.contains(&refused), "{name}: {notices:?}");
+            }
+            assert!(
+                notices
+                    .iter()
+                    .any(|notice| notice.starts_with("CLI target 'disk' opens storage directly")),
+                "{notices:?}"
+            );
+            assert_eq!(notices.len(), 5, "{notices:?}");
+        });
+        assert!(cli.asked().is_empty(), "no token asked for");
+
+        let refused = registry.update(cx, |registry, cx| {
+            let token = Some("secret-typed".to_owned());
+            registry.add_target("new".into(), "https://new.test".into(), token, cx)
+        });
+        assert_eq!(
+            refused.await.unwrap_err(),
+            "the OmniGraph CLI gives a token only through a Unix pipe, so Studio on Windows \
+             cannot use a server that needs a token yet; leave the token empty to add one that \
+             needs none"
+        );
+        assert_eq!(given.lock().unwrap().len(), 1, "the CLI was not asked");
+        assert_eq!(names(cx), ["open"]);
+
+        // On Unix the same targets land on servers, each asking the CLI for its token when it
+        // connects, and the token file one names is watched; on Windows nothing reads it.
+        let watched = |listed: &CliTargets| -> Vec<PathBuf> {
+            listed
+                .watched
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect()
+        };
+        let unix = cli_config::servers_from(&targets, Platform::Unix);
+        assert_eq!(watched(&unix), [PathBuf::from("/tokens/filed")]);
+        let landed: Vec<String> = unix.servers.unwrap().into_iter().map(|s| s.name).collect();
+        assert_eq!(landed, ["envy", "filed", "helped", "open", "stored"]);
+        assert_eq!(unix.errors.len(), 1, "{:?}", unix.errors);
+        let other = cli_config::servers_from(&targets, Platform::Other);
+        assert_eq!(watched(&other), Vec::<PathBuf>::new());
+    }
+
     /// The graph ids opened on a CLI target are remembered by its name: a target listed later
     /// knows them, and a save keeps every CLI target's. The environment's server is not
     /// remembered. A file that cannot be read remembers nothing.
@@ -1277,7 +1422,7 @@ mod tests {
 
         fn lister(&self) -> Lister {
             let held = self.clone();
-            Arc::new(move |_, _| {
+            Arc::new(move |_, _, _| {
                 held.asked.fetch_add(1, Ordering::SeqCst);
                 let given = {
                     let mut answers = held.answers.lock().unwrap();
