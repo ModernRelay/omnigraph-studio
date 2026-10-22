@@ -1,4 +1,4 @@
-//! OmniGraph's languages as Zed's editor knows a language (spec 007): GQ for the query editor and
+//! Omnigraph's languages as Zed's editor knows a language (spec 007): GQ for the query editor and
 //! the schema language for the schema view, each a tree-sitter grammar under `grammars/` with its
 //! highlight, bracket, indent and outline queries, `//` comments and auto-closed brackets. A
 //! buffer that parses with one is coloured from its syntax tree, and its folds stop at the end of

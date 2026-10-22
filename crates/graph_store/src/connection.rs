@@ -1,4 +1,4 @@
-//! One OmniGraph server: its client, contract and version check, and graphs (spec 003).
+//! One Omnigraph server: its client, contract and version check, and graphs (spec 003).
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -1042,7 +1042,7 @@ mod tests {
         });
     }
 
-    /// A server that speaks contract 0.13 (OmniGraph 0.13, or a 0.14 build before the contract
+    /// A server that speaks contract 0.13 (Omnigraph 0.13, or a 0.14 build before the contract
     /// moved) is refused by its header; one that speaks 0.14 connects.
     #[gpui::test]
     async fn a_server_is_refused_by_the_contract_it_speaks(cx: &mut TestAppContext) {

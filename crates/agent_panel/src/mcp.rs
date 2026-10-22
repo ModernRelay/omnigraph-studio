@@ -10,7 +10,7 @@ use crate::tools;
 /// when it is one of these, and offers the newest otherwise.
 pub const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
-pub(crate) const INSTRUCTIONS: &str = "OmniGraph Studio gives you the omnigraph CLI for one OmniGraph graph. \
+pub(crate) const INSTRUCTIONS: &str = "Omnigraph Studio gives you the omnigraph CLI for one Omnigraph graph. \
 Use it for everything: `schema show` first, then `query`, and `mutate` or `load` on your own \
 branch, which the person reviews before it reaches theirs. Run it in your shell by the path \
 omnigraph_cli gives you, or with omnigraph_run when your shell has no network.";

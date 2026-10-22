@@ -5,7 +5,7 @@
 //!
 //! Built on Zed's `http_client::HttpClient` (Apache-2.0): the app passes `reqwest_client`,
 //! tests pass Zed's fake client. The contract is `openapi/omnigraph-0.14.0-edge.json`, copied
-//! from OmniGraph at `edge-20261020-7fd9cc9` (`0.14.0-edge+7fd9cc9`, MIT), the first build that
+//! from Omnigraph at `edge-20261020-7fd9cc9` (`0.14.0-edge+7fd9cc9`, MIT), the first build that
 //! speaks contract `0.14` and the oldest server Studio supports.
 
 pub mod api;

@@ -1,4 +1,4 @@
-//! The tree-sitter grammar for OmniGraph queries (`.gq`), with the queries Studio's editor uses
+//! The tree-sitter grammar for Omnigraph queries (`.gq`), with the queries Studio's editor uses
 //! for highlighting, brackets, indentation and outline (spec 007). `src/parser.c` is generated
 //! from `grammar.js` by the tree-sitter CLI; see `grammars/README.md`.
 

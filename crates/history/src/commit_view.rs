@@ -1220,7 +1220,7 @@ mod tests {
             async move {
                 let cause = |id: &str| json!({ "graph_commit_id": id, "parent_commit_id": "c0", "authored_branch": "main", "authored_at": 0 });
                 let (status, body) = match path.rsplit_once("/commits/") {
-                    // As OmniGraph refuses the graph's first commit's changes.
+                    // As Omnigraph refuses the graph's first commit's changes.
                     Some((_, "c0/changes")) => (
                         409,
                         json!({ "error": "commit 'c0' has no first parent; bootstrap from an exact baseline", "code": "conflict",
@@ -1358,7 +1358,7 @@ mod tests {
 
     /// A session on a server that answers a commit by its id only after `held` of the test
     /// clock, every commit's changes at once (the graph's first commit, `c0`, refused for having
-    /// no parent, as OmniGraph refuses it), and notes every path asked for.
+    /// no parent, as Omnigraph refuses it), and notes every path asked for.
     fn held_commit_session(
         held: Duration,
         cx: &mut TestAppContext,

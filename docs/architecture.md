@@ -1,6 +1,6 @@
 # Architecture
 
-Studio is one GPUI application on Zed's crates. It reaches OmniGraph only over HTTP
+Studio is one GPUI application on Zed's crates. It reaches Omnigraph only over HTTP
 (constitution I). This page is the current design; decisions and their evidence live in
 `specs/`.
 
@@ -29,7 +29,7 @@ collaboration or Zed's database (spec 002). `command_palette` is forked from Zed
 ## Data flow
 
 ```
-view (layer 5) ──reads──▶ entity in graph_store ──calls──▶ graph_client ──HTTP──▶ OmniGraph server
+view (layer 5) ──reads──▶ entity in graph_store ──calls──▶ graph_client ──HTTP──▶ Omnigraph server
       ▲                         │
       └──── cx.notify() ◀───────┘   (results applied on the main thread)
 ```
@@ -115,7 +115,7 @@ a 412 reopens the draft.
 - `#[gpui::test]` for views and entities, against `graph_client` driven by Zed's
   `FakeHttpClient` with recorded responses.
 - `graph_client` and `gq_language` have plain unit tests; they do not depend on GPUI.
-- `crates/graph_client/openapi/omnigraph-0.14.0-edge.json` (OmniGraph `edge-20261020-7fd9cc9`)
+- `crates/graph_client/openapi/omnigraph-0.14.0-edge.json` (Omnigraph `edge-20261020-7fd9cc9`)
   is the contract: `graph_client`'s contract tests check every DTO's fields and every enum's
   variants against its schemas, and `every_route_the_client_calls_is_in_the_contract` makes
   each of the client's calls once and checks that its method and path are one of the

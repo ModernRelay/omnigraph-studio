@@ -75,7 +75,7 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Now, in Unix microseconds (the unit of OmniGraph timestamps).
+/// Now, in Unix microseconds (the unit of Omnigraph timestamps).
 pub fn now_micros() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -53,7 +53,7 @@ pub use session::{
 pub fn init(cx: &mut App) {
     let http: Arc<dyn http_client::HttpClient> = Arc::new(
         reqwest_client::ReqwestClient::user_agent(concat!(
-            "OmniGraph-Studio/",
+            "Omnigraph-Studio/",
             env!("CARGO_PKG_VERSION")
         ))
         .expect("the HTTP client starts"),

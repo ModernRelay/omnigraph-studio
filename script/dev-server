@@ -6,7 +6,7 @@
 #   script/dev-server            # first run applies the cluster and loads dev/seed.jsonl
 #   script/dev-server --reset    # start again from an empty graph
 #
-# Needs an OmniGraph that speaks HTTP contract 0.14 (`omnigraph` and `omnigraph-server`; until 0.14
+# Needs an Omnigraph that speaks HTTP contract 0.14 (`omnigraph` and `omnigraph-server`; until 0.14
 # is released, the edge build `edge-20261020-7fd9cc9` or later, named by OMNIGRAPH_BIN and
 # OMNIGRAPH_SERVER_BIN when not on PATH). Both are checked: the CLI's `version --json`, and the
 # contract header of the started server's /healthz.
@@ -36,7 +36,7 @@ version=$("$CLI" version)
 version=${version%%$'\n'*}
 contract=$("$CLI" version --json | python3 -c 'import json,sys; print(json.load(sys.stdin).get("http_contract", ""))')
 if [[ "$contract" != 0.14 ]]; then
-  echo "dev-server needs an OmniGraph that speaks HTTP contract 0.14 (edge-20261020-7fd9cc9 or later); found: $version (set OMNIGRAPH_BIN and OMNIGRAPH_SERVER_BIN)" >&2
+  echo "dev-server needs an Omnigraph that speaks HTTP contract 0.14 (edge-20261020-7fd9cc9 or later); found: $version (set OMNIGRAPH_BIN and OMNIGRAPH_SERVER_BIN)" >&2
   exit 1
 fi
 

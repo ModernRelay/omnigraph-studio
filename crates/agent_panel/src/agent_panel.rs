@@ -37,7 +37,7 @@ use ui::IconName;
 /// The argument that starts Studio's executable as the agent's stdio MCP server.
 pub const PROXY_COMMAND: &str = "mcp-proxy";
 /// The argument that starts Studio's executable as the agent's launcher, which runs the agent
-/// without OmniGraph's credentials in its environment where there is no `env -u` (spec 013).
+/// without Omnigraph's credentials in its environment where there is no `env -u` (spec 013).
 pub const LAUNCH_COMMAND: &str = "launch-agent";
 
 pub fn init(cx: &mut App) {

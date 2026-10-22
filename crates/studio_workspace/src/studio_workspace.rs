@@ -3989,7 +3989,7 @@ impl Workspace {
 fn server_notices(cli_errors: &[String], start_errors: &[String]) -> Vec<String> {
     cli_errors
         .iter()
-        .map(|error| format!("OmniGraph CLI config: {error}"))
+        .map(|error| format!("Omnigraph CLI config: {error}"))
         .chain(
             start_errors
                 .iter()
@@ -4876,7 +4876,7 @@ impl ConfirmClose {
             ),
             Closing::Graph => ("Close the graph?".into(), lost),
             Closing::Window => ("Close this window?".into(), lost),
-            Closing::Quit => ("Quit OmniGraph Studio?".into(), lost),
+            Closing::Quit => ("Quit Omnigraph Studio?".into(), lost),
         }
     }
 }
@@ -6616,7 +6616,7 @@ mod tests {
         assert_eq!(
             notices,
             [
-                "OmniGraph CLI config: config.yaml: could not parse",
+                "Omnigraph CLI config: config.yaml: could not parse",
                 "Servers at start: Studio's saved servers could not be read (bad), so it starts \
                  without them",
                 "Servers at start: dev: the address is not valid",

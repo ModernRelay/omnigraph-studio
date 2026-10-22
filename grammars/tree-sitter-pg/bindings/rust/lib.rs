@@ -1,4 +1,4 @@
-//! The tree-sitter grammar for OmniGraph schemas (`.pg`), with the queries Studio's schema view
+//! The tree-sitter grammar for Omnigraph schemas (`.pg`), with the queries Studio's schema view
 //! uses for highlighting, brackets, indentation and outline (spec 007). `src/parser.c` is
 //! generated from `grammar.js` by the tree-sitter CLI; see `grammars/README.md`.
 

@@ -2243,7 +2243,7 @@ impl AgentPanel {
                     self.say(
                         format!(
                             "`agent.omnigraph_cli` ({}) does not speak this graph's HTTP API \
-                             ({contract}) with OmniGraph's version-1 operator configuration, so \
+                             ({contract}) with Omnigraph's version-1 operator configuration, so \
                              the agent uses {}{}.",
                             configured.display(),
                             cli.display(),

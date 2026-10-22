@@ -45,7 +45,7 @@ mkdir -p "$(dirname "$out")"
 {
   echo "# Third-party notices"
   echo
-  echo "OmniGraph Studio is free software under the GNU General Public License, version 3 or"
+  echo "Omnigraph Studio is free software under the GNU General Public License, version 3 or"
   echo "later (LICENSE). It includes the works below, each under its own licence."
   echo
   echo "## Fonts, icons and themes from Zed"

@@ -16,7 +16,7 @@ labelled, never blank).
 
 ## What exists today (checked)
 
-- OmniGraph `v0.13.0`: `GET /snapshot?branch=` returns `graph_manifest_version`,
+- Omnigraph `v0.13.0`: `GET /snapshot?branch=` returns `graph_manifest_version`,
   `internal_schema_version` and per-dataset `entity_kind`, `type_name`, `dataset_path`,
   `published_dataset_version`, `entity_count`. `GET /readyz` returns serving state and graph
   counts; `GET /graphs` per-graph state and failures. `explain query …` returns plan rows with

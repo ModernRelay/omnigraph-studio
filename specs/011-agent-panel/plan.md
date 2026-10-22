@@ -41,15 +41,15 @@ change the agent makes must be visible and approved before it lands, and must ar
   `UserMessageChunk`, `AgentMessageChunk`, `AgentThoughtChunk`, `ToolCall`, `ToolCallUpdate`,
   `Plan`, and others Studio ignores. Permission options have kinds `AllowOnce`, `AllowAlways`,
   `RejectOnce`, `RejectAlways`.
-- OmniGraph (`v0.13.0`): the server's `/mcp` endpoint (`crates/omnigraph-server/src/mcp.rs`)
+- Omnigraph (`v0.13.0`): the server's `/mcp` endpoint (`crates/omnigraph-server/src/mcp.rs`)
   is read-only and serves stored queries only ("Mutation tools are unavailable"), so it cannot
   carry proposals, and using it would hand the agent a bearer token.
-- OmniGraph main (2026-10-20; #992, #994, #995, #999): the server's MCP has read tools (`access`,
+- Omnigraph main (2026-10-20; #992, #994, #995, #999): the server's MCP has read tools (`access`,
   paged `commits_list`, changes, `snapshot`) and opt-in write tools (`mutate`, `load`, branch
   create, delete and merge), with the skill's references as resources. Its writes go wherever
   the token the agent holds may write, and no credential narrows that to the agent's branch
   yet (E20), so the agent still reaches the graph only through Studio's gateway (spec 013).
-- OmniGraph (`v0.13.0`): branch names may contain `/`. Checked on the dev server: creating
+- Omnigraph (`v0.13.0`): branch names may contain `/`. Checked on the dev server: creating
   `agent/probe-1` from `main`, listing it, and deleting it as `agent%2Fprobe-1` all succeeded.
 
 ## Design
@@ -222,7 +222,7 @@ Query text, parameters, rows, tokens and prompt text. Agent stderr is shown only
 
 | Decision | Rejected alternatives | Why |
 |---|---|---|
-| Studio serves the tools and executes them on its own session | Point the agent at OmniGraph's `/mcp`; give the agent the CLI and a token | The token would leave Studio, and 0.13's MCP cannot write. Executing in Studio lets one place enforce the agent branch and the approval |
+| Studio serves the tools and executes them on its own session | Point the agent at Omnigraph's `/mcp`; give the agent the CLI and a token | The token would leave Studio, and 0.13's MCP cannot write. Executing in Studio lets one place enforce the agent branch and the approval |
 | A stdio proxy to a Unix socket | MCP over ACP (`unstable_mcp_over_acp`); an HTTP MCP server on loopback | Stdio is the one transport every ACP agent supports. A loopback port is reachable by any local process; a socket in a `0700` directory is not |
 | Depend on `agent-client-protocol` 2.2.0, default features | Fork Zed's `agent_servers` and `agent_ui`; Zed's unstable feature set | Zed's crates need its project and terminal layers. Stable v1 is what released agents speak |
 | No default agent | Default to the Claude preset | Running `npx …@latest` downloads code; the person should choose it |
@@ -273,7 +273,7 @@ and Delta's sidebar.
 - **Each graph's own directory.** A new conversation runs in `agent/graphs/<graph>-<hash>` in the
   data directory (the key made safe plus a stable FNV-1a hash), so an agent's `session/list` in
   it is the graph's conversations. On Windows it is under the local application folder
-  instead (`%LOCALAPPDATA%\OmniGraph Studio\agent\graphs\…`): the data directory is the roaming
+  instead (`%LOCALAPPDATA%\Omnigraph Studio\agent\graphs\…`): the data directory is the roaming
   one, which folder redirection can put on a network share, and cmd cannot work in a network
   folder (spec 013). A conversation keeps the directory it started in (recorded with it;
   `sessions::working_dir`), so one started under a graph's older key still resumes where the
@@ -373,7 +373,7 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
-| 2026-10-21 | With no CLI that reads the home Studio writes, the thread says which CLI it found, why it was refused, and what to install | `agent_panel` `the_cli_that_reads_the_home_studio_writes_is_chosen_without_a_server` (the notice is `no_cli_text`, spec 013) | The notice names the graph's HTTP API and OmniGraph's version-1 operator configuration, each CLI found with its release and reason ("0.14.0-edge+50283ce, which predates that configuration: it has no `config validate`" for the CLI installed here), and ends with the edge build to install, by commit (main `ff542202` or later; `edge-20261021-888223b` is older), the edge installer's command, or `agent.omnigraph_cli`. A configured CLI passed over is named as not speaking the API "with OmniGraph's version-1 operator configuration". Until such a build is installed the agent has no CLI here |
+| 2026-10-21 | With no CLI that reads the home Studio writes, the thread says which CLI it found, why it was refused, and what to install | `agent_panel` `the_cli_that_reads_the_home_studio_writes_is_chosen_without_a_server` (the notice is `no_cli_text`, spec 013) | The notice names the graph's HTTP API and Omnigraph's version-1 operator configuration, each CLI found with its release and reason ("0.14.0-edge+50283ce, which predates that configuration: it has no `config validate`" for the CLI installed here), and ends with the edge build to install, by commit (main `ff542202` or later; `edge-20261021-888223b` is older), the edge installer's command, or `agent.omnigraph_cli`. A configured CLI passed over is named as not speaking the API "with Omnigraph's version-1 operator configuration". Until such a build is installed the agent has no CLI here |
 | 2026-10-21 | The approval keys answer only the write card that shows them | `agent_panel` `the_keys_answer_only_the_write_card_that_shows_them` | Before, ⌘Y, ⌘⌥Y and ⌘⌥N answered the oldest waiting card of any kind (`pending_index`), which could be a permission card that showed no keys: with a Bash request waiting above a write card, ⌘Y allowed the shell command and ⌘⌥Y picked the agent's AllowAlways, a lasting rule. Now they answer the oldest waiting write card (`keyed_write`), which alone shows them; a permission card with no write card under it takes no key, and is answered by its buttons |
 | 2026-10-21 | A write sent before the agent stopped shows its real outcome, and the branch it made is kept | `agent_panel` `a_write_sent_before_the_agent_stopped_still_shows_its_outcome`, `sessions` `conversations_are_kept_per_graph_newest_first` (extended with `set_branch_created`) | Before, stopping the agent marked a running write's card "Outcome unknown" ("the server did not confirm this change") though the gateway ran the write on and the session logged how it ended, and the panel stopped listening, so a branch that write made was never saved and Review was gone after a resume. Now the card keeps running until the outcome comes through what records the write (the gateway's `GatewayEvent::Finished` is gone), finds its card by its own id after the thread changed, and the branch learns whether it exists and is saved; with the tab closed, the conversation's record still learns it. A card still waiting for the person says "Not sent: the agent stopped before you decided", not "Rejected" |
 | 2026-10-21 | A conversation that comes back offers Review of a branch it made before | `agent_panel` `a_resumed_conversation_offers_review_of_a_branch_it_made_before` | Before, the strip needed a change committed in this tab (`changes > 0`), and a resumed conversation starts at 0. Now it shows once the branch exists; ✎ N shows the changes made since the conversation opened, when there are any |

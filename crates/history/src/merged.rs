@@ -1,6 +1,6 @@
 //! The commits History draws (spec 009).
 //!
-//! OmniGraph's `GET /commits?branch=` lists one branch's first-parent chain, newest first, a
+//! Omnigraph's `GET /commits?branch=` lists one branch's first-parent chain, newest first, a
 //! page at a time: a merged branch's commits appear only as a `merged_parent_commit_id`.
 //! Without a lineage route, History reads each merged-in commit alone by its id
 //! (`GET /commits/{id}`), then the parents that commit names, down the merged branch until its

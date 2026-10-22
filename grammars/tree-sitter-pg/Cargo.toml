@@ -1,6 +1,6 @@
 [package]
 name = "tree-sitter-pg"
-description = "Tree-sitter grammar for OmniGraph schemas (.pg), for Studio's schema view"
+description = "Tree-sitter grammar for Omnigraph schemas (.pg), for Studio's schema view"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

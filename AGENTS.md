@@ -1,4 +1,4 @@
-# OmniGraph Studio agent guide
+# Omnigraph Studio agent guide
 
 This file is the map for coding agents. Keep it short: rules live in the constitution, design
 in `docs/`, decisions in `specs/`, exact behavior in code and tests.
@@ -12,14 +12,14 @@ Before every task:
 3. The plan in `specs/` for the area you touch, including its validation log.
 4. [Spec 012](specs/012-omnigraph-engine-changes/plan.md) and its index
    [docs/deferred-engine-changes.md](docs/deferred-engine-changes.md) before designing around a
-   gap in the OmniGraph API. Cite the change ID (E1–E19, R1–R2) in the plan that waits on it.
+   gap in the Omnigraph API. Cite the change ID (E1–E19, R1–R2) in the plan that waits on it.
 
 `CLAUDE.md` is a symlink to this file. Edit `AGENTS.md` only.
 
 ## What Studio is
 
-A native GPUI desktop app for OmniGraph, built on Zed's crates (GPL-3.0-or-later). It talks to
-OmniGraph servers over HTTP only and links `omnigraph-compiler` for offline schema and query
+A native GPUI desktop app for Omnigraph, built on Zed's crates (GPL-3.0-or-later). It talks to
+Omnigraph servers over HTTP only and links `omnigraph-compiler` for offline schema and query
 intelligence. See `README.md`.
 
 ## Pins
@@ -28,7 +28,7 @@ intelligence. See `README.md`.
 |---|---|---|
 | Zed crates | tag `v1.23.2` (`c0199504b9cc`) | `Cargo.toml` `[workspace.dependencies]` |
 | Rust | `1.98.1`, Zed's toolchain at that tag | `rust-toolchain.toml` |
-| OmniGraph HTTP contract | `0.13` | `crates/graph_client/openapi/omnigraph-0.13.0.json` |
+| Omnigraph HTTP contract | `0.13` | `crates/graph_client/openapi/omnigraph-0.13.0.json` |
 | `omnigraph-compiler` | tag `v0.13.0` | `Cargo.toml` |
 
 Bump Zed only with [the procedure](docs/zed-pin.md). Copy Zed's `[patch.crates-io]` entries
@@ -70,7 +70,7 @@ python3 script/check-layers.py   # crate layer rule; keep its table in step with
   appears in the palette.
 - Copying from Zed is allowed (GPL). Keep the file's copyright notice and add a
   `// Forked from zed-industries/zed <path> @ <commit>` line. Keep forks small.
-- No OmniGraph engine changes from this repo. Add the need to spec 012 with an ID, list it in
+- No Omnigraph engine changes from this repo. Add the need to spec 012 with an ID, list it in
   `docs/deferred-engine-changes.md`, and design against today's API.
 - Never add a second copy of GPUI (GPUI Kit, `gpui-pre`, `gpui-ce`, crates.io `gpui`).
 - Never retry a write automatically. Never log tokens, query text or row data.

@@ -334,7 +334,7 @@ impl Failure {
             ),
             ReadError::ContractMismatch { .. } | ReadError::Decode(_) => (
                 error.to_string(),
-                "This server speaks a different OmniGraph contract than Studio.",
+                "This server speaks a different Omnigraph contract than Studio.",
             ),
             // Nothing of it is shown: a part would read as the whole answer.
             ReadError::TooLarge { .. } => (
