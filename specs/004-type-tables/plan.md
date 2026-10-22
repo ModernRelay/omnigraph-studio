@@ -126,17 +126,19 @@ stay put), IX (paged, virtualized).
   on the table's Blob cell under the cursor, whose status bar then lists both; the buttons'
   tooltips name the keys. The file is read off the main thread and refused over 32 MiB before anything
   is sent. The write goes to the branch the view shows, once, bound to the value shown as read
-  at the view's commit: a managed value by its ETag, which names the type's table version, so
-  it is read again at the view's commit when the view moved since (its own writes move it). A
-  view behind its branch reads it at its own last commit when that commit's write was itself
-  bound to an ETag read where the values shown hold, since the server applied it only while
-  the type's table was as the view showed it, and else is bound to the ETag the cell shows
-  (`model::BlobsAt`; since 2026-10-21, before which a second file stored behind was refused as
-  changed elsewhere); a
-  null cell and an external reference have none, so the cell is read at the head first and the
-  write goes only while it still holds what is shown (`*` for a reference, no `If-Match` for
-  null). While out the value shows the amber dot and "saving to <branch>…"; committed, the view
-  moves to its commit as a cell edit does and shows the new value; refused, the server's reason;
+  at the view's commit, taken as the write is sent, after the file is read, from what a table
+  cell shows then (`blob_write::upload_bound`; since 2026-10-21, before which the table's own
+  write landing while the file was read had it refused as changed): a managed value by its
+  ETag, which names the type's table version, so it is read again at the view's commit when
+  the view moved since (its own writes move it). A view behind its branch reads it at its own
+  last commit when that commit's write was itself bound to an ETag read where the values shown
+  hold, since the server applied it only while the type's table was as the view showed it, and
+  else is bound to the ETag the cell shows (`model::BlobsAt`; since 2026-10-21, before which a
+  second file stored behind was refused as changed elsewhere); a null cell and an external
+  reference have none, so the cell is read at the head first and the write goes only while it
+  still holds what is shown (`*` for a reference, no `If-Match` for null). While out the value
+  shows the amber dot and "saving to <branch>…"; committed, the view moves to its commit as a
+  cell edit does and shows the new value; refused, the server's reason;
   changed elsewhere (a 412, or found before sending), what it holds now and "Replace anyway",
   the change again bound to that (a table cell: drop it again); unknown, check History. Nothing
   is retried. A view held at a commit, an edge's value and a property that is not a Blob are
@@ -165,6 +167,13 @@ stay put), IX (paged, virtualized).
 - A page holds `studio.type_table_page_size` rows (100 by default; a graph can have its own,
   spec 002), the `limit` above.
 - The first page records `graph_commit_id`; later pages pass it as `snapshot` (constitution II).
+  Every page, section and group count is tagged with the pin it was sent at; one that lands
+  after the table's own write moved the pin is read again at the new pin, never shown under it
+  (since 2026-10-21; before, a page read before a save landed showed the old value, a deleted
+  row came back and an inserted one never showed).
+- Sorted, a read that shows no row and is not the last (the rows with a value ran out) reads
+  the rows without one at once (since 2026-10-21; before, a table whose rows all lacked the
+  sort's value said it had none).
 - Once the table's own write moved its pin, a later page leaves out the rows the table shows
   already (grouped by a relationship or a neighbour, those its section shows): read at the new
   commit, a row it edited can sort again further on, or into another section, and stays where
@@ -238,9 +247,12 @@ date; not the key, a list or a vector). One read counts the rows per value under
 200 values, rows without a value last); each value is a section with a header (value, count,
 disclosure). An open section reads its first 10 rows when its line comes into view, then "Show
 N more of M" (or "Show N more" when the page holds the rest) reads a page, all keyset pages narrowed with `title = $value` (or `is null`) and
-pinned to the table's commit, in the table's sort. A closed section reads nothing. Every read
-is engine-side, so the counts are right at any size. Edge tables group by their own properties
-the same way.
+pinned to the table's commit, in the table's sort. A closed section reads nothing. A section's
+read whose line is more than a screen from the lines drawn is dropped, freeing its slot (a
+connection has 8), and reads again when its line returns; rows a read puts in above the lines
+in view move the scroll with them, so those lines stay where they are (since 2026-10-21). Every
+read is engine-side, so the counts are right at any size. Edge tables group by their own
+properties the same way.
 
 A node table also groups by a relationship ("people by company"): the Group menu lists the
 table's relationships after its properties, as does a relationship column's header menu. One
@@ -308,7 +320,9 @@ its open section.
   (`builder::update_cells`), each bound to the value its row shows, so one commit. Rows that
   already hold the value are left out. A short `affected_nodes` means some rows changed
   elsewhere: they were left alone, the bar says how many and the table reads the head. Esc or
-  Clear drops the selection.
+  Clear drops the selection; a set already sent stays out, Set stays disabled until it is back,
+  and its outcome shows on the bar, or clears the pick, only while its rows are the ones picked
+  (since 2026-10-21; before, Esc enabled Set again and the outcome landed on a later pick).
   Built (drafts): ⌥↵ keeps an edit as a draft instead of saving it, as clicking away already
   did; a draft cell shows the typed text with a dot, and its tooltip says what the cell holds.
   While drafts exist a pill floats over the bottom of the table ("3 drafts not saved ·
@@ -318,7 +332,12 @@ its open section.
   opens instead and nothing is sent. A short `affected_nodes` means some rows changed
   elsewhere and were left alone whole: those rows are read at the head, the drafts that landed
   clear, and the others stay with "Changed elsewhere to “X”". A refused or lost write puts
-  every draft back with the reason. Discard asks for a second click.
+  every draft back with the reason. A list draft on a row deleted elsewhere fails only itself
+  ("This row was deleted elsewhere"), and the others are saved (since 2026-10-21; before, it
+  marked the whole batch changed, and every save sent nothing until Refresh). Discard asks for
+  a second click, and drops the drafts the pill counts: one whose save is out stays until the
+  save settles it (since 2026-10-21; before, a refused save then lost its text). Each edit has
+  an editor of its own, so ⌘Z never brings back the text of the cell edited before.
 - Insert: a form generated from the node shape (required properties, key, enums, ranges).
 - Delete (⌘⌫): the picked rows (⌘-click, ⇧-click), or else the cursor's, in one commit bound
   to the table's pin (`/mutate/if-graph-commit`). Before it is offered, the dialog reads what
@@ -339,7 +358,10 @@ its open section.
   2026-10-21: before, such a delete offered an Undo that restored nothing), the dialog says why
   and asks for the key, or `delete N` for several rows, to be typed (constitution IV). An edge
   delete takes no dependents; deleting a relationship its source needs is refused by the
-  server, which the dialog shows.
+  server, which the dialog shows. The dialog deletes the kind its table shows, as a node type
+  and an edge type may share a name (since 2026-10-21; before, it took the edge). More than
+  20,000 picked relationships, past what Undo puts back in one commit, are confirmed by typing
+  `delete N`, with no Undo (since 2026-10-21).
 - An edit open when the table moves to another branch (a link, a toast's follow-up), when its
   tab closes, or when the Nodes panel lets its table go, is kept as the cell's draft on the
   branch it was typed on, as leaving the cell keeps it; a tab holding such an edit asks before
@@ -349,10 +371,13 @@ its open section.
 
 ### Outcomes
 
-`ChangeOutput.commit` present: committed. A 4xx with `ErrorOutput`: refused, "Nothing was
-written." plus the reason. A lost response, a timeout or a response without the contract header:
-unknown, "Check History before trying again; your changes are still here", with a button that
-opens the branch's recent commits.
+`ChangeOutput.commit` present: committed, when its kind is `published`. A commit on no branch,
+a proposal or a snapshot, is not a save: "main did not change" with the commit, the draft kept;
+a kind Studio does not know is an unknown outcome (both judged by `OutcomeKind::written`, for
+cell saves, drafts, bulk sets and Blob writes, since 2026-10-21). A 4xx with `ErrorOutput`:
+refused, "Nothing was written." plus the reason. A lost response, a timeout or a response
+without the contract header: unknown, "Check History before trying again; your changes are
+still here", with a button that opens the branch's recent commits.
 
 ### Drawing cost
 
@@ -361,8 +386,13 @@ row callback works out how each drawn line looks (picked, dimmed, the cursor's, 
 header) for the lines it draws, not for every loaded row; a date's or time's relative text is
 made once a minute with the cell's other text; relationship and Blob cells name their elements
 by their place and make their tooltips only when shown; and the grouped line list is built
-once a frame. Blob cells are read once scrolling has paused for 120 ms, for the rows then
-drawn; reads still out for rows scrolled away are dropped and asked again when they return. A
+once a frame. Blob cells are read once scrolling has paused for 120 ms, for the rows the lines
+then drawn show and the Blob columns drawn (grouped, a folded section's rows are on no line;
+since 2026-10-21, before which the span from the first row drawn to the last was read, and
+every Blob column); reads still out for cells scrolled away, up, down or sideways, are dropped
+and asked again when they return. Relationship cells read the rows of the lines near those
+drawn alike. Moving through a filter's offered values notifies its field, which draws the
+table around it and leaves the grid as it was (since 2026-10-21). A
 new order or filter at the same commit keeps the relationship cells and Blob cells already
 read and reads only rows not seen yet; the counts it asks for again come from the session's
 kept answers.
@@ -396,6 +426,19 @@ kept answers.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | A read sent before the table's own write landed is read again at the write's commit | `type_table` `a_read_sent_before_the_tables_own_write_landed_is_read_again_at_its_commit` (a header click reads the first page at c1 while the table's delete of p1 lands at c2; grouped, a section's page read at c2 while p2's delete lands at c3), failing with the pin check undone | Both read again at the new pin: p1 does not come back, nor p2. Undone, the c1 page showed p1 again under c2 |
+| 2026-10-21 | A sorted table whose rows lack the sort's value reads them | `type_table` `a_sorted_table_whose_rows_hold_no_value_reads_them_at_once` ("email is empty", sorted by email), failing with the read-on undone | p1 and p2 read, the list exhausted. Undone, no row showed while the count said 2 |
+| 2026-10-21 | ⌘Z in a cell takes nothing from the cell edited before | `type_table` `undo_in_a_cell_never_brings_back_another_cells_text` ("Ada L" typed in p1's name and saved, then p2's name opened, ⌘Z, ↵), failing with one editor kept across edits | p2's name stayed "Grace" and one write went, p1's. With the shared editor, ⌘Z brought back "Ada L" |
+| 2026-10-21 | The delete dialog deletes the kind the table shows | `type_table` `a_delete_takes_the_kind_its_table_shows` (`node Review` and `edge Review` in one schema) | Opened from the node table it reads the dependents; from the edge table, a relationship's delete. Before, it took the edge either way. Not done here: `table_key` and `OpenType` name a type without its kind, so an edge sharing a node's name opens the node's table (`type_table.rs`, `studio_actions`) |
+| 2026-10-21 | Discard leaves a draft whose save is out | `type_table` `discard_leaves_a_draft_whose_save_is_out` (two drafts, one confirmed and refused with a 403 while Discard is clicked twice) | The other draft went; the confirmed one stayed in the session while out and kept "Ada King" once refused |
+| 2026-10-21 | Esc leaves a bulk set out | `type_table` `esc_while_a_bulk_set_is_out_leaves_it_out` (Esc, two rows picked again, Set, one row picked, then the commit lands) | Set sent nothing more; the commit left the pick of p2 and no notice, and the rows showed the value set |
+| 2026-10-21 | A list draft on a row deleted elsewhere fails only its own part | `type_table` `a_node_gone_elsewhere_fails_only_its_own_part_of_a_list_write` (a bulk set of two rows' tags, one gone at the head; then the gone one alone), failing with the old `holds` | The write went bound to the head (c5); alone, nothing was sent. Before, the whole batch was refused as changed |
+| 2026-10-21 | A frame reads the cells of the rows and columns it draws | `type_table` `a_grouped_frame_reads_only_the_rows_its_lines_show` (sections of 3, 50 folded and 3 rows, a Blob column, two relationship columns), `blob_cells_are_read_in_the_columns_drawn` (a Blob column after 20 text columns), each failing with its fix undone | Six Blob HEADs and six rows per relationship read; before, all 56. The Blob column read nothing until scrolled into view |
+| 2026-10-21 | Section reads away from the view are dropped, and rows above it move nothing | `type_table` `section_reads_away_from_the_view_are_dropped_and_rows_above_it_move_nothing` (40 sections, scrolled to section 20's header) | Section 0's read dropped, section 21's kept; section 0's two rows landing kept section 20's header first in view. Without the scroll follow, section 19's read line was |
+| 2026-10-21 | Moving through the filter's offers leaves the grid as it was | `type_table` `typing_in_a_field_leaves_the_grid_as_it_was`, extended (a Bool filter's two offers, ↓), failing with the table notified | The table drew again and the grid did not |
+| 2026-10-21 | An upload is bound as it is sent | `type_table` `an_upload_is_bound_to_what_the_view_shows_as_it_is_sent` (the view's own value of the same size stored while the file is read), failing with the binding taken before the read; `a_tables_upload_is_bound_where_its_values_hold_as_it_goes` | The write carried the new ETag and stored the file; the table's binding followed its pin to its own commit, and gave none for another branch. Bound before the read, the write was refused as changed. The peek and the Blob tab still bind when the file is chosen (`blob_write::upload`) |
+| 2026-10-21 | A commit on no branch is not a save | `type_table` `a_commit_on_no_branch_is_not_a_save` (`unpublished`, `unattached`, an unknown kind, `published`), `a_blob_write_held_off_its_branch_is_not_saved`, each failing with every commit taken as published | A proposal or a snapshot reads "main did not change" and keeps the draft; an unknown kind is an unknown outcome; a published one saves |
+| 2026-10-21 | More relationships than Undo puts back are typed for | `type_table` `an_edge_delete_past_what_undo_puts_back_is_confirmed_by_typing` (20,000 and 20,001 picked `Knows`), failing with the count undone | 20,000 confirm with ↵; 20,001 say why and ask for `delete 20001` |
 | 2026-10-21 | The peek names a saved value by the bytes that judge its kind | `type_table` `a_slot_names_a_saved_value_by_the_bytes_that_judge_its_kind` (an SVG whose root follows an XML declaration and a comment) | The slot kept its first `blob::KIND_PREFIX` bytes, here the whole value, and Save offered `p1-doc.svg`; it kept 16 before, which named it `.txt` |
 | 2026-10-21 | A peek's Save reads the value it shows where it is held | `type_table` `a_value_stored_from_a_view_behind_is_saved_from_where_it_is_held` (a page at c2 holding "first" stores "second" past another writer's c3, then saves; a peek of a table whose cell holds at `BlobsAt::Unknown`), failing with Save read at the view's commit | Saved 6 bytes "second", read at the write's commit c4; the table's value disabled Save, "Studio knows no commit that holds this value", and read nothing. Undone: "The value ended before its size; nothing was saved.", c2 holding the 5 bytes replaced |
 | 2026-10-21 | A peek from a table behind its branch compares the head as it opens | `type_table` `a_peek_of_a_table_behind_its_branch_compares_the_head_as_it_opens` (another writer changes p1 at c2; the table stays at c1; p1 and p2 peeked), failing with the comparison undone | p1's peek read at c1 offering Refresh; p2's moved to c2. Undone, p1's showed c1's values as current |
