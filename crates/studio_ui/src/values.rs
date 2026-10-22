@@ -6,8 +6,11 @@ use gpui::{App, ClipboardItem, ElementId, SharedString, Window};
 use ui::Tooltip;
 use ui::prelude::*;
 
-/// A value as plain text: a string as it is, nothing for null, anything else as JSON. What a
-/// copied cell holds, and what a text field shows and reads back.
+/// A value as plain text: a string as it is, nothing for null, anything else as JSON (a list is
+/// `["a","b"]`). What a copied value holds, and what a text setting's field shows. A field that
+/// edits a graph value or a query parameter shows `gq_language::input::edit_text` instead,
+/// which writes a list as its items separated by commas and is what the field's reader takes
+/// back.
 pub fn value_text(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::Null => String::new(),

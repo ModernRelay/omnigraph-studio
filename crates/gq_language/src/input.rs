@@ -41,9 +41,12 @@ pub fn same_value(a: &Value, b: &Value) -> bool {
     }
 }
 
-/// The text an editor starts with for a value. A list is its items separated by commas, an item
-/// that holds a comma or a quote, starts or ends with a space, or is empty or `[]` quoted as in
-/// CSV (its quotes doubled); an empty list is `[]`. [`parse_input`] reads each back as it was.
+/// The text a field that edits a value starts with: a cell, a form field, a filter or a query
+/// parameter. A list is its items separated by commas, an item that holds a comma or a quote,
+/// starts or ends with a space, starts with `[` or is empty quoted as in CSV (its quotes
+/// doubled); an empty list is `[]`. [`parse_input`] reads each back as it was, and so does
+/// [`crate::param_value`] for a parameter of the list's type, which takes text starting with `[`
+/// for JSON. A copied value is `studio_ui::value_text` instead, which writes a list as JSON.
 pub fn edit_text(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
@@ -54,7 +57,7 @@ pub fn edit_text(value: &Value) -> String {
             .map(|item| {
                 let text = edit_text(item);
                 let quoted = text.is_empty()
-                    || text == EMPTY_LIST
+                    || text.starts_with('[')
                     || text.contains([',', '"'])
                     || text.trim() != text;
                 if quoted {
@@ -398,7 +401,8 @@ mod tests {
     }
 
     /// A list reads back as it was written: an item holding a comma or a quote, an empty one,
-    /// and the empty list itself, apart from no value.
+    /// one starting with `[`, and the empty list itself, apart from no value. A list parameter
+    /// reads the same text back, though it takes text starting with `[` for JSON.
     #[test]
     fn a_list_reads_back_as_it_was_written() {
         let tags = Property {
@@ -409,12 +413,24 @@ mod tests {
             json!(["Smith, John", "x"]),
             json!(["say \"hi\"", " padded ", ""]),
             json!(["[]"]),
+            json!(["[draft] notes", "b"]),
             json!([]),
             Value::Null,
         ] {
             let text = edit_text(&value);
             assert_eq!(parse_input(&tags, &text), Ok(value.clone()), "{text}");
+            if !value.is_null() {
+                assert_eq!(
+                    crate::param_value("tags", "[String]", false, &text),
+                    Ok(Some(value.clone())),
+                    "{text}"
+                );
+            }
         }
+        assert_eq!(
+            crate::param_value("n", "[I64]", false, &edit_text(&json!([1, 2]))),
+            Ok(Some(json!([1, 2])))
+        );
         assert_eq!(
             edit_text(&json!(["Smith, John", "x"])),
             "\"Smith, John\", x"
