@@ -154,6 +154,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 python3 script/check-layers.py
+python3 script/check-brand.py
 ```
 
 CI runs these checks on macOS, Linux and Windows for each pull request that changes more than
