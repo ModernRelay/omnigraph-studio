@@ -475,6 +475,26 @@ pub enum PageStart {
     },
 }
 
+impl PageStart {
+    /// The `@id` the page's rows come after: none for the first page, nor for the rows without
+    /// a value from their start.
+    fn after_id(&self) -> Option<&str> {
+        match self {
+            PageStart::First => None,
+            PageStart::Nulls { after } if after.is_empty() => None,
+            PageStart::After { id, .. } | PageStart::Nulls { after: id } => Some(id.as_str()),
+        }
+    }
+}
+
+/// `$var.@id > $after`, past the row `after`. A page from the start sends no such clause, not
+/// `> ""`: every row passes that, yet the server takes several times as long to answer the
+/// page with it (4.1 s against 0.7 s for the first page of a type of 70,702 rows).
+fn id_after(var: &str, after: &str, params: &mut Params) -> String {
+    let after = params.add("after", "String", Value::String(after.to_owned()));
+    format!("${var}.@id > {after}")
+}
+
 /// The match clauses and order of one keyset page over binding `var`.
 fn keyset(
     var: &str,
@@ -486,12 +506,8 @@ fn keyset(
 ) -> Result<(Vec<String>, String), BuildError> {
     let by_id = format!("${var}.@id asc");
     let Some(sort) = sort else {
-        let after = match start {
-            PageStart::After { id, .. } | PageStart::Nulls { after: id } => id.clone(),
-            PageStart::First => String::new(),
-        };
-        let after = params.add("after", "String", Value::String(after));
-        return Ok((vec![format!("${var}.@id > {after}")], by_id));
+        let clauses = start.after_id().map(|id| id_after(var, id, params));
+        return Ok((clauses.into_iter().collect(), by_id));
     };
     let property = properties
         .iter()
@@ -519,12 +535,10 @@ fn keyset(
                 ordered,
             )
         }
-        PageStart::After { id: after, .. } | PageStart::Nulls { after } => {
-            let after = params.add("after", "String", Value::String(after.clone()));
-            (
-                vec![format!("{field} is null"), format!("${var}.@id > {after}")],
-                by_id,
-            )
+        PageStart::After { .. } | PageStart::Nulls { .. } => {
+            let mut clauses = vec![format!("{field} is null")];
+            clauses.extend(start.after_id().map(|id| id_after(var, id, params)));
+            (clauses, by_id)
         }
     })
 }
@@ -1870,21 +1884,15 @@ pub fn neighbours_without_properties(
     };
     let mut params = Params::new();
     let id = params.add("id", "String", Value::String(id.to_owned()));
-    let after = match after {
-        None => {
-            let after = params.add("after", "String", Value::String(String::new()));
-            format!("$m.@id > {after}")
-        }
-        Some(After::Neighbour(neighbour)) => {
-            let after = params.add("after", "String", Value::String(neighbour.to_owned()));
-            format!("$m.@id > {after}")
-        }
-        Some(After::Edge { neighbour, edge }) => {
+    // The first page names no neighbour to come after ([`id_after`]).
+    let after = after.map(|after| match after {
+        After::Neighbour(neighbour) => id_after("m", neighbour, &mut params),
+        After::Edge { neighbour, edge } => {
             let after = params.add("after", "String", Value::String(neighbour.to_owned()));
             let edge = params.add("after_edge", "String", Value::String(edge.to_owned()));
             format!("($m.@id > {after} or ($m.@id = {after} and $e.@id > {edge}))")
         }
-    };
+    });
     // The edge's own id too, which removing one relationship names.
     let mut columns = vec!["$m.@id as id".to_owned(), "$e.@id as edge_id".to_owned()];
     if let Some(label) = other.label_property()
@@ -1904,7 +1912,9 @@ pub fn neighbours_without_properties(
             edge_property_column(&property.name)
         ));
     }
-    let mut extra = String::new();
+    let mut extra = after
+        .map(|after| format!("\n    {after}"))
+        .unwrap_or_default();
     // A search narrows the neighbours to ids starting with, or labels containing, the text.
     if let Some(text) = narrow.search.filter(|text| !text.is_empty()) {
         let label = other
@@ -1941,7 +1951,7 @@ pub fn neighbours_without_properties(
         extra.push_str(&format!("\n    {clause}"));
     }
     let text = format!(
-        "query studio_neighbours({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id}\n    {traversal}\n    {after}{extra}\n  }}\n  return {{ {columns} }}\n  order {{ $m.@id asc, $e.@id asc }}\n  limit {limit}\n}}\n",
+        "query studio_neighbours({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id}\n    {traversal}{extra}\n  }}\n  return {{ {columns} }}\n  order {{ $m.@id asc, $e.@id asc }}\n  limit {limit}\n}}\n",
         sig = params.signature(),
         ty = node.name,
         traversal = traversal_clause(group, Some("e")),
@@ -3156,6 +3166,7 @@ mod tests {
         );
         assert!(first.text.contains("order { $n.title asc, $n.@id asc }"));
         assert_compiles(&first);
+        assert_no_cursor(&first);
         let next = node_page(
             &schema,
             "Person",
@@ -3194,6 +3205,28 @@ mod tests {
         assert!(nulls.text.contains("$n.title is null"));
         assert!(nulls.text.contains("order { $n.@id asc }"));
         assert_compiles(&nulls);
+        // The rows without a value, from their start: no cursor; after one of them, its `@id`.
+        assert_no_cursor(&nulls);
+        let more_nulls = node_page(
+            &schema,
+            "Person",
+            &[],
+            Some(&sort),
+            &PageStart::Nulls {
+                after: "person-000003".into(),
+            },
+            50,
+        )
+        .unwrap();
+        assert_compiles(&more_nulls);
+        assert!(
+            more_nulls
+                .text
+                .contains("$n.title is null\n    $n.@id > $after"),
+            "{}",
+            more_nulls.text
+        );
+        assert_eq!(more_nulls.params["after"], json!("person-000003"));
         // Typed values: a date and an integer bind with their own types.
         for (type_name, property, value) in [
             ("Person", "born", Value::String("1980-01-01".into())),
@@ -3273,10 +3306,28 @@ mod tests {
         assert_eq!(snake_case("WorksAt"), "works_at");
     }
 
+    /// A page from the start names no row to come after, in its text or its parameters: an
+    /// `@id > ""` every row passes still costs the server several times the page.
+    fn assert_no_cursor(query: &BuiltQuery) {
+        assert!(!query.text.contains(".@id >"), "{}", query.text);
+        assert!(!query.params.contains_key("after"), "{:?}", query.params);
+    }
+
     #[test]
     fn node_pages_compile_with_and_without_filters() {
         let schema = dev();
-        assert_compiles(&node_page(&schema, "Person", &[], None, &PageStart::First, 100).unwrap());
+        // The first page: no cursor, the same order and limit.
+        let first = node_page(&schema, "Person", &[], None, &PageStart::First, 100).unwrap();
+        assert_compiles(&first);
+        assert_no_cursor(&first);
+        assert!(first.params.is_empty(), "{:?}", first.params);
+        assert!(
+            first.text.contains("order { $n.@id asc }\n  limit 100"),
+            "{}",
+            first.text
+        );
+        let fields = node_page_fields(&schema, "Person", &[], None, &PageStart::First, 100, &[]);
+        assert_no_cursor(&fields.unwrap());
         let filters = [
             Filter {
                 property: "title".into(),
@@ -3308,6 +3359,15 @@ mod tests {
         .unwrap();
         assert_compiles(&page);
         assert_eq!(page.params["after"], json!("person-000010"));
+        assert!(page.text.contains("$n.@id > $after"), "{}", page.text);
+        assert!(
+            page.text.contains("order { $n.@id asc }\n  limit 50"),
+            "{}",
+            page.text
+        );
+        let first = node_page(&schema, "Person", &filters, None, &PageStart::First, 50).unwrap();
+        assert_compiles(&first);
+        assert_no_cursor(&first);
         assert_compiles(&node_count(&schema, "Person", &filters).unwrap());
         // A date preset reads its range: on or after its start and before its end.
         let today = [Filter {
@@ -3459,6 +3519,18 @@ mod tests {
             nulls.contains("limit 50") && nulls.contains("$n.@id > $after"),
             "{nulls}"
         );
+        // Every row, by `@id` from the start: no cursor.
+        let from_start = page(
+            &[],
+            Some(&born),
+            &PageStart::Nulls {
+                after: String::new(),
+            },
+        );
+        assert!(
+            from_start.contains("limit 50") && !from_start.contains("@id >"),
+            "{from_start}"
+        );
         let filter = |op| Filter {
             property: "born".into(),
             op,
@@ -3527,8 +3599,13 @@ mod tests {
     fn edge_pages_and_counts_compile() {
         let schema = dev();
         for edge in &schema.edges {
-            assert_compiles(
-                &edge_page(&schema, &edge.name, &[], None, &PageStart::First, 100).unwrap(),
+            let first = edge_page(&schema, &edge.name, &[], None, &PageStart::First, 100).unwrap();
+            assert_compiles(&first);
+            assert_no_cursor(&first);
+            assert!(
+                first.text.contains("order { $e.@id asc }\n  limit 100"),
+                "{}",
+                first.text
             );
             assert_compiles(&edge_count(&schema, &edge.name, &[]).unwrap());
         }
@@ -3558,6 +3635,8 @@ mod tests {
         .unwrap();
         assert_compiles(&page);
         assert!(page.text.contains("$e.role as e_role"), "{}", page.text);
+        assert!(page.text.contains("$e.@id > $after"), "{}", page.text);
+        assert_eq!(page.params["after"], json!("01J"));
         assert_compiles(&edge_count(&schema, "WorksAt", &filters).unwrap());
         assert!(matches!(
             edge_page(&schema, "Nope", &[], None, &PageStart::First, 1),
@@ -3582,26 +3661,38 @@ mod tests {
             assert_compiles(&page);
             // Each neighbour comes with the edge that relates it, which removing it names.
             assert!(page.text.contains("$e.@id as edge_id"), "{}", page.text);
+            // The first page names no neighbour to come after; order and limit as any page's.
+            assert_no_cursor(&page);
+            assert!(
+                page.text
+                    .contains("order { $m.@id asc, $e.@id asc }\n  limit 50"),
+                "{}",
+                page.text
+            );
             // The pages after a neighbour, or after one edge of it, and the edges counted.
-            for after in [
-                After::Neighbour("person-000001"),
-                After::Edge {
-                    neighbour: "person-000001",
-                    edge: "e-1",
-                },
+            for (after, cursor) in [
+                (After::Neighbour("person-000001"), "$m.@id > $after\n"),
+                (
+                    After::Edge {
+                        neighbour: "person-000001",
+                        edge: "e-1",
+                    },
+                    "($m.@id > $after or ($m.@id = $after and $e.@id > $after_edge))\n",
+                ),
             ] {
-                assert_compiles(
-                    &neighbours(
-                        &schema,
-                        "Person",
-                        group,
-                        "person-000000",
-                        Some(after),
-                        Narrow::default(),
-                        50,
-                    )
-                    .unwrap(),
-                );
+                let next = neighbours(
+                    &schema,
+                    "Person",
+                    group,
+                    "person-000000",
+                    Some(after),
+                    Narrow::default(),
+                    50,
+                )
+                .unwrap();
+                assert_compiles(&next);
+                assert!(next.text.contains(cursor), "{}", next.text);
+                assert_eq!(next.params["after"], json!("person-000001"));
             }
             assert_compiles(&edge_degree(&schema, "Person", group, "person-000000").unwrap());
         }
