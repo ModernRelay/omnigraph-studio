@@ -458,6 +458,12 @@ fn find_data_dir() -> PathBuf {
     }
 }
 
+/// Whether `exe` is an installed Studio rather than a build or a test: only a release build
+/// checks for updates (spec 017).
+pub fn is_release_build(exe: &std::path::Path) -> bool {
+    !is_build_output(exe) && !is_test_binary(exe)
+}
+
 /// Whether an executable is Cargo's build output rather than an installed app: it sits in a
 /// profile directory (or its `examples` or `deps`) of a Cargo build directory, and not in a
 /// macOS bundle. A build directory is one named `target` or one holding the `CACHEDIR.TAG`
@@ -1067,6 +1073,23 @@ mod tests {
             assert!(state.problems.is_empty());
             assert_eq!(state.modified, modified);
         });
+    }
+
+    #[test]
+    fn only_an_installed_build_is_a_release_build() {
+        let release = |path: &str| is_release_build(std::path::Path::new(path));
+        assert!(release(
+            "/Applications/Omnigraph Studio.app/Contents/MacOS/omnigraph-studio"
+        ));
+        assert!(release(
+            "/home/ada/omnigraph-studio-0.3.0-linux-x86_64/bin/omnigraph-studio"
+        ));
+        assert!(!release(
+            "/w/omnigraph-studio/target/debug/omnigraph-studio"
+        ));
+        assert!(!release(
+            "/w/omnigraph-studio/target/debug/deps/studio_update-f7f2cad5771331a9"
+        ));
     }
 
     #[test]

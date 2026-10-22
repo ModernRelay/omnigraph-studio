@@ -99,6 +99,13 @@ rustix = { version = "1.1", features = ["fs"] }
 # The Agent Client Protocol at the version Zed v1.23.2 pins; stable v1 only (spec 011).
 agent-client-protocol = "=2.2.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Studio's updater (spec 017): Tauri's update manifest and minisign check, made for any Rust
+# app. Exact: Studio relies on how 0.2.3 installs (specs/017-auto-update/plan.md).
+cargo-packager-updater = "=0.2.3"
+# Reading the bundle's version out of a downloaded update before it is installed.
+flate2 = "1"
+tar = "0.4"
+tempfile = "3"
 # The agent's gateway serves HTTPS on loopback with a certificate it makes when it starts (spec
 # 013): rustls, which Studio's HTTP client already builds, over smol, with ring as its provider.
 futures-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
