@@ -1,7 +1,8 @@
 # 016: Studio as an OAuth client
 
-Status: draft, not implemented; needs the managed control plane's prerequisites and answers to
-the open questions below · 2026-10-21
+Status: draft, not implemented. Managed clusters come first; a self-hosted OIDC server is
+specified here but not planned for now. Needs the managed control plane's remaining
+prerequisites and answers to the open questions below · 2026-10-24
 
 ## Problem
 
@@ -83,7 +84,7 @@ Studio holds no static credential for it:
 | Server | Credential |
 |---|---|
 | CLI server target with a `token` or `exec` provider | The CLI's exported token (spec 003). A refused one is said as refused; Studio does not swap in OAuth. |
-| CLI server target with `auth: anonymous` | None; if the server's challenge offers OAuth, "Sign in" is offered. |
+| CLI server target with `auth: anonymous` | None; if the server's challenge offers OAuth, "Sign in" is offered. Not planned for now: a self-hosted OIDC server (Deferred). |
 | CLI managed target with a data `endpoint` | Always OAuth. The CLI's managed credential is never exported. |
 | CLI managed target without an `endpoint` | Refused: "This managed target has no data endpoint." |
 | Direct target | Refused (spec 003). |
@@ -240,14 +241,16 @@ Studio restarts; they hold no secrets.
     Metadata Document;
   - name each managed cluster's resource on its own data host, `https://<data host>/mcp`, and
     forward that path and its metadata through the data host's public route, which OAuth alone
-    does not create. Today the resource is published on the control plane's own origin, which
-    a client following RFC 9728 §3.3 (the MCP TypeScript SDK's `checkResourceAllowed`
-    included) refuses; the move is decided and under review there.
+    does not create. Done (2026-10-23): a client following RFC 9728 §3.3 (the MCP TypeScript
+    SDK's `checkResourceAllowed` included) now finds the resource where it calls.
 
   Its authorization server is AuthKit. Studio must not depend on `/openapi.json` being
   reachable through every deployment's proxy.
 - **ModernRelay**: publish Studio's Client ID Metadata Document at a stable HTTPS address.
-- **OmniGraph**: nothing beyond what main serves (A1 is implemented); tracked in #1025.
+- **OmniGraph**: nothing beyond what 0.14.0 serves (A1 is implemented); tracked in #1025.
+- **Studio's CLI finder** (spec 003): it chooses a CLI by `version --json`, and 0.14.0's CLI
+  reports access protocol 2 (target and credential 2 as well); Studio must accept it before a
+  managed target's endpoint can be read from `target inspect`.
 
 ## Decisions
 
@@ -264,6 +267,8 @@ Studio restarts; they hold no secrets.
 ## Deferred
 
 - The implementation, after the prerequisites and open questions are settled.
+- A self-hosted OIDC server (a CLI server target whose server offers sign-in): specified above,
+  not planned for now. Managed clusters come first.
 - Whether managed agents use the CLI's relay or are OAuth clients themselves (RFC #1017, A3;
   #1025's last item).
 - Several authorization servers for one resource (open question 6).
