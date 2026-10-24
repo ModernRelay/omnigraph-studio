@@ -1,12 +1,14 @@
 //! "Open a graph" (spec 003): servers with their state, a server's graphs, a graph id field,
-//! and a form to add a server by URL and token. ↑, ↓ and Tab (Zed's select actions) move
-//! through the servers, the chosen one's graphs and the id field; ↵ runs the row.
+//! and a form to add a server by URL and token (by URL alone on Windows, whose CLI gives Studio
+//! no token: the token field is disabled there and says why). ↑, ↓ and Tab (Zed's select
+//! actions) move through the servers, the chosen one's graphs and the id field; ↵ runs the row.
 
 use editor::{Editor, EditorEvent};
 use gpui::{
     App, Context, DismissEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Render,
     SharedString, Subscription, Task, WeakEntity, Window,
 };
+use graph_store::cli_config::{self, Platform};
 use graph_store::{
     Connection, ConnectionEvent, ConnectionRegistry, ConnectionState, ConnectionWatch,
     GraphListing, ServerSource,
@@ -44,6 +46,9 @@ pub struct OpenGraphModal {
     new_name: Entity<Editor>,
     new_url: Entity<Editor>,
     new_token: Entity<Editor>,
+    /// Whether the CLI gives Studio a token here, as the registry holds it: where it gives none
+    /// (Windows), the new server's token field is disabled and says why.
+    platform: Platform,
     /// The server being added, while the CLI adds its target.
     _adding: Option<Task<()>>,
     /// A replacement for a token the selected server refused.
@@ -82,19 +87,22 @@ impl OpenGraphModal {
     ) -> Self {
         let registry = ConnectionRegistry::global(cx);
         let connections = registry.read(cx).connections.clone();
+        let platform = registry.read(cx).platform();
         // A reload of the operator's files can add, drop or replace servers: the dialog lists
         // and follows what the registry holds now.
         let observe = cx.observe_in(&registry, window, |this, registry, window, cx| {
             this.follow(registry.read(cx).connections.clone(), window, cx)
         });
-        Self::build(workspace, connections, vec![observe], window, cx)
+        Self::build(workspace, connections, vec![observe], platform, window, cx)
     }
 
-    /// The dialog over `connections`, kept in line with the registry by `subscriptions`.
+    /// The dialog over `connections`, kept in line with the registry by `subscriptions`, on
+    /// `platform`.
     fn build(
         workspace: WeakEntity<Workspace>,
         connections: Vec<Entity<Connection>>,
         mut subscriptions: Vec<Subscription>,
+        platform: Platform,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -149,6 +157,7 @@ impl OpenGraphModal {
             new_name,
             new_url,
             new_token,
+            platform,
             replacement_token,
             _adding: None,
             error: None,
@@ -219,11 +228,27 @@ impl OpenGraphModal {
         places
     }
 
+    /// Why the new server's token field is disabled: where the CLI gives Studio no token
+    /// (Windows), Studio could not use a server that needs one. `None` where the field takes a
+    /// token. The registry refuses a token there too ([`ConnectionRegistry::add_target`]).
+    fn token_refusal(&self) -> Option<SharedString> {
+        (!self.platform.exports_tokens()).then(|| {
+            format!(
+                "Studio on Windows adds only servers that need no token: {}.",
+                cli_config::PIPE_ONLY
+            )
+            .into()
+        })
+    }
+
     /// ↓ or Tab (`by` 1), ↑ or ⇧Tab (-1), wrapping around. While a server is added, through
-    /// that form's fields instead.
+    /// that form's fields instead, past a token field that is disabled.
     fn step(&mut self, by: isize, window: &mut Window, cx: &mut Context<Self>) {
         if self.adding {
-            let fields = [&self.new_url, &self.new_name, &self.new_token];
+            let mut fields = vec![&self.new_url, &self.new_name];
+            if self.token_refusal().is_none() {
+                fields.push(&self.new_token);
+            }
             let at = fields
                 .iter()
                 .position(|field| field.focus_handle(cx).is_focused(window));
@@ -704,6 +729,24 @@ impl OpenGraphModal {
                         .child(studio_ui::ds::field_input(editor.clone())),
                 )
         };
+        // Disabled where Studio could not use a token (Windows): it takes no text, Tab passes it
+        // by, and it says why.
+        let token = match self.token_refusal() {
+            None => field("Bearer token", &self.new_token).into_any_element(),
+            Some(reason) => v_flex()
+                .gap(px(space::XS))
+                .child(studio_ui::ds::text::meta("Bearer token"))
+                .child(
+                    studio_ui::ds::field_frame(false, cx)
+                        .id("new-token-disabled")
+                        .debug_selector(|| "new-token-disabled".into())
+                        .opacity(studio_ui::ds::opacity::DIMMED)
+                        .cursor_not_allowed()
+                        .child(studio_ui::ds::text::muted("Not available on Windows"))
+                        .tooltip(ui::Tooltip::text(reason)),
+                )
+                .into_any_element(),
+        };
         v_flex()
             .flex_1()
             .min_w_0()
@@ -711,7 +754,7 @@ impl OpenGraphModal {
             .child(studio_ui::ds::text::body("Add a server"))
             .child(field("Address", &self.new_url))
             .child(field("Name", &self.new_name))
-            .child(field("Bearer token", &self.new_token))
+            .child(token)
             .child(
                 h_flex()
                     .gap(px(space::MD))
@@ -867,6 +910,15 @@ mod tests {
         connections: Vec<Entity<Connection>>,
         cx: &mut TestAppContext,
     ) -> (Entity<OpenGraphModal>, &mut VisualTestContext) {
+        dialog_on(connections, Platform::Unix, cx)
+    }
+
+    /// [`dialog`], on `platform`.
+    fn dialog_on(
+        connections: Vec<Entity<Connection>>,
+        platform: Platform,
+        cx: &mut TestAppContext,
+    ) -> (Entity<OpenGraphModal>, &mut VisualTestContext) {
         cx.update(|cx| {
             studio_theme::init_test(cx);
             editor::init(cx);
@@ -877,6 +929,7 @@ mod tests {
                 WeakEntity::new_invalid(),
                 connections,
                 Vec::new(),
+                platform,
                 window,
                 cx,
             )
@@ -1096,5 +1149,108 @@ mod tests {
         replacement.update(cx, |connection, cx| connection.connect(cx));
         cx.run_until_parked();
         assert_eq!(drawn.get(), before + 1, "its replacement is");
+    }
+
+    /// Which of Add server's fields has the keyboard.
+    fn add_field_focused(
+        modal: &Entity<OpenGraphModal>,
+        cx: &mut VisualTestContext,
+    ) -> &'static str {
+        cx.update(|window, cx| {
+            let modal = modal.read(cx);
+            let fields = [
+                ("address", &modal.new_url),
+                ("name", &modal.new_name),
+                ("token", &modal.new_token),
+            ];
+            fields
+                .into_iter()
+                .find(|(_, editor)| editor.focus_handle(cx).is_focused(window))
+                .map_or("none", |(name, _)| name)
+        })
+    }
+
+    /// The fields Tab visits in Add server, from the address, three steps on.
+    fn add_tab_order(
+        modal: &Entity<OpenGraphModal>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<&'static str> {
+        modal.update_in(cx, |modal, window, cx| modal.show_add(true, window, cx));
+        let mut visited = vec![add_field_focused(modal, cx)];
+        for _ in 0..3 {
+            cx.dispatch_action(menu::SelectNext);
+            visited.push(add_field_focused(modal, cx));
+        }
+        visited
+    }
+
+    /// Where the CLI gives Studio no token (Windows), Add server's token field is disabled and
+    /// says why: it is drawn without an editor, Tab passes it by, and its reason names the Unix
+    /// pipe. A token that reaches Add server anyway is refused by the registry, and said, with
+    /// nothing added and nothing sent.
+    #[gpui::test]
+    fn without_token_export_the_new_servers_token_field_is_disabled(cx: &mut TestAppContext) {
+        let (registry, asked) = cx.update(ConnectionRegistry::init_for_tests);
+        registry.update(cx, |registry, _| {
+            registry.set_platform_for_tests(Platform::Other)
+        });
+        let (modal, cx) = dialog_on(Vec::new(), Platform::Other, cx);
+        assert_eq!(
+            modal
+                .read_with(cx, |modal, _| modal.token_refusal())
+                .as_deref(),
+            Some(
+                "Studio on Windows adds only servers that need no token: the OmniGraph CLI \
+                 gives a token only through a Unix pipe."
+            )
+        );
+        assert_eq!(
+            add_tab_order(&modal, cx),
+            ["address", "name", "address", "name"]
+        );
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("new-token-disabled").is_some(),
+            "drawn disabled"
+        );
+
+        modal.update_in(cx, |modal, window, cx| {
+            for (editor, text) in [
+                (&modal.new_url, "https://new.test"),
+                (&modal.new_token, "secret-typed"),
+            ] {
+                editor.update(cx, |editor, cx| editor.set_text(text, window, cx));
+            }
+            modal.add_server(window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            modal
+                .read_with(cx, |modal, _| modal.error.clone())
+                .as_deref(),
+            Some(
+                "The server was not added: the OmniGraph CLI gives a token only through a Unix \
+                 pipe, so Studio on Windows cannot use a server that needs a token yet; leave \
+                 the token empty to add one that needs none"
+            )
+        );
+        assert!(registry.read_with(cx, |registry, _| registry.connections.is_empty()));
+        assert!(asked.lock().unwrap().is_empty(), "nothing sent");
+    }
+
+    /// Where the CLI gives Studio a token (Unix), Add server's token field is a field like the
+    /// others, in Tab's way.
+    #[gpui::test]
+    fn the_new_servers_token_field_takes_a_token_where_the_cli_exports_one(
+        cx: &mut TestAppContext,
+    ) {
+        let (modal, cx) = dialog_on(Vec::new(), Platform::Unix, cx);
+        assert_eq!(modal.read_with(cx, |modal, _| modal.token_refusal()), None);
+        assert_eq!(
+            add_tab_order(&modal, cx),
+            ["address", "name", "token", "address"]
+        );
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("new-token-disabled").is_none());
     }
 }

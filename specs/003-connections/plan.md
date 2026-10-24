@@ -2,8 +2,9 @@
 
 Status: in progress · 2026-10-22. Built: servers from the targets the OmniGraph CLI lists and
 from the environment; a server added as a CLI target, through the CLI; tokens from the CLI's
-`credentials export`; the contract check; bounded reads; and replacing a refused token
-(validation log). OIDC and managed clusters wait for Studio's own sign-in (Deferred; spec 016).
+`credentials export` (on Unix; on Windows only anonymous targets); the contract check;
+bounded reads; and replacing a refused token (validation log). OIDC and managed clusters wait
+for Studio's own sign-in (Deferred; spec 016).
 
 ## Problem
 
@@ -68,7 +69,12 @@ dialog by keyboard), X (capabilities from the served document).
     a credential (exit 1), and says a failure on standard error as `Error:` with numbered causes
     in colour, a managed target not signed in as `{"type":"login_required",…}`; an unknown target
     is refused with exit 2. It exports a managed target's exchanged data token, which Studio does
-    not ask for.
+    not ask for. On a system other than Unix it refuses every export: at main `242ab02f` its
+    check of standard output (`commands::targets::stdout_is_pipe` in `commands/targets/mod.rs`)
+    asks whether `/dev/stdout` is a FIFO on Unix and is `false` elsewhere, with no named pipe or
+    other route; its `exec` helpers are refused there too (`credential_sources::exec`,
+    `HelperUnsupported`). `version --json`, `target list`, `target inspect` and `credentials
+    status` are not gated by platform.
 - Routes served from 0.14 on but not in `v0.13.0`: Blob `PUT`/`DELETE`, commit publish and drop.
 
 ## Design
@@ -95,8 +101,11 @@ dialog by keyboard), X (capabilities from the served document).
      check of the CLI's files sees: it lists the targets with that CLI and asks every token
      again. The agent's CLI is chosen from the same places with the same probe, and must also
      pass its own check of the agent's home (spec 013). Studio needs a CLI from main `ff542202`
-     on and a version-1 operator configuration. On a system without Unix pipes (Windows) Studio
-     lists no targets and says why: the CLI gives a token only through a pipe.
+     on and a version-1 operator configuration. On Windows Studio finds the CLI and lists its
+     targets as on Unix, and uses the anonymous ones: the CLI gives a token only through a Unix
+     pipe, so each server target that takes one is refused as it is listed
+     (`cli_config::Platform`; since 2026-10-22, before which a Windows Studio listed no targets
+     at all and had no server but the environment's).
    - **Running it.** The CLI runs off the main thread, one sequence of Studio's commands at a time
      (`cli::take_turn`): a listing, an Add server, one target's `credentials status`,
      `credentials export` and `target inspect` together, or the agent's choice of its CLI. The
@@ -130,11 +139,16 @@ dialog by keyboard), X (capabilities from the served document).
      016): Studio does not borrow the CLI's managed data token (RFC 1017, A2), and runs no other
      command for it. The listing describes each as `target list` does (its profile, its cluster
      id and incarnation, and its endpoint and default graph; `CliTargets::managed`), and Studio
-     holds no token for it. A target with `transport.tls.ca` is refused as not supported yet
-     rather than reached with other roots (Deferred). One with `proxy: {mode: url}` gets an HTTP
-     client of its own through that proxy (Zed's client, which also leaves out the hosts in
-     `NO_PROXY`); `direct` and `environment` use Studio's client, which follows the system's
-     proxy settings. A `unix:///…` endpoint is
+     holds no token for it. Where the CLI exports no token (Windows), each server target that
+     takes one, from any source or an `exec` helper, is refused the same way ("CLI target 'x'
+     takes a token, and the OmniGraph CLI gives a token only through a Unix pipe, so Studio on
+     Windows cannot use this target yet"), after any refusal that holds on every system; its
+     token is never asked for and its token file is not watched, and an anonymous target on its
+     address is then that address's server. A target with `transport.tls.ca` is refused as not
+     supported yet rather than reached with other roots (Deferred). One with
+     `proxy: {mode: url}` gets an HTTP client of its own through that proxy (Zed's client, which
+     also leaves out the hosts in `NO_PROXY`); `direct` and `environment` use Studio's client,
+     which follows the system's proxy settings. A `unix:///…` endpoint is
      refused, since Studio's client speaks TCP (the CLI refuses one in the file anyway). A
      configuration the CLI refuses lists nothing and keeps every server as it was; the toast,
      which stays until dismissed, gives the CLI's own words, which for a file in the old format
@@ -199,7 +213,13 @@ dialog by keyboard), X (capabilities from the served document).
    name may be left out: the host is the target's name, made into one a target can have
    (`[A-Za-z][A-Za-z0-9_.-]*`, `server-` before one that starts otherwise). An address Studio
    connects to already is that server, and nothing is added. The CLI rewrites the operator file
-   when it adds a target, so the file's comments do not survive an Add server.
+   when it adds a target, so the file's comments do not survive an Add server. Where the CLI
+   exports no token (Windows), Add server adds only servers that need none: its token field is
+   disabled, with its reason in its tooltip ("Studio on Windows adds only servers that need no
+   token: the OmniGraph CLI gives a token only through a Unix pipe."), and Tab passes it by
+   (since 2026-10-22). A token that reaches the registry anyway is refused before the CLI is
+   asked ("… so Studio on Windows cannot use a server that needs a token yet; leave the token
+   empty to add one that needs none"): Studio could not use the target it would add.
    For development and tests, `OMNIGRAPH_STUDIO_SERVER` (with `OMNIGRAPH_STUDIO_TOKEN`, which
    lasts the run, and `OMNIGRAPH_STUDIO_GRAPH`) still adds a server named `environment`: the
    development server (`script/dev-server`) is plain HTTP with a bearer token, which a CLI
@@ -254,10 +274,11 @@ typed. A new token typed for a server that refused its token is that server's al
 another, by a click, by the keyboard or by the registry dropping the one chosen, clears the field
 and its error, so Update token never sends it to another address (since 2026-10-21; before, one
 field served every server and kept what was typed). While a server is added, Tab moves through
-that form's fields. The dialog lists the registry's servers as they are now: a new listing of the
-CLI's targets that adds, drops or replaces one (a new address is a new connection) is followed,
-so the replacement's state shows and the dropped one's no longer reaches the dialog; a choice
-the registry no longer holds moves to one it does.
+that form's fields, past its token field where that is disabled (Windows). The dialog lists the
+registry's servers as they are now: a new listing of the CLI's targets that adds, drops or
+replaces one (a new address is a new connection) is followed, so the replacement's state shows
+and the dropped one's no longer reaches the dialog; a choice the registry no longer holds moves
+to one it does.
 
 ### States (status-bar chip)
 
@@ -366,6 +387,9 @@ and the tooltip named `omnigraph login`, which is managed sign-in only now).
   `add_root_certificate` for `replace`, the platform's roots and the bundle for `append`),
   wrapped by `ReqwestClient::from`. That needs Zed's `reqwest` (`zed-reqwest` at the revision Zed
   v1.23.2 pins) as a dependency of `graph_store`. Until then such a target is refused.
+- A CLI target's token on Windows. It needs a `credentials export` route the CLI offers off Unix
+  (a named pipe, say), an OmniGraph change; until then such a target is refused and Add server
+  takes no token there.
 - Honouring `proxy: {mode: direct}` exactly: Zed's client follows the system's proxy settings and
   has no constructor that turns them off.
 
@@ -373,6 +397,7 @@ and the tooltip named `omnigraph login`, which is managed sign-in only now).
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-22 | Studio on Windows lists the CLI's targets, connects the anonymous ones, refuses each that takes a token, and adds only servers that need none | OmniGraph main `242ab02f`: `crates/omnigraph-cli/src/commands/targets/mod.rs` (`stdout_is_pipe`, `run_credential`), `commands/targets/args.rs` ("Write an access token to a Unix pipe"), `credential_sources/exec.rs` (`HelperUnsupported` off Unix); `graph_store` `registry::tests::without_token_export_only_anonymous_targets_connect` (the registry's own listing given `Platform::Other`), `cli_tokens::tests::the_targets_are_listed_as_the_cli_describes_them` (extended: the stand-in CLI listed with `Platform::Other`), `cli_tokens::every_system_tests::the_cli_is_looked_for_on_every_system` (no platform gate); `studio` `open_graph::tests::without_token_export_the_new_servers_token_field_is_disabled` and `the_new_servers_token_field_takes_a_token_where_the_cli_exports_one`; an offscreen snapshot of the Open dialog with `Platform::CURRENT` set to `Other` for the run and an empty `OMNIGRAPH_HOME`, the pointer on the token field | The CLI's export refuses every standard output off Unix, with no named-pipe route; the other four commands are not gated. With `Platform::Other`: the CLI was found and `target list --json` alone ran; only the anonymous targets were servers, one connected Ready with no Authorization; the store, env, file and exec targets were refused with the reason and asked nothing; the direct, managed and custom-CA targets kept their reasons. Add server's token field was drawn disabled, Tab went address, name, address; its tooltip read the reason; a token put in the field by the test was refused by the registry and said in the dialog, with nothing added or sent. With `Platform::Unix` the same targets landed as before and Tab reached the token field. Before, `find_cli` refused on every non-Unix system, so a Windows Studio listed no CLI target |
 | 2026-10-22 | The stand-in CLI's tests hold no bound a busy machine can reach | `graph_store` `cli_tokens::tests`: `READ_TIMEOUT` an hour in tests, and the stand-ins' sources given it; `a_refused_export_says_why_and_never_the_token` (an export whose stand-in never answers, run in a turn the test holds, stopped at its own 300 ms); `tokens_asked_together_take_turns_at_the_cli` (a lock the stand-in lets go once it has refused a command, then holds); `a_command_held_back_past_its_timeout_is_not_run` (a turn the test holds) | The timeout path is reached only by a stand-in that never answers, and the busy path only by a turn the test holds; the lock is retried once, then refused through every retry. Before, on a loaded machine, 7 of the tests failed after waiting 60 s for their turn behind the others' commands ("did not answer `version --json` in time"), and the lock test released its lock from a thread 400 ms in |
 | 2026-10-22 | A graph's first reads wait for its connection's token, and a new token reads again every read a 401 could have refused, the schema included | `graph_store` `the_first_reads_wait_for_the_token_and_the_schema_loads` (a CLI server whose token arrives after its graph is shown, as a start reopens a window; then a session whose schema read a stale token was refused, given a good one); `GraphSession::open_when_ready`, `Connection::token_ready` and `ConnectionEvent::TokenReady` | Nothing was sent before the token; then the schema, snapshot, branch list and access, each with it, and the schema loaded with no Refresh. The refused schema was read again under the next token. Before, measured on a 0.14 server: the CLI gave the token 30–320 ms after the session sent its first reads, the schema read was refused (401), and `read_again_for_credential` read the counts, the catalog and the branch list again but never the schema, so a reopened window stayed empty until Refresh |
 | 2026-10-22 | A start connects only the servers it shows; the others connect when the Open dialog lists them | `studio` `a_link_at_a_start_connects_its_server_alone` (a window that would ask for a graph and a link, both before the targets are listed), `a_reopened_window_connects_its_own_servers` (a saved window of two targets of three, then "Open a graph") | The link: nothing sent until the targets were listed, then requests to its server alone, its graph shown and no dialog. The reopened window: its two servers connected and the third not, until the dialog listed it. Before, measured on a 0.14 server: `ask_for_graph` connected every CLI target at a start that reopened no window, even when a link opened one graph at once (10 requests to 5 servers, 15 CLI runs), and a down server's health check waited 15 s |

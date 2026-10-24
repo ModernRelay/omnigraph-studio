@@ -259,6 +259,19 @@ impl ConnectionRegistry {
         }
     }
 
+    /// Takes `platform` as the system Studio runs on, for the tests of what Studio does where
+    /// the CLI gives it no token (Windows).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_platform_for_tests(&mut self, platform: Platform) {
+        self.platform = platform;
+    }
+
+    /// Whether the CLI gives Studio a token here: the system Studio runs on, but in a test. Add
+    /// server's token field follows it.
+    pub fn platform(&self) -> Platform {
+        self.platform
+    }
+
     fn load(http: Arc<dyn HttpClient>, cx: &mut Context<Self>) -> Self {
         let mut this = Self::empty(http, cli_config::operator_dir());
         this.proxied = Arc::new(proxied_client);
@@ -660,7 +673,8 @@ impl ConnectionRegistry {
     /// again at once, and the new target's connection is the answer. An address Studio connects
     /// to already is that connection, and nothing is added. A refusal is the CLI's own words.
     /// Where the CLI gives Studio no token (Windows), a token is refused before the CLI is asked:
-    /// Studio could not use the target it would add.
+    /// Studio could not use the target it would add. The Open dialog disables its token field
+    /// there, so this refusal is what stands behind it.
     pub fn add_target(
         &mut self,
         name: String,

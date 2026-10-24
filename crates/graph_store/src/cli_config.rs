@@ -100,8 +100,8 @@ impl Platform {
 }
 
 /// Why Studio uses no server target that takes a token where the CLI exports none
-/// ([`Platform::Other`]).
-pub(crate) const PIPE_ONLY: &str = "the OmniGraph CLI gives a token only through a Unix pipe";
+/// ([`Platform::Other`]), and why Add server takes no token there.
+pub const PIPE_ONLY: &str = "the OmniGraph CLI gives a token only through a Unix pipe";
 
 /// A managed cluster target, as `target list --json` describes it: refused until Studio has its
 /// own sign-in (spec 016 builds that client from these fields, and reads the profile's control
