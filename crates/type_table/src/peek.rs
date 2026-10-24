@@ -5563,7 +5563,7 @@ mod tests {
     async fn open_fields_stay_drafts_on_the_branch_a_page_leaves(cx: &mut TestAppContext) {
         const TITLED: &str =
             "node Person {\n  slug: String @key\n  name: String\n  title: String?\n}\n";
-        let refused = json!({ "error": "policy denied", "code": "forbidden" });
+        let refused = json!({ "error": "policy denied", "code": "forbidden", "disposition": { "action": "refresh", "effects": "none" } });
         let session = session_answering(TITLED, 403, refused, cx);
         let (view, cx) = page(session.clone(), cx);
         edit_name(&view, "Ada Lovelace", cx);
@@ -6665,7 +6665,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         use crate::test_support::{committed, session_writing};
-        let refused = json!({ "error": "__dst 'p9' not found in Person", "code": "bad_request" });
+        let refused = json!({ "error": "__dst 'p9' not found in Person", "code": "bad_request", "disposition": { "action": "fix", "effects": "none" } });
         let lost = (500, json!({}));
         let cases = [
             // The second write's answer; the first's, which lands, comes first.
@@ -6871,7 +6871,7 @@ mod tests {
     /// written to while the search for the new text is out.
     #[gpui::test]
     async fn enter_waits_for_the_results_of_what_is_typed(cx: &mut TestAppContext) {
-        let refused = json!({ "error": "refused", "code": "bad_request" });
+        let refused = json!({ "error": "refused", "code": "bad_request", "disposition": { "action": "fix", "effects": "none" } });
         let (view, cx) = page(session_answering(KNOWS, 400, refused, cx), cx);
         view.update_in(cx, |view, window, cx| {
             view.start_add(0, window, cx);
@@ -6901,7 +6901,7 @@ mod tests {
     /// its group points from; a refusal stays on the group with its reason.
     #[gpui::test]
     async fn a_refused_relationship_says_why_on_its_group(cx: &mut TestAppContext) {
-        let refused = json!({ "error": "__dst 'p9' not found in Person", "code": "bad_request" });
+        let refused = json!({ "error": "__dst 'p9' not found in Person", "code": "bad_request", "disposition": { "action": "fix", "effects": "none" } });
         let (view, cx) = page(session_answering(KNOWS, 400, refused, cx), cx);
         view.update_in(cx, |view, window, cx| {
             view.start_add(0, window, cx);
@@ -6924,7 +6924,7 @@ mod tests {
     /// and why (constitution III).
     #[gpui::test]
     async fn a_refused_field_opens_again_with_its_text_and_reason(cx: &mut TestAppContext) {
-        let refused = json!({ "error": "policy denied", "code": "forbidden" });
+        let refused = json!({ "error": "policy denied", "code": "forbidden", "disposition": { "action": "refresh", "effects": "none" } });
         let session = session_answering(PEOPLE, 403, refused, cx);
         let (view, cx) = page(session.clone(), cx);
         edit_name(&view, "Ada Lovelace", cx);
@@ -6955,7 +6955,7 @@ mod tests {
     /// typed: refused, its text is kept as the property's draft.
     #[gpui::test]
     async fn a_refused_write_whose_peek_went_keeps_its_text(cx: &mut TestAppContext) {
-        let refused = json!({ "error": "policy denied", "code": "forbidden" });
+        let refused = json!({ "error": "policy denied", "code": "forbidden", "disposition": { "action": "refresh", "effects": "none" } });
         let session = session_answering(PEOPLE, 403, refused, cx);
         let (view, cx) = page(session.clone(), cx);
         view.update_in(cx, |view, window, cx| {
@@ -6989,7 +6989,7 @@ mod tests {
     /// the property's draft on the branch it was typed on, and leaves the new branch alone.
     #[gpui::test]
     async fn a_refused_write_after_a_branch_switch_keeps_its_text(cx: &mut TestAppContext) {
-        let refused = json!({ "error": "policy denied", "code": "forbidden" });
+        let refused = json!({ "error": "policy denied", "code": "forbidden", "disposition": { "action": "refresh", "effects": "none" } });
         let session = session_answering(PEOPLE, 403, refused, cx);
         let (view, cx) = page(session.clone(), cx);
         view.update_in(cx, |view, window, cx| {

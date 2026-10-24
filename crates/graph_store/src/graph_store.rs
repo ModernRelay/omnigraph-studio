@@ -52,7 +52,7 @@ pub use registry::ConnectionRegistry;
 /// ([`cli::omnigraph_variables`]).
 pub mod cli {
     pub use crate::cli_tokens::{
-        FIRST_CLI_COMMIT, FoundCli, Held, MAX_ANSWER_BYTES, READ_TIMEOUT, Ran, Unrun,
+        FIRST_CLI_RELEASE, FoundCli, Held, MAX_ANSWER_BYTES, READ_TIMEOUT, Ran, Unrun,
         VARIABLE_PREFIX, candidates, configured, installed, omnigraph_variables, probe, run,
         take_turn,
     };

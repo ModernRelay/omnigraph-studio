@@ -7,12 +7,9 @@
 #   script/dev-server            # first run applies the cluster and loads dev/seed.jsonl
 #   script/dev-server --reset    # start again from an empty graph
 #
-# Needs OmniGraph's `omnigraph` and `omnigraph-server`, on PATH or named by OMNIGRAPH_BIN and
-# OMNIGRAPH_SERVER_BIN: a CLI from OmniGraph main ff542202 or later, as Studio needs (until 0.14
-# is released, an edge build such as `edge-20261022-7fff9df`), and a server that speaks HTTP
-# contract 0.14 (`edge-20261020-7fd9cc9` or later). Both are checked: the CLI by its
-# `version --json` and its own check of the operator file this script writes, the started
-# server by the contract header its /healthz answers with.
+# Needs OmniGraph's `omnigraph` and `omnigraph-server` of `v0.14.0` or later, on PATH or named by
+# OMNIGRAPH_BIN and OMNIGRAPH_SERVER_BIN. Both are checked: the CLI by its `version --json`, the
+# started server by the contract header its /healthz answers with.
 # Data lives in dev/.data; 0.14 stamps it format 16 on its first write, which 0.13 cannot open.
 set -euo pipefail
 
@@ -22,7 +19,7 @@ BIND=${STUDIO_DEV_BIND:-127.0.0.1:8787}
 CLI=${OMNIGRAPH_BIN:-omnigraph}
 SERVER=${OMNIGRAPH_SERVER_BIN:-omnigraph-server}
 TOKEN=dev-token
-NEEDS_CLI="dev-server needs an OmniGraph CLI from main ff542202 or later, as Studio does (an edge build such as edge-20261022-7fff9df until 0.14 is released)"
+NEEDS_CLI="dev-server needs an OmniGraph CLI of v0.14.0 or later, as Studio does"
 
 if [[ "${1:-}" == "--reset" ]]; then
   rm -rf "$DATA"
@@ -32,10 +29,8 @@ fi
 # line into a closed pipe, which `pipefail` turns into a failed start.
 version=$("$CLI" version)
 version=${version%%$'\n'*}
-# The contract and the protocols Studio's connections require of a CLI (`PROTOCOLS` in
-# crates/graph_store/src/cli_tokens.rs). Prints why the CLI is not one, or nothing. Builds from
-# main f7db38da to just before ff542202 report the same and read this script's file, so they
-# pass: they serve the dev graphs, though Studio's agent refuses them.
+# The contract and the protocols Studio requires of a CLI (`PROTOCOLS` and `PROTOCOL` in
+# crates/graph_store/src/cli_tokens.rs). Prints why the CLI is not one, or nothing.
 # shellcheck disable=SC2016 # the backticks are the message's, not a command
 unfit=$("$CLI" version --json 2> /dev/null | python3 -c '
 import json, sys
@@ -50,12 +45,12 @@ if facts.get("http_contract") != "0.14":
     print("speaks HTTP contract %s" % facts.get("http_contract"))
     sys.exit()
 protocols = facts.get("protocols") or {}
-for name, known in (("target", (1, 2)), ("credential", (1, 2)), ("access", (1,))):
+for name in ("target", "credential", "access"):
     number = protocols.get(name)
     if number is None:
         print("reports no %s protocol" % name)
         sys.exit()
-    if type(number) is not int or number not in known:
+    if type(number) is not int or number != 2:
         print("reports %s protocol %s, which Studio does not drive" % (name, number))
         sys.exit()
 ' || true)
@@ -81,13 +76,6 @@ trap 'rm -rf "$home"' EXIT
 uri=$(python3 -c 'import json, pathlib, sys; print(json.dumps(pathlib.Path(sys.argv[1]).resolve().as_uri()))' "$DATA")
 printf 'version: 1\ntargets:\n  dev: {kind: direct, scope: root, uri: %s}\n' "$uri" > "$home/config.yaml"
 og() { OMNIGRAPH_HOME=$home "$CLI" "$@"; }
-
-# A CLI with those protocols from before OmniGraph's version-1 operator configuration has no
-# `config validate`, which its parser says, and could not read the file.
-if ! said=$(og config validate 2>&1); then
-  echo "$NEEDS_CLI; $version refused the operator file dev-server writes: ${said%%$'\n'*} (set OMNIGRAPH_BIN)" >&2
-  exit 1
-fi
 
 # Runs the CLI with its output kept, shown only when it fails: the target line it prints, and its
 # advice on the lock it keeps, are this script's to act on.
@@ -171,7 +159,7 @@ served=$(curl -fsS -o /dev/null -D - "http://$BIND/healthz" 2> /dev/null \
   | tr -d '\r' | awk -F': *' 'tolower($1) == "omnigraph-http-api" { print $2 }' || true)
 if [[ "$served" != 0.14 ]]; then
   if [[ -n "$served" ]]; then answer="contract $served"; else answer="no contract"; fi
-  echo "dev-server needs an omnigraph-server that speaks HTTP contract 0.14 (edge-20261020-7fd9cc9 or later); $SERVER answers $answer at http://$BIND/healthz (set OMNIGRAPH_SERVER_BIN)" >&2
+  echo "dev-server needs an omnigraph-server of v0.14.0 or later, which speaks HTTP contract 0.14; $SERVER answers $answer at http://$BIND/healthz (set OMNIGRAPH_SERVER_BIN)" >&2
   exit 1
 fi
 

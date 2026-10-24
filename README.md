@@ -28,16 +28,19 @@ Requirements:
 - macOS: the Command Line Tools (GPUI compiles its Metal shaders when Studio starts); full
   Xcode to compile them into a release build (`script/bundle-mac`). Linux: the Wayland, X11 and
   Vulkan development packages listed in `.github/workflows/ci.yml`.
-- An OmniGraph server that speaks HTTP contract 0.14: the edge build `edge-20261020-7fd9cc9`
-  or later. Studio refuses a server that speaks another contract, OmniGraph 0.13 and the
-  earlier 0.14 edge builds included, and its query checks follow that build.
+- An OmniGraph server of `v0.14.0` or later (HTTP contract 0.14). Studio refuses a server
+  that speaks another contract, such as OmniGraph 0.13, and its query checks follow `v0.14.0`.
 - For the servers of the CLI's targets, the agent panel and the sample graph, the `omnigraph`
-  CLI of an edge build made from OmniGraph main `ff542202` or later, such as
-  `edge-20261022-7fff9df` (`VERSION=edge-20261022-7fff9df` with OmniGraph's
-  `scripts/install.sh`), which reads OmniGraph's version-1 operator configuration. Studio looks
-  for it on `PATH`, then in `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`.
+  CLI of `v0.14.0` or later, which OmniGraph's installer puts in `~/.local/bin`:
 
-Run against the sample graph (200 people, 25 companies, 40 projects), with that build's
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | bash
+  ```
+
+  Studio looks for it on `PATH`, then in `~/.local/bin`, `/opt/homebrew/bin` and
+  `/usr/local/bin`, and drives the first that reports target, credential and access protocol 2.
+
+Run against the sample graph (200 people, 25 companies, 40 projects), with that release's
 `omnigraph` and `omnigraph-server` on `PATH` or named by `OMNIGRAPH_BIN` and
 `OMNIGRAPH_SERVER_BIN`:
 
@@ -47,9 +50,8 @@ script/dev-server    # serves knowledge and notes on 127.0.0.1:8787, token dev-t
 
 The first run applies `dev/cluster/` and loads the seeds through a direct target in an operator
 home of the script's own, before the server starts; your `~/.omnigraph` takes no part. It stops,
-saying which, when a binary is one Studio cannot use: the CLI by its `version --json` and its
-check of that home's operator file, the started server by the contract header its `/healthz`
-answers with. `STUDIO_DEV_DATA` and `STUDIO_DEV_BIND` move its data (default `dev/.data`) and
+saying which, when a binary is one Studio cannot use: the CLI by its `version --json`, the
+started server by the contract header its `/healthz` answers with. `STUDIO_DEV_DATA` and `STUDIO_DEV_BIND` move its data (default `dev/.data`) and
 address, and `--reset` starts again from empty graphs.
 
 ```bash
@@ -186,7 +188,7 @@ what is deferred, and a dated validation log of the checks behind each claim.
 
 ## Status
 
-Built against OmniGraph 0.14 (`edge-20261020-7fd9cc9`, HTTP contract 0.14); macOS is the primary platform, and Linux and Windows build and
+Built against OmniGraph `v0.14.0` (HTTP contract 0.14); macOS is the primary platform, and Linux and Windows build and
 test in CI. Not implemented:
 
 - Signed and notarized releases, a Windows installer, auto-update.

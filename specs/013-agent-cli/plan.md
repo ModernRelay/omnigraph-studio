@@ -1,9 +1,9 @@
 # 013: The agent uses the OmniGraph CLI
 
 Status: implemented; the CLI is the only graph tool · 2026-10-13. The CLI home is OmniGraph's
-version-1 operator configuration over loopback TLS since 2026-10-21, checked against
-`0.14.0-edge+7fff9df`, the first edge build that reads it (see "Choosing the CLI"). The agent's
-CLI is found as Studio's own is, by `graph_store::cli`, since 2026-10-22.
+version-1 operator configuration over loopback TLS since 2026-10-21. The agent's CLI is found as
+Studio's own is, by `graph_store::cli`, since 2026-10-22, and is OmniGraph `v0.14.0` or later,
+the first release to report protocol 2, since 2026-10-24 (see "Choosing the CLI").
 
 ## Problem
 
@@ -109,7 +109,9 @@ three items held there and are gone; the items for #1090 and #1115 below say wha
   in the diff `888223b7..ff542202` of `operator_schema.rs`). `edge-20261022-7fff9df`
   (`0.14.0-edge+7fff9df`, main `7fff9dfd`, with `ff542202`) reads it, and is the CLI installed
   at `~/.local/bin` now (checked 2026-10-22: `version --json` reports contract 0.14 and
-  protocols target, credential and access 1).
+  protocols target, credential and access 1). The `v0.14.0` release (2026-10-22, commit
+  `60bfd19d`) reports all three as 2 (#1133, #1135; its `version --json` is
+  `{"version":"0.14.0","channel":"stable","http_contract":"0.14","protocols":{"target":2,"credential":2,"access":2},…}`).
 - Policy branch scopes are `any`, `protected`, `unprotected`
   (`crates/omnigraph-policy/src/lib.rs:213-217`). A commit records the actor resolved from the
   bearer token (`handlers.rs:415-437`).
@@ -352,48 +354,42 @@ look in the same places, probe alike, and share one turn at the CLI.
    `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin` (`cli::candidates`), each program
    once: a place that links to a program listed before it is that program (`cli::installed`).
 2. Each is probed as Studio probes its own CLI (`cli::probe`), without a server: `omnigraph
-   version --json` must report `http_contract` 0.14 (OmniGraph #987, E23) and the target,
-   credential and access protocols Studio drives (1 or 2, 1 or 2, and 1), and `target list`,
-   `target inspect`, `credentials status` and `credentials export` must each answer `--help`.
-   Each command is bounded to 10 s. What a program was found to be is kept in
-   `cli_probes.json` until its file changes, so a later conversation, or a launch, runs no
-   probe of it again; a program that could not be run or did not answer in time is asked again
-   at the next look. An older release, or one that reports another number or none, fits
-   nothing.
-3. A CLI the probe takes then checks the home itself: `omnigraph config validate
-   --operator-config <private home>/config.yaml`, run as `omnigraph_run` runs the CLI (that home
-   as `OMNIGRAPH_HOME`, no other `OMNIGRAPH_*` variable), bounded to 10 s, off the main thread.
-   It must exit 0. Protocol 1 alone proves nothing: CLIs before and after the version-1
-   configuration both report it. Protocol 2, which #1127 asks a later CLI to report, is taken
-   too, and still validated. The first that passes goes in the wrapper, so a slow or unavailable
-   server never decides which CLI a conversation gets. The first OmniGraph build that passes is
-   the edge build made from main at `ff542202` or later; `edge-20261021-888223b` has the
-   version-1 configuration without one `auth` per server target and refuses the home.
-4. The look waits for Studio's turn at the CLI up to 120 s, ahead of the asks no window waits
+   version --json` must report `http_contract` 0.14 (OmniGraph #987, E23) and target,
+   credential and access protocol 2, bounded to 10 s. OmniGraph `v0.14.0` is the first release
+   to report 2 (#1133, #1135), and every CLI that does reads the version-1 configuration Studio
+   writes, so the probe is the whole check: no `--help` of a command and no `config validate`
+   of the home. What a program was found to be is kept in `cli_probes.json` with the
+   requirements it was judged against, until its file or those requirements change, so a later
+   conversation, or a launch, runs no probe of it again; a program that could not be run or did
+   not answer in time is asked again at the next look. The first that fits goes in the wrapper,
+   so a slow or unavailable server never decides which CLI a conversation gets. An older
+   release, an edge build that reports protocol 1, or one that reports another number or none,
+   fits nothing.
+3. The look waits for Studio's turn at the CLI up to 120 s, ahead of the asks no window waits
    on, since a person waits on the conversation. When Studio's other commands hold the CLI past
    that (a token's export waiting on its credential helper), no CLI is asked: the wrapper runs
    nothing and says the CLI was busy with another of Studio's commands, and to start a new
    conversation to try again.
-5. If none fits, the wrapper runs nothing and prints why, so `omnigraph_run` and the agent's
+4. If none fits, the wrapper runs nothing and prints why, so `omnigraph_run` and the agent's
    shell refuse rather than run a CLI that cannot reach the gateway. A notice in the thread names
    what the graph and the home need, and each CLI found with why it does not fit, naming its
    release where it reported one: it answers no `version --json`, speaks another contract,
-   reports no target, credential or access protocol, or one Studio does not know, lacks a command
-   Studio runs, could not be run or did not answer in time, or its `config validate` refused the
-   home (its first line of error, the parser's refusal of `config` included). It ends with what to
-   install: an OmniGraph edge build made from main at `ff542202` or later
-   (`edge-20261021-888223b` is older and refuses it), with the installer's edge-channel command,
-   or `omnigraph_cli` set to such a CLI. The `omnigraph_cli` tool and the conversation's
-   instructions say the CLI is unavailable and name the same commit. A configured `omnigraph_cli`
-   that does not fit is passed over with a notice naming the one used.
+   reports no target, credential or access protocol, or one other than 2, or could not be run or
+   did not answer in time. It ends with what to install: OmniGraph `v0.14.0` or later, with
+   OmniGraph's installer (`curl -fsSL
+   https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | bash`;
+   `install.ps1` through PowerShell on Windows), or `omnigraph_cli` set to such a CLI. The
+   `omnigraph_cli` tool and the conversation's instructions say the CLI is unavailable and name
+   the same release. A configured `omnigraph_cli` that does not fit is passed over with a notice
+   naming the one used.
 
-`0.14.0-edge+50283ce` is refused: it reports no access protocol (and has no `config validate`),
-as decided. The first build of the version-1 line installed here, `0.14.0-edge+7fff9df`
-(2026-10-21, OmniGraph main with `ff542202`), is taken: the ignored `gateway` test
-`a_live_cli_reaches_the_gateway_with_what_its_home_holds`, run with `OMNIGRAPH_STUDIO_LIVE_CLI`
-pointing at it, passes (validation log). The ignored
+The edge builds are refused: `0.14.0-edge+50283ce` reports no access protocol, and
+`0.14.0-edge+7fff9df`, the build installed here when this was written, reports protocol 1. The
+ignored `gateway` test `a_live_cli_reaches_the_gateway_with_what_its_home_holds` passed with
+`OMNIGRAPH_STUDIO_LIVE_CLI` pointing at `0.14.0-edge+7fff9df` (validation log, 2026-10-21); it
+has not been run against a `v0.14.0` CLI, which is not installed here. The ignored
 `the_stock_cli_reads_and_writes_its_branch_through_the_gateway` also needs a server and has not
-been run with it.
+been run with either.
 
 ### Gateway rules
 
@@ -719,6 +715,7 @@ CLI is the one they trust).
 | 2026-10-21 | The wrapper's first run waits for Gatekeeper's scan | An unsigned C probe (not checked in) that writes a two-line script, makes it `0700` and runs it twice; `/usr/bin/log show` for `syspolicyd` and `XprotectService` over those seconds; Apple M5 Pro, macOS 26.5.2 | `syspolicyd` logged `GK performScan` for the script (`-67062`: unsigned), opened XProtect's analysis service, which loaded the XProtect YARA rules, then `Putting executable into provenance`; the second run logged no scan. First run 0.17 s and 0.26 s in two tries, second 6 ms and 12 ms. Not reproduced: the 7-23 s the live test saw while builds were running |
 | 2026-10-22 | The gateway keeps a slot for a connection that gives the token | `agent_panel` `socket::a_full_listener_lets_go_of_the_oldest_unproved_connection` (a listener of 64: the CLI's connection, then 63 held open by another process, then connections with and without the token until all 64 have it, then one more), `gateway::only_a_request_with_the_token_has_its_body_read`, extended (only the token proves a connection, before its body is read); the MCP socket's connections prove themselves by reaching its private folder | Full, each next connection closed the oldest without the token, never the CLI's; with all 64 holding it, the next was closed unread. Before, a full listener closed the next whatever it was, the CLI's among them, for as long as 64 others were held |
 | 2026-10-22 | `.studio` is refused by an NTFS stream's name | `agent_panel` `the_studio_folder_is_refused_by_any_name_that_opens_it`, extended: `.studio::$INDEX_ALLOCATION`, `.Studio:$I30:$INDEX_ALLOCATION` and `.studio. :stream` | Refused on every platform, the name read up to its first `:`. Before, each passed, and NTFS opens the folder itself by the first two. Not covered still: an 8.3 short name (`STUDIO~1`) |
+| 2026-10-24 | The agent's CLI is OmniGraph `v0.14.0` or later, chosen by its probe alone | `agent_panel` `cli_home` `the_first_cli_studio_drives_is_chosen_without_a_server`, `a_cli_is_probed_once_for_every_conversation` and the refusal tests with stand-ins for `0.14.0-edge+50283ce` (no access protocol) and `0.14.0-edge+888223b` (protocol 1); `~/.local/bin/omnigraph` `version --json` | The first CLI reporting contract 0.14 and protocols 2, 2 and 2 goes in the wrapper, probed once for every conversation, though the stand-ins answer nothing but `version --json` (no `--help`, no `config validate`); the edge stand-ins are passed over and the notice ends with OmniGraph's installer command. The installed `0.14.1-edge+7711e4a` reports 2, 2 and 2 |
 
 ## Corrections
 

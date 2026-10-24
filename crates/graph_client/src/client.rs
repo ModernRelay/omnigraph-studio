@@ -18,9 +18,9 @@ use url::Url;
 use crate::api::{
     AccessOutput, BlobWriteOutput, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput,
     BranchListOutput, BranchMergeOutput, BranchMergeRequest, ChangeFeedOutput, ChangeOutput,
-    ChangeRequest, CommitChanges, CommitListOutput, DiffOutput, ErrorOutput, GraphListResponse,
-    HealthOutput, InvokeStoredQueryRequest, MergeBaseOutput, QueriesCatalogOutput, QueryRequest,
-    ReadOutput, ReadinessOutput, SchemaOutput, SnapshotOutput,
+    ChangeRequest, CommitChanges, CommitListOutput, DiffOutput, DispositionEffects, ErrorOutput,
+    GraphListResponse, HealthOutput, InvokeStoredQueryRequest, MergeBaseOutput,
+    QueriesCatalogOutput, QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput, SnapshotOutput,
 };
 use crate::{
     ApiError, CONTRACT, CONTRACT_HEADER, IF_GRAPH_COMMIT_HEADER, WriteOutcome, speaks_contract,
@@ -1527,12 +1527,16 @@ fn summary(raw: &RawResponse) -> ApiErrorSummary {
 /// alike.
 ///
 /// - 2xx with the contract header: committed, with the body.
-/// - 4xx, 503 and 429 with the contract header and the server's error body: refused; the server
-///   did not admit or did not apply the write. OmniGraph stamps the header on every response
-///   it sends, errors included, so an error without it came from something in between (a
-///   proxy, a gateway), which cannot say whether the server applied the write.
-/// - Anything else (a lost contract header, an error without the server's body, other 5xx):
-///   unknown.
+/// - An error with the contract header and the server's error body that states its
+///   disposition (every 0.14.0 server does): the disposition decides. Effects `none` is a
+///   refusal whatever the status, a 500 included; `unknown` or `partial` is unknown whatever
+///   the status, a 503 included, since some or all of the write may have happened.
+/// - Such an error without a disposition (a server before OmniGraph 0.14.0), or with an effect
+///   this build does not know: unknown, since nothing rules the change out.
+/// - Anything else (a lost contract header, an error without the server's body): unknown.
+///   OmniGraph stamps the header on every response it sends, errors included, so an error
+///   without it came from something in between (a proxy, a gateway), which cannot say whether
+///   the server applied the write.
 pub fn judge_write<'a>(
     status: StatusCode,
     contract: Option<&str>,
@@ -1547,17 +1551,32 @@ pub fn judge_write<'a>(
         }
         return WriteOutcome::Committed(body);
     }
-    let refused = status.is_client_error()
-        || status == StatusCode::SERVICE_UNAVAILABLE
-        || status == StatusCode::TOO_MANY_REQUESTS;
-    if refused
-        && contract_ok
-        && let Ok(body) = serde_json::from_slice::<ErrorOutput>(body)
-    {
-        return WriteOutcome::Refused(ApiError {
-            status: status.as_u16(),
-            body,
-        });
+    if contract_ok && let Ok(body) = serde_json::from_slice::<ErrorOutput>(body) {
+        let effects = body.disposition.map(|disposition| disposition.effects);
+        return match effects {
+            Some(DispositionEffects::None) => WriteOutcome::Refused(ApiError {
+                status: status.as_u16(),
+                body,
+            }),
+            Some(DispositionEffects::Unknown | DispositionEffects::Partial) => {
+                WriteOutcome::Unknown {
+                    reason: format!(
+                        "the server answered {status} and could not say whether the change was \
+                         made: {}",
+                        body.error
+                    ),
+                }
+            }
+            // An effect this build does not know, or none at all: OmniGraph 0.14.0 and later
+            // state one on every error, so the answer cannot rule the change out.
+            Some(DispositionEffects::Other) | None => WriteOutcome::Unknown {
+                reason: format!(
+                    "the server answered {status} without saying whether the change was made \
+                     (OmniGraph before 0.14.0 does not say): {}",
+                    body.error
+                ),
+            },
+        };
     }
     WriteOutcome::Unknown {
         reason: format!("the server answered {status}"),
@@ -1811,6 +1830,60 @@ mod tests {
         assert_eq!(decode_segment("%zz%4"), "%zz%4");
     }
 
+    /// A 0.14.0 server states every error's effects, and the disposition decides a write's
+    /// outcome over the status: nothing done is a refusal even on a 500, and effects the server
+    /// cannot rule out are unknown even on a 503. Without one, nothing rules the change out.
+    #[test]
+    fn a_disposition_decides_a_write_outcome_over_its_status() {
+        let error = |effects: Option<&str>| match effects {
+            Some(effects) => format!(
+                r#"{{"error":"no","code":"internal","disposition":{{"action":"retry","effects":"{effects}"}}}}"#
+            ),
+            None => r#"{"error":"no","code":"internal"}"#.to_owned(),
+        };
+        let judge = |status: u16, effects: Option<&str>| {
+            let body = error(effects);
+            match judge_write(
+                StatusCode::from_u16(status).unwrap(),
+                Some(crate::CONTRACT),
+                body.as_bytes(),
+            ) {
+                WriteOutcome::Committed(_) => "committed",
+                WriteOutcome::Refused(_) => "refused",
+                WriteOutcome::Unknown { .. } => "unknown",
+            }
+        };
+        assert_eq!(judge(500, Some("none")), "refused", "nothing was done");
+        assert_eq!(judge(409, Some("none")), "refused");
+        assert_eq!(
+            judge(503, Some("unknown")),
+            "unknown",
+            "it may have been done"
+        );
+        assert_eq!(
+            judge(409, Some("partial")),
+            "unknown",
+            "some of it was done"
+        );
+        assert_eq!(
+            judge(409, Some("later")),
+            "unknown",
+            "an effect this build does not know"
+        );
+        assert_eq!(
+            judge(409, None),
+            "unknown",
+            "a server before 0.14.0: the status rules nothing out"
+        );
+        assert_eq!(judge(503, None), "unknown");
+        // Without the contract header the server did not answer, whatever the body says.
+        let body = error(Some("none"));
+        assert!(matches!(
+            judge_write(StatusCode::INTERNAL_SERVER_ERROR, None, body.as_bytes()),
+            WriteOutcome::Unknown { .. }
+        ));
+    }
+
     /// Every route the client calls is one the contract serves, with that method: each public
     /// call is made once, a conditional write both ways, against a server that records what it
     /// was sent, and each request's path is matched to the contract's paths, a `{…}` standing for
@@ -1911,7 +1984,7 @@ mod tests {
         });
 
         let contract: Value =
-            serde_json::from_str(include_str!("../openapi/omnigraph-0.14.0-edge.json")).unwrap();
+            serde_json::from_str(include_str!("../openapi/omnigraph-0.14.0.json")).unwrap();
         let paths = contract["paths"].as_object().expect("paths");
         let same_route = |template: &str, path: &str| {
             let (template, path) = (template.split('/'), path.split('/'));
@@ -2197,7 +2270,7 @@ mod tests {
 
     #[test]
     fn a_refusal_carries_the_servers_reason() {
-        let body = r#"{"error":"graph commit moved","code":"conflict","precondition_failure":{"expected":"a","actual":"b"}}"#;
+        let body = r#"{"error":"graph commit moved","code":"precondition_failed","disposition":{"action":"refresh","effects":"none"},"precondition_failure":{"expected":"a","actual":"b"}}"#;
         let outcome = block_on(client(respond(412, Some(CONTRACT), body)).mutate(
             "g",
             &ChangeRequest::default(),
@@ -2333,14 +2406,14 @@ mod tests {
                     .status(200)
                     .header(CONTRACT_HEADER, CONTRACT)
                     .body(AsyncBody::from(
-                        r#"{"graph_id":"g","actor":"act-ada","graph_wide":["read"],"branch":"main","target_branch":"fix","actions":["read","change","branch_create","later"]}"#,
+                        r#"{"graph_id":"g","actor_id":"act-ada","graph_wide":["read"],"branch":"main","target_branch":"fix","actions":["read","change","branch_create","later"]}"#,
                     ))
                     .unwrap())
             }
         });
         let client = client(http);
         let access = block_on(client.access("g", Some("main"), Some("fix"))).unwrap();
-        assert_eq!(access.actor.as_deref(), Some("act-ada"));
+        assert_eq!(access.actor_id.as_deref(), Some("act-ada"));
         assert_eq!(
             access.actions,
             [
@@ -3015,7 +3088,7 @@ mod tests {
     /// the cell's current ETag; nothing is sent again.
     #[test]
     fn a_changed_blob_refuses_the_write_with_its_current_etag() {
-        let changed = r#"{"error":"If-Match did not hold for Note.attachment","blob_precondition_failure":{"current_etag":"\"e3\""}}"#;
+        let changed = r#"{"error":"If-Match did not hold for Note.attachment","code":"precondition_failed","disposition":{"action":"refresh","effects":"none"},"blob_precondition_failure":{"current_etag":"\"e3\""}}"#;
         let (http, seen) = blob_write_server(412, changed);
         let outcome = block_on(client(http).blob_put(
             "g",
@@ -3055,7 +3128,11 @@ mod tests {
         ));
         // Too large for the server is its refusal: nothing was stored.
         assert!(matches!(
-            put(respond(413, Some(CONTRACT), r#"{"error":"Blob put exceeds 1048576 bytes"}"#)),
+            put(respond(
+                413,
+                Some(CONTRACT),
+                r#"{"error":"Blob put exceeds 1048576 bytes","code":"payload_too_large","disposition":{"action":"fix","effects":"none"}}"#
+            )),
             WriteOutcome::Refused(error) if error.status == 413
         ));
     }

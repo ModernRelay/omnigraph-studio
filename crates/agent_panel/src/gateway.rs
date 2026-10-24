@@ -2059,8 +2059,7 @@ mod tests {
     /// (the private home): each request reaches the server with the person's token. The fake
     /// server's answer need not be one the CLI reads; what reached it is what is checked.
     #[test]
-    #[ignore = "needs: OMNIGRAPH_STUDIO_LIVE_CLI, an omnigraph CLI built from OmniGraph main at \
-                ff542202 or later"]
+    #[ignore = "needs: OMNIGRAPH_STUDIO_LIVE_CLI, an omnigraph CLI of OmniGraph v0.14.0 or later"]
     fn a_live_cli_reaches_the_gateway_with_what_its_home_holds() {
         let cli = std::env::var_os("OMNIGRAPH_STUDIO_LIVE_CLI")
             .map(std::path::PathBuf::from)

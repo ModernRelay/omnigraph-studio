@@ -9671,7 +9671,7 @@ mod tests {
             studio_theme::init_test(cx);
             editor::init(cx);
         });
-        let refused = serde_json::json!({ "error": "policy denied", "code": "forbidden" });
+        let refused = serde_json::json!({ "error": "policy denied", "code": "forbidden", "disposition": { "action": "refresh", "effects": "none" } });
         let session = crate::test_support::session_answering(PEOPLE, 403, refused, cx);
         let (table, cx) = cx.add_window_view({
             let session = session.clone();
@@ -12004,7 +12004,7 @@ mod tests {
         for (status, body, landed) in [
             (
                 403,
-                serde_json::json!({ "error": "policy denied", "code": "forbidden" }),
+                serde_json::json!({ "error": "policy denied", "code": "forbidden", "disposition": { "action": "refresh", "effects": "none" } }),
                 false,
             ),
             (200, crate::test_support::committed("c2", "c1"), true),
@@ -12381,7 +12381,7 @@ mod tests {
     /// until the save settles it, so a refused save puts its text back.
     #[gpui::test]
     async fn discard_leaves_a_draft_whose_save_is_out(cx: &mut TestAppContext) {
-        let refused = serde_json::json!({ "error": "policy denied", "code": "forbidden" });
+        let refused = serde_json::json!({ "error": "policy denied", "code": "forbidden", "disposition": { "action": "refresh", "effects": "none" } });
         let session = crate::test_support::session_answering(PEOPLE, 403, refused, cx);
         let (table, cx) = people_table(&session, cx);
         let key = |id: &str| DraftKey {

@@ -975,7 +975,7 @@ mod tests {
     /// A refused save keeps the text and says why (constitution III).
     #[gpui::test]
     async fn a_refused_text_is_kept_with_the_reason(cx: &mut TestAppContext) {
-        let refused = json!({ "error": "policy denied", "code": "forbidden" });
+        let refused = json!({ "error": "policy denied", "code": "forbidden", "disposition": { "action": "refresh", "effects": "none" } });
         let (view, cx) = editor_answering(403, refused, cx);
         save(&view, cx);
         view.read_with(cx, |view, cx| {
@@ -1034,7 +1034,7 @@ mod tests {
     /// draft, bound to the value it was read at, which a table of the type shows.
     #[gpui::test]
     async fn a_refused_text_whose_tab_closed_is_kept_as_a_draft(cx: &mut TestAppContext) {
-        let refused = json!({ "error": "policy denied", "code": "forbidden" });
+        let refused = json!({ "error": "policy denied", "code": "forbidden", "disposition": { "action": "refresh", "effects": "none" } });
         let (view, cx) = editor_answering(403, refused, cx);
         let session = view.read_with(cx, |view, _| view.session.clone());
         view.update_in(cx, |view, window, cx| view.save(&SaveText, window, cx));

@@ -183,7 +183,7 @@ jobs:
 
           On Windows, unzip anywhere and run \`omnigraph-studio.exe\`. It is not signed, so SmartScreen may ask first: choose More info, then Run anyway.
 
-          Studio connects to an OmniGraph server that speaks HTTP contract 0.14 (edge-20261020-7fd9cc9 or later); see the README for connecting and for a sample graph. The servers of your \`omnigraph\` CLI's targets, and the agent panel, need that CLI from an edge build made from OmniGraph main ff542202 or later (edge-20261022-7fff9df or later).
+          Studio connects to an OmniGraph server of v0.14.0 or later (HTTP contract 0.14); see the README for connecting and for a sample graph. The servers of your \`omnigraph\` CLI's targets, and the agent panel, need that CLI at v0.14.0 or later.
           NOTES
           flags=()
           [[ "$version" == 0.* ]] && flags+=(--prerelease)

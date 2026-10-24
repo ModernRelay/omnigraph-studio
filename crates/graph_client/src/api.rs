@@ -1,6 +1,6 @@
 //! Request and response types for the OmniGraph 0.14 HTTP API.
 //!
-//! Field names and optionality follow `openapi/omnigraph-0.14.0-edge.json`; the test at the bottom
+//! Field names and optionality follow `openapi/omnigraph-0.14.0.json`; the test at the bottom
 //! of this file fails if a type here and the contract disagree. Add fields only as surfaces
 //! need them, and add each new type to the test.
 
@@ -423,7 +423,7 @@ pub struct AccessOutput {
     pub graph_id: String,
     /// The actor the credential resolves to; none on a server without authentication.
     #[serde(default)]
-    pub actor: Option<String>,
+    pub actor_id: Option<String>,
     /// Actions allowed with no branch named: the graph-scoped ones, and those a single rule
     /// allows on every branch. An action allowed on every branch only by two rules together
     /// is missing here; `actions` for a branch has it.
@@ -730,6 +730,10 @@ pub struct ErrorOutput {
     pub error: String,
     #[serde(default)]
     pub code: Option<ErrorCode>,
+    /// What the request did and what to do next; OmniGraph 0.14.0 and later send it on every
+    /// error. Without it a write's outcome is unknown ([`crate::judge_write`]).
+    #[serde(default)]
+    pub disposition: Option<DispositionOutput>,
     #[serde(default)]
     pub merge_conflicts: Option<Vec<MergeConflictOutput>>,
     #[serde(default)]
@@ -769,7 +773,65 @@ pub enum ErrorCode {
     UnattachedCannotPublish,
     /// The credential resolves to another actor than `Omnigraph-If-Actor` named (412).
     ActorMismatch,
+    /// The server cannot say whether the request's effects happened; its disposition says to
+    /// reconcile (settle it by reading history, never by sending it again).
+    OutcomeUnknown,
+    /// A condition the request set did not hold (412): nothing was done.
+    PreconditionFailed,
+    /// The graph needs recovery before it takes this request.
+    RecoveryRequired,
+    /// An external Blob source refused or failed.
+    ExternalBlobSource,
+    /// The change feed no longer holds the position asked for; read a new baseline.
+    ChangeFeedGap,
+    /// The request did not arrive whole in time (408).
+    RequestTimeout,
+    /// A branch could not start at the commit named; see `branch_start_refusal`.
+    BranchStartRefusal,
+    /// The request body is larger than the server takes (413).
+    PayloadTooLarge,
+    /// The request body's media type is not one the route takes (415).
+    UnsupportedMediaType,
+    /// A Blob byte range that cannot be satisfied (416); see `blob_range`.
+    RangeNotSatisfiable,
+    /// The request was cancelled before it finished.
+    Cancelled,
+    /// The request ran out of its server-side time.
+    DeadlineExceeded,
+    /// The result is larger than the server returns.
+    ResultTooLarge,
     /// A value a later build speaking contract 0.14 may send, so an answer still decodes.
+    #[serde(other)]
+    Other,
+}
+
+/// What a refused or failed request did and what its caller should do next, stated by the
+/// server on every error since 0.14.0 (RFC #1017, "Dispositions and refusals").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct DispositionOutput {
+    pub action: DispositionAction,
+    pub effects: DispositionEffects,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispositionAction {
+    Fix,
+    Refresh,
+    Retry,
+    Recover,
+    Reconcile,
+    #[serde(other)]
+    Other,
+}
+
+/// Whether the request's effects happened: none, some, or the server cannot say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispositionEffects {
+    None,
+    Partial,
+    Unknown,
     #[serde(other)]
     Other,
 }
@@ -812,7 +874,7 @@ mod contract_tests {
 
     use serde_json::Value;
 
-    const CONTRACT: &str = include_str!("../openapi/omnigraph-0.14.0-edge.json");
+    const CONTRACT: &str = include_str!("../openapi/omnigraph-0.14.0.json");
 
     /// (schema name, the fields our type declares). Fields we declare must exist in the
     /// contract, and every field the contract requires must be declared.
@@ -841,7 +903,7 @@ mod contract_tests {
                 "booted_serving_digest",
             ],
         ),
-        ("GraphListResponse", &["graphs"]),
+        ("GraphListOutput", &["graphs"]),
         (
             "MergeBaseOutput",
             &[
@@ -943,7 +1005,7 @@ mod contract_tests {
             "AccessOutput",
             &[
                 "graph_id",
-                "actor",
+                "actor_id",
                 "graph_wide",
                 "branch",
                 "target_branch",
@@ -966,7 +1028,7 @@ mod contract_tests {
                 "branch_delete_error_details",
             ],
         ),
-        ("GraphDiscoveryResponse", &["graphs"]),
+        ("GraphDiscoveryOutput", &["graphs"]),
         ("GraphDiscoveryEntry", &["graph_id", "display_name"]),
         (
             "CommitListOutput",
@@ -1020,6 +1082,7 @@ mod contract_tests {
             &[
                 "error",
                 "code",
+                "disposition",
                 "merge_conflicts",
                 "precondition_failure",
                 "blob_precondition_failure",
@@ -1033,6 +1096,7 @@ mod contract_tests {
             &["entity_kind", "type_name", "kind", "message", "entity_id"],
         ),
         ("PreconditionFailureOutput", &["expected", "actual"]),
+        ("DispositionOutput", &["action", "effects"]),
         (
             "InvokeStoredQueryRequest",
             &["params", "branch", "snapshot", "expect_mutation"],
@@ -1095,14 +1159,13 @@ mod contract_tests {
                 "invalid_stored_queries",
             ],
         ),
-        ("EntityKindOutput", &["node", "edge"]),
-        ("BlobEntityKind", &["node", "edge"]),
-        ("BlobWriteStateOutput", &["managed", "null"]),
+        ("EntityKind", &["node", "edge"]),
+        ("BlobWriteState", &["managed", "null"]),
         (
             "BranchMergeOutcome",
             &["already_up_to_date", "fast_forward", "merged"],
         ),
-        ("ChangeOpOutput", &["insert", "update", "delete"]),
+        ("ChangeOp", &["insert", "update", "delete"]),
         (
             "ErrorCode",
             &[
@@ -1119,8 +1182,26 @@ mod contract_tests {
                 "internal",
                 "unattached_cannot_publish",
                 "actor_mismatch",
+                "outcome_unknown",
+                "precondition_failed",
+                "recovery_required",
+                "external_blob_source",
+                "change_feed_gap",
+                "request_timeout",
+                "branch_start_refusal",
+                "payload_too_large",
+                "unsupported_media_type",
+                "range_not_satisfiable",
+                "cancelled",
+                "deadline_exceeded",
+                "result_too_large",
             ],
         ),
+        (
+            "DispositionAction",
+            &["fix", "refresh", "retry", "recover", "reconcile"],
+        ),
+        ("DispositionEffects", &["none", "partial", "unknown"]),
         (
             "ChangeDiffRefusalReason",
             &["parentless_commit", "schema_boundary", "unknown"],
@@ -1152,10 +1233,7 @@ mod contract_tests {
                 "invoke_query",
             ],
         ),
-        (
-            "CommitKindOutput",
-            &["published", "unpublished", "unattached"],
-        ),
+        ("CommitKind", &["published", "unpublished", "unattached"]),
         (
             "ParamKind",
             &[
@@ -1164,7 +1242,7 @@ mod contract_tests {
             ],
         ),
         (
-            "MergeConflictKindOutput",
+            "MergeConflictKind",
             &[
                 "divergent_insert",
                 "divergent_update",

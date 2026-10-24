@@ -15,7 +15,7 @@ This skill captures the operational rules for working with a locally or remotely
 
 Check `omnigraph version` and the command's `--help` before using these
 instructions. This skill tracks the current CLI/server contract, including
-`Omnigraph-Http-Api: 0.14`; the released 0.13 contract is unsupported. The engine
+`Omnigraph-Http-Api: 0.14`; older HTTP contracts are unsupported. The engine
 reports `internal-schema 16 (serves v14 to v16)`: the storage format it
 writes, then the range it serves. New graphs use `__id`/`__src`/`__dst` system columns; a graph
 that already spells them `id`/`src`/`dst` keeps its physical columns. A
@@ -202,6 +202,7 @@ destination line. Legacy `--server`, `--store`, `--cluster`,
 | Local configuration | `config validate/rename-profile/rename-target/recover-rename/recover-operations`, `target list/inspect/add/refresh/remove`, `skill export/show`, `version`, `embed`; `alias NAME` owns its target and graph |
 | Authentication | `login --create-profile NAME`, `login --profile NAME`, or `logout --profile NAME` for platform sessions; `credentials set/status/remove/export` requires explicit profile or standalone target |
 | Access | `access [--branch B [--target-branch T]]`; the actor and the actions the graph's policy grants it, from a server's access route or, for a direct graph or root target, the installed policy; catalogue and managed targets refuse |
+| Agent MCP | `mcp --target NAME [--graph G] [--write]` relays an agent's stdio MCP to an existing server target's `/mcp`, bound to one graph, read-only tools unless `--write`; a cancelled write gets no answer and may still have landed; direct and managed targets refuse |
 
 `query` and `mutate` invoke stored queries by positional name, or accept
 `--query FILE` / `-e SOURCE`. Use `--params` or `--params-file`, never interpolate
@@ -289,6 +290,10 @@ Direct `init`/`load` and **`cluster apply`** write storage without an HTTP serve
 - **Direct / embedded access — no server.** Address a graph's storage directly
   with a local path or `--target file:///absolute/path/graph.omni`; `init` also accepts its creation URI positionally.
   There is **no single-graph server mode** — the server is cluster-only.
+- **Agents — one path per place.** In a terminal, an agent runs CLI commands
+  with `--target`, or connects its MCP client to an existing server target with
+  `omnigraph mcp --target NAME` (see `references/commands.md`, MCP for agents);
+  in Studio's agent panel it uses Studio's gateway. No path starts a server.
 
 ### The two config surfaces
 

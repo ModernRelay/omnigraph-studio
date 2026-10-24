@@ -19,11 +19,15 @@ dialog by keyboard), X (capabilities from the served document).
 
 ## What exists today (checked)
 
-- OmniGraph 0.14, from the edge build `edge-20261020-7fd9cc9` on (Studio's minimum server; its
-  document is `crates/graph_client/openapi/omnigraph-0.14.0-edge.json`): contract header
-  `omnigraph-http-api`, value `0.14` (`graph_client::CONTRACT`). Every protected request must
-  carry it; a mismatch is `400 api_contract_mismatch`; responses echo it. An earlier 0.14 build
-  and `v0.13.0` speak `0.13`, which Studio refuses.
+- OmniGraph 0.14, from the release `v0.14.0` on (Studio's minimum server; its document is
+  `crates/graph_client/openapi/omnigraph-0.14.0.json`): contract header `omnigraph-http-api`,
+  value `0.14` (`graph_client::CONTRACT`). Every protected request must carry it; a mismatch is
+  `400 api_contract_mismatch`; responses echo it. Every error states a `disposition` (`action`,
+  `effects`), which alone decides a write's outcome (constitution III): effects `none` is a
+  refusal, anything else or none unknown. The edge builds from `edge-20261020-7fd9cc9` to the
+  release send `0.14` too but are not supported: their errors state no disposition, so a write
+  they refuse reads as unknown, and their access reports name the actor `actor`, which Studio
+  reads as absent. Earlier builds and `v0.13.0` speak `0.13`, which Studio refuses.
 - Public routes: `GET`/`HEAD /healthz`, `GET /readyz`, `GET /openapi.json`. The CLI checks the
   contract with `HEAD /healthz` before a data request.
 - `GET /graphs` needs the `graph_list` action, which is denied without a cluster policy, even to
@@ -39,7 +43,9 @@ dialog by keyboard), X (capabilities from the served document).
   each kind of target and no secret, and on the person's own home:
   - `version --json` reports `protocols: {target: 1, credential: 1, access: 1}`. `50283ce` (before
     #1115) reports target and credential 1 only, and `888223b` (#1115 without #1126) all three, so
-    the numbers alone do not tell the formats apart (#1127 asks for a bump).
+    the numbers alone do not tell the formats apart (#1127 asks for a bump). The `v0.14.0`
+    release reports `{target: 2, credential: 2, access: 2}` (#1133, #1135), the only numbers
+    Studio drives since 2026-10-24.
   - `target list --json` is an object from target name to its entry, sorted by name. A `server`
     entry has `kind`, `endpoint` (written with a trailing slash), `auth` (`{provider: anonymous}`;
     `{provider: token, source: {store: {}}}`, `{env: NAME}` or `{file: PATH}` with the path made
@@ -88,24 +94,23 @@ dialog by keyboard), X (capabilities from the served document).
      Connection → OmniGraph CLI, a leading `~` read as the home folder), then at each `omnigraph`
      on `PATH`, then in `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`
      (`graph_store::cli::candidates`). It runs the first that fits (`cli::probe`): its `version
-     --json` reports Studio's HTTP contract (`0.14`) and the target, credential and access
-     protocols Studio drives (1 or 2, 1 or 2, and 1: those of main `7fff9dfd`, and the bump
-     #1127 asks for), and it has `target list`, `target inspect`, `credentials status` and
-     `credentials export` (each answers `--help`), since a build before `f7db38da` reports the
-     same numbers without them. Each program passed over is named with why. What a program was
-     found to be is kept, in memory and in `cli_probes.json` in the data directory, until its
-     file changes (its modification time, size or permissions), so a start runs no probe an
-     earlier launch ran; one that could not be run or did not answer in time is asked again at
-     the next look (since 2026-10-22; before, a slow probe passed a CLI over for the run, and no
-     probe was kept past the run). A changed setting moves where Studio looks, which the next
+     --json` reports Studio's HTTP contract (`0.14`) and target, credential and access protocol
+     2, which OmniGraph `v0.14.0` is the first release to report; an edge build before it
+     reports 1 and is passed over. That one command is the whole probe: every CLI that reports
+     2 has the commands Studio runs. Each program passed over is named with why. What a program
+     was found to be is kept, in memory and in `cli_probes.json` in the data directory, with the
+     requirements it was judged against, until its file changes (its modification time, size or
+     permissions) or those requirements do, so a start runs no probe an earlier launch ran;
+     one that could not be run or did not answer in time is asked again at the next look (since
+     2026-10-22; before, a slow probe passed a CLI over for the run, and no probe was kept past
+     the run). A changed setting moves where Studio looks, which the next
      check of the CLI's files sees: it lists the targets with that CLI and asks every token
-     again. The agent's CLI is chosen from the same places with the same probe, and must also
-     pass its own check of the agent's home (spec 013). Studio needs a CLI from main `ff542202`
-     on and a version-1 operator configuration. On Windows Studio finds the CLI and lists its
-     targets as on Unix, and uses the anonymous ones: the CLI gives a token only through a Unix
-     pipe, so each server target that takes one is refused as it is listed
-     (`cli_config::Platform`; since 2026-10-22, before which a Windows Studio listed no targets
-     at all and had no server but the environment's).
+     again. The agent's CLI is chosen from the same places with the same probe (spec 013).
+     Studio needs a CLI of `v0.14.0` or later and a version-1 operator configuration. On Windows
+     Studio finds the CLI and lists its targets as on Unix, and uses the anonymous ones: the CLI
+     gives a token only through a Unix pipe, so each server target that takes one is refused as
+     it is listed (`cli_config::Platform`; since 2026-10-22, before which a Windows Studio listed
+     no targets at all and had no server but the environment's).
    - **Running it.** The CLI runs off the main thread, one sequence of Studio's commands at a time
      (`cli::take_turn`): a listing, an Add server, one target's `credentials status`,
      `credentials export` and `target inspect` together, or the agent's choice of its CLI. The
@@ -244,8 +249,8 @@ dialog by keyboard), X (capabilities from the served document).
 2. Compare with the contracts `graph_client` speaks (only `0.14` today, `CONTRACT`). Mismatch:
    state `contract mismatch`, which reads "Server speaks 0.13; Studio speaks 0.14" for a 0.13
    server.
-3. Capabilities: every route Studio uses is served by its minimum server (0.14, or the edge
-   build before it), so connecting reads no capability set. A surface that comes to use a newer
+3. Capabilities: every route Studio uses is served by its minimum server (`v0.14.0`), so
+   connecting reads no capability set. A surface that comes to use a newer
    route reads `GET /openapi.json` and asks which operation ids exist, never the version string
    (constitution X). Connecting once read the whole document (387 KB at the edge build) before
    listing graphs, for a set nothing asked.
@@ -397,6 +402,7 @@ and the tooltip named `omnigraph login`, which is managed sign-in only now).
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-24 | Studio drives a CLI of OmniGraph `v0.14.0` or later, and an error's disposition alone decides a write's outcome | `graph_store` `cli_tokens::tests::a_cli_is_chosen_by_its_contract_and_protocols` (stand-ins reporting `v0.14.0`'s `version --json`, an edge build's protocol 1, one with no access protocol, and 0.15.0's target protocol 3), `a_probe_is_remembered_across_launches` (a probe kept under other requirements); `graph_client` `a_disposition_decides_a_write_outcome_over_its_status`, `object_types_match_the_contract` and `enum_types_match_the_contract` against `openapi/omnigraph-0.14.0.json`, with every refusal fixture given the disposition `v0.14.0` sends (`omnigraph-server` `lib.rs` `disposition`); `~/.local/bin/omnigraph` `version --json`; `/healthz` of the hosted servers | The release stand-in is chosen, running only `version --json`; the others are passed over ("is 0.14.0-edge+7fff9df, whose target protocol 1 Studio does not know"); a probe kept under the earlier rule runs again. Effects `none` is refused on a 500, `unknown` and `partial` are unknown on a 409 and a 503, and none at all is unknown. The installed `0.14.1-edge+7711e4a` reports protocols 2, 2 and 2, which Studio before this refused ("whose access protocol 2 Studio does not know"). A server on `0.14.0-edge+50283ce` sends no disposition (its document has none), so a write it refuses reads as unknown until it runs `v0.14.0` |
 | 2026-10-22 | Studio on Windows lists the CLI's targets, connects the anonymous ones, refuses each that takes a token, and adds only servers that need none | OmniGraph main `242ab02f`: `crates/omnigraph-cli/src/commands/targets/mod.rs` (`stdout_is_pipe`, `run_credential`), `commands/targets/args.rs` ("Write an access token to a Unix pipe"), `credential_sources/exec.rs` (`HelperUnsupported` off Unix); `graph_store` `registry::tests::without_token_export_only_anonymous_targets_connect` (the registry's own listing given `Platform::Other`), `cli_tokens::tests::the_targets_are_listed_as_the_cli_describes_them` (extended: the stand-in CLI listed with `Platform::Other`), `cli_tokens::every_system_tests::the_cli_is_looked_for_on_every_system` (no platform gate); `studio` `open_graph::tests::without_token_export_the_new_servers_token_field_is_disabled` and `the_new_servers_token_field_takes_a_token_where_the_cli_exports_one`; an offscreen snapshot of the Open dialog with `Platform::CURRENT` set to `Other` for the run and an empty `OMNIGRAPH_HOME`, the pointer on the token field | The CLI's export refuses every standard output off Unix, with no named-pipe route; the other four commands are not gated. With `Platform::Other`: the CLI was found and `target list --json` alone ran; only the anonymous targets were servers, one connected Ready with no Authorization; the store, env, file and exec targets were refused with the reason and asked nothing; the direct, managed and custom-CA targets kept their reasons. Add server's token field was drawn disabled, Tab went address, name, address; its tooltip read the reason; a token put in the field by the test was refused by the registry and said in the dialog, with nothing added or sent. With `Platform::Unix` the same targets landed as before and Tab reached the token field. Before, `find_cli` refused on every non-Unix system, so a Windows Studio listed no CLI target |
 | 2026-10-22 | The stand-in CLI's tests hold no bound a busy machine can reach | `graph_store` `cli_tokens::tests`: `READ_TIMEOUT` an hour in tests, and the stand-ins' sources given it; `a_refused_export_says_why_and_never_the_token` (an export whose stand-in never answers, run in a turn the test holds, stopped at its own 300 ms); `tokens_asked_together_take_turns_at_the_cli` (a lock the stand-in lets go once it has refused a command, then holds); `a_command_held_back_past_its_timeout_is_not_run` (a turn the test holds) | The timeout path is reached only by a stand-in that never answers, and the busy path only by a turn the test holds; the lock is retried once, then refused through every retry. Before, on a loaded machine, 7 of the tests failed after waiting 60 s for their turn behind the others' commands ("did not answer `version --json` in time"), and the lock test released its lock from a thread 400 ms in |
 | 2026-10-22 | A graph's first reads wait for its connection's token, and a new token reads again every read a 401 could have refused, the schema included | `graph_store` `the_first_reads_wait_for_the_token_and_the_schema_loads` (a CLI server whose token arrives after its graph is shown, as a start reopens a window; then a session whose schema read a stale token was refused, given a good one); `GraphSession::open_when_ready`, `Connection::token_ready` and `ConnectionEvent::TokenReady` | Nothing was sent before the token; then the schema, snapshot, branch list and access, each with it, and the schema loaded with no Refresh. The refused schema was read again under the next token. Before, measured on a 0.14 server: the CLI gave the token 30–320 ms after the session sent its first reads, the schema read was refused (401), and `read_again_for_credential` read the counts, the catalog and the branch list again but never the schema, so a reopened window stayed empty until Refresh |

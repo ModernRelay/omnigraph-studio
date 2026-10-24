@@ -454,7 +454,7 @@ pub(crate) fn session_with_blobs(
 
 /// What the access route answers for a credential that reads every branch and changes none.
 pub(crate) fn read_only_access() -> Value {
-    json!({ "graph_id": "knowledge", "actor": "act-reader", "graph_wide": ["read"], "actions": ["read"] })
+    json!({ "graph_id": "knowledge", "actor_id": "act-reader", "graph_wide": ["read"], "actions": ["read"] })
 }
 
 /// As [`session_with_blobs`], the access route answering `access` for every branch (the other
@@ -661,6 +661,8 @@ impl Blobs {
                 if !holds {
                     let failure = json!({
                         "error": format!("If-Match did not hold for {cell}"),
+                        "code": "precondition_failed",
+                        "disposition": { "action": "refresh", "effects": "none" },
                         "blob_precondition_failure": { "current_etag": held.map(|(_, etag)| etag) },
                     });
                     return (412, Vec::new(), failure.to_string().into_bytes());
@@ -884,7 +886,7 @@ fn serve_blobs(
                         .status(400)
                         .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                         .body(AsyncBody::from(
-                            json!({ "error": message, "code": "bad_request" }).to_string(),
+                            json!({ "error": message, "code": "bad_request", "disposition": { "action": "fix", "effects": "none" } }).to_string(),
                         ))
                         .unwrap());
                 }

@@ -4686,7 +4686,7 @@ pub(crate) mod tests {
             studio_theme::init_test(cx);
             editor::init(cx);
         });
-        let access = json!({ "graph_id": "knowledge", "actor": "act-dev", "graph_wide": ["read"], "actions": ["read", "branch_merge"] });
+        let access = json!({ "graph_id": "knowledge", "actor_id": "act-dev", "graph_wide": ["read"], "actions": ["read", "branch_merge"] });
         let (session, asked) = review_server_with(
             Some(access),
             false,
@@ -4750,7 +4750,7 @@ pub(crate) mod tests {
         let over = move |path: &str, _: &str, _: &str| {
             (new_token.load(std::sync::atomic::Ordering::SeqCst)
                 && path.ends_with("/branches/merge-base"))
-            .then(|| (403, json!({ "error": "forbidden", "code": "forbidden" })))
+            .then(|| (403, json!({ "error": "forbidden", "code": "forbidden", "disposition": { "action": "refresh", "effects": "none" } })))
         };
         let (session, asked) =
             review_server_with(None, false, None, "f2", |_| (500, json!({})), over, cx);
@@ -4960,7 +4960,7 @@ pub(crate) mod tests {
             editor::init(cx);
         });
         // Changes on every branch, and nothing else of a branch's.
-        let access = json!({ "graph_id": "knowledge", "actor": "act-dev", "graph_wide": ["read"], "actions": ["read", "change"] });
+        let access = json!({ "graph_id": "knowledge", "actor_id": "act-dev", "graph_wide": ["read"], "actions": ["read", "change"] });
         let (session, asked) = review_server_with(
             Some(access),
             false,
@@ -5418,7 +5418,7 @@ pub(crate) mod tests {
                 } else if path.ends_with("/changes") && query.contains("start=after%3Am2") {
                     (
                         400,
-                        json!({ "error": "start commit is not on this branch's first-parent chain", "code": "bad_request" }),
+                        json!({ "error": "start commit is not on this branch's first-parent chain", "code": "bad_request", "disposition": { "action": "fix", "effects": "none" } }),
                     )
                 } else if path.ends_with("/changes") {
                     (200, feed.clone())
@@ -5701,7 +5701,7 @@ pub(crate) mod tests {
                 } else if path.ends_with("/changes") && merged_in && query.contains(&refused) {
                     (
                         400,
-                        json!({ "error": "start commit is not on this branch's first-parent chain", "code": "bad_request" }),
+                        json!({ "error": "start commit is not on this branch's first-parent chain", "code": "bad_request", "disposition": { "action": "fix", "effects": "none" } }),
                     )
                 } else if path.ends_with("/diff") {
                     (

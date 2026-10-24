@@ -87,8 +87,8 @@ race.
 
 Over HTTP, beside the `Omnigraph-Http-Api: 0.14` header every graph request
 needs, send the raw id in the `Omnigraph-If-Graph-Commit` header to
-`POST /graphs/{id}/mutate/if-graph-commit` or
-`POST /graphs/{id}/queries/{name}/if-graph-commit`. The plain routes reject that
+`POST /graphs/{graph_id}/mutate/if-graph-commit` or
+`POST /graphs/{graph_id}/queries/{query_name}/if-graph-commit`. The plain routes reject that
 header; an older server answers `404`, so never fall back to the unconditional
 route.
 

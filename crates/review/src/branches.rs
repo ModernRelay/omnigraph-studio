@@ -1463,7 +1463,7 @@ mod tests {
                         let error = format!("cannot start a branch at commit '{commit}'");
                         (
                             *status,
-                            json!({ "error": error, "code": "conflict", "branch_start_refusal": refusal }),
+                            json!({ "error": error, "code": "branch_start_refusal", "disposition": { "action": "fix", "effects": "none" }, "branch_start_refusal": refusal }),
                         )
                     }
                     None => {

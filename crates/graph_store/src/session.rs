@@ -4409,8 +4409,16 @@ mod tests {
             "affected_edges": 0,
             "commit": { "graph_commit_id": "r9", "graph_manifest_version": 9, "kind": "published", "created_at": 0 },
         });
-        let refused = serde_json::json!({ "error": "policy denied", "code": "forbidden" });
-        let failed = serde_json::json!({ "error": "the server failed" });
+        let refused = serde_json::json!({
+            "error": "policy denied",
+            "code": "forbidden",
+            "disposition": { "action": "refresh", "effects": "none" },
+        });
+        let failed = serde_json::json!({
+            "error": "the server failed",
+            "code": "internal",
+            "disposition": { "action": "reconcile", "effects": "unknown" },
+        });
         let session = answering_session(
             vec![
                 (200, committed),
@@ -6000,7 +6008,7 @@ mod tests {
                             "type_name": "Person", "dataset_path": "nodes/1",
                             "published_dataset_version": 2, "entity_count": 7 }] }),
                         "queries" => json!({ "queries": [] }),
-                        "access" => json!({ "graph_id": "knowledge", "actor": "act-ada",
+                        "access" => json!({ "graph_id": "knowledge", "actor_id": "act-ada",
                             "graph_wide": ["read"], "branch": "main", "actions": ["read"] }),
                         "branches" => json!({ "branches": ["main", "feature"] }),
                         name => json!({ "query_name": name, "target": { "branch": "main" },
@@ -6654,7 +6662,7 @@ mod tests {
                 }
                 let body = if path.ends_with("/mutate") {
                     mutations.fetch_add(1, Ordering::SeqCst);
-                    r#"{"error":"refused for the test"}"#
+                    r#"{"error":"refused for the test","code":"bad_request","disposition":{"action":"fix","effects":"none"}}"#
                 } else {
                     r#"{"branches":["main"]}"#
                 };
@@ -6962,12 +6970,16 @@ mod tests {
                     };
                     (
                         200,
-                        json!({ "graph_id": "knowledge", "actor": "act-ada", "graph_wide": ["read"], "actions": actions }),
+                        json!({ "graph_id": "knowledge", "actor_id": "act-ada", "graph_wide": ["read"], "actions": actions }),
                     )
                 } else if create {
                     (
                         403,
-                        json!({ "error": "policy denied", "code": "forbidden" }),
+                        json!({
+                            "error": "policy denied",
+                            "code": "forbidden",
+                            "disposition": { "action": "refresh", "effects": "none" },
+                        }),
                     )
                 } else {
                     (200, json!({ "branches": ["main", "fix"] }))
@@ -7093,7 +7105,7 @@ mod tests {
                     } else {
                         json!(["read"])
                     };
-                    let body = json!({ "graph_id": "knowledge", "actor": "act-ada",
+                    let body = json!({ "graph_id": "knowledge", "actor_id": "act-ada",
                         "graph_wide": ["read"], "branch": "main", "actions": actions });
                     (200, body)
                 } else if path.ends_with("/schema") {
@@ -7112,7 +7124,11 @@ mod tests {
                 } else if path.ends_with("/mutate") {
                     (
                         403,
-                        json!({ "error": "policy denied", "code": "forbidden" }),
+                        json!({
+                            "error": "policy denied",
+                            "code": "forbidden",
+                            "disposition": { "action": "refresh", "effects": "none" },
+                        }),
                     )
                 } else if path.ends_with("/snapshot") {
                     let body = json!({ "graph_branch": "main", "graph_manifest_version": 3,
@@ -7351,7 +7367,7 @@ mod tests {
                         }
                         "snapshot" => json!({ "graph_branch": "main", "graph_manifest_version": 3,
                             "internal_schema_version": 16, "datasets": [] }),
-                        "access" => json!({ "graph_id": "knowledge", "actor": "act-ada",
+                        "access" => json!({ "graph_id": "knowledge", "actor_id": "act-ada",
                             "graph_wide": ["read"], "branch": "main", "actions": ["read"] }),
                         "branches" => json!({ "branches": ["main"] }),
                         _ => json!({ "query_name": "studio_head", "target": { "branch": "main" },

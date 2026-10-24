@@ -5507,7 +5507,7 @@ mod tests {
                         (
                             200,
                             format!(
-                                r#"{{"graph_id":"notes","actor":"act-ada","graph_wide":["read"],"actions":{actions}}}"#
+                                r#"{{"graph_id":"notes","actor_id":"act-ada","graph_wide":["read"],"actions":{actions}}}"#
                             ),
                         )
                     }

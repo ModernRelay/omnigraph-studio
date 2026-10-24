@@ -113,7 +113,7 @@ impl Access {
     pub(crate) fn actor(&self) -> Option<&str> {
         self.answers
             .values()
-            .find_map(|answer| answer.actor.as_deref())
+            .find_map(|answer| answer.actor_id.as_deref())
     }
 
     /// Whether `scope` is to be read: neither answered nor asked. When it is, it counts as
@@ -168,7 +168,7 @@ mod tests {
     ) -> AccessOutput {
         AccessOutput {
             graph_id: "g".into(),
-            actor: Some("act-ada".into()),
+            actor_id: Some("act-ada".into()),
             graph_wide: graph_wide.to_vec(),
             branch: branch.map(str::to_owned),
             target_branch: None,

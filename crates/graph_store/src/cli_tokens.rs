@@ -18,7 +18,7 @@
 //! Studio looks for the CLI where [`candidates`] says: first the one Studio's settings name
 //! (`omnigraph_cli`, [`configured`]), then on `PATH` and in the install folders. A program is the
 //! CLI Studio runs when what `version --json` reports is Studio's HTTP contract and
-//! [`PROTOCOLS`], and the commands Studio runs are there ([`COMMANDS`]); what a program was found
+//! [`PROTOCOLS`] at [`PROTOCOL`]; what a program was found
 //! to be is remembered across launches until its file changes ([`Probes`], [`probe`]). It runs
 //! off the main thread with a timeout, one sequence of commands at a time ([`TURN`]: the CLI
 //! refuses a second command on a home whose lock another holds; [`run`]), its standard input
@@ -52,33 +52,17 @@ const CLI_NAME: &str = if cfg!(windows) {
 /// ([`is_omnigraph_variable`]).
 pub const VARIABLE_PREFIX: &str = "OMNIGRAPH_";
 
-/// The protocols `version --json` reports, and the numbers of each that Studio drives: the
-/// target, credential and access protocols of OmniGraph main `7fff9dfd` (all 1), and the bump of
-/// the first two that ModernRelay/omnigraph#1127 asks for, which marks the same commands. A CLI
-/// that reports another number, or none, speaks commands Studio does not know. CLIs from before
-/// and after OmniGraph's version-1 operator configuration both report target protocol 1, so
-/// the agent's CLI is also asked to check the home Studio writes for it (spec 013).
-const PROTOCOLS: &[(&str, &[u64])] = &[
-    ("target", &[1, 2]),
-    ("credential", &[1, 2]),
-    ("access", &[1]),
-];
+/// The protocols `version --json` reports, each of which Studio drives at [`PROTOCOL`].
+const PROTOCOLS: &[&str] = &["target", "credential", "access"];
 
-/// The OmniGraph main commit whose CLI is the first Studio drives: the version-1 operator
-/// configuration with one `auth` per server target (ModernRelay/omnigraph#1126), in which the
-/// agent's CLI home is written, and every command [`COMMANDS`] names. An earlier build with that
-/// configuration (`edge-20261021-888223b`) reads a server target's `auth` as a map of named
-/// entries.
-pub const FIRST_CLI_COMMIT: &str = "ff542202";
+/// The number of each of [`PROTOCOLS`] Studio drives: OmniGraph 0.14.0's, the first that names
+/// the version-1 operator configuration, its commands and their answers exactly
+/// (ModernRelay/omnigraph#1135, #1133). Earlier builds are not supported; a CLI that reports
+/// another number, or none, speaks commands Studio does not know.
+const PROTOCOL: u64 = 2;
 
-/// The commands Studio runs, which must be there too: builds before OmniGraph main `f7db38da`
-/// report the same protocol numbers without them (ModernRelay/omnigraph#1127).
-const COMMANDS: &[&[&str]] = &[
-    &["target", "list"],
-    &["target", "inspect"],
-    &["credentials", "status"],
-    &["credentials", "export"],
-];
+/// The first OmniGraph release whose CLI Studio drives.
+pub const FIRST_CLI_RELEASE: &str = "0.14.0";
 
 /// The CLI's own bound on a token (`credential_sources::MAX_CREDENTIAL_BYTES`, 64 KiB).
 const MAX_TOKEN_BYTES: usize = 64 * 1024;
@@ -217,19 +201,34 @@ pub fn installed(places: &[PathBuf]) -> Vec<PathBuf> {
     programs
 }
 
-/// What a program Studio looked at was found to be, and its file's stamp then.
+/// What a program Studio looked at was found to be, its file's stamp then, and what Studio
+/// asked of a CLI then ([`requirements`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Probed {
     path: PathBuf,
     stamp: FileStamp,
+    /// [`requirements`] when it was probed; an entry kept under other ones, or none (an earlier
+    /// Studio's), is probed again.
+    #[serde(default)]
+    requires: String,
     found: Result<FoundCli, String>,
+}
+
+/// What Studio asks of a CLI, in words: a program judged under other ones is judged again, so
+/// a Studio that asks more or less than the one that probed it does not take its verdict.
+fn requirements() -> String {
+    format!(
+        "HTTP contract {}, {} protocol {PROTOCOL}",
+        graph_client::CONTRACT,
+        PROTOCOLS.join(", ")
+    )
 }
 
 /// What each program Studio looked at was found to be, kept in Studio's data directory
 /// (`cli_probes.json`) as well as in memory, so a launch asks a program nothing it asked before:
 /// a program is probed again only when its file changes (its modification time, size or
-/// permissions), so a start and a connect run only the commands they need. A probe is five
-/// commands (`version --json` and four `--help`), tens of milliseconds at every start.
+/// permissions), so a start and a connect run only the commands they need. A probe is one
+/// command, `version --json`.
 struct Probes {
     /// The file was read: at the first look of a run.
     read: bool,
@@ -266,7 +265,9 @@ impl Probes {
     fn find(&self, program: &Path, stamp: FileStamp) -> Option<Result<FoundCli, String>> {
         self.held
             .iter()
-            .find(|probed| probed.path == program && probed.stamp == stamp)
+            .find(|probed| {
+                probed.path == program && probed.stamp == stamp && probed.requires == requirements()
+            })
             .map(|probed| probed.found.clone())
     }
 
@@ -277,6 +278,7 @@ impl Probes {
         self.held.push(Probed {
             path: program.to_owned(),
             stamp,
+            requires: requirements(),
             found,
         });
         let excess = self.held.len().saturating_sub(PROBES_KEPT);
@@ -327,16 +329,16 @@ pub(crate) async fn find_cli(programs: &[PathBuf], turn: &Held) -> Result<FoundC
         unfit.join("; ")
     };
     Err(format!(
-        "Studio found no OmniGraph CLI it can drive (an OmniGraph build from main \
-         {FIRST_CLI_COMMIT} on, speaking HTTP contract {} and reporting target, credential and \
-         access protocols it knows): {looked}",
+        "Studio found no OmniGraph CLI it can drive (OmniGraph {FIRST_CLI_RELEASE} or later, \
+         speaking HTTP contract {} and reporting target, credential and access protocol \
+         {PROTOCOL}): {looked}",
         graph_client::CONTRACT
     ))
 }
 
 /// `program` as the CLI Studio runs: one whose `version --json` reports Studio's HTTP contract
-/// and [`PROTOCOLS`], and which has [`COMMANDS`]. Otherwise why not, in words that follow its
-/// path ("is 0.15.0, whose target protocol 3 Studio does not know"). What it was found to be is
+/// and [`PROTOCOLS`] at [`PROTOCOL`]. Otherwise why not, in words that follow its path ("is
+/// 0.15.0, whose target protocol 3 Studio does not know"). What it was found to be is
 /// remembered while its file is unchanged ([`Probes`]); otherwise it is probed in the turn held.
 pub async fn probe(program: &Path, turn: &Held) -> Result<FoundCli, String> {
     let stamp = crate::cli_config::stamp(&[program.to_owned()])
@@ -400,10 +402,10 @@ async fn probe_now(program: &Path, turn: &Held) -> Result<FoundCli, Unfit> {
             )));
         }
     }
-    for (protocol, known) in PROTOCOLS {
+    for protocol in PROTOCOLS {
         let reported = json.pointer(&format!("/protocols/{protocol}"));
         match reported.and_then(Value::as_u64) {
-            Some(number) if known.contains(&number) => {}
+            Some(PROTOCOL) => {}
             Some(number) => {
                 return Err(Unfit::lasting(format!(
                     "is {version}, whose {protocol} protocol {number} Studio does not know"
@@ -414,24 +416,6 @@ async fn probe_now(program: &Path, turn: &Held) -> Result<FoundCli, Unfit> {
                     "is {version}, which reports no {protocol} protocol"
                 )));
             }
-        }
-    }
-    for words in COMMANDS {
-        let mut args: Vec<&str> = words.to_vec();
-        args.push("--help");
-        let ran = run(
-            turn,
-            || command(program, &[], &args),
-            READ_TIMEOUT,
-            MAX_ANSWER_BYTES,
-        )
-        .await
-        .map_err(transient)?;
-        if !ran.status.success() {
-            return Err(Unfit::lasting(format!(
-                "is {version}, which has no `{}`",
-                words.join(" ")
-            )));
         }
     }
     Ok(FoundCli {
@@ -1232,8 +1216,8 @@ mod tests {
     use crate::cli_config::{CliAuth, Platform, read_targets};
     use crate::connection::{Connection, ConnectionState, ServerEntry, ServerSource};
 
-    /// What `version --json` reports at OmniGraph main `7fff9dfd` (`0.14.0-edge+7fff9df`).
-    const VERSION: &str = r#"{"version":"0.14.0-edge+7fff9df","channel":"edge","commit":"7fff9dfd91835201986d72f3e3e014b36c3e636a","http_contract":"0.14","protocols":{"target":1,"credential":1,"access":1},"internal_schema":{"writes":16,"serves":[14,16]}}"#;
+    /// What `version --json` reports in the OmniGraph 0.14.0 release.
+    const VERSION: &str = r#"{"version":"0.14.0","channel":"stable","commit":"60bfd19db780fdff3a5178f959c1204143420114","http_contract":"0.14","protocols":{"target":2,"credential":2,"access":2},"internal_schema":{"writes":16,"serves":[14,16]}}"#;
 
     /// A stand-in for the OmniGraph CLI: a shell script that answers the commands Studio runs
     /// from files in its directory, and records each call and the OmniGraph variables of each
@@ -1264,9 +1248,6 @@ lock() {{
 }}
 case "$*" in
   "version --json") cat "$dir/version.json"; exit 0 ;;
-  *" --help")
-    [ -f "$dir/no-$1-$2" ] && {{ echo "error: unrecognized subcommand '$1'" >&2; exit 2; }}
-    echo "Usage: omnigraph $1 $2"; exit 0 ;;
   "target add "*" --json")
     [ -f "$dir/refuse-add" ] && {{ printf 'Error: \n   0: \033[91mtarget already exists\033[0m\n' >&2; exit 1; }}
     cat > "$dir/added-$3.json"; echo '{{"registered":"'"$3"'"}}'; exit 0 ;;
@@ -1343,11 +1324,11 @@ exit 64
             );
         }
 
-        /// The calls made since the last look, but the probe's (`version --json` and `--help`).
+        /// The calls made since the last look, but the probe's (`version --json`).
         fn commands(&self) -> Vec<String> {
             self.calls()
                 .into_iter()
-                .filter(|call| !call.ends_with("--help") && call != "version --json")
+                .filter(|call| call != "version --json")
                 .collect()
         }
 
@@ -1397,12 +1378,11 @@ exit 64
         smol::block_on(source.token(Arc::default()))
     }
 
-    /// A CLI is chosen only when it speaks Studio's HTTP contract, reports the target,
-    /// credential and access protocols Studio drives (those of OmniGraph main `7fff9dfd`, and the
-    /// bump #1127 asks for) and has every command Studio runs; each one passed over is named with
-    /// why.
+    /// A CLI is chosen only when it speaks Studio's HTTP contract and reports target,
+    /// credential and access protocol 2, as OmniGraph 0.14.0 does; an earlier build is passed
+    /// over, and each one passed over is named with why.
     #[test]
-    fn a_cli_is_chosen_by_its_contract_protocols_and_commands() {
+    fn a_cli_is_chosen_by_its_contract_and_protocols() {
         let old = StandIn::new("old");
         old.write("version.json", "not json");
         let other_contract = StandIn::new("other-contract");
@@ -1418,21 +1398,19 @@ exit 64
         let pre_access = StandIn::new("pre-access");
         pre_access.write(
             "version.json",
-            r#"{"version":"0.14.0-edge+50283ce","http_contract":"0.14","protocols":{"target":1,"credential":1}}"#,
+            r#"{"version":"0.14.0-edge+50283ce","http_contract":"0.14","protocols":{"target":2,"credential":2}}"#,
         );
         let unknown = StandIn::new("unknown");
         unknown.write(
             "version.json",
             r#"{"version":"0.15.0","http_contract":"0.14","protocols":{"target":3,"credential":2,"access":1}}"#,
         );
-        let no_status = StandIn::new("no-status");
-        no_status.write("no-credentials-status", "");
-        let current = StandIn::new("current");
-        let bumped = StandIn::new("bumped");
-        bumped.write(
+        let edge = StandIn::new("edge");
+        edge.write(
             "version.json",
-            r#"{"version":"0.14.1","http_contract":"0.14","protocols":{"target":2,"credential":2,"access":1}}"#,
+            r#"{"version":"0.14.0-edge+7fff9df","channel":"edge","http_contract":"0.14","protocols":{"target":1,"credential":1,"access":1}}"#,
         );
+        let current = StandIn::new("current");
         let missing = old.dir.join("not-there");
         let not_executable = old.dir.join("plain");
         std::fs::write(&not_executable, "#!/bin/sh\n").unwrap();
@@ -1443,13 +1421,13 @@ exit 64
             &no_contract,
             &pre_access,
             &unknown,
-            &no_status,
+            &edge,
         ];
         let mut programs: Vec<PathBuf> = vec![missing, not_executable];
         programs.extend(unfit.iter().map(|stand_in| stand_in.program.clone()));
         // A place that links to a program listed before it is that program, probed once.
         let linked = old.dir.join("linked");
-        std::os::unix::fs::symlink(&no_status.program, &linked).unwrap();
+        std::os::unix::fs::symlink(&edge.program, &linked).unwrap();
         programs.push(linked);
         let why = found(&programs).unwrap_err();
         for said in [
@@ -1458,8 +1436,8 @@ exit 64
             "is 0.14.0-dev, which reports no HTTP contract",
             "is 0.14.0-edge+50283ce, which reports no access protocol",
             "is 0.15.0, whose target protocol 3 Studio does not know",
-            "is 0.14.0-edge+7fff9df, which has no `credentials status`",
-            "from main ff542202 on",
+            "is 0.14.0-edge+7fff9df, whose target protocol 1 Studio does not know",
+            "OmniGraph 0.14.0 or later",
         ] {
             assert!(why.contains(said), "{said}: {why}");
         }
@@ -1467,19 +1445,18 @@ exit 64
             !why.contains("not-there") && !why.contains("plain") && !why.contains("linked"),
             "{why}"
         );
-        assert_eq!(why.matches("which has no `credentials status`").count(), 1);
+        assert_eq!(why.matches("whose target protocol 1").count(), 1);
 
         programs.push(current.program.clone());
-        programs.push(bumped.program.clone());
         let chosen = found(&programs).unwrap();
         assert_eq!(chosen.path, current.program);
-        assert_eq!(chosen.version, "0.14.0-edge+7fff9df");
-        let chosen = found(&bumped.programs()).unwrap();
-        assert_eq!(chosen.version, "0.14.1");
+        assert_eq!(chosen.version, "0.14.0");
         // Found again with no probe while the program is unchanged.
-        bumped.calls();
-        found(&bumped.programs()).unwrap();
-        assert!(bumped.calls().is_empty());
+        let again = StandIn::new("again");
+        assert_eq!(found(&again.programs()).unwrap().version, "0.14.0");
+        again.calls();
+        found(&again.programs()).unwrap();
+        assert!(again.calls().is_empty());
 
         let none = found(&[]).unwrap_err();
         assert!(none.contains("no `omnigraph` is on PATH"), "{none}");
@@ -1917,20 +1894,36 @@ exit 64
     fn a_probe_is_remembered_across_launches() {
         let cli = StandIn::new("remembered");
         assert!(found(&cli.programs()).is_ok());
-        assert_eq!(cli.calls().len(), 5, "`version --json` and four `--help`");
+        assert_eq!(cli.calls(), ["version --json"]);
         // The next launch: nothing in memory, the data directory's file read again.
         studio_settings::writes_done();
         forget_probes();
         assert!(found(&cli.programs()).is_ok());
         assert!(cli.calls().is_empty(), "asked nothing");
         let kept = std::fs::read_to_string(probes_path()).unwrap();
-        assert!(kept.contains("0.14.0-edge+7fff9df"), "{kept}");
+        assert!(kept.contains(r#""0.14.0""#), "{kept}");
 
         // Upgraded in place: its stamp changed, so it is asked again.
         let script = std::fs::read_to_string(&cli.program).unwrap();
         std::fs::write(&cli.program, format!("{script}\n# upgraded\n")).unwrap();
         assert!(found(&cli.programs()).is_ok());
-        assert_eq!(cli.calls().len(), 5);
+        assert_eq!(cli.calls(), ["version --json"]);
+
+        // Kept by a Studio that asked something else of a CLI: probed again, under these.
+        studio_settings::writes_done();
+        let earlier = std::fs::read_to_string(probes_path())
+            .unwrap()
+            .replace(&requirements(), "HTTP contract 0.14, target protocol 1");
+        std::fs::write(probes_path(), earlier).unwrap();
+        forget_probes();
+        assert!(found(&cli.programs()).is_ok());
+        assert_eq!(cli.calls(), ["version --json"], "judged again");
+        studio_settings::writes_done();
+        assert!(
+            std::fs::read_to_string(probes_path())
+                .unwrap()
+                .contains(&requirements())
+        );
     }
 
     /// The sequences waiting for the CLI take it in the order they asked, but one a window
