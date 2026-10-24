@@ -2,16 +2,20 @@
 
 Status: draft, not implemented. Managed clusters come first; a self-hosted OIDC server is
 specified here but not planned for now. Needs the managed control plane's remaining
-prerequisites and answers to the open questions below · 2026-10-24
+prerequisites and answers to the open questions below. Until it lands, Studio reaches a managed
+cluster on the CLI's login (spec 003, since 2026-10-25), which this client replaces · 2026-10-25
 
 ## Problem
 
 A server that admits people through OIDC asks for a short-lived access token issued for it,
 and Studio has no way to get one. Studio connects with no credential or with a static token the
 OmniGraph CLI exports for a server target. Against an OIDC
-server it gets a 401 and can only say so. A managed target gets no token (spec 003), and the
-change that moves targets onto the CLI's commands refuses it: the CLI's managed data credential
-is not Studio's to borrow (RFC #1017, Appendix A2). This plan
+server it gets a 401 and can only say so. A managed target is reached for now with the data
+token the CLI exchanges from the person's `omnigraph login` (spec 003), an interim the person
+chose on 2026-10-25 against RFC #1017's Appendix A2. That token is the CLI's: it lasts an hour
+here (A2 allows up to 24), removing the person's admission does not retract it, and Studio acts
+with the CLI's login rather than as a client of its own, which the server cannot tell apart or
+give less authority. This plan
 makes Studio a standard OAuth public client of any OIDC-enabled OmniGraph server, self-hosted or
 managed, signing a person in through their browser. It is a spec only; nothing is implemented.
 

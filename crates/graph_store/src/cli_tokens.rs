@@ -9,7 +9,10 @@
 //! target's token comes from `credentials export --target NAME`, which writes the token and a
 //! newline to a pipe and refuses a terminal or a file. So an environment variable, a token file,
 //! the CLI's secure store and a credential helper are each resolved by OmniGraph's own code
-//! (OmniGraph RFC 1017, "Static tokens for clients"). Studio keeps a token in memory only, never
+//! (OmniGraph RFC 1017, "Static tokens for clients"). A managed target's token is the data
+//! credential the CLI exchanges from the person's `omnigraph login` as it exports it, an hour's at
+//! most; `credentials status` takes no managed target, so its export is asked for directly. That
+//! is an interim until Studio's own sign-in (spec 016). Studio keeps a token in memory only, never
 //! logs or writes it, and sends it only to the endpoint of the target it was exported for. Only
 //! the export needs a Unix pipe: on Windows the CLI refuses every export, so Studio there finds
 //! the CLI and lists its targets as on Unix, and uses only those that take no token
@@ -121,6 +124,13 @@ impl std::fmt::Debug for Token {
 /// waiting for the CLI ([`TURN`]), however long it has waited already.
 pub trait TokenSource: Send + Sync + 'static {
     fn token(&self, hurry: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, String>>;
+
+    /// The managed profile whose login the token is exchanged from, when it carries the
+    /// person's own login rather than a token for the server: said where the connection is
+    /// shown.
+    fn login_profile(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The CLI Studio runs.
@@ -575,6 +585,8 @@ impl CliTokenSource {
     pub(crate) fn for_server(server: &CliServer, credential: &CliCredential) -> Self {
         let timeout = match credential {
             CliCredential::Helper { timeout } => EXPORT_TIMEOUT.max(*timeout + HELPER_MARGIN),
+            // An exchange with the control plane, renewing the login when it must.
+            CliCredential::Managed { .. } => EXPORT_TIMEOUT + HELPER_MARGIN,
             _ => EXPORT_TIMEOUT,
         };
         Self {
@@ -605,28 +617,35 @@ impl CliTokenSource {
         let target = self.target.as_str();
         let kept = self.kept();
 
-        // Whether a credential is there at all, read without the secret.
-        let status = json_answer(
-            &cli,
-            &turn,
-            &kept,
-            &["credentials", "status", "--target", target, "--json"],
-        )
-        .await?;
-        let availability = status.get("availability").and_then(Value::as_str);
-        let route = status.pointer("/owner/route").and_then(Value::as_str);
-        match availability {
-            Some("absent" | "unavailable") => return Err(self.no_credential()),
-            Some("anonymous") => return Err(self.changed()),
-            _ if route != Some(self.endpoint.as_str()) => return Err(self.changed()),
-            _ => {}
+        // Whether a credential is there at all, read without the secret. The CLI takes no
+        // managed target here (its status is its profile's, which says nothing of the cluster's
+        // data credential), so a managed export is asked for directly.
+        let managed = matches!(self.credential, CliCredential::Managed { .. });
+        if !managed {
+            let status = json_answer(
+                &cli,
+                &turn,
+                &kept,
+                &["credentials", "status", "--target", target, "--json"],
+            )
+            .await?;
+            let availability = status.get("availability").and_then(Value::as_str);
+            let route = status.pointer("/owner/route").and_then(Value::as_str);
+            match availability {
+                Some("absent" | "unavailable") => return Err(self.no_credential()),
+                Some("anonymous") => return Err(self.changed()),
+                _ if route != Some(self.endpoint.as_str()) => return Err(self.changed()),
+                _ => {}
+            }
         }
 
         let token = self.export(&cli, &turn, &kept).await?;
 
-        // The export read the configuration again: a token for another endpoint is dropped.
+        // The export read the configuration again: a token for another endpoint, or another
+        // kind of target, is dropped.
         let inspected = inspect_target(&cli, &turn, target).await?;
-        let still = inspected.pointer("/target/kind").and_then(Value::as_str) == Some("server")
+        let kind = if managed { "managed" } else { "server" };
+        let still = inspected.pointer("/target/kind").and_then(Value::as_str) == Some(kind)
             && inspected
                 .pointer("/target/endpoint")
                 .and_then(Value::as_str)
@@ -703,6 +722,13 @@ impl TokenSource for CliTokenSource {
     fn token(&self, hurry: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, String>> {
         let source = self.clone();
         async move { source.resolve(hurry).await }.boxed()
+    }
+
+    fn login_profile(&self) -> Option<String> {
+        match &self.credential {
+            CliCredential::Managed { profile } => Some(profile.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -1464,8 +1490,10 @@ exit 64
 
     /// The targets are what `target list --json` says, in the shape the CLI at OmniGraph main
     /// `7fff9dfd` prints: server targets land on servers (an anonymous one with no token, the
-    /// others with where their credential is), direct and managed targets are refused, each
-    /// with why, a managed target is kept as the listing describes it with no other command, a
+    /// others with where their credential is), a managed target with a data endpoint lands on it
+    /// with its CLI login as its credential, direct targets and a managed one without an endpoint
+    /// are refused, each with why, a managed target is kept as the listing describes it with no
+    /// other command, a
     /// target's own certificate authority is read with it and its bundle watched, and a second
     /// target on an address is named as an alternative. Where the CLI exports no token (Windows), the CLI is found and the targets
     /// listed alike, and each server target that takes a token is refused with why. A
@@ -1516,6 +1544,15 @@ exit 64
             shown,
             vec![
                 (
+                    "cloud",
+                    "https://cluster.example.com",
+                    vec!["crm".to_owned()],
+                    CliAuth::Token(CliCredential::Managed {
+                        profile: "work".into()
+                    }),
+                    None
+                ),
+                (
                     "envy",
                     "https://env.example.com/og",
                     vec!["knowledge".to_owned()],
@@ -1565,10 +1602,10 @@ exit 64
                 ),
             ]
         );
-        assert_eq!(servers[4].alternatives, ["stored-too"]);
-        assert_eq!(servers[0].endpoint, "https://env.example.com/og/");
+        assert_eq!(servers[5].alternatives, ["stored-too"]);
+        assert_eq!(servers[1].endpoint, "https://env.example.com/og/");
         assert_eq!(
-            servers[5].transport.roots,
+            servers[6].transport.roots,
             Some(crate::cli_config::CliRoots {
                 replace: false,
                 file: ca_file.clone(),
@@ -1587,10 +1624,9 @@ exit 64
         };
         assert!(said("disk").contains("opens storage directly"));
         assert!(said("rooted").contains("scope root"));
-        assert!(said("cloud").contains("managed cluster, which needs Studio's own sign-in"));
-        assert!(said("control").contains("does not borrow the CLI's managed token"));
+        assert!(said("control").contains("managed cluster registered without a data endpoint"));
         assert!(said("stored-too").contains("which Studio reaches as 'stored', the first by name"));
-        assert_eq!(listed.errors.len(), 5, "{:?}", listed.errors);
+        assert_eq!(listed.errors.len(), 4, "{:?}", listed.errors);
         let managed: Vec<_> = listed
             .managed
             .iter()
@@ -1645,7 +1681,7 @@ exit 64
                 ("stored-too".to_owned(), CliAuth::Anonymous, vec![]),
             ]
         );
-        for name in ["envy", "filed", "helped", "strategy", "stored"] {
+        for name in ["cloud", "envy", "filed", "helped", "strategy", "stored"] {
             let refused = format!(
                 "CLI target '{name}' takes a token, and the OmniGraph CLI gives a token only \
                  through a Unix pipe, so Studio on Windows cannot use this target yet"
@@ -1659,7 +1695,6 @@ exit 64
         for (name, said) in [
             ("disk", "opens storage directly"),
             ("rooted", "scope root"),
-            ("cloud", "managed cluster"),
             ("control", "managed cluster"),
         ] {
             assert!(
@@ -1871,6 +1906,59 @@ exit 64
             "{moved}"
         );
         assert!(!moved.contains("secret-moving-token"));
+    }
+
+    /// A managed target's token is the data credential the CLI exchanges from its login, asked
+    /// for with `credentials export` alone, since `credentials status` takes no managed target,
+    /// and kept only while `target inspect` still names that managed target at that endpoint.
+    /// The source says whose login it carries; a server target's says none.
+    #[test]
+    fn a_managed_targets_token_is_exchanged_from_the_clis_login() {
+        let cli = StandIn::new("managed");
+        let endpoint = "https://c1-i1.graphs.example.com/";
+        cli.write(
+            "inspect-cloud.json",
+            &format!(
+                r#"{{"name":"cloud","target":{{"kind":"managed","profile":"work","cluster_id":"c1","cluster_incarnation":"i1","endpoint":"{endpoint}"}}}}"#
+            ),
+        );
+        cli.write("token-cloud", "secret-data-token");
+        let source = cli.source(
+            "cloud",
+            endpoint,
+            CliCredential::Managed {
+                profile: "work".into(),
+            },
+        );
+        assert_eq!(source.login_profile().as_deref(), Some("work"));
+        assert_eq!(
+            token_of(&source).unwrap().into_string(),
+            "secret-data-token"
+        );
+        assert_eq!(
+            cli.commands(),
+            [
+                "credentials export --target cloud",
+                "target inspect cloud --json",
+            ]
+        );
+        assert!(cli.files_holding("secret-data-token").is_empty());
+
+        // Turned into a server target at the same address while its token was read: dropped.
+        cli.write(
+            "move-cloud",
+            &format!(
+                r#"{{"name":"cloud","target":{{"kind":"server","endpoint":"{endpoint}","auth":{{"provider":"anonymous"}}}}}}"#
+            ),
+        );
+        let turned = token_of(&source).unwrap_err();
+        assert!(
+            turned.contains("changed while Studio read its token"),
+            "{turned}"
+        );
+        assert!(!turned.contains("secret-data-token"));
+        let stored = cli.source("stored", "https://store.example.com/", CliCredential::Store);
+        assert_eq!(stored.login_profile(), None);
     }
 
     /// A refused export says the CLI's reason, without its colours or its note of the target,

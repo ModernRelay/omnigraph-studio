@@ -539,6 +539,12 @@ impl Connection {
         }));
     }
 
+    /// The managed profile whose login the CLI exchanges for this server's token, when it does
+    /// ([`TokenSource::login_profile`]).
+    pub fn login_profile(&self) -> Option<String> {
+        self.token_source.as_ref()?.login_profile()
+    }
+
     /// Whether a connect asks its token source first: it has one, and no token was given.
     fn asks_token_source(&self) -> bool {
         self.token_source.is_some() && !self.token_given

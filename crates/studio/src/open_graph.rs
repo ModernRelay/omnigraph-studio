@@ -547,10 +547,7 @@ impl OpenGraphModal {
                         let c = connection.read(cx);
                         let color = connection_color(&c.state);
                         let selected = self.selected.as_ref() == Some(&connection);
-                        let source = match c.server.source {
-                            ServerSource::Cli => "CLI target",
-                            ServerSource::Environment => "environment",
-                        };
+                        let source = source_label(&c.server.source, c.login_profile().as_deref());
                         MenuRow::new(("server", index))
                             .height(size::FEED_ROW)
                             .toggle_state(selected)
@@ -791,15 +788,43 @@ fn server_status(c: &Connection) -> String {
 }
 
 /// What Update token does with the token typed: it lasts this run, and for a CLI server the
-/// CLI's own command keeps one for the CLI and Studio.
+/// CLI's own command keeps one for the CLI and Studio. For a managed cluster reached on the CLI's
+/// login, it first says where that cluster's token comes from.
 fn token_tooltip(c: &Connection) -> String {
-    match c.server.source {
+    tooltip_for(
+        &c.server.source,
+        &c.server.name,
+        c.login_profile().as_deref(),
+    )
+}
+
+/// [`token_tooltip`] for a server of `source` named `name`, reached on the CLI's login of
+/// `profile` when there is one.
+fn tooltip_for(source: &ServerSource, name: &str, profile: Option<&str>) -> String {
+    if let Some(profile) = profile {
+        return format!(
+            "Studio uses your OmniGraph CLI login here (profile {profile}): the CLI exchanges it \
+             for an hour's token for this cluster, which Studio keeps in memory and asks for \
+             again when it lapses. `omnigraph login --profile {profile}` signs in again. A token \
+             typed here is used until Studio quits. Studio's own sign-in will replace this."
+        );
+    }
+    match source {
         ServerSource::Cli => format!(
             "Used until Studio quits. To keep one for the CLI and Studio, pipe it to `omnigraph \
-             credentials set --target {} --stdin`.",
-            c.server.name
+             credentials set --target {name} --stdin`."
         ),
         ServerSource::Environment => "Used until Studio quits.".into(),
+    }
+}
+
+/// Where a server in the list comes from, after its address: a CLI target, saying so when
+/// Studio reaches it on the CLI's login of `profile`, or the environment.
+fn source_label(source: &ServerSource, profile: Option<&str>) -> String {
+    match (source, profile) {
+        (ServerSource::Cli, Some(profile)) => format!("CLI target, your CLI login ({profile})"),
+        (ServerSource::Cli, None) => "CLI target".to_owned(),
+        (ServerSource::Environment, _) => "environment".to_owned(),
     }
 }
 
@@ -1113,6 +1138,19 @@ mod tests {
             "{cli}"
         );
         assert!(!cli.contains("login"), "{cli}");
+        assert_eq!(source_label(&ServerSource::Cli, None), "CLI target");
+
+        // A managed cluster reached on the CLI's login says so, and how to sign in again.
+        let login = tooltip_for(&ServerSource::Cli, "cloud", Some("work"));
+        assert!(
+            login.contains("your OmniGraph CLI login here (profile work)")
+                && login.contains("`omnigraph login --profile work` signs in again"),
+            "{login}"
+        );
+        assert_eq!(
+            source_label(&ServerSource::Cli, Some("work")),
+            "CLI target, your CLI login (work)"
+        );
     }
 
     /// A reload that replaces a server (a new address in the CLI config) is followed: the new

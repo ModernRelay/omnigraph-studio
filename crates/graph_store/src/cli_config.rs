@@ -6,8 +6,9 @@
 //! taking its token from the CLI's `credentials export`, which gives one only on a Unix system:
 //! elsewhere (Windows) a target that takes a token is refused, with why ([`Platform`]). A
 //! `direct` target is refused: Studio never opens storage or starts a server. A `managed` cluster
-//! is refused until Studio has its own sign-in: it does not borrow the CLI's managed token
-//! (OmniGraph RFC 1017, "One server model" and A2). An address is one server: of the targets on
+//! with a data endpoint lands on that endpoint, its token the data credential the CLI exchanges
+//! from the person's `omnigraph login` ([`CliCredential::Managed`]): an interim until Studio's own
+//! sign-in (spec 016; OmniGraph RFC 1017, A2). An address is one server: of the targets on
 //! one endpoint, Studio connects as the first by name and names the others, each an identity of
 //! its own, as alternatives it does not connect as (`target list --json` does not say which
 //! target is the default). The CLI's aliases are not read: the CLI has no command that lists
@@ -101,6 +102,10 @@ pub enum CliCredential {
     File { path: PathBuf },
     /// `provider: exec`: a credential helper the CLI runs, given this long.
     Helper { timeout: Duration },
+    /// A managed target's data credential, which the CLI exchanges from the login of `profile`
+    /// (`omnigraph login`) each time it is exported, an hour's at most. An interim until Studio
+    /// signs in itself (spec 016): it acts with the CLI's login, not as a client of its own.
+    Managed { profile: String },
 }
 
 /// Whether the system Studio runs on lets the OmniGraph CLI give it a token. Every command Studio
@@ -134,9 +139,10 @@ impl Platform {
 /// ([`Platform::Other`]), and why Add server takes no token there.
 pub const PIPE_ONLY: &str = "the OmniGraph CLI gives a token only through a Unix pipe";
 
-/// A managed cluster target, as `target list --json` describes it: refused until Studio has its
-/// own sign-in (spec 016 builds that client from these fields, and reads the profile's control
-/// plane itself). Studio holds no token for it and never exports one.
+/// A managed cluster target, as `target list --json` describes it, kept for Studio's own sign-in
+/// (spec 016 builds that client from these fields, and reads the profile's control plane
+/// itself). Until then one with a data endpoint also lands as a server whose token the CLI
+/// exchanges from its login ([`CliCredential::Managed`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedTarget {
     /// The target's name.
@@ -192,7 +198,7 @@ pub struct CliTargets {
     /// file's as its target's revision holds it. A later stamp that differs lists the targets
     /// again.
     pub watched: Vec<(PathBuf, Option<FileStamp>)>,
-    /// The managed targets, refused (in `errors`) but kept as `target list` describes them.
+    /// The managed targets, as `target list` describes them, whether they landed or not.
     pub managed: Vec<ManagedTarget>,
 }
 
@@ -422,7 +428,7 @@ fn land(
             auth,
             transport,
             default_graph,
-        } => (endpoint, auth, transport, default_graph),
+        } => (endpoint, cli_auth(auth)?, transport, default_graph),
         Entry::Direct { scope } => {
             return Err(format!(
                 "opens storage directly (`kind: direct`, scope {scope}); Studio never opens \
@@ -438,42 +444,27 @@ fn land(
         } => {
             managed.push(ManagedTarget {
                 name: name.to_owned(),
-                profile,
+                profile: profile.clone(),
                 cluster_id,
                 cluster_incarnation,
-                endpoint,
-                default_graph,
+                endpoint: endpoint.clone(),
+                default_graph: default_graph.clone(),
             });
-            return Err(
-                "is a managed cluster, which needs Studio's own sign-in; that is not \
-                        built yet, and Studio does not borrow the CLI's managed token"
-                    .to_owned(),
-            );
+            let Some(endpoint) = endpoint else {
+                return Err(
+                    "is a managed cluster registered without a data endpoint, so it names no \
+                     server for Studio to reach"
+                        .to_owned(),
+                );
+            };
+            (
+                endpoint,
+                CliAuth::Token(CliCredential::Managed { profile }),
+                None,
+                default_graph,
+            )
         }
         Entry::Other => return Err("is of a kind Studio does not know".to_owned()),
-    };
-    let auth = match auth {
-        Auth::Anonymous => CliAuth::Anonymous,
-        Auth::Token {
-            source: Source::Store(_),
-        } => CliAuth::Token(CliCredential::Store),
-        Auth::Token {
-            source: Source::Env(variable),
-        } => CliAuth::Token(CliCredential::Environment { variable }),
-        Auth::Token {
-            source: Source::File(path),
-        } => CliAuth::Token(CliCredential::File { path }),
-        Auth::Exec { timeout } => {
-            let seconds = timeout
-                .as_deref()
-                .and_then(|timeout| timeout.strip_suffix('s'))
-                .and_then(|seconds| seconds.parse::<u64>().ok())
-                .unwrap_or(30);
-            CliAuth::Token(CliCredential::Helper {
-                timeout: Duration::from_secs(seconds),
-            })
-        }
-        Auth::Other => return Err("authenticates in a way Studio does not know".to_owned()),
     };
     if endpoint
         .get(..5)
@@ -539,6 +530,33 @@ fn land(
         alternatives: Vec::new(),
         // The name too: an entry renamed is listed alike, and its token is asked for by name.
         revision: format!("{name} {value} {file_stamp:?}"),
+    })
+}
+
+/// How a server target's requests are authenticated, from its `auth`.
+fn cli_auth(auth: Auth) -> Result<CliAuth, String> {
+    Ok(match auth {
+        Auth::Anonymous => CliAuth::Anonymous,
+        Auth::Token {
+            source: Source::Store(_),
+        } => CliAuth::Token(CliCredential::Store),
+        Auth::Token {
+            source: Source::Env(variable),
+        } => CliAuth::Token(CliCredential::Environment { variable }),
+        Auth::Token {
+            source: Source::File(path),
+        } => CliAuth::Token(CliCredential::File { path }),
+        Auth::Exec { timeout } => {
+            let seconds = timeout
+                .as_deref()
+                .and_then(|timeout| timeout.strip_suffix('s'))
+                .and_then(|seconds| seconds.parse::<u64>().ok())
+                .unwrap_or(30);
+            CliAuth::Token(CliCredential::Helper {
+                timeout: Duration::from_secs(seconds),
+            })
+        }
+        Auth::Other => return Err("authenticates in a way Studio does not know".to_owned()),
     })
 }
 
