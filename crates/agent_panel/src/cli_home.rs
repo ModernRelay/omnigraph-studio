@@ -2430,6 +2430,7 @@ mod tests {
 
     /// An OmniGraph variable in Studio's environment, as a person's shell exports a token, set
     /// in the process [`a_run_starts_the_chosen_cli_with_its_private_home`] runs itself in.
+    #[cfg(unix)]
     const STUDIOS_OWN: (&str, &str) = ("OMNIGRAPH_TOKEN_STUDIO_TEST", "studios-own-token");
 
     /// The agent can rewrite its wrapper and its home's config, but `omnigraph_run` runs outside
