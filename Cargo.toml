@@ -72,6 +72,9 @@ collections = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 util = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 http_client = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 reqwest_client = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
+# The reqwest fork Zed v1.23.2 pins, with its features, for a CLI target that trusts its own
+# certificate authority (spec 003): `reqwest_client` takes a `reqwest::Client` built with roots.
+reqwest = { package = "zed-reqwest", git = "https://github.com/zed-industries/reqwest.git", rev = "33bc764aa15ff7b200bf7c93bd96e24878d53e14", default-features = false, features = ["charset", "http2", "macos-system-configuration", "multipart", "rustls-tls-native-roots", "socks", "stream"] }
 editor = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 markdown = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 language = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }

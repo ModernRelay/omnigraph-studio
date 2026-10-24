@@ -1,8 +1,9 @@
 # 003: Connections
 
-Status: in progress · 2026-10-22. Built: servers from the targets the OmniGraph CLI lists and
+Status: in progress · 2026-10-25. Built: servers from the targets the OmniGraph CLI lists and
 from the environment; a server added as a CLI target, through the CLI; tokens from the CLI's
-`credentials export` (on Unix; on Windows only anonymous targets); the contract check;
+`credentials export` (on Unix; on Windows only anonymous targets); a target's own certificate
+authority; the contract check;
 bounded reads; and replacing a refused token (validation log). OIDC and managed clusters wait
 for Studio's own sign-in (Deferred; spec 016).
 
@@ -149,11 +150,17 @@ dialog by keyboard), X (capabilities from the served document).
      takes a token, and the OmniGraph CLI gives a token only through a Unix pipe, so Studio on
      Windows cannot use this target yet"), after any refusal that holds on every system; its
      token is never asked for and its token file is not watched, and an anonymous target on its
-     address is then that address's server. A target with `transport.tls.ca` is refused as not
-     supported yet rather than reached with other roots (Deferred). One with
-     `proxy: {mode: url}` gets an HTTP client of its own through that proxy (Zed's client, which
-     also leaves out the hosts in `NO_PROXY`); `direct` and `environment` use Studio's client,
-     which follows the system's proxy settings. A `unix:///…` endpoint is
+     address is then that address's server. A target with `transport.tls.ca` trusts its own
+     certificate authority, as the CLI does (`operator_transport.rs`): the listing reads the
+     bundle, a regular file of at most 1 MiB holding PEM certificates, at least one, and
+     watches it like a token file (`cli_config::CliRoots`, since 2026-10-25). The target gets an
+     HTTP client of its own, made from the bundle the listing read, which trusts it with the
+     system's roots (`append`) or alone (`replace`); a bundle that cannot be used refuses the
+     target with why, and with an HTTPS proxy it is refused, as the CLI refuses that pair. One
+     with `proxy: {mode: url}` gets an HTTP client of its own through that proxy (Zed's client,
+     which also leaves out the hosts in `NO_PROXY`); `direct` and `environment` use Studio's
+     client, which follows the system's proxy settings. A changed proxy or bundle makes a new
+     connection. A `unix:///…` endpoint is
      refused, since Studio's client speaks TCP (the CLI refuses one in the file anyway). A
      configuration the CLI refuses lists nothing and keeps every server as it was; the toast,
      which stays until dismissed, gives the CLI's own words, which for a file in the old format
@@ -228,8 +235,8 @@ dialog by keyboard), X (capabilities from the served document).
    For development and tests, `OMNIGRAPH_STUDIO_SERVER` (with `OMNIGRAPH_STUDIO_TOKEN`, which
    lasts the run, and `OMNIGRAPH_STUDIO_GRAPH`) still adds a server named `environment`: the
    development server (`script/dev-server`) is plain HTTP with a bearer token, which a CLI
-   target cannot be (the CLI takes HTTP only for an anonymous loopback server), and a TLS front
-   would need the custom CA Studio does not support yet (Deferred). A problem with it is said
+   target cannot be (the CLI takes HTTP only for an anonymous loopback server); a TLS front with
+   a certificate authority of its own can be one now. A problem with it is said
    in a toast ("The server OMNIGRAPH_STUDIO_SERVER names was not added: …").
    An address is made a server root before it is used (`graph_client::server_root`): trimmed,
    without a trailing slash, with `http://` added for a loopback host (`localhost`, `127.*`,
@@ -386,12 +393,6 @@ and the tooltip named `omnigraph login`, which is managed sign-in only now).
   sessions. Until then Studio connects to running servers.
 - OIDC and signed data credentials, managed clusters among them: supported by the server, but
   Studio starts with static bearer tokens; its own OAuth client is spec 016.
-- A CLI target's own certificate authority (`transport.tls.ca`, `append` or `replace`).
-  `graph_client` takes any `HttpClient`, so nothing changes there: the registry would make the
-  target's client from a `reqwest::Client` with those roots (`tls_built_in_root_certs(false)` and
-  `add_root_certificate` for `replace`, the platform's roots and the bundle for `append`),
-  wrapped by `ReqwestClient::from`. That needs Zed's `reqwest` (`zed-reqwest` at the revision Zed
-  v1.23.2 pins) as a dependency of `graph_store`. Until then such a target is refused.
 - A CLI target's token on Windows. It needs a `credentials export` route the CLI offers off Unix
   (a named pipe, say), an OmniGraph change; until then such a target is refused and Add server
   takes no token there.
@@ -402,6 +403,7 @@ and the tooltip named `omnigraph login`, which is managed sign-in only now).
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-25 | A CLI target that trusts its own certificate authority is reached with it, as the CLI reaches it | `graph_store` `registry::tests::a_target_is_reached_with_its_own_certificate_authority` (a test authority and an HTTPS server on `127.0.0.1` with a certificate it signed: the target's client with `append`, then `replace`; the same with another authority's bundle; Studio's own client), run again with the bundle's certificates not added; `cli_tokens::tests::a_targets_certificate_authority_is_read_as_the_cli_reads_it` (both modes, an HTTP proxy, a missing file, a folder, a file over 1 MiB, broken PEM, a key with no certificate, mode `merge`, an HTTPS proxy); `the_targets_are_listed_as_the_cli_describes_them` with a real bundle; `a_renamed_cli_target_keeps_its_connection`; the CLI's `operator_transport.rs` at `v0.14.0` read for the rules | Both modes answered 200; another authority's bundle and Studio's own client failed the handshake, as did both modes with the certificates not added. The bundle rules refuse each bad case with why, the CLI's limits; every bundle named is watched, a refused one too, and the HTTPS proxy is refused before its bundle is read. The target lands on Unix and is refused for its token on Windows. A changed bundle makes a new connection, the same one keeps it. Once, by hand, against a server whose certificate the system trusts (`omnigraph.ragnor.co/healthz`), with a test authority's bundle: `append` answered 200, `replace` failed with `UnknownIssuer`, so `replace` leaves out the system's roots. Not run against a real server with its own authority: the local `strategy` server was not running |
 | 2026-10-24 | Studio drives a CLI of OmniGraph `v0.14.0` or later, and an error's disposition alone decides a write's outcome | `graph_store` `cli_tokens::tests::a_cli_is_chosen_by_its_contract_and_protocols` (stand-ins reporting `v0.14.0`'s `version --json`, an edge build's protocol 1, one with no access protocol, and 0.15.0's target protocol 3), `a_probe_is_remembered_across_launches` (a probe kept under other requirements); `graph_client` `a_disposition_decides_a_write_outcome_over_its_status`, `object_types_match_the_contract` and `enum_types_match_the_contract` against `openapi/omnigraph-0.14.0.json`, with every refusal fixture given the disposition `v0.14.0` sends (`omnigraph-server` `lib.rs` `disposition`); `~/.local/bin/omnigraph` `version --json`; `/healthz` of the hosted servers | The release stand-in is chosen, running only `version --json`; the others are passed over ("is 0.14.0-edge+7fff9df, whose target protocol 1 Studio does not know"); a probe kept under the earlier rule runs again. Effects `none` is refused on a 500, `unknown` and `partial` are unknown on a 409 and a 503, and none at all is unknown. The installed `0.14.1-edge+7711e4a` reports protocols 2, 2 and 2, which Studio before this refused ("whose access protocol 2 Studio does not know"). A server on `0.14.0-edge+50283ce` sends no disposition (its document has none), so a write it refuses reads as unknown until it runs `v0.14.0` |
 | 2026-10-22 | Studio on Windows lists the CLI's targets, connects the anonymous ones, refuses each that takes a token, and adds only servers that need none | OmniGraph main `242ab02f`: `crates/omnigraph-cli/src/commands/targets/mod.rs` (`stdout_is_pipe`, `run_credential`), `commands/targets/args.rs` ("Write an access token to a Unix pipe"), `credential_sources/exec.rs` (`HelperUnsupported` off Unix); `graph_store` `registry::tests::without_token_export_only_anonymous_targets_connect` (the registry's own listing given `Platform::Other`), `cli_tokens::tests::the_targets_are_listed_as_the_cli_describes_them` (extended: the stand-in CLI listed with `Platform::Other`), `cli_tokens::every_system_tests::the_cli_is_looked_for_on_every_system` (no platform gate); `studio` `open_graph::tests::without_token_export_the_new_servers_token_field_is_disabled` and `the_new_servers_token_field_takes_a_token_where_the_cli_exports_one`; an offscreen snapshot of the Open dialog with `Platform::CURRENT` set to `Other` for the run and an empty `OMNIGRAPH_HOME`, the pointer on the token field | The CLI's export refuses every standard output off Unix, with no named-pipe route; the other four commands are not gated. With `Platform::Other`: the CLI was found and `target list --json` alone ran; only the anonymous targets were servers, one connected Ready with no Authorization; the store, env, file and exec targets were refused with the reason and asked nothing; the direct, managed and custom-CA targets kept their reasons. Add server's token field was drawn disabled, Tab went address, name, address; its tooltip read the reason; a token put in the field by the test was refused by the registry and said in the dialog, with nothing added or sent. With `Platform::Unix` the same targets landed as before and Tab reached the token field. Before, `find_cli` refused on every non-Unix system, so a Windows Studio listed no CLI target |
 | 2026-10-22 | The stand-in CLI's tests hold no bound a busy machine can reach | `graph_store` `cli_tokens::tests`: `READ_TIMEOUT` an hour in tests, and the stand-ins' sources given it; `a_refused_export_says_why_and_never_the_token` (an export whose stand-in never answers, run in a turn the test holds, stopped at its own 300 ms); `tokens_asked_together_take_turns_at_the_cli` (a lock the stand-in lets go once it has refused a command, then holds); `a_command_held_back_past_its_timeout_is_not_run` (a turn the test holds) | The timeout path is reached only by a stand-in that never answers, and the busy path only by a turn the test holds; the lock is retried once, then refused through every retry. Before, on a loaded machine, 7 of the tests failed after waiting 60 s for their turn behind the others' commands ("did not answer `version --json` in time"), and the lock test released its lock from a thread 400 ms in |

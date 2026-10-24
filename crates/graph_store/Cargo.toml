@@ -15,6 +15,7 @@ graph_client = { workspace = true }
 gq_language = { workspace = true }
 http_client = { workspace = true }
 reqwest_client = { workspace = true }
+reqwest = { workspace = true }
 studio_settings = { workspace = true }
 studio_ui = { workspace = true }
 anyhow = { workspace = true }
@@ -25,6 +26,8 @@ url = { workspace = true }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+futures-rustls = { workspace = true }
+rcgen = { workspace = true }
 
 [features]
 # The fake server (`test_server`), for the tests of crates that show a session.

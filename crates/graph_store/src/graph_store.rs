@@ -21,6 +21,8 @@ pub mod scope;
 mod session;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_server;
+#[cfg(test)]
+mod test_tls;
 
 use std::sync::Arc;
 

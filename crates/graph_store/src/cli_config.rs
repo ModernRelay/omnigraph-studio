@@ -14,7 +14,10 @@
 //! them. Studio lists the targets again when the operator file, a token file a target names, or
 //! the CLI where Studio looks for it changes ([`stamp`]); it never writes or parses the file. A
 //! listing is one turn at the CLI, and one command once the CLI is known: `target list --json`.
+//! A target's own certificate authority (`transport.tls.ca`) is read with the listing, as the CLI
+//! reads it ([`CliRoots`]), and watched like a token file.
 
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -38,15 +41,43 @@ pub struct CliServer {
     /// That target's `default_graph`.
     pub graphs: Vec<String>,
     pub auth: CliAuth,
-    /// The proxy its `transport.proxy` names (`mode: url`), else none: Studio's own client,
-    /// which follows the system's proxy settings.
-    pub proxy: Option<String>,
+    /// How its requests reach it: the proxy and certificate authority its `transport` names.
+    pub transport: CliTransport,
     /// The other targets on the address, by name, which Studio does not connect as.
     pub alternatives: Vec<String>,
     /// What decides its token: its entry as the CLI describes it, and the token file it names as
     /// last written. A server whose revision changes asks the CLI for its token again.
     pub revision: String,
 }
+
+/// How a CLI server's requests reach it, from its target's `transport`. The default is Studio's
+/// own client, which follows the system's proxy settings and trusts the system's roots.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CliTransport {
+    /// The proxy its `transport.proxy` names (`mode: url`), else none.
+    pub proxy: Option<String>,
+    /// The certificate authority its `transport.tls.ca` names, as read when the targets were
+    /// listed, else none.
+    pub roots: Option<CliRoots>,
+}
+
+/// A target's own certificate authority (`transport.tls.ca`), read as the OmniGraph CLI reads it
+/// (`operator_transport.rs`): a regular file of at most [`MAX_CA_BYTES`] holding PEM
+/// certificates, at least one. Its bytes are kept, so a server's client is made from the bundle
+/// the listing read; a changed file lists the targets again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliRoots {
+    /// `mode: replace`: the bundle's certificates are the only roots trusted. `mode: append`:
+    /// they are trusted with the system's.
+    pub replace: bool,
+    /// The bundle, as the CLI resolved its path.
+    pub file: PathBuf,
+    /// The bundle's bytes.
+    pub bundle: Vec<u8>,
+}
+
+/// The most a certificate authority bundle may hold, as the CLI reads one: 1 MiB.
+pub const MAX_CA_BYTES: u64 = 1024 * 1024;
 
 /// How a CLI server's requests are authenticated.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,9 +187,10 @@ pub struct CliTargets {
     /// What could not be listed or used, each said once.
     pub errors: Vec<String>,
     /// The files whose change can change a server or its token, the operator file and the
-    /// token files the targets name, each with its stamp ([`stamp`]) as the listing saw it: the
-    /// operator file's taken just before the CLI read it, a token file's as its target's
-    /// revision holds it. A later stamp that differs lists the targets again.
+    /// token and certificate authority files the targets name, each with its stamp ([`stamp`])
+    /// as the listing saw it: the operator file's taken just before the CLI read it, a token
+    /// file's as its target's revision holds it. A later stamp that differs lists the targets
+    /// again.
     pub watched: Vec<(PathBuf, Option<FileStamp>)>,
     /// The managed targets, refused (in `errors`) but kept as `target list` describes them.
     pub managed: Vec<ManagedTarget>,
@@ -373,8 +405,8 @@ pub(crate) fn servers_from(
 }
 
 /// The server the target `name`, described as `value`, lands on, on `platform`, or why it lands
-/// on none. A token file it names is watched, with its stamp; a managed target is kept in
-/// `managed`.
+/// on none. A token or certificate authority file it names is watched, with its stamp; a managed
+/// target is kept in `managed`.
 fn land(
     name: &str,
     value: &Value,
@@ -453,24 +485,33 @@ fn land(
     }
     let url = graph_client::server_root(&endpoint)
         .map_err(|error| format!("cannot be reached: {error}"))?;
-    let proxy = match transport {
-        Some(Transport {
-            tls: Some(Tls { ca: Some(ca) }),
-            ..
-        }) => {
-            return Err(format!(
-                "trusts its own certificate authority (`transport.tls.ca`, mode {}, {}), which \
-                 Studio does not support yet; it is not connected rather than reached with other \
-                 roots",
-                ca.mode,
-                ca.file.display()
-            ));
-        }
-        Some(Transport {
-            proxy: Some(Proxy::Url { url }),
-            ..
-        }) => Some(url),
+    let (proxy, ca) = match transport {
+        Some(Transport { tls, proxy }) => (proxy, tls.and_then(|tls| tls.ca)),
+        None => (None, None),
+    };
+    let proxy = match proxy {
+        Some(Proxy::Url { url }) => Some(url),
         _ => None,
+    };
+    let roots = match ca {
+        Some(ca) => {
+            // As the CLI: one HTTPS proxy and a destination's own roots are not told apart.
+            if let Some(url) = proxy.as_deref().filter(|url| {
+                url.get(..8)
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+            }) {
+                return Err(format!(
+                    "trusts its own certificate authority and goes through the HTTPS proxy \
+                     {url}, which the OmniGraph CLI refuses too: it does not keep the two trusts \
+                     apart"
+                ));
+            }
+            // Watched before it is read, refused or not: a write after the stamp lists the
+            // targets again, and a bundle put right lands the target.
+            watched.push((ca.file.clone(), stamp_of(&ca.file)));
+            Some(read_roots(&ca)?)
+        }
+        None => None,
     };
     // Last, so a target refused on every system says that instead, and before its token file is
     // watched, since nothing here reads it.
@@ -494,11 +535,53 @@ fn land(
         endpoint,
         graphs: default_graph.into_iter().collect(),
         auth,
-        proxy,
+        transport: CliTransport { proxy, roots },
         alternatives: Vec::new(),
         // The name too: an entry renamed is listed alike, and its token is asked for by name.
         revision: format!("{name} {value} {file_stamp:?}"),
     })
+}
+
+/// The certificate authority `ca` names, read as the CLI reads it, or why it cannot be used.
+fn read_roots(ca: &Ca) -> Result<CliRoots, String> {
+    let replace = match ca.mode.as_str() {
+        "append" => false,
+        "replace" => true,
+        other => {
+            return Err(format!(
+                "trusts its own certificate authority (`transport.tls.ca`) in mode {other}, \
+                 which Studio does not know"
+            ));
+        }
+    };
+    let file = &ca.file;
+    let refused = |why: String| {
+        format!(
+            "trusts its own certificate authority (`transport.tls.ca`, {}), which {why}",
+            file.display()
+        )
+    };
+    let metadata = std::fs::metadata(file)
+        .map_err(|error| refused(format!("Studio could not read: {error}")))?;
+    if !metadata.is_file() {
+        return Err(refused("is not a regular file".into()));
+    }
+    let mut bundle = Vec::new();
+    std::fs::File::open(file)
+        .and_then(|opened| opened.take(MAX_CA_BYTES + 1).read_to_end(&mut bundle))
+        .map_err(|error| refused(format!("Studio could not read: {error}")))?;
+    if bundle.len() as u64 > MAX_CA_BYTES {
+        return Err(refused("is over 1 MiB".into()));
+    }
+    match reqwest::Certificate::from_pem_bundle(&bundle) {
+        Ok(certificates) if !certificates.is_empty() => Ok(CliRoots {
+            replace,
+            file: file.clone(),
+            bundle,
+        }),
+        Ok(_) => Err(refused("holds no certificate".into())),
+        Err(_) => Err(refused("is not PEM certificates".into())),
+    }
 }
 
 /// `'a'`, `'a' and 'b'`, or `'a', 'b' and 'c'`, after "CLI target" or "CLI targets".

@@ -1466,14 +1466,17 @@ exit 64
     /// `7fff9dfd` prints: server targets land on servers (an anonymous one with no token, the
     /// others with where their credential is), direct and managed targets are refused, each
     /// with why, a managed target is kept as the listing describes it with no other command, a
-    /// custom CA is not supported yet, and a second target on an address is named as an
-    /// alternative. Where the CLI exports no token (Windows), the CLI is found and the targets
+    /// target's own certificate authority is read with it and its bundle watched, and a second
+    /// target on an address is named as an alternative. Where the CLI exports no token (Windows), the CLI is found and the targets
     /// listed alike, and each server target that takes a token is refused with why. A
     /// configuration the CLI refuses lists nothing, with the CLI's own words.
     #[test]
     fn the_targets_are_listed_as_the_cli_describes_them() {
         let cli = StandIn::new("targets");
         let token_file = cli.dir.join("tokens").join("filed");
+        let authority = crate::test_tls::Authority::new("strategy");
+        let ca_file = cli.dir.join("ca.pem");
+        std::fs::write(&ca_file, &authority.pem).unwrap();
         cli.write(
             "targets.json",
             &format!(
@@ -1486,11 +1489,12 @@ exit 64
   "helped": {{"kind": "server", "endpoint": "https://exec.example.com/", "auth": {{"provider": "exec", "command": ["/usr/bin/false"], "timeout": "5s"}}, "transport": {{"proxy": {{"mode": "url", "url": "http://proxy.example.com:8080/"}}}}}},
   "open": {{"kind": "server", "endpoint": "http://127.0.0.1:8787/", "auth": {{"provider": "anonymous"}}}},
   "rooted": {{"kind": "direct", "scope": "root", "uri": "file:///tmp/graphs", "default_graph": "knowledge"}},
-  "strategy": {{"kind": "server", "endpoint": "https://127.0.0.1:8443/", "auth": {{"provider": "token", "source": {{"store": {{}}}}}}, "transport": {{"tls": {{"ca": {{"mode": "append", "file": "/tmp/ca.pem"}}}}, "proxy": {{"mode": "direct"}}}}, "default_graph": "strategy"}},
+  "strategy": {{"kind": "server", "endpoint": "https://127.0.0.1:8443/", "auth": {{"provider": "token", "source": {{"store": {{}}}}}}, "transport": {{"tls": {{"ca": {{"mode": "append", "file": "{ca}"}}}}, "proxy": {{"mode": "direct"}}}}, "default_graph": "strategy"}},
   "stored": {{"kind": "server", "endpoint": "https://store.example.com/", "auth": {{"provider": "token", "source": {{"store": {{}}}}}}}},
   "stored-too": {{"kind": "server", "endpoint": "https://store.example.com", "auth": {{"provider": "anonymous"}}}}
 }}"#,
-                file = token_file.display()
+                file = token_file.display(),
+                ca = ca_file.display()
             ),
         );
         let home = cli.dir.join("home");
@@ -1504,7 +1508,7 @@ exit 64
                     server.url.as_str(),
                     server.graphs.clone(),
                     server.auth.clone(),
-                    server.proxy.as_deref(),
+                    server.transport.proxy.as_deref(),
                 )
             })
             .collect();
@@ -1552,12 +1556,27 @@ exit 64
                     CliAuth::Token(CliCredential::Store),
                     None
                 ),
+                (
+                    "strategy",
+                    "https://127.0.0.1:8443",
+                    vec!["strategy".to_owned()],
+                    CliAuth::Token(CliCredential::Store),
+                    None
+                ),
             ]
         );
         assert_eq!(servers[4].alternatives, ["stored-too"]);
         assert_eq!(servers[0].endpoint, "https://env.example.com/og/");
+        assert_eq!(
+            servers[5].transport.roots,
+            Some(crate::cli_config::CliRoots {
+                replace: false,
+                file: ca_file.clone(),
+                bundle: authority.pem.clone().into_bytes(),
+            })
+        );
         let watched: Vec<&PathBuf> = listed.watched.iter().map(|(path, _)| path).collect();
-        assert_eq!(watched, [&home.join("config.yaml"), &token_file]);
+        assert_eq!(watched, [&home.join("config.yaml"), &token_file, &ca_file]);
         let said = |name: &str| {
             listed
                 .errors
@@ -1570,9 +1589,8 @@ exit 64
         assert!(said("rooted").contains("scope root"));
         assert!(said("cloud").contains("managed cluster, which needs Studio's own sign-in"));
         assert!(said("control").contains("does not borrow the CLI's managed token"));
-        assert!(said("strategy").contains("does not support yet"));
         assert!(said("stored-too").contains("which Studio reaches as 'stored', the first by name"));
-        assert_eq!(listed.errors.len(), 6, "{:?}", listed.errors);
+        assert_eq!(listed.errors.len(), 5, "{:?}", listed.errors);
         let managed: Vec<_> = listed
             .managed
             .iter()
@@ -1610,7 +1628,8 @@ exit 64
         // Where the CLI exports no token (Windows), the same CLI is found and the same targets
         // listed with the same one command: the anonymous ones land, `stored-too` now the one
         // target on its address, and each that takes a token is refused with why, after any
-        // refusal that holds on every system, its token file not watched.
+        // refusal that holds on every system, its token file not watched. A bundle is read, and
+        // watched, before that refusal, as one that cannot be used is refused on every system.
         let windows = smol::block_on(read_targets(Some(&home), &cli.programs(), Platform::Other));
         let landed: Vec<_> = windows
             .servers
@@ -1626,7 +1645,7 @@ exit 64
                 ("stored-too".to_owned(), CliAuth::Anonymous, vec![]),
             ]
         );
-        for name in ["envy", "filed", "helped", "stored"] {
+        for name in ["envy", "filed", "helped", "strategy", "stored"] {
             let refused = format!(
                 "CLI target '{name}' takes a token, and the OmniGraph CLI gives a token only \
                  through a Unix pipe, so Studio on Windows cannot use this target yet"
@@ -1642,7 +1661,6 @@ exit 64
             ("rooted", "scope root"),
             ("cloud", "managed cluster"),
             ("control", "managed cluster"),
-            ("strategy", "does not support yet"),
         ] {
             assert!(
                 windows
@@ -1657,7 +1675,7 @@ exit 64
         assert_eq!(windows.errors.len(), 9, "{:?}", windows.errors);
         assert_eq!(windows.managed, listed.managed);
         let watched: Vec<&PathBuf> = windows.watched.iter().map(|(path, _)| path).collect();
-        assert_eq!(watched, [&home.join("config.yaml")]);
+        assert_eq!(watched, [&home.join("config.yaml"), &ca_file]);
         assert_eq!(cli.commands(), ["target list --json"]);
 
         // The CLI's own refusal of an old-format file, as it answers `--json`.
@@ -1674,6 +1692,140 @@ exit 64
             "{:?}",
             refused.errors
         );
+    }
+
+    /// A target's own certificate authority is read as the CLI reads it: a regular file of at
+    /// most 1 MiB holding PEM certificates, at least one, trusted with the system's roots
+    /// (`append`) or alone (`replace`), and never with an HTTPS proxy. Every bundle a target
+    /// names is watched, one that cannot be used too, so putting it right lands its target.
+    #[test]
+    fn a_targets_certificate_authority_is_read_as_the_cli_reads_it() {
+        let dir = std::env::temp_dir().join(format!("studio-ca-bundles-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("folder")).unwrap();
+        let pem = crate::test_tls::Authority::new("bundle").pem;
+        let file = |name: &str, bytes: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        let good = file("good.pem", pem.as_bytes());
+        let large = file(
+            "large.pem",
+            &vec![b'a'; crate::cli_config::MAX_CA_BYTES as usize + 1],
+        );
+        let broken = file(
+            "broken.pem",
+            b"-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n",
+        );
+        let key = file(
+            "key.pem",
+            rcgen::KeyPair::generate()
+                .unwrap()
+                .serialize_pem()
+                .as_bytes(),
+        );
+        let missing = dir.join("missing.pem");
+        let folder = dir.join("folder");
+        let target = |name: &str, mode: &str, path: &Path, proxy: Option<&str>| {
+            let mut transport =
+                serde_json::json!({ "tls": { "ca": { "mode": mode, "file": path } } });
+            if let Some(url) = proxy {
+                transport["proxy"] = serde_json::json!({ "mode": "url", "url": url });
+            }
+            (
+                name.to_owned(),
+                serde_json::json!({
+                    "kind": "server",
+                    "endpoint": format!("https://{name}.example.com/"),
+                    "auth": { "provider": "anonymous" },
+                    "transport": transport,
+                }),
+            )
+        };
+        let targets: serde_json::Map<String, serde_json::Value> = [
+            target("append", "append", &good, None),
+            target("replace", "replace", &good, None),
+            target(
+                "proxied",
+                "append",
+                &good,
+                Some("http://proxy.example.com:8080/"),
+            ),
+            target("missing", "append", &missing, None),
+            target("folder", "append", &folder, None),
+            target("large", "append", &large, None),
+            target("broken", "append", &broken, None),
+            target("keyonly", "replace", &key, None),
+            target("merged", "merge", &good, None),
+            target(
+                "secured",
+                "append",
+                &good,
+                Some("https://proxy.example.com/"),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let listed = crate::cli_config::servers_from(&targets, Platform::Unix);
+        let landed: Vec<_> = listed
+            .servers
+            .unwrap()
+            .into_iter()
+            .map(|server| {
+                let roots = server.transport.roots.unwrap();
+                assert_eq!(
+                    (&roots.file, &roots.bundle),
+                    (&good, &pem.clone().into_bytes())
+                );
+                (server.name, roots.replace, server.transport.proxy)
+            })
+            .collect();
+        assert_eq!(
+            landed,
+            [
+                ("append".to_owned(), false, None),
+                (
+                    "proxied".to_owned(),
+                    false,
+                    Some("http://proxy.example.com:8080/".to_owned())
+                ),
+                ("replace".to_owned(), true, None),
+            ]
+        );
+        let said = |name: &str| {
+            listed
+                .errors
+                .iter()
+                .find(|error| error.starts_with(&format!("CLI target '{name}' ")))
+                .cloned()
+                .unwrap_or_else(|| panic!("{name}: {:?}", listed.errors))
+        };
+        for (name, why) in [
+            ("missing", "which Studio could not read"),
+            ("folder", "which is not a regular file"),
+            ("large", "which is over 1 MiB"),
+            ("broken", "which is not PEM certificates"),
+            ("keyonly", "which holds no certificate"),
+            ("merged", "in mode merge, which Studio does not know"),
+            (
+                "secured",
+                "goes through the HTTPS proxy https://proxy.example.com/",
+            ),
+        ] {
+            assert!(said(name).contains(why), "{name}: {}", said(name));
+        }
+        assert_eq!(listed.errors.len(), 7, "{:?}", listed.errors);
+        // By name, each bundle as its target names it; the HTTPS proxy is refused before its
+        // bundle is looked at.
+        let watched: Vec<&PathBuf> = listed.watched.iter().map(|(path, _)| path).collect();
+        assert_eq!(
+            watched,
+            [
+                &good, &broken, &folder, &key, &large, &good, &missing, &good, &good
+            ]
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A token comes from `credentials export` through a pipe, after `credentials status` found

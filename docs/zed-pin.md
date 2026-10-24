@@ -12,6 +12,7 @@ purpose.
 | Treatment | Crates | License |
 |---|---|---|
 | Depend | `gpui`, `gpui_platform`, `gpui_tokio`, `refineable`, `sum_tree`, `collections`, `util`, `http_client`, `reqwest_client` | Apache-2.0 |
+| Depend, at the revision and features Zed's workspace pins | `reqwest` (`zed-reqwest`, Zed's fork) | MIT or Apache-2.0 |
 | Depend | `ui`, `theme`, `component`, `icons`, `menu` | GPL-3.0-or-later |
 | Depend (spike S4 passed) | `editor`, `multi_buffer`, `language`, `settings`, `theme_settings`, `release_channel`, `assets` | GPL-3.0-or-later |
 | Fork and trim into Studio crates | `workspace`, `picker`, `command_palette`, `settings_ui`, `tabular_data_preview`, `git_ui` (commit graph), `markdown` | GPL-3.0-or-later |

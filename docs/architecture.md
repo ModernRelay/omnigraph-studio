@@ -16,7 +16,7 @@ other: what two features share moves down a layer.
 | 2 | `graph_client` | Every HTTP request: contract header, DTOs for the 0.14 API, write outcomes, change-feed paging. **No `gpui`** | Zed `http_client` (Apache-2.0), serde |
 | 2 | `gq_language` | Schema and query intelligence on `omnigraph-compiler`: parse, diagnostics, completion items, hover text, result-column types. **No `gpui`** | `omnigraph-compiler` |
 | 2 | `studio_ui` | Studio components on Zed's `ui`: the design system (`ds`: buttons, modals, the context menu forked from Zed's), state chips, write-outcome banners, empty and error states, text read as markdown | `ui`, `menu`, `theme`, `studio_theme`, `pulldown-cmark` |
-| 3 | `graph_store` | GPUI entities: connections, graph sessions, schema model, snapshot pins, exploration, drafts | `gpui`, `graph_client`, `gq_language`, Zed's `reqwest_client` |
+| 3 | `graph_store` | GPUI entities: connections, graph sessions, schema model, snapshot pins, exploration, drafts | `gpui`, `graph_client`, `gq_language`, Zed's `reqwest_client` and the `reqwest` it pins |
 | 4 | `studio_workspace` | The window frame: panes, tabs, docks, panels, status bar, modal and toast layers | `gpui`, `ui`, `studio_ui`, `studio_actions`, `studio_settings` |
 | 4 | `change_cards` | The entity cards a review and a commit's view share: an entity's card, its relationship lines, a run's header, how many lines a card shows | `gpui`, `ui`, `studio_ui`, `graph_store`, `gq_language` |
 | 5 | `command_palette`, `type_table`, `relationship_tree`, `graph_canvas`, `query_editor`, `review`, `history`, `inspectors`, `agent_panel` | One surface each | layers 0–4 |
@@ -41,7 +41,8 @@ view (layer 5) ──reads──▶ entity in graph_store ──calls──▶ g
   another crate holds is the agent gateway's (`GraphSession::gateway_client`), which forwards
   the agent CLI's own requests inside its sandbox.
 - `graph_client` sends through Zed's `HttpClient` (the `reqwest_client` that `graph_store::init`
-  installs); `graph_store` awaits it in a task it keeps in a field, so dropping or replacing the
+  installs, or one of its own for a CLI target whose `transport` names a proxy or a certificate
+  authority); `graph_store` awaits it in a task it keeps in a field, so dropping or replacing the
   task cancels the request.
 - Results are applied in one `update` on the main thread, followed by one `notify`.
 

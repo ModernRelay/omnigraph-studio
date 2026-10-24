@@ -4210,10 +4210,12 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "futures",
+ "futures-rustls",
  "gpui",
  "gq_language",
  "graph_client",
  "http_client",
+ "rcgen",
  "reqwest_client",
  "serde",
  "serde_json",
@@ -4221,6 +4223,7 @@ dependencies = [
  "studio_settings",
  "studio_ui",
  "url",
+ "zed-reqwest",
 ]
 
 [[package]]

@@ -18,15 +18,17 @@ use gpui::{App, AppContext as _, Context, Entity, Global, Task};
 use http_client::HttpClient;
 use serde::{Deserialize, Serialize};
 
-use crate::cli_config::{self, CliAuth, CliServer, CliTargets, FileStamp, Platform};
+use crate::cli_config::{self, CliAuth, CliServer, CliTargets, CliTransport, FileStamp, Platform};
 use crate::cli_tokens::{self, CliTokenSource, Token, TokenSource};
 use crate::connection::{Connection, ServerEntry, ServerSource};
 
 /// How often the CLI's files are checked for a change, as Studio's settings file is.
 const OPERATOR_POLL: Duration = Duration::from_secs(2);
 
-/// Makes the HTTP client for a CLI target whose `transport.proxy` names a proxy URL.
-type ProxiedHttp = Arc<dyn Fn(&str) -> anyhow::Result<Arc<dyn HttpClient>> + Send + Sync>;
+/// Makes the HTTP client for a CLI target whose `transport` names a proxy or its own certificate
+/// authority.
+type TransportHttp =
+    Arc<dyn Fn(&CliTransport) -> anyhow::Result<Arc<dyn HttpClient>> + Send + Sync>;
 
 /// Makes the token source of a CLI server whose token the CLI gives; none for an anonymous one.
 type TokenSources = Arc<dyn Fn(&CliServer) -> Option<Arc<dyn TokenSource>> + Send + Sync>;
@@ -52,8 +54,8 @@ struct KnownGraphs {
 struct CliKept {
     /// Its revision ([`CliServer::revision`]): one that changes asks the CLI for its token again.
     revision: String,
-    /// The proxy its requests go through, which its connection's client was made with.
-    proxy: Option<String>,
+    /// How its requests reach it, which its connection's client was made with.
+    transport: CliTransport,
 }
 
 pub struct ConnectionRegistry {
@@ -66,7 +68,7 @@ pub struct ConnectionRegistry {
     /// happened.
     notices: Vec<String>,
     http: Arc<dyn HttpClient>,
-    proxied: ProxiedHttp,
+    transported: TransportHttp,
     token_sources: TokenSources,
     lister: Lister,
     /// Whether the CLI gives Studio a token here: the system Studio runs on, but in a test. Where
@@ -149,13 +151,63 @@ fn valid_target_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
 }
 
-/// The HTTP client for a CLI target whose requests go through the proxy at `url`
-/// (`transport.proxy`, `mode: url`). Zed's client also leaves out the hosts in `NO_PROXY`.
-fn proxied_client(url: &str) -> anyhow::Result<Arc<dyn HttpClient>> {
-    let proxy = http_client::Url::parse(url)?;
-    Ok(Arc::new(
-        reqwest_client::ReqwestClient::proxy_and_user_agent(Some(proxy), crate::USER_AGENT)?,
-    ))
+/// The HTTP client for a CLI target whose `transport` names a proxy (`mode: url`) or its own
+/// certificate authority (`tls.ca`), as the OmniGraph CLI makes its own (`operator_transport.rs`):
+/// with `append` the bundle's certificates are trusted with the system's roots, with `replace`
+/// alone. The reqwest Zed pins has no bundled web roots to leave out. Requests go through the
+/// proxy, else as the system's settings say; Zed's client also leaves out the hosts in
+/// `NO_PROXY`.
+fn transport_client(transport: &CliTransport) -> anyhow::Result<Arc<dyn HttpClient>> {
+    let proxy = transport
+        .proxy
+        .as_deref()
+        .map(http_client::Url::parse)
+        .transpose()?;
+    let Some(roots) = &transport.roots else {
+        return Ok(Arc::new(
+            reqwest_client::ReqwestClient::proxy_and_user_agent(proxy, crate::USER_AGENT)?,
+        ));
+    };
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::USER_AGENT,
+        reqwest::header::HeaderValue::from_static(crate::USER_AGENT),
+    );
+    let mut builder = reqwest::Client::builder()
+        .use_rustls_tls()
+        .default_headers(headers)
+        .connect_timeout(Duration::from_secs(10))
+        .tcp_keepalive(Duration::from_secs(30))
+        .pool_idle_timeout(Duration::from_secs(30))
+        .tls_built_in_root_certs(!roots.replace)
+        .tls_built_in_native_certs(!roots.replace);
+    for certificate in reqwest::Certificate::from_pem_bundle(&roots.bundle)? {
+        builder = builder.add_root_certificate(certificate);
+    }
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(reqwest::Proxy::all(proxy)?.no_proxy(reqwest::NoProxy::from_env()));
+    }
+    Ok(Arc::new(reqwest_client::ReqwestClient::from(
+        builder.build()?,
+    )))
+}
+
+/// What a target's `transport` names, after "CLI target 'name'".
+fn describe_transport(transport: &CliTransport) -> String {
+    let roots = transport
+        .roots
+        .as_ref()
+        .map(|roots| format!("its own certificate authority ({})", roots.file.display()));
+    let proxy = transport
+        .proxy
+        .as_ref()
+        .map(|proxy| format!("the proxy {proxy}"));
+    match (roots, proxy) {
+        (Some(roots), Some(proxy)) => format!("trusts {roots} and goes through {proxy}"),
+        (Some(roots), None) => format!("trusts {roots}"),
+        (None, Some(proxy)) => format!("names {proxy}"),
+        (None, None) => "names no transport".to_owned(),
+    }
 }
 
 /// The token source of a CLI server: `credentials export` for its target, with the CLI Studio
@@ -274,7 +326,7 @@ impl ConnectionRegistry {
 
     fn load(http: Arc<dyn HttpClient>, cx: &mut Context<Self>) -> Self {
         let mut this = Self::empty(http, cli_config::operator_dir());
-        this.proxied = Arc::new(proxied_client);
+        this.transported = Arc::new(transport_client);
         this.known = load_known_graphs(&known_graphs_path());
         this.saving = true;
 
@@ -331,7 +383,7 @@ impl ConnectionRegistry {
             environment_notice: None,
             notices: Vec::new(),
             http,
-            proxied: Arc::new(move |_| Ok(same.clone())),
+            transported: Arc::new(move |_| Ok(same.clone())),
             token_sources: Arc::new(|_| None),
             lister: Arc::new(list_with_the_cli),
             platform: Platform::CURRENT,
@@ -515,22 +567,22 @@ impl ConnectionRegistry {
             return self.keep_notices(errors);
         };
         let mut changed = false;
-        // An address that keeps its server keeps its connection only with the same proxy: the
-        // client was made with it.
-        let named: Vec<(&String, &Option<String>)> = servers
+        // An address that keeps its server keeps its connection only with the same transport:
+        // the client was made with it.
+        let named: Vec<(&String, &CliTransport)> = servers
             .iter()
-            .map(|server| (&server.url, &server.proxy))
+            .map(|server| (&server.url, &server.transport))
             .collect();
         let kept = &self.cli_kept;
         let mut left: Vec<ServerEntry> = Vec::new();
         self.connections.retain(|connection| {
             let server = &connection.read(cx).server;
             let stays = server.source != ServerSource::Cli
-                || named.iter().any(|(url, proxy)| {
+                || named.iter().any(|(url, transport)| {
                     **url == server.url
                         && kept
                             .get(&server.url)
-                            .is_none_or(|kept| kept.proxy == **proxy)
+                            .is_none_or(|kept| kept.transport == **transport)
                 });
             if !stays {
                 left.push(server.clone());
@@ -561,7 +613,7 @@ impl ConnectionRegistry {
             }
             let kept = CliKept {
                 revision: server.revision.clone(),
-                proxy: server.proxy.clone(),
+                transport: server.transport.clone(),
             };
             let existing = self.connections.iter().find(|connection| {
                 let entry = &connection.read(cx).server;
@@ -608,19 +660,20 @@ impl ConnectionRegistry {
                 source: ServerSource::Cli,
                 known_graphs: graphs,
             };
-            let http = match &server.proxy {
-                Some(proxy) => match (self.proxied)(proxy) {
+            let http = if server.transport == CliTransport::default() {
+                self.http.clone()
+            } else {
+                match (self.transported)(&server.transport) {
                     Ok(http) => http,
                     Err(error) => {
                         errors.push(format!(
-                            "CLI target '{}' names the proxy {proxy}, which Studio cannot use: \
-                             {error}",
-                            server.name
+                            "CLI target '{}' {}, which Studio cannot use: {error}",
+                            server.name,
+                            describe_transport(&server.transport)
                         ));
                         continue;
                     }
-                },
-                None => self.http.clone(),
+                }
             };
             let source = (self.token_sources)(&server);
             match Connection::new(entry, None, http) {
@@ -907,7 +960,7 @@ mod tests {
             endpoint: format!("{url}/"),
             graphs: Vec::new(),
             auth: CliAuth::Token(CliCredential::Store),
-            proxy: None,
+            transport: CliTransport::default(),
             alternatives: Vec::new(),
             revision: revision.into(),
         }
@@ -1133,8 +1186,9 @@ mod tests {
 
     /// A CLI target renamed on the same endpoint is the same server: its connection, which
     /// open windows hold, takes the new name and asks the CLI as the new target. A target moved
-    /// to a new address takes the graphs remembered for its name. One that names another proxy
-    /// is a new connection, since its client is made with it.
+    /// to a new address takes the graphs remembered for its name. One that names another proxy,
+    /// or a certificate authority of its own or another bundle of one, is a new connection,
+    /// since its client is made with them.
     #[gpui::test]
     async fn a_renamed_cli_target_keeps_its_connection(cx: &mut TestAppContext) {
         let (http, sent) = answering();
@@ -1198,13 +1252,30 @@ mod tests {
 
         // Through a proxy now: a connection of its own.
         let mut proxied = server("new", "http://b.test", "renamed");
-        proxied.proxy = Some("http://proxy.test:8080".into());
+        proxied.transport.proxy = Some("http://proxy.test:8080".into());
         assert!(apply(&registry, files(vec![proxied]), cx));
         let through = find(&registry, "new", cx).unwrap();
         assert_ne!(through, moved);
         through.read_with(cx, |connection, _| {
             assert_eq!(connection.server.known_graphs, ["knowledge"]);
         });
+
+        // Trusting a certificate authority of its own: a connection of its own, kept while the
+        // bundle the listing read stays the same, and made again with another.
+        let mut rooted = server("new", "http://b.test", "renamed");
+        rooted.transport.roots = Some(cli_config::CliRoots {
+            replace: false,
+            file: PathBuf::from("/ca.pem"),
+            bundle: b"first".to_vec(),
+        });
+        assert!(apply(&registry, files(vec![rooted.clone()]), cx));
+        let trusting = find(&registry, "new", cx).unwrap();
+        assert_ne!(trusting, through);
+        assert!(!apply(&registry, files(vec![rooted.clone()]), cx));
+        assert_eq!(find(&registry, "new", cx).unwrap(), trusting);
+        rooted.transport.roots.as_mut().unwrap().bundle = b"second".to_vec();
+        assert!(apply(&registry, files(vec![rooted]), cx));
+        assert_ne!(find(&registry, "new", cx).unwrap(), trusting);
     }
 
     /// A server whose target is anonymous asks the CLI nothing and sends no token; one that
@@ -1658,5 +1729,45 @@ mod tests {
         for name in ["", "1st", "-x", "a b", "a/b"] {
             assert!(!valid_target_name(name), "{name}");
         }
+    }
+
+    /// A CLI target that trusts its own certificate authority is reached with it, as the CLI
+    /// reaches it: trusted with the system's roots (`append`) or alone (`replace`). Studio's own
+    /// client, which trusts the system's roots, is refused at the handshake, and so is a bundle
+    /// of another authority.
+    #[test]
+    fn a_target_is_reached_with_its_own_certificate_authority() {
+        let authority = crate::test_tls::Authority::new("the server's own");
+        let url = format!("https://127.0.0.1:{}/healthz", authority.serve());
+        let trusting = |pem: &str, replace| CliTransport {
+            proxy: None,
+            roots: Some(cli_config::CliRoots {
+                replace,
+                file: PathBuf::from("ca.pem"),
+                bundle: pem.as_bytes().to_vec(),
+            }),
+        };
+        let status = |http: Arc<dyn HttpClient>| {
+            smol::block_on(http.get(&url, AsyncBody::default(), false))
+                .map(|response| response.status().as_u16())
+        };
+        for replace in [false, true] {
+            let http = transport_client(&trusting(&authority.pem, replace)).unwrap();
+            assert_eq!(status(http).unwrap(), 200, "replace: {replace}");
+        }
+        let another = crate::test_tls::Authority::new("another");
+        for replace in [false, true] {
+            let http = transport_client(&trusting(&another.pem, replace)).unwrap();
+            assert!(
+                status(http).is_err(),
+                "another authority, replace: {replace}"
+            );
+        }
+        let own: Arc<dyn HttpClient> =
+            Arc::new(reqwest_client::ReqwestClient::user_agent(crate::USER_AGENT).unwrap());
+        assert!(
+            status(own).is_err(),
+            "Studio's own client does not trust it"
+        );
     }
 }
