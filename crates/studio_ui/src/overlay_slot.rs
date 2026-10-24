@@ -13,8 +13,8 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, Element, ElementId, GlobalElementId,
-    InspectorElementId, IntoElement, LayoutId, Pixels, Position, Size, Style, Styled as _, Window,
-    canvas,
+    InspectorElementId, IntoElement, LayoutId, Pixels, Point, Position, Size, Style, Styled as _,
+    Window, canvas,
 };
 
 /// Where the place is in the window, and the part of the window it showed in.
@@ -39,6 +39,18 @@ impl OverlaySlot {
             |_, _, _, _| {},
         )
         .size_full()
+    }
+
+    /// The part of the marked place that showed, or none while no place is marked.
+    pub fn shown(&self) -> Option<Bounds<Pixels>> {
+        self.0
+            .get()
+            .map(|(bounds, mask)| bounds.intersect(&mask.bounds))
+    }
+
+    /// Whether `position` is in [`Self::shown`].
+    pub fn contains(&self, position: Point<Pixels>) -> bool {
+        self.shown().is_some_and(|shown| shown.contains(&position))
     }
 
     /// `child` drawn over the marked place at its size, or nothing while no place is marked.

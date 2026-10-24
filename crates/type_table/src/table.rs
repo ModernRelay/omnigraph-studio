@@ -444,6 +444,8 @@ pub struct TypeTable {
     /// Where the grid drew the cell being edited; the cell's editor is drawn over it from
     /// outside the grid, so a keystroke does not draw the grid again.
     edit_slot: studio_ui::OverlaySlot,
+    /// The axis the wheel gesture over the rows is held to ([`sideways_scroll`]).
+    wheel_gesture: Rc<RefCell<gpui::OngoingScroll>>,
     /// The lines whose Blob cells were last asked for, and the pause before they are read.
     blob_lines: Option<Range<usize>>,
     _blob_wait: Option<Task<()>>,
@@ -740,6 +742,7 @@ impl TypeTable {
             frame_minute: 0,
             grid,
             edit_slot: Default::default(),
+            wheel_gesture: Default::default(),
             resizing: None,
             blob_lines: None,
             _blob_wait: None,
@@ -7088,7 +7091,12 @@ impl TypeTable {
                         .collect()
                 }),
             );
-        let sideways = self.table_state.read(cx).horizontal_scroll_handle.clone();
+        let state = self.table_state.read(cx);
+        let wheel = sideways_scroll(
+            state.horizontal_scroll_handle.clone(),
+            self.wheel_gesture.clone(),
+            self.edit_slot.clone(),
+        );
         v_flex()
             .size_full()
             .child(header)
@@ -7098,7 +7106,7 @@ impl TypeTable {
                     .flex_1()
                     .min_h_0()
                     .child(table)
-                    .child(sideways_scroll(sideways)),
+                    .child(wheel),
             )
             .into_any_element()
     }
@@ -8745,29 +8753,53 @@ fn new_scope(session: &Entity<GraphSession>, cx: &mut App) -> ReadScope {
     })
 }
 
-/// Takes a sideways swipe over the rows before Zed's row list sees it, and moves the columns.
-/// The list scrolls only vertically, and GPUI gives a vertical-only scroll area a purely
-/// sideways delta as a vertical one, so without this a swipe meant for the columns moved the
-/// rows. A swipe more sideways than down is taken here, in the capture phase: the shared
-/// horizontal handle (the header's and every row's) moves by it, within its range, and the
-/// event goes no further. Any other swipe passes through untouched.
-fn sideways_scroll(handle: gpui::ScrollHandle) -> impl IntoElement {
+/// Takes a wheel over the rows before Zed's row list sees it, so a gesture moves the rows or
+/// the columns and not both. The list scrolls only vertically, holds no axis, and GPUI gives a
+/// vertical-only scroll area a purely sideways delta as a vertical one; every scroll area
+/// under the pointer applies a wheel, none stopping it (`paint_scroll_listener`). The columns'
+/// areas hold their axis for a gesture (`restrict_scroll_to_axis`). So the gesture's axis is
+/// held here too, in the capture phase, as GPUI holds it (`OngoingScroll`): a trackpad gesture
+/// keeps the axis it started on until it turns clearly to the other, and a wheel that sends
+/// lines is judged event by event.
+///
+/// A sideways one moves the shared horizontal handle (the header's and every row's) and goes
+/// no further. A purely sideways drift of one held up and down goes no further either, since
+/// the list would move the rows by it. Anything else passes through untouched. Over the open
+/// cell editor the wheel is the editor's. The area is the pointer's by `should_handle_scroll`,
+/// as for any scroll area: `is_hovered` is false after a key. A moved handle draws again the
+/// view that drew the grid and the views holding it (`mark_view_dirty`), as GPUI's own scroll
+/// areas do, not every view in the window, which a refresh would (`refreshing` passes over
+/// every view's cache).
+fn sideways_scroll(
+    columns: gpui::ScrollHandle,
+    gesture: Rc<RefCell<gpui::OngoingScroll>>,
+    editor: studio_ui::OverlaySlot,
+) -> impl IntoElement {
     gpui::canvas(
         |bounds, window, _| window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
         move |_, hitbox, window, _| {
+            let view = window.current_view();
             window.on_mouse_event(move |event: &gpui::ScrollWheelEvent, phase, window, cx| {
-                if phase != gpui::DispatchPhase::Capture || !hitbox.is_hovered(window) {
+                if phase != gpui::DispatchPhase::Capture
+                    || !hitbox.should_handle_scroll(window)
+                    || editor.contains(event.position)
+                {
                     return;
                 }
-                let delta = event.delta.pixel_delta(window.line_height());
-                if delta.x.abs() <= delta.y.abs() {
-                    return;
+                let sent = event.delta.pixel_delta(window.line_height());
+                let mut delta = sent;
+                if event.delta.precise() {
+                    gesture.borrow_mut().filter(&mut delta, event.touch_phase);
                 }
-                let offset = handle.offset();
-                let x = (offset.x + delta.x).clamp(-handle.max_offset().x, px(0.));
-                if x != offset.x {
-                    handle.set_offset(point(x, offset.y));
-                    window.refresh();
+                if delta.x.abs() > delta.y.abs() {
+                    let offset = columns.offset();
+                    let x = (offset.x + delta.x).clamp(-columns.max_offset().x, px(0.));
+                    if x != offset.x {
+                        columns.set_offset(point(x, offset.y));
+                        cx.notify(view);
+                    }
+                } else if sent.x == px(0.) || sent.y != px(0.) {
+                    return;
                 }
                 cx.stop_propagation();
             });
@@ -10007,8 +10039,10 @@ mod tests {
         );
     }
 
-    /// A sideways wheel over the rows moves the columns, not the rows, and the columns stay
-    /// where it put them when the table draws again (spec 004).
+    /// A sideways wheel over the rows moves the columns, not the rows, after a key as after the
+    /// pointer, draws the grid again, and leaves the columns where it put them when the table
+    /// draws again. A trackpad gesture keeps its axis while it drifts, and a wheel over the open
+    /// cell editor scrolls the editor's text (spec 004).
     #[gpui::test]
     async fn a_sideways_wheel_scrolls_the_columns_not_the_rows(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -10021,7 +10055,9 @@ mod tests {
         let schema = format!("{PEOPLE}{edges}");
         let rows: Vec<serde_json::Value> = (0..60)
             .map(|i| {
-                serde_json::json!({"n": {"@id": format!("p{i}"), "slug": format!("p{i}"), "name": format!("Person {i}")}})
+                // The first name runs past its cell, so its editor has text to scroll to.
+                let name = if i == 0 { "Person 0 ".repeat(40) } else { format!("Person {i}") };
+                serde_json::json!({"n": {"@id": format!("p{i}"), "slug": format!("p{i}"), "name": name}})
             })
             .collect();
         let (session, _) = crate::test_support::session_routing(
@@ -10053,16 +10089,27 @@ mod tests {
             })
         };
         assert_eq!(offsets(cx), (px(0.), px(0.)));
-        cx.simulate_event(gpui::ScrollWheelEvent {
-            position: point(px(400.), px(300.)),
-            delta: gpui::ScrollDelta::Pixels(point(px(-120.), px(0.))),
-            modifiers: gpui::Modifiers::default(),
-            touch_phase: gpui::TouchPhase::Moved,
+        let wheel = |at: gpui::Point<Pixels>, (x, y): (f32, f32), touch_phase| {
+            gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                position: at,
+                delta: gpui::ScrollDelta::Pixels(point(px(x), px(y))),
+                modifiers: gpui::Modifiers::default(),
+                touch_phase,
+            })
+        };
+        let over_rows = point(px(400.), px(300.));
+        // A key leaves the pointer's hover false; the wheel is still the rows' area's.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        let drawn = grid_renders(&table, cx);
+        cx.update(|window, cx| {
+            window.dispatch_event(wheel(over_rows, (-120., 0.), gpui::TouchPhase::Moved), cx);
         });
         cx.run_until_parked();
         let (x, y) = offsets(cx);
         assert_eq!(y, px(0.), "the rows did not move");
         assert_eq!(x, px(-120.), "the columns moved by the wheel's width");
+        assert!(grid_renders(&table, cx) > drawn, "the grid drew the move");
         // Drawn again, they stay.
         table.update(cx, |_, cx| cx.notify());
         cx.run_until_parked();
@@ -10071,6 +10118,70 @@ mod tests {
             px(-120.),
             "a draw keeps the columns where they were"
         );
+
+        // A gesture that starts sideways and drifts down moves only the columns; one that
+        // starts down and drifts sideways only the rows. Each gesture's events are sent
+        // together, as a trackpad sends them, within the gap after which GPUI starts a new
+        // gesture.
+        let gesture = |cx: &mut gpui::VisualTestContext,
+                       events: [((f32, f32), gpui::TouchPhase); 2]| {
+            cx.update(|window, cx| {
+                for (delta, phase) in events {
+                    window.dispatch_event(wheel(over_rows, delta, phase), cx);
+                }
+            });
+            cx.run_until_parked();
+        };
+        use gpui::TouchPhase::{Moved, Started};
+        gesture(cx, [((-30., 0.), Started), ((-10., -15.), Moved)]);
+        assert_eq!(offsets(cx), (px(-160.), px(0.)), "held sideways");
+        gesture(cx, [((0., -40.), Started), ((-30., -20.), Moved)]);
+        assert_eq!(offsets(cx), (px(-160.), px(-60.)), "held up and down");
+        // A sideways jitter too small to turn the gesture, which the list would take as a
+        // move down.
+        gesture(cx, [((0., -10.), Started), ((-4., 0.), Moved)]);
+        assert_eq!(
+            offsets(cx),
+            (px(-160.), px(-70.)),
+            "a small sideways drift moves nothing"
+        );
+
+        // Over the open cell editor the wheel scrolls the editor's text.
+        table.update_in(cx, |table, window, cx| {
+            let state = table.table_state.read(cx);
+            state
+                .horizontal_scroll_handle
+                .set_offset(point(px(0.), px(0.)));
+            state
+                .scroll_handle
+                .0
+                .borrow()
+                .base_handle
+                .set_offset(point(px(0.), px(0.)));
+            let col = table.columns.iter().position(|c| c.key == "name").unwrap();
+            table.start_edit(Cursor { row: 0, col }, window, cx);
+        });
+        cx.run_until_parked();
+        let editor = table
+            .read_with(cx, |table, _| table.edit_slot.shown())
+            .expect("the editor's cell is drawn");
+        let editor_x = |cx: &mut gpui::VisualTestContext| {
+            table.update(cx, |table, cx| {
+                table
+                    .cell_editor
+                    .update(cx, |editor, cx| editor.scroll_position(cx).x)
+            })
+        };
+        assert_eq!(editor_x(cx), 0.);
+        cx.update(|window, cx| {
+            window.dispatch_event(
+                wheel(editor.center(), (-60., 0.), gpui::TouchPhase::Moved),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(offsets(cx), (px(0.), px(0.)), "the columns did not move");
+        assert!(editor_x(cx) > 0., "the editor scrolled");
     }
 
     /// A type with many relationships reads the neighbours of the relationship columns rows
