@@ -16,6 +16,9 @@ ignore = [
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is unmaintained; reached through Zed's reqwest fork" },
     { id = "RUSTSEC-2026-0206", reason = "rustybuzz is unmaintained; reached through usvg, which GPUI uses for SVG icons" },
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser is unmaintained; reached through usvg, as rustybuzz" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names is unmaintained, merged into zbus 6; zbus 5 comes in through gpui_linux (accesskit_unix, ashpd, notify-rust, oo7), on Linux only" },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant is unmaintained, merged into zbus 6; reached through zbus 5, as zbus_names" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive is unmaintained, merged into zbus 6; reached through zvariant, as zbus_names" },
 ]
 
 [licenses]
