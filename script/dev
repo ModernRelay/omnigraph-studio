@@ -20,7 +20,8 @@ else
   "$ROOT/script/dev-server" > "$log" 2>&1 &
   server=$!
   trap 'kill "$server" 2>/dev/null || true; wait "$server" 2>/dev/null || true; rm -f "$log"' EXIT
-  trap 'exit 130' INT TERM
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   # dev-server says "Serving" once both graphs are seeded, and exits on any error before it.
   until grep -q '^Serving ' "$log"; do
     if ! kill -0 "$server" 2>/dev/null; then
