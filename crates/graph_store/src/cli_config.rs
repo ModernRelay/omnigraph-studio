@@ -102,9 +102,10 @@ pub enum CliCredential {
     File { path: PathBuf },
     /// `provider: exec`: a credential helper the CLI runs, given this long.
     Helper { timeout: Duration },
-    /// A managed target's data credential, which the CLI exchanges from the login of `profile`
-    /// (`omnigraph login`) each time it is exported, an hour's at most. An interim until Studio
-    /// signs in itself (spec 016): it acts with the CLI's login, not as a client of its own.
+    /// A managed target's cluster data token, which the CLI holds for `profile`: the one it has
+    /// cached while that still holds, else a new one from the profile's credential (for a
+    /// profile that signs in, the person's `omnigraph login`). An interim until Studio signs in
+    /// itself (spec 016): Studio acts as the CLI's principal, not as a client of its own.
     Managed { profile: String },
 }
 

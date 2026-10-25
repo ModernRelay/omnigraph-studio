@@ -365,10 +365,7 @@ impl OpenGraphModal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if matches!(
-            connection.read(cx).state,
-            ConnectionState::Idle | ConnectionState::Unreachable(_)
-        ) {
+        if retries_on_select(connection.read(cx)) {
             connection.update(cx, |c, cx| c.connect(cx));
         }
         self.cursor = Some(Place::Server(connection.entity_id()));
@@ -584,6 +581,7 @@ impl OpenGraphModal {
         let c = connection.read(cx);
         let status = server_status(c);
         let state = c.state.clone();
+        let offers_retry = retries_on_select(c);
         // A token typed in replaces one the server refused, or one the CLI would not give to a
         // server that asks for one.
         let asks_token = state == ConnectionState::Unauthorized;
@@ -617,8 +615,13 @@ impl OpenGraphModal {
                     .px(px(space::MD))
                     .gap(px(space::MD))
                     .child(Indicator::dot().color(connection_color(&state)))
-                    .child(studio_ui::ds::text::muted(status))
-                    .child(div().flex_1())
+                    // Wraps, so the CLI's whole reason shows within the pane.
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(studio_ui::ds::text::muted(status)),
+                    )
                     .map(|row| match &state {
                         ConnectionState::Connecting => row.child(
                             studio_ui::ds::button("cancel-connect", "Cancel")
@@ -627,7 +630,7 @@ impl OpenGraphModal {
                                     selected.update(cx, |c, cx| c.cancel(cx));
                                 })),
                         ),
-                        ConnectionState::Unreachable(_) | ConnectionState::Idle => row.child(
+                        _ if offers_retry => row.child(
                             studio_ui::ds::button("retry-connect", "Retry")
                                 .style(ButtonStyle::Subtle)
                                 .start_icon(Icon::new(IconName::RotateCw))
@@ -787,6 +790,21 @@ fn server_status(c: &Connection) -> String {
     }
 }
 
+/// Whether the CLI gave this server no token: asked again, it may give one, once the person has
+/// signed in (`omnigraph login`) or put the target's credential right.
+fn gave_no_token(c: &Connection) -> bool {
+    c.state == ConnectionState::Unauthorized && c.token_unread.is_some()
+}
+
+/// Whether choosing this server, or its Retry, connects it again: one never connected or
+/// unreachable, and one the CLI gave no token.
+fn retries_on_select(c: &Connection) -> bool {
+    matches!(
+        c.state,
+        ConnectionState::Idle | ConnectionState::Unreachable(_)
+    ) || gave_no_token(c)
+}
+
 /// What Update token does with the token typed: it lasts this run, and for a CLI server the
 /// CLI's own command keeps one for the CLI and Studio. For a managed cluster reached on the CLI's
 /// login, it first says where that cluster's token comes from.
@@ -803,10 +821,11 @@ fn token_tooltip(c: &Connection) -> String {
 fn tooltip_for(source: &ServerSource, name: &str, profile: Option<&str>) -> String {
     if let Some(profile) = profile {
         return format!(
-            "Studio uses your OmniGraph CLI login here (profile {profile}): the CLI exchanges it \
-             for an hour's token for this cluster, which Studio keeps in memory and asks for \
-             again when it lapses. `omnigraph login --profile {profile}` signs in again. A token \
-             typed here is used until Studio quits. Studio's own sign-in will replace this."
+            "Studio uses the token the OmniGraph CLI gives for this cluster from its profile \
+             {profile} (for a profile that signs in, your `omnigraph login --profile {profile}`). \
+             Studio keeps it in memory and asks the CLI again when the server refuses it; the CLI \
+             gives the same token while it holds and a new one once it lapses. A token typed \
+             here is used until Studio quits. Studio's own sign-in will replace this."
         );
     }
     match source {
@@ -818,11 +837,11 @@ fn tooltip_for(source: &ServerSource, name: &str, profile: Option<&str>) -> Stri
     }
 }
 
-/// Where a server in the list comes from, after its address: a CLI target, saying so when
-/// Studio reaches it on the CLI's login of `profile`, or the environment.
+/// Where a server in the list comes from, after its address: a CLI target, naming the CLI
+/// profile whose managed token Studio uses when it does, or the environment.
 fn source_label(source: &ServerSource, profile: Option<&str>) -> String {
     match (source, profile) {
-        (ServerSource::Cli, Some(profile)) => format!("CLI target, your CLI login ({profile})"),
+        (ServerSource::Cli, Some(profile)) => format!("CLI target, CLI profile {profile}"),
         (ServerSource::Cli, None) => "CLI target".to_owned(),
         (ServerSource::Environment, _) => "environment".to_owned(),
     }
@@ -1140,16 +1159,37 @@ mod tests {
         assert!(!cli.contains("login"), "{cli}");
         assert_eq!(source_label(&ServerSource::Cli, None), "CLI target");
 
-        // A managed cluster reached on the CLI's login says so, and how to sign in again.
+        // A managed cluster reached with the CLI's token names its profile and how it signs in.
         let login = tooltip_for(&ServerSource::Cli, "cloud", Some("work"));
         assert!(
-            login.contains("your OmniGraph CLI login here (profile work)")
-                && login.contains("`omnigraph login --profile work` signs in again"),
+            login.contains("from its profile work")
+                && login.contains("`omnigraph login --profile work`"),
             "{login}"
         );
         assert_eq!(
             source_label(&ServerSource::Cli, Some("work")),
-            "CLI target, your CLI login (work)"
+            "CLI target, CLI profile work"
+        );
+
+        // A server the CLI gave no token is asked again when chosen, as its Retry does: the
+        // person may have signed in since. A token the server refused is not asked again by a
+        // click.
+        let gave_none = |reason: Option<&str>, cx: &mut TestAppContext| {
+            connection.update(cx, |connection, _| {
+                connection.state = ConnectionState::Unauthorized;
+                connection.token_unread = reason.map(str::to_owned);
+                retries_on_select(connection)
+            })
+        };
+        assert!(!gave_none(None, cx), "a refused token");
+        assert!(gave_none(Some("login required"), cx));
+        let (modal, cx) = dialog(vec![connection.clone()], cx);
+        modal.update_in(cx, |modal, window, cx| {
+            modal.select(connection.clone(), window, cx)
+        });
+        assert_eq!(
+            connection.read_with(cx, |connection, _| connection.state.clone()),
+            ConnectionState::Connecting
         );
     }
 

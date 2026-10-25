@@ -539,7 +539,7 @@ impl Connection {
         }));
     }
 
-    /// The managed profile whose login the CLI exchanges for this server's token, when it does
+    /// The CLI profile whose managed data token this server's token is, when it is one
     /// ([`TokenSource::login_profile`]).
     pub fn login_profile(&self) -> Option<String> {
         self.token_source.as_ref()?.login_profile()

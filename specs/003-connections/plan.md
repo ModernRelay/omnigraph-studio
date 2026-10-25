@@ -76,11 +76,13 @@ dialog by keyboard), X (capabilities from the served document).
     `personal` target, counted with `wc -c`), refuses a terminal or a regular file before it reads
     a credential (exit 1), and says a failure on standard error as `Error:` with numbered causes
     in colour, a managed target not signed in as `{"type":"login_required",…}`; an unknown target
-    is refused with exit 2. It exports a managed target's exchanged data token, a JWT for the
-    cluster that lasts an hour (`exp − iat` 3600 s, checked 2026-10-25 against
-    `modernrelay-og-cluster` on `0.14.1-edge+7711e4a`), without starting a login; `credentials
-    status --target` refuses a managed target ("managed credentials set/status/remove require
-    explicit --profile"). On a system other than Unix it refuses every export: at main `242ab02f` its
+    is refused with exit 2. It exports a managed target's cluster data token without starting a
+    login: the one it has cached while that still validates, else a new one it asks the issuer
+    for with a 3600 s lifetime, which the issuer may shorten (one made with `omnigraph cluster
+    token --ttl` can last up to 86400 s; `managed/data.rs`). Asked again after a 401 the cache
+    still validates, it gives the same token; a target whose endpoint pin no longer matches
+    fails the export. `credentials status --target` refuses a managed target ("managed
+    credentials set/status/remove require explicit --profile"). On a system other than Unix it refuses every export: at main `242ab02f` its
     check of standard output (`commands::targets::stdout_is_pipe` in `commands/targets/mod.rs`)
     asks whether `/dev/stdout` is a FIFO on Unix and is `false` elsewhere, with no named pipe or
     other route; its `exec` helpers are refused there too (`credential_sources::exec`,
@@ -146,14 +148,17 @@ dialog by keyboard), X (capabilities from the served document).
      thread; the file itself is never read). A `server` target is a server, its `default_graph`
      a known graph of it. Each `direct` target is refused with why: Studio never opens storage or
      starts a server. A `managed` target with a data endpoint lands on that endpoint, its
-     credential the data token the CLI exchanges from the person's login of its profile
-     (`CliCredential::Managed`). This is an interim until Studio signs in itself (spec 016), and
-     it departs from RFC 1017's A2, which has Studio not borrow that token; the person chose it
-     on 2026-10-25, with A2 to be amended. Its token is asked for with `credentials export`
-     alone, kept in memory only, and asked for again after a 401, which is how an expired one
-     is replaced; `target inspect` must still name that managed target at that endpoint. The
-     Open dialog says the server uses the CLI's login and names the profile and
-     `omnigraph login --profile`. A managed target without an endpoint is refused with why.
+     credential the cluster data token the CLI holds for its profile (`CliCredential::Managed`;
+     for a profile that signs in, from the person's `omnigraph login`). This is an interim until
+     Studio signs in itself (spec 016), and it departs from RFC 1017's A2, which has Studio not
+     borrow that token; the person chose it on 2026-10-25, and A2's amendment is proposed
+     (OmniGraph #1152). Its token is asked for with `credentials export` alone, kept in memory
+     only, and asked for again after a 401: a lapsed one is replaced, and one refused for
+     another reason comes back the same and stays refused. `target inspect` must still name that
+     managed target at that endpoint. The Open dialog names the CLI profile the token comes
+     from, and choosing the server or its Retry asks the CLI again after it gave none (since
+     2026-10-25: before, nothing asked again until Refresh, so a person who signed in after the
+     CLI said "login required" saw it stay). A managed target without an endpoint is refused with why.
      The listing keeps every managed target as `target list` describes it (its profile, its
      cluster id and incarnation, and its endpoint and default graph; `CliTargets::managed`)
      for spec 016. Where the CLI exports no token (Windows), each server target that
@@ -415,6 +420,7 @@ and the tooltip named `omnigraph login`, which is managed sign-in only now).
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-25 | Choosing a server the CLI gave no token asks the CLI again | `studio` `a_server_sent_no_token_is_said_to_ask_for_one` (a server in "No token from the CLI" chosen in the Open dialog goes to connecting; one whose token the server refused does not), run again with the fix undone | Ragnor signed in after the CLI had told Studio "login required" for `modernrelay-og-cluster`, and the dialog kept that reason: nothing asked again before a Refresh, and choosing the server did not connect it. Now choosing it, or its Retry, asks again; with the fix undone the server stayed `Unauthorized`. The reason now wraps within the pane instead of running past its edge |
 | 2026-10-25 | A managed cluster is reached on the CLI's login | `graph_store` `cli_tokens::tests::a_managed_targets_token_is_exchanged_from_the_clis_login` (a stand-in CLI: the commands run, the token kept from files, a target turned into a server target while its token was read), `the_targets_are_listed_as_the_cli_describes_them` (`cloud` lands, `control` without an endpoint refused, both kept; on Windows `cloud` refused for its token); `studio` `a_server_sent_no_token_is_said_to_ask_for_one` (the dialog's words); once, by hand, Studio's listing and token source against Ragnor's operator home and `~/.local/bin/omnigraph` `0.14.1-edge+7711e4a`, in a temporary test since removed | The stand-in ran `credentials export --target cloud` and `target inspect cloud --json` only, and the token reached no file; a target turned into a server target dropped it. Live: `modernrelay-og-cluster` landed with `Managed { profile: "managed-og" }` and no notice was left for any target; the export gave a 760-byte token; `GET /graphs` was refused by the cluster's policy (`graph_list`, 403) and `GET /graphs/discovery` named 2 graphs, which the connection falls back to |
 | 2026-10-25 | A CLI target that trusts its own certificate authority is reached with it, as the CLI reaches it | `graph_store` `registry::tests::a_target_is_reached_with_its_own_certificate_authority` (a test authority and an HTTPS server on `127.0.0.1` with a certificate it signed: the target's client with `append`, then `replace`; the same with another authority's bundle; Studio's own client), run again with the bundle's certificates not added; `cli_tokens::tests::a_targets_certificate_authority_is_read_as_the_cli_reads_it` (both modes, an HTTP proxy, a missing file, a folder, a file over 1 MiB, broken PEM, a key with no certificate, mode `merge`, an HTTPS proxy); `the_targets_are_listed_as_the_cli_describes_them` with a real bundle; `a_renamed_cli_target_keeps_its_connection`; the CLI's `operator_transport.rs` at `v0.14.0` read for the rules | Both modes answered 200; another authority's bundle and Studio's own client failed the handshake, as did both modes with the certificates not added. The bundle rules refuse each bad case with why, the CLI's limits; every bundle named is watched, a refused one too, and the HTTPS proxy is refused before its bundle is read. The target lands on Unix and is refused for its token on Windows. A changed bundle makes a new connection, the same one keeps it. Once, by hand, against a server whose certificate the system trusts (`omnigraph.ragnor.co/healthz`), with a test authority's bundle: `append` answered 200, `replace` failed with `UnknownIssuer`, so `replace` leaves out the system's roots. Not run against a real server with its own authority: the local `strategy` server was not running |
 | 2026-10-24 | Studio drives a CLI of OmniGraph `v0.14.0` or later, and an error's disposition alone decides a write's outcome | `graph_store` `cli_tokens::tests::a_cli_is_chosen_by_its_contract_and_protocols` (stand-ins reporting `v0.14.0`'s `version --json`, an edge build's protocol 1, one with no access protocol, and 0.15.0's target protocol 3), `a_probe_is_remembered_across_launches` (a probe kept under other requirements); `graph_client` `a_disposition_decides_a_write_outcome_over_its_status`, `object_types_match_the_contract` and `enum_types_match_the_contract` against `openapi/omnigraph-0.14.0.json`, with every refusal fixture given the disposition `v0.14.0` sends (`omnigraph-server` `lib.rs` `disposition`); `~/.local/bin/omnigraph` `version --json`; `/healthz` of the hosted servers | The release stand-in is chosen, running only `version --json`; the others are passed over ("is 0.14.0-edge+7fff9df, whose target protocol 1 Studio does not know"); a probe kept under the earlier rule runs again. Effects `none` is refused on a 500, `unknown` and `partial` are unknown on a 409 and a 503, and none at all is unknown. The installed `0.14.1-edge+7711e4a` reports protocols 2, 2 and 2, which Studio before this refused ("whose access protocol 2 Studio does not know"). A server on `0.14.0-edge+50283ce` sends no disposition (its document has none), so a write it refuses reads as unknown until it runs `v0.14.0` |

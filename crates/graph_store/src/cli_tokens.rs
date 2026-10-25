@@ -9,10 +9,11 @@
 //! target's token comes from `credentials export --target NAME`, which writes the token and a
 //! newline to a pipe and refuses a terminal or a file. So an environment variable, a token file,
 //! the CLI's secure store and a credential helper are each resolved by OmniGraph's own code
-//! (OmniGraph RFC 1017, "Static tokens for clients"). A managed target's token is the data
-//! credential the CLI exchanges from the person's `omnigraph login` as it exports it, an hour's at
-//! most; `credentials status` takes no managed target, so its export is asked for directly. That
-//! is an interim until Studio's own sign-in (spec 016). Studio keeps a token in memory only, never
+//! (OmniGraph RFC 1017, "Static tokens for clients"). A managed target's token is the cluster
+//! data token the CLI holds for its profile: the one it has cached while that still holds,
+//! else a new one it asks for (3600 s, which the issuer may shorten; one made with
+//! `omnigraph cluster token --ttl` can last a day). `credentials status` takes no managed target,
+//! so its export is asked for directly. That is an interim until Studio's own sign-in (spec 016). Studio keeps a token in memory only, never
 //! logs or writes it, and sends it only to the endpoint of the target it was exported for. Only
 //! the export needs a Unix pipe: on Windows the CLI refuses every export, so Studio there finds
 //! the CLI and lists its targets as on Unix, and uses only those that take no token
@@ -125,9 +126,8 @@ impl std::fmt::Debug for Token {
 pub trait TokenSource: Send + Sync + 'static {
     fn token(&self, hurry: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, String>>;
 
-    /// The managed profile whose login the token is exchanged from, when it carries the
-    /// person's own login rather than a token for the server: said where the connection is
-    /// shown.
+    /// The CLI profile whose managed token this is, when it is the CLI's own managed data token
+    /// rather than a token for the server: said where the connection is shown.
     fn login_profile(&self) -> Option<String> {
         None
     }

@@ -12,10 +12,10 @@ and Studio has no way to get one. Studio connects with no credential or with a s
 OmniGraph CLI exports for a server target. Against an OIDC
 server it gets a 401 and can only say so. A managed target is reached for now with the data
 token the CLI exchanges from the person's `omnigraph login` (spec 003), an interim the person
-chose on 2026-10-25 against RFC #1017's Appendix A2. That token is the CLI's: it lasts an hour
-here (A2 allows up to 24), removing the person's admission does not retract it, and Studio acts
-with the CLI's login rather than as a client of its own, which the server cannot tell apart or
-give less authority. This plan
+chose on 2026-10-25 against RFC #1017's Appendix A2. That token is the CLI's: the CLI asks for
+3600 s and caches it, a cached `cluster token` can last up to 86400 s, removing the person's
+issuer membership does not retract it, and Studio acts as the CLI's principal rather than as a
+client of its own, which the server cannot tell apart or give less authority. This plan
 makes Studio a standard OAuth public client of any OIDC-enabled OmniGraph server, self-hosted or
 managed, signing a person in through their browser. It is a spec only; nothing is implemented.
 
