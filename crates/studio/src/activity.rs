@@ -4,7 +4,7 @@ use std::ops::Range;
 use std::time::Duration;
 
 use gpui::{Context, Entity, Render, Subscription, Task, WeakEntity, Window, uniform_list};
-use graph_store::{GraphSession, HeldAs, OutcomeEntry, OutcomeKind, SessionEvent};
+use graph_store::{GraphSession, HeldAs, Loadable, OutcomeEntry, OutcomeKind, SessionEvent};
 use studio_actions::graph::OpenHistory;
 use studio_workspace::{Workspace, WorkspaceEvent};
 use ui::prelude::*;
@@ -15,10 +15,11 @@ const TIMES_EVERY: Duration = Duration::from_secs(60);
 
 pub struct ActivityLog {
     session: Option<Entity<GraphSession>>,
-    /// How many outcomes the session had logged ([`GraphSession::outcomes_logged`]) when the
-    /// log last drew: a session event that logged none (a read starting or ending, a head
-    /// seen) leaves the log as it was.
-    logged: u64,
+    /// How many outcomes the session had logged ([`GraphSession::outcomes_logged`]), and how
+    /// many merges it had settled ([`GraphSession::merges_settled`]), when the log last drew: a
+    /// session event that changed neither (a read starting or ending, a head seen) leaves the
+    /// log as it was.
+    logged: (u64, u64),
     /// Draws the log again each minute while it lists writes.
     _times: Option<Task<()>>,
     #[cfg(test)]
@@ -37,7 +38,7 @@ impl ActivityLog {
     ) -> Self {
         let mut this = Self {
             session: None,
-            logged: 0,
+            logged: (0, 0),
             _times: None,
             #[cfg(test)]
             renders: 0,
@@ -62,14 +63,28 @@ impl ActivityLog {
         self._subscriptions.truncate(1);
         if let Some(session) = &session {
             // Every write's outcome is logged with this event, which every read sent and
-            // answered also raises: only a new outcome draws the log.
+            // answered also raises: only a new outcome, or a merge settled, draws the log. A new
+            // branch list draws it while a row offers Open history, which it offers only on a
+            // branch the list holds.
             self._subscriptions.push(cx.subscribe(
                 session,
                 |this, session, event: &SessionEvent, cx| {
-                    if let SessionEvent::ActivityChanged = event
-                        && session.read(cx).outcomes_logged != this.logged
-                    {
-                        cx.notify();
+                    match event {
+                        SessionEvent::ActivityChanged
+                            if logged(session.read(cx)) != this.logged =>
+                        {
+                            cx.notify();
+                        }
+                        SessionEvent::BranchesChanged
+                            if session
+                                .read(cx)
+                                .outcomes
+                                .iter()
+                                .any(|entry| history_to_check(entry).is_some()) =>
+                        {
+                            cx.notify();
+                        }
+                        _ => {}
                     }
                 },
             ));
@@ -97,11 +112,15 @@ impl ActivityLog {
     /// Opens History on `branch`, where a write whose outcome nobody knows went: whether it
     /// landed is read there (constitution III). The graph is the one the window shows, whose
     /// writes the log lists; the window moves to the branch first, as a toast's Open history
-    /// did before errors folded into the log.
+    /// did before errors folded into the log. Never to a branch the session's list does not
+    /// hold ([`history_refusal`]), which the row's button is disabled for.
     fn open_history(&mut self, branch: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = &self.session else {
             return;
         };
+        if history_refusal(&branch, &session.read(cx).branches).is_some() {
+            return;
+        }
         session.update(cx, |session, cx| session.set_branch(branch, cx));
         window.dispatch_action(Box::new(OpenHistory), cx);
     }
@@ -113,9 +132,9 @@ impl Render for ActivityLog {
         {
             self.renders += 1;
         }
-        let (count, logged) = self.session.as_ref().map_or((0, 0), |session| {
+        let (count, logged) = self.session.as_ref().map_or((0, (0, 0)), |session| {
             let session = session.read(cx);
-            (session.outcomes.len(), session.outcomes_logged)
+            (session.outcomes.len(), logged(session))
         });
         self.logged = logged;
         if count == 0 {
@@ -131,13 +150,17 @@ impl Render for ActivityLog {
                 let Some(session) = &this.session else {
                     return Vec::new();
                 };
-                let outcomes = &session.read(cx).outcomes;
+                let session = session.read(cx);
+                let outcomes = &session.outcomes;
                 range
                     .filter_map(|index| {
                         let entry = outcomes.get(outcomes.len().checked_sub(index + 1)?)?;
                         let row = activity_row(index, entry);
                         Some(match history_to_check(entry) {
-                            Some(branch) => row.action(open_history_button(index, branch, cx)),
+                            Some(branch) => {
+                                let refusal = history_refusal(branch, &session.branches);
+                                row.action(open_history_button(index, branch, refusal, cx))
+                            }
                             None => row,
                         })
                     })
@@ -221,24 +244,64 @@ fn said(entry: &OutcomeEntry) -> Said {
     }
 }
 
+/// What the log draws again for ([`ActivityLog::logged`]).
+fn logged(session: &GraphSession) -> (u64, u64) {
+    (session.outcomes_logged, session.merges_settled)
+}
+
 /// The branch whose History a write's row opens: an outcome nobody knows is settled by reading
-/// the history of the branch it went to (constitution III). Every other outcome is known, and
-/// its row offers nothing.
+/// the history of the branch it went to (constitution III), while it is unsettled. A merge's
+/// target history that has since shown it landed, or shown nothing of it, settled it
+/// ([`graph_store::MergeEntry::settled`]): its row offers nothing more, as a row whose outcome
+/// is known does.
 fn history_to_check(entry: &OutcomeEntry) -> Option<&str> {
+    let settled = entry
+        .merge
+        .as_ref()
+        .is_some_and(|merge| merge.settled.is_some());
     match entry.outcome {
-        OutcomeKind::Unknown { .. } => Some(&entry.branch),
+        OutcomeKind::Unknown { .. } if !settled => Some(&entry.branch),
         _ => None,
     }
 }
 
-/// An unknown outcome's row button: History on its branch ([`ActivityLog::open_history`]).
-fn open_history_button(index: usize, branch: &str, cx: &Context<ActivityLog>) -> impl IntoElement {
+/// Why History cannot be opened on `branch`, when the branch list the session holds does not
+/// have it: a log row outlives its toast and the branch it names, which may have been deleted
+/// since (a merge's target), or never made (a create whose outcome nobody knows that did not
+/// land), and Open history moves the window to that branch first. `None` when the list holds
+/// it.
+fn history_refusal(branch: &str, branches: &Loadable<Vec<String>>) -> Option<String> {
+    match branches.loaded() {
+        Some(listed) if listed.iter().any(|listed| listed == branch) => None,
+        Some(_) => Some(format!(
+            "There is no branch {branch} now: it was deleted, or the write that made it did not \
+             land. Its History cannot be opened."
+        )),
+        None => Some(format!(
+            "The branch list is not read yet, so whether {branch} is there is not known."
+        )),
+    }
+}
+
+/// An unknown outcome's row button: History on its branch ([`ActivityLog::open_history`]),
+/// disabled with why when the branch is not there to open (`refusal`).
+fn open_history_button(
+    index: usize,
+    branch: &str,
+    refusal: Option<String>,
+    cx: &Context<ActivityLog>,
+) -> impl IntoElement {
     let branch = branch.to_owned();
+    let disabled = refusal.is_some();
     div()
         .debug_selector(move || format!("activity-open-history-{index}"))
         .child(
             studio_ui::ds::row_button(("activity-open-history", index), "Open history")
                 .variant(studio_ui::ds::Variant::Ghost)
+                .disabled(disabled)
+                .when_some(refusal, |button, refusal| {
+                    button.tooltip(ui::Tooltip::text(refusal))
+                })
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.open_history(branch.clone(), window, cx)
                 })),
@@ -279,7 +342,7 @@ fn activity_row(index: usize, entry: &OutcomeEntry) -> studio_ui::ds::ActivityRo
 #[cfg(test)]
 mod tests {
     use gpui::{TestAppContext, VisualTestContext};
-    use graph_store::OutcomeKind;
+    use graph_store::{MergeEntry, MergeSent, MergeSettled, OutcomeKind};
 
     use super::*;
 
@@ -436,5 +499,130 @@ mod tests {
         cx.run_until_parked();
         let graph = session.read_with(cx, |session, _| session.graph_id.clone());
         assert_eq!(*opened.borrow(), [(graph, "fix".to_owned())]);
+    }
+
+    /// Open history is offered while an outcome is unsettled and on a branch the session's
+    /// list holds; a branch the list lacks (deleted since, or a create that did not land)
+    /// leaves it disabled with why, and a merge whose target history has settled it offers
+    /// nothing. Before, every unknown outcome offered it for as long as its row lived, and it
+    /// moved the window to a branch that might be gone.
+    #[test]
+    fn open_history_is_offered_for_an_unsettled_outcome_on_a_listed_branch() {
+        let entry = |branch: &str, settled: Option<MergeSettled>| OutcomeEntry {
+            at: std::time::SystemTime::UNIX_EPOCH,
+            branch: branch.into(),
+            description: "merge".into(),
+            outcome: OutcomeKind::Unknown {
+                reason: "the connection closed".into(),
+            },
+            follow_up: None,
+            merge: settled.map(|settled| MergeEntry {
+                source: "feature".into(),
+                sent: MergeSent::default(),
+                settled: Some(settled),
+            }),
+        };
+        let listed = Loadable::Loaded(vec!["main".to_owned(), "fix".to_owned()]);
+        assert_eq!(history_to_check(&entry("fix", None)), Some("fix"));
+        assert_eq!(history_refusal("fix", &listed), None);
+        for settled in [MergeSettled::Landed, MergeSettled::NotShown] {
+            assert_eq!(history_to_check(&entry("main", Some(settled))), None);
+        }
+        let gone = history_refusal("gone", &listed).expect("refused");
+        assert!(gone.starts_with("There is no branch gone now"), "{gone}");
+        let unread = history_refusal("fix", &Loadable::Loading).expect("refused");
+        assert!(unread.contains("not read yet"), "{unread}");
+    }
+
+    /// An unknown outcome's row follows the session: its Open history is disabled, and does
+    /// nothing, once the branch it names leaves the branch list, and goes once a read of the
+    /// merge's target settles it. The log draws for both, though neither logs an outcome.
+    #[gpui::test]
+    async fn an_unknown_outcomes_row_follows_its_branch_and_settlement(cx: &mut TestAppContext) {
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+        });
+        let (session, served) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n}\n",
+            |_| serde_json::json!([]),
+            cx,
+        );
+        served.lock().unwrap().branches.push("fix".into());
+        cx.run_until_parked();
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let opened: Rc<RefCell<Vec<String>>> = Rc::default();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.set_session(session.clone(), window, cx);
+            let handle = cx.entity().downgrade();
+            let log = cx.new(|cx| ActivityLog::new(handle, Some(session.clone()), window, cx));
+            workspace.set_activity_view(log.into(), cx);
+            let opened = opened.clone();
+            workspace.register_action(move |workspace, _: &OpenHistory, _, cx| {
+                let branch = workspace.session().unwrap().read(cx).branch.clone();
+                opened.borrow_mut().push(branch);
+            });
+        });
+        // A merge into main nobody knows the outcome of, then a write to fix alike.
+        let unknown = || OutcomeKind::Unknown {
+            reason: "the connection closed".into(),
+        };
+        session.update(cx, |session, cx| {
+            session.outcomes.push(OutcomeEntry {
+                at: std::time::SystemTime::now(),
+                branch: "main".into(),
+                description: "Merge feature into main".into(),
+                outcome: unknown(),
+                follow_up: None,
+                merge: Some(MergeEntry {
+                    source: "feature".into(),
+                    sent: MergeSent::default(),
+                    settled: None,
+                }),
+            });
+            session.outcomes_logged += 1;
+            cx.emit(SessionEvent::ActivityChanged);
+        });
+        let write = session.update(cx, |session, cx| {
+            session.external_write("fix".into(), "Rename Ada".into(), false, cx)
+        });
+        write.finish(unknown());
+        cx.dispatch_action(studio_actions::workspace::ActivatePanel {
+            id: "activity".into(),
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("activity-open-history-0").is_some(), "fix");
+        assert!(cx.debug_bounds("activity-open-history-1").is_some(), "main");
+
+        // fix is deleted elsewhere: its row's button is drawn disabled, and does nothing.
+        served
+            .lock()
+            .unwrap()
+            .branches
+            .retain(|branch| branch != "fix");
+        session.update(cx, |session, cx| session.reload_branches(cx));
+        cx.run_until_parked();
+        let button = cx
+            .debug_bounds("activity-open-history-0")
+            .expect("drawn, disabled");
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(opened.borrow().is_empty(), "nothing opened");
+        assert_eq!(
+            session.read_with(cx, |session, _| session.branch.clone()),
+            "main"
+        );
+
+        // main's history shows the merge landed: its row offers nothing more.
+        session.update(cx, |session, cx| {
+            let sent = MergeSent::default();
+            session.settle_merge("feature", "main", &sent, MergeSettled::Landed, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("activity-open-history-1").is_none(),
+            "settled"
+        );
     }
 }

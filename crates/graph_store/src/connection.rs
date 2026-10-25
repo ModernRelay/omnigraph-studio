@@ -33,6 +33,19 @@ pub struct ServerEntry {
     pub known_graphs: Vec<String>,
 }
 
+impl ServerEntry {
+    /// How what Studio saves of a graph names its server ([`crate::GraphSession::overrides_key`]):
+    /// the target's name and its address, `<name>@<address>` (a target's name holds no `@`).
+    /// The CLI gives a server target no identity that outlives its name: the owner and profile
+    /// ids `credentials status` reports belong to the name, are new after a rename, and stay
+    /// with the name when it is given to another server. A name alone would hand one server's
+    /// saved state to another that took its name; with the address, that server starts with
+    /// nothing saved, as a target renamed or moved to another address does.
+    pub fn saved_key(&self) -> String {
+        format!("{}@{}", self.name, self.url)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionState {
     Idle,
@@ -299,7 +312,9 @@ impl Connection {
     }
 
     /// Takes the source's answer. A token connects (for a connect under way, or when it changed);
-    /// no token sends nothing more, the connection refused with why.
+    /// no token sends nothing more, the connection refused with why. The answer to a connect
+    /// cancelled while a window waited for its token ([`Self::cancel`]) is taken, and the
+    /// connection stays as Cancel left it.
     fn token_answered(
         &mut self,
         answer: Result<Token, String>,
@@ -309,6 +324,7 @@ impl Connection {
         if !connecting {
             self._asking = None;
         }
+        let connecting = connecting && self.state == ConnectionState::Connecting;
         let was_ready = self.token_ready();
         self.token_answered = true;
         self.hurry.store(false, Ordering::SeqCst);
@@ -447,10 +463,17 @@ impl Connection {
         Rc::strong_count(&self.watchers) > 1
     }
 
-    /// Stops a connection attempt that is taking too long.
+    /// Stops a connection attempt that is taking too long. A connect still waiting for its
+    /// token while a window waits for that token too ([`Self::wait_for_token`]) keeps asking
+    /// for it: the window's first reads go once it answers, and the connect stops there
+    /// ([`Self::token_answered`]). Dropped, the ask would leave the window waiting for a token
+    /// nothing asks for, empty until it is hidden and shown again.
     pub fn cancel(&mut self, cx: &mut Context<Self>) {
         if self.state == ConnectionState::Connecting {
-            self._task = None;
+            let window_waits = !self.token_ready() && self.hurry.load(Ordering::SeqCst);
+            if !window_waits {
+                self._task = None;
+            }
             // A check already scheduled would connect again, or mark the server down.
             self._health_check = None;
             self.check_missed = false;

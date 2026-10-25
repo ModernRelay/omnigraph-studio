@@ -1,6 +1,6 @@
 //! What a workspace remembers between runs (spec 002): the window's bounds, and per graph (its
-//! one key, `<target>/<graph>`) the open tabs, the active tab and which panels are shown. Plain
-//! JSON under Studio's data directory; no database.
+//! one key, `<target>@<address>/<graph>`) the open tabs, the active tab and which panels are
+//! shown. Plain JSON under Studio's data directory; no database.
 //!
 //! A tab is remembered only if its item returns [`SavedItem`] from `Item::serialize`, and comes
 //! back only if a feature registered its kind with [`register_item_kind`]. A query tab keeps its
@@ -87,8 +87,8 @@ fn workspaces_dir() -> PathBuf {
     studio_settings::data_dir().join("workspaces")
 }
 
-/// A file name for a graph's key (`<target>/<graph>`, `studio_settings::overrides_key`): a
-/// stable FNV-1a hash, so names need no escaping.
+/// A file name for a graph's key (`<target>@<address>/<graph>`, `GraphSession::overrides_key`):
+/// a stable FNV-1a hash, so names need no escaping.
 fn file_name(key: &str) -> String {
     let hash = key.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
         (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
@@ -141,11 +141,15 @@ pub struct SavedSession {
     pub shown: usize,
 }
 
-/// A graph a window had open, by its CLI target's name and its id (spec 002): a window whose
-/// target the CLI no longer lists is not reopened.
+/// A graph a window had open, by its CLI target's name and address and its id (spec 002), as
+/// its saved state is filed (`GraphSession::overrides_key`): a window whose target the CLI no
+/// longer lists at that address is not reopened, so a name given to another server does not
+/// reopen the graphs of the server that had it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SavedGraph {
     pub target: String,
+    /// The target's address (`ServerEntry::url`).
+    pub url: String,
     pub graph: String,
     pub branch: String,
 }
@@ -447,6 +451,7 @@ mod tests {
     fn graph(name: &str) -> SavedGraph {
         SavedGraph {
             target: "example".into(),
+            url: "https://example.test".into(),
             graph: name.into(),
             branch: "main".into(),
         }
@@ -489,13 +494,15 @@ mod tests {
         assert_eq!(parse_session(&text), Some(windows));
         assert_eq!(parse_session("{}"), Some(Vec::new()));
         assert_eq!(parse_session("not json"), None);
-        // An earlier build's file names its graphs by their server's address: it is set aside.
-        assert_eq!(
-            parse_session(
-                r#"{"windows":[{"graphs":[{"server_url":"http://a","graph":"g","branch":"main"}]}]}"#
-            ),
-            None
-        );
+        // An earlier build's file names its graphs by their server's address alone, or by
+        // their target's name alone: it is set aside.
+        for graph in [
+            r#"{"server_url":"http://a","graph":"g","branch":"main"}"#,
+            r#"{"target":"a","graph":"g","branch":"main"}"#,
+        ] {
+            let file = format!(r#"{{"windows":[{{"graphs":[{graph}]}}]}}"#);
+            assert_eq!(parse_session(&file), None, "{graph}");
+        }
     }
 
     #[test]

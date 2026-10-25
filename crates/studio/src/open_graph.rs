@@ -585,7 +585,7 @@ impl OpenGraphModal {
         // A token typed in replaces one the server refused, or one the CLI would not give to a
         // server that asks for one.
         let asks_token = state == ConnectionState::Unauthorized;
-        let token_tooltip = token_tooltip(c);
+        let token_tooltip = token_tooltip(c, self.platform);
         let selected = connection.clone();
         let listing_note = match &c.graphs {
             GraphListing::NotAllowed => Some("This token may not list graphs. Enter a graph id."),
@@ -805,20 +805,30 @@ fn retries_on_select(c: &Connection) -> bool {
     ) || gave_no_token(c)
 }
 
-/// What Update token does with the token typed: it lasts this run, and for a CLI server the
-/// CLI's own command keeps one for the CLI and Studio. For a managed cluster reached on the CLI's
-/// login, it first says where that cluster's token comes from.
-fn token_tooltip(c: &Connection) -> String {
+/// What Update token does with the token typed: it lasts this run
+/// ([`ConnectionRegistry::update_token`]), and for a CLI server on Unix the CLI's own command
+/// keeps one for the CLI and Studio. Where the CLI exports no token (Windows), that command
+/// would make the target one that takes a token, which Studio there refuses
+/// ([`Platform::exports_tokens`]): a CLI server the dialog lists there is an anonymous target,
+/// and the token typed is the only one Studio can use for it. For a managed cluster reached on
+/// the CLI's login, it first says where that cluster's token comes from.
+fn token_tooltip(c: &Connection, platform: Platform) -> String {
     tooltip_for(
         &c.server.source,
         &c.server.name,
         c.login_profile().as_deref(),
+        platform,
     )
 }
 
-/// [`token_tooltip`] for a server of `source` named `name`, reached on the CLI's login of
-/// `profile` when there is one.
-fn tooltip_for(source: &ServerSource, name: &str, profile: Option<&str>) -> String {
+/// [`token_tooltip`] for a server of `source` named `name` on `platform`, reached on the CLI's
+/// login of `profile` when there is one.
+fn tooltip_for(
+    source: &ServerSource,
+    name: &str,
+    profile: Option<&str>,
+    platform: Platform,
+) -> String {
     if let Some(profile) = profile {
         return format!(
             "Studio uses the token the OmniGraph CLI gives for this cluster from its profile \
@@ -829,9 +839,14 @@ fn tooltip_for(source: &ServerSource, name: &str, profile: Option<&str>) -> Stri
         );
     }
     match source {
-        ServerSource::Cli => format!(
+        ServerSource::Cli if platform.exports_tokens() => format!(
             "Used until Studio quits. To keep one for the CLI and Studio, pipe it to `omnigraph \
              credentials set --target {name} --stdin`."
+        ),
+        ServerSource::Cli => format!(
+            "Used until Studio quits. Studio on Windows cannot use a target that needs a token \
+             yet ({}), so the CLI cannot keep this one for it.",
+            cli_config::PIPE_ONLY
         ),
         ServerSource::Environment => "Used until Studio quits.".into(),
     }
@@ -1144,23 +1159,35 @@ mod tests {
                 "No token from the CLI".to_owned()
             )
         );
-        let tooltip = |source: ServerSource, cx: &mut TestAppContext| {
+        let tooltip = |source: ServerSource, platform: Platform, cx: &mut TestAppContext| {
             connection.update(cx, |connection, _| {
                 connection.server.source = source;
                 connection.server.name = "cloud".into();
-                token_tooltip(connection)
+                token_tooltip(connection, platform)
             })
         };
-        let cli = tooltip(ServerSource::Cli, cx);
+        let cli = tooltip(ServerSource::Cli, Platform::Unix, cx);
         assert!(
             cli.contains("`omnigraph credentials set --target cloud --stdin`"),
             "{cli}"
         );
         assert!(!cli.contains("login"), "{cli}");
+        // Where the CLI exports no token, its command would make a target Studio refuses: the
+        // tooltip says the token lasts this run, and names no command.
+        assert_eq!(
+            tooltip(ServerSource::Cli, Platform::Other, cx),
+            "Used until Studio quits. Studio on Windows cannot use a target that needs a token \
+             yet (the OmniGraph CLI gives a token only through a Unix pipe), so the CLI cannot \
+             keep this one for it."
+        );
+        assert_eq!(
+            tooltip(ServerSource::Environment, Platform::Other, cx),
+            "Used until Studio quits."
+        );
         assert_eq!(source_label(&ServerSource::Cli, None), "CLI target");
 
         // A managed cluster reached with the CLI's token names its profile and how it signs in.
-        let login = tooltip_for(&ServerSource::Cli, "cloud", Some("work"));
+        let login = tooltip_for(&ServerSource::Cli, "cloud", Some("work"), Platform::Unix);
         assert!(
             login.contains("from its profile work")
                 && login.contains("`omnigraph login --profile work`"),

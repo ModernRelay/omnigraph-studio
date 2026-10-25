@@ -15,13 +15,14 @@ use chrono::{DateTime, Utc};
 use gpui::{App, AppContext as _, Context, Entity, Global};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use studio_workspace::{ToastKind, Workspace};
 
 /// One conversation with an agent on a graph.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRecord {
     /// The agent's session id.
     pub session: String,
-    /// The graph, as its key (`<target>/<graph id>`, `GraphSession::overrides_key`).
+    /// The graph, as its key (`<target>@<address>/<graph id>`, `GraphSession::overrides_key`).
     pub graph: String,
     /// The agent command, joined with spaces: a session belongs to the agent that made it.
     pub agent: String,
@@ -70,6 +71,10 @@ pub struct AgentSessions {
     /// Whether changes are written to the file: not when it held what Studio could not read
     /// and could not be set aside, since a save would replace it. They are kept for this run.
     saving: bool,
+    /// What the person is told, once, about a file Studio could not read and set aside: which
+    /// file, why, and where it is kept ([`Self::tell_pending`]). One that could not be set
+    /// aside is said in the Conversations panel instead ([`Self::not_saved`]).
+    notice: Option<String>,
     live: HashMap<String, Live>,
     /// Conversations whose turn ended while their tab was not the one shown.
     unread: HashSet<String>,
@@ -84,27 +89,60 @@ impl Global for GlobalSessions {}
 impl AgentSessions {
     /// The one index of this run of Studio.
     pub fn global(cx: &mut App) -> Entity<AgentSessions> {
-        if let Some(global) = cx.try_global::<GlobalSessions>() {
-            return global.0.clone();
-        }
-        let path = studio_settings::data_dir()
-            .join("agent")
-            .join("sessions.json");
-        let sessions = cx.new(|_| AgentSessions::load(path));
-        cx.set_global(GlobalSessions(sessions.clone()));
+        let sessions = match cx.try_global::<GlobalSessions>() {
+            Some(global) => global.0.clone(),
+            None => {
+                let path = studio_settings::data_dir()
+                    .join("agent")
+                    .join("sessions.json");
+                let sessions = cx.new(|_| AgentSessions::load(path));
+                cx.set_global(GlobalSessions(sessions.clone()));
+                sessions
+            }
+        };
+        Self::tell_pending(&sessions, cx);
         sessions
     }
 
     fn load(path: PathBuf) -> Self {
-        let Stored { value, saving } = read_records(&path);
+        let (Stored { value, saving }, notice) = read_records(&path);
         Self {
             path,
             records: value,
             saving,
+            notice,
             live: HashMap::new(),
             unread: HashSet::new(),
             deleted: HashSet::new(),
         }
+    }
+
+    /// Shows the notice about the file set aside ([`Self::notice`]) in a toast that stays until
+    /// dismissed, in the active window, else any: once, at the first look at the index with a
+    /// window open. Deferred, since the index is first looked at while a window is being made.
+    fn tell_pending(sessions: &Entity<AgentSessions>, cx: &mut App) {
+        if sessions.read(cx).notice.is_none() {
+            return;
+        }
+        let sessions = sessions.clone();
+        cx.defer(move |cx| {
+            let workspace = |window: gpui::AnyWindowHandle| window.downcast::<Workspace>();
+            let Some(window) = cx
+                .active_window()
+                .and_then(workspace)
+                .or_else(|| cx.windows().into_iter().find_map(workspace))
+            else {
+                return;
+            };
+            let Some(notice) = sessions.update(cx, |sessions, _| sessions.notice.take()) else {
+                return;
+            };
+            window
+                .update(cx, |workspace, _, cx| {
+                    workspace.show_toast(ToastKind::Error, notice, cx)
+                })
+                .ok();
+        });
     }
 
     /// The file, when Studio could neither read it nor set it aside: the list then lasts only
@@ -447,14 +485,14 @@ struct Stored<T> {
     saving: bool,
 }
 
-/// The text of one of Studio's state files: `Ok(None)` when there is none, `Err` when it is
-/// there but cannot be read (not UTF-8, or held by another program), which is as unusable as a
-/// file that does not parse.
-fn read_text(path: &Path) -> Result<Option<String>, ()> {
+/// The text of one of Studio's state files: `Ok(None)` when there is none, `Err` with why when
+/// it is there but cannot be read (not UTF-8, or held by another program), which is as unusable
+/// as a file that does not parse.
+fn read_text(path: &Path) -> Result<Option<String>, String> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(Some(text)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(()),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -465,31 +503,56 @@ fn set_aside(path: &Path) -> bool {
     studio_settings::set_aside(path).is_some()
 }
 
-/// The records on disk. A file that does not parse as this build's form ([`SessionsFile`]), one
-/// of another [`VERSION`], or one that cannot be read at all, is set aside whole, renamed beside
-/// itself, as Studio's other state files are, so the next save, which writes only what this run
-/// holds, loses nothing. One that cannot be set aside is never saved over.
-fn read_records(path: &Path) -> Stored<Vec<SessionRecord>> {
-    let file = match read_text(path) {
-        Ok(Some(text)) => serde_json::from_str::<SessionsFile>(&text).ok(),
+/// The records on disk, and what the person is told when the file was set aside. A file that
+/// does not parse as this build's form ([`SessionsFile`]), one of another [`VERSION`], or one
+/// that cannot be read at all, is set aside whole, renamed beside itself, as Studio's other
+/// state files are, so the next save, which writes only what this run holds, loses nothing; one
+/// record of an older form is enough, since no record is read on its own. The notice names the
+/// file, why it was not read, and where it is kept. One that cannot be set aside is never saved
+/// over, and the Conversations panel says so ([`AgentSessions::not_saved`]).
+fn read_records(path: &Path) -> (Stored<Vec<SessionRecord>>, Option<String>) {
+    let unread = match read_text(path) {
+        Ok(Some(text)) => match serde_json::from_str::<SessionsFile>(&text) {
+            Ok(file) if file.version == VERSION => {
+                let stored = Stored {
+                    value: file.sessions,
+                    saving: true,
+                };
+                return (stored, None);
+            }
+            Ok(file) => format!(
+                "it is of another build of Studio, version {} where this one reads {VERSION}",
+                file.version
+            ),
+            Err(error) => error.to_string(),
+        },
         Ok(None) => {
-            return Stored {
+            let stored = Stored {
                 value: Vec::new(),
                 saving: true,
             };
+            return (stored, None);
         }
-        Err(()) => None,
+        Err(error) => error,
     };
-    match file.filter(|file| file.version == VERSION) {
-        Some(file) => Stored {
-            value: file.sessions,
-            saving: true,
-        },
-        None => Stored {
+    let Some(aside) = studio_settings::set_aside(path) else {
+        let stored = Stored {
             value: Vec::new(),
-            saving: set_aside(path),
-        },
-    }
+            saving: false,
+        };
+        return (stored, None);
+    };
+    let notice = format!(
+        "The agent conversations list {} could not be read ({unread}), so it starts empty; the \
+         file is kept as {}.",
+        path.display(),
+        aside.display()
+    );
+    let stored = Stored {
+        value: Vec::new(),
+        saving: true,
+    };
+    (stored, Some(notice))
 }
 
 /// The preferences file's object. A file that exists but cannot be read or is not a JSON
@@ -502,7 +565,7 @@ fn read(path: &Path) -> Stored<Map<String, Value>> {
             Ok(Value::Object(object)) => Some(object),
             _ => None,
         },
-        Err(()) => None,
+        Err(_) => None,
     };
     match object {
         Some(value) => Stored {
@@ -819,16 +882,28 @@ mod tests {
                 .collect()
         };
 
-        // A file as Studio writes it is read whole, and stays.
+        // What the person is told of a file set aside names it and where it is kept.
+        let told = |notice: Option<String>, aside: &[PathBuf]| {
+            let notice = notice.expect("the person is told");
+            assert!(notice.contains(&path.display().to_string()), "{notice}");
+            assert!(notice.contains(&aside[0].display().to_string()), "{notice}");
+            notice
+        };
+
+        // A file as Studio writes it is read whole, and stays, with nothing to tell.
         let file = json!({ "version": VERSION, "sessions": [record] });
         std::fs::write(&path, file.to_string()).unwrap();
-        let Stored {
-            value: records,
-            saving,
-        } = read_records(&path);
+        let (
+            Stored {
+                value: records,
+                saving,
+            },
+            notice,
+        ) = read_records(&path);
         assert!(saving);
         assert_eq!(records, std::slice::from_ref(&record));
         assert!(path.exists());
+        assert_eq!(notice, None);
 
         // A record without its working directory, with none, without its marks, or of another
         // shape sets the whole file aside, and nothing in it is read.
@@ -846,10 +921,13 @@ mod tests {
             fresh();
             let file = json!({ "version": VERSION, "sessions": [record, unread] });
             std::fs::write(&path, file.to_string()).unwrap();
-            let Stored {
-                value: records,
-                saving,
-            } = read_records(&path);
+            let (
+                Stored {
+                    value: records,
+                    saving,
+                },
+                notice,
+            ) = read_records(&path);
             assert!(saving, "set aside, so saved again: {unread}");
             assert!(records.is_empty(), "{unread}");
             assert!(!path.exists(), "set aside before it is written again");
@@ -859,6 +937,7 @@ mod tests {
                 file.to_string(),
                 "the file set aside is the file as it was"
             );
+            told(notice, &aside());
         }
 
         // Every record readable, but the file of another version, or of none: nothing is read,
@@ -867,9 +946,63 @@ mod tests {
             fresh();
             let file = json!({ "version": version, "sessions": [record] });
             std::fs::write(&path, file.to_string()).unwrap();
-            assert!(read_records(&path).value.is_empty(), "version {version}");
+            let (stored, notice) = read_records(&path);
+            assert!(stored.value.is_empty(), "version {version}");
             assert!(!path.exists(), "version {version}");
+            let notice = told(notice, &aside());
+            if version == json!(VERSION + 1) {
+                assert!(notice.contains("another build of Studio"), "{notice}");
+            }
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A conversations file set aside is told once: the index holds the notice from its load
+    /// until a window shows it, and a file read, or one that could not be set aside (which the
+    /// Conversations panel says), holds none. Before, one record of an older form emptied the
+    /// list and nothing said so, nor where the file went.
+    #[gpui::test]
+    fn a_file_set_aside_is_told_once(cx: &mut gpui::TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("studio-agent-told-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.json");
+        let mut legacy = serde_json::to_value(record("a", "server/crm", "claude", 0)).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .insert("cwd".into(), Value::Null);
+        std::fs::write(
+            &path,
+            json!({ "version": VERSION, "sessions": [legacy] }).to_string(),
+        )
+        .unwrap();
+        let store = cx.new(|_| AgentSessions::load(path.clone()));
+        let notice = store.update(cx, |store, _| store.notice.take());
+        let notice = notice.expect("told");
+        assert!(
+            notice.starts_with(&format!(
+                "The agent conversations list {} could not be read (",
+                path.display()
+            )),
+            "{notice}"
+        );
+        assert!(notice.contains(".unreadable-"), "{notice}");
+        assert_eq!(store.read_with(cx, |store, _| store.notice.clone()), None);
+        // The file written again in its place is read, and tells nothing.
+        store.update(cx, |store, cx| {
+            store.upsert(record("b", "server/crm", "claude", 0), cx)
+        });
+        studio_settings::writes_done();
+        assert_eq!(AgentSessions::load(path.clone()).notice, None);
+        // One that cannot be set aside tells nothing here: the panel says it is not saved.
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "not json").unwrap();
+        block_set_aside(&path);
+        let held = AgentSessions::load(path.clone());
+        assert_eq!(held.notice, None);
+        assert_eq!(held.not_saved(), Some(path.as_path()));
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -19,7 +19,7 @@ use gpui::{
 };
 use graph_store::{ConnectionRegistry, open_session, open_session_behind};
 use studio_actions::workspace::{NewWindow, OpenGraph, OpenLink, OpenSettings, Quit, RevealLog};
-use studio_workspace::{SavedWindow, ToastKind, Workspace};
+use studio_workspace::{SavedGraph, SavedWindow, ToastKind, Workspace};
 
 pub use open_graph::OpenGraphModal;
 
@@ -189,8 +189,8 @@ pub fn window_options(bounds: Option<gpui::Bounds<gpui::Pixels>>, cx: &App) -> W
 }
 
 /// Opens Studio's windows: one for `OMNIGRAPH_STUDIO_GRAPH` when it is set, else every window
-/// the last run had open with a graph on a target the CLI still lists, each where it was, else
-/// one window asking for a graph. The CLI's targets are listed off the main thread
+/// the last run had open with a graph on a target the CLI still lists at its address, each where
+/// it was, else one window asking for a graph. The CLI's targets are listed off the main thread
 /// ([`ConnectionRegistry::when_listed`]), so the saved windows open at once, where they were,
 /// and take their graphs once the targets are listed.
 pub fn open_windows(cx: &mut App) {
@@ -231,22 +231,27 @@ pub fn open_windows(cx: &mut App) {
     .detach();
 }
 
-/// Gives each window a start reopened the graphs it had on targets the CLI lists, a graph
-/// listed by two windows in the first alone. A window left with none closes, unless no window
-/// has a graph: the first then asks for one, unless a link that came meanwhile opens one.
+/// Gives each window a start reopened the graphs it had on targets the CLI lists, each at the
+/// address it had, a graph listed by two windows in the first alone. A window left with none
+/// closes, unless no window has a graph: the first then asks for one ([`ask_for_graph`]), once
+/// the links that came meanwhile are opened and only if they leave it without a graph.
 fn fill_reopened(opened: Vec<(WindowHandle<Workspace>, SavedWindow)>, cx: &mut App) {
     let registry = ConnectionRegistry::global(cx);
-    let known: HashSet<String> = registry
+    let known: HashSet<(String, String)> = registry
         .read(cx)
         .connections
         .iter()
-        .map(|connection| connection.read(cx).server.name.clone())
+        .map(|connection| {
+            let server = &connection.read(cx).server;
+            (server.name.clone(), server.url.clone())
+        })
         .collect();
     let mut taken = HashSet::new();
     let mut empty = Vec::new();
     let mut filled = false;
     for (handle, saved) in opened {
-        let Some(saved) = reopenable(saved, |target| known.contains(target), &mut taken) else {
+        let listed = |target: &str, url: &str| known.contains(&(target.to_owned(), url.to_owned()));
+        let Some(saved) = reopenable(saved, listed, &mut taken) else {
             empty.push(handle);
             continue;
         };
@@ -290,18 +295,19 @@ fn new_workspace(window: &mut Window, cx: &mut App) -> Entity<Workspace> {
     workspace
 }
 
-/// `window` with only its graphs on CLI targets `known` holds and not `taken` by a window
-/// before it, or `None` when it is left with none. A graph is open in one window at a time:
-/// its tabs and drafts are saved by graph, so two windows holding it would each write over the
-/// other's. One listed by two windows from an earlier session reopens in the first.
+/// `window` with only its graphs on CLI targets `known` lists at their addresses and not
+/// `taken` by a window before it, or `None` when it is left with none. A graph is open in one
+/// window at a time: its tabs and drafts are saved by graph, so two windows holding it would
+/// each write over the other's. One listed by two windows from an earlier session reopens in the
+/// first.
 fn reopenable(
     mut window: SavedWindow,
-    known: impl Fn(&str) -> bool,
+    known: impl Fn(&str, &str) -> bool,
     taken: &mut HashSet<(String, String)>,
 ) -> Option<SavedWindow> {
     let shown = window.session.graphs.get(window.session.shown).cloned();
     window.session.graphs.retain(|graph| {
-        known(&graph.target) && taken.insert((graph.target.clone(), graph.graph.clone()))
+        known(&graph.target, &graph.url) && taken.insert((graph.url.clone(), graph.graph.clone()))
     });
     window.session.shown = shown
         .and_then(|shown| window.session.graphs.iter().position(|g| *g == shown))
@@ -320,20 +326,23 @@ fn reopen_window(
 ) {
     let registry = ConnectionRegistry::global(cx);
     let connections = registry.read(cx).connections.clone();
-    let connection_of = |target: &str, cx: &App| {
+    let connection_of = |graph: &SavedGraph, cx: &App| {
         connections
             .iter()
-            .find(|c| c.read(cx).server.name == target)
+            .find(|c| {
+                let server = &c.read(cx).server;
+                server.name == graph.target && server.url == graph.url
+            })
             .cloned()
     };
     if let Some(shown) = saved.session.graphs.get(saved.session.shown)
-        && let Some(connection) = connection_of(&shown.target, cx)
+        && let Some(connection) = connection_of(shown, cx)
     {
         connection.update(cx, |connection, cx| connection.connect_if_idle(cx));
     }
     let mut last = None;
     for (index, graph) in saved.session.graphs.iter().enumerate() {
-        let Some(connection) = connection_of(&graph.target, cx) else {
+        let Some(connection) = connection_of(graph, cx) else {
             continue;
         };
         connection.update(cx, |connection, cx| connection.connect_if_idle(cx));
@@ -371,25 +380,27 @@ fn environment_graph(cx: &App) -> Option<(Entity<graph_store::Connection>, Strin
     Some((connection, graph))
 }
 
-/// Links that came while the CLI's targets were not yet listed, still to open: a window that
-/// would ask for a graph meanwhile does not, since a link opens one.
+/// Links that came while the CLI's targets were not yet listed, still to open, and the windows
+/// that would have asked for a graph meanwhile: a link opens one, so they wait for the links,
+/// and ask once the last is opened, if they still have none ([`link_opened`]).
 #[derive(Default)]
-struct LinksWaiting(usize);
+struct LinksWaiting {
+    count: usize,
+    asking: Vec<gpui::AnyWindowHandle>,
+}
 
 impl Global for LinksWaiting {}
 
-fn links_waiting(cx: &App) -> bool {
-    cx.try_global::<LinksWaiting>()
-        .is_some_and(|waiting| waiting.0 > 0)
-}
-
 /// Shows "Open a graph" in `workspace`'s window, once the CLI's targets are listed: at a start
-/// they are listed off the main thread. A link that comes meanwhile opens its graph instead,
-/// and the dialog is not shown; nor is it over a graph or a dialog the window has by then.
+/// they are listed off the main thread. It is not shown over a graph or a dialog the window has
+/// by then. While links that came meanwhile wait to open, it waits for them: one opens a graph,
+/// and the dialog would connect every server only for the link to hide it. One that does not
+/// open (a link from `omnigraph studio`, a server Studio does not know) leaves the window
+/// without a graph, which then asks.
 fn ask_for_graph(workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App) {
     let registry = ConnectionRegistry::global(cx);
     if registry.read(cx).listed() {
-        show_open_dialog(workspace, window, cx);
+        ask_unless_busy(workspace, window, cx);
         return;
     }
     let listed = registry.update(cx, |registry, _| registry.when_listed());
@@ -398,20 +409,50 @@ fn ask_for_graph(workspace: &Entity<Workspace>, window: &mut Window, cx: &mut Ap
         .spawn(cx, async move |cx| {
             listed.await;
             cx.update(|window, cx| {
-                let Some(workspace) = workspace.upgrade() else {
-                    return;
-                };
-                let busy = {
-                    let workspace = workspace.read(cx);
-                    workspace.session().is_some() || workspace.has_modal()
-                };
-                if !busy && !links_waiting(cx) {
-                    show_open_dialog(&workspace, window, cx);
+                if let Some(workspace) = workspace.upgrade() {
+                    ask_unless_busy(&workspace, window, cx);
                 }
             })
             .ok();
         })
         .detach();
+}
+
+/// [`ask_for_graph`] once the CLI's targets are listed: the dialog, unless the window has a graph
+/// or a dialog, or links still wait to open.
+fn ask_unless_busy(workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App) {
+    let busy = {
+        let workspace = workspace.read(cx);
+        workspace.session().is_some() || workspace.has_modal()
+    };
+    if busy {
+        return;
+    }
+    let waiting = cx.default_global::<LinksWaiting>();
+    if waiting.count > 0 {
+        waiting.asking.push(window.window_handle());
+        return;
+    }
+    show_open_dialog(workspace, window, cx);
+}
+
+/// A link that waited for the CLI's targets has been opened, or refused: once it is the last, each
+/// window that waited to ask for a graph asks now if it still has none, so a refused link leaves
+/// the dialog rather than an empty window.
+fn link_opened(cx: &mut App) {
+    let waiting = cx.default_global::<LinksWaiting>();
+    waiting.count -= 1;
+    if waiting.count > 0 {
+        return;
+    }
+    for handle in std::mem::take(&mut waiting.asking) {
+        cx.update_window(handle, |root, window, cx| {
+            if let Ok(workspace) = root.downcast::<Workspace>() {
+                ask_unless_busy(&workspace, window, cx);
+            }
+        })
+        .ok();
+    }
 }
 
 /// Connects every server the CLI lists and shows "Open a graph" over them: only when the dialog
@@ -449,18 +490,19 @@ fn open_initial_graph(workspace: &Entity<Workspace>, window: &mut Window, cx: &m
 /// open, else in the active window, else in a new one. What the link names is shown, never run;
 /// a server Studio does not know is refused rather than added. A link that comes at a start,
 /// before the CLI's targets are listed, opens once they are: they say which servers Studio
-/// knows.
+/// knows. A window that waited for it to ask for a graph asks then, if the link left it with
+/// none ([`link_opened`]).
 pub fn open_link(link: &str, cx: &mut App) {
     let registry = ConnectionRegistry::global(cx);
     if !registry.read(cx).listed() {
-        cx.default_global::<LinksWaiting>().0 += 1;
+        cx.default_global::<LinksWaiting>().count += 1;
         let listed = registry.update(cx, |registry, _| registry.when_listed());
         let link = link.to_owned();
         cx.spawn(async move |cx| {
             listed.await;
             cx.update(|cx| {
-                cx.default_global::<LinksWaiting>().0 -= 1;
                 open_link(&link, cx);
+                link_opened(cx);
             });
         })
         .detach();
@@ -677,15 +719,17 @@ mod reopen_tests {
 
     /// A graph two saved windows listed reopens in the first alone; the second shows what is
     /// left, and a window left with nothing is not reopened. Graphs are taken by their CLI
-    /// target: one on a target the CLI no longer lists is not reopened.
+    /// target at its address: one on a target the CLI no longer lists is not reopened, nor one
+    /// on a target whose name the CLI now gives another server, whose saved state it is not.
     #[test]
     fn a_graph_two_windows_listed_reopens_in_the_first() {
-        let window = |graphs: &[&str], shown: usize| -> SavedWindow {
+        let saved = |graphs: &[&str], url: &str, shown: usize| -> SavedWindow {
             serde_json::from_value(serde_json::json!({
                 "graphs": graphs
                     .iter()
                     .map(|graph| serde_json::json!({
                         "target": "studio",
+                        "url": url,
                         "graph": graph,
                         "branch": "main",
                     }))
@@ -694,20 +738,23 @@ mod reopen_tests {
             }))
             .unwrap()
         };
+        let window = |graphs: &[&str], shown: usize| saved(graphs, "https://studio.test", shown);
         let elsewhere: SavedWindow = serde_json::from_value(serde_json::json!({
-            "graphs": [{"target": "gone", "graph": "crm", "branch": "main"}],
+            "graphs": [{"target": "gone", "url": "https://gone.test", "graph": "crm", "branch": "main"}],
             "shown": 0,
         }))
         .unwrap();
+        let listed = |target: &str, url: &str| target == "studio" && url == "https://studio.test";
         let mut taken = HashSet::new();
         let windows: Vec<SavedWindow> = [
             window(&["crm", "notes"], 0),
             window(&["notes", "ops"], 1),
             window(&["crm"], 0),
             elsewhere,
+            saved(&["people"], "https://studio-before.test", 0),
         ]
         .into_iter()
-        .filter_map(|window| reopenable(window, |target| target == "studio", &mut taken))
+        .filter_map(|window| reopenable(window, listed, &mut taken))
         .collect();
         let graphs: Vec<Vec<&str>> = windows
             .iter()
@@ -806,8 +853,8 @@ mod start_tests {
         let (_registry, servers, asked) = studio_with_servers(cx);
         let saved: SavedWindow = serde_json::from_value(serde_json::json!({
             "graphs": [
-                {"target": "a", "graph": "notes", "branch": "main"},
-                {"target": "b", "graph": "people", "branch": "main"},
+                {"target": "a", "url": "http://a.test", "graph": "notes", "branch": "main"},
+                {"target": "b", "url": "http://b.test", "graph": "people", "branch": "main"},
             ],
             "shown": 1,
         }))
@@ -819,10 +866,87 @@ mod start_tests {
         let hosts = std::mem::take(&mut *asked.lock().unwrap());
         assert!(!hosts.iter().any(|host| host == "c.test"), "{hosts:?}");
 
-        cx.update(|window, cx| ask_for_graph(&workspace, window, cx));
+        cx.update(|window, cx| show_open_dialog(&workspace, window, cx));
         cx.run_until_parked();
         assert_eq!(connected(&servers, cx), [true, true, true]);
         workspace.read_with(cx, |workspace, _| assert!(workspace.has_modal()));
+    }
+
+    /// A link that opens Studio and cannot be opened leaves its window asking for a graph: the
+    /// window waited for the link rather than ask, and asks once it is refused, whatever was
+    /// wrong with it (one from `omnigraph studio`, a server Studio does not know, which is how a
+    /// target that needs a token reads on Windows). The refusal is said too. Before, the window
+    /// stayed empty with no dialog, and the toast pointed at "Open a graph", which was not there.
+    #[gpui::test]
+    fn a_link_refused_at_a_start_leaves_the_open_dialog(cx: &mut TestAppContext) {
+        refused_at_a_start("omnigraph-studio://connect?code=abc", cx);
+    }
+
+    #[gpui::test]
+    fn a_link_to_an_unknown_server_at_a_start_leaves_the_open_dialog(cx: &mut TestAppContext) {
+        refused_at_a_start(
+            "omnigraph-studio://graph?server=http://unknown.test&graph=g",
+            cx,
+        );
+    }
+
+    /// `link` opens Studio, whose one window would ask for a graph, and is refused.
+    fn refused_at_a_start(link: &str, cx: &mut TestAppContext) {
+        let (registry, servers, _asked) = studio_with_servers(cx);
+        registry.update(cx, |registry, cx| registry.set_listed_for_tests(false, cx));
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        cx.update(|window, cx| ask_for_graph(&workspace, window, cx));
+        cx.update(|_, cx| open_link(link, cx));
+        registry.update(cx, |registry, cx| registry.set_listed_for_tests(true, cx));
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.session().is_none());
+            assert!(workspace.has_modal(), "the dialog");
+            assert_eq!(workspace.toast_messages().len(), 1, "the refusal is said");
+        });
+        assert_eq!(
+            connected(&servers, cx),
+            [true, true, true],
+            "as the dialog does"
+        );
+    }
+
+    /// A start that reopens no window asks for a graph only after the links that came while
+    /// the CLI's targets were listed: one that opens its graph keeps the dialog away, and with
+    /// it every server but its own unconnected. Before, the reopened windows' path showed the
+    /// dialog at once, connecting every server, and the link then hid it.
+    #[gpui::test]
+    fn a_link_at_a_reopened_start_keeps_the_dialog_away(cx: &mut TestAppContext) {
+        let (registry, servers, asked) = studio_with_servers(cx);
+        registry.update(cx, |registry, cx| registry.set_listed_for_tests(false, cx));
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let handle = gpui::VisualContext::window_handle(cx)
+            .downcast::<Workspace>()
+            .unwrap();
+        let gone: SavedWindow = serde_json::from_value(serde_json::json!({
+            "graphs": [{"target": "gone", "url": "http://gone.test", "graph": "g", "branch": "main"}],
+            "shown": 0,
+        }))
+        .unwrap();
+        cx.update(|_, cx| open_link("omnigraph-studio://graph?server=http://c.test&graph=g", cx));
+        // Listed, and the reopened windows filled before the link opens, as at a start: from the
+        // app, as a start fills them, since inside the window's own update `fill_reopened`
+        // could not update the window, and would ask nothing.
+        registry.update(cx, |registry, cx| registry.set_listed_for_tests(true, cx));
+        cx.cx.update(|cx| fill_reopened(vec![(handle, gone)], cx));
+        assert_eq!(
+            connected(&servers, cx),
+            [false, false, false],
+            "no dialog yet"
+        );
+        cx.run_until_parked();
+        assert_eq!(connected(&servers, cx), [false, false, true]);
+        let hosts = std::mem::take(&mut *asked.lock().unwrap());
+        assert!(hosts.iter().all(|host| host == "c.test"), "{hosts:?}");
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(!workspace.has_modal(), "no dialog over the link's graph");
+            assert_eq!(workspace.session().unwrap().read(cx).graph_id, "g");
+        });
     }
 }
 

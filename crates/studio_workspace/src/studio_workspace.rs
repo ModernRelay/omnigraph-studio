@@ -117,9 +117,13 @@ struct Toast {
     /// ([`Workspace::make_room`]); 0 for a toast that stands for itself.
     folded: usize,
     /// The graph the toast is about (a write's outcome, a fold of a graph's errors); `None` for
-    /// one about no graph (a notice about the servers, a file not written). Errors fold only
-    /// with errors about the same graph.
+    /// one about no graph (a notice about the servers, a file not written). Errors fold with
+    /// errors about the same graph, and across graphs only when no graph has two to fold
+    /// ([`Self::across`]).
     graph: Option<GraphAt>,
+    /// A fold of errors about several graphs, or about graphs and the servers
+    /// ([`Workspace::fold_oldest_error`]).
+    across: bool,
 }
 
 impl Toast {
@@ -158,6 +162,33 @@ impl Toast {
             hovered: false,
             folded: count,
             graph,
+            across: false,
+        }
+    }
+
+    /// The toast that stands for `count` errors folded off a full stack whatever they were
+    /// about, when no graph had two errors to fold. It stays until dismissed, as they would have.
+    /// Its Open activity shows the activity log of the graph the window shows when it is
+    /// pressed, which lists that graph's refusals and unknown outcomes; each other graph's are
+    /// in its own log, shown with it.
+    fn folded_across(id: usize, count: usize) -> Self {
+        Self {
+            id,
+            kind: ToastKind::Error,
+            message: folded_errors_text(count, None),
+            action: Some(FollowUp {
+                label: "Open activity".into(),
+                action: Box::new(studio_actions::workspace::ActivatePanel {
+                    id: ACTIVITY_PANEL.into(),
+                }),
+                on: None,
+                undoes: false,
+            }),
+            remaining: None,
+            hovered: false,
+            folded: count,
+            graph: None,
+            across: true,
         }
     }
 }
@@ -698,8 +729,10 @@ impl Workspace {
                 .iter()
                 .map(|(session, _)| {
                     let session = session.read(cx);
+                    let server = &session.connection.read(cx).server;
                     SavedGraph {
-                        target: session.connection.read(cx).server.name.clone(),
+                        target: server.name.clone(),
+                        url: server.url.clone(),
                         graph: session.graph_id.clone(),
                         branch: session.branch.clone(),
                     }
@@ -2299,6 +2332,7 @@ impl Workspace {
             hovered: false,
             folded: 0,
             graph,
+            across: false,
         });
         cx.notify();
         if remaining.is_none() {
@@ -2339,10 +2373,10 @@ impl Workspace {
     /// the window's edge, the newest last: the oldest toast that is not kept ([`Toast::kept`])
     /// goes, one with no follow-up before one with. While every toast shown is kept, errors
     /// fold instead ([`Self::fold_oldest_error`]), so a run of them, such as an agent's
-    /// refused writes, takes the place of one. An Undo, which only its toast offers, is never
-    /// taken away nor folded: the stack passes the limit only when Undos fill it, with at most
-    /// one other toast and the one coming. Undos come only from deletes the person confirmed,
-    /// and each goes after [`TOAST_DURATION`].
+    /// refused writes, takes the place of one, whatever graphs they are about. An Undo, which
+    /// only its toast offers, is never taken away nor folded: the stack passes the limit only
+    /// when Undos fill it, with at most one error and the toast coming. Undos come only from
+    /// deletes the person confirmed, and each goes after [`TOAST_DURATION`].
     fn make_room(&mut self) {
         if self.toasts.len() < TOASTS_SHOWN {
             return;
@@ -2360,12 +2394,13 @@ impl Workspace {
         }
     }
 
-    /// One toast fewer by folding one graph's errors: the oldest error shown on its own that
-    /// can fold joins the toast that counts its graph's errors folded, or, with none up, it and
-    /// the next of its graph's errors shown alone become that toast, in the older's place.
-    /// Errors about no graph fold only with each other. With no two errors of one graph up,
-    /// nothing folds. A fold stands for one graph, so its Open activity shows that graph's log,
-    /// where each of the errors folded is listed.
+    /// One toast fewer by folding errors, by graph when one graph can: the oldest error shown on
+    /// its own that can fold joins the toast that counts its graph's errors folded, or, with
+    /// none up, it and the next of its graph's errors shown alone become that toast, in the
+    /// older's place. Errors about no graph fold with each other alike. A fold that stands for
+    /// one graph opens that graph's log, where each of the errors folded is listed. With no two
+    /// errors of one graph up (three graphs' and a notice about the servers, say), the errors
+    /// fold across graphs instead ([`Self::fold_across`]), so the stack still makes room.
     fn fold_oldest_error(&mut self) {
         let alone = |toast: &Toast| toast.kind == ToastKind::Error && toast.folded == 0;
         for oldest in 0..self.toasts.len() {
@@ -2376,7 +2411,7 @@ impl Workspace {
             if let Some(fold) = self
                 .toasts
                 .iter_mut()
-                .find(|toast| toast.folded > 0 && toast.graph == graph)
+                .find(|toast| toast.folded > 0 && !toast.across && toast.graph == graph)
             {
                 fold.folded += 1;
                 fold.message = folded_errors_text(fold.folded, graph.as_ref());
@@ -2394,11 +2429,50 @@ impl Workspace {
                 return;
             }
         }
+        self.fold_across();
+    }
+
+    /// One toast fewer when no graph's errors fold: the oldest error shown joins the fold made
+    /// across graphs before, or, with none up, the two oldest errors shown, alone or folded,
+    /// become one, in the older's place, counting every error they stood for
+    /// ([`Toast::folded_across`]). With fewer than two errors up, nothing folds: the rest of the
+    /// stack is Undos.
+    fn fold_across(&mut self) {
+        let errors: Vec<usize> = (0..self.toasts.len())
+            .filter(|&at| self.toasts[at].kind == ToastKind::Error && !self.toasts[at].across)
+            .collect();
+        let stands_for = |toast: &Toast| toast.folded.max(1);
+        if let Some(fold) = self.toasts.iter().position(|toast| toast.across) {
+            let Some(&oldest) = errors.first() else {
+                return;
+            };
+            let count = self.toasts[fold].folded + stands_for(&self.toasts[oldest]);
+            self.toasts[fold].folded = count;
+            self.toasts[fold].message = folded_errors_text(count, None);
+            self.toasts.remove(oldest);
+            return;
+        }
+        let [older, newer, ..] = errors[..] else {
+            return;
+        };
+        let count = stands_for(&self.toasts[older]) + stands_for(&self.toasts[newer]);
+        self.toasts.remove(newer);
+        let id = self.next_toast;
+        self.next_toast += 1;
+        self.toasts[older] = Toast::folded_across(id, count);
     }
 
     pub fn dismiss_toast(&mut self, id: usize, cx: &mut Context<Self>) {
         self.toasts.retain(|t| t.id != id);
         cx.notify();
+    }
+
+    /// The text of each toast shown, oldest first.
+    pub fn toast_messages(&self) -> Vec<SharedString> {
+        self.toasts
+            .iter()
+            .map(|toast| toast.message.clone())
+            .collect()
     }
 
     // ---- actions ----
@@ -4140,8 +4214,8 @@ fn address_of(session: &Entity<GraphSession>, cx: &App) -> (String, String) {
 }
 
 /// The key a graph's tabs and drafts are saved under: the graph's one key, its CLI target's
-/// name and its id (`GraphSession::overrides_key`), as the saved windows name the graph and its
-/// settings, saved queries and conversations are filed (spec 002).
+/// name and address and its id (`GraphSession::overrides_key`), as the saved windows name the
+/// graph and its settings, saved queries and conversations are filed (spec 002).
 fn saved_key_of(session: &Entity<GraphSession>, cx: &App) -> String {
     session.read(cx).overrides_key(cx)
 }
@@ -6860,6 +6934,118 @@ mod tests {
             let fold = &workspace.toasts[0];
             assert_eq!(fold.message.as_ref(), "2 earlier errors");
             assert!(fold.action.is_none());
+        });
+    }
+
+    /// Errors kept from four sources, three graphs and a notice about the servers, leave no
+    /// two of one graph to fold: they fold across graphs instead, so every new error still
+    /// makes room within [`TOASTS_SHOWN`], and a delete's Undo stays up. The fold counts what it
+    /// took and opens the activity log of the graph the window shows. Before, nothing folded,
+    /// and each new error ran the stack past the limit, below the window's edge.
+    #[gpui::test]
+    fn errors_of_four_sources_fold_across_graphs_within_the_stack(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+        });
+        let notes = idle_session("http://a.test", "notes", cx);
+        let people = idle_session("http://b.test", "people", cx);
+        let ops = idle_session("http://c.test", "ops", cx);
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update(cx, |workspace, cx| {
+            workspace.graph_order.push(people.entity_id());
+            workspace.subscribe_session(people.clone(), cx);
+            workspace.add_behind(notes.clone(), None, cx);
+            workspace.add_behind(ops.clone(), None, cx);
+            for id in ["nodes", ACTIVITY_PANEL] {
+                let view = cx.new(|_| Field);
+                workspace.add_panel(
+                    PanelPosition::Bottom,
+                    id,
+                    id,
+                    IconName::Table,
+                    view.into(),
+                    cx,
+                );
+            }
+            workspace.activate_panel("nodes", cx);
+        });
+        let refuse =
+            |session: &Entity<GraphSession>, n: usize, cx: &mut gpui::VisualTestContext| {
+                let outcome = OutcomeKind::Refused {
+                    message: "the policy denies it".into(),
+                };
+                log_outcome(session, &format!("Write {n}"), outcome, None, cx);
+            };
+        let shown = |cx: &mut gpui::VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .toast_messages()
+                    .iter()
+                    .map(|message| message.to_string())
+                    .collect::<Vec<_>>()
+            })
+        };
+        let refused =
+            |n: usize| format!("Write {n} · refused: the policy denies it. Nothing was written.");
+        log_outcome(
+            &people,
+            "Delete Person ada",
+            OutcomeKind::Committed {
+                commit: Some("c1".into()),
+            },
+            Some(graph_store::FollowUp::UndoDelete),
+            cx,
+        );
+        refuse(&notes, 2, cx);
+        refuse(&people, 3, cx);
+        refuse(&ops, 4, cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_toast(ToastKind::Error, "A notice about the servers", cx)
+        });
+        assert_eq!(
+            shown(cx),
+            [
+                "Delete Person ada · committed to main".to_owned(),
+                "2 earlier errors".to_owned(),
+                format!("ops: {}", refused(4)),
+                "A notice about the servers".to_owned(),
+            ],
+            "the two oldest errors, of two graphs, folded"
+        );
+        refuse(&people, 5, cx);
+        refuse(&notes, 6, cx);
+        assert_eq!(
+            shown(cx),
+            [
+                "Delete Person ada · committed to main".to_owned(),
+                "4 earlier errors".to_owned(),
+                refused(5),
+                format!("notes: {}", refused(6)),
+            ],
+            "each error after joins the fold, the Undo still up"
+        );
+
+        let fold = workspace.read_with(cx, |workspace, _| workspace.toasts[1].id);
+        workspace.update_in(cx, |workspace, window, cx| {
+            window.focus(&workspace.focus_handle, cx)
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.run_follow_up(fold, window, cx)
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.session().unwrap().read(cx).graph_id,
+                "people",
+                "the graph shown stays"
+            );
+            assert_eq!(
+                (workspace.bottom.open, workspace.bottom.active_id()),
+                (true, Some(ACTIVITY_PANEL.into())),
+                "Open activity shows the activity log"
+            );
         });
     }
 

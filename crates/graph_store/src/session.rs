@@ -639,6 +639,11 @@ pub struct GraphSession {
     pub connection: Entity<Connection>,
     pub graph_id: String,
     pub branch: String,
+    /// How this graph's saved state names its server ([`crate::ServerEntry::saved_key`]),
+    /// taken when the session is made: a target renamed while the graph is open keeps the
+    /// graph's state where it was until the graph is opened again, under the new name, with
+    /// nothing saved.
+    server_key: String,
     pub schema: Loadable<Arc<SchemaModel>>,
     pub branches: Loadable<Vec<String>>,
     pub datasets: Loadable<Vec<SnapshotDatasetOutput>>,
@@ -665,6 +670,10 @@ pub struct GraphSession {
     /// How many outcomes were ever logged, those dropped from [`Self::outcomes`] included: a
     /// view that has seen this many has seen every outcome.
     pub outcomes_logged: u64,
+    /// How many times what the target's history showed of a merge whose outcome is unknown
+    /// changed on its entry ([`Self::settle_merge`]): the log draws such a row again, since it
+    /// no longer offers to check History.
+    pub merges_settled: u64,
     pub reads_in_flight: usize,
     pub writes_in_flight: usize,
     /// Why the graph is unavailable, when it answered 503 (spec 003); reads resume, and this
@@ -837,10 +846,12 @@ impl GraphSession {
         branch: String,
         cx: &mut Context<Self>,
     ) -> Self {
+        let server_key = connection.read(cx).server.saved_key();
         let mut session = Self {
             connection,
             graph_id,
             branch,
+            server_key,
             schema: Loadable::NotLoaded,
             branches: Loadable::NotLoaded,
             datasets: Loadable::NotLoaded,
@@ -852,6 +863,7 @@ impl GraphSession {
             stored_queries_wanted: false,
             outcomes: Vec::new(),
             outcomes_logged: 0,
+            merges_settled: 0,
             reads_in_flight: 0,
             writes_in_flight: 0,
             unavailable: None,
@@ -1247,8 +1259,15 @@ impl GraphSession {
 
     /// The person's Refresh: [`Self::reload`], and a CLI server's token asked of the CLI again
     /// ([`Connection::refresh_token`]). Only Refresh asks it: a graph first shown reads with the
-    /// token its connect was given.
+    /// token its connect was given. A graph whose first reads have not gone yet sends them the
+    /// way it would have ([`Self::open_when_ready`]): once its token is there, connecting a
+    /// server left idle (a connect cancelled) to ask for it. Read at once, they would carry no
+    /// token and be refused.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        if !self.opened {
+            self.open_when_ready(cx);
+            return;
+        }
         self.reload(cx);
         self.connection
             .update(cx, |connection, cx| connection.refresh_token(cx));
@@ -1808,20 +1827,22 @@ impl GraphSession {
         }));
     }
 
-    /// This graph's one key for what Studio saves of it: its CLI target's name and its id,
-    /// `<target>/<graph>` ([`studio_settings::overrides_key`]). Its settings (spec 002), its tabs
-    /// and drafts, its saved queries' folder and its agent conversations are filed under it.
-    pub fn overrides_key(&self, cx: &App) -> String {
-        studio_settings::overrides_key(&self.connection.read(cx).server.name, &self.graph_id)
+    /// This graph's one key for what Studio saves of it: its server, by its CLI target's name
+    /// and address as the session was made with them ([`crate::ServerEntry::saved_key`]), and
+    /// its id, `<target>@<address>/<graph>` ([`studio_settings::overrides_key`]). Its settings
+    /// (spec 002), its tabs and drafts, its saved queries' folder and its agent conversations
+    /// are filed under it. The same for the session's life: a rename meanwhile moves nothing.
+    pub fn overrides_key(&self, _: &App) -> String {
+        studio_settings::overrides_key(&self.server_key, &self.graph_id)
     }
 
     /// The browsing limits in effect for this graph: its overrides in the settings, else the
     /// shared ones.
     pub fn options(&self, cx: &App) -> studio_settings::GraphOptions {
-        let target = &self.connection.read(cx).server.name;
+        let (server, graph) = (&self.server_key, &self.graph_id);
         match cx.try_global::<studio_settings::StudioSettings>() {
-            Some(settings) => settings.for_graph(target, &self.graph_id),
-            None => studio_settings::StudioSettings::default().for_graph(target, &self.graph_id),
+            Some(settings) => settings.for_graph(server, graph),
+            None => studio_settings::StudioSettings::default().for_graph(server, graph),
         }
     }
 
@@ -3884,12 +3905,17 @@ impl GraphSession {
             })
             .filter_map(|entry| entry.merge.as_mut())
             .find(|merge| merge.source == source && merge.sent == *sent)?;
-        if merge.settled != Some(MergeSettled::Landed) && merge.settled != Some(settled) {
+        let changed = merge.settled != Some(MergeSettled::Landed) && merge.settled != Some(settled);
+        if changed {
             merge.settled = Some(settled);
+        }
+        let now = merge.settled;
+        if changed {
+            self.merges_settled += 1;
             cx.emit(SessionEvent::ActivityChanged);
             cx.notify();
         }
-        merge.settled
+        now
     }
 
     fn finish_write(
@@ -4222,7 +4248,8 @@ mod tests {
     use http_client::{AsyncBody, FakeHttpClient};
 
     use super::*;
-    use crate::connection::{ServerEntry, ServerSource};
+    use crate::cli_tokens::{Token, TokenSource};
+    use crate::connection::{ConnectionState, ServerEntry, ServerSource};
 
     /// A scope on main showing answers that depend on these node and edge types.
     fn watching(session: &mut GraphSession, nodes: &[&str], edges: &[&str]) -> ReadScope {
@@ -7299,39 +7326,35 @@ mod tests {
         });
     }
 
-    /// A graph shown while its connection's token is still on its way from the CLI sends
-    /// nothing until the token is there, then reads it all, the schema included, with no
-    /// Refresh. Before, its first reads went out with no token and were refused (401), and a new
-    /// token read the counts, the catalog and the branch list again but not the schema, so a
-    /// window a start reopened stayed empty until Refresh. A schema a 401 refused is read again
-    /// when the token changes, as every read a 401 could have refused is.
-    #[gpui::test]
-    async fn the_first_reads_wait_for_the_token_and_the_schema_loads(cx: &mut TestAppContext) {
+    /// A token source that answers its first ask when the test gives it its token, and `good`
+    /// to every ask after.
+    struct Gated(std::sync::Mutex<Option<oneshot::Receiver<&'static str>>>);
+    impl TokenSource for Gated {
+        fn token(
+            &self,
+            _: Arc<AtomicBool>,
+        ) -> futures::future::BoxFuture<'static, Result<Token, String>> {
+            let gate = self.0.lock().unwrap().take();
+            async move {
+                match gate {
+                    Some(gate) => gate.await.map(Token::new).map_err(|_| "gone".into()),
+                    None => Ok(Token::new("good")),
+                }
+            }
+            .boxed()
+        }
+    }
+
+    /// The graph reads a server was sent, each with the token it carried.
+    type GraphReads = Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+    /// A server that answers the token `good` alone, and every read of the graph `knowledge`
+    /// sent to it.
+    fn answers_good_alone() -> (Arc<dyn http_client::HttpClient>, GraphReads) {
         use futures::AsyncReadExt as _;
         use serde_json::json;
 
-        use crate::cli_tokens::{Token, TokenSource};
-
-        /// A token source that answers when the test gives it its token.
-        struct Gated(std::sync::Mutex<Option<oneshot::Receiver<&'static str>>>);
-        impl TokenSource for Gated {
-            fn token(
-                &self,
-                _: Arc<AtomicBool>,
-            ) -> futures::future::BoxFuture<'static, Result<Token, String>> {
-                let gate = self.0.lock().unwrap().take();
-                async move {
-                    match gate {
-                        Some(gate) => gate.await.map(Token::new).map_err(|_| "gone".into()),
-                        None => Ok(Token::new("good")),
-                    }
-                }
-                .boxed()
-            }
-        }
-
-        // Answers the token `good` alone; every graph read is listed with its token.
-        let asked: Arc<std::sync::Mutex<Vec<(String, String)>>> = Arc::default();
+        let asked: GraphReads = Arc::default();
         let log = asked.clone();
         let http = FakeHttpClient::create(move |request| {
             let path = request.uri().path().to_owned();
@@ -7386,6 +7409,14 @@ mod tests {
                 Ok(response.body(AsyncBody::from(body.to_string())).unwrap())
             }
         });
+        (http, asked)
+    }
+
+    /// The CLI server `personal`, whose token the CLI gives when the test sends it.
+    fn waiting_for_its_token(
+        http: Arc<dyn http_client::HttpClient>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<Connection>, oneshot::Sender<&'static str>) {
         let server = ServerEntry {
             name: "personal".into(),
             url: "https://graph.test".into(),
@@ -7395,10 +7426,24 @@ mod tests {
         let (give, gate) = oneshot::channel();
         let source: Arc<dyn TokenSource> = Arc::new(Gated(std::sync::Mutex::new(Some(gate))));
         let connection = cx.new(|_| {
-            Connection::new(server.clone(), None, http.clone())
+            Connection::new(server, None, http)
                 .unwrap()
                 .with_token_source(Some(source))
         });
+        (connection, give)
+    }
+
+    /// A graph shown while its connection's token is still on its way from the CLI sends
+    /// nothing until the token is there, then reads it all, the schema included, with no
+    /// Refresh. Before, its first reads went out with no token and were refused (401), and a new
+    /// token read the counts, the catalog and the branch list again but not the schema, so a
+    /// window a start reopened stayed empty until Refresh. A schema a 401 refused is read again
+    /// when the token changes, as every read a 401 could have refused is.
+    #[gpui::test]
+    async fn the_first_reads_wait_for_the_token_and_the_schema_loads(cx: &mut TestAppContext) {
+        let (http, asked) = answers_good_alone();
+        let (connection, give) = waiting_for_its_token(http.clone(), cx);
+        let server = connection.read_with(cx, |connection, _| connection.server.clone());
         // As a start reopens a window: the server connects, then its graph is shown at once.
         connection.update(cx, |connection, cx| connection.connect(cx));
         let session =
@@ -7451,6 +7496,144 @@ mod tests {
         session.read_with(cx, |session, _| {
             assert!(session.schema_model().is_some(), "with no Refresh")
         });
+    }
+
+    /// A graph waiting for its token gets it whatever the person does meanwhile. Cancel on its
+    /// server's slow connect stops the connect but not the ask the window waits on: the token
+    /// comes, the graph reads with it, and the server stays as Cancel left it. Refresh before
+    /// the token sends nothing, and after a Cancel connects the server again to ask for it.
+    /// Before, Cancel dropped the ask, so the window stayed empty until it was hidden and shown
+    /// again, and Refresh sent the first reads without a token, to be refused (401), without
+    /// connecting.
+    #[gpui::test]
+    async fn a_graph_waiting_for_its_token_gets_it_through_cancel_and_refresh(
+        cx: &mut TestAppContext,
+    ) {
+        let (http, asked) = answers_good_alone();
+        let read_with_the_token = |asked: &GraphReads| {
+            let sent = std::mem::take(&mut *asked.lock().unwrap());
+            assert!(
+                sent.iter().all(|(_, token)| token == "Bearer good"),
+                "every read carried the token: {sent:?}"
+            );
+            for read in ["schema", "snapshot", "branches", "access"] {
+                assert!(
+                    sent.iter().any(|(sent, _)| sent == read),
+                    "{read}: {sent:?}"
+                );
+            }
+        };
+        let state = |connection: &Entity<Connection>, cx: &mut TestAppContext| {
+            connection.read_with(cx, |connection, _| connection.state.clone())
+        };
+
+        // Cancel while the window waits.
+        let (connection, give) = waiting_for_its_token(http.clone(), cx);
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        let session =
+            cx.update(|cx| open_session(connection.clone(), "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        connection.update(cx, |connection, cx| connection.cancel(cx));
+        cx.run_until_parked();
+        assert_eq!(state(&connection, cx), ConnectionState::Idle);
+        assert!(asked.lock().unwrap().is_empty(), "{:?}", asked.lock());
+        give.send("good")
+            .expect("the ask the window waits on goes on");
+        cx.run_until_parked();
+        read_with_the_token(&asked);
+        session.read_with(cx, |session, _| assert!(session.schema_model().is_some()));
+        assert_eq!(
+            state(&connection, cx),
+            ConnectionState::Idle,
+            "the connect stays cancelled"
+        );
+
+        // Refresh before the token comes, then after a Cancel.
+        let (connection, _give) = waiting_for_its_token(http, cx);
+        let session =
+            cx.update(|cx| open_session(connection.clone(), "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        assert_eq!(state(&connection, cx), ConnectionState::Connecting);
+        session.update(cx, |session, cx| session.refresh(cx));
+        cx.run_until_parked();
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "nothing sent without the token: {:?}",
+            asked.lock()
+        );
+        connection.update(cx, |connection, cx| connection.cancel(cx));
+        session.update(cx, |session, cx| session.refresh(cx));
+        assert_eq!(
+            state(&connection, cx),
+            ConnectionState::Connecting,
+            "Refresh connects the server again, which asks for the token"
+        );
+        cx.run_until_parked();
+        read_with_the_token(&asked);
+        session.read_with(cx, |session, _| assert!(session.schema_model().is_some()));
+        assert_eq!(state(&connection, cx), ConnectionState::Ready);
+    }
+
+    /// What Studio saves of a graph is filed by its CLI target's name and address: a name the
+    /// CLI gives another server is another key, so that server inherits none of the first one's
+    /// settings, tabs, saved queries or conversations. A target renamed while its graph is open
+    /// keeps the open graph's key, settings included, so nothing moves under the session; the
+    /// graph opened again under the new name starts with nothing saved. Before, the key was the
+    /// target's name alone, read again at each call: a rename moved it all to an empty key in
+    /// the middle of a session, and a name reused for another server handed it everything.
+    #[gpui::test]
+    fn a_graphs_saved_state_is_filed_by_its_targets_name_and_address(cx: &mut TestAppContext) {
+        let http = FakeHttpClient::with_404_response();
+        let server = |url: &str, cx: &mut TestAppContext| {
+            let entry = ServerEntry {
+                name: "prod".into(),
+                url: url.into(),
+                source: ServerSource::Cli,
+                known_graphs: Vec::new(),
+            };
+            cx.new(|_| Connection::new(entry, None, http.clone()).unwrap())
+        };
+        let open = |connection: &Entity<Connection>, cx: &mut TestAppContext| {
+            let connection = connection.clone();
+            cx.update(|cx| open_session_behind(connection, "crm".into(), "main".into(), cx))
+        };
+        let key = |session: &Entity<GraphSession>, cx: &mut TestAppContext| {
+            session.read_with(cx, |session, cx| session.overrides_key(cx))
+        };
+        let page = |session: &Entity<GraphSession>, cx: &mut TestAppContext| {
+            session.read_with(cx, |session, cx| session.options(cx).tree_page_size)
+        };
+        let first = server("https://a.test", cx);
+        let reused = server("https://b.test", cx);
+        let (at_a, at_b) = (open(&first, cx), open(&reused, cx));
+        assert_eq!(key(&at_a, cx), "prod@https://a.test/crm");
+        assert_eq!(key(&at_b, cx), "prod@https://b.test/crm");
+        cx.update(|cx| {
+            let mut settings = studio_settings::StudioSettings::default();
+            let overrides = studio_settings::GraphOverrides {
+                tree_page_size: Some(7),
+                ..Default::default()
+            };
+            settings
+                .graphs
+                .insert("prod@https://a.test/crm".into(), overrides);
+            cx.set_global(settings);
+        });
+        assert_eq!(page(&at_a, cx), 7);
+        assert_ne!(page(&at_b, cx), 7, "another server's settings");
+
+        first.update(cx, |connection, _| {
+            connection.server.name = "production".into()
+        });
+        assert_eq!(key(&at_a, cx), "prod@https://a.test/crm", "nothing moves");
+        assert_eq!(page(&at_a, cx), 7);
+        let renamed = open(&first, cx);
+        assert_eq!(key(&renamed, cx), "production@https://a.test/crm");
+        assert_ne!(
+            page(&renamed, cx),
+            7,
+            "opened again, it starts with nothing saved"
+        );
     }
 
     /// A branch starts at a branch's head or at a commit, and its request names the one, never
