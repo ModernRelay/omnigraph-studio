@@ -81,6 +81,16 @@ exit status and the last 20 lines (at most 4 KB) of its stderr, and **Restart**.
 graph or closing the window ends the agent (the process group is killed; on Windows, the job
 Studio's launcher holds it in, spec 013) and removes the socket.
 
+The agent starts when the first message is sent, so that message waits for the start (a first
+`npx` fetch and the agent's own MCP servers take seconds). It is not queued: it shows in the
+thread at once as the person's, with "Starting the agent…" under it, and is sent as the first
+turn when the agent is ready (`AgentPanel::opening`); messages sent after it wait in the queue
+behind it. A start that has not answered in 20 s says "The agent has not answered yet" with
+Start again, and only then does the composer offer the restart button. A start that fails keeps
+the message ("Not sent yet: it goes when the agent starts again") under the agent's error, which
+reads as its reason without the protocol library's debugging fields. A message sent before an
+agent is chosen goes once one is.
+
 `session/new` gets `cwd` = `<data dir>/agent/workspace` (created empty) and one MCP server:
 `{ name: "omnigraph", command: <Studio's executable>, args: ["mcp-proxy", <socket>] }`. The
 socket is `<runtime dir>/<pid>-<n>.sock`, where the runtime directory is
@@ -318,7 +328,8 @@ and Delta's sidebar.
 
 ACP runs one turn at a time and has no queue; Zed queues on the client
 (`agent_ui/src/conversation_view/message_queue.rs` at `v1.23.2`), and so does Studio. A message
-sent while the agent works waits in a card above the composer ("2 queued messages", Clear all),
+sent while the agent works (or after the first one while it starts, see Lifecycle) waits in a
+card above the composer ("2 queued messages", Clear all),
 one line each with the next marked by an accent dot; Remove and Edit (back into the composer,
 ahead of a draft) on hover, Send now on the next one always and on the rest on hover. When a turn
 ends the next message is sent. Stop pauses the queue ("paused until you send") until the person
@@ -376,6 +387,7 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-26 | A first message shows in the thread while the agent starts, and the whole flow reads right | `agent_panel` `a_first_message_opens_the_conversation_and_later_ones_queue`, `streaming_into_the_last_turn_keeps_the_earlier_turns_blocks` (the waiting block ends the thread, before the stop's callout), `a_run_of_steps_reads_as_one_sentence`, `host::tests::an_agents_error_reads_without_the_librarys_internals`; offscreen snapshots on the dev graph with a stand-in ACP agent whose start takes 6 to 90 s: a first send, a second send while starting, a start past 20 s, an agent that exits at once, a send while a turn runs, Stop; then Codex (`@agentclientprotocol/codex-acp` 2.2.2) asked to reply "ok" and to count Person nodes, and the conversation opened again | Before: Ragnor's first message on `mr-ops` sat in "1 queued message" with Send now while the agent started, under the empty "Ask about the graph", with only an orange dot to say why, and the restart button showed from the first second. After: the message is in the thread with "Starting the agent…", a second waits in the queue behind it, both go in order once the agent is ready; past 20 s the thread says the agent has not answered, with Start again; an agent that exits shows "Process exited with exit status: 1" (before, the library's JSON with a path into `~/.cargo/registry`) above the message, kept to send. Codex answered "ok" and "200 Person nodes" (the sidebar's count); its run's line now says "used 3 other tools" beside Studio's own, so the parts add up to the turn's tool calls (before, "used 6 tools" read as the total beside "9 tool calls"); the context ring shows its percentage, so a nearly empty one no longer reads as a spinner. The conversation came back with its history. Outside Studio, `codex-acp` answered `initialize` in 3 s and `session/new` in 1 to 4 s with and without Studio's MCP proxy; a `session/load` of a conversation another Codex client holds is refused (`thread_active_writer`), which Studio answers by opening a new one. The ten minutes Ragnor's live message waited were not reproduced |
 | 2026-10-21 | With no CLI that reads the home Studio writes, the thread says which CLI it found, why it was refused, and what to install | `agent_panel` `the_cli_that_reads_the_home_studio_writes_is_chosen_without_a_server` (the notice is `no_cli_text`, spec 013) | The notice names the graph's HTTP API and OmniGraph's version-1 operator configuration, each CLI found with its release and reason ("0.14.0-edge+50283ce, which predates that configuration: it has no `config validate`" for the CLI installed here), and ends with the edge build to install, by commit (main `ff542202` or later; `edge-20261021-888223b` is older), the edge installer's command, or `agent.omnigraph_cli`. A configured CLI passed over is named as not speaking the API "with OmniGraph's version-1 operator configuration". Until such a build is installed the agent has no CLI here |
 | 2026-10-21 | The approval keys answer only the write card that shows them | `agent_panel` `the_keys_answer_only_the_write_card_that_shows_them` | Before, ⌘Y, ⌘⌥Y and ⌘⌥N answered the oldest waiting card of any kind (`pending_index`), which could be a permission card that showed no keys: with a Bash request waiting above a write card, ⌘Y allowed the shell command and ⌘⌥Y picked the agent's AllowAlways, a lasting rule. Now they answer the oldest waiting write card (`keyed_write`), which alone shows them; a permission card with no write card under it takes no key, and is answered by its buttons |
 | 2026-10-21 | A write sent before the agent stopped shows its real outcome, and the branch it made is kept | `agent_panel` `a_write_sent_before_the_agent_stopped_still_shows_its_outcome`, `sessions` `conversations_are_kept_per_graph_newest_first` (extended with `set_branch_created`) | Before, stopping the agent marked a running write's card "Outcome unknown" ("the server did not confirm this change") though the gateway ran the write on and the session logged how it ended, and the panel stopped listening, so a branch that write made was never saved and Review was gone after a resume. Now the card keeps running until the outcome comes through what records the write (the gateway's `GatewayEvent::Finished` is gone), finds its card by its own id after the thread changed, and the branch learns whether it exists and is saved; with the tab closed, the conversation's record still learns it. A card still waiting for the person says "Not sent: the agent stopped before you decided", not "Rejected" |

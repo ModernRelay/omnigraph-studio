@@ -59,6 +59,18 @@ check the branch history before the agent tries it again.";
 /// What the card of a write still waiting for the person says when the agent stops.
 const STOPPED_UNSENT: &str = "Not sent: the agent stopped before you decided.";
 
+/// How long the agent may take to start before the thread says it is slow and offers to start
+/// it again. A first start fetches the adapter (`npx`) and starts its MCP servers, which can
+/// take seconds; one past this has most likely stalled.
+const SLOW_START: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Whether a message sent before the agent is ready opens the conversation, shown in the thread
+/// at once ([`AgentPanel::opening`]), rather than waiting in the queue: only when nothing was
+/// sent before it, so the messages go in the order they were sent.
+fn opens(has_opening: bool, queue_holds: bool) -> bool {
+    !has_opening && !queue_holds
+}
+
 /// The write card the approval keys answer: the one waiting longest. A permission request of
 /// the agent's own is answered only by its buttons: there the agent's "always" option is a
 /// lasting rule of its own, which ⌘⌥Y, Always on this branch for a write, must not pick
@@ -404,7 +416,8 @@ impl Entry {
 }
 
 /// One item of the thread's list: an entry, a query the agent ran, a run of steps folded to
-/// one line, or the callout of an agent that stopped. `lead` carries the agent's mark; `ends`
+/// one line, the message sent before the agent was ready with how its start goes, or the
+/// callout of an agent that stopped. `lead` carries the agent's mark; `ends`
 /// marks the last reply of a finished turn, which carries the turn's actions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Block {
@@ -425,13 +438,16 @@ enum Block {
         end: usize,
         lead: bool,
     },
+    /// The agent starting, under the message sent before it was ready
+    /// ([`AgentPanel::opening`]), or that message after the agent stopped before it went.
+    Waiting,
     Exited,
 }
 
 /// What a thread was brought up to: its entries' version, its folds' count, how the agent
 /// stopped, and whether it is working on a turn, which holds back the turn's actions
 /// ([`AgentPanel::thread_key`]).
-type ThreadKey = (u64, u64, Option<u64>, bool);
+type ThreadKey = (u64, u64, Option<u64>, bool, Option<u64>);
 
 /// The thread's entries, and what each shows folded to a number, kept as they change: a
 /// streamed token rehashes the entry it lands in, not the whole conversation (a tool's input
@@ -828,6 +844,14 @@ pub struct AgentPanel {
     _markdown_watch: std::collections::HashMap<usize, Subscription>,
     state: State,
     entries: Entries,
+    /// The message sent before the agent was ready for it: shown in the thread at once, as the
+    /// person's, and sent as the first turn once the agent is ready. Later ones wait in the
+    /// queue behind it, as they would behind a running turn.
+    opening: Option<String>,
+    /// The agent has been starting for [`SLOW_START`] without answering: the thread says so
+    /// and offers to start it again.
+    slow_start: bool,
+    _slow_start: Option<Task<()>>,
     branch: Option<AgentBranch>,
     always_allow: bool,
     /// The adapter the agent runs as, which says which of its tool calls are Studio's.
@@ -961,7 +985,15 @@ impl AgentPanel {
             editor
         });
         cx.observe_global::<StudioSettings>(|this, cx| {
+            let was_setup = matches!(this.state, State::Setup);
             this.sync_setup_state(cx);
+            // What was sent before an agent was chosen goes to the one chosen.
+            if was_setup
+                && matches!(this.state, State::Idle)
+                && (this.opening.is_some() || this.queue.holds_messages())
+            {
+                this.start(cx);
+            }
             cx.notify();
         })
         .detach();
@@ -1038,6 +1070,9 @@ impl AgentPanel {
             _markdown_watch: std::collections::HashMap::new(),
             state: State::Setup,
             entries: Entries::default(),
+            opening: None,
+            slow_start: false,
+            _slow_start: None,
             markdown: std::collections::HashMap::new(),
             branch: None,
             always_allow: false,
@@ -1146,7 +1181,7 @@ impl AgentPanel {
             let (name, base) = (branch.name.clone(), branch.base.clone());
             cx.background_spawn(async move { Prepared::make(&cwd, &graph, &name, &base) })
         };
-        self.state = State::Starting;
+        self.enter_starting(cx);
         self.preparing = Some(cx.spawn(async move |this, cx| {
             let prepared = prepare.await;
             this.update(cx, |this, cx| match prepared {
@@ -1314,8 +1349,28 @@ impl AgentPanel {
             instructions: instructions_tx,
             _tasks: tasks,
         });
-        self.state = State::Starting;
+        self.enter_starting(cx);
         cx.notify();
+    }
+
+    /// The agent starts. One that has not answered [`SLOW_START`] later is said to be slow, with
+    /// an offer to start it again; a start already under way keeps its clock.
+    fn enter_starting(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.state, State::Starting) && self._slow_start.is_some() {
+            return;
+        }
+        self.state = State::Starting;
+        self.slow_start = false;
+        self._slow_start = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SLOW_START).await;
+            this.update(cx, |this, cx| {
+                if matches!(this.state, State::Starting) {
+                    this.slow_start = true;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
     }
 
     fn fail_start(&mut self, message: String, cx: &mut Context<Self>) {
@@ -1365,6 +1420,7 @@ impl AgentPanel {
     /// conversation when it can load it, else a new one begins in this tab.
     fn restart(&mut self, _: &Restart, _window: &mut Window, cx: &mut Context<Self>) {
         self.stop_host();
+        self._slow_start = None;
         self.clear_thread();
         // What the start given up said is said again by this one.
         self.said_while_starting.clear();
@@ -1482,9 +1538,19 @@ impl AgentPanel {
                     }),
                 }
                 self.state = State::Ready { agent };
+                self._slow_start = None;
+                self.slow_start = false;
                 self.show_held();
-                // What was sent before the agent was ready goes now, in order.
-                self.send_queued(cx);
+                // What was sent before the agent was ready goes now: the message on screen as
+                // the first turn, the queue after it as turns end.
+                match self.opening.take() {
+                    Some(text) => {
+                        if !self.prompt(text.clone(), cx) {
+                            self.opening = Some(text);
+                        }
+                    }
+                    None => self.send_queued(cx),
+                }
             }
             HostEvent::Update(update) => {
                 // What was said before the replay began waits with what is said during it.
@@ -1812,21 +1878,34 @@ impl AgentPanel {
                     self.queue.enqueue(text, first);
                 }
             }
-            State::Prompting { .. } | State::Starting => self.queue.enqueue(text, first),
+            State::Prompting { .. } => self.queue.enqueue(text, first),
+            State::Starting => self.hold_until_ready(text, first),
             State::Setup => {
-                self.queue.enqueue(text, first);
+                self.hold_until_ready(text, first);
                 self.entries.push(Entry::Notice {
                     text: "Choose an agent to send this to.".into(),
                     error: false,
                 });
             }
             State::Idle | State::Exited { .. } => {
-                self.queue.enqueue(text, first);
+                self.hold_until_ready(text, first);
                 self.replace_on_replay = (!self.entries.is_empty()).then_some(self.entries.len());
                 self.start(cx);
             }
         }
         cx.notify();
+    }
+
+    /// A message sent before the agent is ready for it. With nothing waiting already it is the
+    /// opening ([`Self::opening`]): shown in the thread at once and sent as soon as the agent is
+    /// ready. Any other waits in the queue, behind it.
+    fn hold_until_ready(&mut self, text: String, first: bool) {
+        if opens(self.opening.is_some(), self.queue.holds_messages()) {
+            self.opening = Some(text);
+            self.thread.scroll_to_end();
+        } else {
+            self.queue.enqueue(text, first);
+        }
     }
 
     /// Sends `text` as the next turn; whether it went.
@@ -1960,7 +2039,10 @@ impl AgentPanel {
     /// What closing the tab would drop: a draft in the composer, a message waiting its turn,
     /// or a card waiting for the person's answer.
     fn holds_work(&self) -> bool {
-        self.has_draft || self.queue.holds_messages() || self.pending_index().is_some()
+        self.has_draft
+            || self.opening.is_some()
+            || self.queue.holds_messages()
+            || self.pending_index().is_some()
     }
 
     /// Answers the write card at `index`, which its buttons and keys do.
@@ -3174,6 +3256,7 @@ fn thread_blocks(
     entries: &[Entry],
     changed: usize,
     working: bool,
+    waiting: bool,
     exited: bool,
 ) -> (Vec<Block>, usize) {
     let cut = entries[..changed.min(entries.len())]
@@ -3185,11 +3268,14 @@ fn thread_blocks(
         .take_while(|block| match block {
             Block::Entry { index, .. } | Block::Query { index, .. } => *index < cut,
             Block::Activity { start, .. } => *start < cut,
-            Block::Exited => false,
+            Block::Waiting | Block::Exited => false,
         })
         .count();
     let mut blocks = shown[..kept].to_vec();
     blocks.extend(blocks_from(entries, cut, working));
+    if waiting {
+        blocks.push(Block::Waiting);
+    }
     if exited {
         blocks.push(Block::Exited);
     }
@@ -3277,11 +3363,16 @@ impl ToolKind {
         }
     }
 
-    fn phrase(self, count: usize) -> String {
+    /// What `count` calls of this kind did. Beside Studio's own tools in the same run, the
+    /// agent's others are its "other" tools, so the parts add up to the turn's tool calls.
+    fn phrase(self, count: usize, beside_studios: bool) -> String {
         let plural = |one: &str, many: &str| if count == 1 { one } else { many }.to_owned();
         match self {
             Self::Cli => "looked up the CLI".into(),
             Self::Run => format!("ran {count} omnigraph {}", plural("command", "commands")),
+            Self::Other if beside_studios => {
+                format!("used {count} other {}", plural("tool", "tools"))
+            }
             Self::Other => format!("used {count} {}", plural("tool", "tools")),
         }
     }
@@ -3303,9 +3394,10 @@ fn activity_summary(thoughts: usize, tools: &[ToolKind]) -> String {
             seen.push(*kind);
         }
     }
+    let beside_studios = seen.iter().any(|kind| *kind != ToolKind::Other);
     for kind in seen {
         let count = tools.iter().filter(|other| **other == kind).count();
-        parts.push(kind.phrase(count));
+        parts.push(kind.phrase(count, beside_studios));
     }
     let text = parts.join(", ");
     let mut chars = text.chars();
@@ -3427,9 +3519,12 @@ impl AgentPanel {
         }
         end.extend(self.render_usage(cx));
         end.extend(self.render_options(cx));
-        // Starting too: an agent that never answers (a program waiting on its input, one
-        // without its ACP flag) is not waited for forever.
-        if matches!(self.state, State::Exited { .. } | State::Starting) {
+        // A slow start too: an agent that never answers (a program waiting on its input, one
+        // without its ACP flag) is not waited for forever. A start that is merely under way
+        // offers nothing to cancel it.
+        if matches!(self.state, State::Exited { .. })
+            || (matches!(self.state, State::Starting) && self.slow_start)
+        {
             end.push(
                 ds::icon_button("restart", IconName::RotateCw)
                     .icon_color(Color::Muted)
@@ -3565,7 +3660,24 @@ impl AgentPanel {
             _ => None,
         };
         let working = matches!(self.state, State::Prompting { .. });
-        (self.entries.version, self.folds, exited, working)
+        let waiting = self.shows_waiting().then(|| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            (
+                &self.opening,
+                matches!(self.state, State::Starting),
+                self.slow_start,
+            )
+                .hash(&mut hasher);
+            hasher.finish()
+        });
+        (self.entries.version, self.folds, exited, working, waiting)
+    }
+
+    /// Whether the thread ends with [`Block::Waiting`]: a message sent before the agent was
+    /// ready that has not gone, or a start under way after the conversation on screen.
+    fn shows_waiting(&self) -> bool {
+        self.opening.is_some()
+            || (matches!(self.state, State::Starting) && !self.entries.is_empty())
     }
 
     /// Brings each agent reply's markdown up to its text: new replies get an entity, a growing
@@ -3675,6 +3787,16 @@ impl AgentPanel {
                 self.expanded_activity.contains(&start).hash(&mut hasher);
                 start..end
             }
+            Block::Waiting => {
+                (
+                    &self.opening,
+                    matches!(self.state, State::Starting),
+                    matches!(self.state, State::Exited { .. }),
+                    self.slow_start,
+                )
+                    .hash(&mut hasher);
+                0..0
+            }
             Block::Exited => {
                 if let State::Exited { message, stderr } = &self.state {
                     message.hash(&mut hasher);
@@ -3701,6 +3823,7 @@ impl AgentPanel {
             &self.entries,
             changed,
             matches!(self.state, State::Prompting { .. }),
+            self.shows_waiting(),
             matches!(self.state, State::Exited { .. }),
         );
         // A kept block shows what it showed, unless a fold changed since.
@@ -3731,7 +3854,10 @@ impl AgentPanel {
     }
 
     fn render_thread(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        if self.entries.is_empty() && !matches!(self.state, State::Exited { .. }) {
+        if self.entries.is_empty()
+            && self.opening.is_none()
+            && !matches!(self.state, State::Exited { .. })
+        {
             return v_flex()
                 .flex_1()
                 .min_h_0()
@@ -3791,6 +3917,7 @@ impl AgentPanel {
                     div().into_any_element()
                 }
             }
+            Block::Waiting => self.render_waiting(cx),
             Block::Exited => match &self.state {
                 State::Exited { message, stderr } => {
                     let mut callout = studio_ui::ds::callout(Severity::Error, message.clone());
@@ -3809,6 +3936,50 @@ impl AgentPanel {
             .pb(px(ds::space::LG))
             .when(ix == 0, |block| block.pt(px(ds::space::XL)))
             .child(body)
+            .into_any_element()
+    }
+
+    /// The message sent before the agent was ready, as the person's, with how the agent's
+    /// start goes under it: starting, slow to answer (with Start again), or stopped before
+    /// the message went.
+    fn render_waiting(&self, cx: &mut Context<Self>) -> AnyElement {
+        let status = match &self.state {
+            State::Starting if self.slow_start => h_flex()
+                .gap(px(ds::space::SM))
+                .items_center()
+                .child(ds::text::muted("The agent has not answered yet."))
+                .child(
+                    ds::row_button("restart-slow", "Start again")
+                        .start_icon(Icon::new(IconName::RotateCw))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.restart(&Restart, window, cx)),
+                        ),
+                )
+                .into_any_element(),
+            State::Starting => h_flex()
+                .gap(px(ds::space::XS))
+                .items_center()
+                .child(studio_ui::ds::spinner())
+                .child(ds::text::meta("Starting the agent…"))
+                .into_any_element(),
+            State::Exited { .. } => {
+                ds::text::meta("Not sent yet: it goes when the agent starts again.")
+                    .into_any_element()
+            }
+            _ => ds::text::meta("Waiting for the agent").into_any_element(),
+        };
+        v_flex()
+            .gap(px(ds::space::SM))
+            .when(!self.entries.is_empty(), |column| {
+                column.mt(px(ds::space::XL))
+            })
+            .children(self.opening.as_ref().map(|text| {
+                gutter_row(
+                    Some(studio_ui::ds::icon::lead(IconName::Person)),
+                    div().prose().child(text.clone()),
+                )
+            }))
+            .child(gutter_row(None, status))
             .into_any_element()
     }
 
@@ -4516,6 +4687,16 @@ impl AgentPanel {
                     .bg_color(ds::surface::control_border(cx))
                     .progress_color(color),
                 )
+                // Nearly empty, a ring still reads as a spinner; its number says it is a gauge.
+                .child(
+                    ds::text::meta(format!("{}%", (ratio * 100.).round() as u32)).color(
+                        if nearly_full {
+                            Color::Warning
+                        } else {
+                            Color::Muted
+                        },
+                    ),
+                )
                 .tooltip(move |_, cx| Tooltip::with_meta(title.clone(), None, meta.clone(), cx))
                 .into_any_element(),
         )
@@ -5163,7 +5344,9 @@ mod tests {
 
     /// A streamed token lands in the last turn, and only that turn's blocks are made again:
     /// the earlier turns keep theirs, and the blocks are those a rebuild of the whole thread
-    /// makes. A change in an earlier turn makes its turn's blocks and the later ones again.
+    /// makes. A change in an earlier turn makes its turn's blocks and the later ones again. A
+    /// message waiting for the agent ends the thread, before the callout of an agent that
+    /// stopped, and is never kept as a turn's block.
     #[test]
     fn streaming_into_the_last_turn_keeps_the_earlier_turns_blocks() {
         let query = || Entry::Tool {
@@ -5185,10 +5368,11 @@ mod tests {
         ] {
             entries.push(entry);
         }
-        let whole = |entries: &Entries, working| thread_blocks(&[], entries, 0, working, false).0;
+        let whole =
+            |entries: &Entries, working| thread_blocks(&[], entries, 0, working, false, false).0;
         let changed = entries.rehash();
         assert_eq!(changed, 0);
-        let (blocks, kept) = thread_blocks(&[], &entries, changed, true, false);
+        let (blocks, kept) = thread_blocks(&[], &entries, changed, true, false, false);
         assert_eq!(kept, 0);
         let first_turn = blocks
             .iter()
@@ -5204,15 +5388,29 @@ mod tests {
         }
         let changed = entries.rehash();
         assert_eq!(changed, 5);
-        let (again, kept) = thread_blocks(&blocks, &entries, changed, true, false);
+        let (again, kept) = thread_blocks(&blocks, &entries, changed, true, false, false);
         assert_eq!(kept, first_turn, "the first turn's blocks are kept");
         assert_eq!(again, whole(&entries, true));
 
         // The turn ends: still only the last turn is made again, now with its actions.
-        let (ended, kept) = thread_blocks(&again, &entries, entries.len(), false, true);
+        let (ended, kept) = thread_blocks(&again, &entries, entries.len(), false, false, true);
         assert_eq!(kept, first_turn);
         assert_eq!(ended[..ended.len() - 1], whole(&entries, false)[..]);
         assert_eq!(ended.last(), Some(&Block::Exited));
+
+        // A message sent while the agent comes back ends the thread, before the callout.
+        let (waiting, kept) = thread_blocks(&ended, &entries, entries.len(), false, true, true);
+        assert_eq!(kept, first_turn);
+        assert_eq!(
+            waiting[waiting.len() - 2..],
+            [Block::Waiting, Block::Exited]
+        );
+        let (alone, _) = thread_blocks(&[], &Entries::default(), 0, false, true, false);
+        assert_eq!(
+            alone,
+            [Block::Waiting],
+            "a first message, on an empty thread"
+        );
 
         // A change in the first turn (a write card's outcome, a tool's status) makes it again.
         entries.change_each(|entry| match entry {
@@ -5223,9 +5421,22 @@ mod tests {
             _ => false,
         });
         let changed = entries.rehash();
-        let (rebuilt, kept) = thread_blocks(&ended, &entries, changed, false, false);
+        let (rebuilt, kept) = thread_blocks(&ended, &entries, changed, false, false, false);
         assert_eq!(kept, 0);
         assert_eq!(rebuilt, whole(&entries, false));
+    }
+
+    /// A message sent before the agent is ready opens the conversation, in the thread at once,
+    /// only when nothing was sent before it; any later one waits in the queue behind it, so
+    /// the messages go in the order they were sent.
+    #[test]
+    fn a_first_message_opens_the_conversation_and_later_ones_queue() {
+        assert!(opens(false, false), "the first message");
+        assert!(!opens(true, false), "a second, sent while the agent starts");
+        assert!(
+            !opens(false, true),
+            "one sent after messages kept in the queue across a stop"
+        );
     }
 
     #[test]
@@ -5360,8 +5571,15 @@ mod tests {
         );
         assert_eq!(
             activity_summary(0, &[Cli, Run, Run, Other]),
-            "Looked up the CLI, ran 2 omnigraph commands, used 1 tool"
+            "Looked up the CLI, ran 2 omnigraph commands, used 1 other tool"
         );
+        // The agent's own tools first, as Codex reads its skill: "other", so the parts add up
+        // to the turn's tool calls rather than one reading as the total.
+        assert_eq!(
+            activity_summary(0, &[Other, Other, Cli, Run, Run, Other]),
+            "Used 3 other tools, looked up the CLI, ran 2 omnigraph commands"
+        );
+        assert_eq!(activity_summary(0, &[Other, Other]), "Used 2 tools");
         assert_eq!(activity_summary(2, &[]), "Thought 2 times");
         assert_eq!(ToolKind::of(Some(StudioTool::Run)), Run);
     }

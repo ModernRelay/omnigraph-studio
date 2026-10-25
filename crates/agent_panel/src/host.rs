@@ -326,6 +326,31 @@ pub type Opening = Arc<Mutex<Vec<mpsc::UnboundedSender<HostEvent>>>>;
 
 /// Runs one agent until every handle to it is dropped or it exits; then every open conversation
 /// hears why. Dropping the future kills the agent's process group.
+/// An agent's error in words a person reads: its message, then the reason in its data when it
+/// gives one (a string, or the `data` or `message` of an object). Fields the protocol library
+/// adds for its own debugging, such as where in its source it failed (`spawned_at`), are left
+/// out, as is a bare "Internal error" ahead of a reason.
+fn error_words(error: &agent_client_protocol::Error) -> String {
+    let detail = match &error.data {
+        Some(serde_json::Value::String(text)) => Some(text.clone()),
+        Some(serde_json::Value::Object(fields)) => ["data", "message"]
+            .iter()
+            .find_map(|key| fields.get(*key).and_then(serde_json::Value::as_str))
+            .map(str::to_owned),
+        _ => None,
+    };
+    let message = error.message.trim();
+    match detail.map(|detail| detail.trim().to_owned()) {
+        Some(detail) if !detail.is_empty() && message.eq_ignore_ascii_case("internal error") => {
+            detail
+        }
+        Some(detail) if !detail.is_empty() && !message.is_empty() => format!("{message}: {detail}"),
+        Some(detail) if !detail.is_empty() => detail,
+        _ if message.is_empty() => format!("error {}", i32::from(error.code)),
+        _ => message.to_owned(),
+    }
+}
+
 pub async fn run(
     launch: AgentLaunch,
     commands: mpsc::UnboundedReceiver<ConnectionCommand>,
@@ -344,7 +369,7 @@ pub async fn run(
     let failed = result.is_err();
     let message = match result {
         Ok(()) => "The agent session ended.".to_owned(),
-        Err(error) => format!("The agent stopped: {error}"),
+        Err(error) => format!("The agent stopped: {}", error_words(&error)),
     };
     let stderr = stderr
         .lock()
@@ -709,7 +734,10 @@ async fn open_session(
                     opened_or_failed(&opening);
                     events
                         .unbounded_send(HostEvent::Exited {
-                            message: format!("The agent could not open a conversation: {error}"),
+                            message: format!(
+                                "The agent could not open a conversation: {}",
+                                error_words(&error)
+                            ),
                             stderr: String::new(),
                             failed: true,
                         })
@@ -1063,6 +1091,27 @@ async fn list_sessions(
 mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{ContentChunk, TextContent};
+
+    /// An agent's error reads as its message and its reason, without the protocol library's
+    /// debugging fields: an agent whose program exited before it answered says that, not where
+    /// in the library it was noticed.
+    #[test]
+    fn an_agents_error_reads_without_the_librarys_internals() {
+        let exited = agent_client_protocol::Error::internal_error().data(serde_json::json!({
+            "spawned_at": "/Users/x/.cargo/registry/src/agent-client-protocol-2.2.0/src/jsonrpc.rs:1931:39",
+            "data": "Process exited with exit status: 1",
+        }));
+        assert_eq!(error_words(&exited), "Process exited with exit status: 1");
+        let refused =
+            agent_client_protocol::Error::invalid_params().data("no agent command is set");
+        assert_eq!(
+            error_words(&refused),
+            "Invalid params: no agent command is set"
+        );
+        let bare = agent_client_protocol::Error::internal_error()
+            .data(serde_json::json!({ "spawned_at": "jsonrpc.rs:1" }));
+        assert_eq!(error_words(&bare), "Internal error");
+    }
 
     /// Codex asks permission for an MCP call by its id alone: the call is Studio's tool by what
     /// its first update said.
