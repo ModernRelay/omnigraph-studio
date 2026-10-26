@@ -1400,6 +1400,16 @@ exit 64
     }
 
     /// The CLI Studio would run of `programs`, found in a turn at the CLI of its own.
+    /// Held by the test that starts the probe cache over ([`forget_probes`], rewriting its file)
+    /// and by each test whose assertions need a program it probed to stay remembered: the cache
+    /// is the process's, and the tests run at once. Without it, a launch simulated in one test
+    /// made another's remembered program be probed again.
+    static PROBE_CACHE: Mutex<()> = Mutex::new(());
+
+    fn probe_cache() -> MutexGuard<'static, ()> {
+        PROBE_CACHE.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn found(programs: &[PathBuf]) -> Result<FoundCli, String> {
         smol::block_on(async {
             let turn = take_turn(&Arc::default(), READ_TIMEOUT, "a look for the CLI").await?;
@@ -1417,6 +1427,7 @@ exit 64
     /// over, and each one passed over is named with why.
     #[test]
     fn a_cli_is_chosen_by_its_contract_and_protocols() {
+        let _cache = probe_cache();
         let old = StandIn::new("old");
         old.write("version.json", "not json");
         let other_contract = StandIn::new("other-contract");
@@ -2140,6 +2151,7 @@ exit 64
     /// asked again.
     #[test]
     fn a_probe_is_remembered_across_launches() {
+        let _cache = probe_cache();
         let cli = StandIn::new("remembered");
         assert!(found(&cli.programs()).is_ok());
         assert_eq!(cli.calls(), ["version --json"]);
@@ -2178,6 +2190,7 @@ exit 64
     /// waits on (`hurry` raised) goes before them, even raised after it started waiting.
     #[test]
     fn the_token_a_window_waits_on_goes_first() {
+        let _cache = probe_cache();
         let cli = StandIn::new("hurry");
         for name in ["early", "late", "shown"] {
             cli.server(name, &format!("https://{name}.example.com/"));
