@@ -533,9 +533,10 @@ impl GraphClient {
         })
     }
 
-    /// A count that moves whenever the token is replaced by another: everything read with the
-    /// old one, and what it was allowed to do, is to be read again with the new, which may see
-    /// less.
+    /// A count that moves whenever the token is replaced by another, or the transport it is sent
+    /// through ([`Self::set_http`]): everything read with the old one, and what it was allowed to
+    /// do, is to be read again with the new, which may see less, or (a new certificate
+    /// authority) reach what the old one could not.
     pub fn credential_changes(&self) -> u64 {
         self.credential_changes
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -598,6 +599,9 @@ impl GraphClient {
             .http
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = http;
+        // What was read, or failed, through the old transport is read again through this one.
+        self.credential_changes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Replaces the token for this client and every clone of it; requests sent after this use
@@ -2113,7 +2117,8 @@ mod tests {
     }
 
     /// An HTTP client replaced on the client, as when the CLI target's certificate authority
-    /// changed, is the one every clone sends through next: none keeps the old trust.
+    /// changed, is the one every clone sends through next: none keeps the old trust, and the
+    /// change counts as a credential change, so what was read is read again.
     #[test]
     fn a_replaced_http_client_reaches_every_clone() {
         let answering = |name: &'static str, seen: Arc<std::sync::Mutex<Vec<&'static str>>>| {
@@ -2132,7 +2137,9 @@ mod tests {
         let held = client(answering("old", seen.clone()));
         let gateway = held.clone();
         block_on(gateway.schema("g")).ok();
+        let changes = held.credential_changes();
         held.set_http(answering("new", seen.clone()));
+        assert_eq!(gateway.credential_changes(), changes + 1);
         block_on(gateway.schema("g")).ok();
         block_on(held.schema("g")).ok();
         assert_eq!(*seen.lock().unwrap(), ["old", "new", "new"]);
