@@ -143,7 +143,7 @@ def main():
     family = {
         "$schema": "https://zed.dev/schema/themes/v0.2.0.json",
         "name": "Studio",
-        "author": "OmniGraph Studio",
+        "author": "Omnigraph Studio",
         "themes": [
             build("Studio Light", "Vitesse Refined Light", LIGHT, False),
             build("Studio Dark", "Vitesse Refined Dark", DARK, True),

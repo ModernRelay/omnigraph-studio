@@ -1,4 +1,4 @@
-//! OmniGraph Studio's composition root: every crate is initialised here, in layer order
+//! Omnigraph Studio's composition root: every crate is initialised here, in layer order
 //! (`docs/architecture.md`). `main.rs` runs it; the snapshot example renders it offscreen.
 
 mod activity;
@@ -173,7 +173,7 @@ pub fn window_options(bounds: Option<gpui::Bounds<gpui::Pixels>>, cx: &App) -> W
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(gpui::TitlebarOptions {
-            title: Some("OmniGraph Studio".into()),
+            title: Some("Omnigraph Studio".into()),
             appears_transparent: true,
             traffic_light_position: Some(studio_workspace::traffic_light_position(
                 studio_ui::ds::is_glass(cx),
@@ -516,7 +516,7 @@ pub fn open_link(link: &str, cx: &mut App) {
         return tell(
             cx,
             ToastKind::Info,
-            "This link comes from `omnigraph studio`, which needs a later OmniGraph. Open the graph \
+            "This link comes from `omnigraph studio`, which needs a later Omnigraph. Open the graph \
              from “Open a graph” instead."
                 .into(),
         );

@@ -60,7 +60,7 @@ gpui = { workspace = true, features = ["test-support"] }
 # scan of it: `test-support` lifts the bound on the CLI's answers (`graph_store::cli::READ_TIMEOUT`).
 graph_store = { workspace = true, features = ["test-support"] }
 http_client = { workspace = true }
-# The CLI home's config checked against OmniGraph's operator-config JSON Schema.
+# The CLI home's config checked against Omnigraph's operator-config JSON Schema.
 regex = { workspace = true }
 reqwest_client = { workspace = true }
 serde_norway = { workspace = true }

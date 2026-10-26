@@ -31,7 +31,7 @@ and relationships where they see them, and expand a text property into a full ma
 ## What exists today (checked)
 
 Studio at `5b88186`; Zed `v1.23.2` (`~/.cargo/git/checkouts/zed-a70e2ad075855582/c019950`);
-OmniGraph `v0.13.0`.
+Omnigraph `v0.13.0`.
 
 - **No node tab.** Tab kinds are blob, type table, canvas, storage, query, review, history,
   commit, agent and settings (`register_item_kind` in `type_table.rs:36,51`,
@@ -59,8 +59,8 @@ OmniGraph `v0.13.0`.
 - **Relationships are written only from edge tables**: `InsertEdgeModal` with two empty
   endpoint searches (`dialogs.rs:394-895`), delete with ⌘⌫ bound to the table's pin
   (`dialogs.rs:1018-1021`). There is no edge update builder (`builder.rs:1669-1945`).
-- **OmniGraph 0.13**: edge types have no update; a keyed edge changes by inserting its key
-  again, an unkeyed one by delete and insert (`docs/user/mutations/index.md:90-92` at OmniGraph
+- **Omnigraph 0.13**: edge types have no update; a keyed edge changes by inserting its key
+  again, an unkeyed one by delete and insert (`docs/user/mutations/index.md:90-92` at Omnigraph
   main). One mutation is constructive (insert, update) or destructive (delete), never both
   (`docs/dev/writes.md:376-379`, rule D2). Multi-statement mutations publish one commit.
   `@card(min..max)` restricts an edge type's count; `@description("…")` annotates types and
@@ -167,7 +167,7 @@ Four parts, built in this order; each lands on its own.
   datetime a field with a calendar; a list editable chips (so an element may hold a comma); a
   nullable property a clear button (×) that sets null, so an empty string can also be stored;
   numbers right-aligned, with `@range` bounds shown and checked before saving as the server
-  checks them (OmniGraph #1071): both bounds inclusive, `..max` an inclusive maximum, each
+  checks them (Omnigraph #1071): both bounds inclusive, `..max` an inclusive maximum, each
   element of a list against the range, integer bounds within `I64`; `@check` regexes checked
   before saving. The server stays the authority; these checks only save a round trip.
 - Keys and ids stay read-only (the engine cannot change them).
@@ -264,7 +264,7 @@ Four parts, built in this order; each lands on its own.
 - E25: one mutation that may hold inserts, updates and deletes (lift D2 for one write), so a
   relationship replacement is one commit without a branch.
 - E26: edge update (T16), so an unkeyed edge's properties change without a new id.
-- R2 (on OmniGraph main, not 0.13): unpublished commits could hold "Save as one change" for
+- R2 (on Omnigraph main, not 0.13): unpublished commits could hold "Save as one change" for
   review before it reaches the branch.
 - Typing into a table's selected cell needs the keymap to leave printable keys to the table;
   j, k, g and Space are table keys today, so typing to edit waits on moving those to modifiers
@@ -293,8 +293,8 @@ Four parts, built in this order; each lands on its own.
 | 2026-10-16 | Text values read as markdown | `studio_ui` `text` tests (plain values such as `foo_bar_baz` and `3 < 4` stay plain; headings, emphasis, lists, line breaks, links and code are markup; a cell's first line drops the markup); `type_table` `a_text_cell_shows_its_markdowns_first_line` (keys, enums and lists are not parsed); offscreen snapshots of the `notes` graph after giving two notes a markdown and a multi-line body (`dev/notes-seed.jsonl`) | The page renders the heading, bold, inline code, the list and the link, headings near the body's size (Zed's agent style); the peek keeps the plain body's three lines; capitals measure the same as the labels beside them once the size is set on the element around the markdown, since GPUI's text runs carry no size; the table cell reads "Keyset paging…" |
 | 2026-10-16 | Part 1: a node's page and the ways to open it | `type_table` `a_nodes_page_reads_it_and_names_its_tab` (label as the tab title, one tab per node and commit, remembered and restored, a held page never newer); `studio_workspace` `an_asked_for_peek_shows_the_inspector_that_selection_leaves_hidden`; offscreen snapshots of Radia Knuth's page and of a peek | The page lists every property and opens every non-empty relationship group; the tab reads "Radia Knuth"; the peek has ↗ beside Explore and the footer "⌘↵ Open"; a peek asked for while the right dock was hidden shows it |
 | 2026-10-16 | The flows above are today's | A read of `type_table`, `relationship_tree`, `graph_canvas`, `inspectors`, `review` and the keymaps, citing file and line | As listed under "What exists today" |
-| 2026-10-16 | 0.13 keeps unknown annotations and the compiler exposes them per property | `docs/user/schema/index.md:139` at OmniGraph main; `git show v0.13.0:crates/omnigraph-compiler/src/schema/ast.rs` | "retained as metadata"; `PropDecl { name, prop_type, annotations }` |
-| 2026-10-16 | D2 and edge update rules | `docs/dev/writes.md:376-379`, `docs/user/mutations/index.md:90-92` at OmniGraph main | One mutation constructive or destructive; edges have no update |
+| 2026-10-16 | 0.13 keeps unknown annotations and the compiler exposes them per property | `docs/user/schema/index.md:139` at Omnigraph main; `git show v0.13.0:crates/omnigraph-compiler/src/schema/ast.rs` | "retained as metadata"; `PropDecl { name, prop_type, annotations }` |
+| 2026-10-16 | D2 and edge update rules | `docs/dev/writes.md:376-379`, `docs/user/mutations/index.md:90-92` at Omnigraph main | One mutation constructive or destructive; edges have no update |
 | 2026-10-16 | 0.13 keeps a property annotation it does not know, but only from the start | `omnigraph` 0.13.0 on a scratch graph: `init` with `body: String? @format("markdown")`, `schema show`; `schema plan` adding the annotation to an existing property, then a new property and a new type carrying it | `init` and `schema show` keep it verbatim; adding it to `Note.body`: "supported: no … changing annotations beyond @description/@instruction is not supported in schema migration v1"; a new property or type with it: "supported: yes" |
 | 2026-10-16 | Plain text keeps its lines when rendered as markdown | `crates/markdown/src/markdown.rs:3292-3295` at Zed `v1.23.2` | `MarkdownStyle::soft_break_as_hard_break` renders a soft break as a line break |
 | 2026-10-16 | `markdown_preview` cannot be used as it is | `crates/markdown_preview/Cargo.toml` at Zed `v1.23.2` | Depends on `workspace` and `project` |

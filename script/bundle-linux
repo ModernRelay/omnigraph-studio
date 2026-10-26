@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a Linux tarball of OmniGraph Studio in target/bundle (spec 001, "Shipping"):
+# Build a Linux tarball of Omnigraph Studio in target/bundle (spec 001, "Shipping"):
 #
 #   omnigraph-studio-<version>-linux-<arch>/
 #     bin/omnigraph-studio

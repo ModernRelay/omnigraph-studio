@@ -1,4 +1,4 @@
-//! The `omnigraph-studio` agent skill (spec 013): the OmniGraph guide that matches the CLI
+//! The `omnigraph-studio` agent skill (spec 013): the Omnigraph guide that matches the CLI
 //! contract Studio speaks, with Studio's own entry point, written into a graph's agent working
 //! directory where each agent looks for skills. Claude Code reads `.claude/skills` and Codex
 //! `.agents/skills`; neither reads the other's.
@@ -173,7 +173,7 @@ mod tests {
         );
     }
 
-    /// The guide teaches the operator configuration the agent's CLI reads, OmniGraph's
+    /// The guide teaches the operator configuration the agent's CLI reads, Omnigraph's
     /// version-1 file, and none of the target-only format before it, which that CLI refuses.
     #[test]
     fn the_guide_teaches_the_operator_configuration_the_agents_cli_reads() {

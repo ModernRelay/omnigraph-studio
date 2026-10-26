@@ -1,7 +1,7 @@
 //! A test's check of a JSON value against a JSON Schema (draft 2020-12), for the keywords
-//! OmniGraph's operator-config schema uses, so the CLI home Studio writes is held to the schema
-//! OmniGraph publishes (`fixtures/omnigraph-operator-config.schema.json`, a copy of
-//! `docs/user/cli/operator-config.schema.json` at OmniGraph main `97788d37`). A keyword the
+//! Omnigraph's operator-config schema uses, so the CLI home Studio writes is held to the schema
+//! Omnigraph publishes (`fixtures/omnigraph-operator-config.schema.json`, a copy of
+//! `docs/user/cli/operator-config.schema.json` at Omnigraph main `97788d37`). A keyword the
 //! check does not know fails it rather than passing unread; annotations are read as such.
 
 use serde_json::Value;
@@ -206,7 +206,7 @@ fn check(root: &Value, schema: &Value, value: &Value, at: &str, found: &mut Vec<
 mod tests {
     use serde_json::json;
 
-    /// The check reads each keyword OmniGraph's schema uses as JSON Schema does, and refuses one
+    /// The check reads each keyword Omnigraph's schema uses as JSON Schema does, and refuses one
     /// it does not know.
     #[test]
     fn the_check_reads_the_keywords_it_knows_and_refuses_others() {

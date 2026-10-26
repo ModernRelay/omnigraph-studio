@@ -1,4 +1,4 @@
-//! The OmniGraph CLI's targets, as the CLI describes them (spec 003).
+//! The Omnigraph CLI's targets, as the CLI describes them (spec 003).
 //!
 //! Studio reads no operator configuration itself: `omnigraph target list --json`, run with the
 //! CLI Studio chose ([`crate::cli_tokens`]), says what the targets are, without a server or a
@@ -8,7 +8,7 @@
 //! `direct` target is refused: Studio never opens storage or starts a server. A `managed` cluster
 //! with a data endpoint lands on that endpoint, its token the data credential the CLI exchanges
 //! from the person's `omnigraph login` ([`CliCredential::Managed`]): an interim until Studio's own
-//! sign-in (spec 016; OmniGraph RFC 1017, A2). An address is one server: of the targets on
+//! sign-in (spec 016; Omnigraph RFC 1017, A2). An address is one server: of the targets on
 //! one endpoint, Studio connects as the first by name and names the others, each an identity of
 //! its own, as alternatives it does not connect as (`target list --json` does not say which
 //! target is the default). The CLI's aliases are not read: the CLI has no command that lists
@@ -62,7 +62,7 @@ pub struct CliTransport {
     pub roots: Option<CliRoots>,
 }
 
-/// A target's own certificate authority (`transport.tls.ca`), read as the OmniGraph CLI reads it
+/// A target's own certificate authority (`transport.tls.ca`), read as the Omnigraph CLI reads it
 /// (`operator_transport.rs`): a regular file of at most [`MAX_CA_BYTES`] holding PEM
 /// certificates, at least one. Its bytes are kept, so a server's client is made from the bundle
 /// the listing read; a changed file lists the targets again.
@@ -109,10 +109,10 @@ pub enum CliCredential {
     Managed { profile: String },
 }
 
-/// Whether the system Studio runs on lets the OmniGraph CLI give it a token. Every command Studio
+/// Whether the system Studio runs on lets the Omnigraph CLI give it a token. Every command Studio
 /// runs to find the CLI and list and check its targets (`version --json`, `target list --json`,
 /// `target inspect`, `credentials status`) reads no secret and runs on every system; only
-/// `credentials export`, the one way the CLI gives Studio a token, needs a Unix pipe. At OmniGraph
+/// `credentials export`, the one way the CLI gives Studio a token, needs a Unix pipe. At Omnigraph
 /// main `242ab02f`, its check of its standard output (`commands::targets::stdout_is_pipe`) asks
 /// whether `/dev/stdout` is a FIFO on Unix and is `false` on every other system, with no named
 /// pipe or other route, so on Windows the CLI refuses every export, whatever Studio connects to
@@ -138,7 +138,7 @@ impl Platform {
 
 /// Why Studio uses no server target that takes a token where the CLI exports none
 /// ([`Platform::Other`]), and why Add server takes no token there.
-pub const PIPE_ONLY: &str = "the OmniGraph CLI gives a token only through a Unix pipe";
+pub const PIPE_ONLY: &str = "the Omnigraph CLI gives a token only through a Unix pipe";
 
 /// A managed cluster target, as `target list --json` describes it, kept for Studio's own sign-in
 /// (spec 016 builds that client from these fields, and reads the profile's control plane
@@ -239,7 +239,7 @@ pub async fn read_targets(
         Ok(cli) => cli,
         Err(why) => {
             return refused(format!(
-                "Studio lists the CLI's targets with the OmniGraph CLI, and {why}"
+                "Studio lists the CLI's targets with the Omnigraph CLI, and {why}"
             ));
         }
     };
@@ -254,7 +254,7 @@ pub async fn read_targets(
         Err(refusal) => CliTargets {
             watched: vec![(config.clone(), config_stamp)],
             ..refused(format!(
-                "The OmniGraph CLI ({}, {}) could not list its targets: {refusal}",
+                "The Omnigraph CLI ({}, {}) could not list its targets: {refusal}",
                 cli.path.display(),
                 cli.version
             ))
@@ -494,7 +494,7 @@ fn land(
             }) {
                 return Err(format!(
                     "trusts its own certificate authority and goes through the HTTPS proxy \
-                     {url}, which the OmniGraph CLI refuses too: it does not keep the two trusts \
+                     {url}, which the Omnigraph CLI refuses too: it does not keep the two trusts \
                      apart"
                 ));
             }

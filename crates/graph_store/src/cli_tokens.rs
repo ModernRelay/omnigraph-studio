@@ -1,4 +1,4 @@
-//! The OmniGraph CLI, as Studio finds, checks and runs it: for the CLI's targets and their tokens
+//! The Omnigraph CLI, as Studio finds, checks and runs it: for the CLI's targets and their tokens
 //! (spec 003), and for the agent, whose CLI the agent panel chooses with the same finder, probe
 //! and runner, checking only the home it writes for the agent on top (spec 013).
 //!
@@ -8,8 +8,8 @@
 //! from `credentials status --target NAME --json`, which reads no secret either; and a server
 //! target's token comes from `credentials export --target NAME`, which writes the token and a
 //! newline to a pipe and refuses a terminal or a file. So an environment variable, a token file,
-//! the CLI's secure store and a credential helper are each resolved by OmniGraph's own code
-//! (OmniGraph RFC 1017, "Static tokens for clients"). A managed target's token is the cluster
+//! the CLI's secure store and a credential helper are each resolved by Omnigraph's own code
+//! (Omnigraph RFC 1017, "Static tokens for clients"). A managed target's token is the cluster
 //! data token the CLI holds for its profile: the one it has cached while that still holds,
 //! else a new one it asks for (3600 s, which the issuer may shorten; one made with
 //! `omnigraph cluster token --ttl` can last a day). `credentials status` takes no managed target,
@@ -26,7 +26,7 @@
 //! to be is remembered across launches until its file changes ([`Probes`], [`probe`]). It runs
 //! off the main thread with a timeout, one sequence of commands at a time ([`TURN`]: the CLI
 //! refuses a second command on a home whose lock another holds; [`run`]), its standard input
-//! empty, and none of OmniGraph's variables ([`omnigraph_variables`]) but `OMNIGRAPH_HOME` and
+//! empty, and none of Omnigraph's variables ([`omnigraph_variables`]) but `OMNIGRAPH_HOME` and
 //! the one a target's own token source names ([`scrubbed`]). A token is asked for when its
 //! server connects, once more after a 401, and on Refresh (`Connection`), not on a timer: the
 //! secure store cannot be watched.
@@ -52,20 +52,20 @@ const CLI_NAME: &str = if cfg!(windows) {
     "omnigraph"
 };
 
-/// What the name of every OmniGraph variable starts with, in any ASCII case
+/// What the name of every Omnigraph variable starts with, in any ASCII case
 /// ([`is_omnigraph_variable`]).
 pub const VARIABLE_PREFIX: &str = "OMNIGRAPH_";
 
 /// The protocols `version --json` reports, each of which Studio drives at [`PROTOCOL`].
 const PROTOCOLS: &[&str] = &["target", "credential", "access"];
 
-/// The number of each of [`PROTOCOLS`] Studio drives: OmniGraph 0.14.0's, the first that names
+/// The number of each of [`PROTOCOLS`] Studio drives: Omnigraph 0.14.0's, the first that names
 /// the version-1 operator configuration, its commands and their answers exactly
 /// (ModernRelay/omnigraph#1135, #1133). Earlier builds are not supported; a CLI that reports
 /// another number, or none, speaks commands Studio does not know.
 const PROTOCOL: u64 = 2;
 
-/// The first OmniGraph release whose CLI Studio drives.
+/// The first Omnigraph release whose CLI Studio drives.
 pub const FIRST_CLI_RELEASE: &str = "0.14.0";
 
 /// The CLI's own bound on a token (`credential_sources::MAX_CREDENTIAL_BYTES`, 64 KiB).
@@ -320,7 +320,7 @@ impl Unfit {
     }
 }
 
-/// The first of `programs` that is an OmniGraph CLI Studio can drive for its servers
+/// The first of `programs` that is an Omnigraph CLI Studio can drive for its servers
 /// ([`probe`]), on every system: only `credentials export` needs a Unix pipe, so where there is
 /// none the CLI still lists its targets, and a target that takes a token is refused as it is
 /// listed ([`crate::cli_config::Platform`]). Otherwise why none is, naming each program found.
@@ -339,7 +339,7 @@ pub(crate) async fn find_cli(programs: &[PathBuf], turn: &Held) -> Result<FoundC
         unfit.join("; ")
     };
     Err(format!(
-        "Studio found no OmniGraph CLI it can drive (OmniGraph {FIRST_CLI_RELEASE} or later, \
+        "Studio found no Omnigraph CLI it can drive (Omnigraph {FIRST_CLI_RELEASE} or later, \
          speaking HTTP contract {} and reporting target, credential and access protocol \
          {PROTOCOL}): {looked}",
         graph_client::CONTRACT
@@ -390,7 +390,7 @@ async fn probe_now(program: &Path, turn: &Held) -> Result<FoundCli, Unfit> {
         .and_then(|ran| serde_json::from_slice::<Value>(&ran.stdout).ok())
         .ok_or_else(|| {
             Unfit::lasting(
-                "answers no `version --json` (older than OmniGraph 0.14, or not its CLI)",
+                "answers no `version --json` (older than Omnigraph 0.14, or not its CLI)",
             )
         })?;
     let version = json
@@ -553,7 +553,7 @@ async fn json_answer(
     };
     let json = serde_json::from_slice::<Value>(&ran.stdout).ok();
     if ran.status.success() {
-        return json.ok_or_else(|| format!("the OmniGraph CLI's answer to {asked} is not JSON"));
+        return json.ok_or_else(|| format!("the Omnigraph CLI's answer to {asked} is not JSON"));
     }
     let refused = json
         .as_ref()
@@ -598,7 +598,7 @@ impl CliTokenSource {
         }
     }
 
-    /// The OmniGraph variables the CLI keeps for this target: the one its token source names.
+    /// The Omnigraph variables the CLI keeps for this target: the one its token source names.
     fn kept(&self) -> Vec<String> {
         match &self.credential {
             CliCredential::Environment { variable } => vec![variable.clone()],
@@ -671,7 +671,7 @@ impl CliTokenSource {
             Ok(ran) => ran,
             Err(Unrun::Timeout) => {
                 return Err(format!(
-                    "the OmniGraph CLI gave no token within {} s ({asked}), and was stopped",
+                    "the Omnigraph CLI gave no token within {} s ({asked}), and was stopped",
                     self.timeout.as_secs()
                 ));
             }
@@ -686,7 +686,7 @@ impl CliTokenSource {
             ));
         }
         exported_token(ran.stdout).ok_or_else(|| {
-            format!("the OmniGraph CLI's answer to {asked} was not one token and a newline")
+            format!("the Omnigraph CLI's answer to {asked} was not one token and a newline")
         })
     }
 
@@ -750,7 +750,7 @@ fn command(program: &Path, kept: &[String], args: &[&str]) -> std::process::Comm
     command
 }
 
-/// `program` as Studio starts it: with no OmniGraph variable from Studio's environment (whose
+/// `program` as Studio starts it: with no Omnigraph variable from Studio's environment (whose
 /// names are `names`) but `OMNIGRAPH_HOME`, which names the operator home, and those `kept`,
 /// which a target's token source reads; and with no colours in what it says.
 fn scrubbed(
@@ -768,9 +768,9 @@ fn scrubbed(
     command
 }
 
-/// Whether `name` is one of OmniGraph's variables: it starts with [`VARIABLE_PREFIX`], in any
+/// Whether `name` is one of Omnigraph's variables: it starts with [`VARIABLE_PREFIX`], in any
 /// ASCII case. That takes in the CLI's tokens and addressing, tokens kept for other servers
-/// (`OMNIGRAPH_MR_BEARER_TOKEN`) and a local server's token list alike, and a variable OmniGraph
+/// (`OMNIGRAPH_MR_BEARER_TOKEN`) and a local server's token list alike, and a variable Omnigraph
 /// adds later without a list to keep. Windows reads a name in any case (there
 /// `omnigraph_profile` is the profile); elsewhere such a name is taken in too, which removes
 /// nothing a program needs.
@@ -779,12 +779,12 @@ fn is_omnigraph_variable(name: &str) -> bool {
         .is_some_and(|start| start.eq_ignore_ascii_case(VARIABLE_PREFIX))
 }
 
-/// The OmniGraph variables among `names` that a process Studio starts must not inherit, sorted
+/// The Omnigraph variables among `names` that a process Studio starts must not inherit, sorted
 /// and each once ([`is_omnigraph_variable`]): every one but those `kept`, matched in any ASCII
 /// case too, as Windows reads names. Studio's own CLI keeps its operator home and the variable a
 /// target's token source names; the agent keeps those its settings set. A name that is not
 /// Unicode is left: it cannot be named on a command line here, and no program reads it by an
-/// OmniGraph name, which is.
+/// Omnigraph name, which is.
 pub fn omnigraph_variables(
     names: impl IntoIterator<Item = std::ffi::OsString>,
     kept: &[&str],
@@ -820,11 +820,11 @@ impl Unrun {
     fn said(self, cli: &Path, asked: &str, timeout: Duration) -> String {
         match self {
             Unrun::Timeout => format!(
-                "the OmniGraph CLI did not answer {asked} within {} s, and was stopped",
+                "the Omnigraph CLI did not answer {asked} within {} s, and was stopped",
                 timeout.as_secs()
             ),
             Unrun::Failed(error) => format!(
-                "Studio could not run the OmniGraph CLI at {} ({asked}): {error}",
+                "Studio could not run the Omnigraph CLI at {} ({asked}): {error}",
                 shown(cli)
             ),
         }
@@ -1007,7 +1007,7 @@ pub async fn take_turn(
 ) -> Result<Held, String> {
     TURN.take(hurry, bound).await.ok_or_else(|| {
         format!(
-            "the OmniGraph CLI was busy with another of Studio's commands for {} s, so {asked} \
+            "the Omnigraph CLI was busy with another of Studio's commands for {} s, so {asked} \
              was not run",
             bound.as_secs()
         )
@@ -1148,7 +1148,7 @@ fn said(stderr: &[u8]) -> String {
     };
     let causes: Vec<String> = causes.into_iter().map(problem).collect();
     if causes.is_empty() {
-        return "the OmniGraph CLI failed and said nothing".to_owned();
+        return "the Omnigraph CLI failed and said nothing".to_owned();
     }
     let mut line = causes.join("; ");
     const MAX: usize = 400;
@@ -1242,11 +1242,11 @@ mod tests {
     use crate::cli_config::{CliAuth, Platform, read_targets};
     use crate::connection::{Connection, ConnectionState, ServerEntry, ServerSource};
 
-    /// What `version --json` reports in the OmniGraph 0.14.0 release.
+    /// What `version --json` reports in the Omnigraph 0.14.0 release.
     const VERSION: &str = r#"{"version":"0.14.0","channel":"stable","commit":"60bfd19db780fdff3a5178f959c1204143420114","http_contract":"0.14","protocols":{"target":2,"credential":2,"access":2},"internal_schema":{"writes":16,"serves":[14,16]}}"#;
 
-    /// A stand-in for the OmniGraph CLI: a shell script that answers the commands Studio runs
-    /// from files in its directory, and records each call and the OmniGraph variables of each
+    /// A stand-in for the Omnigraph CLI: a shell script that answers the commands Studio runs
+    /// from files in its directory, and records each call and the Omnigraph variables of each
     /// export. Its export refuses a standard output that is not a pipe, as the CLI's does.
     struct StandIn {
         dir: PathBuf,
@@ -1405,7 +1405,7 @@ exit 64
     }
 
     /// A CLI is chosen only when it speaks Studio's HTTP contract and reports target,
-    /// credential and access protocol 2, as OmniGraph 0.14.0 does; an earlier build is passed
+    /// credential and access protocol 2, as Omnigraph 0.14.0 does; an earlier build is passed
     /// over, and each one passed over is named with why.
     #[test]
     fn a_cli_is_chosen_by_its_contract_and_protocols() {
@@ -1463,7 +1463,7 @@ exit 64
             "is 0.14.0-edge+50283ce, which reports no access protocol",
             "is 0.15.0, whose target protocol 3 Studio does not know",
             "is 0.14.0-edge+7fff9df, whose target protocol 1 Studio does not know",
-            "OmniGraph 0.14.0 or later",
+            "Omnigraph 0.14.0 or later",
         ] {
             assert!(why.contains(said), "{said}: {why}");
         }
@@ -1488,7 +1488,7 @@ exit 64
         assert!(none.contains("no `omnigraph` is on PATH"), "{none}");
     }
 
-    /// The targets are what `target list --json` says, in the shape the CLI at OmniGraph main
+    /// The targets are what `target list --json` says, in the shape the CLI at Omnigraph main
     /// `7fff9dfd` prints: server targets land on servers (an anonymous one with no token, the
     /// others with where their credential is), a managed target with a data endpoint lands on it
     /// with its CLI login as its credential, direct targets and a managed one without an endpoint
@@ -1683,7 +1683,7 @@ exit 64
         );
         for name in ["cloud", "envy", "filed", "helped", "strategy", "stored"] {
             let refused = format!(
-                "CLI target '{name}' takes a token, and the OmniGraph CLI gives a token only \
+                "CLI target '{name}' takes a token, and the Omnigraph CLI gives a token only \
                  through a Unix pipe, so Studio on Windows cannot use this target yet"
             );
             assert!(
@@ -1865,7 +1865,7 @@ exit 64
 
     /// A token comes from `credentials export` through a pipe, after `credentials status` found
     /// one there, and stands only while `target inspect` still names the endpoint it was asked
-    /// for. The CLI runs with no OmniGraph variable but `OMNIGRAPH_HOME` and the one its target
+    /// for. The CLI runs with no Omnigraph variable but `OMNIGRAPH_HOME` and the one its target
     /// names, and the token reaches no file, error or debug output.
     #[test]
     fn a_token_is_exported_through_a_pipe() {
@@ -2017,7 +2017,7 @@ exit 64
         .unwrap_err();
         assert_eq!(
             stopped,
-            "the OmniGraph CLI gave no token within 0 s (`omnigraph credentials export --target \
+            "the Omnigraph CLI gave no token within 0 s (`omnigraph credentials export --target \
              slow`), and was stopped"
         );
     }
@@ -2240,7 +2240,7 @@ exit 64
         assert!(cli.calls().is_empty(), "nothing was run");
     }
 
-    /// The CLI runs with none of Studio's OmniGraph variables but `OMNIGRAPH_HOME` and the one
+    /// The CLI runs with none of Studio's Omnigraph variables but `OMNIGRAPH_HOME` and the one
     /// its target's source names: checked in a process of its own, started with such variables
     /// set, so no other test's environment changes.
     #[test]
@@ -2263,7 +2263,7 @@ exit 64
     }
 
     /// Run by [`the_export_runs_without_studios_omnigraph_variables`] in a process whose
-    /// environment holds OmniGraph variables; run alone it checks nothing.
+    /// environment holds Omnigraph variables; run alone it checks nothing.
     #[test]
     #[ignore = "child: run by the_export_runs_without_studios_omnigraph_variables"]
     fn export_environment_in_its_own_process() {
@@ -2408,10 +2408,10 @@ exit 64
             said(b"target_unknown: unknown target 'x'; register it\n"),
             "target_unknown: unknown target 'x'; register it"
         );
-        assert_eq!(said(b""), "the OmniGraph CLI failed and said nothing");
+        assert_eq!(said(b""), "the Omnigraph CLI failed and said nothing");
     }
 
-    /// The CLI keeps no OmniGraph variable from Studio's environment but `OMNIGRAPH_HOME` and
+    /// The CLI keeps no Omnigraph variable from Studio's environment but `OMNIGRAPH_HOME` and
     /// the one its target's token source names: Studio's own tokens and addressing stay out.
     #[test]
     fn the_cli_keeps_only_the_operator_home_and_its_own_variable() {
@@ -2669,7 +2669,7 @@ exit 64
     }
 }
 
-/// The one rule for OmniGraph's variables, which Studio's CLI, the agent, the agent's
+/// The one rule for Omnigraph's variables, which Studio's CLI, the agent, the agent's
 /// `omnigraph_run` and its wrapper follow alike: on every system, as Windows reads names.
 #[cfg(test)]
 mod variable_tests {
@@ -2702,7 +2702,7 @@ mod variable_tests {
         }
     }
 
-    /// Every OmniGraph variable is removed but those kept, which are matched in any ASCII case
+    /// Every Omnigraph variable is removed but those kept, which are matched in any ASCII case
     /// too; each once, sorted.
     #[test]
     fn what_is_removed_is_every_omnigraph_variable_but_those_kept() {
@@ -2766,7 +2766,7 @@ mod live_tests {
     /// from a thread of its own, as the Open dialog asks them. Only the tokens' lengths are
     /// looked at; nothing is printed.
     #[test]
-    #[ignore = "needs: an OmniGraph CLI from main ff542202 on where Studio looks for one, and an \
+    #[ignore = "needs: an Omnigraph CLI from main ff542202 on where Studio looks for one, and an \
                 operator home with server targets whose credentials are configured"]
     fn every_server_target_is_given_its_token_when_asked_together() {
         let dir = operator_dir();

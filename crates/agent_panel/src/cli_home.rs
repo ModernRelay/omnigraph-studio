@@ -3,7 +3,7 @@
 //! agent's environment or in one instructions file. Each conversation gets a directory of its
 //! own, `<cwd>/.studio/<branch>/`:
 //!
-//! - `config.yaml`, OmniGraph's version-1 operator configuration, names this conversation's
+//! - `config.yaml`, Omnigraph's version-1 operator configuration, names this conversation's
 //!   gateway as the server target `studio`, its default, with the graph, at
 //!   `https://127.0.0.1:<port>`;
 //! - `token` (`0600`) holds the gateway's session token, never the person's, which the target
@@ -11,7 +11,7 @@
 //! - `ca.pem` (`0600`) holds the certificate the gateway serves, the only one the target trusts
 //!   (`transport.tls.ca`, `mode: replace`);
 //! - `omnigraph` (`0700`) runs the CLI Studio found with that directory as `OMNIGRAPH_HOME`,
-//!   loopback outside any proxy, and no other OmniGraph variable in its environment: a shell
+//!   loopback outside any proxy, and no other Omnigraph variable in its environment: a shell
 //!   script on Unix, a batch file `omnigraph.cmd` on Windows ([`Wrapper`]).
 //!
 //! The agent learns the wrapper's path from its conversation's MCP instructions and the
@@ -75,7 +75,7 @@ pub struct GatewayAccess<'a> {
 const TOKEN_FILE: &str = "token";
 const CA_FILE: &str = "ca.pem";
 
-/// The CLI config for the home in `home`, OmniGraph's version-1 operator configuration: the
+/// The CLI config for the home in `home`, Omnigraph's version-1 operator configuration: the
 /// gateway on `port` as the server target `studio`, its default, with `graph`, reached over HTTPS
 /// with the token in `home`'s `token`, trusting only the certificate in its `ca.pem`, and never
 /// through a proxy. Written by hand, in the plain YAML the CLI reads strictly (no null, tag,
@@ -84,7 +84,7 @@ fn config(home: &Path, port: u16, graph: &str) -> String {
     let home = std::path::absolute(home).unwrap_or_else(|_| home.to_owned());
     let file = |name: &str| yaml_string(&home.join(name).to_string_lossy());
     [
-        "# Written by OmniGraph Studio for one agent conversation (spec 013).".to_owned(),
+        "# Written by Omnigraph Studio for one agent conversation (spec 013).".to_owned(),
         "version: 1".into(),
         "targets:".into(),
         "  studio:".into(),
@@ -196,7 +196,7 @@ impl CliHome {
     }
 
     /// The chosen CLI as `omnigraph_run` starts it, in `dir`: the private home, loopback
-    /// outside any proxy, and none of Studio's own OmniGraph variables (its tokens, profile or
+    /// outside any proxy, and none of Studio's own Omnigraph variables (its tokens, profile or
     /// home; [`cli::omnigraph_variables`]), so it speaks only to this conversation's gateway.
     fn command(&self, cli: &Path, dir: &Path) -> std::process::Command {
         let mut command = std::process::Command::new(cli);
@@ -286,8 +286,8 @@ impl CliHome {
         match cli_ready {
             Some(false) => format!(
                 "Studio found no omnigraph CLI that speaks this graph's HTTP API and reads \
-                 OmniGraph's version-1 operator configuration, so the graph is not available in \
-                 this conversation. Tell the person: they can install OmniGraph {release} or \
+                 Omnigraph's version-1 operator configuration, so the graph is not available in \
+                 this conversation. Tell the person: they can install Omnigraph {release} or \
                  later, or set `omnigraph_cli` in Studio's settings. Your branch would be \
                  {branch}.",
                 release = cli::FIRST_CLI_RELEASE,
@@ -337,8 +337,8 @@ pub fn write_agents_md(cwd: &Path, graph: &str) -> std::io::Result<()> {
         ""
     };
     let text = format!(
-        "# OmniGraph graph `{graph}`\n\n\
-         Written by OmniGraph Studio. You work on the OmniGraph graph `{graph}` with a person in \
+        "# Omnigraph graph `{graph}`\n\n\
+         Written by Omnigraph Studio. You work on the Omnigraph graph `{graph}` with a person in \
          Studio.\n\n\
          Before writing a query, a mutation or a load, read the `omnigraph-studio` skill \
          (`.claude/skills/omnigraph-studio/SKILL.md` or `.agents/skills/omnigraph-studio/SKILL.md` \
@@ -374,7 +374,7 @@ pub fn write_agents_md(cwd: &Path, graph: &str) -> std::io::Result<()> {
     Confined::open(cwd)?.write("AGENTS.md", text.as_bytes(), 0o644)
 }
 
-/// How to install the newest OmniGraph release, as its install guide gives it.
+/// How to install the newest Omnigraph release, as its install guide gives it.
 const INSTALL: &str = if cfg!(windows) {
     "powershell -NoProfile -ExecutionPolicy Bypass -Command \"iwr -UseBasicParsing \
      https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.ps1 | iex\""
@@ -475,7 +475,7 @@ pub async fn choose_cli(home: &CliHome, candidates: Vec<PathBuf>) -> CliChoice {
 /// does not fit, and what to install.
 fn no_cli_text(found: &[(PathBuf, Unfit)]) -> String {
     let mut text = format!(
-        "No omnigraph CLI here speaks this graph's HTTP API ({}) and reads OmniGraph's \
+        "No omnigraph CLI here speaks this graph's HTTP API ({}) and reads Omnigraph's \
          version-1 operator configuration, which Studio writes for the agent's CLI",
         graph_client::CONTRACT
     );
@@ -498,7 +498,7 @@ fn no_cli_text(found: &[(PathBuf, Unfit)]) -> String {
         text.push_str(&each.join("; "));
     }
     text.push_str(&format!(
-        ". Install OmniGraph {} or later: `{INSTALL}`. Or set `omnigraph_cli` in Studio's \
+        ". Install Omnigraph {} or later: `{INSTALL}`. Or set `omnigraph_cli` in Studio's \
          settings to such a CLI.",
         cli::FIRST_CLI_RELEASE
     ));
@@ -1431,7 +1431,7 @@ const LOOPBACK: &str = "127.0.0.1,localhost";
 
 /// What the agent's `omnigraph` wrapper does, the one account both scripts are written from
 /// ([`posix_script`], [`cmd_script`]), so only their syntax differs. Run, it removes every
-/// OmniGraph variable from the CLI's environment, each whose name starts with
+/// Omnigraph variable from the CLI's environment, each whose name starts with
 /// [`cli::VARIABLE_PREFIX`] in any ASCII case, as `omnigraph_run`, the agent's launch and
 /// Studio's own CLI do ([`cli::omnigraph_variables`]), so no token kept for another target,
 /// profile, home or control-plane address the agent's environment holds reaches the
@@ -1468,7 +1468,7 @@ fn posix_script(wrapper: &Wrapper<'_>) -> String {
         Wrapper::Refuse { why } => {
             return format!(
                 "#!/bin/sh\n\
-                 # Written by OmniGraph Studio for one agent conversation (spec 013).\n\
+                 # Written by Omnigraph Studio for one agent conversation (spec 013).\n\
                  echo {why} >&2\n\
                  exit 1\n",
                 why = shell_quote(why),
@@ -1477,7 +1477,7 @@ fn posix_script(wrapper: &Wrapper<'_>) -> String {
     };
     let mut script = String::from(
         "#!/bin/sh\n\
-         # Written by OmniGraph Studio for one agent conversation (spec 013): the omnigraph\n\
+         # Written by Omnigraph Studio for one agent conversation (spec 013): the omnigraph\n\
          # CLI, pointed at Studio's gateway for this conversation.\n",
     );
     // Only names a shell can hold match: `unset` of any other would end the script, and the CLI
@@ -1550,7 +1550,7 @@ fn cmd_script(wrapper: &Wrapper<'_>) -> String {
     };
     let mut lines = vec![
         "@echo off".to_owned(),
-        "rem Written by OmniGraph Studio for one agent conversation (spec 013): the omnigraph"
+        "rem Written by Omnigraph Studio for one agent conversation (spec 013): the omnigraph"
             .to_owned(),
         "rem CLI, pointed at Studio's gateway for this conversation.".to_owned(),
         "setlocal EnableExtensions DisableDelayedExpansion".to_owned(),
@@ -1633,7 +1633,7 @@ fn cmd_refusal(why: &str) -> String {
         .collect();
     let mut lines = vec![
         "@echo off".to_owned(),
-        "rem Written by OmniGraph Studio for one agent conversation (spec 013).".to_owned(),
+        "rem Written by Omnigraph Studio for one agent conversation (spec 013).".to_owned(),
         "setlocal EnableExtensions DisableDelayedExpansion".to_owned(),
     ];
     for chunk in plain.as_bytes().chunks(1000) {
@@ -1691,7 +1691,7 @@ mod tests {
     }
 
     /// What `version --json` reports for a CLI of `version` that speaks `contract`, reads target
-    /// protocol `target` and credential and access protocol 2, as OmniGraph 0.14.0 does.
+    /// protocol `target` and credential and access protocol 2, as Omnigraph 0.14.0 does.
     #[cfg(unix)]
     fn reports(version: &str, contract: &str, target: u64) -> String {
         format!(
@@ -1700,7 +1700,7 @@ mod tests {
     }
 
     /// The first candidate that Studio's own finder takes (it speaks the graph's contract and
-    /// reports target, credential and access protocol 2, as OmniGraph 0.14.0 does) is chosen,
+    /// reports target, credential and access protocol 2, as Omnigraph 0.14.0 does) is chosen,
     /// with no server behind the gateway. A build before the release (the edge builds
     /// `0.14.0-edge+50283ce` and `0.14.0-edge+888223b`, which report protocol 1), one that
     /// reports a target protocol Studio does not know, one that speaks another contract and one
@@ -1819,7 +1819,7 @@ mod tests {
                         .cloned()
                         .zip([
                             probe(
-                                "answers no `version --json` (older than OmniGraph 0.14, or not \
+                                "answers no `version --json` (older than Omnigraph 0.14, or not \
                                  its CLI)"
                             ),
                             probe("is 0.14.0-dev, which reports no target protocol"),
@@ -1837,7 +1837,7 @@ mod tests {
                         .collect::<Vec<_>>()
                 );
                 for says in [
-                    "speaks this graph's HTTP API (0.14) and reads OmniGraph's version-1 operator \
+                    "speaks this graph's HTTP API (0.14) and reads Omnigraph's version-1 operator \
                      configuration",
                     "omnigraph-0.13 answers no `version --json`",
                     &format!(
@@ -1846,7 +1846,7 @@ mod tests {
                     ),
                     "0.16.0, whose target protocol 3",
                     "0.15.0, which speaks HTTP contract 0.15",
-                    "Install OmniGraph 0.14.0 or later",
+                    "Install Omnigraph 0.14.0 or later",
                     "scripts/install.sh",
                     "set `omnigraph_cli` in Studio's settings",
                 ] {
@@ -1917,7 +1917,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Both homes hold OmniGraph's version-1 operator configuration as its own schema and
+    /// Both homes hold Omnigraph's version-1 operator configuration as its own schema and
     /// parser require it: `version: 1` and no `target_config_version`; the gateway as the server
     /// target `studio` at `https://127.0.0.1:<port>`, the default target, with the graph; its
     /// token read from the home's `token` file (the session token, a bearer token as the CLI
@@ -2428,19 +2428,19 @@ mod tests {
         std::fs::remove_dir_all(&outside).ok();
     }
 
-    /// An OmniGraph variable in Studio's environment, as a person's shell exports a token, set
+    /// An Omnigraph variable in Studio's environment, as a person's shell exports a token, set
     /// in the process [`a_run_starts_the_chosen_cli_with_its_private_home`] runs itself in.
     #[cfg(unix)]
     const STUDIOS_OWN: (&str, &str) = ("OMNIGRAPH_TOKEN_STUDIO_TEST", "studios-own-token");
 
     /// The agent can rewrite its wrapper and its home's config, but `omnigraph_run` runs outside
     /// its sandbox: it starts the chosen CLI itself, with the private home, in a private folder,
-    /// and without Studio's own OmniGraph variables. Ending the conversation leaves a later one's
+    /// and without Studio's own Omnigraph variables. Ending the conversation leaves a later one's
     /// credentials in the same folder alone.
     #[cfg(unix)]
     #[test]
     fn a_run_starts_the_chosen_cli_with_its_private_home() {
-        // Studio's environment must hold an OmniGraph variable for the run to have one to
+        // Studio's environment must hold an Omnigraph variable for the run to have one to
         // remove. Setting it here would change the environment every other test of this process
         // reads and spawns from, so the test runs again in a process of its own, started with
         // the variable, and passes when that run does.
@@ -2687,7 +2687,7 @@ mod tests {
         );
         assert!(script.contains(&format!("OMNIGRAPH_HOME='{}'", home.dir.display())));
 
-        // The wrapper runs with its own home, loopback outside any proxy, and no other OmniGraph
+        // The wrapper runs with its own home, loopback outside any proxy, and no other Omnigraph
         // variable, one the CLI does not read today and one in another case included.
         home.use_cli(Path::new("/usr/bin/env")).unwrap();
         let output = std::process::Command::new(&home.command)
@@ -2727,7 +2727,7 @@ mod tests {
             .join("d".repeat(120))
             .join(".studio/agent-20261013-101500");
         let network =
-            PathBuf::from(r"\\server\share\ada\AppData\Roaming\OmniGraph Studio\agent\graphs\g");
+            PathBuf::from(r"\\server\share\ada\AppData\Roaming\Omnigraph Studio\agent\graphs\g");
         for (windows, wrapper, at, runs) in [
             (false, "omnigraph", &cwd, true),
             (true, "omnigraph.cmd", &cwd, true),
@@ -2795,7 +2795,7 @@ mod tests {
         assert_eq!(
             posix,
             "#!/bin/sh\n\
-             # Written by OmniGraph Studio for one agent conversation (spec 013): the omnigraph\n\
+             # Written by Omnigraph Studio for one agent conversation (spec 013): the omnigraph\n\
              # CLI, pointed at Studio's gateway for this conversation.\n\
              for name in $(env | sed -n 's/^\\([Oo][Mm][Nn][Ii][Gg][Rr][Aa][Pp][Hh]_[A-Za-z0-9_]*\\)=.*/\\1/p'); do unset \"$name\"; done\n\
              OMNIGRAPH_HOME='/data/agent/graphs/g/.studio/agent-x'\n\
@@ -2806,13 +2806,13 @@ mod tests {
         );
         let cmd = cmd_script(&Wrapper::Run {
             home: Path::new(
-                r"C:\Users\ada\AppData\Roaming\OmniGraph Studio\agent\graphs\g\.studio\agent-x",
+                r"C:\Users\ada\AppData\Roaming\Omnigraph Studio\agent\graphs\g\.studio\agent-x",
             ),
             cli: Path::new(r"C:\Users\ada\.local\bin\omnigraph.exe"),
         });
         let lines = [
             "@echo off",
-            "rem Written by OmniGraph Studio for one agent conversation (spec 013): the omnigraph",
+            "rem Written by Omnigraph Studio for one agent conversation (spec 013): the omnigraph",
             "rem CLI, pointed at Studio's gateway for this conversation.",
             "setlocal EnableExtensions DisableDelayedExpansion",
             "for /f \"delims==\" %%N in ('set OMNIGRAPH_ 2^>nul') do set \"%%N=\"",
@@ -2831,7 +2831,7 @@ mod tests {
     /// way is; otherwise the wrapper says so and runs nothing. Its refusals are escaped too.
     #[test]
     fn the_batch_file_names_hostile_paths_and_refuses_what_it_cannot_name() {
-        let home = r"C:\Users\Jürgen\AppData\Roaming\OmniGraph Studio\agent\graphs\g\.studio\a";
+        let home = r"C:\Users\Jürgen\AppData\Roaming\Omnigraph Studio\agent\graphs\g\.studio\a";
         let name = |cli: &str| cmd_program(Path::new(home), Path::new(cli));
         assert_eq!(
             name(r"C:\Tools\50% & ^y (z) !w! 'q';=,\omnigraph.exe").as_deref(),
@@ -2865,7 +2865,7 @@ mod tests {
         assert_eq!(
             refusal,
             "@echo off\r\n\
-             rem Written by OmniGraph Studio for one agent conversation (spec 013).\r\n\
+             rem Written by Omnigraph Studio for one agent conversation (spec 013).\r\n\
              setlocal EnableExtensions DisableDelayedExpansion\r\n\
              1>&2 echo(No CLI: 'C:\\J?rgen\\x' 100%% ^& ^<a^|b^> ^^c ^(d^)\r\n\
              exit /b 1\r\n"

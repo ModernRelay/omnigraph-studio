@@ -1,17 +1,17 @@
-# 012: OmniGraph engine changes
+# 012: Omnigraph engine changes
 
-Status: open · 2026-10-11, updated 2026-10-21. Landed on OmniGraph main: E6, E7, E8, E23 and E24
-by 2026-10-15, then E10, E15 (as the access route), E21 and E22 by 2026-10-20 (see "On OmniGraph
+Status: open · 2026-10-11, updated 2026-10-21. Landed on Omnigraph main: E6, E7, E8, E23 and E24
+by 2026-10-15, then E10, E15 (as the access route), E21 and E22 by 2026-10-20 (see "On Omnigraph
 main, 2026-10-20"). Studio's oldest supported server is the edge build `edge-20261020-7fd9cc9`,
 the first that speaks HTTP contract 0.14, until 0.14 is released (`edge-20261018-0a62bb7`, then
-`edge-20261017-d883c49`, before; both speak `0.13`, which Studio now refuses) (constitution X). When a change is picked up it becomes an OmniGraph RFC and issue
+`edge-20261017-d883c49`, before; both speak `0.13`, which Studio now refuses) (constitution X). When a change is picked up it becomes an Omnigraph RFC and issue
 in `ModernRelay/omnigraph`, follows that repository's invariants and test ownership, and Studio
 adopts it once its minimum server serves it, or before then only when a server's OpenAPI
 document advertises it.
 
 ## Problem
 
-Studio's surfaces are designed to work on OmniGraph 0.13 as released. Some of them would be
+Studio's surfaces are designed to work on Omnigraph 0.13 as released. Some of them would be
 simpler, faster or more correct with engine changes: a one-command launch, a real branch diff, a
 merge preview, typed result columns, paged history. This plan records each change once, with
 its shape, the engine rules it must respect, the Studio spec waiting on it, and what Studio does
@@ -20,11 +20,11 @@ until then. `docs/deferred-engine-changes.md` is the short index of the same lis
 ## Principles
 
 X (the engine moves at its own pace), I (one HTTP path in every mode), IV (policy enforced by
-the engine), XII (each change carries its evidence into the OmniGraph RFC).
+the engine), XII (each change carries its evidence into the Omnigraph RFC).
 
 ## What exists today (checked)
 
-OmniGraph `v0.13.0` unless noted; line numbers from the research at main `680fdfef`.
+Omnigraph `v0.13.0` unless noted; line numbers from the research at main `680fdfef`.
 
 - The server binary boots clusters only (`crates/omnigraph-server/src/lib.rs:192-197`). The
   library can serve one standalone graph: `AppState::open`, `open_with_bearer_tokens` or
@@ -46,10 +46,10 @@ OmniGraph `v0.13.0` unless noted; line numbers from the research at main `680fdf
   schema plan for standalone graphs, or identity introspection over HTTP.
 - Engine capabilities already present but not served: `diff_between` and `diff_commits` (ids and
   ops, unbounded), `query_inspected` (`#[doc(hidden)]`), `plan_schema`, `list_commits`.
-- On OmniGraph main, not in 0.13.0: Blob `PUT`/`DELETE`, commit publish and drop, merge
+- On Omnigraph main, not in 0.13.0: Blob `PUT`/`DELETE`, commit publish and drop, merge
   `as_commit` (unpublished commits).
 
-## On OmniGraph main, 2026-10-15
+## On Omnigraph main, 2026-10-15
 
 Checked at main `fe69c039` (server 0.14.0, unreleased; latest release v0.13.0) by diffing its
 `openapi.json` with v0.13.0's. The contract header is still `0.13` and every change is
@@ -68,7 +68,7 @@ not know.
   cursor), E11 (`ReadOutput.columns` is still names), E12–E19, E20 (#978), E21
   (`BranchCreateRequest` is still `name` and `from`), E22 (#976).
 
-## On OmniGraph main, 2026-10-20
+## On Omnigraph main, 2026-10-20
 
 Checked at main `4ba904d3` by diffing its `openapi.json` with the contract Studio carries
 (`crates/graph_client/openapi/omnigraph-0.14.0-edge.json`, then from `edge-20261017-d883c49`) and
@@ -130,7 +130,7 @@ change is additive; the CLI's is not.
   the agent's CLI and the person's are whatever is installed, so specs 003 and 013 read both
   operator-file formats.
 
-## On OmniGraph main, 2026-10-21
+## On Omnigraph main, 2026-10-21
 
 Checked at main `97788d37` by reading the CLI's source (`operator_schema.rs` and its
 `validation.rs` and `yaml.rs`, `credential_sources.rs`, `operator_transport.rs`, `scope.rs`,
@@ -189,7 +189,7 @@ CLI so deployed servers never gain a browser mode by accident. Never `--unauthen
 **E4. Owner discovery for a graph root.**
 A file under `$OMNIGRAPH_HOME` naming the process, port and session that owns a graph root, so
 a second `omnigraph studio` attaches instead of opening a second writer, and CLI writes can route
-through it. Discovery only: publication safety stays with the manifest version CAS (OmniGraph
+through it. Discovery only: publication safety stays with the manifest version CAS (Omnigraph
 invariants deny process-local locks presented as fencing).
 *Waits:* E1. *Today:* not applicable.
 
@@ -225,7 +225,7 @@ suggested edits, completion, hover, go to definition into the schema. One servic
 Zed and other editors. *Waits:* 007 (optional). *Today:* `gq_language` calls the compiler
 in-process.
 
-**E18. Tree-sitter grammars in the OmniGraph repository.** `tree-sitter-gq` and
+**E18. Tree-sitter grammars in the Omnigraph repository.** `tree-sitter-gq` and
 `tree-sitter-pg` move to the language's owner, with a Zed extension for `.gq` and `.pg` beside
 them. *Waits:* E17. *Today:* `grammars/` in this repository.
 
@@ -276,7 +276,7 @@ wrote, and names the first build that does by commit (`ff542202`).
 
 ### Branching
 
-**E21. A branch from a commit.** *Landed (#1016) as `from_commit`; see "On OmniGraph main,
+**E21. A branch from a commit.** *Landed (#1016) as `from_commit`; see "On Omnigraph main,
 2026-10-20".* `BranchCreateRequest` at 0.13.0 takes `name` and `from`, a
 parent branch whose head the new branch forks ("Parent branch to fork from. Defaults to
 `main`", `openapi.json`). Forking at a commit of a branch's history (`from_commit`) would let
@@ -289,7 +289,7 @@ branch head.
 ### Writes
 
 **E25. A mutation that both adds and removes.** Rule D2 keeps one mutation constructive
-(insert, update) or destructive (delete), never both (`docs/dev/writes.md:376-379` at OmniGraph
+(insert, update) or destructive (delete), never both (`docs/dev/writes.md:376-379` at Omnigraph
 main), so replacing a relationship from a node is two commits, and a `@card(..1)` replacement
 must delete before it inserts. One write holding both, staged and published once, would make it
 one commit. *Waits:* 014. *Today:* Studio saves the two parts as two ordered commits and names
@@ -371,14 +371,14 @@ Then engine changes still open:
 | Date | Claim | Check | Result |
 |---|---|---|---|
 | 2026-10-22 | The first published build whose CLI reads Studio's home is `edge-20261022-7fff9df` | `git ls-remote --tags` of ModernRelay/omnigraph (`edge-20261021-888223b`, then `edge-20261022-7fff9df` at `7fff9dfd`); `git merge-base --is-ancestor ff542202 7fff9dfd`; the installed `0.14.0-edge+7fff9df`'s `version --json` and `config validate --operator-config` on a file with a loopback server target of `auth: {provider: anonymous}`, beside `0.14.0-edge+888223b`'s | `7fff9dfd` contains `ff542202`. `7fff9df` reports protocols `target` 1, `credential` 1, `access` 1 and passes the file; `888223b` reports the same protocols and refuses it (`invalid type: string "anonymous", expected internally tagged enum StrictAuthProfile`) |
-| 2026-10-21 | The CLI reads only the version-1 operator configuration, and no published build reads Studio's home yet | OmniGraph main `97788d37`: `operator_schema.rs` (`target_config_version` refused), the diff `888223b7..ff542202` of `operator_schema.rs` (server `auth` from a map to one provider), `commands/targets/args.rs` (`config validate`); `gh release list` (newest `edge-20261021-888223b`, 2026-10-22 00:21 UTC); `~/.local/bin/omnigraph version --json` and `config validate --operator-config /dev/null` | `0.14.0-edge+50283ce` reports `http_contract` 0.14 and `protocols.target` 1, and answers "unrecognized subcommand 'config'" (exit 2). `888223b` has #1115 without #1126. E34 filed as #1127 |
+| 2026-10-21 | The CLI reads only the version-1 operator configuration, and no published build reads Studio's home yet | Omnigraph main `97788d37`: `operator_schema.rs` (`target_config_version` refused), the diff `888223b7..ff542202` of `operator_schema.rs` (server `auth` from a map to one provider), `commands/targets/args.rs` (`config validate`); `gh release list` (newest `edge-20261021-888223b`, 2026-10-22 00:21 UTC); `~/.local/bin/omnigraph version --json` and `config validate --operator-config /dev/null` | `0.14.0-edge+50283ce` reports `http_contract` 0.14 and `protocols.target` 1, and answers "unrecognized subcommand 'config'" (exit 2). `888223b` has #1115 without #1126. E34 filed as #1127 |
 | 2026-10-21 | The server's version fields are wider than its contract says (E30) | `omnigraph-api-types/src/lib.rs` at `7fd9cc9` (`CommitOutput`, `SnapshotOutput`, `SnapshotDatasetOutput`, `SchemaApplyOutput`, `PublishedDatasetVersionConflictOutput`: `u64`; its own test decodes `9_223_372_036_854_775_809u64`); `crates/graph_client/openapi/omnigraph-0.14.0-edge.json` (`int64`, `minimum: 0`); what the running app was answered by the edge server; `graph_client` `a_detached_manifest_version_decodes` | A write `as commit` was answered with `graph_manifest_version: 10415222161995537841`, which Studio's `i64` refused to decode, so the write read as unknown; as `u64` it decodes, and the query editor says it is held |
-| 2026-10-20 | What OmniGraph main serves that Studio's minimum server does not | `openapi.json` at main `4ba904d3` diffed with `crates/graph_client/openapi/omnigraph-0.14.0-edge.json` by operation, parameter and schema property; the `changelog.d` notes added since `d883c49e`; the CLI reference and targets guide at `4ba904d3` | New: `GET /graphs/{id}/access`; `limit`, `page_token`, `head_commit_id`, `next_page_token` on commits; `from_commit` and `from_commit_id` on branch creation; `ChangeOutput.executed`; error details `branch_start_refusal` and `full_text_index_required`. Contract header still `0.13`. The CLI drops `--server` and profiles for targets (#1090) |
-| 2026-10-15 | What OmniGraph main serves that 0.13.0 does not | `openapi.json` at `v0.13.0` and at main `fe69c039`, diffed by operation id, schema properties and parameters; issues #976–#980 | New: `cluster_getDiff`, `cluster_getBranchDiff`, `cluster_getMergeBase`, `cluster_putBlob`, `cluster_clearBlob`, `cluster_publishCommit`, `cluster_dropCommit`, OAuth resource metadata; `dry_run` and `as_commit` on merge; commit kinds and filters; `ReadOutput.page`. Contract header still `0.13`. #977 and #979 closed by #987 and #988; #976, #978 and #980 open |
+| 2026-10-20 | What Omnigraph main serves that Studio's minimum server does not | `openapi.json` at main `4ba904d3` diffed with `crates/graph_client/openapi/omnigraph-0.14.0-edge.json` by operation, parameter and schema property; the `changelog.d` notes added since `d883c49e`; the CLI reference and targets guide at `4ba904d3` | New: `GET /graphs/{id}/access`; `limit`, `page_token`, `head_commit_id`, `next_page_token` on commits; `from_commit` and `from_commit_id` on branch creation; `ChangeOutput.executed`; error details `branch_start_refusal` and `full_text_index_required`. Contract header still `0.13`. The CLI drops `--server` and profiles for targets (#1090) |
+| 2026-10-15 | What Omnigraph main serves that 0.13.0 does not | `openapi.json` at `v0.13.0` and at main `fe69c039`, diffed by operation id, schema properties and parameters; issues #976–#980 | New: `cluster_getDiff`, `cluster_getBranchDiff`, `cluster_getMergeBase`, `cluster_putBlob`, `cluster_clearBlob`, `cluster_publishCommit`, `cluster_dropCommit`, OAuth resource metadata; `dry_run` and `as_commit` on merge; commit kinds and filters; `ReadOutput.page`. Contract header still `0.13`. #977 and #979 closed by #987 and #988; #976, #978 and #980 open |
 | 2026-10-11 | Route list at 0.13.0 and main | parsed `openapi.json` at `v0.13.0` and main | 0.13.0 lacks Blob PUT/DELETE and commit publish/drop |
 | 2026-10-11 | `BranchMergeRequest` at 0.13.0 | parsed `openapi.json` at `v0.13.0` | `source`, `target`, `delete_branch`, `settings`; no `as_commit` |
 | 2026-10-11 | `CommitOutput` at 0.13.0 | parsed `openapi.json` at `v0.13.0` | No `published` field; `GET /commits` takes `branch` only |
-| 2026-10-11 | Server internals cited above | Studio integration research at OmniGraph main `680fdfef` | Re-check every line reference against the release the RFC targets |
+| 2026-10-11 | Server internals cited above | Studio integration research at Omnigraph main `680fdfef` | Re-check every line reference against the release the RFC targets |
 
 ## Corrections
 

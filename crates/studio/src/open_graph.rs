@@ -109,7 +109,7 @@ impl OpenGraphModal {
         let graph_id = input("Graph id, for example knowledge", window, cx);
         let new_name = input("Name, for example dev", window, cx);
         let new_url = input("http://127.0.0.1:8787", window, cx);
-        let new_token = input("Token (kept by the OmniGraph CLI)", window, cx);
+        let new_token = input("Token (kept by the Omnigraph CLI)", window, cx);
         new_token.update(cx, |editor, cx| editor.set_masked(true, cx));
         let replacement_token = input("New token", window, cx);
         replacement_token.update(cx, |editor, cx| editor.set_masked(true, cx));
@@ -471,7 +471,7 @@ impl OpenGraphModal {
             .map(|connection| connection.entity_id())
             .collect();
         let adding = registry.update(cx, |registry, cx| registry.add_target(name, url, token, cx));
-        self.error = Some("Adding the target through the OmniGraph CLI…".into());
+        self.error = Some("Adding the target through the Omnigraph CLI…".into());
         cx.notify();
         self._adding = Some(cx.spawn_in(window, async move |this, cx| {
             let added = adding.await;
@@ -780,7 +780,7 @@ fn server_status(c: &Connection) -> String {
             format!("Could not reach the server: {error}")
         }
         (ConnectionState::Unauthorized, Some(reason)) => {
-            format!("The OmniGraph CLI gave no token for this server: {reason}")
+            format!("The Omnigraph CLI gave no token for this server: {reason}")
         }
         (ConnectionState::Unauthorized, None) if !c.refused_with_token => {
             "This server asks for a token; none is configured for it.".into()
@@ -831,7 +831,7 @@ fn tooltip_for(
 ) -> String {
     if let Some(profile) = profile {
         return format!(
-            "Studio uses the token the OmniGraph CLI gives for this cluster from its profile \
+            "Studio uses the token the Omnigraph CLI gives for this cluster from its profile \
              {profile} (for a profile that signs in, your `omnigraph login --profile {profile}`). \
              Studio keeps it in memory and asks the CLI again when the server refuses it; the CLI \
              gives the same token while it holds and a new one once it lapses. A token typed \
@@ -1153,7 +1153,7 @@ mod tests {
         assert_eq!(
             said(false, cx),
             (
-                "The OmniGraph CLI gave no token for this server: No credential is configured \
+                "The Omnigraph CLI gave no token for this server: No credential is configured \
                  for 'cloud'"
                     .to_owned(),
                 "No token from the CLI".to_owned()
@@ -1177,7 +1177,7 @@ mod tests {
         assert_eq!(
             tooltip(ServerSource::Cli, Platform::Other, cx),
             "Used until Studio quits. Studio on Windows cannot use a target that needs a token \
-             yet (the OmniGraph CLI gives a token only through a Unix pipe), so the CLI cannot \
+             yet (the Omnigraph CLI gives a token only through a Unix pipe), so the CLI cannot \
              keep this one for it."
         );
         assert_eq!(
@@ -1305,7 +1305,7 @@ mod tests {
                 .read_with(cx, |modal, _| modal.token_refusal())
                 .as_deref(),
             Some(
-                "Studio on Windows adds only servers that need no token: the OmniGraph CLI \
+                "Studio on Windows adds only servers that need no token: the Omnigraph CLI \
                  gives a token only through a Unix pipe."
             )
         );
@@ -1334,7 +1334,7 @@ mod tests {
                 .read_with(cx, |modal, _| modal.error.clone())
                 .as_deref(),
             Some(
-                "The server was not added: the OmniGraph CLI gives a token only through a Unix \
+                "The server was not added: the Omnigraph CLI gives a token only through a Unix \
                  pipe, so Studio on Windows cannot use a server that needs a token yet; leave \
                  the token empty to add one that needs none"
             )

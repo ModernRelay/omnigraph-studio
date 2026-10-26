@@ -5,7 +5,7 @@
 //!
 //! Built on Zed's `http_client::HttpClient` (Apache-2.0): the app passes `reqwest_client`,
 //! tests pass Zed's fake client. The contract is `openapi/omnigraph-0.14.0.json`, copied
-//! from OmniGraph `v0.14.0` (MIT), the release that fixed contract `0.14` and the oldest server
+//! from Omnigraph `v0.14.0` (MIT), the release that fixed contract `0.14` and the oldest server
 //! Studio supports.
 
 pub mod api;

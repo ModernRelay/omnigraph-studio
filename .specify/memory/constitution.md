@@ -1,17 +1,17 @@
-# OmniGraph Studio constitution
+# Omnigraph Studio constitution
 
 Version 1.2.1 · ratified 2026-10-11 · amended 2026-10-17 (IV: ↵ and Undo for what Studio can
-put back) · amended 2026-10-18 (IV: ↵ for what loses no data) · amended 2026-10-24 (X: OmniGraph
+put back) · amended 2026-10-18 (IV: ↵ for what loses no data) · amended 2026-10-24 (X: Omnigraph
 `v0.14.0` and later)
 
-OmniGraph Studio is a native desktop app for exploring and changing OmniGraph graphs: type
+Omnigraph Studio is a native desktop app for exploring and changing Omnigraph graphs: type
 tables, a relationship tree, a graph canvas, a `.gq` query editor, branches, review, merge and
 history. These principles bind every plan and every change. A plan names the principles it
 touches; a change that breaks one amends this file first.
 
 ## I. The engine is the authority; Studio speaks HTTP
 
-Studio reads and writes graphs only through an OmniGraph server's HTTP API. It never opens
+Studio reads and writes graphs only through an Omnigraph server's HTTP API. It never opens
 graph storage, never links the engine, and never keeps a copy of graph data that it treats as
 true. The one engine crate it links is `omnigraph-compiler`, for parsing schemas and queries
 offline; parsing is language intelligence, not data access.
@@ -74,7 +74,7 @@ thread. A frame does no I/O.
 
 ## X. The engine moves at its own pace
 
-Studio speaks OmniGraph's HTTP contract 0.14 (OmniGraph `v0.14.0` and later) and refuses a
+Studio speaks Omnigraph's HTTP contract 0.14 (Omnigraph `v0.14.0` and later) and refuses a
 server that speaks another contract. A feature that would be better
 with an engine change is designed against today's API, and the change is recorded in
 `docs/deferred-engine-changes.md`. Studio never works around a missing route by keeping its own
@@ -90,7 +90,7 @@ No AGPL, SSPL or BSL dependencies. No GPUI Kit or other copy of GPUI: there is e
 
 ## XII. Evidence over assumption
 
-Every plan has a validation log. Claims about Zed, GPUI or OmniGraph are checked against source
+Every plan has a validation log. Claims about Zed, GPUI or Omnigraph are checked against source
 at the pinned revisions and cited by path. A performance claim needs a measurement, recorded
 with the machine and the data size.
 

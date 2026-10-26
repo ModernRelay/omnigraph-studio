@@ -1,6 +1,6 @@
-//! Every server Studio knows: the server targets the OmniGraph CLI lists, and, for development
+//! Every server Studio knows: the server targets the Omnigraph CLI lists, and, for development
 //! and tests, one from the environment. Studio keeps no server list or token of its own
-//! (OmniGraph RFC 1017): a server is added as a CLI target, through the CLI
+//! (Omnigraph RFC 1017): a server is added as a CLI target, through the CLI
 //! ([`ConnectionRegistry::add_target`]). The targets are listed off the main thread, at start and
 //! whenever the CLI's files change: a start shows its windows at once, and they find the CLI's
 //! servers once the first listing lands ([`ConnectionRegistry::when_listed`]).
@@ -152,7 +152,7 @@ fn valid_target_name(name: &str) -> bool {
 }
 
 /// The HTTP client for a CLI target whose `transport` names a proxy (`mode: url`) or its own
-/// certificate authority (`tls.ca`), as the OmniGraph CLI makes its own (`operator_transport.rs`):
+/// certificate authority (`tls.ca`), as the Omnigraph CLI makes its own (`operator_transport.rs`):
 /// with `append` the bundle's certificates are trusted with the system's roots, with `replace`
 /// alone. The reqwest Zed pins has no bundled web roots to leave out. Requests go through the
 /// proxy, else as the system's settings say; Zed's client also leaves out the hosts in
@@ -1390,7 +1390,7 @@ mod tests {
             let notices = registry.notices();
             for name in ["envy", "filed", "helped", "stored"] {
                 let refused = format!(
-                    "CLI target '{name}' takes a token, and the OmniGraph CLI gives a token only \
+                    "CLI target '{name}' takes a token, and the Omnigraph CLI gives a token only \
                      through a Unix pipe, so Studio on Windows cannot use this target yet"
                 );
                 assert!(notices.contains(&refused), "{name}: {notices:?}");
@@ -1411,7 +1411,7 @@ mod tests {
         });
         assert_eq!(
             refused.await.unwrap_err(),
-            "the OmniGraph CLI gives a token only through a Unix pipe, so Studio on Windows \
+            "the Omnigraph CLI gives a token only through a Unix pipe, so Studio on Windows \
              cannot use a server that needs a token yet; leave the token empty to add one that \
              needs none"
         );
@@ -1695,7 +1695,7 @@ mod tests {
         });
         let refused = CliTargets {
             servers: None,
-            errors: vec!["The OmniGraph CLI (…) could not list its targets: refused".into()],
+            errors: vec!["The Omnigraph CLI (…) could not list its targets: refused".into()],
             ..CliTargets::default()
         };
         assert!(apply(&registry, refused, cx));

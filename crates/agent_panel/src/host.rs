@@ -401,7 +401,7 @@ async fn connect(
     let Some((program, args)) = launch.command.split_first() else {
         return Err(agent_client_protocol::Error::invalid_params().data("no agent command is set"));
     };
-    // The agent never inherits the person's graph credentials (spec 013): OmniGraph's own
+    // The agent never inherits the person's graph credentials (spec 013): Omnigraph's own
     // variables in Studio's environment are removed for its process, unless the agent's
     // settings set them. The process API can add variables but not remove them, so the agent
     // starts through `env -u`, or on Windows through Studio's own launcher. Model providers'
@@ -1662,7 +1662,7 @@ fn without_variables(
     Ok(("/usr/bin/env".into(), wrapped))
 }
 
-/// OmniGraph's variables among `names`, every `OMNIGRAPH_*` one in any ASCII case
+/// Omnigraph's variables among `names`, every `OMNIGRAPH_*` one in any ASCII case
 /// ([`graph_store::cli::omnigraph_variables`], the one rule Studio's own CLI follows too),
 /// except those the agent's own settings set.
 fn credential_variables(

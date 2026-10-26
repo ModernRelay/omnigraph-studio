@@ -1,4 +1,4 @@
-//! The HTTP client for one OmniGraph server (spec 003).
+//! The HTTP client for one Omnigraph server (spec 003).
 //!
 //! Reads return `Result<T, ReadError>`. Writes return a [`WriteOutcome`] and are never retried
 //! here (constitution III).
@@ -71,13 +71,13 @@ pub struct ApiErrorSummary {
     /// at a schema boundary. Boxed, so every read's error stays small.
     pub change_diff_refusal: Option<Box<crate::api::ChangeDiffRefusalOutput>>,
     /// The `Bearer` challenge a 401 carried (`WWW-Authenticate`), which a server sends with
-    /// every 401 since OmniGraph #1122; `None` otherwise, and from an older server.
+    /// every 401 since Omnigraph #1122; `None` otherwise, and from an older server.
     pub challenge: Option<Box<Challenge>>,
 }
 
 /// A `WWW-Authenticate` challenge: its scheme and its parameters, as RFC 9110 §11.6.1 writes
-/// them. OmniGraph sends `Bearer`, with `error="invalid_token"` when it refused the token a
-/// request carried, and `resource_metadata="<url>"` when it takes OAuth sign-in (OmniGraph RFC
+/// them. Omnigraph sends `Bearer`, with `error="invalid_token"` when it refused the token a
+/// request carried, and `resource_metadata="<url>"` when it takes OAuth sign-in (Omnigraph RFC
 /// 1017, A1). A scheme's token68 payload (`Negotiate abc==`), which some schemes take in place
 /// of parameters, is read past and not kept: Studio speaks `Bearer` alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,7 +224,7 @@ pub enum PropertyThen {
     Absent,
     /// It had this name; a historical read does not follow a rename.
     Named(String),
-    /// Its column carries no property identity (data written before OmniGraph 0.10), so the
+    /// Its column carries no property identity (data written before Omnigraph 0.10), so the
     /// server cannot tell which property it was.
     Unwitnessed,
 }
@@ -329,7 +329,7 @@ impl ServerHealth {
 struct RawResponse {
     status: StatusCode,
     contract: Option<String>,
-    /// `Retry-After` in seconds; the HTTP-date form is not used by OmniGraph.
+    /// `Retry-After` in seconds; the HTTP-date form is not used by Omnigraph.
     retry_after: Option<Duration>,
     headers: HeaderMap,
     body: Vec<u8>,
@@ -1464,7 +1464,7 @@ fn json<T: Serialize>(value: &T) -> Vec<u8> {
     serde_json::to_vec(value).expect("request types serialize")
 }
 
-/// Whether a read's answer is the server's: it carries the contract Studio speaks. OmniGraph
+/// Whether a read's answer is the server's: it carries the contract Studio speaks. Omnigraph
 /// stamps the header on every response it sends, errors included, as [`judge_write`] relies on
 /// too. A success without it is a server that does not say which contract it speaks. An error
 /// without it came from something between Studio and the server (a proxy, a gateway): it says
@@ -1531,10 +1531,10 @@ fn summary(raw: &RawResponse) -> ApiErrorSummary {
 ///   disposition (every 0.14.0 server does): the disposition decides. Effects `none` is a
 ///   refusal whatever the status, a 500 included; `unknown` or `partial` is unknown whatever
 ///   the status, a 503 included, since some or all of the write may have happened.
-/// - Such an error without a disposition (a server before OmniGraph 0.14.0), or with an effect
+/// - Such an error without a disposition (a server before Omnigraph 0.14.0), or with an effect
 ///   this build does not know: unknown, since nothing rules the change out.
 /// - Anything else (a lost contract header, an error without the server's body): unknown.
-///   OmniGraph stamps the header on every response it sends, errors included, so an error
+///   Omnigraph stamps the header on every response it sends, errors included, so an error
 ///   without it came from something in between (a proxy, a gateway), which cannot say whether
 ///   the server applied the write.
 pub fn judge_write<'a>(
@@ -1567,12 +1567,12 @@ pub fn judge_write<'a>(
                     ),
                 }
             }
-            // An effect this build does not know, or none at all: OmniGraph 0.14.0 and later
+            // An effect this build does not know, or none at all: Omnigraph 0.14.0 and later
             // state one on every error, so the answer cannot rule the change out.
             Some(DispositionEffects::Other) | None => WriteOutcome::Unknown {
                 reason: format!(
                     "the server answered {status} without saying whether the change was made \
-                     (OmniGraph before 0.14.0 does not say): {}",
+                     (Omnigraph before 0.14.0 does not say): {}",
                     body.error
                 ),
             },
@@ -3213,7 +3213,7 @@ mod tests {
         assert!(GraphClient::new("http://localhost:8080", None, http).is_ok());
     }
 
-    /// A 401 carries the server's `Bearer` challenge (OmniGraph #1122): whether it refused the
+    /// A 401 carries the server's `Bearer` challenge (Omnigraph #1122): whether it refused the
     /// token sent, and where its protected-resource metadata is; another status, or a 401
     /// without the header (an older server), carries none.
     #[test]

@@ -302,7 +302,7 @@ second line shows it (`omnigraph branch create feature-x --from main`).
 
 ### What the credential may do (E15)
 
-Built 2026-10-20 on `GET /graphs/{id}/access` (OmniGraph #1073, E15). The session reads it for
+Built 2026-10-20 on `GET /graphs/{id}/access` (Omnigraph #1073, E15). The session reads it for
 its branch when the graph opens and when the branch changes, and again after a 403 on the graph
 or a new token, which the client counts apart; a branch's menu reads it for that branch as it
 opens, and a review for its branch and target (`AccessScope::branch_into`) as it opens. Each is
@@ -385,7 +385,7 @@ Its action is not registered, so the palette and the keyboard button's list leav
     field hears it lost focus), and the scope switch writes it to the scope it was typed in
     before showing the other. A
     doc comment's lines read as one paragraph. Only `agent.env` (a map) and `graphs` stay in
-    `settings.json` alone. The OmniGraph CLI (`omnigraph_cli`), the CLI Studio and the agent
+    `settings.json` alone. The Omnigraph CLI (`omnigraph_cli`), the CLI Studio and the agent
     look for first (specs 003 and 013), is under Connection (since 2026-10-22; before,
     `agent.omnigraph_cli` under Agent, which no longer sets anything). The nav counts changed settings per section;
     search spans every section; the search box has focus when the tab opens.
@@ -471,8 +471,8 @@ and a 97 % fill let the text behind show through.
   it reads again, so the person's text is never replaced by defaults. A change is written
   into the file as it is on disk at that moment, never over it.
 - The data directory is the person's unless the binary is Cargo's build output (`cargo run`,
-  an example): that uses "OmniGraph Studio Dev" (`omnigraph-studio-dev` on Linux). The data
-  directory is `%APPDATA%\OmniGraph Studio` on Windows (`OmniGraph Studio Dev` for a development
+  an example): that uses "Omnigraph Studio Dev" (`omnigraph-studio-dev` on Linux). The data
+  directory is `%APPDATA%\Omnigraph Studio` on Windows (`Omnigraph Studio Dev` for a development
   run). A bundled
   app is the person's whichever profile built it. `OMNIGRAPH_STUDIO_DATA` overrides both; the
   snapshot tool sets a fresh temporary directory when it is unset. With restoring off, Studio
@@ -932,10 +932,10 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 ## Deferred
 
 - `omnigraph-studio://connect?code=…`, the launcher's single-use code (engine change E1): a link
-  of that kind is refused with a note until OmniGraph has `omnigraph studio`.
+  of that kind is refused with a note until Omnigraph has `omnigraph studio`.
 - Engine changes, [spec 012](../012-omnigraph-engine-changes/plan.md):
   - E9 branch details: the branch menu derives head and fork from `GET /commits?branch=` until then.
-  - E15 what may I do (`GET /graphs/{id}/access`, OmniGraph #1073): built 2026-10-20 (Design,
+  - E15 what may I do (`GET /graphs/{id}/access`, Omnigraph #1073): built 2026-10-20 (Design,
     What the credential may do). Branch creation stays offered: the answer judges it only with
     the new branch's name.
 
@@ -1018,7 +1018,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 | 2026-10-12 | Zed's global handlers appear as rows | palette snapshot | `editor::init` registers `workspace::NewFile` and `workspace::NewWindow` globally; their handlers read Zed's `AppState` with `cx.global`, which panics in Studio. The palette hides `workspace::`, `zed::` and `menu::`; ⌘N is rebound to `studio_graph::NewQuery` at the root (spec 007), so the key no longer reaches `NewFile` |
 | 2026-10-12 | With nothing focused, an action reaches only global handlers | offscreen snapshots: `studio::ToggleSidebar` and `studio::OpenGraph` did nothing until the workspace had focus | A window opens with no focus, so the workspace's handlers and key bindings are unreachable until something is clicked. The snapshot example now focuses the workspace first; the app should focus it when a window opens |
 | 2026-10-12 | Settings rows are generated in declaration order | `studio_settings` field tests (row order, sections, kinds, path writes and resets); `serde_json`'s `preserve_order` is on in the workspace graph; offscreen snapshots of the Appearance section and of searches for "page" and "agent" | Fourteen rows in four sections; `agent.env` hidden; changed rows show Reset and the nav counts them |
-| 2026-10-14 | Every setting with a control is on the page | `studio_settings` field tests (row list, kinds, one-paragraph descriptions); offscreen snapshots in a scratch data folder: a search for "agent", a path typed into OmniGraph CLI then ↵, a second run with Reset, the Ask before writes switch | `agent.ask_before_writes` and `agent.omnigraph_cli`, added for spec 013, had been hidden; text settings had no control at all (the page showed the value read-only), and no switch had been drawn. Now sixteen rows: ↵ wrote `"omnigraph_cli": "/opt/omnigraph/bin/omnigraph"` (mode 0600) and showed Reset, Reset wrote `null` and emptied the field, the switch wrote `true`. Descriptions had kept their doc comments' line breaks, and GPUI breaks lines at `/`, so paths left the descriptions |
+| 2026-10-14 | Every setting with a control is on the page | `studio_settings` field tests (row list, kinds, one-paragraph descriptions); offscreen snapshots in a scratch data folder: a search for "agent", a path typed into Omnigraph CLI then ↵, a second run with Reset, the Ask before writes switch | `agent.ask_before_writes` and `agent.omnigraph_cli`, added for spec 013, had been hidden; text settings had no control at all (the page showed the value read-only), and no switch had been drawn. Now sixteen rows: ↵ wrote `"omnigraph_cli": "/opt/omnigraph/bin/omnigraph"` (mode 0600) and showed Reset, Reset wrote `null` and emptied the field, the switch wrote `true`. Descriptions had kept their doc comments' line breaks, and GPUI breaks lines at `/`, so paths left the descriptions |
 | 2026-10-14 | The footers show the server's round trip and, when asked, Studio's memory and CPU | `studio_workspace` test `the_process_reads_its_memory_and_cpu`; `studio_settings` tests (row list, `default.json`); `cargo clippy -p studio --features perf`; an offscreen snapshot with `show_performance` on, a table open, 4.5 s waited, then ⌘⌥⇧F | The sidebar read "environment contract 0.13 · 2 ms", the document footer ended "42 MB · 1% CPU", and the overlay key toasted the `perf` build command in a default build. A `release-fast` build with `--features perf` then drew the overlay after ⌘⌥⇧F (frame time, 1% and 10% slowest, maximum, frames). On the running app (debug bundle), the reading Studio uses, `proc_pid_rusage`'s physical footprint, gave 363.7 MiB where macOS's `footprint` reported 364 MB and `top` 361 MB: the figure Activity Monitor shows |
 | 2026-10-14 | Glass corners, button padding and the tab strip | Offscreen snapshots in glass with two tabs and the pointer on the first, the edge dialog, and a query in flat; corners cropped at 2× from every sheet | The first tab's shade had a square corner outside the document sheet's curve, faint at rest and plain on hover; now it follows the curve. Every other corner of the sidebar, document and inspector sheets, including the footer switcher under the pointer, was already clean. Buttons read with 6 px insets at 28 px; header strips are 36 px, footers 40 |
 | 2026-10-14 | Nested radii are concentric | Audit of all 69 rounded surfaces; `ds` test `nested_radii_are_concentric`; offscreen snapshots of the filter pill being written with × under the pointer, the edge dialog's offers and the canvas's floating controls, cropped at 2× | Wrong before: offer rows (4 px) in a 6 px list 4 px in, the context chip's 6 px tile 6 px inside 10 px, the canvas bars sized for 6 px children around Zed's 4 px buttons, square 4 px buttons in the pills' round ends. Now the lists are 8 px, the tile 4 px, the bars 7 px, and the pill buttons round with an even 4 px gap. Dialogs, the peek and the palette pad more than their radius, so their children keep their own |
@@ -1050,7 +1050,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
   not read; the key is `<target>/<graph id>`, which such a name, when it is the target's, matches
   again; persistence was said to be keyed by server. The status bar's example said "contract
   0.13", and a new token was said to come from `omnigraph login` changing the CLI's files, which
-  is managed sign-in only. The OmniGraph CLI setting moved from `agent.omnigraph_cli` (Agent) to
+  is managed sign-in only. The Omnigraph CLI setting moved from `agent.omnigraph_cli` (Agent) to
   `omnigraph_cli` (Connection), which the settings section now says. A parked graph's first
   reads were said to include the stored queries, which are read once a view wants them.
 

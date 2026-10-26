@@ -16,7 +16,7 @@ throws everything away.
 The cause is structural. Each view (table, peek and page, tree and canvas, history) builds its
 own queries, runs its own fetching state machine and keeps its own partial cache. Nothing
 schedules reads across views, nothing knows which reads a new commit leaves valid, and nothing
-uses what OmniGraph guarantees: a commit never changes.
+uses what Omnigraph guarantees: a commit never changes.
 
 This plan replaces those per-view mechanisms with one read model owned by the session.
 
@@ -32,16 +32,16 @@ This plan replaces those per-view mechanisms with one read model owned by the se
   nothing it shows is not a change: its content is identical, so the "Newer data" chip appears
   only when the view's data actually differs.
 - IX: every read is bounded: a page size or a cap, a concurrency cap, a byte budget for the cache.
-- X: Studio's minimum server is OmniGraph 0.14 (Ragnor, 2026-10-17): today's `main`, released as
+- X: Studio's minimum server is Omnigraph 0.14 (Ragnor, 2026-10-17): today's `main`, released as
   0.14 edge builds (`edge-20261017-d883c49`, `0.14.0-edge+d883c49`). It adds the graph diff,
   branch review, merge-base and merge dry run (#966) and paged commit lists (#1013); the engine
   changes filed below are not in it. The HTTP contract header is still `0.13`.
-- XII: every claim below was checked against OmniGraph `main` (`d883c49e`) or the 0.13 server on
+- XII: every claim below was checked against Omnigraph `main` (`d883c49e`) or the 0.13 server on
   the personal graph; see the validation log.
 
 ## What exists today (checked)
 
-### The workload (personal graph, OmniGraph 0.13.0 server, 2026-10-17)
+### The workload (personal graph, Omnigraph 0.13.0 server, 2026-10-17)
 
 Measured with the CLI (10 ms start-up, so the times are server and network), from a Mac to
 `omnigraph.ragnor.co`, reads only, Studio's own query text.
@@ -69,7 +69,7 @@ groups (16 on empty edge tables). History: about 20 commits an hour, in bursts (
 from one writer. So requests, not bytes, are the scarce resource; reads at old commits cost
 more; heads move every few minutes.
 
-### OmniGraph (`main` at `d883c49e`; server 0.13.0)
+### Omnigraph (`main` at `d883c49e`; server 0.13.0)
 
 1. Every read answers from one pinned version and reports its `graph_commit_id`
    (`crates/omnigraph-api-types/src/lib.rs`, `ReadOutput.graph_commit_id`).
@@ -335,7 +335,7 @@ A first cut of parts 1 and 4, ahead of the shared cache:
   so in the column's header. A relationship group whose edge type, or other end's type, did not
   exist at the commit had no neighbours then and shows none; one whose neighbour label or edge
   property is newer is read without it. A property whose stored column has no identity (data
-  written before OmniGraph 0.10) shows as "not readable at this commit". The server names one
+  written before Omnigraph 0.10) shows as "not readable at this commit". The server names one
   property per refusal and only in its message (`omnigraph-core` `error.rs`); an engine change
   could name them all, typed.
 

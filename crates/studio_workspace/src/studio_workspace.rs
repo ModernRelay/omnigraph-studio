@@ -5065,7 +5065,7 @@ impl ConfirmClose {
             ),
             Closing::Graph => ("Close the graph?".into(), lost),
             Closing::Window => ("Close this window?".into(), lost),
-            Closing::Quit => ("Quit OmniGraph Studio?".into(), lost),
+            Closing::Quit => ("Quit Omnigraph Studio?".into(), lost),
         }
     }
 }

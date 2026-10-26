@@ -5,7 +5,7 @@
 //! - `omnigraph-studio://graph?server=<url>&graph=<id>[&branch=<name>]`
 //! - `omnigraph-studio://node?server=<url>&graph=<id>&type=<Type>&id=<key>[&branch=<name>]`
 //! - `omnigraph-studio://query?server=<url>&graph=<id>&text=<gq>[&branch=<name>]`
-//! - `omnigraph-studio://connect?code=<code>` is reserved for OmniGraph's `omnigraph studio`
+//! - `omnigraph-studio://connect?code=<code>` is reserved for Omnigraph's `omnigraph studio`
 //!   launcher (engine change E1) and refused until it exists.
 
 use url::Url;
@@ -35,7 +35,7 @@ pub enum DeepLink {
         target: Target,
         text: String,
     },
-    /// A link from the `omnigraph studio` launcher, which no OmniGraph release has yet.
+    /// A link from the `omnigraph studio` launcher, which no Omnigraph release has yet.
     Connect,
 }
 

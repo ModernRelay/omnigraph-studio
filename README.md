@@ -1,8 +1,8 @@
-# OmniGraph Studio
+# Omnigraph Studio
 
 A native, GPU-rendered desktop client for
-[OmniGraph](https://github.com/ModernRelay/omnigraph) graphs, written in Rust. It connects to
-an OmniGraph server over HTTP and provides a table per node and edge type, a relationship
+[Omnigraph](https://github.com/ModernRelay/omnigraph) graphs, written in Rust. It connects to
+an Omnigraph server over HTTP and provides a table per node and edge type, a relationship
 explorer, a GQ query editor with stored queries, branch review and merge, commit history and an
 agent panel.
 
@@ -30,10 +30,10 @@ Requirements:
 - macOS: the Command Line Tools (GPUI compiles its Metal shaders when Studio starts); full
   Xcode to compile them into a release build (`script/bundle-mac`). Linux: the Wayland, X11 and
   Vulkan development packages listed in `.github/workflows/ci.yml`.
-- An OmniGraph server of `v0.14.0` or later (HTTP contract 0.14). Studio refuses a server
-  that speaks another contract, such as OmniGraph 0.13, and its query checks follow `v0.14.0`.
+- An Omnigraph server of `v0.14.0` or later (HTTP contract 0.14). Studio refuses a server
+  that speaks another contract, such as Omnigraph 0.13, and its query checks follow `v0.14.0`.
 - For the servers of the CLI's targets, the agent panel and the sample graph, the `omnigraph`
-  CLI of `v0.14.0` or later, which OmniGraph's installer puts in `~/.local/bin`:
+  CLI of `v0.14.0` or later, which Omnigraph's installer puts in `~/.local/bin`:
 
   ```bash
   curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | bash
@@ -79,7 +79,7 @@ CLI too (`omnigraph target add`, and `credentials set` for its token).
 | `OMNIGRAPH_STUDIO_TOKEN` | Its bearer token |
 | `OMNIGRAPH_STUDIO_GRAPH` | Opens this graph on that server at launch |
 | `OMNIGRAPH_STUDIO_BRANCH` | The branch to open (default `main`) |
-| `OMNIGRAPH_STUDIO_DATA` | Directory of `settings.json`, `keymap.json` and the session (default `~/Library/Application Support/OmniGraph Studio`, `%APPDATA%\OmniGraph Studio` on Windows, or `$XDG_CONFIG_HOME/omnigraph-studio`) |
+| `OMNIGRAPH_STUDIO_DATA` | Directory of `settings.json`, `keymap.json` and the session (default `~/Library/Application Support/Omnigraph Studio`, `%APPDATA%\Omnigraph Studio` on Windows, or `$XDG_CONFIG_HOME/omnigraph-studio`) |
 
 Packaging: `script/bundle-mac` builds an app bundle and a DMG, ad hoc signed unless a signing
 identity is configured (`--fast` bundles the optimized `release-fast` build, which rebuilds in
@@ -114,9 +114,9 @@ seconds, to run day to day); `script/bundle-linux` builds a tarball with a `.des
   defaults) may hold comments, are read again when saved, and list every problem by line; a
   change from the tab rewrites only the setting it touches.
 
-## How Studio uses OmniGraph
+## How Studio uses Omnigraph
 
-Studio is a client of the OmniGraph HTTP API and nothing else. These rules are in
+Studio is a client of the Omnigraph HTTP API and nothing else. These rules are in
 `.specify/memory/constitution.md` and each feature plan records how it follows them.
 
 - **HTTP only.** No access to graph storage and no engine crate except `omnigraph-compiler`,
@@ -195,7 +195,7 @@ what is deferred, and a dated validation log of the checks behind each claim.
 
 ## Status
 
-Built against OmniGraph `v0.14.0` (HTTP contract 0.14); macOS is the primary platform, and Linux and Windows build and
+Built against Omnigraph `v0.14.0` (HTTP contract 0.14); macOS is the primary platform, and Linux and Windows build and
 test in CI. Not implemented:
 
 - Signed and notarized releases, a Windows installer, auto-update.
@@ -205,7 +205,7 @@ test in CI. Not implemented:
 
 ## License
 
-GPL-3.0-or-later, because Studio links Zed's GPL-3.0 UI crates (`LICENSE`). OmniGraph is MIT
+GPL-3.0-or-later, because Studio links Zed's GPL-3.0 UI crates (`LICENSE`). Omnigraph is MIT
 and is not affected: Studio talks to it over HTTP and links only the MIT-licensed
 `omnigraph-compiler`.
 

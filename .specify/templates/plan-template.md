@@ -17,7 +17,7 @@ or a measurement.
 
 - Studio:
 - Zed (`v1.23.2`):
-- OmniGraph (`v0.13.0`):
+- Omnigraph (`v0.13.0`):
 
 ## Design
 

@@ -47,7 +47,7 @@ pub use fixes::{RevertUnavailable, revert_query};
 pub use graph_client::api::{AccessAction, EntityKind};
 pub use registry::ConnectionRegistry;
 
-/// The OmniGraph CLI as Studio finds, checks and runs it, for its own servers and tokens
+/// The Omnigraph CLI as Studio finds, checks and runs it, for its own servers and tokens
 /// (spec 003) and for the agent's CLI (spec 013): where Studio looks ([`cli::candidates`]),
 /// which program it runs ([`cli::probe`]), how it runs one, one sequence at a time
 /// ([`cli::take_turn`], [`cli::run`]), and which variables none of them inherits
@@ -66,7 +66,7 @@ pub use session::{
 };
 
 /// The user agent of Studio's requests.
-pub(crate) const USER_AGENT: &str = concat!("OmniGraph-Studio/", env!("CARGO_PKG_VERSION"));
+pub(crate) const USER_AGENT: &str = concat!("Omnigraph-Studio/", env!("CARGO_PKG_VERSION"));
 
 /// Sets up the HTTP client and loads every known server. Call once at startup.
 pub fn init(cx: &mut App) {

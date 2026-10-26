@@ -1,4 +1,4 @@
-//! One OmniGraph server: its client, contract and version check, and graphs (spec 003).
+//! One Omnigraph server: its client, contract and version check, and graphs (spec 003).
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use crate::cli_tokens::{Token, TokenSource};
 /// Where Studio learned about a server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerSource {
-    /// A server target the OmniGraph CLI lists; its token, if any, is the CLI's to give.
+    /// A server target the Omnigraph CLI lists; its token, if any, is the CLI's to give.
     Cli,
     /// `OMNIGRAPH_STUDIO_SERVER` in the environment, for development and tests; its token,
     /// `OMNIGRAPH_STUDIO_TOKEN`, lasts the run.
@@ -122,7 +122,7 @@ pub struct Connection {
     /// it. `None` until one answers, and after one fails.
     pub latency: Option<Duration>,
     pub graphs: GraphListing,
-    /// Why the token source gave no token (the OmniGraph CLI's reason): Studio then sends the
+    /// Why the token source gave no token (the Omnigraph CLI's reason): Studio then sends the
     /// server nothing. `None` once a token is set.
     pub token_unread: Option<String>,
     /// Whether the server refused the token of the request it answered with 401
@@ -676,7 +676,7 @@ enum Probe {
 
 /// A read that left the connection unusable: the state it leaves, and for a 401 whether the
 /// server's challenge says it refused the token sent (`None` from a server that sends none,
-/// one before OmniGraph #1122).
+/// one before Omnigraph #1122).
 struct Failed {
     state: ConnectionState,
     token_refused: Option<bool>,
@@ -1152,7 +1152,7 @@ mod tests {
         });
     }
 
-    /// A server that speaks contract 0.13 (OmniGraph 0.13, or a 0.14 build before the contract
+    /// A server that speaks contract 0.13 (Omnigraph 0.13, or a 0.14 build before the contract
     /// moved) is refused by its header; one that speaks 0.14 connects.
     #[gpui::test]
     async fn a_server_is_refused_by_the_contract_it_speaks(cx: &mut TestAppContext) {

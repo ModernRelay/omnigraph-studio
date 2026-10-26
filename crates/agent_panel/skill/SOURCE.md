@@ -1,6 +1,6 @@
-# The OmniGraph guide in Studio's agent skill
+# The Omnigraph guide in Studio's agent skill
 
-`upstream/` is a copy of the OmniGraph skill, unmodified: `skills/omnigraph/` and `LICENSE`
+`upstream/` is a copy of the Omnigraph skill, unmodified: `skills/omnigraph/` and `LICENSE`
 from [ModernRelay/omnigraph](https://github.com/ModernRelay/omnigraph) at tag `v0.14.0`
 (commit `60bfd19db780fdff3a5178f959c1204143420114`), the oldest release whose CLI Studio's agent
 drives: it reads the version-1 operator configuration Studio writes for the agent, and speaks

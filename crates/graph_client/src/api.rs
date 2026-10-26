@@ -1,4 +1,4 @@
-//! Request and response types for the OmniGraph 0.14 HTTP API.
+//! Request and response types for the Omnigraph 0.14 HTTP API.
 //!
 //! Field names and optionality follow `openapi/omnigraph-0.14.0.json`; the test at the bottom
 //! of this file fails if a type here and the contract disagree. Add fields only as surfaces
@@ -730,7 +730,7 @@ pub struct ErrorOutput {
     pub error: String,
     #[serde(default)]
     pub code: Option<ErrorCode>,
-    /// What the request did and what to do next; OmniGraph 0.14.0 and later send it on every
+    /// What the request did and what to do next; Omnigraph 0.14.0 and later send it on every
     /// error. Without it a write's outcome is unknown ([`crate::judge_write`]).
     #[serde(default)]
     pub disposition: Option<DispositionOutput>,

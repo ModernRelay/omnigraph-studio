@@ -1,6 +1,6 @@
 [package]
 name = "tree-sitter-gq"
-description = "Tree-sitter grammar for OmniGraph queries (.gq), for Studio's query editor"
+description = "Tree-sitter grammar for Omnigraph queries (.gq), for Studio's query editor"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

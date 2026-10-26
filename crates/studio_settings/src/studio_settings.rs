@@ -350,7 +350,7 @@ pub struct StudioSettings {
     /// The omnigraph program Studio runs to list its servers and read their tokens, and that the
     /// agent runs to reach the graph. Studio tries it first, then each omnigraph on PATH and in
     /// the usual install folders, and runs the first that fits.
-    #[schemars(title = "OmniGraph CLI", extend("x-section" = "Connection"))]
+    #[schemars(title = "Omnigraph CLI", extend("x-section" = "Connection"))]
     pub omnigraph_cli: Option<String>,
     #[schemars(extend("x-section" = "Agent"))]
     pub agent: AgentSettings,
@@ -407,7 +407,7 @@ struct SettingsFileState {
 impl Global for SettingsFileState {}
 
 /// Studio's data directory, for every crate: `OMNIGRAPH_STUDIO_DATA`, else
-/// `~/Library/Application Support/OmniGraph Studio` on macOS, `%APPDATA%\OmniGraph Studio` on
+/// `~/Library/Application Support/Omnigraph Studio` on macOS, `%APPDATA%\Omnigraph Studio` on
 /// Windows, `$XDG_CONFIG_HOME/omnigraph-studio` elsewhere. A binary run from a Cargo build
 /// directory (`cargo run`, an example) uses a sibling directory ending in "Dev" instead, so a
 /// development run never rewrites the tabs, drafts and conversations of the app the person
@@ -437,16 +437,16 @@ fn find_data_dir() -> PathBuf {
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join("AppData").join("Roaming"))
             .join(if dev {
-                "OmniGraph Studio Dev"
+                "Omnigraph Studio Dev"
             } else {
-                "OmniGraph Studio"
+                "Omnigraph Studio"
             });
     }
     if cfg!(target_os = "macos") {
         home.join("Library/Application Support").join(if dev {
-            "OmniGraph Studio Dev"
+            "Omnigraph Studio Dev"
         } else {
-            "OmniGraph Studio"
+            "Omnigraph Studio"
         })
     } else {
         std::env::var_os("XDG_CONFIG_HOME")
@@ -1081,10 +1081,10 @@ mod tests {
         assert!(dev("/w/omnigraph-studio/target/debug/examples/snapshot"));
         assert!(dev("/w/omnigraph-studio/target/debug/deps/studio-0123abcd"));
         assert!(!dev(
-            "/w/omnigraph-studio/target/bundle/OmniGraph Studio.app/Contents/MacOS/omnigraph-studio"
+            "/w/omnigraph-studio/target/bundle/Omnigraph Studio.app/Contents/MacOS/omnigraph-studio"
         ));
         assert!(!dev(
-            "/Applications/OmniGraph Studio.app/Contents/MacOS/omnigraph-studio"
+            "/Applications/Omnigraph Studio.app/Contents/MacOS/omnigraph-studio"
         ));
         assert!(!dev("/opt/omnigraph-studio/bin/omnigraph-studio"));
         assert!(!dev("/usr/local/bin/omnigraph-studio"));

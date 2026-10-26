@@ -436,7 +436,7 @@ mod tests {
         // A doc comment's lines are one paragraph.
         assert!(!field("agent.ask_before_writes").description.contains('\n'));
         let cli = field("omnigraph_cli");
-        assert_eq!(cli.title, "OmniGraph CLI");
+        assert_eq!(cli.title, "Omnigraph CLI");
         assert_eq!(cli.kind, FieldKind::Text { nullable: true });
         assert_eq!(
             cli.section, "Connection",

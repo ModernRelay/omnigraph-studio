@@ -1,21 +1,21 @@
 # Grammars
 
-Tree-sitter grammars for OmniGraph's languages, used by the query editor for highlighting,
+Tree-sitter grammars for Omnigraph's languages, used by the query editor for highlighting,
 folding and outline (spec 007):
 
-- `tree-sitter-gq`: queries, mutations and statements (`.gq`) at OmniGraph `v0.14.0`, the
+- `tree-sitter-gq`: queries, mutations and statements (`.gq`) at Omnigraph `v0.14.0`, the
   `omnigraph-compiler` tag Studio pins; its `query.pest` is unchanged from
   `edge-20261020-7fd9cc9`, where the corpus below was checked. Built: the query editor's buffer
   parses with it (`query_editor::syntax`).
-- `tree-sitter-pg`: schemas (`.pg`) at OmniGraph v0.13.0. Built: the read-only schema view
+- `tree-sitter-pg`: schemas (`.pg`) at Omnigraph v0.13.0. Built: the read-only schema view
   parses with it (`query_editor::schema_view`).
 
-The source of truth for both languages is OmniGraph's pest grammars
+The source of truth for both languages is Omnigraph's pest grammars
 (`crates/omnigraph-compiler/src/query/query.pest` and `schema/schema.pest` at the pinned tag).
 Type checking, diagnostics and completion come from `omnigraph-compiler` itself, not from these
 grammars.
 
-These grammars live here until OmniGraph takes ownership of them together with an
+These grammars live here until Omnigraph takes ownership of them together with an
 `omnigraph lsp` server (`docs/deferred-engine-changes.md`).
 
 ## tree-sitter-gq
@@ -36,7 +36,7 @@ These grammars live here until OmniGraph takes ownership of them together with a
   `gq_language::TokenKind::syntax_name`), `brackets.scm`, `indents.scm` and `outline.scm`.
 - `cargo test -p tree-sitter-gq` parses a file that uses every clause kind and one that uses
   every statement, compiles the queries and checks that the statement words highlight as
-  keywords. Check a grammar change against OmniGraph's logic-test corpus too: extract the
+  keywords. Check a grammar change against Omnigraph's logic-test corpus too: extract the
   `--- query` and `--- mutate` steps of `crates/omnigraph-gqt/cases/**/*.gqt` at the pinned tag
   (leaving out steps whose next `--- expect` is an error) and run `tree-sitter parse --quiet
   --stat` over them with the repository's fixture queries (`crates/omnigraph/tests/fixtures/*.gq`
@@ -52,6 +52,6 @@ These grammars live here until OmniGraph takes ownership of them together with a
   property or a relationship reads the same colour in a schema as in a query.
 - `cargo test -p tree-sitter-pg` parses a schema that uses every construct, keeps the
   declarations after a broken one, compiles the queries and checks the outline. Check a grammar
-  change against OmniGraph's schemas too: the repository's `.pg` files and the `--- schema`
+  change against Omnigraph's schemas too: the repository's `.pg` files and the `--- schema`
   sections of the `.gqt` corpus at the pinned tag; at v0.13.0 all 269 parse without an error
   node.

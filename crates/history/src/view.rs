@@ -2291,7 +2291,7 @@ mod tests {
     use super::*;
 
     /// A server for History's tests. It holds each branch's first-parent chain, newest first,
-    /// and pages a listing as OmniGraph does (`limit`, `page_token`, `head_commit_id`; a later
+    /// and pages a listing as Omnigraph does (`limit`, `page_token`, `head_commit_id`; a later
     /// page answers for the head the first resolved). It answers a commit by its id, the head
     /// probe with the branch's newest commit, and every commit's changes with none, and notes
     /// every request.

@@ -41,7 +41,7 @@ pub fn identity() -> std::io::Result<Identity> {
     let mut params = rcgen::CertificateParams::default();
     params.subject_alt_names = vec![rcgen::SanType::IpAddress(Ipv4Addr::LOCALHOST.into())];
     let mut name = rcgen::DistinguishedName::new();
-    name.push(rcgen::DnType::CommonName, "OmniGraph Studio agent gateway");
+    name.push(rcgen::DnType::CommonName, "Omnigraph Studio agent gateway");
     params.distinguished_name = name;
     params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];

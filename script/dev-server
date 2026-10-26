@@ -7,7 +7,7 @@
 #   script/dev-server            # first run applies the cluster and loads dev/seed.jsonl
 #   script/dev-server --reset    # start again from an empty graph
 #
-# Needs OmniGraph's `omnigraph` and `omnigraph-server` of `v0.14.0` or later, on PATH or named by
+# Needs Omnigraph's `omnigraph` and `omnigraph-server` of `v0.14.0` or later, on PATH or named by
 # OMNIGRAPH_BIN and OMNIGRAPH_SERVER_BIN. Both are checked: the CLI by its `version --json`, the
 # started server by the contract header its /healthz answers with.
 # Data lives in dev/.data; 0.14 stamps it format 16 on its first write, which 0.13 cannot open.
@@ -19,7 +19,7 @@ BIND=${STUDIO_DEV_BIND:-127.0.0.1:8787}
 CLI=${OMNIGRAPH_BIN:-omnigraph}
 SERVER=${OMNIGRAPH_SERVER_BIN:-omnigraph-server}
 TOKEN=dev-token
-NEEDS_CLI="dev-server needs an OmniGraph CLI of v0.14.0 or later, as Studio does"
+NEEDS_CLI="dev-server needs an Omnigraph CLI of v0.14.0 or later, as Studio does"
 
 if [[ "${1:-}" == "--reset" ]]; then
   rm -rf "$DATA"

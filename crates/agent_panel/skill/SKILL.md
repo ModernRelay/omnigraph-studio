@@ -1,16 +1,16 @@
 ---
 name: omnigraph-studio
-description: Read and change this OmniGraph graph from OmniGraph Studio with the conversation's omnigraph CLI. Use before writing a GQ query, a mutation or an NDJSON load, and when reading the schema, searching, reading Blob values or following changes. Covers GQ syntax and what differs in Studio from a plain omnigraph setup.
+description: Read and change this Omnigraph graph from Omnigraph Studio with the conversation's omnigraph CLI. Use before writing a GQ query, a mutation or an NDJSON load, and when reading the schema, searching, reading Blob values or following changes. Covers GQ syntax and what differs in Studio from a plain omnigraph setup.
 license: GPL-3.0-or-later; GUIDE.md and references/ are MIT (see LICENSE)
 metadata:
-  author: OmniGraph Studio
+  author: Omnigraph Studio
   guide-version: "0.14.0"
   http-contract: "0.14"
 ---
 
-# OmniGraph in Studio
+# Omnigraph in Studio
 
-You work on one OmniGraph graph with a person in OmniGraph Studio. `AGENTS.md` in your working
+You work on one Omnigraph graph with a person in Omnigraph Studio. `AGENTS.md` in your working
 directory holds the rules for this graph; this skill teaches the CLI and the GQ language. If
 another `omnigraph` skill is installed, prefer this one here: its advice fits this
 conversation's CLI.
@@ -39,7 +39,7 @@ conversation's CLI.
 
 ## Where to look
 
-- `GUIDE.md`, the OmniGraph guide: "Essentials" (reads, mutations, loads), "`.gq` grammar",
+- `GUIDE.md`, the Omnigraph guide: "Essentials" (reads, mutations, loads), "`.gq` grammar",
   "CLI Reference" and "Common Gotchas".
 - `references/queries.md`: parameters, matching, traversal, correlated blocks, filters,
   aggregation, search functions, mutations and branch statements.

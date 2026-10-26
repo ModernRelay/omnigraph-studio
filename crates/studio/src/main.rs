@@ -1,4 +1,4 @@
-//! OmniGraph Studio.
+//! Omnigraph Studio.
 
 // A release build on Windows opens no console window beside the app's own.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -24,7 +24,7 @@ fn main() {
         }
         return;
     }
-    // On Windows the agent starts through this executable, which runs it without OmniGraph's
+    // On Windows the agent starts through this executable, which runs it without Omnigraph's
     // credentials in its environment (spec 013).
     if command.as_deref() == Some(std::ffi::OsStr::new(agent_panel::LAUNCH_COMMAND)) {
         std::process::exit(agent_panel::launch_agent(args));

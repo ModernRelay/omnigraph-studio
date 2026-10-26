@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a Windows zip of OmniGraph Studio in target/bundle (spec 001, "Shipping"):
+# Build a Windows zip of Omnigraph Studio in target/bundle (spec 001, "Shipping"):
 #
 #   omnigraph-studio-<version>-windows-<arch>/
 #     omnigraph-studio.exe
@@ -10,7 +10,7 @@
 #   script/bundle-windows --debug    # the debug build, to check the layout quickly
 #
 # Runs in Git Bash on Windows, as GitHub's Windows runners provide it. Unzip anywhere and run
-# omnigraph-studio.exe; Studio keeps its settings in %APPDATA%\OmniGraph Studio. An installer is
+# omnigraph-studio.exe; Studio keeps its settings in %APPDATA%\Omnigraph Studio. An installer is
 # not built yet, and the executable is not signed.
 set -euo pipefail
 
