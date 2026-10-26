@@ -626,6 +626,11 @@ mod tests {
         lives: u64,
         /// The sign-in service gives no refresh token.
         no_refresh: bool,
+        /// The sign-in service's issuer, `ISSUER` when empty: one on the server's own origin
+        /// takes the target's client for its token and revocation requests.
+        issuer: String,
+        /// The server holds its sign-in details' answer until this is lowered.
+        hold_metadata: bool,
         /// The tokens the server refused, in order.
         refused: Vec<String>,
         /// Each request, after the name of the client it went through.
@@ -648,10 +653,20 @@ mod tests {
             .as_secs()
     }
 
+    impl Served {
+        fn issuer(&self) -> String {
+            if self.issuer.is_empty() {
+                ISSUER.to_owned()
+            } else {
+                self.issuer.clone()
+            }
+        }
+    }
+
     fn issue(served: &mut Served) -> Value {
         served.issued += 1;
         let access = jwt(json!({
-            "iss": ISSUER, "aud": RESOURCE, "client_id": CLIENT, "sub": "user_1",
+            "iss": served.issuer(), "aud": RESOURCE, "client_id": CLIENT, "sub": "user_1",
             "org_id": "org_1", "iat": now(), "exp": now() + served.lives,
             "n": served.issued,
         }));
@@ -690,6 +705,13 @@ mod tests {
                 ),
             )]
         };
+        let issuer = served.issuer();
+        let issued_at = url::Url::parse(&issuer).unwrap();
+        let server_metadata = format!(
+            "{}/.well-known/oauth-authorization-server{}",
+            issued_at.origin().ascii_serialization(),
+            issued_at.path().trim_end_matches('/')
+        );
         match (method, url) {
             ("GET", u) if u == format!("{SERVER}/healthz") => (
                 200,
@@ -717,18 +739,18 @@ mod tests {
             ("GET", u) if u == format!("{SERVER}/.well-known/oauth-protected-resource/mcp") => (
                 200,
                 vec![],
-                json!({"resource": RESOURCE, "authorization_servers": [ISSUER], "bearer_methods_supported": ["header"]}),
+                json!({"resource": RESOURCE, "authorization_servers": [issuer], "bearer_methods_supported": ["header"]}),
             ),
-            ("GET", u) if u == format!("{ISSUER}/.well-known/oauth-authorization-server") => (
+            ("GET", u) if u == server_metadata => (
                 200,
                 vec![],
                 json!({
-                    "issuer": ISSUER, "authorization_endpoint": format!("{ISSUER}/authorize"),
-                    "token_endpoint": format!("{ISSUER}/token"), "revocation_endpoint": format!("{ISSUER}/revoke"),
+                    "issuer": issuer, "authorization_endpoint": format!("{issuer}/authorize"),
+                    "token_endpoint": format!("{issuer}/token"), "revocation_endpoint": format!("{issuer}/revoke"),
                     "code_challenge_methods_supported": ["S256"], "client_id_metadata_document_supported": true,
                 }),
             ),
-            ("POST", u) if u == format!("{ISSUER}/token") => {
+            ("POST", u) if u == format!("{issuer}/token") => {
                 let form = form(&body);
                 served.log.push(format!(
                     "token {} resource={}",
@@ -752,7 +774,7 @@ mod tests {
                     )
                 }
             }
-            ("POST", u) if u == format!("{ISSUER}/revoke") => {
+            ("POST", u) if u == format!("{issuer}/revoke") => {
                 served.log.push(format!("revoke {}", form(&body)["token"]));
                 (200, vec![], json!({}))
             }
@@ -784,6 +806,11 @@ mod tests {
                     .map(str::to_owned);
                 let mut body = String::new();
                 futures::AsyncReadExt::read_to_string(&mut request.into_body(), &mut body).await?;
+                if url.contains("/.well-known/oauth-protected-resource") {
+                    while served.lock().unwrap().hold_metadata {
+                        smol::Timer::after(Duration::from_millis(10)).await;
+                    }
+                }
                 let (status, headers, page) =
                     answer(&mut served.lock().unwrap(), &method, &url, bearer, body);
                 let mut response = Response::builder()
@@ -849,7 +876,8 @@ mod tests {
         served.lock().unwrap().codes.insert("c1".into());
         let callback = url::Url::parse(&query["redirect_uri"]).unwrap();
         assert_eq!(callback.host_str(), Some("127.0.0.1"));
-        let path = format!("/callback?code=c1&state={}&iss={}", query["state"], ISSUER);
+        let issuer = served.lock().unwrap().issuer();
+        let path = format!("/callback?code=c1&state={}&iss={issuer}", query["state"]);
         let port = callback.port().unwrap();
         std::thread::spawn(move || {
             use std::io::{Read as _, Write as _};
@@ -1078,6 +1106,67 @@ mod tests {
             "{to_server:?}"
         );
         assert_eq!(keychain.items.lock().unwrap()[&key].1, b"r2".to_vec());
+    }
+
+    /// A sign-in read, or made in the browser, while the target's transport changes takes the
+    /// new client when it finishes: requests to the server's address, to a sign-in service there
+    /// included, do not stay on the proxy or certificate authority the task started with.
+    #[gpui::test]
+    async fn a_sign_in_finished_after_a_transport_change_takes_the_new_client(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served {
+            lives: 300,
+            issuer: format!("{SERVER}/oauth"),
+            hold_metadata: true,
+            ..Served::default()
+        }));
+        let connection = connection(&served, Arc::default(), cx);
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the sign-in details asked for", |_| {
+            let served = served.lock().unwrap();
+            served
+                .requests
+                .iter()
+                .any(|r| r.contains("oauth-protected-resource"))
+        });
+        let next = through("next", served.clone());
+        connection.update(cx, |c, cx| c.replace_http(next, cx));
+        served.lock().unwrap().hold_metadata = false;
+        until(cx, "the offer", |cx| {
+            matches!(sign_in_state(&connection, cx).1, SignIn::Offered { .. })
+        });
+
+        connection.update(cx, |c, cx| c.sign_in(cx));
+        let third = through("third", served.clone());
+        connection.update(cx, |c, cx| c.replace_http(third, cx));
+        let browser = approve(&served, &cx.opened_url().unwrap());
+        until(cx, "the sign-in", |cx| {
+            sign_in_state(&connection, cx).0 == ConnectionState::Ready
+        });
+        browser.join().unwrap();
+        connection.update(cx, |c, cx| c.sign_out(cx));
+        until(cx, "the revocation", |_| {
+            served.lock().unwrap().log.iter().any(|l| l == "revoke r1")
+        });
+        let requests = served.lock().unwrap().requests.clone();
+        // The exchange went through the client its sign-in started with, the one discovery
+        // finished under; what the sign-in kept takes the newest.
+        assert!(
+            requests.contains(&format!("next {SERVER}/oauth/token")),
+            "{requests:?}"
+        );
+        assert!(
+            requests.contains(&format!("third {SERVER}/oauth/revoke")),
+            "{requests:?}"
+        );
+        for stale in [
+            format!("first {SERVER}/oauth/token"),
+            format!("first {SERVER}/oauth/revoke"),
+        ] {
+            assert!(!requests.contains(&stale), "{requests:?}");
+        }
     }
 
     #[gpui::test]

@@ -836,6 +836,7 @@ impl Connection {
                 match found {
                     Err(why) => this.sign_in = SignIn::Unavailable(why),
                     Ok(service) => {
+                        let service = this.current(service);
                         let host = service.host();
                         this.service = Some(service.clone());
                         this.sign_in = SignIn::Offered {
@@ -968,7 +969,7 @@ impl Connection {
                 match signed_in {
                     Ok(tokens) => {
                         let source = OAuthSource::signed_in(
-                            service,
+                            this.current(service),
                             &target,
                             context.keychain.clone(),
                             tokens,
@@ -1020,6 +1021,16 @@ impl Connection {
         self.replace_token(None, None, cx);
         cx.emit(ConnectionEvent::StateChanged);
         cx.notify();
+    }
+
+    /// `service`, read or signed in through clients the connection may have replaced since it
+    /// started ([`Self::replace_http`]): its requests to the server's address take the client
+    /// held now, not the one a discovery or browser wait started with.
+    fn current(&self, service: Service) -> Service {
+        Service {
+            clients: service.clients.through(self.http.clone()),
+            ..service
+        }
     }
 
     /// Takes the token from `source`, a sign-in just made or kept, and connects with it.
