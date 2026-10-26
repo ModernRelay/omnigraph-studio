@@ -1399,7 +1399,6 @@ exit 64
         }
     }
 
-    /// The CLI Studio would run of `programs`, found in a turn at the CLI of its own.
     /// Held by the test that starts the probe cache over ([`forget_probes`], rewriting its file)
     /// and by each test whose assertions need a program it probed to stay remembered: the cache
     /// is the process's, and the tests run at once. Without it, a launch simulated in one test
@@ -1410,6 +1409,7 @@ exit 64
         PROBE_CACHE.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The CLI Studio would run of `programs`, found in a turn at the CLI of its own.
     fn found(programs: &[PathBuf]) -> Result<FoundCli, String> {
         smol::block_on(async {
             let turn = take_turn(&Arc::default(), READ_TIMEOUT, "a look for the CLI").await?;
