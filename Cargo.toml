@@ -120,7 +120,9 @@ smol = "2"
 schemars = "1"
 semver = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# Floats parse to the value they were written from: a page's sort cursor or a cell's filter
+# sends a float back to the server, which compares it exactly.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 # Reading settings.json: where a value that does not fit is, and which keys do nothing.
 serde_ignored = "0.1"
 serde_path_to_error = "0.1"

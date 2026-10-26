@@ -380,7 +380,9 @@ const QUERY_ANSWER_MAX: usize = 32 * 1024 * 1024;
 /// The most of any other read's answer a read takes ([`GraphClient::read`]), as a query's: a
 /// change-feed page (up to 1,000 changes, each with its images), a commit's changes or a diff
 /// page is decoded whole too. The pages Studio asks for stay far below it; a feed read stopped
-/// by it leaves its later commits unknown, and the views over them read again.
+/// by it leaves its later commits unknown, and the views over them read again. Every other
+/// answer is bounded by it too (a write's, a merge preview's, health): one cut short does not
+/// decode, which for a write is an unknown outcome.
 const READ_ANSWER_MAX: usize = QUERY_ANSWER_MAX;
 
 /// A server address as typed, made into the root URL a client is built on: trimmed, without a
@@ -658,7 +660,7 @@ impl GraphClient {
             body,
             headers,
             timeout,
-            BodyLimit::First(usize::MAX),
+            BodyLimit::First(READ_ANSWER_MAX),
         )
         .await
     }
@@ -748,8 +750,14 @@ impl GraphClient {
         body: Option<Vec<u8>>,
         headers: &[(&str, &str)],
     ) -> Result<RawResponse, ReadError> {
-        self.fetch_reading(method, url, body, headers, BodyLimit::First(usize::MAX))
-            .await
+        self.fetch_reading(
+            method,
+            url,
+            body,
+            headers,
+            BodyLimit::First(READ_ANSWER_MAX),
+        )
+        .await
     }
 
     /// [`Self::fetch`], keeping only what `limit` says of the body.
@@ -1578,8 +1586,16 @@ pub fn judge_write<'a>(
         }
         return WriteOutcome::Committed(body);
     }
-    if contract_ok && let Ok(body) = serde_json::from_slice::<ErrorOutput>(body) {
-        let effects = body.disposition.map(|disposition| disposition.effects);
+    if contract_ok && let Ok(stated) = serde_json::from_slice::<Stated>(body) {
+        let effects = stated.disposition.map(|disposition| disposition.effects);
+        // The rest of the body, as far as this build reads it: a refusal stays one when a detail
+        // does not (a conflict of a kind it does not know).
+        let body = serde_json::from_slice::<ErrorOutput>(body).unwrap_or(ErrorOutput {
+            error: stated.error,
+            code: stated.code,
+            disposition: stated.disposition,
+            ..ErrorOutput::default()
+        });
         return match effects {
             Some(DispositionEffects::None) => WriteOutcome::Refused(ApiError {
                 status: status.as_u16(),
@@ -1608,6 +1624,17 @@ pub fn judge_write<'a>(
     WriteOutcome::Unknown {
         reason: format!("the server answered {status}"),
     }
+}
+
+/// What of an error's body decides a write's outcome ([`judge_write`]), read on its own: a detail
+/// this build reads otherwise cannot turn a refusal into an unknown outcome.
+#[derive(serde::Deserialize)]
+struct Stated {
+    error: String,
+    #[serde(default)]
+    code: Option<crate::api::ErrorCode>,
+    #[serde(default)]
+    disposition: Option<crate::api::DispositionOutput>,
 }
 
 /// [`judge_write`], with a committed write's body read as `T`; one that cannot be read is
@@ -1903,6 +1930,16 @@ mod tests {
             "a server before 0.14.0: the status rules nothing out"
         );
         assert_eq!(judge(503, None), "unknown");
+        // A detail this build does not read leaves the disposition to decide.
+        let unread = r#"{"error":"no","code":"conflict","disposition":{"action":"fix","effects":"none"},"merge_conflicts":[{"entity_kind":"hyperedge","type_name":"T","kind":"later","message":"m"}]}"#;
+        match judge_write(
+            StatusCode::CONFLICT,
+            Some(crate::CONTRACT),
+            unread.as_bytes(),
+        ) {
+            WriteOutcome::Refused(refusal) => assert_eq!(refusal.body.error, "no"),
+            _ => panic!("a refusal whose details this build does not read"),
+        }
         // Without the contract header the server did not answer, whatever the body says.
         let body = error(Some("none"));
         assert!(matches!(
