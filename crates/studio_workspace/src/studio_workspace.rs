@@ -2407,12 +2407,28 @@ impl Workspace {
     /// One toast fewer by folding errors, by graph when one graph can: the oldest error shown on
     /// its own that can fold joins the toast that counts its graph's errors folded, or, with
     /// none up, it and the next of its graph's errors shown alone become that toast, in the
-    /// older's place. Errors about no graph fold with each other alike. A fold that stands for
-    /// one graph opens that graph's log, where each of the errors folded is listed. With no two
-    /// errors of one graph up (three graphs' and a notice about the servers, say), the errors
-    /// fold across graphs instead ([`Self::fold_across`]), so the stack still makes room.
+    /// older's place. A fold that stands for one graph opens that graph's log, where each of the
+    /// errors folded is listed. With no two errors of one graph up (three graphs', say), the
+    /// errors fold across graphs instead ([`Self::fold_across`]), so the stack still makes room.
+    /// Errors about a graph fold first, since its log keeps each of them: one about no graph (a
+    /// notice about the servers) is in its toast alone, and folds, with the others alike, only
+    /// when nothing else can.
     fn fold_oldest_error(&mut self) {
-        let alone = |toast: &Toast| toast.kind == ToastKind::Error && toast.folded == 0;
+        for graphs_only in [true, false] {
+            if self.fold_by_graph(graphs_only) || self.fold_across(graphs_only) {
+                return;
+            }
+        }
+    }
+
+    /// Folds the oldest error that can join its graph's fold, or make one with the next of its
+    /// graph's errors; with `graphs_only`, only an error about a graph. Whether it folded one.
+    fn fold_by_graph(&mut self, graphs_only: bool) -> bool {
+        let alone = |toast: &Toast| {
+            toast.kind == ToastKind::Error
+                && toast.folded == 0
+                && (toast.graph.is_some() || !graphs_only)
+        };
         for oldest in 0..self.toasts.len() {
             if !alone(&self.toasts[oldest]) {
                 continue;
@@ -2426,7 +2442,7 @@ impl Workspace {
                 fold.folded += 1;
                 fold.message = folded_errors_text(fold.folded, graph.as_ref());
                 self.toasts.remove(oldest);
-                return;
+                return true;
             }
             let next = self.toasts[oldest + 1..]
                 .iter()
@@ -2436,40 +2452,46 @@ impl Workspace {
                 let id = self.next_toast;
                 self.next_toast += 1;
                 self.toasts[oldest] = Toast::folded_errors(id, 2, graph);
-                return;
+                return true;
             }
         }
-        self.fold_across();
+        false
     }
 
     /// One toast fewer when no graph's errors fold: the oldest error shown joins the fold made
     /// across graphs before, or, with none up, the two oldest errors shown, alone or folded,
     /// become one, in the older's place, counting every error they stood for
-    /// ([`Toast::folded_across`]). With fewer than two errors up, nothing folds: the rest of the
-    /// stack is Undos.
-    fn fold_across(&mut self) {
+    /// ([`Toast::folded_across`]); with `graphs_only`, only errors about a graph. With fewer
+    /// than two errors up, nothing folds: the rest of the stack is Undos. Whether it folded.
+    fn fold_across(&mut self, graphs_only: bool) -> bool {
         let errors: Vec<usize> = (0..self.toasts.len())
-            .filter(|&at| self.toasts[at].kind == ToastKind::Error && !self.toasts[at].across)
+            .filter(|&at| {
+                let toast = &self.toasts[at];
+                toast.kind == ToastKind::Error
+                    && !toast.across
+                    && (toast.graph.is_some() || !graphs_only)
+            })
             .collect();
         let stands_for = |toast: &Toast| toast.folded.max(1);
         if let Some(fold) = self.toasts.iter().position(|toast| toast.across) {
             let Some(&oldest) = errors.first() else {
-                return;
+                return false;
             };
             let count = self.toasts[fold].folded + stands_for(&self.toasts[oldest]);
             self.toasts[fold].folded = count;
             self.toasts[fold].message = folded_errors_text(count, None);
             self.toasts.remove(oldest);
-            return;
+            return true;
         }
         let [older, newer, ..] = errors[..] else {
-            return;
+            return false;
         };
         let count = stands_for(&self.toasts[older]) + stands_for(&self.toasts[newer]);
         self.toasts.remove(newer);
         let id = self.next_toast;
         self.next_toast += 1;
         self.toasts[older] = Toast::folded_across(id, count);
+        true
     }
 
     pub fn dismiss_toast(&mut self, id: usize, cx: &mut Context<Self>) {
@@ -2477,7 +2499,8 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The text of each toast shown, oldest first.
+    /// The text of each toast shown, oldest first: for the tests of crates that show toasts.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn toast_messages(&self) -> Vec<SharedString> {
         self.toasts
             .iter()
@@ -7051,9 +7074,11 @@ mod tests {
 
     /// Errors kept from four sources, three graphs and a notice about the servers, leave no
     /// two of one graph to fold: they fold across graphs instead, so every new error still
-    /// makes room within [`TOASTS_SHOWN`], and a delete's Undo stays up. The fold counts what it
-    /// took and opens the activity log of the graph the window shows. Before, nothing folded,
-    /// and each new error ran the stack past the limit, below the window's edge.
+    /// makes room within [`TOASTS_SHOWN`], and a delete's Undo stays up. The graphs' errors fold
+    /// first, each kept in its graph's activity log, so the notice, in no log, stays up. The
+    /// fold counts what it took and opens the activity log of the graph the window shows.
+    /// Before, nothing folded, and each new error ran the stack past the limit, below the
+    /// window's edge; then the notice was folded with the rest, and its text was gone.
     #[gpui::test]
     fn errors_of_four_sources_fold_across_graphs_within_the_stack(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
@@ -7132,10 +7157,10 @@ mod tests {
             [
                 "Delete Person ada · committed to main".to_owned(),
                 "4 earlier errors".to_owned(),
-                refused(5),
+                "A notice about the servers".to_owned(),
                 format!("notes: {}", refused(6)),
             ],
-            "each error after joins the fold, the Undo still up"
+            "each graph's error after joins the fold, the Undo and the notice still up"
         );
 
         let fold = workspace.read_with(cx, |workspace, _| workspace.toasts[1].id);

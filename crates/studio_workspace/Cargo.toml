@@ -30,5 +30,9 @@ http_client = { workspace = true }
 studio_settings = { workspace = true, features = ["test-support"] }
 studio_theme = { workspace = true, features = ["test-support"] }
 
+[features]
+# `Workspace::toast_messages`, for the tests of crates that show toasts.
+test-support = []
+
 [lints]
 workspace = true

@@ -133,8 +133,9 @@ OMNIGRAPH_SERVER_BEARER_TOKENS_JSON="{\"act-dev\":\"$TOKEN\"}" \
 server=$!
 # Only EXIT: bash runs it when a signal ends the script too, and a trapped INT or TERM would let the
 # script carry on after the server is gone. The wait lets the server shut down and release the
-# cluster lock before the script ends.
-trap 'kill $server 2>/dev/null; wait $server 2>/dev/null; rm -rf "$home"' EXIT
+# cluster lock before the script ends. Under `set -e` a failing command would end the trap, so a
+# server already gone, or one a signal ended, still leaves its home removed.
+trap 'kill "$server" 2>/dev/null || true; wait "$server" 2>/dev/null || true; rm -rf "$home"' EXIT
 
 # Asked only while the server runs: one that exited (the address taken meanwhile, a cluster it
 # cannot open) is reported as having exited, not as a server that answers no contract.

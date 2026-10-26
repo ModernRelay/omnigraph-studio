@@ -1993,9 +1993,21 @@ impl AgentPanel {
 
     /// Puts a queued message back in the composer to edit, ahead of what is there.
     fn edit_queued(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(text) = self.queue.take(id) else {
-            return;
-        };
+        if let Some(text) = self.queue.take(id) {
+            self.put_back(text, window, cx);
+        }
+    }
+
+    /// Takes back the message waiting for the agent to start ([`Self::opening`]): it goes to
+    /// the composer, to be changed or not sent at all, and nothing is sent when the agent starts.
+    fn edit_opening(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = self.opening.take() {
+            self.put_back(text, window, cx);
+        }
+    }
+
+    /// Puts an unsent message in the composer, ahead of what is there.
+    fn put_back(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         self.composer.update(cx, |editor, cx| {
             let draft = editor.text(cx);
             let text = if draft.trim().is_empty() {
@@ -3939,9 +3951,20 @@ impl AgentPanel {
             .into_any_element()
     }
 
+    /// Edit for the message waiting for the agent ([`Self::edit_opening`]), offered once the
+    /// agent is slow to start or has stopped.
+    fn edit_opening_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.opening.as_ref()?;
+        Some(
+            ds::row_button("edit-opening", "Edit")
+                .on_click(cx.listener(|this, _, window, cx| this.edit_opening(window, cx)))
+                .into_any_element(),
+        )
+    }
+
     /// The message sent before the agent was ready, as the person's, with how the agent's
     /// start goes under it: starting, slow to answer (with Start again), or stopped before
-    /// the message went.
+    /// the message went. Slow or stopped, Edit takes it back.
     fn render_waiting(&self, cx: &mut Context<Self>) -> AnyElement {
         let status = match &self.state {
             State::Starting if self.slow_start => h_flex()
@@ -3955,6 +3978,7 @@ impl AgentPanel {
                             cx.listener(|this, _, window, cx| this.restart(&Restart, window, cx)),
                         ),
                 )
+                .children(self.edit_opening_button(cx))
                 .into_any_element(),
             State::Starting => h_flex()
                 .gap(px(ds::space::XS))
@@ -3962,10 +3986,14 @@ impl AgentPanel {
                 .child(studio_ui::ds::spinner())
                 .child(ds::text::meta("Starting the agent…"))
                 .into_any_element(),
-            State::Exited { .. } => {
-                ds::text::meta("Not sent yet: it goes when the agent starts again.")
-                    .into_any_element()
-            }
+            State::Exited { .. } => h_flex()
+                .gap(px(ds::space::SM))
+                .items_center()
+                .child(ds::text::meta(
+                    "Not sent yet: it goes when the agent starts again.",
+                ))
+                .children(self.edit_opening_button(cx))
+                .into_any_element(),
             _ => ds::text::meta("Waiting for the agent").into_any_element(),
         };
         v_flex()

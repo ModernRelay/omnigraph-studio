@@ -4,7 +4,9 @@ use std::ops::Range;
 use std::time::Duration;
 
 use gpui::{Context, Entity, Render, Subscription, Task, WeakEntity, Window, uniform_list};
-use graph_store::{GraphSession, HeldAs, Loadable, OutcomeEntry, OutcomeKind, SessionEvent};
+use graph_store::{
+    GraphSession, HeldAs, Loadable, MergeSettled, OutcomeEntry, OutcomeKind, SessionEvent,
+};
 use studio_actions::graph::OpenHistory;
 use studio_workspace::{Workspace, WorkspaceEvent};
 use ui::prelude::*;
@@ -250,15 +252,15 @@ fn logged(session: &GraphSession) -> (u64, u64) {
 }
 
 /// The branch whose History a write's row opens: an outcome nobody knows is settled by reading
-/// the history of the branch it went to (constitution III), while it is unsettled. A merge's
-/// target history that has since shown it landed, or shown nothing of it, settled it
-/// ([`graph_store::MergeEntry::settled`]): its row offers nothing more, as a row whose outcome
-/// is known does.
+/// the history of the branch it went to (constitution III), while it is unsettled. A merge whose
+/// target history has since shown it landed is settled ([`graph_store::MergeEntry::settled`]):
+/// its row offers nothing more, as a row whose outcome is known does. One the history has not
+/// shown may still land, so its row still offers it.
 fn history_to_check(entry: &OutcomeEntry) -> Option<&str> {
     let settled = entry
         .merge
         .as_ref()
-        .is_some_and(|merge| merge.settled.is_some());
+        .is_some_and(|merge| merge.settled == Some(MergeSettled::Landed));
     match entry.outcome {
         OutcomeKind::Unknown { .. } if !settled => Some(&entry.branch),
         _ => None,
@@ -342,7 +344,7 @@ fn activity_row(index: usize, entry: &OutcomeEntry) -> studio_ui::ds::ActivityRo
 #[cfg(test)]
 mod tests {
     use gpui::{TestAppContext, VisualTestContext};
-    use graph_store::{MergeEntry, MergeSent, MergeSettled, OutcomeKind};
+    use graph_store::{MergeEntry, MergeSent, OutcomeKind};
 
     use super::*;
 
@@ -503,7 +505,7 @@ mod tests {
 
     /// Open history is offered while an outcome is unsettled and on a branch the session's
     /// list holds; a branch the list lacks (deleted since, or a create that did not land)
-    /// leaves it disabled with why, and a merge whose target history has settled it offers
+    /// leaves it disabled with why, and a merge whose target history shows it landed offers
     /// nothing. Before, every unknown outcome offered it for as long as its row lived, and it
     /// moved the window to a branch that might be gone.
     #[test]
@@ -525,9 +527,15 @@ mod tests {
         let listed = Loadable::Loaded(vec!["main".to_owned(), "fix".to_owned()]);
         assert_eq!(history_to_check(&entry("fix", None)), Some("fix"));
         assert_eq!(history_refusal("fix", &listed), None);
-        for settled in [MergeSettled::Landed, MergeSettled::NotShown] {
-            assert_eq!(history_to_check(&entry("main", Some(settled))), None);
-        }
+        assert_eq!(
+            history_to_check(&entry("main", Some(MergeSettled::Landed))),
+            None
+        );
+        assert_eq!(
+            history_to_check(&entry("main", Some(MergeSettled::NotShown))),
+            Some("main"),
+            "a merge the history has not shown may still land"
+        );
         let gone = history_refusal("gone", &listed).expect("refused");
         assert!(gone.starts_with("There is no branch gone now"), "{gone}");
         let unread = history_refusal("fix", &Loadable::Loading).expect("refused");

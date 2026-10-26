@@ -324,8 +324,6 @@ type SharedRoutes = Arc<Mutex<Routes>>;
 /// the agent fails to start hears why.
 pub type Opening = Arc<Mutex<Vec<mpsc::UnboundedSender<HostEvent>>>>;
 
-/// Runs one agent until every handle to it is dropped or it exits; then every open conversation
-/// hears why. Dropping the future kills the agent's process group.
 /// An agent's error in words a person reads: its message, then the reason in its data when it
 /// gives one (a string, or the `data` or `message` of an object). Fields the protocol library
 /// adds for its own debugging, such as where in its source it failed (`spawned_at`), are left
@@ -351,6 +349,8 @@ fn error_words(error: &agent_client_protocol::Error) -> String {
     }
 }
 
+/// Runs one agent until every handle to it is dropped or it exits; then every open conversation
+/// hears why. Dropping the future kills the agent's process group.
 pub async fn run(
     launch: AgentLaunch,
     commands: mpsc::UnboundedReceiver<ConnectionCommand>,

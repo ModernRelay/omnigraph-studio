@@ -287,10 +287,11 @@ impl TypeNaming {
     }
 }
 
-/// A graph's one key for everything Studio saves of it: its CLI target's name and its id,
-/// `<target>/<graph id>` (a target's name holds no `/`). Its `graphs` settings, its tabs and
-/// drafts, its saved queries' folder ([`queries_dir`]) and its agent conversations are kept
-/// under it, as the windows a start reopens name the graph.
+/// A graph's one key for everything Studio saves of it: its server's key and its id,
+/// `<server>/<graph id>`. The server's key is its CLI target's name and address,
+/// `<target>@<address>` (`graph_store::ServerEntry::saved_key`), and a graph id holds no `/`.
+/// Its `graphs` settings, its tabs and drafts, its saved queries' folder ([`queries_dir`]) and
+/// its agent conversations are kept under it, as the windows a start reopens name the graph.
 pub fn overrides_key(target: &str, graph: &str) -> String {
     format!("{target}/{graph}")
 }
