@@ -34,7 +34,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// `0.14.1-edge`, 2026-10-25) one page of a branch's review took 37 to 60 s, so a 60 s read
 /// failed about as often as it answered. As long as a write, which the server also works out
 /// whole. A read is still sent once, unless refused with 429.
-const CHANGE_READ_TIMEOUT: Duration = Duration::from_secs(300);
+pub const CHANGE_READ_TIMEOUT: Duration = Duration::from_secs(300);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(300);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 /// How many times a read refused with 429 is tried again (spec 003). Writes never are.
@@ -288,6 +288,14 @@ impl ApiErrorSummary {
 fn quoted(text: &str) -> Option<String> {
     let inner = text.strip_prefix('\'')?.strip_suffix('\'')?;
     (!inner.is_empty() && !inner.contains('\'')).then(|| inner.to_owned())
+}
+
+impl ReadError {
+    /// Whether the server took the request and had not answered when Studio stopped waiting
+    /// for it: a timeout once the connection was open, not one opening it.
+    pub fn timed_out(&self) -> bool {
+        matches!(self, ReadError::Transport(cause) if cause == REQUEST_TIMED_OUT)
+    }
 }
 
 impl std::fmt::Display for ReadError {
@@ -1772,6 +1780,11 @@ async fn read_body(mut body: AsyncBody, skip: u64, limit: usize) -> std::io::Res
     Ok(bytes)
 }
 
+/// A request the server took and had not answered within its timeout ([`ReadError::timed_out`]).
+const REQUEST_TIMED_OUT: &str = "the request timed out";
+/// A connection that did not open within its timeout: no server was reached.
+const CONNECT_TIMED_OUT: &str = "the connection timed out";
+
 /// What went wrong reaching the server, in words: a class (refused, timed out, name not found,
 /// TLS, connection closed) or else the innermost cause, with any URL removed. The client's own
 /// text names the whole request URL, which can hold a Blob row's key, and its outer layer
@@ -1783,7 +1796,13 @@ fn describe_transport(error: &anyhow::Error) -> String {
         .collect();
     let all = layers.join(" ").to_lowercase();
     let class = if all.contains("timed out") || all.contains("timeout") {
-        Some("the request timed out")
+        // A connection that never opened reached no server (`client error (Connect)` is
+        // hyper's layer for it); a request that did was waiting for the server's answer.
+        if all.contains("(connect)") {
+            Some(CONNECT_TIMED_OUT)
+        } else {
+            Some(REQUEST_TIMED_OUT)
+        }
     } else if all.contains("connection refused") {
         Some("the connection was refused")
     } else if all.contains("dns error")
@@ -3445,6 +3464,32 @@ mod tests {
             ReadError::Transport(describe_transport(&refused)).to_string(),
             "Could not reach the server: the connection was refused"
         );
+    }
+
+    /// A timeout says whether the server was reached: reqwest's chain for a request the server
+    /// had not answered in time, and for a connection that did not open in time (hyper's
+    /// `Connect` layer under it), at `zed-reqwest` `33bc764` and `hyper-util` 0.1.17.
+    #[test]
+    fn a_timeout_says_whether_the_server_was_reached() {
+        let url = "error sending request for url (https://graph.example.com/graphs/g/diff?from=a)";
+        let unanswered =
+            anyhow::Error::new(std::io::Error::other("operation timed out")).context(url);
+        let unopened = anyhow::Error::new(std::io::Error::other("operation timed out"))
+            .context("client error (Connect)")
+            .context(url);
+        let unanswered = ReadError::Transport(describe_transport(&unanswered));
+        let unopened = ReadError::Transport(describe_transport(&unopened));
+        assert!(unanswered.timed_out());
+        assert_eq!(
+            unanswered.to_string(),
+            "Could not reach the server: the request timed out"
+        );
+        assert!(!unopened.timed_out());
+        assert_eq!(
+            unopened.to_string(),
+            "Could not reach the server: the connection timed out"
+        );
+        assert!(!ReadError::Transport("the connection was refused".into()).timed_out());
     }
 
     #[test]

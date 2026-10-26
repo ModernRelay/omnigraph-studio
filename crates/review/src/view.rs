@@ -40,6 +40,10 @@ use crate::scope_menu::ScopeMenu;
 
 /// How long typing in the search pauses before the cards are filtered.
 const SEARCH_DELAY: Duration = Duration::from_millis(80);
+/// How long a review is read before it says the server is still working out the changes. A
+/// small branch is read well within it; on a large graph one page of changes takes the server
+/// most of a minute, with nothing to show until it is whole (spec 008, validation 2026-10-26).
+const SLOW_READ: Duration = Duration::from_secs(10);
 
 /// Changes asked for per change-feed page: the server's most (`COMMIT_CHANGES_MAX_CHANGES`),
 /// as the CLI asks when it follows every page. Each page restarts the server's comparison
@@ -477,6 +481,9 @@ pub struct ReviewView {
     show_conflicts: bool,
     /// Someone else wrote to the branch after this review was read.
     newer: bool,
+    /// The review being read has been read for longer than [`SLOW_READ`]: it says the server is
+    /// still working out the changes.
+    reading_slowly: bool,
     /// Another writer changed the schema while the review being read was read: the review it
     /// finishes with is newer at once.
     schema_moved_while_loading: bool,
@@ -503,6 +510,8 @@ pub struct ReviewView {
     /// The target's head as the session knew it when the dry run was asked for.
     preview_target: Option<String>,
     _load_task: Option<Task<()>>,
+    /// Marks the review being read as slow once [`SLOW_READ`] has passed.
+    _slow_task: Option<Task<()>>,
     _names_task: Option<Task<()>>,
     _preview_task: Option<Task<()>>,
     _merge_task: Option<Task<()>>,
@@ -635,6 +644,7 @@ impl ReviewView {
             delete_branch: true,
             show_conflicts: false,
             newer: false,
+            reading_slowly: false,
             schema_moved_while_loading: false,
             fixes_running: 0,
             fix_queue: VecDeque::new(),
@@ -647,6 +657,7 @@ impl ReviewView {
             preview_owed: false,
             preview_target: None,
             _load_task: None,
+            _slow_task: None,
             _names_task: None,
             _preview_task: None,
             _merge_task: None,
@@ -848,6 +859,15 @@ impl ReviewView {
     fn read_again(&mut self, held: Option<ForkRead>, cx: &mut Context<Self>) {
         self.keep_marks();
         self.load = LoadState::Loading { folded: 0 };
+        self.reading_slowly = false;
+        self._slow_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SLOW_READ).await;
+            this.update(cx, |this, cx| {
+                this.reading_slowly = true;
+                cx.notify();
+            })
+            .ok();
+        }));
         self.newer = false;
         self.schema_moved_while_loading = false;
         self.show_conflicts = false;
@@ -903,6 +923,8 @@ impl ReviewView {
         searched: Searched,
         cx: &mut Context<Self>,
     ) {
+        self.reading_slowly = false;
+        self._slow_task = None;
         match result {
             Ok(data) => {
                 self.cards = data
@@ -2245,7 +2267,11 @@ impl ReviewView {
                         self.branch
                     )
                 },
-                String::new(),
+                if self.reading_slowly {
+                    "On a large graph this can take a few minutes.".to_owned()
+                } else {
+                    String::new()
+                },
             ),
             (LoadState::Failed(error), _) => (
                 format!("The review could not be read: {error}"),
@@ -3213,6 +3239,22 @@ enum FeedError {
     Failed(String),
 }
 
+/// Why a page of changes could not be read, in words. The server works a page out whole before
+/// it answers and sets no deadline, and on a large graph that takes minutes (spec 012, E35 to
+/// E38): one it took and had not answered when Studio stopped waiting says so, rather than that
+/// the server could not be reached.
+fn change_read_failure(error: &ReadError) -> String {
+    if error.timed_out() {
+        format!(
+            "The server was still working out the changes after {} minutes, and Studio \
+             stopped waiting.",
+            graph_client::CHANGE_READ_TIMEOUT.as_secs() / 60
+        )
+    } else {
+        error.to_string()
+    }
+}
+
 /// Folds `branch`'s change feed from `start` (`after:<fork>`) up to `head`, the change cap, or
 /// a block after `head`.
 async fn fold_feed(
@@ -3240,7 +3282,7 @@ async fn fold_feed(
             .await
             .map_err(|error| match error {
                 ReadError::Refused(refusal) if first && refusal.status == 400 => FeedError::Refused,
-                error => FeedError::Failed(error.to_string()),
+                error => FeedError::Failed(change_read_failure(&error)),
             })?;
         let mut blocks = Vec::new();
         let mut last_commit = None;
@@ -3608,7 +3650,7 @@ async fn read_review_since_merge(
                         session.diff(&base, &head, token, limit, cx)
                     })
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| change_read_failure(&e))?;
                 let block = ChangeBlockOutput {
                     cause: cause.clone(),
                     changes: page.changes,
@@ -3662,7 +3704,7 @@ async fn read_commit_review(
                         session.commit_changes(&commit, token, limit, cx)
                     })
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| change_read_failure(&e))?;
                 // The page is shared with the session's memo: its changes are copied for the
                 // fold off the main thread.
                 let (cause, changes) = (page.cause, page.changes);
@@ -3811,6 +3853,20 @@ impl Render for ReviewView {
             .into_any_element(),
             (LoadState::Failed(error), _) => {
                 studio_ui::ds::error_state("The review could not be read", error.clone())
+                    .child(
+                        studio_ui::ds::state_action(
+                            "refresh-failed",
+                            "Refresh",
+                            &Refresh,
+                            &self.focus_handle,
+                            cx,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
+                    )
+                    .into_any_element()
+            }
+            _ if self.reading_slowly => {
+                studio_ui::ds::loading_state("The server is still working out the changes…")
                     .into_any_element()
             }
             _ => studio_ui::ds::loading_state("Reading changes…").into_any_element(),
@@ -5326,6 +5382,122 @@ pub(crate) mod tests {
         assert_eq!(dry_runs(&asked), 0);
     }
 
+    /// A review whose changes the server takes long to work out says, after [`SLOW_READ`], that
+    /// the server is still working on them, and stops saying so once they are read.
+    #[gpui::test]
+    async fn a_slow_review_says_the_server_is_still_working(cx: &mut gpui::TestAppContext) {
+        use futures::FutureExt as _;
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (answered, held) = futures::channel::oneshot::channel::<()>();
+        let held = std::sync::Mutex::new(Some(held));
+        // The feed's first page after the fork, m1, is the slow read.
+        let (session, _) = fake_server_held(
+            review_answers(
+                None,
+                false,
+                None,
+                "f2",
+                |_| (500, json!({})),
+                |_, _, _| None,
+            ),
+            move |path, query| {
+                let held = held
+                    .lock()
+                    .unwrap()
+                    .take_if(|_| path.ends_with("/changes") && query.contains("after%3Am1"))?;
+                Some(
+                    async move {
+                        held.await.ok();
+                        Ok(())
+                    }
+                    .boxed(),
+                )
+            },
+            cx,
+        );
+        let (view, cx) = cx.add_window_view({
+            let session = session.clone();
+            |window, cx| ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.load, LoadState::Loading { .. }));
+            assert!(!view.reading_slowly, "not yet");
+        });
+        cx.executor().advance_clock(SLOW_READ);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.load, LoadState::Loading { .. }));
+            assert!(view.reading_slowly);
+        });
+        answered.send(()).unwrap();
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.load, LoadState::Ready));
+            assert!(!view.reading_slowly);
+            assert_eq!(view.bound_head.as_deref(), Some("f2"));
+        });
+        // Read again, the review is slow only once its own read is.
+        view.update(cx, |view, cx| view.reload(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.load, LoadState::Ready));
+            assert!(!view.reading_slowly);
+        });
+    }
+
+    /// A page of changes the server had not answered when Studio stopped waiting says the
+    /// server was still working on them, not that it could not be reached, and offers Refresh.
+    #[gpui::test]
+    async fn a_review_that_timed_out_says_the_server_was_still_working(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use futures::FutureExt as _;
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _) = fake_server_held(
+            review_answers(
+                None,
+                false,
+                None,
+                "f2",
+                |_| (500, json!({})),
+                |_, _, _| None,
+            ),
+            |path, query| {
+                (path.ends_with("/changes") && query.contains("after%3Am1"))
+                    .then(|| async { Err(std::io::Error::other("operation timed out")) }.boxed())
+            },
+            cx,
+        );
+        let (view, cx) = cx.add_window_view({
+            let session = session.clone();
+            |window, cx| ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let LoadState::Failed(error) = &view.load else {
+                panic!("the review was read");
+            };
+            assert_eq!(
+                error.as_ref(),
+                "The server was still working out the changes after 5 minutes, and Studio \
+                 stopped waiting."
+            );
+            assert!(!view.reading_slowly);
+        });
+        // Any other failure reads as it came.
+        assert_eq!(
+            change_read_failure(&ReadError::Transport("the connection was refused".into())),
+            "Could not reach the server: the connection was refused"
+        );
+    }
+
     /// A fix asked for while the merge is out is refused on its card until the merge is back,
     /// and offered again then.
     #[gpui::test]
@@ -5511,6 +5683,21 @@ pub(crate) mod tests {
         Entity<GraphSession>,
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) {
+        fake_server(
+            review_answers(access, merged_in, feed, took, write, over),
+            cx,
+        )
+    }
+
+    /// What [`review_server_with`]'s server answers each request's path, query and body with.
+    fn review_answers(
+        access: Option<Value>,
+        merged_in: bool,
+        feed: Option<Value>,
+        took: &'static str,
+        write: impl Fn(usize) -> (u16, Value) + Send + Sync + 'static,
+        over: impl Fn(&str, &str, &str) -> Option<(u16, Value)> + Send + Sync + 'static,
+    ) -> impl Fn(&str, &str, &str) -> (u16, Value) + Send + Sync + 'static {
         let writes = std::sync::atomic::AtomicUsize::new(0);
         let commit = |id: &str, parent: Option<&str>| json!({ "graph_commit_id": id, "graph_manifest_version": 1, "kind": "published", "created_at": 0, "parent_commit_id": parent, "actor_id": "act-dev" });
         let person = |id: &str, op: &str| json!({ "kind": "node", "type": { "id": "Person", "name": "Person" }, "id": id, "op": op, "before": { "properties": { "slug": id } }, "after": { "properties": { "slug": id, "name": "x" } } });
@@ -5540,72 +5727,86 @@ pub(crate) mod tests {
             json!({ "commits": [commit("f2", Some("f1")), commit("f1", Some("m1")), commit("m1", None)] })
         };
         let main = json!({ "commits": [commit("m2", Some("m1")), commit("m1", None)] });
-        fake_server(
-            move |path, query, sent| {
-                if let Some(answer) = over(path, query, sent) {
-                    answer
-                } else if let Some(access) = access.as_ref().filter(|_| path.ends_with("/access")) {
-                    (200, access.clone())
-                } else if path.contains("/mutate") {
-                    write(writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
-                } else if path.ends_with("/branches/merge") {
-                    let merge = json!({ "graph_commit_id": "m3", "graph_manifest_version": 4, "kind": "published", "created_at": 0, "parent_commit_id": "m2", "merged_parent_commit_id": took });
-                    let mut answer = json!({ "source": "feature", "target": "main", "outcome": "merged", "commit": merge });
-                    if sent.contains("\"delete_branch\":true") {
-                        answer["branch_deleted"] = json!(true);
-                    }
-                    (200, answer)
-                } else if path.ends_with("/schema") {
-                    (
-                        200,
-                        json!({ "schema_source": "node Person {\n  slug: String @key\n  name: String?\n}\n" }),
-                    )
-                } else if path.ends_with("/branches/merge-base") {
-                    (200, base.clone())
-                } else if let Some((_, id)) = path
-                    .strip_suffix("/changes")
-                    .and_then(|commit| commit.rsplit_once("/commits/"))
-                {
-                    // One commit's own changes: its block of the feed.
-                    let blocks = feed["blocks"].as_array().cloned().unwrap_or_default();
-                    match blocks
-                        .iter()
-                        .find(|block| block["cause"]["graph_commit_id"] == id)
-                    {
-                        Some(block) => (
-                            200,
-                            json!({ "cause": block["cause"], "changes": block["changes"] }),
-                        ),
-                        None => (
-                            404,
-                            json!({ "error": "no such commit", "code": "not_found" }),
-                        ),
-                    }
-                } else if path.ends_with("/changes") && query.contains("start=after%3Am2") {
-                    (
-                        400,
-                        json!({ "error": "start commit is not on this branch's first-parent chain", "code": "bad_request", "disposition": { "action": "fix", "effects": "none" } }),
-                    )
-                } else if path.ends_with("/changes") {
-                    (200, feed.clone())
-                } else if path.ends_with("/diff") && query.contains("from=m2&to=f2") {
-                    (200, diff.clone())
-                } else if path.ends_with("/commits") && query.contains("branch=feature") {
-                    (200, feature.clone())
-                } else if path.ends_with("/commits") {
-                    (200, main.clone())
-                } else {
-                    (200, json!({ "branches": ["main", "feature"] }))
+        move |path: &str, query: &str, sent: &str| {
+            if let Some(answer) = over(path, query, sent) {
+                answer
+            } else if let Some(access) = access.as_ref().filter(|_| path.ends_with("/access")) {
+                (200, access.clone())
+            } else if path.contains("/mutate") {
+                write(writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+            } else if path.ends_with("/branches/merge") {
+                let merge = json!({ "graph_commit_id": "m3", "graph_manifest_version": 4, "kind": "published", "created_at": 0, "parent_commit_id": "m2", "merged_parent_commit_id": took });
+                let mut answer = json!({ "source": "feature", "target": "main", "outcome": "merged", "commit": merge });
+                if sent.contains("\"delete_branch\":true") {
+                    answer["branch_deleted"] = json!(true);
                 }
-            },
-            cx,
-        )
+                (200, answer)
+            } else if path.ends_with("/schema") {
+                (
+                    200,
+                    json!({ "schema_source": "node Person {\n  slug: String @key\n  name: String?\n}\n" }),
+                )
+            } else if path.ends_with("/branches/merge-base") {
+                (200, base.clone())
+            } else if let Some((_, id)) = path
+                .strip_suffix("/changes")
+                .and_then(|commit| commit.rsplit_once("/commits/"))
+            {
+                // One commit's own changes: its block of the feed.
+                let blocks = feed["blocks"].as_array().cloned().unwrap_or_default();
+                match blocks
+                    .iter()
+                    .find(|block| block["cause"]["graph_commit_id"] == id)
+                {
+                    Some(block) => (
+                        200,
+                        json!({ "cause": block["cause"], "changes": block["changes"] }),
+                    ),
+                    None => (
+                        404,
+                        json!({ "error": "no such commit", "code": "not_found" }),
+                    ),
+                }
+            } else if path.ends_with("/changes") && query.contains("start=after%3Am2") {
+                (
+                    400,
+                    json!({ "error": "start commit is not on this branch's first-parent chain", "code": "bad_request", "disposition": { "action": "fix", "effects": "none" } }),
+                )
+            } else if path.ends_with("/changes") {
+                (200, feed.clone())
+            } else if path.ends_with("/diff") && query.contains("from=m2&to=f2") {
+                (200, diff.clone())
+            } else if path.ends_with("/commits") && query.contains("branch=feature") {
+                (200, feature.clone())
+            } else if path.ends_with("/commits") {
+                (200, main.clone())
+            } else {
+                (200, json!({ "branches": ["main", "feature"] }))
+            }
+        }
     }
 
     /// A session on a server answering each request's path, query and body with `answer`;
     /// every request is recorded, a merge with its body.
     pub(crate) fn fake_server(
         answer: impl Fn(&str, &str, &str) -> (u16, Value) + Send + Sync + 'static,
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<GraphSession>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        fake_server_held(answer, |_, _| None, cx)
+    }
+
+    /// As [`fake_server`], a request whose path and query `held` gives a wait for answered only
+    /// once that wait is over, or never answered when it ends in an error: the request fails
+    /// with it, as one the client stopped waiting for does.
+    fn fake_server_held(
+        answer: impl Fn(&str, &str, &str) -> (u16, Value) + Send + Sync + 'static,
+        held: impl Fn(&str, &str) -> Option<futures::future::BoxFuture<'static, std::io::Result<()>>>
+        + Send
+        + Sync
+        + 'static,
         cx: &mut gpui::TestAppContext,
     ) -> (
         Entity<GraphSession>,
@@ -5622,6 +5823,7 @@ pub(crate) mod tests {
         let http = FakeHttpClient::create(move |request| {
             let path = request.uri().path().to_owned();
             let query = request.uri().query().unwrap_or_default().to_owned();
+            let wait = held(&path, &query);
             let bound = request
                 .headers()
                 .get(graph_client::IF_GRAPH_COMMIT_HEADER)
@@ -5631,6 +5833,9 @@ pub(crate) mod tests {
             let (seen, answer) = (seen.clone(), answer.clone());
             async move {
                 use futures::AsyncReadExt as _;
+                if let Some(wait) = wait {
+                    wait.await?;
+                }
                 let mut sent = String::new();
                 request.into_body().read_to_string(&mut sent).await.ok();
                 let merge = if path.ends_with("/branches/merge") {
