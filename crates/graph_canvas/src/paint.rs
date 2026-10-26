@@ -364,7 +364,7 @@ pub(crate) fn paint(
 
     // Chips. From afar most are a letter mark, and a frame of thousands repeats a few letters:
     // each is shaped once here, not once a chip.
-    let mut letters: HashMap<(SharedString, u32), ShapedLine> = HashMap::new();
+    let mut letters: HashMap<SharedString, ShapedLine> = HashMap::new();
     let mut rects = chips.borrow_mut();
     rects.clear();
     rects.resize(scene.nodes.len(), Bounds::default());
@@ -384,18 +384,10 @@ pub(crate) fn paint(
                 SceneKind::Node { .. } => {
                     let initial = &texts[index].initial;
                     let line = letters
-                        .entry((initial.clone(), 1f32.to_bits()))
-                        .or_insert_with(|| shape_letter(initial, MARK_SIZE, 1., palette, window))
+                        .entry(initial.clone())
+                        .or_insert_with(|| shape_letter(initial, MARK_SIZE, palette, window))
                         .clone();
-                    paint_letter_mark(
-                        p,
-                        type_color(&node.color_key),
-                        &line,
-                        MARK_SIZE,
-                        1.,
-                        window,
-                        cx,
-                    )
+                    paint_letter_mark(p, type_color(&node.color_key), &line, MARK_SIZE, window, cx)
                 }
             };
             continue;
@@ -422,7 +414,6 @@ pub(crate) fn paint(
                 } else {
                     &palette.shadow
                 },
-                alpha: 1.,
                 ring: focus.then_some(palette.here_halo),
             },
             palette,
@@ -441,7 +432,6 @@ pub(crate) fn paint(
                 fill: palette.card,
                 border: focus.then_some(palette.here),
                 shadow: &palette.pointed,
-                alpha: 1.,
                 ring: focus.then_some(palette.here_halo),
             },
             palette,
@@ -814,9 +804,8 @@ struct PillStyle<'a> {
     fill: Hsla,
     /// A hairline inside the chip: only where you are; otherwise its shadow's ring outlines it.
     border: Option<Hsla>,
-    /// Its shadow, the ring first, faded with the chip by `alpha`.
+    /// Its shadow, the ring first.
     shadow: &'a [Layer],
-    alpha: f32,
     /// The focus ring's glow.
     ring: Option<Hsla>,
 }
@@ -837,13 +826,7 @@ fn paint_chip_body(rect: Bounds<Pixels>, radius: f32, style: &PillStyle, window:
             }],
         );
     }
-    for layer in style.shadow {
-        let layer = Layer {
-            color: layer.color.opacity(style.alpha),
-            ..*layer
-        };
-        studio_ui::ds::elevation::paint_layers(rect, radius, &[layer], window);
-    }
+    studio_ui::ds::elevation::paint_layers(rect, radius, style.shadow, window);
     window.paint_quad(quad(
         rect,
         Corners::all(px(radius)),
@@ -924,8 +907,8 @@ fn paint_pill(
     let middle = at.y;
     if let Some((tint, letter)) = mark {
         let center = point(px(x + mark_size / 2.), middle);
-        let line = shape_letter(&letter, mark_size, style.fill.a, palette, window);
-        paint_letter_mark(center, tint, &line, mark_size, style.fill.a, window, cx);
+        let line = shape_letter(&letter, mark_size, palette, window);
+        paint_letter_mark(center, tint, &line, mark_size, window, cx);
         x += mark_size + gap;
     }
     for line in &lines {
@@ -1031,13 +1014,12 @@ fn paint_open_chip(
     // The mark stays where the chip had it, beside the first line.
     let left = f32::from(rect.left()) + pad_x;
     let first_middle = rect.top() + px(pad_y + line_height / 2.);
-    let mark = shape_letter(&letter, mark_size, 1., palette, window);
+    let mark = shape_letter(&letter, mark_size, palette, window);
     paint_letter_mark(
         point(px(left + mark_size / 2.), first_middle),
         tint,
         &mark,
         mark_size,
-        1.,
         window,
         cx,
     );
@@ -1066,13 +1048,7 @@ fn wrap_width(whole: f32, widest: f32, text_size: f32) -> f32 {
 }
 
 /// A mark's letter, shaped for a mark `size_px` across.
-fn shape_letter(
-    letter: &str,
-    size_px: f32,
-    alpha: f32,
-    palette: &Palette,
-    window: &mut Window,
-) -> ShapedLine {
+fn shape_letter(letter: &str, size_px: f32, palette: &Palette, window: &mut Window) -> ShapedLine {
     let font = Font {
         weight: studio_ui::ds::text::weight::HEADING,
         ..palette.font.clone()
@@ -1083,7 +1059,7 @@ fn shape_letter(
         &[TextRun {
             len: letter.len(),
             font,
-            color: palette.on_tint.opacity(alpha),
+            color: palette.on_tint,
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -1099,7 +1075,6 @@ fn paint_letter_mark(
     tint: Hsla,
     line: &ShapedLine,
     size_px: f32,
-    alpha: f32,
     window: &mut Window,
     cx: &mut App,
 ) -> Bounds<Pixels> {
@@ -1112,7 +1087,7 @@ fn paint_letter_mark(
     window.paint_quad(quad(
         rect,
         px(corner),
-        tint.opacity(alpha),
+        tint,
         px(0.),
         tint,
         BorderStyle::Solid,
