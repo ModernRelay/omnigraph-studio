@@ -176,7 +176,10 @@ mod tests {
         })
     }
 
-    fn heard() -> (Arc<Mutex<Vec<u8>>>, Box<dyn Fn(u8) + Send>) {
+    /// The percents a download reported, and the callback it reports them to.
+    type Heard = (Arc<Mutex<Vec<u8>>>, Box<dyn Fn(u8) + Send>);
+
+    fn heard() -> Heard {
         let percents = Arc::new(Mutex::new(Vec::new()));
         let sink = percents.clone();
         (
