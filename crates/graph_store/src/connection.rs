@@ -185,9 +185,6 @@ pub struct Connection {
     _renewal: Option<Task<()>>,
     /// The renewal came while nothing watched the server: the next watch asks.
     renewal_missed: bool,
-    /// Where the server's 401 said its sign-in details are, once it offered a sign-in: a new
-    /// client for the server reads them again through itself.
-    sign_in_metadata: Option<String>,
     /// The ask under way is a renewal, before the token held ends: its answer replaces the
     /// token quietly. An ask after a refusal is not one, and its token is tried at once.
     renewing: bool,
@@ -288,7 +285,6 @@ impl Connection {
             _signing_in: None,
             _renewal: None,
             renewal_missed: false,
-            sign_in_metadata: None,
             renewing: false,
         })
     }
@@ -355,19 +351,17 @@ impl Connection {
     /// since the target changed.
     pub(crate) fn replace_http(&mut self, http: Arc<dyn HttpClient>, cx: &mut Context<Self>) {
         self.http = http.clone();
-        self.client.set_http(http);
-        // A sign-in reached the server's address through the old client. It is read again
-        // through the new one now, and a kept sign-in refreshed from the keychain: a 401 to a
-        // graph's read, the next sign that the token lapsed, asks no source when there is none.
-        let metadata = self.sign_in_metadata.clone();
-        if self.oauth.is_some() {
-            self.token_source = None;
+        self.client.set_http(http.clone());
+        // A sign-in keeps going through the new client: its requests to the server's address
+        // take it from now on, and a refresh under way finishes and is kept. A new sign-in read
+        // from the keychain here would race that refresh for the refresh token it rotates.
+        if let Some(service) = &mut self.service {
+            service.clients = service.clients.through(http.clone());
         }
-        self.drop_sign_in();
+        if let Some(source) = &self.oauth {
+            source.reach_through(http);
+        }
         cx.emit(ConnectionEvent::CredentialChanged);
-        if let Some(metadata) = metadata {
-            self.offered_sign_in(metadata, cx);
-        }
     }
 
     /// Stops the connection for good, as when its CLI target is gone or names a transport Studio
@@ -815,7 +809,6 @@ impl Connection {
         let Ok(endpoint) = url::Url::parse(&self.server.url) else {
             return;
         };
-        self.sign_in_metadata = Some(metadata.clone());
         self.sign_in = SignIn::Reading;
         let clients =
             oauth_client::Clients::new(endpoint, self.http.clone(), context.elsewhere.clone());
@@ -1046,7 +1039,6 @@ impl Connection {
     fn drop_sign_in(&mut self) {
         self.oauth = None;
         self.service = None;
-        self.sign_in_metadata = None;
         self.holder = None;
         self._renewal = None;
         self._signing_in = None;

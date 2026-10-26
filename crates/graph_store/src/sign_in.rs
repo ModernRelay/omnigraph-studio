@@ -159,11 +159,14 @@ pub struct MemoryKeychain {
     pub items: Mutex<HashMap<String, KeychainItem>>,
     /// Writes are refused, as a keychain that will not keep the sign-in.
     pub refuses_writes: AtomicBool,
+    /// How many times it was read.
+    pub reads: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(any(test, feature = "test-support"))]
 impl Keychain for MemoryKeychain {
     fn read(&self, key: String) -> KeychainRead {
+        self.reads.fetch_add(1, Ordering::SeqCst);
         let item = self
             .items
             .lock()
@@ -239,10 +242,6 @@ impl Service {
             self.server.issuer, self.resource.resource
         )
     }
-
-    fn token_client(&self) -> &dyn HttpClient {
-        self.clients.for_url(&self.server.token_endpoint)
-    }
 }
 
 /// Reads and checks the server's sign-in details, its sign-in service's, and which client ID
@@ -306,6 +305,9 @@ pub(crate) struct OAuthSource {
 
 struct Inner {
     service: Service,
+    /// The clients its requests take: the service's at first, then those a new transport for
+    /// the server's address makes ([`OAuthSource::reach_through`]).
+    clients: Mutex<Clients>,
     key: String,
     keychain: Arc<dyn Keychain>,
     held: smol::lock::Mutex<Held>,
@@ -398,6 +400,7 @@ impl OAuthSource {
         Self {
             inner: Arc::new(Inner {
                 key: service.key(target),
+                clients: Mutex::new(service.clients.clone()),
                 service,
                 keychain,
                 held: smol::lock::Mutex::new(held),
@@ -424,6 +427,18 @@ impl OAuthSource {
 
     pub(crate) fn kept_in_keychain(&self) -> bool {
         self.inner.kept.load(Ordering::SeqCst)
+    }
+
+    /// Sends the sign-in's requests to the server's address through `http` from now on: the
+    /// CLI target's transport changed. The sign-in stands, and a refresh under way finishes
+    /// with its client and keeps what it gives.
+    pub(crate) fn reach_through(&self, http: Arc<dyn HttpClient>) {
+        let mut clients = self
+            .inner
+            .clients
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *clients = clients.through(http);
     }
 
     /// Ends the sign-in: drops its tokens, deletes the keychain item and, when the service
@@ -453,14 +468,10 @@ impl OAuthSource {
             }
             if let Some(refresh) = refresh {
                 let service = &inner.service;
-                oauth_client::revoke(
-                    service.token_client(),
-                    &service.server,
-                    &service.client_id,
-                    &refresh,
-                )
-                .await
-                .ok();
+                let http = inner.token_client();
+                oauth_client::revoke(http.as_ref(), &service.server, &service.client_id, &refresh)
+                    .await
+                    .ok();
             }
         }
         .boxed()
@@ -479,6 +490,13 @@ impl TokenSource for OAuthSource {
 }
 
 impl Inner {
+    fn token_client(&self) -> Arc<dyn HttpClient> {
+        self.clients
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .client_for(&self.service.server.token_endpoint)
+    }
+
     async fn token(&self) -> Result<Token, String> {
         let mut held = self.held.lock().await;
         if self.ended.load(Ordering::SeqCst) {
@@ -498,8 +516,9 @@ impl Inner {
         let service = &self.service;
         let mut failed_once = false;
         loop {
+            let http = self.token_client();
             match oauth_client::refresh(
-                service.token_client(),
+                http.as_ref(),
                 &service.server,
                 &refresh,
                 service.expected(),
@@ -1001,11 +1020,11 @@ mod tests {
     }
 
     /// A target whose transport changed (another certificate authority, another proxy) is
-    /// reached through a new client; the sign-in made through the old one is read again
-    /// through the new one, and refreshed from the keychain, rather than refreshed over the old
-    /// trust.
+    /// reached through a new client, and its sign-in goes on through it: nothing is read from
+    /// the keychain, which a refresh under way could rotate under a second sign-in, and a token
+    /// that lapses afterwards is refreshed with the server's requests on the new client.
     #[gpui::test]
-    async fn a_new_transport_reads_the_sign_in_again_through_it(cx: &mut TestAppContext) {
+    async fn a_new_transport_keeps_the_sign_in_through_it(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let served = Arc::new(Mutex::new(Served {
             lives: 300,
@@ -1024,18 +1043,31 @@ mod tests {
         until(cx, "the kept sign-in", |cx| {
             sign_in_state(&connection, cx).0 == ConnectionState::Ready
         });
+        let reads = keychain.reads.load(Ordering::SeqCst);
 
-        // At once, not at a 401 that no read routes to a connection without a token source.
         served.lock().unwrap().requests.clear();
         let next = through("next", served.clone());
         connection.update(cx, |c, cx| c.replace_http(next, cx));
-        until(cx, "the sign-in through the new client", |cx| {
+        cx.run_until_parked();
+        assert!(matches!(
+            sign_in_state(&connection, cx).1,
+            SignIn::SignedIn { .. }
+        ));
+        assert_eq!(
+            keychain.reads.load(Ordering::SeqCst),
+            reads,
+            "the keychain is not read"
+        );
+        assert_eq!(served.lock().unwrap().issued, 1);
+
+        // The token lapses: the server refuses it, and the sign-in refreshes it.
+        served.lock().unwrap().accepted.clear();
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the refresh through the new client", |cx| {
             served.lock().unwrap().issued == 2
-                && matches!(sign_in_state(&connection, cx).1, SignIn::SignedIn { .. })
                 && sign_in_state(&connection, cx).0 == ConnectionState::Ready
         });
         let served = served.lock().unwrap();
-        assert_eq!(served.issued, 2, "refreshed from the kept token");
         let to_server: Vec<&String> = served
             .requests
             .iter()
