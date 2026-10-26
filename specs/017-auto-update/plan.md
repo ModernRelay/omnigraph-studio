@@ -1,7 +1,8 @@
 # 017: Studio updates itself
 
 Status: built 2026-10-22 (branch `auto-update`); installing waits on Developer ID signed and
-notarized releases (issue #3) and the update key (open questions 1 and 2) · 2026-10-22
+notarized releases (issue #3) and the update key (open questions 1 and 2) · 2026-10-22 ·
+amended 2026-10-26 (Studio downloads, verifies and installs the update itself; see Corrections)
 
 ## Problem
 
@@ -11,15 +12,14 @@ releases page, downloads a disk image or tarball by hand and replaces the app. `
 pins no Studio version, because "Studio updates itself"; today there is neither an updater nor a
 latest URL, since every release is a pre-release and every file name carries the version.
 Issue #3 asks for both, with signing. This plan makes the releases serve updates in the format
-Tauri apps use, and makes Studio check for them, verify them and install them with
-`cargo-packager-updater`, Tauri's updater made for any Rust app. It is a spec only; nothing is
-implemented.
+Tauri apps use, and makes Studio check for them, verify them against its update key and install
+them by exchanging its bundle with the update's.
 
 ## Principles
 
 - I: the engine is the authority, and one client owns every request. The update check and
   download are the only requests Studio makes that are not to an Omnigraph server, and the
-  download goes through the updater crate's own HTTP client. This plan amends I's "in practice"
+  download goes through Studio's own HTTP client. This plan amends I's "in practice"
   line to name them (a patch: 1.2.0 to 1.2.1), and the architecture and agent rules with it.
 - III: a write has three outcomes. Restarting to update goes through the same confirmation as
   Quit, so no draft or unsaved query is lost to an update.
@@ -30,8 +30,8 @@ implemented.
   shown.
 - VIII: keyboard first. Check for Updates, Restart to Update, Download Update and View Release
   Notes are actions with bindings, in the palette and the app menu.
-- IX: work is bounded. One check or download at a time. The manifest has a size cap; the
-  download is bounded by time, because the crate reads it whole into memory (open question 7).
+- IX: work is bounded. One check or download at a time. The manifest has a size cap, and the
+  download one by size (256 MiB, read into memory) and by time.
 - XII: evidence over assumption. Every Zed, GitHub, crate and Omnigraph fact below is checked.
 
 ## What exists today (checked)
@@ -129,14 +129,17 @@ implemented.
   team, and the disk image passes `xcrun stapler validate`. A hand-run build may still be ad
   hoc; it is never published.
 - **The update file.** `script/bundle-mac` also writes `Omnigraph-Studio-<version>-arm64.app.tar.gz`,
-  the signed app with `Omnigraph Studio.app/` as its top directory, and the workflow signs it
-  with `cargo packager signer sign` (cargo-packager `0.11.8`), writing its `.sig`.
+  the signed app with `Omnigraph Studio.app/` as its top directory. The workflow's `sign-update`
+  job signs it with `cargo packager signer sign` (cargo-packager `0.11.8`, installed from
+  crates.io with its lock file), writing its `.sig`, and checks that signature against the
+  committed public key with `minisign -V`. It runs for a tag only, apart from the builds, in the
+  `update-signing` environment, which holds the key; the builds can read no signing secret, and
+  only the publish job may write to the repository.
 - **The manifest.** The workflow writes `latest.json` from the release's files and uploads it:
 
   ```json
   {
     "version": "0.3.0",
-    "notes": "<the release's notes>",
     "pub_date": "2026-11-02T10:00:00Z",
     "platforms": {
       "macos-aarch64": {
@@ -149,7 +152,10 @@ implemented.
   ```
 
   Linux and Windows get entries when they install in place (Deferred); until then Studio reads
-  only `version` for them.
+  only `version` for them. Studio decodes only its own platform's entry, so an entry a later
+  release adds for another platform, in any shape, never stops an older Studio's check.
+- **A pre-release is not latest.** A tag with a pre-release version (`v0.3.0-rc.1`) is
+  published as a pre-release, so `latest` and every Studio skip it.
 - **Version-free names.** Each release also carries its first-install files under names
   without the version, at `https://github.com/ModernRelay/omnigraph-studio/releases/latest/download/<name>`:
   `Omnigraph-Studio-arm64.dmg`, `omnigraph-studio-linux-x86_64.tar.gz`,
@@ -158,16 +164,20 @@ implemented.
   names case-sensitively; issue #3's example name, spelled with a capital G, predates the
   rename and is corrected there.
 - **The keys.** The update key pair is made once with `cargo packager signer generate`; the
-  private key and its password are workflow secrets (`STUDIO_UPDATER_KEY`,
-  `STUDIO_UPDATER_KEY_PASSWORD`, open question 2), and the public key is a constant in Studio.
+  private key and its password are secrets of the `update-signing` environment
+  (`STUDIO_UPDATER_KEY`, `STUDIO_UPDATER_KEY_PASSWORD`, open question 2), and the public key is
+  `crates/studio_update/update-key.pub`. Once that file holds the key, a release whose macOS
+  update has no signature is refused (`script/release-files.py`).
   The Apple team identifier is written in this plan, the README and Studio (`TEAM_ID`, open
   question 1).
 
 ### Who checks, and when
 
 - A release build checks: on macOS a Studio running from an `.app` bundle, on Linux and
-  Windows a binary that is not a build output (`is_build_output`). A development build never
-  checks; Check for Updates there says "Updates are off in a development build."
+  Windows a binary that is not a build output (`is_build_output`). Neither may sit under a
+  Cargo build directory, so the bundle `script/bundle-mac` writes to `target/bundle/` is a
+  development build too (`is_release_build`). A development build never checks; Check for
+  Updates there says "Updates are off in a development build."
 - The first check runs 30 seconds after launch, then every hour while Studio runs, and when the
   person chooses Check for Updates. One check or download runs at a time; a manual check
   during one joins it.
@@ -180,9 +190,12 @@ implemented.
   `GET https://github.com/ModernRelay/omnigraph-studio/releases/latest/download/latest.json`,
   following GitHub's redirect to its file host, HTTPS only, at most 64 KiB, 15 seconds, with
   the user agent `Omnigraph-Studio/<version>`. It sends no cookie, token, identifier or
-  telemetry. It parses the answer as the crate's `RemoteRelease`.
+  telemetry. It decodes `version` and this platform's entry alone. The macOS entry's `url` must
+  be exactly the release's file for that version,
+  `https://github.com/ModernRelay/omnigraph-studio/releases/download/v<version>/Omnigraph-Studio-<version>-arm64.app.tar.gz`;
+  a manifest naming any other file is refused.
 - The update is newer when `version` is greater than the running version by semver
-  precedence; equal or older is "up to date".
+  precedence (build metadata counts for nothing); equal or older is "up to date".
 - An answer that fails these, or no answer, leaves Studio as it was: a background check logs
   it; a manual check says "Couldn't check for updates: <reason>."
 
@@ -191,21 +204,27 @@ implemented.
 1. **Where Studio runs.** The bundle is `cx.app_path()`. Studio installs only where it can
    replace the bundle itself: not on a read-only volume or a mounted disk image (`/Volumes/…`),
    not under App Translocation (`…/AppTranslocation/…`), and only when the person can write
-   both the bundle and its folder. Anywhere else it offers Download and never calls `install`,
-   so the crate's administrator prompt never runs.
-2. **Download and verify.** Studio builds an `Update` from the `macos-aarch64` entry (the
-   update file's URL and signature, `format: app`, the bundle path, Studio's public key, the
-   user agent `Omnigraph-Studio/<version>`, a 30-minute timeout) and calls
-   `download_extended` on a background thread. It returns the file only when its minisign
-   signature verifies. Progress is reported when the whole percentage changes.
+   both the bundle and its folder. Anywhere else it offers Download and downloads nothing.
+   Studio never asks for an administrator's password.
+2. **Download and verify.** Studio downloads the `macos-aarch64` entry's file through its own
+   HTTP client on the background executor, following GitHub's redirects to its file host (at
+   most 10), within 30 minutes and at most 256 MiB, whether or not the host says the file's
+   length (`BundleInstaller`, `crates/studio_update/src/bundle.rs`). It keeps the file only
+   when its minisign signature, base64 in the manifest, verifies against the update key with
+   `minisign-verify`. Progress is reported when the whole percentage changes.
 3. **Check the version.** Studio reads `Omnigraph Studio.app/Contents/Info.plist` from the
    downloaded archive in memory; its `CFBundleShortVersionString` must equal the manifest's
    `version`, so an older signed build is never installed under a newer number.
-4. **Install.** `Update::install` on a background thread: the crate unpacks the archive,
-   renames the running bundle aside and the new one into place. The running process keeps its
-   open files.
-5. **Clean.** The next launch deletes leftover `packager_current_app*` and
-   `packager_updated_app*` directories under the system temp directory older than 24 hours.
+4. **Install.** On a thread of its own, Studio unpacks the archive into a new hidden folder
+   beside the bundle, `.omnigraph-studio-update-<random>`, with `tar`'s `unpack`, which writes
+   nothing outside that folder (an entry naming `..` is skipped). The folder must hold exactly
+   one directory named `*.app`, not a link. Studio then exchanges that directory with the
+   running bundle in one rename (`renamex_np` with `RENAME_SWAP`), so the bundle's path holds
+   the old app or the new one whatever happens, and deletes the folder, which now holds the old
+   app. A failure before the exchange leaves the bundle as it was. The running process keeps
+   its open files.
+5. **Clean.** The next launch deletes leftover `.omnigraph-studio-update-*` folders beside the
+   bundle older than 24 hours: Studio's own, never another app's.
 
 Studio is now **ready to restart**. Quitting instead also works: the next launch is the new
 version.
@@ -215,6 +234,11 @@ version.
 - Restart to Update asks as Quit does when work would be lost, titled "Restart to update
   Omnigraph Studio?", then calls `cx.restart()`. GPUI waits for the process to exit and opens
   the bundle at the same path. The session is restored on launch, as after any quit.
+- Between the install and the restart, the bundle's path holds the new version. An agent
+  conversation started in that time runs the new binary as its tool proxy (`current_exe`),
+  against the old app's socket. The proxy is a byte pipe, so this works as long as the command
+  line that starts the proxy stays the same across versions; a change to it needs the old
+  form kept for one release.
 
 ### Linux and Windows
 
@@ -273,8 +297,8 @@ next launch is the new version.
 ### Where it lives
 
 - A new crate, `studio_update`, in layer 3 beside `graph_store`: the GPUI entity that
-  schedules checks and holds the state, the manifest fetch, and the calls into
-  `cargo-packager-updater` `0.2.3` (exact version) on background threads.
+  schedules checks and holds the state, the manifest fetch, the download and its signature
+  check (`minisign-verify`), and the bundle exchange (`rustix`'s `renameat_with`).
 - `studio_workspace` gives the window a status item slot (`set_status_item`) and `restart`,
   which asks as `quit` does; `studio` draws the item from the entity (`update_status.rs`),
   registers the actions and sets the menu item.
@@ -290,7 +314,7 @@ next launch is the new version.
 | First check after launch | 30 s |
 | Check interval | 1 h |
 | Manifest | 64 KiB, 15 s |
-| Download | 30 min; no size limit in the crate (open question 7); about 50 MB today |
+| Download | 30 min, 256 MiB; about 50 MB today |
 | Work at a time | one check or download |
 | Leftover update directories | deleted after 24 h |
 
@@ -299,8 +323,8 @@ next launch is the new version.
 - Publish full releases; keep `--latest`.
 - Refuse a tag's release when the macOS app fails the team requirement or the disk image is
   not stapled.
-- Build, sign and upload `Omnigraph-Studio-<version>-arm64.app.tar.gz` and its `.sig`
-  (installing `cargo-packager` `0.11.8` in the macOS job for `signer sign`).
+- Build and upload `Omnigraph-Studio-<version>-arm64.app.tar.gz`; sign it in the tag-only
+  `sign-update` job, in the `update-signing` environment, and upload its `.sig`.
 - Upload the first-install files a second time under their version-free names.
 - Write and upload `latest.json`.
 
@@ -315,10 +339,12 @@ next launch is the new version.
 
 | Decision | Rejected alternatives | Why |
 |---|---|---|
-| `cargo-packager-updater` for the manifest, the signature check and the macOS install | Studio's own updater; Zed's `auto_update`; Velopack; Sparkle | It is Tauri's updater without Tauri: the manifest and minisign keys Tauri apps already use, with the signature checked before anything is installed. Zed's crate asks zed.dev with telemetry identifiers and checks nothing it downloads. Velopack checks only checksums listed in the same feed and needs the .NET SDK in CI. Sparkle is macOS-only Objective-C with its own appcast and windows |
+| Tauri's manifest and minisign keys, with Studio's own download, signature check and macOS install | `cargo-packager-updater` (chosen until 2026-10-26); Zed's `auto_update`; Velopack; Sparkle | The manifest and keys are what Tauri apps already use, and `cargo packager signer` makes and signs with them. The crate's install deleted the only copy of the old app when its last rename failed, fell back to a root shell command with unescaped paths, and read the whole download with no size limit, and its manifest type refused any platform entry it did not know (Corrections). Zed's crate asks zed.dev with telemetry identifiers and checks nothing it downloads. Velopack checks only checksums listed in the same feed and needs the .NET SDK in CI. Sparkle is macOS-only Objective-C with its own appcast and windows |
 | Full downloads, no deltas | Velopack's delta packages | A full macOS update is about 50 MB and has stayed there across releases |
-| Studio reads `latest.json` itself; the crate downloads, verifies and installs | The crate's `Updater::check` | `check` reads the manifest without a size limit, and on Linux sets Debian's certificate paths for the whole process, which other distributions do not have; Studio's own fetch keeps the cap, its user agent and its HTTP client |
-| Install only where Studio can write; offer Download elsewhere | The crate's administrator prompt | The prompt runs a root shell command with the paths unescaped in single quotes, and a password prompt from a background update is loud (VII) |
+| The update is exchanged with the bundle in one rename, beside it | Rename the bundle aside, then the update in | Two renames leave no app at the bundle's path between them, and a failure of the second loses the first; one exchange cannot |
+| Install only where Studio can write; offer Download elsewhere | An administrator prompt | A password prompt from a background update is loud (VII), and a root command built from paths is one more thing to get wrong |
+| The manifest's macOS file must be the release's own | Any HTTPS address | The manifest is not signed; tying its file to the release's address leaves no other host to serve it |
+| Sign in a tag-only job of its own, in a protected environment | Sign in the macOS build job | The build runs every dependency's build script and any dispatched branch; the key should meet only a tagged release's archive, after a reviewer approves |
 | The bundle's version must equal the manifest's | Trust the manifest | The signature covers the file, not the version written beside it; without the check an older signed build could be installed as newer |
 | The workflow checks the Developer ID team; Studio checks the minisign signature | Studio also runs `codesign` against the team before installing | Every published build passes the team check in CI, which the CLI relies on; a second check in Studio would unpack the archive twice for the same assurance |
 | Keep the disk image; add the `.app.tar.gz` | One file for both | The CLI and first installs take a disk image; the updater's `app` format is a tarball of the bundle |
@@ -332,7 +358,7 @@ next launch is the new version.
 
 - Linux in place, as an AppImage built by `cargo-packager` (`format: appimage`), and Windows,
   as an NSIS installer built by it (`format: nsis`), which also gives Windows the package
-  identity issue #3 asks for. Both reuse the same crate and manifest.
+  identity issue #3 asks for. Both reuse the same manifest and keys.
 - Intel Macs: there is no x86_64 macOS build (issue #3 asks whether to support them).
 - Release channels (beta, nightly), delta updates, and a policy that turns updates off for
   every person on a machine.
@@ -343,19 +369,17 @@ next launch is the new version.
 
 1. The Apple team identifier, who holds the Developer ID certificate, and when the secrets are
    set. Nothing in this plan ships before.
-2. Who holds the update key and its password, and where: a repository secret, or a protected
-   environment whose use needs a reviewer, so that a workflow change alone cannot sign a
-   release.
+2. Who holds the update key and its password. The workflow reads them from the
+   `update-signing` environment (2026-10-26); the environment needs required reviewers set in
+   the repository's settings, so that a workflow change alone cannot sign a release.
 3. Whether a beta channel is wanted, which would bring pre-releases back alongside `latest`.
 4. ~~The default bindings for the four actions.~~ None: they are palette-only, as Zed's are
    (2026-10-22).
 5. Whether a release may ever require an update (a minimum version beside the manifest), for
    example when a contract bump makes older Studios refuse every server.
 6. To check when built: that the swapped bundle opens without a Gatekeeper prompt.
-7. Upstream: issues for `cargo-packager-updater` to escape the administrator command's paths,
-   put the backup back when the last rename fails, limit the download's size, and leave the
-   certificate variables alone. If they are not fixed, whether Studio keeps a small patched
-   copy of the crate (`lib.rs` is 1,216 lines).
+7. ~~Upstream fixes to `cargo-packager-updater`, or a patched copy.~~ Neither: Studio does the
+   download, check and install itself (2026-10-26, Corrections).
 
 ## Validation log
 
@@ -381,4 +405,10 @@ next launch is the new version.
 
 ## Corrections
 
-None yet.
+| Date | Was | Now | Why |
+|---|---|---|---|
+| 2026-10-26 | `cargo-packager-updater` downloaded, verified and installed; Studio guarded its administrator prompt by checking it could write the bundle and its folder | `BundleInstaller`: Studio's HTTP client downloads at most 256 MiB, `minisign-verify` checks the signature, and the update is exchanged with the bundle in one rename beside it; the crate is gone | A review found the guard incomplete: write access was checked up to 30 minutes before the install, and an ACL that `access(W_OK)` does not test still reached the prompt, whose command a folder name could inject into. The crate's second rename deleted the old app when it failed, its download had no size bound, and its unpacking used `Entry::unpack` |
+| 2026-10-26 | The manifest was the crate's `RemoteRelease`; any HTTPS `url` was taken | Only this platform's entry is decoded, and the macOS `url` must be the release's own file | One unknown entry for another platform would have stopped every older Studio's check for good |
+| 2026-10-26 | The macOS build job signed with the update key, on any run | A tag-only job in the `update-signing` environment signs, and checks the signature against the committed key; only publishing writes | A dispatched run on any branch could sign an archive every Studio would install |
+| 2026-10-26 | Turning `studio.auto_update` off stopped the schedule only; a failed background check cleared an offered download | Off also stops a check or download nobody asked for; a failure leaves what was offered | The setting says nothing is downloaded unless asked; being offline says nothing about the release |
+| 2026-10-26 | Any `.app` bundle was a release build, the one in `target/bundle/` included | A bundle under a Cargo build directory is a development build | Once the key ships, a developer's bundle older than the latest release would have been replaced by it, against the decision that a build from `target/` is never replaced |

@@ -1,4 +1,4 @@
-//! The release installer, `cargo-packager-updater` itself, against a signed update served on
+//! The release installer, through Studio's HTTP client against a signed update served on
 //! loopback: a genuine update downloads and replaces the bundle, and any other is refused
 //! before anything is written (spec 017).
 
@@ -9,11 +9,18 @@ use std::sync::{Arc, Mutex};
 use base64::Engine as _;
 use semver::Version;
 use studio_update::manifest::PlatformUpdate;
-use studio_update::{InstallError, Installer as _, Job, PackagerInstaller};
+use studio_update::{BundleInstaller, InstallError, Installer as _, Job};
 
 const UPDATE: &[u8] = include_bytes!("fixtures/update.app.tar.gz");
 const SIGNATURE: &str = include_str!("fixtures/update.app.tar.gz.minisig");
 const PUBLIC_KEY: &str = include_str!("fixtures/test.pub");
+
+/// The installer a release uses, with the HTTP client Studio sends through.
+fn installer() -> BundleInstaller {
+    BundleInstaller::new(Arc::new(
+        reqwest_client::ReqwestClient::user_agent("Omnigraph-Studio/test").unwrap(),
+    ))
+}
 
 fn base64(text: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(text)
@@ -67,7 +74,7 @@ fn a_signed_update_downloads_whole_and_reports_its_progress() {
     );
     let percents = Arc::new(Mutex::new(Vec::new()));
     let heard = percents.clone();
-    let bytes = futures::executor::block_on(PackagerInstaller.download(
+    let bytes = futures::executor::block_on(installer().download(
         &job,
         Box::new(move |percent| heard.lock().unwrap().push(percent)),
     ))
@@ -83,7 +90,7 @@ fn an_update_its_signature_does_not_cover_is_refused() {
     tampered[last] ^= 0xff;
     let folder = tempfile::tempdir().unwrap();
     let job = job(serve(tampered), folder.path().join("Omnigraph Studio.app"));
-    let result = futures::executor::block_on(PackagerInstaller.download(&job, Box::new(|_| {})));
+    let result = futures::executor::block_on(installer().download(&job, Box::new(|_| {})));
     assert!(
         matches!(result, Err(InstallError::Refused(_))),
         "{result:?}"
@@ -97,7 +104,7 @@ fn a_download_that_cannot_reach_its_host_fails_without_being_refused() {
     drop(closed);
     let folder = tempfile::tempdir().unwrap();
     let job = job(url, folder.path().join("Omnigraph Studio.app"));
-    let result = futures::executor::block_on(PackagerInstaller.download(&job, Box::new(|_| {})));
+    let result = futures::executor::block_on(installer().download(&job, Box::new(|_| {})));
     assert!(matches!(result, Err(InstallError::Failed(_))), "{result:?}");
 }
 
@@ -114,7 +121,7 @@ fn installing_replaces_the_bundle_with_the_updates() {
     .unwrap();
     std::fs::write(bundle.join("Contents/Old.txt"), "gone after the update").unwrap();
     let job = job(serve(UPDATE.to_vec()), bundle.clone());
-    futures::executor::block_on(PackagerInstaller.install(&job, UPDATE.to_vec())).unwrap();
+    futures::executor::block_on(installer().install(&job, UPDATE.to_vec())).unwrap();
     assert_eq!(
         std::fs::read_to_string(bundle.join("Contents/MacOS/omnigraph-studio")).unwrap(),
         "the new build\n"
@@ -123,7 +130,7 @@ fn installing_replaces_the_bundle_with_the_updates() {
     assert!(!bundle.join("Contents/Old.txt").exists());
 }
 
-/// A bundle archived as `script/bundle-mac` archives it and installed by the crate still
+/// A bundle archived as `script/bundle-mac` archives it and installed by Studio still
 /// passes `codesign --verify --strict`: the signature lives in the bundle's own files, and the
 /// install keeps them, their modes and the executable intact.
 #[cfg(target_os = "macos")]
@@ -174,7 +181,7 @@ fn an_installed_bundle_keeps_its_signature() {
     std::fs::create_dir_all(bundle.join("Contents")).unwrap();
     let job = job(serve(Vec::new()), bundle.clone());
     let bytes = std::fs::read(&archive).unwrap();
-    futures::executor::block_on(PackagerInstaller.install(&job, bytes)).unwrap();
+    futures::executor::block_on(installer().install(&job, bytes)).unwrap();
     let verified = Command::new("codesign")
         .args(["--verify", "--strict", "--verbose=2"])
         .arg(&bundle)

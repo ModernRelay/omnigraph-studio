@@ -3,11 +3,11 @@
 //! Layer 3 (`docs/architecture.md`): the only crate that makes requests not to an Omnigraph
 //! server, and only to Studio's own releases.
 
+mod bundle;
 pub mod install;
 pub mod manifest;
-mod packager;
 
-pub use packager::PackagerInstaller;
+pub use bundle::{BundleInstaller, MAX_UPDATE_BYTES};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -100,8 +100,8 @@ pub enum InstallError {
     Failed(String),
 }
 
-/// Downloads, verifies and installs, off the main thread: `cargo-packager-updater` in a
-/// release, a fake in tests.
+/// Downloads, verifies and installs, off the main thread: [`BundleInstaller`] in a release, a
+/// fake in tests.
 pub trait Installer: Send + Sync + 'static {
     /// The update's bytes, once its signature verifies; `progress` hears whole percents.
     fn download(
@@ -125,6 +125,10 @@ pub struct Updater {
     refused: HashMap<Version, String>,
     /// Whether the person asked for the work under way, so its outcome is said.
     asked: bool,
+    /// What the item shows once nothing is under way or being said: nothing, or a newer
+    /// version offered as a download. A failed check, in the background or asked for, leaves
+    /// it as it was.
+    resting: UpdateState,
     work: Option<Task<()>>,
     poll: Option<Task<()>>,
     clear: Option<Task<()>>,
@@ -149,6 +153,7 @@ impl Updater {
             newest: None,
             refused: HashMap::new(),
             asked: false,
+            resting: UpdateState::Idle,
             work: None,
             poll: None,
             clear: None,
@@ -170,11 +175,26 @@ impl Updater {
         &self.options.running
     }
 
+    /// Whether the person asked for the work under way, which the item then shows as busy;
+    /// work in the background shows its progress without.
+    pub fn asked(&self) -> bool {
+        self.asked
+    }
+
     /// Checks on a schedule while `on` (`studio.auto_update`): half a minute after launch, then
-    /// hourly. A development build never does.
+    /// hourly. A development build never does. Turned off, a check or download the person did
+    /// not ask for stops there; an install under way finishes, since its thread cannot be
+    /// stopped halfway, and a ready update stays ready.
     pub fn set_automatic(&mut self, on: bool, cx: &mut Context<Self>) {
         if !on {
             self.poll = None;
+            if self.work.is_some()
+                && !self.asked
+                && !matches!(self.state, UpdateState::Installing { .. })
+            {
+                self.work = None;
+                self.rest(cx);
+            }
             return;
         }
         if self.poll.is_some() || !self.options.release_build {
@@ -309,12 +329,13 @@ impl Updater {
             cx,
         );
         let (sender, mut percents) = mpsc::unbounded();
-        let download = self.installer.download(
+        // On the background executor: reading and verifying tens of MB never holds a frame.
+        let download = cx.background_spawn(self.installer.download(
             &job,
             Box::new(move |percent| {
                 sender.unbounded_send(percent).ok();
             }),
-        );
+        ));
         let installer = self.installer.clone();
         self.work = Some(cx.spawn(async move |this, cx| {
             let mut download = download.fuse();
@@ -408,15 +429,19 @@ impl Updater {
         );
     }
 
-    /// Ends the work under way with an outcome said only to a person who asked.
+    /// Ends the work under way with an outcome said only to a person who asked. Up to date,
+    /// nothing is offered any more; a failure leaves what was offered.
     fn finish(&mut self, said: UpdateState, cx: &mut Context<Self>) {
         let asked = self.asked;
         self.work = None;
         self.asked = false;
+        if said == UpdateState::UpToDate {
+            self.resting = UpdateState::Idle;
+        }
         if asked {
             self.say(said, cx);
         } else {
-            self.set(UpdateState::Idle, cx);
+            self.rest(cx);
         }
     }
 
@@ -424,17 +449,24 @@ impl Updater {
     fn end(&mut self, state: UpdateState, cx: &mut Context<Self>) {
         self.work = None;
         self.asked = false;
+        self.resting = state.clone();
         self.set(state, cx);
     }
 
-    /// Shows `state` for [`SAID_FOR`], then nothing.
+    /// Shows what stays once nothing is under way or said.
+    fn rest(&mut self, cx: &mut Context<Self>) {
+        let resting = self.resting.clone();
+        self.set(resting, cx);
+    }
+
+    /// Shows `state` for [`SAID_FOR`], then what stays.
     fn say(&mut self, state: UpdateState, cx: &mut Context<Self>) {
         self.set(state.clone(), cx);
         self.clear = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SAID_FOR).await;
             this.update(cx, |this, cx| {
                 if this.state == state {
-                    this.set(UpdateState::Idle, cx);
+                    this.rest(cx);
                 }
             })
             .ok();
@@ -476,19 +508,35 @@ pub fn init(cx: &mut App) {
     let options = Options {
         running: Version::parse(env!("CARGO_PKG_VERSION"))
             .expect("the workspace version is semver"),
-        platform: cargo_packager_updater::target(),
+        platform: platform(),
         release_build,
         bundle,
         public_key: key_from(UPDATE_KEY),
     };
-    if release_build {
-        cx.background_spawn(async {
-            install::clean_leftovers(&std::env::temp_dir(), std::time::SystemTime::now());
+    if let Some(folder) = options.bundle.as_ref().and_then(|bundle| bundle.parent()) {
+        let folder = folder.to_path_buf();
+        cx.background_spawn(async move {
+            install::clean_leftovers(&folder, std::time::SystemTime::now());
         })
         .detach();
     }
     let http = cx.http_client();
-    init_with(options, http, Arc::new(PackagerInstaller), cx);
+    let installer = Arc::new(BundleInstaller::new(http.clone()));
+    init_with(options, http, installer, cx);
+}
+
+/// This platform's key in the update manifest, `<os>-<arch>` as Tauri names them
+/// (`macos-aarch64`, `linux-x86_64`, `windows-x86_64`); `None` where Studio is not built.
+fn platform() -> Option<String> {
+    let os = match std::env::consts::OS {
+        os @ ("macos" | "linux" | "windows") => os,
+        _ => return None,
+    };
+    let arch = match std::env::consts::ARCH {
+        arch @ ("aarch64" | "x86_64") => arch,
+        _ => return None,
+    };
+    Some(format!("{os}-{arch}"))
 }
 
 fn init_with(
@@ -844,6 +892,104 @@ mod tests {
         cx.executor().advance_clock(CHECK_EVERY);
         cx.run_until_parked();
         assert_eq!(installer.downloads.load(Ordering::SeqCst), 2);
+    }
+
+    #[gpui::test]
+    async fn turning_updates_off_stops_a_download_in_the_background(cx: &mut TestAppContext) {
+        let folder = bundle();
+        let (http, _) = host(|| manifest("0.3.0"));
+        let installer = Arc::new(FakeInstaller::default());
+        *installer.archive.lock().unwrap() = Some(archive("0.3.0"));
+        let (open, gate) = oneshot::channel();
+        *installer.gate.lock().unwrap() = Some(gate);
+        let updater = updater(
+            options(MAC, &folder.path().join("Omnigraph Studio.app")),
+            http,
+            installer.clone(),
+            cx,
+        );
+        updater.update(cx, |updater, cx| updater.set_automatic(true, cx));
+        cx.executor().advance_clock(FIRST_CHECK);
+        cx.run_until_parked();
+        assert!(matches!(
+            state(&updater, cx),
+            UpdateState::Downloading { .. }
+        ));
+        updater.update(cx, |updater, cx| updater.set_automatic(false, cx));
+        cx.run_until_parked();
+        assert_eq!(state(&updater, cx), UpdateState::Idle);
+        assert!(open.send(()).is_err(), "the download was dropped");
+        cx.run_until_parked();
+        assert!(installer.installed.lock().unwrap().is_empty());
+    }
+
+    #[gpui::test]
+    async fn a_download_the_person_asked_for_goes_on_with_updates_off(cx: &mut TestAppContext) {
+        let folder = bundle();
+        let (http, _) = host(|| manifest("0.3.0"));
+        let installer = Arc::new(FakeInstaller::default());
+        *installer.archive.lock().unwrap() = Some(archive("0.3.0"));
+        let (open, gate) = oneshot::channel();
+        *installer.gate.lock().unwrap() = Some(gate);
+        let updater = updater(
+            options(MAC, &folder.path().join("Omnigraph Studio.app")),
+            http,
+            installer.clone(),
+            cx,
+        );
+        updater.update(cx, |updater, cx| updater.check(cx));
+        cx.run_until_parked();
+        updater.update(cx, |updater, cx| updater.set_automatic(false, cx));
+        open.send(()).unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            state(&updater, cx),
+            UpdateState::Ready {
+                version: Version::new(0, 3, 0)
+            }
+        );
+    }
+
+    /// A newer version offered as a download stays offered when a later check fails, in the
+    /// background or asked for: being offline says nothing about the release.
+    #[gpui::test]
+    async fn a_failed_check_leaves_the_newer_version_offered(cx: &mut TestAppContext) {
+        let folder = bundle();
+        let answer = Arc::new(Mutex::new(manifest("0.3.0")));
+        let served = answer.clone();
+        let (http, _) = host(move || served.lock().unwrap().clone());
+        let updater = updater(
+            options("linux-x86_64", &folder.path().join("Omnigraph Studio.app")),
+            http,
+            Arc::default(),
+            cx,
+        );
+        let offered = UpdateState::Available {
+            version: Version::new(0, 3, 0),
+            reason: None,
+        };
+        updater.update(cx, |updater, cx| updater.set_automatic(true, cx));
+        cx.executor().advance_clock(FIRST_CHECK);
+        cx.run_until_parked();
+        assert_eq!(state(&updater, cx), offered);
+        *answer.lock().unwrap() = "<html>Not Found</html>".into();
+        cx.executor().advance_clock(CHECK_EVERY);
+        cx.run_until_parked();
+        assert_eq!(
+            state(&updater, cx),
+            offered,
+            "a background failure says nothing"
+        );
+        updater.update(cx, |updater, cx| updater.check(cx));
+        cx.run_until_parked();
+        assert!(matches!(state(&updater, cx), UpdateState::Failed { .. }));
+        cx.executor().advance_clock(SAID_FOR);
+        cx.run_until_parked();
+        assert_eq!(
+            state(&updater, cx),
+            offered,
+            "and once said, the offer is back"
+        );
     }
 
     #[gpui::test]

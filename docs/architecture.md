@@ -17,7 +17,7 @@ other: what two features share moves down a layer.
 | 2 | `gq_language` | Schema and query intelligence on `omnigraph-compiler`: parse, diagnostics, completion items, hover text, result-column types. **No `gpui`** | `omnigraph-compiler` |
 | 2 | `studio_ui` | Studio components on Zed's `ui`: the design system (`ds`: buttons, modals, the context menu forked from Zed's), state chips, write-outcome banners, empty and error states, text read as markdown | `ui`, `menu`, `theme`, `studio_theme`, `pulldown-cmark` |
 | 3 | `graph_store` | GPUI entities: connections, graph sessions, schema model, snapshot pins, exploration, drafts | `gpui`, `graph_client`, `gq_language`, Zed's `reqwest_client` and the `reqwest` it pins |
-| 3 | `studio_update` | The updater (spec 017): checks Studio's own releases, downloads, verifies and installs an update. The only requests not to an Omnigraph server | `gpui`, `studio_settings`, `cargo-packager-updater` |
+| 3 | `studio_update` | The updater (spec 017): checks Studio's own releases, downloads, verifies and installs an update. The only requests not to an Omnigraph server | `gpui`, `studio_settings`, `http_client`, `minisign-verify` |
 | 4 | `studio_workspace` | The window frame: panes, tabs, docks, panels, status bar, modal and toast layers | `gpui`, `ui`, `studio_ui`, `studio_actions`, `studio_settings` |
 | 4 | `change_cards` | The entity cards a review and a commit's view share: an entity's card, its relationship lines, a run's header, how many lines a card shows | `gpui`, `ui`, `studio_ui`, `graph_store`, `gq_language` |
 | 5 | `command_palette`, `type_table`, `relationship_tree`, `graph_canvas`, `query_editor`, `review`, `history`, `inspectors`, `agent_panel` | One surface each | layers 0–4 |

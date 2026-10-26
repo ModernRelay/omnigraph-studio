@@ -1,6 +1,6 @@
 //! Installing a downloaded update on macOS: where Studio may replace itself, the version inside
-//! an update, and what an interrupted install leaves behind (spec 017, "Downloading and
-//! installing on macOS").
+//! an update, the exchange of the running bundle with the update's, and what an interrupted
+//! install leaves behind (spec 017, "Downloading and installing on macOS").
 
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
@@ -11,7 +11,7 @@ use anyhow::{Context as _, Result, bail};
 /// Why Studio cannot replace its own bundle where it runs; it offers the download instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Blocked {
-    /// On a disk image or another volume (`/Volumes/…`): the swap's renames cannot cross to it.
+    /// On a disk image or another volume (`/Volumes/…`), often read-only.
     DiskImage,
     /// Run in place from Downloads: macOS moved it to a random read-only path.
     Translocated,
@@ -19,8 +19,8 @@ pub enum Blocked {
     NotWritable(PathBuf),
 }
 
-/// Whether Studio must not install over `bundle`. Where it may, the crate's install renames
-/// the bundle and never needs the administrator prompt it would otherwise run.
+/// Whether Studio must not install over `bundle`: checked before the download, so a bundle
+/// Studio cannot replace is offered as a download instead of being fetched in vain.
 pub fn blocked(bundle: &Path) -> Option<Blocked> {
     if bundle.starts_with("/Volumes") {
         return Some(Blocked::DiskImage);
@@ -90,26 +90,91 @@ fn plist_string(plist: &str, key: &str) -> Option<String> {
     Some(value.trim().to_owned()).filter(|value| !value.is_empty())
 }
 
-/// The temporary directories `cargo-packager-updater` installs through, left behind only when
-/// Studio stopped during an install.
-const LEFTOVER_PREFIXES: [&str; 2] = ["packager_current_app", "packager_updated_app"];
+/// The start of the name of the folder an update is unpacked in, beside the bundle it replaces.
+/// Hidden, and Studio's own, so cleaning up never touches another app's files.
+const STAGING_PREFIX: &str = ".omnigraph-studio-update-";
+
+/// Replaces `bundle` with the bundle in `archive`: unpacked into a folder beside it, then
+/// exchanged with it in one rename, so `bundle` holds the old app or the new one whatever
+/// happens; the old one is then deleted with that folder. Nothing outside the folder is
+/// written while unpacking, and a failure before the exchange leaves `bundle` as it was.
+pub fn replace_bundle(bundle: &Path, archive: &[u8]) -> Result<()> {
+    let folder = bundle
+        .parent()
+        .filter(|folder| !folder.as_os_str().is_empty())
+        .context("the bundle has no folder")?;
+    let staging = tempfile::Builder::new()
+        .prefix(STAGING_PREFIX)
+        .tempdir_in(folder)
+        .with_context(|| format!("Studio can't write in {}", folder.display()))?;
+    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(archive));
+    tar.unpack(staging.path())
+        .context("the update could not be unpacked")?;
+    let update = only_bundle(staging.path())?;
+    exchange(&update, bundle)
+        .with_context(|| format!("Studio can't replace itself in {}", folder.display()))?;
+    // A new modification time tells Finder and Launch Services the bundle changed.
+    if let Err(error) = std::fs::File::open(bundle)
+        .and_then(|bundle| bundle.set_modified(std::time::SystemTime::now()))
+    {
+        log::warn!("the updated bundle's time was not set: {error}");
+    }
+    // `update` now holds the old app; deleting the folder deletes it. If that fails, the next
+    // launch removes what is left ([`clean_leftovers`]).
+    if let Err(error) = staging.close() {
+        log::warn!("the old bundle was not deleted: {error}");
+    }
+    Ok(())
+}
+
+/// The one app bundle an update unpacks to: a real directory named `*.app`, never a link.
+fn only_bundle(staging: &Path) -> Result<PathBuf> {
+    let entries = std::fs::read_dir(staging)?.collect::<std::io::Result<Vec<_>>>()?;
+    match entries.as_slice() {
+        [entry]
+            if entry.file_type()?.is_dir()
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "app") =>
+        {
+            Ok(entry.path())
+        }
+        _ => bail!("the update does not hold exactly one app bundle"),
+    }
+}
+
+/// Swaps two paths in one rename (`renamex_np` with `RENAME_SWAP` on macOS, `renameat2` with
+/// `RENAME_EXCHANGE` on Linux): both exist before and after, each under the other's name.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn exchange(a: &Path, b: &Path) -> std::io::Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    renameat_with(CWD, a, CWD, b, RenameFlags::EXCHANGE).map_err(std::io::Error::from)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn exchange(_: &Path, _: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "Studio replaces itself only on macOS",
+    ))
+}
 
 /// How long a leftover is kept: an install under way is never that old.
 const LEFTOVER_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Removes the updater's directories in `temp` older than a day, and says how many.
-pub fn clean_leftovers(temp: &Path, now: SystemTime) -> usize {
-    let Ok(entries) = std::fs::read_dir(temp) else {
+/// Removes the update folders in `folder` (the bundle's) older than a day, left only when
+/// Studio stopped during an install or could not delete the old bundle, and says how many.
+pub fn clean_leftovers(folder: &Path, now: SystemTime) -> usize {
+    let Ok(entries) = std::fs::read_dir(folder) else {
         return 0;
     };
     entries
         .flatten()
         .filter(|entry| {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            LEFTOVER_PREFIXES
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(STAGING_PREFIX)
         })
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .filter(|entry| {
@@ -239,22 +304,136 @@ mod tests {
 
     #[test]
     fn leftovers_older_than_a_day_are_removed() {
-        let temp = tempfile::tempdir().unwrap();
+        let folder = tempfile::tempdir().unwrap();
         for name in [
-            "packager_current_appA1b2C3",
-            "packager_updated_appD4e5F6",
-            "something_else",
+            ".omnigraph-studio-update-A1b2C3",
+            ".omnigraph-studio-update-D4e5F6",
+            "packager_current_appG7h8I9",
+            "Omnigraph Studio.app",
         ] {
-            std::fs::create_dir(temp.path().join(name)).unwrap();
+            std::fs::create_dir(folder.path().join(name)).unwrap();
         }
         let now = SystemTime::now();
-        assert_eq!(clean_leftovers(temp.path(), now), 0, "a day has not passed");
+        assert_eq!(
+            clean_leftovers(folder.path(), now),
+            0,
+            "a day has not passed"
+        );
         let tomorrow = now + Duration::from_secs(25 * 60 * 60);
-        assert_eq!(clean_leftovers(temp.path(), tomorrow), 2);
-        let left: Vec<String> = std::fs::read_dir(temp.path())
+        assert_eq!(clean_leftovers(folder.path(), tomorrow), 2);
+        let mut left: Vec<String> = std::fs::read_dir(folder.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(left, ["something_else"]);
+        left.sort();
+        assert_eq!(
+            left,
+            ["Omnigraph Studio.app", "packager_current_appG7h8I9"],
+            "another app's folders and the bundle stay"
+        );
+    }
+
+    /// A folder holding a bundle whose executable says `build`, and that bundle.
+    fn installed(build: &str) -> (tempfile::TempDir, PathBuf) {
+        let folder = tempfile::tempdir().unwrap();
+        let bundle = folder.path().join("Omnigraph Studio.app");
+        std::fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
+        std::fs::write(bundle.join("Contents/MacOS/omnigraph-studio"), build).unwrap();
+        std::fs::write(bundle.join("Contents/Old.txt"), "only in the old build").unwrap();
+        (folder, bundle)
+    }
+
+    fn folder_names(folder: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(folder)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn an_update_takes_the_bundles_place_and_the_old_one_is_deleted() {
+        let (folder, bundle) = installed("the old build");
+        let update = archive(&[
+            (
+                "Omnigraph Studio.app/Contents/MacOS/omnigraph-studio",
+                "the new build",
+            ),
+            ("Omnigraph Studio.app/Contents/Info.plist", &plist("0.3.0")),
+        ]);
+        replace_bundle(&bundle, &update).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(bundle.join("Contents/MacOS/omnigraph-studio")).unwrap(),
+            "the new build"
+        );
+        assert!(!bundle.join("Contents/Old.txt").exists());
+        assert_eq!(folder_names(folder.path()), ["Omnigraph Studio.app"]);
+    }
+
+    #[test]
+    fn an_update_that_does_not_unpack_leaves_the_bundle_as_it_was() {
+        let (folder, bundle) = installed("the old build");
+        assert!(replace_bundle(&bundle, b"not gzip").is_err());
+        assert_eq!(
+            std::fs::read_to_string(bundle.join("Contents/MacOS/omnigraph-studio")).unwrap(),
+            "the old build"
+        );
+        assert_eq!(folder_names(folder.path()), ["Omnigraph Studio.app"]);
+    }
+
+    #[test]
+    fn an_update_without_exactly_one_bundle_is_not_installed() {
+        let (folder, bundle) = installed("the old build");
+        for update in [
+            archive(&[
+                ("Omnigraph Studio.app/Contents/Info.plist", &plist("0.3.0")),
+                ("Other.app/Contents/Info.plist", &plist("0.3.0")),
+            ]),
+            archive(&[("Omnigraph Studio/Contents/Info.plist", &plist("0.3.0"))]),
+        ] {
+            assert!(replace_bundle(&bundle, &update).is_err());
+        }
+        assert_eq!(
+            std::fs::read_to_string(bundle.join("Contents/MacOS/omnigraph-studio")).unwrap(),
+            "the old build"
+        );
+        assert_eq!(folder_names(folder.path()), ["Omnigraph Studio.app"]);
+    }
+
+    /// An entry naming `..` is never written, so an update cannot place a file beside the
+    /// bundle, whatever it holds.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn an_entry_outside_the_update_is_not_written() {
+        let (folder, bundle) = installed("the old build");
+        let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        let content = "the new build";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(
+            &mut header,
+            "Omnigraph Studio.app/Contents/MacOS/omnigraph-studio",
+            content.as_bytes(),
+        )
+        .unwrap();
+        // `append_data` refuses `..`; a raw header is what a hostile archive carries.
+        let escape = "../escaped.txt";
+        let mut header = tar::Header::new_gnu();
+        header.as_gnu_mut().unwrap().name[..escape.len()].copy_from_slice(escape.as_bytes());
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append(&header, content.as_bytes()).unwrap();
+        let mut gz = tar.into_inner().unwrap();
+        gz.flush().unwrap();
+        replace_bundle(&bundle, &gz.finish().unwrap()).unwrap();
+        assert_eq!(folder_names(folder.path()), ["Omnigraph Studio.app"]);
     }
 }

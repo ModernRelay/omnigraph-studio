@@ -466,9 +466,19 @@ fn find_data_dir() -> PathBuf {
 }
 
 /// Whether `exe` is an installed Studio rather than a build or a test: only a release build
-/// checks for updates (spec 017).
+/// checks for updates (spec 017). A bundle `script/bundle-mac` wrote into `target/bundle/` is
+/// not one: a release must never replace a build, though that bundle keeps the installed data
+/// directory ([`is_build_output`]).
 pub fn is_release_build(exe: &std::path::Path) -> bool {
-    !is_build_output(exe) && !is_test_binary(exe)
+    !is_build_output(exe) && !is_test_binary(exe) && !under_build_dir(exe)
+}
+
+/// Whether a folder above `exe` is a Cargo build directory: named `target`, or holding the
+/// `CACHEDIR.TAG` Cargo writes into every one.
+fn under_build_dir(exe: &std::path::Path) -> bool {
+    exe.ancestors().skip(1).any(|dir| {
+        dir.file_name().is_some_and(|name| name == "target") || dir.join("CACHEDIR.TAG").is_file()
+    })
 }
 
 /// Whether an executable is Cargo's build output rather than an installed app: it sits in a
@@ -1097,6 +1107,20 @@ mod tests {
         assert!(!release(
             "/w/omnigraph-studio/target/debug/deps/studio_update-f7f2cad5771331a9"
         ));
+        assert!(
+            !release(
+                "/w/omnigraph-studio/target/bundle/Omnigraph Studio.app/Contents/MacOS/omnigraph-studio"
+            ),
+            "a bundle built here is never replaced by a release"
+        );
+        let elsewhere =
+            std::env::temp_dir().join(format!("studio-build-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("CACHEDIR.TAG"), "Signature").unwrap();
+        let bundle = elsewhere.join("bundle/Omnigraph Studio.app/Contents/MacOS/omnigraph-studio");
+        let release_there = is_release_build(&bundle);
+        std::fs::remove_dir_all(&elsewhere).ok();
+        assert!(!release_there, "a build directory of any name");
     }
 
     #[test]

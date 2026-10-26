@@ -1,9 +1,13 @@
-//! The update manifest Studio's releases publish, `latest.json`: Tauri's format, read with
-//! `cargo-packager-updater`'s own type (spec 017, "What the releases serve").
+//! The update manifest Studio's releases publish, `latest.json`, in Tauri's format (spec 017,
+//! "What the releases serve"). Only this platform's entry is decoded, so an entry a later
+//! release adds for another platform, in a format this Studio does not know, never stops it
+//! learning of a newer version.
+
+use std::collections::HashMap;
 
 use anyhow::{Context as _, Result, bail};
-use cargo_packager_updater::{RemoteRelease, RemoteReleaseData, UpdateFormat};
 use semver::Version;
+use serde::Deserialize;
 
 const RELEASES: &str = "https://github.com/ModernRelay/omnigraph-studio/releases";
 
@@ -14,11 +18,14 @@ pub const FEED: &str =
 /// The most of a manifest Studio reads; today's is under 1 KiB.
 pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 
+/// The platform Studio installs updates on in place, and the only one the manifest's
+/// `app` entry is read for.
+const MAC: &str = "macos-aarch64";
+
 /// The newest release, as this platform sees it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Release {
     pub version: Version,
-    pub notes: Option<String>,
     /// The file this platform installs, when Studio installs updates here.
     pub update: Option<PlatformUpdate>,
 }
@@ -27,41 +34,66 @@ pub struct Release {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlatformUpdate {
     pub url: String,
-    /// The content of the file's minisign `.sig`.
+    /// Base64 of the file's minisign `.sig`.
     pub signature: String,
 }
 
+#[derive(Deserialize)]
+struct Manifest {
+    version: String,
+    #[serde(default)]
+    platforms: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct Entry {
+    url: String,
+    signature: String,
+    format: String,
+}
+
 /// Reads a manifest for `platform` (`macos-aarch64`, `linux-x86_64`, …). Only a macOS bundle
-/// (`format: app`) is installed in place today; other platforms learn the version alone.
+/// (`format: app`) is installed in place today; other platforms learn the version alone. The
+/// macOS file must be the one the release workflow uploads for that version, under the
+/// release's own address: a manifest naming any other file is refused.
 pub fn parse(bytes: &[u8], platform: &str) -> Result<Release> {
-    let release: RemoteRelease =
+    let manifest: Manifest =
         serde_json::from_slice(bytes).context("the answer is not an update manifest")?;
-    let entry = match &release.data {
-        RemoteReleaseData::Static { platforms } => platforms.get(platform),
-        RemoteReleaseData::Dynamic(entry) => Some(entry),
-    };
-    let update = match entry {
-        Some(entry) if matches!(entry.format, UpdateFormat::App) => {
-            if entry.url.scheme() != "https" {
-                bail!("the update for {platform} is not served over HTTPS");
+    let version = Version::parse(&manifest.version).with_context(|| {
+        format!(
+            "the manifest's version {:?} is not semver",
+            manifest.version
+        )
+    })?;
+    let update = match manifest.platforms.get(platform) {
+        Some(entry) if platform == MAC => {
+            let entry: Entry = serde_json::from_value(entry.clone())
+                .with_context(|| format!("the manifest's {platform} entry"))?;
+            if entry.format != "app" {
+                None
+            } else if entry.url != update_url(&version) {
+                bail!("the update for {platform} is not this release's file");
+            } else {
+                Some(PlatformUpdate {
+                    url: entry.url,
+                    signature: entry.signature,
+                })
             }
-            Some(PlatformUpdate {
-                url: entry.url.to_string(),
-                signature: entry.signature.clone(),
-            })
         }
         _ => None,
     };
-    Ok(Release {
-        version: release.version,
-        notes: release.notes,
-        update,
-    })
+    Ok(Release { version, update })
 }
 
-/// Whether `release` is newer than the running version, by semver precedence.
+/// The macOS update file the release workflow uploads for `version`.
+pub fn update_url(version: &Version) -> String {
+    format!("{RELEASES}/download/v{version}/Omnigraph-Studio-{version}-arm64.app.tar.gz")
+}
+
+/// Whether `release` is newer than the running version, by semver precedence: build metadata
+/// counts for nothing.
 pub fn is_newer(release: &Version, running: &Version) -> bool {
-    release > running
+    release.cmp_precedence(running).is_gt()
 }
 
 /// The version-free download for a platform, which always serves the newest release; the
@@ -88,7 +120,6 @@ mod tests {
 
     const MANIFEST: &str = r#"{
       "version": "0.3.0",
-      "notes": "Faster tables.",
       "pub_date": "2026-11-02T10:00:00Z",
       "platforms": {
         "macos-aarch64": {
@@ -139,11 +170,39 @@ mod tests {
         assert!(release.update.is_none());
     }
 
+    /// Only the file the release workflow uploads for that version is installed: not one
+    /// served in the clear, from another host, or of another version.
     #[test]
-    fn an_update_not_served_over_https_is_refused() {
-        let plain = MANIFEST.replace("https://github.com", "http://github.com");
-        let error = parse(plain.as_bytes(), "macos-aarch64").unwrap_err();
-        assert!(error.to_string().contains("HTTPS"), "{error}");
+    fn an_update_from_anywhere_but_its_release_is_refused() {
+        for elsewhere in [
+            MANIFEST.replace("https://github.com", "http://github.com"),
+            MANIFEST.replace("https://github.com", "https://example.com"),
+            MANIFEST.replace("download/v0.3.0", "download/v0.2.9"),
+            MANIFEST.replace(".app.tar.gz", ".app.tar.gz?x=1"),
+        ] {
+            let error = parse(elsewhere.as_bytes(), "macos-aarch64").unwrap_err();
+            assert!(
+                error.to_string().contains("not this release's file"),
+                "{error}"
+            );
+        }
+    }
+
+    /// An entry a later release adds for another platform, in a shape this Studio does not
+    /// know, leaves the check working.
+    #[test]
+    fn another_platforms_entry_of_any_shape_is_not_read() {
+        let later = MANIFEST.replace(
+            r#""platforms": {"#,
+            r#""platforms": {
+              "linux-x86_64": {"format": "deb", "url": "not a url"},
+              "windows-x86_64": "an installer, one day","#,
+        );
+        let release = parse(later.as_bytes(), "macos-aarch64").unwrap();
+        assert!(release.update.is_some());
+        let linux = parse(later.as_bytes(), "linux-x86_64").unwrap();
+        assert_eq!(linux.version, Version::new(0, 3, 0));
+        assert!(linux.update.is_none());
     }
 
     #[test]
@@ -174,6 +233,10 @@ mod tests {
             &Version::parse("0.2.2-beta.1").unwrap(),
             &Version::new(0, 2, 2)
         ));
+        assert!(
+            !is_newer(&Version::parse("0.2.1+rebuilt").unwrap(), &running),
+            "build metadata is not a newer version"
+        );
     }
 
     #[test]

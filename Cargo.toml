@@ -102,10 +102,9 @@ rustix = { version = "1.1", features = ["fs"] }
 # The Agent Client Protocol at the version Zed v1.23.2 pins; stable v1 only (spec 011).
 agent-client-protocol = "=2.2.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-# Studio's updater (spec 017): Tauri's update manifest and minisign check, made for any Rust
-# app. Exact: Studio relies on how 0.2.3 installs (specs/017-auto-update/plan.md).
-cargo-packager-updater = "=0.2.3"
-# Reading the bundle's version out of a downloaded update before it is installed.
+# Studio's updater (spec 017): an update's minisign signature, checked against the update key.
+minisign-verify = "0.2"
+# Unpacking a downloaded update and reading its bundle's version before it is installed.
 # The update key and signature are base64 of minisign's files, as Tauri writes them (spec 017).
 base64 = "0.22"
 flate2 = "1"
