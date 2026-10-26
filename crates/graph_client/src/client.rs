@@ -27,6 +27,14 @@ use crate::{
 };
 
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a read of changes waits for its answer: a page of a branch's change feed, of a diff,
+/// of one commit's changes, and a merge's dry run. The server works such a page out whole before
+/// it answers and sets no deadline of its own, and the work grows with the tables the changes
+/// touch, not with the page (spec 012, E35 to E38): on the hosted personal graph (Omnigraph
+/// `0.14.1-edge`, 2026-10-25) one page of a branch's review took 37 to 60 s, so a 60 s read
+/// failed about as often as it answered. As long as a write, which the server also works out
+/// whole. A read is still sent once, unless refused with 429.
+const CHANGE_READ_TIMEOUT: Duration = Duration::from_secs(300);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(300);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 /// How many times a read refused with 429 is tried again (spec 003). Writes never are.
@@ -755,14 +763,15 @@ impl GraphClient {
         })
     }
 
-    /// Sends a read once one of the connection's read slots is free; one refused with 429
-    /// waits as asked, without its slot, and goes again.
+    /// Sends a read once one of the connection's read slots is free, waiting up to `timeout`
+    /// for its answer; one refused with 429 waits as asked, without its slot, and goes again.
     async fn fetch(
         &self,
         method: Method,
         url: Url,
         body: Option<Vec<u8>>,
         headers: &[(&str, &str)],
+        timeout: Duration,
     ) -> Result<RawResponse, ReadError> {
         self.fetch_reading(
             method,
@@ -770,6 +779,7 @@ impl GraphClient {
             body,
             headers,
             BodyLimit::First(READ_ANSWER_MAX),
+            timeout,
         )
         .await
     }
@@ -782,6 +792,7 @@ impl GraphClient {
         body: Option<Vec<u8>>,
         headers: &[(&str, &str)],
         limit: BodyLimit,
+        timeout: Duration,
     ) -> Result<RawResponse, ReadError> {
         let mut retries = 0;
         loop {
@@ -792,7 +803,7 @@ impl GraphClient {
                     url.clone(),
                     body.clone(),
                     headers,
-                    READ_TIMEOUT,
+                    timeout,
                     limit,
                 )
                 .await
@@ -823,6 +834,23 @@ impl GraphClient {
             .await
     }
 
+    /// [`Self::read`] of changes: a `GET` that waits up to [`CHANGE_READ_TIMEOUT`].
+    async fn read_changes<T: DeserializeOwned>(
+        &self,
+        segments: &[&str],
+        query: &[(&str, &str)],
+    ) -> Result<T, ReadError> {
+        self.read_within(
+            Method::GET,
+            segments,
+            query,
+            None,
+            READ_ANSWER_MAX,
+            CHANGE_READ_TIMEOUT,
+        )
+        .await
+    }
+
     /// [`Self::read`] of an answer of at most `cap` bytes. One byte past `cap` is read, to know
     /// the answer goes on, and none after it: a longer answer is [`ReadError::TooLarge`], never
     /// a part of one decoded as if it were whole.
@@ -834,9 +862,25 @@ impl GraphClient {
         body: Option<Vec<u8>>,
         cap: usize,
     ) -> Result<T, ReadError> {
+        self.read_within(method, segments, query, body, cap, READ_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::read_capped`], waiting up to `timeout` for the answer.
+    async fn read_within<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        segments: &[&str],
+        query: &[(&str, &str)],
+        body: Option<Vec<u8>>,
+        cap: usize,
+        timeout: Duration,
+    ) -> Result<T, ReadError> {
         let url = self.url(segments, query);
         let limit = BodyLimit::First(cap.saturating_add(1));
-        let raw = self.fetch_reading(method, url, body, &[], limit).await?;
+        let raw = self
+            .fetch_reading(method, url, body, &[], limit, timeout)
+            .await?;
         if !raw.status.is_success() {
             return Err(refusal(&raw));
         }
@@ -876,7 +920,9 @@ impl GraphClient {
         at: BlobAt<'_>,
     ) -> Result<BlobMeta, ReadError> {
         let url = self.blob_url(graph, cell, at);
-        let raw = self.fetch(Method::HEAD, url, None, &[]).await?;
+        let raw = self
+            .fetch(Method::HEAD, url, None, &[], READ_TIMEOUT)
+            .await?;
         let header = |name: &str| {
             raw.headers
                 .get(name)
@@ -937,6 +983,7 @@ impl GraphClient {
                     start: range.start,
                     len,
                 },
+                READ_TIMEOUT,
             )
             .await?;
         match raw.status.as_u16() {
@@ -1311,13 +1358,8 @@ impl GraphClient {
         if let Some(token) = page_token {
             query.push(("page_token", token));
         }
-        self.read(
-            Method::GET,
-            &["graphs", graph, "commits", commit_id, "changes"],
-            &query,
-            None,
-        )
-        .await
+        self.read_changes(&["graphs", graph, "commits", commit_id, "changes"], &query)
+            .await
     }
 
     /// `GET /graphs/{id}/diff`: one page of the net changes from commit `from` to commit
@@ -1335,8 +1377,7 @@ impl GraphClient {
         if let Some(token) = page_token {
             query.push(("page_token", token));
         }
-        self.read(Method::GET, &["graphs", graph, "diff"], &query, None)
-            .await
+        self.read_changes(&["graphs", graph, "diff"], &query).await
     }
 
     /// `GET /graphs/{id}/branches/merge-base`: what a merge of `source` into `target` would
@@ -1373,7 +1414,13 @@ impl GraphClient {
             dry_run: true,
         };
         let raw = self
-            .fetch(Method::POST, url, Some(json(&request)), &[])
+            .fetch(
+                Method::POST,
+                url,
+                Some(json(&request)),
+                &[],
+                CHANGE_READ_TIMEOUT,
+            )
             .await?;
         check_contract(&raw)?;
         if raw.status.is_success() {
@@ -1407,7 +1454,7 @@ impl GraphClient {
             FeedAt::Page(token) => ("page_token", token),
         });
         query.extend(types.iter().map(|name| ("type", name.as_str())));
-        self.read(Method::GET, &["graphs", graph, "changes"], &query, None)
+        self.read_changes(&["graphs", graph, "changes"], &query)
             .await
     }
 
@@ -2082,6 +2129,86 @@ mod tests {
                 "{} {path} is not a route of the contract",
                 method.to_uppercase()
             );
+        }
+    }
+
+    /// A read of changes, which the server works out whole whatever the page, waits as long as a
+    /// write; every other read waits a minute, as before.
+    #[test]
+    fn a_read_of_changes_waits_longer_than_other_reads() {
+        /// Each request's method and path, and the timeout it was sent with.
+        type Sent = Vec<(String, Option<Duration>)>;
+        let sent: Arc<std::sync::Mutex<Sent>> = Arc::default();
+        let log = sent.clone();
+        let http = FakeHttpClient::create(move |request| {
+            log.lock().unwrap().push((
+                format!("{} {}", request.method(), request.uri().path()),
+                request
+                    .extensions()
+                    .get::<http_client::RequestTimeout>()
+                    .map(|timeout| timeout.0),
+            ));
+            async move {
+                Ok(Response::builder()
+                    .status(200)
+                    .header(CONTRACT_HEADER, CONTRACT)
+                    .body(AsyncBody::from("{}"))
+                    .unwrap())
+            }
+        });
+        let at = client(http);
+        let graph = "knowledge";
+        let cell = BlobCell {
+            edge: false,
+            type_name: "Person".into(),
+            id: "p1".into(),
+            property: "photo".into(),
+        };
+        let query = QueryRequest {
+            query: "query q() {}".into(),
+            name: None,
+            params: None,
+            branch: Some("main".into()),
+            snapshot: None,
+        };
+        let taken = || std::mem::take(&mut *sent.lock().unwrap());
+        block_on(async {
+            at.changes(graph, "main", FeedAt::Start("now"), &[], 10)
+                .await
+                .ok();
+            at.diff(graph, "c1", "c2", None, 10).await.ok();
+            at.commit_changes(graph, "c1", None, 10).await.ok();
+            at.merge_preview(graph, "feature", "main").await.ok();
+        });
+        let changes = taken();
+        block_on(async {
+            at.graphs().await.ok();
+            at.schema(graph).await.ok();
+            at.snapshot(graph, "main").await.ok();
+            at.query(graph, &query).await.ok();
+            at.stored_queries(graph).await.ok();
+            at.access(graph, Some("main"), None).await.ok();
+            at.branches(graph).await.ok();
+            at.commit_page(graph, "main", 1, None).await.ok();
+            at.commit(graph, "c1").await.ok();
+            at.merge_base(graph, "feature", "main").await.ok();
+            at.blob_head(graph, &cell, BlobAt::Branch("main"))
+                .await
+                .ok();
+            at.blob_bytes(graph, &cell, BlobAt::Snapshot("c1"), 0..10)
+                .await
+                .ok();
+        });
+        let others = taken();
+        assert!(CHANGE_READ_TIMEOUT > READ_TIMEOUT);
+        assert_eq!(CHANGE_READ_TIMEOUT, WRITE_TIMEOUT);
+        assert_eq!(changes.len(), 4, "{changes:?}");
+        for (route, timeout) in &changes {
+            assert_eq!(*timeout, Some(CHANGE_READ_TIMEOUT), "{route}");
+        }
+        assert_eq!(others.len(), 12, "{others:?}");
+        for (route, timeout) in &others {
+            assert_eq!(*timeout, Some(READ_TIMEOUT), "{route}");
         }
     }
 
