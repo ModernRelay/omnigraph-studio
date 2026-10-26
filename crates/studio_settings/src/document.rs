@@ -138,17 +138,17 @@ fn parse(text: &str) -> Result<Value, String> {
 
 /// What to set aside for a value that does not fit at `failed`. A list element with a part that
 /// does not fit (one saved view) is set aside alone, and so is one that is itself wrong in a
-/// list of objects (a view that is `null`): the others apply, and a later save keeps them. A
-/// list of plain values whose element is wrong (a number in the agent's command) is set aside
-/// whole, so no setting runs with part of its list missing. `None` when the failure is the
-/// document itself.
+/// list whose every other element is an object (a view that is `null`): the others apply, and a
+/// later save keeps them. Any other list whose element is wrong (a number, or an object, in the
+/// agent's command) is set aside whole, so no setting runs with part of its list missing.
+/// `None` when the failure is the document itself.
 fn drop_target(document: &Value, failed: &[Step]) -> Option<Vec<Step>> {
     match failed
         .iter()
         .position(|step| matches!(step, Step::Index(_)))
     {
         Some(index) if index + 1 < failed.len() => Some(failed[..=index].to_vec()),
-        Some(index) if index > 0 && holds_objects(document, &failed[..index]) => {
+        Some(index) if index > 0 && records_but(document, &failed[..index], &failed[index]) => {
             Some(failed[..=index].to_vec())
         }
         Some(index) => (index > 0).then(|| failed[..index].to_vec()),
@@ -187,15 +187,23 @@ fn out_of_range(document: &Value) -> Option<(Vec<Step>, String)> {
     None
 }
 
-/// Whether the list at `path` holds an object: its elements are records, each its own value.
-fn holds_objects(document: &Value, path: &[Step]) -> bool {
+/// Whether every element of the list at `path` but the one at `wrong` is an object: the list
+/// holds records, each its own value. One object among plain values does not make it so.
+fn records_but(document: &Value, path: &[Step], wrong: &Step) -> bool {
+    let Step::Index(wrong) = *wrong else {
+        return false;
+    };
     path.iter()
         .try_fold(document, |value, step| match step {
             Step::Key(key) => value.get(key.as_str()),
             Step::Index(index) => value.get(*index),
         })
         .and_then(Value::as_array)
-        .is_some_and(|list| list.iter().any(Value::is_object))
+        .is_some_and(|list| {
+            list.iter()
+                .enumerate()
+                .all(|(index, element)| index == wrong || element.is_object())
+        })
 }
 
 /// A deserializer's message in the words of a settings file: a number, a whole number, a list,
@@ -767,6 +775,12 @@ mod tests {
         assert!(
             settings.agent.command.is_empty(),
             "no command runs with part of its list"
+        );
+        let stray = read(r#"{"agent": {"command": ["claude", {"x": 1}, "--flag"]}}"#).unwrap();
+        assert!(
+            stray.settings.agent.command.is_empty(),
+            "an object among plain values sets the list aside whole: {:?}",
+            stray.settings.agent.command
         );
         let graph = &settings.graphs["dev/knowledge"];
         assert_eq!(
