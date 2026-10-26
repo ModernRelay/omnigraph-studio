@@ -5403,7 +5403,10 @@ pub(crate) mod tests {
         let again = session
             .read_with(cx, |session, _| session.schema_model())
             .unwrap();
-        assert!(!Arc::ptr_eq(&again, &loaded));
+        assert!(
+            Arc::ptr_eq(&again, &loaded),
+            "the schema held, not compiled again"
+        );
         view.read_with(cx, |view, _| {
             assert!(same_schema(grouped_with(view).as_ref(), Some(&again)));
             assert!(

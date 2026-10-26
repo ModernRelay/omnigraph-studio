@@ -1202,7 +1202,10 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, cx| {
             let current = view.session.read(cx).schema_model().unwrap();
-            assert!(!Arc::ptr_eq(&current, &grouped), "read again");
+            assert!(
+                Arc::ptr_eq(&current, &grouped),
+                "the schema held, not compiled again"
+            );
             assert!(
                 view.schema
                     .as_ref()

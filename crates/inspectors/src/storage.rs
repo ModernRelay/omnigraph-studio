@@ -185,8 +185,8 @@ impl StorageInspector {
     }
 
     /// The session moved to another branch, and reads that branch's snapshot for its counts:
-    /// the inspector shows that one once it is in. A session that reads none, or whose read
-    /// fails, leaves the inspector to read its own.
+    /// the inspector shows that read once it is in, or why it failed. A session that reads
+    /// none leaves the inspector to read its own.
     fn branch_changed(&mut self, cx: &mut Context<Self>) {
         self.branch = self.session.read(cx).branch.clone();
         self.snapshot = Loadable::Loading;
@@ -198,16 +198,28 @@ impl StorageInspector {
     }
 
     /// The session's snapshot of the inspector's branch, while one is awaited after a branch
-    /// change: taken when it is in, or read here when the session's read failed or never began.
+    /// change: taken when it is in, and its failure shown when it failed (the same request sent
+    /// again would fail alike; Refresh asks). Read here when the session read none.
     fn take_session_snapshot(&mut self, cx: &mut Context<Self>) {
         let session = self.session.read(cx);
         if let Some(snapshot) = session.snapshot_of(&self.branch) {
             self.awaiting_counts = false;
             self.snapshot = Loadable::Loaded(tables_in_order((*snapshot).clone()));
             cx.notify();
-        } else if matches!(session.snapshot, Loadable::Failed(_) | Loadable::NotLoaded) {
-            self.awaiting_counts = false;
-            self.reload_snapshot(cx);
+            return;
+        }
+        match &session.snapshot {
+            Loadable::Failed(error) => {
+                let error = error.clone();
+                self.awaiting_counts = false;
+                self.snapshot = Loadable::Failed(error);
+                cx.notify();
+            }
+            Loadable::NotLoaded => {
+                self.awaiting_counts = false;
+                self.reload_snapshot(cx);
+            }
+            Loadable::Loading | Loadable::Loaded(_) => {}
         }
     }
 
@@ -796,7 +808,10 @@ mod tests {
         );
         inspector.read_with(cx, |inspector, _| {
             assert_eq!(inspector.branch, "feature");
-            assert!(matches!(inspector.snapshot, Loadable::Loaded(_)));
+            assert!(
+                !matches!(inspector.snapshot, Loadable::Loading),
+                "the session's read, shown"
+            );
         });
         assert_eq!(
             served.lock().unwrap().snapshot_reads,
