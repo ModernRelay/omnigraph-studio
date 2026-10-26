@@ -30,6 +30,9 @@ const OPERATOR_POLL: Duration = Duration::from_secs(2);
 type TransportHttp =
     Arc<dyn Fn(&CliTransport) -> anyhow::Result<Arc<dyn HttpClient>> + Send + Sync>;
 
+/// The clients made for a listing's transports ([`prepare_transports`]), or why one could not be.
+type Prepared = Vec<(CliTransport, Result<Arc<dyn HttpClient>, String>)>;
+
 /// Makes the token source of a CLI server whose token the CLI gives; none for an anonymous one.
 type TokenSources = Arc<dyn Fn(&CliServer) -> Option<Arc<dyn TokenSource>> + Send + Sync>;
 
@@ -192,6 +195,31 @@ fn transport_client(transport: &CliTransport) -> anyhow::Result<Arc<dyn HttpClie
     )))
 }
 
+/// The clients the transports of `targets` need that `held` does not hold already, made off the
+/// main thread: one that trusts the system's roots too reads them from the system's store,
+/// which can take a while. A failure is kept as its message, said when the target is applied.
+fn prepare_transports(
+    targets: &CliTargets,
+    held: &[CliTransport],
+    make: &TransportHttp,
+) -> Prepared {
+    let mut prepared: Prepared = Vec::new();
+    for server in targets.servers.iter().flatten() {
+        let transport = &server.transport;
+        if *transport == CliTransport::default()
+            || held.contains(transport)
+            || prepared.iter().any(|(made, _)| made == transport)
+        {
+            continue;
+        }
+        prepared.push((
+            transport.clone(),
+            make(transport).map_err(|error| error.to_string()),
+        ));
+    }
+    prepared
+}
+
 /// What a target's `transport` names, after "CLI target 'name'".
 fn describe_transport(transport: &CliTransport) -> String {
     let roots = transport
@@ -205,8 +233,8 @@ fn describe_transport(transport: &CliTransport) -> String {
     match (roots, proxy) {
         (Some(roots), Some(proxy)) => format!("trusts {roots} and goes through {proxy}"),
         (Some(roots), None) => format!("trusts {roots}"),
-        (None, Some(proxy)) => format!("names {proxy}"),
-        (None, None) => "names no transport".to_owned(),
+        // Only a target with a transport is described: one with neither uses Studio's client.
+        (None, proxy) => format!("names {}", proxy.unwrap_or_default()),
     }
 }
 
@@ -511,9 +539,18 @@ impl ConnectionRegistry {
                 if !listing && !listed_files && !cli_moved {
                     continue;
                 }
-                let targets = cx
+                let Ok((held, make)) = this.update(cx, |this, _| this.transport_maker()) else {
+                    break;
+                };
+                let lister = lister.clone();
+                let dir = dir.clone();
+                let (targets, prepared) = cx
                     .background_executor()
-                    .spawn(lister(dir.clone(), places, platform))
+                    .spawn(async move {
+                        let targets = lister(dir, places, platform).await;
+                        let prepared = prepare_transports(&targets, &held, &make);
+                        (targets, prepared)
+                    })
                     .await;
                 let alive = this
                     .update(cx, |this, cx| {
@@ -521,7 +558,7 @@ impl ConnectionRegistry {
                         let asks_again = cli_moved && !listing;
                         this.cli_stamp = cli_stamp;
                         this.keep_stamp(&targets);
-                        let changed = this.apply_cli_targets(targets, cx);
+                        let changed = this.apply_cli_targets(targets, prepared, cx);
                         if asks_again {
                             this.ask_cli_tokens_again(cx);
                         }
@@ -557,7 +594,39 @@ impl ConnectionRegistry {
     /// token again; a target's graph is added. Targets that could not be listed change no server. What could not be
     /// listed or used, a server that cannot be added included, is a change only when it differs
     /// from what was kept.
-    fn apply_cli_targets(&mut self, targets: CliTargets, cx: &mut Context<Self>) -> bool {
+    /// The transports the CLI connections hold, and what makes a client for another, for a
+    /// listing to prepare off the main thread ([`prepare_transports`]).
+    fn transport_maker(&self) -> (Vec<CliTransport>, TransportHttp) {
+        let held = self
+            .cli_kept
+            .values()
+            .map(|kept| kept.transport.clone())
+            .collect();
+        (held, self.transported.clone())
+    }
+
+    /// The client for `transport`: the one prepared beside the listing, else made here (a
+    /// listing applied without preparing, as in tests).
+    fn transport_http(
+        &self,
+        transport: &CliTransport,
+        prepared: &mut Prepared,
+    ) -> Result<Arc<dyn HttpClient>, String> {
+        if *transport == CliTransport::default() {
+            return Ok(self.http.clone());
+        }
+        match prepared.iter().position(|(made, _)| made == transport) {
+            Some(at) => prepared.swap_remove(at).1,
+            None => (self.transported)(transport).map_err(|error| error.to_string()),
+        }
+    }
+
+    fn apply_cli_targets(
+        &mut self,
+        targets: CliTargets,
+        mut prepared: Prepared,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let CliTargets {
             servers,
             mut errors,
@@ -568,33 +637,32 @@ impl ConnectionRegistry {
             return self.keep_notices(errors);
         };
         let mut changed = false;
-        // An address that keeps its server keeps its connection only with the same transport:
-        // the client was made with it.
-        let named: Vec<(&String, &CliTransport)> = servers
-            .iter()
-            .map(|server| (&server.url, &server.transport))
-            .collect();
-        let kept = &self.cli_kept;
+        // An address still listed keeps its connection, which a changed transport moves to its
+        // new client below. One no longer listed is retired: the windows holding it send
+        // nothing more, so none keeps a token or a trust its target no longer names.
+        let named: Vec<&String> = servers.iter().map(|server| &server.url).collect();
         let mut left: Vec<ServerEntry> = Vec::new();
+        let mut gone = Vec::new();
         self.connections.retain(|connection| {
             let server = &connection.read(cx).server;
-            let stays = server.source != ServerSource::Cli
-                || named.iter().any(|(url, transport)| {
-                    **url == server.url
-                        && kept
-                            .get(&server.url)
-                            .is_none_or(|kept| kept.transport == **transport)
-                });
+            let stays = server.source != ServerSource::Cli || named.contains(&&server.url);
             if !stays {
                 left.push(server.clone());
+                gone.push(connection.clone());
             }
             stays
         });
+        for connection in gone {
+            connection.update(cx, |connection, cx| {
+                let why = format!(
+                    "The CLI no longer lists the target '{}' at {}",
+                    connection.server.name, connection.server.url
+                );
+                connection.retire(why, cx);
+            });
+        }
         changed |= !left.is_empty();
-        self.cli_kept
-            .retain(|url, _| left.iter().all(|entry| entry.url != *url));
-        self.cli_kept
-            .retain(|url, _| named.iter().any(|(named, _)| *named == url));
+        self.cli_kept.retain(|url, _| named.contains(&url));
         for server in servers {
             let url = server.url.clone();
             // An address Studio reaches already as the environment's server is that connection:
@@ -621,6 +689,29 @@ impl ConnectionRegistry {
                 entry.source == ServerSource::Cli && entry.url == url
             });
             if let Some(connection) = existing.cloned() {
+                let moved = self
+                    .cli_kept
+                    .get(&url)
+                    .is_some_and(|held| held.transport != server.transport);
+                if moved {
+                    match self.transport_http(&server.transport, &mut prepared) {
+                        Ok(http) => connection
+                            .update(cx, |connection, cx| connection.replace_http(http, cx)),
+                        Err(error) => {
+                            let why = format!(
+                                "CLI target '{}' {}, which Studio cannot use: {error}",
+                                server.name,
+                                describe_transport(&server.transport)
+                            );
+                            errors.push(why.clone());
+                            connection.update(cx, |connection, cx| connection.retire(why, cx));
+                            self.connections.retain(|held| *held != connection);
+                            self.cli_kept.remove(&url);
+                            changed = true;
+                            continue;
+                        }
+                    }
+                }
                 connection.update(cx, |connection, cx| {
                     if connection.server.name != server.name {
                         connection.server.name = server.name.clone();
@@ -661,19 +752,15 @@ impl ConnectionRegistry {
                 source: ServerSource::Cli,
                 known_graphs: graphs,
             };
-            let http = if server.transport == CliTransport::default() {
-                self.http.clone()
-            } else {
-                match (self.transported)(&server.transport) {
-                    Ok(http) => http,
-                    Err(error) => {
-                        errors.push(format!(
-                            "CLI target '{}' {}, which Studio cannot use: {error}",
-                            server.name,
-                            describe_transport(&server.transport)
-                        ));
-                        continue;
-                    }
+            let http = match self.transport_http(&server.transport, &mut prepared) {
+                Ok(http) => http,
+                Err(error) => {
+                    errors.push(format!(
+                        "CLI target '{}' {}, which Studio cannot use: {error}",
+                        server.name,
+                        describe_transport(&server.transport)
+                    ));
+                    continue;
                 }
             };
             let source = (self.token_sources)(&server);
@@ -773,21 +860,23 @@ impl ConnectionRegistry {
         let dir = self.operator_dir.clone();
         let places = self.cli_places.clone();
         let lister = self.lister.clone();
+        let (held, make) = self.transport_maker();
         cx.spawn(async move |this, cx| {
-            let (added, targets) = {
+            let (added, targets, prepared) = {
                 let (name, url) = (name.clone(), url.clone());
                 cx.background_executor()
                     .spawn(async move {
                         let added =
                             cli_tokens::add_server_target(&places, &name, &url, token).await;
                         let targets = lister(dir, places, platform).await;
-                        (added, targets)
+                        let prepared = prepare_transports(&targets, &held, &make);
+                        (added, targets, prepared)
                     })
                     .await
             };
             this.update(cx, |this, cx| {
                 this.keep_stamp(&targets);
-                if this.apply_cli_targets(targets, cx) {
+                if this.apply_cli_targets(targets, prepared, cx) {
                     this.save(cx);
                     cx.notify();
                 }
@@ -979,7 +1068,9 @@ mod tests {
         files: CliTargets,
         cx: &mut TestAppContext,
     ) -> bool {
-        registry.update(cx, |registry, cx| registry.apply_cli_targets(files, cx))
+        registry.update(cx, |registry, cx| {
+            registry.apply_cli_targets(files, Vec::new(), cx)
+        })
     }
 
     fn find(
@@ -1187,16 +1278,17 @@ mod tests {
 
     /// A CLI target renamed on the same endpoint is the same server: its connection, which
     /// open windows hold, takes the new name and asks the CLI as the new target. A target moved
-    /// to a new address takes the graphs remembered for its name. One that names another proxy,
-    /// or a certificate authority of its own or another bundle of one, is a new connection,
-    /// since its client is made with them.
+    /// to a new address takes the graphs remembered for its name, and the connection at the old
+    /// address is retired. One that names another proxy, or a certificate authority of its own
+    /// or another bundle of one, keeps its connection, moved to a client made with them; one
+    /// whose transport Studio cannot use is retired.
     #[gpui::test]
     async fn a_renamed_cli_target_keeps_its_connection(cx: &mut TestAppContext) {
         let (http, sent) = answering();
         let cli = Arc::new(FakeCli::default());
         cli.give("old", "one");
         cli.give("new", "two");
-        let registry = registry_with(http, &cli, cx);
+        let registry = registry_with(http.clone(), &cli, cx);
         let at_a = |cx: &mut TestAppContext| {
             registry.read_with(cx, |registry, cx| {
                 registry
@@ -1238,7 +1330,9 @@ mod tests {
         assert_eq!(token_sent(&open, &sent, cx).as_deref(), Some("Bearer two"));
         assert!(!apply(&registry, renamed(), cx));
 
-        // Moved to another address, it is a new connection with the graphs it had.
+        // Moved to another address, it is a new connection with the graphs it had. The one at
+        // the old address, which a window may still hold, sends nothing more: no token, and no
+        // request.
         assert!(apply(
             &registry,
             files(vec![server("new", "http://b.test", "renamed")]),
@@ -1250,19 +1344,43 @@ mod tests {
             assert_eq!(connection.server.url, "http://b.test");
             assert_eq!(connection.server.known_graphs, ["knowledge"]);
         });
+        open.read_with(cx, |connection, _| {
+            assert!(matches!(
+                connection.state,
+                crate::ConnectionState::Unreachable(_)
+            ));
+        });
+        sent.lock().unwrap().clear();
+        assert_eq!(
+            token_sent(&open, &sent, cx),
+            None,
+            "the old address is sent nothing"
+        );
 
-        // Through a proxy now: a connection of its own.
+        // Through a proxy now, or trusting a certificate authority of its own: the same
+        // connection, which every window holding it reaches through its new client, kept while
+        // the bundle the listing read stays the same and moved again with another.
+        let made = Arc::new(AtomicUsize::new(0));
+        let counted = made.clone();
+        let through_http = http.clone();
+        registry.update(cx, |registry, _| {
+            registry.transported = Arc::new(move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(through_http.clone())
+            });
+        });
         let mut proxied = server("new", "http://b.test", "renamed");
         proxied.transport.proxy = Some("http://proxy.test:8080".into());
         assert!(apply(&registry, files(vec![proxied]), cx));
-        let through = find(&registry, "new", cx).unwrap();
-        assert_ne!(through, moved);
-        through.read_with(cx, |connection, _| {
+        assert_eq!(find(&registry, "new", cx).unwrap(), moved);
+        assert_eq!(
+            made.load(Ordering::SeqCst),
+            1,
+            "a client made for the proxy"
+        );
+        moved.read_with(cx, |connection, _| {
             assert_eq!(connection.server.known_graphs, ["knowledge"]);
         });
-
-        // Trusting a certificate authority of its own: a connection of its own, kept while the
-        // bundle the listing read stays the same, and made again with another.
         let mut rooted = server("new", "http://b.test", "renamed");
         rooted.transport.roots = Some(cli_config::CliRoots {
             replace: false,
@@ -1270,13 +1388,31 @@ mod tests {
             bundle: b"first".to_vec(),
         });
         assert!(apply(&registry, files(vec![rooted.clone()]), cx));
-        let trusting = find(&registry, "new", cx).unwrap();
-        assert_ne!(trusting, through);
+        assert_eq!(made.load(Ordering::SeqCst), 2);
         assert!(!apply(&registry, files(vec![rooted.clone()]), cx));
-        assert_eq!(find(&registry, "new", cx).unwrap(), trusting);
+        assert_eq!(
+            made.load(Ordering::SeqCst),
+            2,
+            "the same bundle keeps its client"
+        );
         rooted.transport.roots.as_mut().unwrap().bundle = b"second".to_vec();
+        assert!(apply(&registry, files(vec![rooted.clone()]), cx));
+        assert_eq!(made.load(Ordering::SeqCst), 3);
+        assert_eq!(find(&registry, "new", cx).unwrap(), moved);
+
+        // A transport Studio cannot use retires the connection, said once, and lists no server.
+        registry.update(cx, |registry, _| {
+            registry.transported = Arc::new(|_| Err(anyhow::anyhow!("not a certificate")));
+        });
+        rooted.transport.roots.as_mut().unwrap().bundle = b"third".to_vec();
         assert!(apply(&registry, files(vec![rooted]), cx));
-        assert_ne!(find(&registry, "new", cx).unwrap(), trusting);
+        assert!(find(&registry, "new", cx).is_none());
+        moved.read_with(cx, |connection, _| {
+            assert!(matches!(
+                connection.state,
+                crate::ConnectionState::Unreachable(_)
+            ));
+        });
     }
 
     /// A server whose target is anonymous asks the CLI nothing and sends no token; one that

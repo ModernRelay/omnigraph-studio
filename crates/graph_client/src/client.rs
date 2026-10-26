@@ -465,7 +465,9 @@ pub struct GraphClient {
     /// Shared by every clone, as the connection's one token: a token replaced after the server
     /// refused the old one reaches every holder, a running agent's gateway among them.
     token: Arc<std::sync::RwLock<Option<Arc<str>>>>,
-    http: Arc<dyn HttpClient>,
+    /// Shared by every clone, as the token is: a target whose transport changed is reached
+    /// through the new one by every holder ([`Self::set_http`]).
+    http: Arc<std::sync::RwLock<Arc<dyn HttpClient>>>,
     /// Shared by every clone, so the bound holds for the whole connection.
     read_slots: Arc<smol::lock::Semaphore>,
     /// How often the token was replaced by another ([`Self::credential_changes`]), and how often
@@ -516,7 +518,7 @@ impl GraphClient {
         Ok(Self {
             base,
             token: Arc::new(std::sync::RwLock::new(token.map(Into::into))),
-            http,
+            http: Arc::new(std::sync::RwLock::new(http)),
             read_slots: Arc::new(smol::lock::Semaphore::new(READ_CONCURRENCY)),
             credential_changes: Arc::default(),
             refusals: Arc::default(),
@@ -570,6 +572,24 @@ impl GraphClient {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .entry(decode_segment(id))
             .or_default() += 1;
+    }
+
+    /// The HTTP client requests go through now.
+    fn http(&self) -> Arc<dyn HttpClient> {
+        self.http
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Replaces the HTTP client for this client and every clone of it, as when the CLI target's
+    /// proxy or certificate authority changed; requests sent after this go through it, and one
+    /// under way finishes through the one it started with.
+    pub fn set_http(&self, http: Arc<dyn HttpClient>) {
+        *self
+            .http
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = http;
     }
 
     /// Replaces the token for this client and every clone of it; requests sent after this use
@@ -673,7 +693,7 @@ impl GraphClient {
             .body(body.map(AsyncBody::from).unwrap_or_else(AsyncBody::empty))
             .map_err(|error| error.to_string())?;
         let response = self
-            .http
+            .http()
             .send(request)
             .await
             .map_err(|error| describe_transport(&error))?;
@@ -1044,7 +1064,7 @@ impl GraphClient {
             .body(request.body)
             .map_err(|error| error.to_string())?;
         let response = self
-            .http
+            .http()
             .send(request)
             .await
             .map_err(|error| describe_transport(&error))?;
@@ -2046,6 +2066,32 @@ mod tests {
         .unwrap();
         block_on(gateway.schema("g")).ok();
         assert_eq!(*sent.lock().unwrap(), ["Bearer new", "Bearer new"]);
+    }
+
+    /// An HTTP client replaced on the client, as when the CLI target's certificate authority
+    /// changed, is the one every clone sends through next: none keeps the old trust.
+    #[test]
+    fn a_replaced_http_client_reaches_every_clone() {
+        let answering = |name: &'static str, seen: Arc<std::sync::Mutex<Vec<&'static str>>>| {
+            FakeHttpClient::create(move |_| {
+                seen.lock().unwrap().push(name);
+                async move {
+                    Ok(Response::builder()
+                        .status(200)
+                        .header(CONTRACT_HEADER, CONTRACT)
+                        .body(AsyncBody::from("{}"))
+                        .unwrap())
+                }
+            })
+        };
+        let seen: Arc<std::sync::Mutex<Vec<&'static str>>> = Arc::default();
+        let held = client(answering("old", seen.clone()));
+        let gateway = held.clone();
+        block_on(gateway.schema("g")).ok();
+        held.set_http(answering("new", seen.clone()));
+        block_on(gateway.schema("g")).ok();
+        block_on(held.schema("g")).ok();
+        assert_eq!(*seen.lock().unwrap(), ["old", "new", "new"]);
     }
 
     /// Stored queries: the catalog decodes (a kind Studio does not know is `Other`), a read

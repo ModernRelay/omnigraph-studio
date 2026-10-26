@@ -1201,6 +1201,11 @@ impl GraphSession {
                 }
             }
             Err(ReadError::Transport(_)) => {}
+            // The token may have lapsed: the connection asks its source again, once for it.
+            Err(ReadError::Refused(error)) if error.status == 401 => {
+                self.connection
+                    .update(cx, |connection, cx| connection.read_refused(cx));
+            }
             _ => {
                 if self.unavailable.take().is_some() {
                     self.recheck_after = RECHECK_FIRST;

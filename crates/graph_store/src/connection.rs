@@ -142,6 +142,9 @@ pub struct Connection {
     token_fresh: bool,
     /// The source was asked again after a 401, which it is once until a connect is ready.
     asked_after_refusal: bool,
+    /// The credential generation ([`GraphClient::credential_changes`]) a graph read was last
+    /// refused under ([`Connection::read_refused`]): the source is asked again once for each.
+    read_refused_under: Option<u64>,
     /// The source has answered since it was set, with a token or why it gave none: requests
     /// sent from then carry what it gave ([`Connection::token_ready`]).
     token_answered: bool,
@@ -161,6 +164,31 @@ pub struct Connection {
     watchers: Rc<()>,
     /// A health check came while nothing watched the server: the next watch checks at once.
     check_missed: bool,
+}
+
+/// The HTTP client of a retired connection ([`Connection::retire`]): every request fails with
+/// why, and nothing is sent.
+struct Unusable(String);
+
+impl HttpClient for Unusable {
+    fn user_agent(&self) -> Option<&http_client::http::HeaderValue> {
+        None
+    }
+
+    fn proxy(&self) -> Option<&http_client::Url> {
+        None
+    }
+
+    fn send(
+        &self,
+        _: http_client::http::Request<http_client::AsyncBody>,
+    ) -> futures::future::BoxFuture<
+        'static,
+        anyhow::Result<http_client::Response<http_client::AsyncBody>>,
+    > {
+        let why = self.0.clone();
+        Box::pin(async move { Err(anyhow::anyhow!(why)) })
+    }
 }
 
 /// Health re-check interval after a failure (spec 003).
@@ -205,6 +233,7 @@ impl Connection {
             token_given: false,
             token_fresh: false,
             asked_after_refusal: false,
+            read_refused_under: None,
             token_answered: false,
             hurry: Arc::default(),
             _asking: None,
@@ -256,6 +285,58 @@ impl Connection {
             self.token_given = false;
             self.replace_token(None, None, cx);
         }
+    }
+
+    /// Sends through `http` from now on, as when the CLI target's proxy or certificate authority
+    /// changed: every holder of the client moves to it (the agent's gateway among them), and what
+    /// was read through the old one is read again. The registry asks the token source again too,
+    /// since the target changed.
+    pub(crate) fn replace_http(&mut self, http: Arc<dyn HttpClient>, cx: &mut Context<Self>) {
+        self.client.set_http(http);
+        cx.emit(ConnectionEvent::CredentialChanged);
+    }
+
+    /// Stops the connection for good, as when its CLI target is gone or names a transport Studio
+    /// cannot use: the token and where it came from are dropped, every request fails with `why`
+    /// without leaving Studio, and nothing is checked again. A window showing one of its graphs
+    /// says so; opening the graph again reaches the target as the CLI lists it now.
+    pub(crate) fn retire(&mut self, why: String, cx: &mut Context<Self>) {
+        self.token_source = None;
+        self.token_given = false;
+        self.token_answered = true;
+        self.client.set_token(None);
+        self.has_token = false;
+        self.client.set_http(Arc::new(Unusable(why.clone())));
+        self._asking = None;
+        self._task = None;
+        self._listing = None;
+        self._health_check = None;
+        self.state = ConnectionState::Unreachable(why);
+        cx.emit(ConnectionEvent::CredentialChanged);
+        cx.emit(ConnectionEvent::StateChanged);
+        cx.notify();
+    }
+
+    /// A read on one of the server's graphs was answered 401 while it carried the source's token:
+    /// the token may have lapsed (a managed data token lives an hour), with `/healthz`, which
+    /// carries none, still answering. The source is told ([`TokenSource::note_refused`]), then
+    /// asked again, once for the token held: a renewed token replaces it and what was read is
+    /// read again ([`ConnectionEvent::CredentialChanged`]); the same token leaves the read
+    /// refused. A token typed in, or a server without a source, is not asked about. A refused
+    /// write is never sent again.
+    pub fn read_refused(&mut self, cx: &mut Context<Self>) {
+        if !self.has_token || !self.asks_token_source() || !self.token_answered {
+            return;
+        }
+        let generation = self.client.credential_changes();
+        if self.read_refused_under == Some(generation) {
+            return;
+        }
+        self.read_refused_under = Some(generation);
+        if let Some(source) = &self.token_source {
+            source.note_refused();
+        }
+        self.ask_for_token(false, cx);
     }
 
     /// Whether requests sent now carry the token they would carry once the token source has
@@ -582,6 +663,9 @@ impl Connection {
             self.refused_with_token = failed.token_refused.unwrap_or(token_sent);
             if token_sent && !self.asked_after_refusal && self.asks_token_source() {
                 self.asked_after_refusal = true;
+                if let Some(source) = &self.token_source {
+                    source.note_refused();
+                }
                 self.ask_for_token(false, cx);
             }
         }
@@ -1168,5 +1252,100 @@ mod tests {
             connect_to(graph_client::CONTRACT, cx),
             ConnectionState::Ready
         );
+    }
+
+    /// A graph read refused with 401 while it carried the source's token asks the source again,
+    /// once for that token and telling it first: a renewed token replaces the lapsed one, a
+    /// second refusal of the same token asks nothing more, and a token typed in is not asked
+    /// about.
+    #[gpui::test]
+    async fn a_read_refused_for_its_token_asks_the_source_once(cx: &mut TestAppContext) {
+        use std::sync::atomic::AtomicUsize;
+        #[derive(Default)]
+        struct Renewing {
+            given: std::sync::Mutex<Vec<&'static str>>,
+            asked: AtomicUsize,
+            refused: AtomicUsize,
+        }
+        impl TokenSource for Renewing {
+            fn token(
+                &self,
+                _: Arc<AtomicBool>,
+            ) -> futures::future::BoxFuture<'static, Result<Token, String>> {
+                self.asked.fetch_add(1, Ordering::SeqCst);
+                let mut given = self.given.lock().unwrap();
+                let token = if given.len() > 1 {
+                    given.remove(0)
+                } else {
+                    given[0]
+                };
+                Box::pin(async move { Ok(Token::new(token)) })
+            }
+            fn note_refused(&self) {
+                self.refused.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            async move {
+                let body = if path.ends_with("/healthz") {
+                    r#"{"status":"ok","version":"0.14.0","internal_schema_version":16}"#
+                } else {
+                    r#"{"graphs":[]}"#
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let source = Arc::new(Renewing::default());
+        *source.given.lock().unwrap() = vec!["lapsed", "renewed"];
+        let server = ServerEntry {
+            name: "managed".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Cli,
+            known_graphs: Vec::new(),
+        };
+        let held: Arc<dyn TokenSource> = source.clone();
+        let connection = cx.new(|_| {
+            Connection::new(server, None, http)
+                .unwrap()
+                .with_token_source(Some(held))
+        });
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        cx.run_until_parked();
+        let asked = || source.asked.load(Ordering::SeqCst);
+        let refused = || source.refused.load(Ordering::SeqCst);
+        let changes = |cx: &mut TestAppContext| {
+            connection.read_with(cx, |connection, _| connection.client().credential_changes())
+        };
+        assert_eq!(asked(), 1);
+        let lapsed = changes(cx);
+
+        connection.update(cx, |connection, cx| connection.read_refused(cx));
+        cx.run_until_parked();
+        assert_eq!((asked(), refused()), (2, 1));
+        assert_eq!(changes(cx), lapsed + 1, "the renewed token replaced it");
+
+        // Refused again under the renewed token: asked once more, which gives the same one.
+        connection.update(cx, |connection, cx| connection.read_refused(cx));
+        cx.run_until_parked();
+        assert_eq!((asked(), refused()), (3, 2));
+        connection.update(cx, |connection, cx| connection.read_refused(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            (asked(), refused()),
+            (3, 2),
+            "the same token is not asked about twice"
+        );
+
+        connection.update(cx, |connection, cx| {
+            connection.set_token(Some("typed".into()), cx);
+            connection.read_refused(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(asked(), 3, "a token typed in is not asked about");
     }
 }

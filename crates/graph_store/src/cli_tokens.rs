@@ -131,6 +131,11 @@ pub trait TokenSource: Send + Sync + 'static {
     fn login_profile(&self) -> Option<String> {
         None
     }
+
+    /// The server refused the last token this source gave (a 401 to a request that carried it),
+    /// said before the source is asked again: a source that keeps a token it can renew renews it
+    /// rather than giving the same one back. The CLI's sources keep nothing.
+    fn note_refused(&self) {}
 }
 
 /// The CLI Studio runs.
