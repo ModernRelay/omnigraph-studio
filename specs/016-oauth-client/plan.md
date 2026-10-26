@@ -1,9 +1,12 @@
 # 016: Studio as an OAuth client
 
-Status: draft, not implemented. Managed clusters come first; a self-hosted OIDC server is
-specified here but not planned for now. Needs the managed control plane's remaining
-prerequisites and answers to the open questions below. Until it lands, Studio reaches a managed
-cluster on the CLI's login (spec 003, since 2026-10-25), which this client replaces · 2026-10-25
+Status: implemented for a CLI server target with `auth: anonymous` whose server offers sign-in
+(`oauth_client`, `graph_store::sign_in`, 2026-10-26), and tested end to end against Omnigraph
+v0.14.0 (`script/dev-sign-in`). Studio has no client identity yet (open question 1): until its
+metadata document is published or it is registered, a real sign-in service refuses it, and only
+`OMNIGRAPH_STUDIO_OAUTH_CLIENT` (development) signs in. A managed target still reaches its
+cluster on the CLI's login (spec 003, since 2026-10-25) until the managed control plane's
+prerequisites below are met · 2026-10-26
 
 ## Problem
 
@@ -17,7 +20,7 @@ chose on 2026-10-25 against RFC #1017's Appendix A2. That token is the CLI's: th
 issuer membership does not retract it, and Studio acts as the CLI's principal rather than as a
 client of its own, which the server cannot tell apart or give less authority. This plan
 makes Studio a standard OAuth public client of any OIDC-enabled Omnigraph server, self-hosted or
-managed, signing a person in through their browser. It is a spec only; nothing is implemented.
+managed, signing a person in through their browser.
 
 ## Principles
 
@@ -88,8 +91,8 @@ Studio holds no static credential for it:
 | Server | Credential |
 |---|---|
 | CLI server target with a `token` or `exec` provider | The CLI's exported token (spec 003). A refused one is said as refused; Studio does not swap in OAuth. |
-| CLI server target with `auth: anonymous` | None; if the server's challenge offers OAuth, "Sign in" is offered. Not planned for now: a self-hosted OIDC server (Deferred). |
-| CLI managed target with a data `endpoint` | Always OAuth. The CLI's managed credential is never exported. |
+| CLI server target with `auth: anonymous` | None; if the server's challenge offers OAuth, "Sign in" is offered (built 2026-10-26). |
+| CLI managed target with a data `endpoint` | OAuth once the managed control plane offers it and registers Studio; until then the CLI's login (spec 003). |
 | CLI managed target without an `endpoint` | Refused: "This managed target has no data endpoint." |
 | Direct target | Refused (spec 003). |
 
@@ -104,8 +107,8 @@ a token, as today.
 1. **Protected-resource metadata.** Take the URL from the challenge's `resource_metadata`, which
    the server derives from its resource identifier (RFC 9728 §3.1). With no challenge yet,
    Studio sends one request without a credential to get one; it never assumes the metadata
-   sits at the host's root. `GET` it over HTTPS (HTTP only for a loopback endpoint), 10 seconds,
-   at most 64 KiB, JSON.
+   sits at the host's root. The URL must be on the endpoint's origin. `GET` it over HTTPS (HTTP
+   only for a loopback endpoint), 10 seconds, at most 64 KiB, JSON, no redirect followed.
 2. **Check it.** `resource` must be an absolute HTTPS URL (HTTP only on loopback) on the
    endpoint's origin, for every target, managed ones included: a managed cluster's resource
    names its own data host, `https://<data host>/mcp`. A resource on any other origin is
@@ -119,9 +122,13 @@ a token, as today.
    `/.well-known/oauth-authorization-server` for the issuer (path inserted after the host),
    else OpenID Connect discovery's `/.well-known/openid-configuration`; same bounds. Its
    `issuer` must equal the named issuer exactly; an issuer the resource metadata does not name
-   is never used. `authorization_endpoint` and `token_endpoint` must be HTTPS, and
-   `code_challenge_methods_supported` must include `S256`. Studio does not use a
-   `registration_endpoint`.
+   is never used. `authorization_endpoint`, `token_endpoint` and `revocation_endpoint` must be
+   HTTPS, or HTTP on loopback; the issuer must be HTTPS. `code_challenge_methods_supported` must
+   include `S256`. Studio does not use a `registration_endpoint`.
+4. **Transport.** Requests to the endpoint's origin take the CLI target's own transport (its
+   proxy and certificate authority, spec 003); requests to any other host take Studio's own
+   client, as the CLI's identity-provider traffic does not inherit a target's transport
+   (Omnigraph `docs/user/cli/targets.md`, Transport and capability boundaries).
 
 Discovery answers are kept in memory per endpoint and fetched again after a sign-in fails or
 Studio restarts; they hold no secrets.
@@ -137,7 +144,9 @@ Studio restarts; they hold no secrets.
   listed without a port; the authorization server must accept any port on it (RFC 8252 §7.3).
 - An authorization server that does not accept a metadata-document client ID may have Studio
   pre-registered as a public client with loopback redirects. Its ID is kept in Studio per
-  issuer, as data shipped with Studio, not typed by the person.
+  issuer, as data shipped with Studio, not typed by the person. A registered ID is used before
+  the metadata document. For development, `OMNIGRAPH_STUDIO_OAUTH_CLIENT` names one client ID
+  used at any sign-in service.
 - With neither, sign-in is refused: "The sign-in service at <issuer host> does not accept
   Omnigraph Studio." Studio never registers itself dynamically.
 
@@ -151,12 +160,14 @@ Studio restarts; they hold no secrets.
 - It opens the system browser (`open_url`) at the authorization endpoint with
   `response_type=code`, `client_id`, `redirect_uri=http://127.0.0.1:<port>/callback`,
   `code_challenge`, `code_challenge_method=S256`, `state` and `resource=<resource>` (RFC 8707),
-  and the scopes the authorization server needs for a refresh token (open question 3).
-- The listener answers only `GET /callback` whose `state` matches; anything else is 404. It
-  takes one callback, answers it with a short page ("Signed in to <host>. You can close this
-  tab." or the error), and closes. It closes after 5 minutes, on Cancel, or when the server is
-  removed. An `error` in the callback is shown with its `error_description`, as plain text, cut
-  at 300 characters.
+  and `scope=offline_access` when the authorization server lists that scope (open question 3).
+- The listener takes `GET /callback` whose `state` matches; a callback with another `state` is
+  answered 400 and the listener waits on, and anything else is 404. An `iss` that is not the
+  issuer ends the sign-in (RFC 9207). It takes one callback, answers it with a short page
+  ("Signed in to <host>. You can close this tab." or the error), and closes. It closes after 5
+  minutes, on Cancel, or when the server is removed. An `error` in the callback is shown with its
+  `error_description`, as plain text, cut at 300 characters. Each request has 10 seconds and 8 KiB
+  to arrive.
 - The code is exchanged at the token endpoint (`grant_type=authorization_code`, `code`,
   `redirect_uri`, `client_id`, `code_verifier`, `resource`), 15 seconds, at most 64 KiB. The
   answer must have `token_type` `Bearer`, an `access_token` and an `expires_in` of 300 or less.
@@ -185,9 +196,12 @@ Studio restarts; they hold no secrets.
 
 ### Refresh
 
-- An access token is refreshed when 60 seconds or less of its life remain and the server is in
-  use, and before a request that would otherwise send an expired one. Nothing refreshes for a
-  server no view reads.
+- An access token is refreshed when 60 seconds or less of its life remain (halfway through a
+  token that lives two minutes or less) and the server is in use, and before a request that
+  would otherwise send an expired one. Nothing refreshes for a server no view reads; the next
+  view to show it asks. A renewal replaces the token without counting as another credential, so
+  nothing read is read again. A token refreshed after a 401 is a new credential and is tried at
+  once.
 - One refresh runs at a time per target (its client, issuer, resource and account), for
   every view and window; others wait for its answer. These tokens are never mixed with a static token or the
   CLI's credentials.
@@ -267,12 +281,17 @@ Studio restarts; they hold no secrets.
 | A refused write is not re-sent after sign-in | Re-send it once the token is fresh | The person may not want it after a detour through the browser; constitution III keeps writes explicit |
 | One account per CLI target | Several accounts per target, kept side by side | A CLI target names one identity, and GPUI keeps one keychain item per key; a second account is a second target on the same endpoint |
 | Claims read unverified, for audience and display only | Verify the JWT in Studio | The server verifies; Studio's check only stops it sending a token issued for another resource |
+| The target's transport for the endpoint's origin, Studio's own client elsewhere | The target's transport for every sign-in request | The CLI's rule: identity-provider traffic does not inherit a target's transport. A sign-in service behind the server's own address (as `script/dev-sign-in` serves it) is reached as the server is |
+| HTTP accepted for the authorization, token and revocation endpoints on loopback | HTTPS only | A sign-in service on this machine (a development one) answers over HTTP; nothing leaves the machine. The issuer and the resource stay HTTPS, as the server requires |
+| A renewal is quiet; a refresh after a 401 is a new credential | Every new token counts as another credential | Counting renewals would read every view again every few minutes. After a 401 the views' reads failed, and reading them again with the new token is what is wanted |
 
 ## Deferred
 
-- The implementation, after the prerequisites and open questions are settled.
-- A self-hosted OIDC server (a CLI server target whose server offers sign-in): specified above,
-  not planned for now. Managed clusters come first.
+- A managed target's sign-in, once the managed control plane offers it and registers Studio: its
+  organization check (`org_id` against the profile's `organization_id`) and the end of the CLI
+  login interim.
+- A refused write's message after sign-in ("Signed out before the change was sent; nothing was
+  written"): a 401 to a write is said as any refusal today.
 - Whether managed agents use the CLI's relay or are OAuth clients themselves (RFC #1017, A3;
   #1025's last item).
 - Several authorization servers for one resource (open question 6).
@@ -307,6 +326,9 @@ Studio restarts; they hold no secrets.
 | 2026-10-21 | The managed control plane's own design agrees with this plan | Its identity and client specifications, read at their current head (a private repository, not cited here) | It publishes each managed cluster's resource and metadata itself, on its own origin, not on the data host; it prefers metadata-document clients; refresh tokens rotate and must repeat the resource; a client never silently opens a browser or replays a write; OAuth access needs a public route to the data host. Its OAuth profile is built, off by default and enabled per deployment |
 | 2026-10-21 | A managed resource on the data host suits every client | The MCP TypeScript SDK sends `new URL(resource).href` as `resource`, which turns a bare origin into `origin/`; a resource ending in `/mcp` is sent unchanged, and `checkResourceAllowed` requires the server's origin and a path prefix | The managed resource is `https://<data host>/mcp`; Studio requires the endpoint's origin for every target, and the profile-`api` exception is gone |
 | 2026-10-21 | A managed target can name its data endpoint without network access | Omnigraph main `docs/user/cli/targets.md` ("Configure destinations", `target inspect`) | `endpoint` is optional on a managed target and required for data operations |
+
+| 2026-10-26 | The client signs in to a real Omnigraph server | `script/dev-sign-in` (Omnigraph v0.14.0 `omnigraph-server --oidc-identity-trust`, a TLS front from its own CA, a stand-in authorization server); `graph_store` `a_real_server_is_signed_in_to_through_the_bed` | The server's own 401 names its metadata; the token is accepted and the graphs list; sign-out revokes; a subject the admission file does not name gets 401 `invalid_token` again after one refresh, shown as Not admitted (Omnigraph #1172) |
+| 2026-10-26 | The protocol rules hold | `oauth_client` tests (RFC 7636 vector, discovery refusals, callback state and `iss`, token claims), `graph_store` `sign_in` tests (browser sign-in, keychain custody, rotation, quiet renewal, `invalid_grant`, one refresh after a refusal, no sign-in over a CLI credential) | Pass; a refreshed token applied as a quiet renewal after a 401 was never sent, found by the bed and fixed with a test that fails without the fix |
 
 ## Corrections
 

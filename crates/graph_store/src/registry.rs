@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::cli_config::{self, CliAuth, CliServer, CliTargets, CliTransport, FileStamp, Platform};
 use crate::cli_tokens::{self, CliTokenSource, Token, TokenSource};
 use crate::connection::{Connection, ServerEntry, ServerSource};
+use crate::sign_in::{self, PlatformKeychain, SignInContext};
 
 /// How often the CLI's files are checked for a change, as Studio's settings file is.
 const OPERATOR_POLL: Duration = Duration::from_secs(2);
@@ -100,6 +101,9 @@ pub struct ConnectionRegistry {
     listing_waiters: Vec<oneshot::Sender<()>>,
     /// The graph ids remembered for each CLI target, as last read or saved.
     known: KnownGraphs,
+    /// What a CLI server's connection signs in with when its server asks (spec 016): `None` in
+    /// a test that does not set it ([`Self::set_sign_in_for_tests`]).
+    sign_in: Option<SignInContext>,
     /// Whether the remembered graphs are written to the data directory: Studio's, not a
     /// test's.
     saving: bool,
@@ -160,7 +164,7 @@ fn valid_target_name(name: &str) -> bool {
 /// alone. The reqwest Zed pins has no bundled web roots to leave out. Requests go through the
 /// proxy, else as the system's settings say; Zed's client also leaves out the hosts in
 /// `NO_PROXY`.
-fn transport_client(transport: &CliTransport) -> anyhow::Result<Arc<dyn HttpClient>> {
+pub(crate) fn transport_client(transport: &CliTransport) -> anyhow::Result<Arc<dyn HttpClient>> {
     let proxy = transport
         .proxy
         .as_deref()
@@ -342,6 +346,11 @@ impl ConnectionRegistry {
     /// Takes `platform` as the system Studio runs on, for the tests of what Studio does where
     /// the CLI gives it no token (Windows).
     #[cfg(any(test, feature = "test-support"))]
+    pub fn set_sign_in_for_tests(&mut self, context: SignInContext) {
+        self.sign_in = Some(context);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub fn set_platform_for_tests(&mut self, platform: Platform) {
         self.platform = platform;
     }
@@ -357,6 +366,11 @@ impl ConnectionRegistry {
         this.transported = Arc::new(transport_client);
         this.known = load_known_graphs(&known_graphs_path());
         this.saving = true;
+        this.sign_in = Some(SignInContext {
+            elsewhere: this.http.clone(),
+            keychain: PlatformKeychain::start(cx),
+            identities: sign_in::studio_identities(),
+        });
 
         if let Ok(url) = std::env::var("OMNIGRAPH_STUDIO_SERVER") {
             let url = graph_client::server_root(&url).unwrap_or(url);
@@ -425,6 +439,7 @@ impl ConnectionRegistry {
             listed: true,
             listing_waiters: Vec::new(),
             known: KnownGraphs::default(),
+            sign_in: None,
             saving: false,
             _watch: None,
         }
@@ -766,7 +781,9 @@ impl ConnectionRegistry {
             let source = (self.token_sources)(&server);
             match Connection::new(entry, None, http) {
                 Ok(connection) => {
-                    let connection = connection.with_token_source(source);
+                    let connection = connection
+                        .with_token_source(source)
+                        .with_sign_in(self.sign_in.clone());
                     self.connections.push(cx.new(|_| connection));
                     self.cli_kept.insert(url, kept);
                     changed = true;

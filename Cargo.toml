@@ -21,6 +21,7 @@ members = [
     "crates/inspectors",
     "crates/agent_panel",
     "crates/studio_update",
+    "crates/oauth_client",
     "grammars/tree-sitter-gq",
     "grammars/tree-sitter-pg",
 ]
@@ -53,6 +54,7 @@ change_cards = { path = "crates/change_cards" }
 graph_client = { path = "crates/graph_client" }
 graph_store = { path = "crates/graph_store" }
 studio_update = { path = "crates/studio_update" }
+oauth_client = { path = "crates/oauth_client" }
 gq_language = { path = "crates/gq_language" }
 command_palette = { path = "crates/command_palette" }
 type_table = { path = "crates/type_table" }
@@ -107,6 +109,8 @@ minisign-verify = "0.2"
 # Unpacking a downloaded update and reading its bundle's version before it is installed.
 # The update key and signature are base64 of minisign's files, as Tauri writes them (spec 017).
 base64 = "0.22"
+# PKCE's code challenge is the verifier's SHA-256 (RFC 7636 §4.2, spec 016).
+sha2 = "0.10"
 flate2 = "1"
 tar = "0.4"
 tempfile = "3"

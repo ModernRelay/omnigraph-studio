@@ -621,6 +621,16 @@ impl GraphClient {
         true
     }
 
+    /// Replaces the token with a renewal of it: the same account's next short-lived token, as
+    /// an OAuth refresh gives (spec 016). Nothing read with the old one is read again, so it is
+    /// not counted as another token ([`Self::credential_changes`]).
+    pub fn renew_token(&self, token: String) {
+        *self
+            .token
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(token.into());
+    }
+
     fn token(&self) -> Option<Arc<str>> {
         self.token
             .read()

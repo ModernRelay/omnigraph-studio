@@ -12,6 +12,7 @@ LAYERS = {
     "studio_settings": 1,
     "studio_theme": 1,
     "graph_client": 2,
+    "oauth_client": 2,
     "gq_language": 2,
     "studio_ui": 2,
     "graph_store": 3,
@@ -29,7 +30,7 @@ LAYERS = {
     "agent_panel": 5,
     "studio": 6,
 }
-NO_GPUI = {"graph_client", "gq_language"}
+NO_GPUI = {"graph_client", "gq_language", "oauth_client"}
 
 errors = []
 for manifest in sorted(glob.glob("crates/*/Cargo.toml")):

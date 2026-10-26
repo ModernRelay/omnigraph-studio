@@ -95,21 +95,53 @@ pub(crate) const EXPORT_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const HELPER_MARGIN: Duration = Duration::from_secs(15);
 
 /// A token, kept in memory only: its `Debug` never shows it.
-pub struct Token(String);
+pub struct Token {
+    secret: String,
+    lease: Option<Lease>,
+}
+
+/// How long a short-lived token stands, and whose it is: an OAuth access token's (spec 016). The
+/// connection asks for the next before it ends, and the next one of the same holder replaces it
+/// quietly, as nothing read with it needs reading again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lease {
+    pub expires_at: std::time::SystemTime,
+    /// When the next is asked for: a minute before it ends, or halfway through a token that
+    /// lives two minutes or less.
+    pub renew_at: std::time::SystemTime,
+    /// The account the token was issued to.
+    pub holder: String,
+}
 
 impl Token {
-    /// A token the person typed into Studio, handed to the CLI to keep (`credentials set`).
+    /// A token the person typed into Studio, handed to the CLI to keep (`credentials set`), or
+    /// one the CLI gave: it stands until the server refuses it.
     pub(crate) fn typed(token: String) -> Self {
-        Self(token)
+        Self {
+            secret: token,
+            lease: None,
+        }
+    }
+
+    /// A token that stands until `lease` ends.
+    pub(crate) fn leased(token: String, lease: Lease) -> Self {
+        Self {
+            secret: token,
+            lease: Some(lease),
+        }
+    }
+
+    pub(crate) fn lease(&self) -> Option<&Lease> {
+        self.lease.as_ref()
     }
 
     pub(crate) fn into_string(self) -> String {
-        self.0
+        self.secret
     }
 
     #[cfg(test)]
     pub(crate) fn new(token: &str) -> Self {
-        Self(token.to_owned())
+        Self::typed(token.to_owned())
     }
 }
 
@@ -748,7 +780,7 @@ fn exported_token(stdout: Vec<u8>) -> Option<Token> {
     let valid = !token.is_empty()
         && token.len() <= MAX_TOKEN_BYTES
         && token.bytes().all(|byte| (0x21..=0x7e).contains(&byte));
-    valid.then(|| Token(token.to_owned()))
+    valid.then(|| Token::typed(token.to_owned()))
 }
 
 /// `program` with `args`, as Studio starts it ([`scrubbed`]).

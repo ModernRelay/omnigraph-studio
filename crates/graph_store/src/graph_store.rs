@@ -19,6 +19,7 @@ mod refusal;
 mod registry;
 pub mod scope;
 mod session;
+pub mod sign_in;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_server;
 #[cfg(test)]
