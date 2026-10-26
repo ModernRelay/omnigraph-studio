@@ -185,6 +185,9 @@ pub struct Connection {
     _renewal: Option<Task<()>>,
     /// The renewal came while nothing watched the server: the next watch asks.
     renewal_missed: bool,
+    /// Where the server's 401 said its sign-in details are, once it offered a sign-in: a new
+    /// client for the server reads them again through itself.
+    sign_in_metadata: Option<String>,
     /// The ask under way is a renewal, before the token held ends: its answer replaces the
     /// token quietly. An ask after a refusal is not one, and its token is tried at once.
     renewing: bool,
@@ -285,6 +288,7 @@ impl Connection {
             _signing_in: None,
             _renewal: None,
             renewal_missed: false,
+            sign_in_metadata: None,
             renewing: false,
         })
     }
@@ -352,14 +356,18 @@ impl Connection {
     pub(crate) fn replace_http(&mut self, http: Arc<dyn HttpClient>, cx: &mut Context<Self>) {
         self.http = http.clone();
         self.client.set_http(http);
-        // A sign-in reached the server's address through the old client: it is forgotten here
-        // (the keychain keeps it), read again through the new one at the next 401, and a kept
-        // sign-in refreshed from there.
+        // A sign-in reached the server's address through the old client. It is read again
+        // through the new one now, and a kept sign-in refreshed from the keychain: a 401 to a
+        // graph's read, the next sign that the token lapsed, asks no source when there is none.
+        let metadata = self.sign_in_metadata.clone();
         if self.oauth.is_some() {
             self.token_source = None;
         }
         self.drop_sign_in();
         cx.emit(ConnectionEvent::CredentialChanged);
+        if let Some(metadata) = metadata {
+            self.offered_sign_in(metadata, cx);
+        }
     }
 
     /// Stops the connection for good, as when its CLI target is gone or names a transport Studio
@@ -771,6 +779,10 @@ impl Connection {
     fn refused(&mut self, failed: Failed, token_sent: bool, cx: &mut Context<Self>) {
         if failed.state == ConnectionState::Unauthorized {
             self.refused_with_token = failed.token_refused.unwrap_or(token_sent);
+            // A refused token is not renewed: the ask below is the one more try, and a token
+            // the server takes schedules its own renewal.
+            self._renewal = None;
+            self.renewal_missed = false;
             if token_sent && !self.asked_after_refusal && self.asks_token_source() {
                 self.asked_after_refusal = true;
                 if let Some(source) = &self.token_source {
@@ -803,6 +815,7 @@ impl Connection {
         let Ok(endpoint) = url::Url::parse(&self.server.url) else {
             return;
         };
+        self.sign_in_metadata = Some(metadata.clone());
         self.sign_in = SignIn::Reading;
         let clients =
             oauth_client::Clients::new(endpoint, self.http.clone(), context.elsewhere.clone());
@@ -900,6 +913,8 @@ impl Connection {
         cx.notify();
         let target = self.server.name.clone();
         let host = oauth_client::host_of(&self.server.url);
+        // The sign-in this one replaces, as another account after Not admitted.
+        let previous = self.oauth.clone();
         self._signing_in = Some(cx.spawn(async move |this, cx| {
             let redirect = callback.redirect_uri().to_owned();
             let issuer = service.server.issuer.clone();
@@ -930,6 +945,13 @@ impl Connection {
                     .map_err(|error| error.to_string())
                 })
                 .await;
+            // One account per target: the one replaced ends, its refresh token revoked, and the
+            // keychain keeps only the new one's, or none, never the old account's.
+            if signed_in.is_ok()
+                && let Some(previous) = &previous
+            {
+                previous.replaced().await;
+            }
             let kept = match &signed_in {
                 Ok(tokens) => match &tokens.refresh_token {
                     Some(refresh) => context
@@ -941,7 +963,10 @@ impl Connection {
                         )
                         .await
                         .is_ok(),
-                    None => false,
+                    None => {
+                        context.keychain.delete(service.key(&target)).await.ok();
+                        false
+                    }
                 },
                 Err(_) => false,
             };
@@ -1011,6 +1036,8 @@ impl Connection {
         self.token_given = false;
         self.asked_after_refusal = false;
         self.holder = None;
+        self._renewal = None;
+        self.renewal_missed = false;
         self.connect(cx);
     }
 
@@ -1019,6 +1046,7 @@ impl Connection {
     fn drop_sign_in(&mut self) {
         self.oauth = None;
         self.service = None;
+        self.sign_in_metadata = None;
         self.holder = None;
         self._renewal = None;
         self._signing_in = None;
@@ -1035,6 +1063,10 @@ impl Connection {
         self._renewal = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(wait).await;
             this.update(cx, |this, cx| {
+                // A server not ready is asked again by its next connect, which asks for a token.
+                if this.state != ConnectionState::Ready {
+                    return;
+                }
                 if this.watched() {
                     this.renewing = true;
                     this.ask_for_token(false, cx);

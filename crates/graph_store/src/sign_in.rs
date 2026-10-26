@@ -54,9 +54,15 @@ pub fn studio_identities() -> ClientIdentities {
     }
 }
 
+/// A keychain item: its user, the account, and its secret.
+pub type KeychainItem = (String, Vec<u8>);
+
+/// A keychain item read, `None` when the keychain holds none for the key.
+pub type KeychainRead = BoxFuture<'static, Result<Option<KeychainItem>, String>>;
+
 /// The OS keychain, one item per key with a user and a secret, as GPUI reaches it.
 pub trait Keychain: Send + Sync + 'static {
-    fn read(&self, key: String) -> BoxFuture<'static, Result<Option<(String, Vec<u8>)>, String>>;
+    fn read(&self, key: String) -> KeychainRead;
     fn write(
         &self,
         key: String,
@@ -72,7 +78,7 @@ enum KeychainRequest {
     Delete(String),
 }
 
-type KeychainReply = oneshot::Sender<Result<Option<(String, Vec<u8>)>, String>>;
+type KeychainReply = oneshot::Sender<Result<Option<KeychainItem>, String>>;
 
 /// The platform's keychain, reachable from any thread: GPUI's credential calls are made on the
 /// main thread, so each request is sent there and answered.
@@ -112,10 +118,7 @@ impl PlatformKeychain {
         Arc::new(Self { requests })
     }
 
-    fn ask(
-        &self,
-        request: KeychainRequest,
-    ) -> BoxFuture<'static, Result<Option<(String, Vec<u8>)>, String>> {
+    fn ask(&self, request: KeychainRequest) -> KeychainRead {
         let (reply, answer) = oneshot::channel();
         let sent = self.requests.unbounded_send((request, reply));
         async move {
@@ -127,7 +130,7 @@ impl PlatformKeychain {
 }
 
 impl Keychain for PlatformKeychain {
-    fn read(&self, key: String) -> BoxFuture<'static, Result<Option<(String, Vec<u8>)>, String>> {
+    fn read(&self, key: String) -> KeychainRead {
         self.ask(KeychainRequest::Read(key))
     }
 
@@ -153,14 +156,14 @@ impl Keychain for PlatformKeychain {
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 pub struct MemoryKeychain {
-    pub items: Mutex<HashMap<String, (String, Vec<u8>)>>,
+    pub items: Mutex<HashMap<String, KeychainItem>>,
     /// Writes are refused, as a keychain that will not keep the sign-in.
     pub refuses_writes: AtomicBool,
 }
 
 #[cfg(any(test, feature = "test-support"))]
 impl Keychain for MemoryKeychain {
-    fn read(&self, key: String) -> BoxFuture<'static, Result<Option<(String, Vec<u8>)>, String>> {
+    fn read(&self, key: String) -> KeychainRead {
         let item = self
             .items
             .lock()
@@ -427,6 +430,16 @@ impl OAuthSource {
     /// publishes a revocation endpoint, revokes the refresh token there, once, within 10
     /// seconds (spec 016, Custody).
     pub(crate) fn sign_out(&self) -> BoxFuture<'static, ()> {
+        self.end(true)
+    }
+
+    /// Ends the sign-in another replaces, for the same target: drops its tokens and revokes its
+    /// refresh token, leaving the keychain item to the sign-in that replaces it.
+    pub(crate) fn replaced(&self) -> BoxFuture<'static, ()> {
+        self.end(false)
+    }
+
+    fn end(&self, forget: bool) -> BoxFuture<'static, ()> {
         let inner = self.inner.clone();
         inner.ended.store(true, Ordering::SeqCst);
         async move {
@@ -435,7 +448,9 @@ impl OAuthSource {
                 held.access = None;
                 held.refresh.take()
             };
-            inner.keychain.delete(inner.key.clone()).await.ok();
+            if forget {
+                inner.keychain.delete(inner.key.clone()).await.ok();
+            }
             if let Some(refresh) = refresh {
                 let service = &inner.service;
                 oauth_client::revoke(
@@ -590,6 +605,8 @@ mod tests {
         admits_nobody: bool,
         /// How long each access token lives.
         lives: u64,
+        /// The sign-in service gives no refresh token.
+        no_refresh: bool,
         /// The tokens the server refused, in order.
         refused: Vec<String>,
         /// Each request, after the name of the client it went through.
@@ -619,8 +636,11 @@ mod tests {
             "org_id": "org_1", "iat": now(), "exp": now() + served.lives,
             "n": served.issued,
         }));
-        let refresh = format!("r{}", served.issued);
         served.accepted.insert(access.clone());
+        if served.no_refresh {
+            return json!({"token_type": "Bearer", "access_token": access, "expires_in": served.lives});
+        }
+        let refresh = format!("r{}", served.issued);
         served.refresh.insert(refresh.clone());
         json!({"token_type": "Bearer", "access_token": access, "expires_in": served.lives, "refresh_token": refresh})
     }
@@ -904,6 +924,31 @@ mod tests {
                 why: None
             }
         );
+
+        // Signed in again, then as another account whose grant gives no refresh token: the
+        // sign-in replaced is revoked, and the keychain keeps no account rather than the old one,
+        // which the next launch would restore.
+        connection.update(cx, |c, cx| c.sign_in(cx));
+        let browser = approve(&served, &cx.opened_url().unwrap());
+        until(cx, "the second sign-in", |cx| {
+            sign_in_state(&connection, cx).0 == ConnectionState::Ready
+        });
+        browser.join().unwrap();
+        assert_eq!(keychain.items.lock().unwrap()[&key].1, b"r2".to_vec());
+        served.lock().unwrap().no_refresh = true;
+        connection.update(cx, |c, cx| c.sign_in(cx));
+        let browser = approve(&served, &cx.opened_url().unwrap());
+        until(cx, "the sign-in as another account", |cx| {
+            matches!(
+                sign_in_state(&connection, cx).1,
+                SignIn::SignedIn { kept: false, .. }
+            ) && sign_in_state(&connection, cx).0 == ConnectionState::Ready
+        });
+        browser.join().unwrap();
+        until(cx, "the replaced sign-in's revocation", |_| {
+            served.lock().unwrap().log.iter().any(|l| l == "revoke r2")
+        });
+        assert!(keychain.items.lock().unwrap().is_empty());
     }
 
     #[gpui::test]
@@ -980,15 +1025,14 @@ mod tests {
             sign_in_state(&connection, cx).0 == ConnectionState::Ready
         });
 
+        // At once, not at a 401 that no read routes to a connection without a token source.
+        served.lock().unwrap().requests.clear();
         let next = through("next", served.clone());
         connection.update(cx, |c, cx| c.replace_http(next, cx));
-        assert_eq!(sign_in_state(&connection, cx).1, SignIn::NotOffered);
-        served.lock().unwrap().requests.clear();
-        // The token lapses: the server refuses it, and the sign-in is found again.
-        served.lock().unwrap().accepted.clear();
-        connection.update(cx, |c, cx| c.connect(cx));
         until(cx, "the sign-in through the new client", |cx| {
-            sign_in_state(&connection, cx).0 == ConnectionState::Ready
+            served.lock().unwrap().issued == 2
+                && matches!(sign_in_state(&connection, cx).1, SignIn::SignedIn { .. })
+                && sign_in_state(&connection, cx).0 == ConnectionState::Ready
         });
         let served = served.lock().unwrap();
         assert_eq!(served.issued, 2, "refreshed from the kept token");
@@ -1041,8 +1085,12 @@ mod tests {
         );
         assert!(keychain.items.lock().unwrap().is_empty());
 
-        // A fresh sign-in the server refuses, and refuses again after one refresh.
+        // A fresh sign-in the server refuses, and refuses again after one refresh. Its tokens
+        // live two seconds, and the server is watched, so a renewal left running would refresh
+        // again after one.
+        let _watch = connection.update(cx, |c, cx| c.watch(cx));
         served.lock().unwrap().admits_nobody = true;
+        served.lock().unwrap().lives = 2;
         connection.update(cx, |c, cx| c.sign_in(cx));
         let browser = approve(&served, &cx.opened_url().unwrap());
         until(cx, "the refusal", |cx| {
@@ -1052,6 +1100,13 @@ mod tests {
         });
         browser.join().unwrap();
         cx.run_until_parked();
+        assert_eq!(sign_in_state(&connection, cx).2, "Not admitted");
+        std::thread::sleep(Duration::from_millis(1200));
+        cx.executor().advance_clock(Duration::from_secs(3));
+        for _ in 0..20 {
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(sign_in_state(&connection, cx).2, "Not admitted");
         let served = served.lock().unwrap();
         assert_eq!(served.issued, 2, "refreshed once, not in a loop");

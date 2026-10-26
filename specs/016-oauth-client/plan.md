@@ -184,7 +184,9 @@ Studio restarts; they hold no secrets.
 - The refresh token goes to the OS keychain, under the target, the issuer and the resource,
   with the account as the item's user: key
   `omnigraph-studio-oauth:<target>#<issuer>#<resource>`. One account is signed in per target;
-  signing in as another replaces it, and a second account is a second CLI target.
+  signing in as another replaces it: the sign-in replaced ends and its refresh token is revoked,
+  and the keychain keeps the new account's refresh token, or none when its grant gave none,
+  never the old account's. A second account is a second CLI target.
 - The access token stays in memory, per target, for at most its lifetime. Neither
   token is written to disk, logs, saved state, links, crash reports or any agent's environment;
   the agent gateway uses Studio's connection, and the agent never sees the token.
@@ -201,7 +203,9 @@ Studio restarts; they hold no secrets.
   would otherwise send an expired one. Nothing refreshes for a server no view reads; the next
   view to show it asks. A renewal replaces the token without counting as another credential, so
   nothing read is read again. A token refreshed after a 401 is a new credential and is tried at
-  once.
+  once. A refused token is not renewed: a renewal runs only while the server is ready, and a 401
+  cancels the one scheduled. A CLI target whose transport changes reads the sign-in again
+  through the new client at once, and refreshes a kept sign-in from the keychain.
 - One refresh runs at a time per target (its client, issuer, resource and account), for
   every view and window; others wait for its answer. These tokens are never mixed with a static token or the
   CLI's credentials.
@@ -329,6 +333,8 @@ Studio restarts; they hold no secrets.
 
 | 2026-10-26 | The client signs in to a real Omnigraph server | `script/dev-sign-in` (Omnigraph v0.14.0 `omnigraph-server --oidc-identity-trust`, a TLS front from its own CA, a stand-in authorization server); `graph_store` `a_real_server_is_signed_in_to_through_the_bed` | The server's own 401 names its metadata; the token is accepted and the graphs list; sign-out revokes; a subject the admission file does not name gets 401 `invalid_token` again after one refresh, shown as Not admitted (Omnigraph #1172) |
 | 2026-10-26 | The protocol rules hold | `oauth_client` tests (RFC 7636 vector, discovery refusals, callback state and `iss`, token claims), `graph_store` `sign_in` tests (browser sign-in, keychain custody, rotation, quiet renewal, `invalid_grant`, one refresh after a refusal, no sign-in over a CLI credential) | Pass; a refreshed token applied as a quiet renewal after a 401 was never sent, found by the bed and fixed with a test that fails without the fix |
+
+| 2026-10-26 | Three review findings on ModernRelay/omnigraph-studio#12 (Cursor Bugbot) hold | `graph_store` `sign_in` tests, each extended to fail without its fix: `a_sign_in_the_service_ended_or_the_server_does_not_admit_is_said` (a watched server with two-second tokens refreshed again after Not admitted), `a_server_that_offers_sign_in_is_signed_in_through_the_browser` (a second account whose grant gives no refresh token left the first account's in the keychain, unrevoked), `a_new_transport_reads_the_sign_in_again_through_it` (after `replace_http`, nothing read the sign-in again until a probe) | Fixed: a 401 cancels the renewal and a renewal runs only while ready; the replaced sign-in is revoked and the keychain item replaced or deleted; `replace_http` reads the sign-in again at once |
 
 ## Corrections
 
