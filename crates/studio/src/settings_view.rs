@@ -986,8 +986,7 @@ fn show_keymap_file(cx: &mut App) {
                 log::error!("{message}");
                 crate::tell(cx, studio_workspace::ToastKind::Error, message);
             }
-        })
-        .ok();
+        });
     })
     .detach();
 }

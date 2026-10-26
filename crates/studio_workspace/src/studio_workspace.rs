@@ -3521,14 +3521,15 @@ impl Workspace {
             .size_full()
             .min_w_0()
             .min_h_0()
-            // An empty pane has nothing to take the keyboard: a click in it makes it active.
-            // Any other is made active by its tab taking the keyboard (`render`).
-            .capture_any_mouse_down(cx.listener(move |this, _, _, cx| {
+            // An empty pane has no tab to take the keyboard: a click in it makes it active and
+            // gives the workspace the keyboard ([`Self::activate_in`]), so the next frame, which
+            // follows the keyboard, keeps it so. Any other is made active by its tab taking the
+            // keyboard (`render`).
+            .capture_any_mouse_down(cx.listener(move |this, _, window, cx| {
                 if this.active_pane != pane_id
                     && this.pane(pane_id).is_some_and(|pane| pane.items.is_empty())
                 {
-                    this.active_pane = pane_id;
-                    cx.notify();
+                    this.activate_in(pane_id, 0, false, window, cx);
                 }
             }))
             .child(self.render_pane_header(pane_id, cx))
@@ -6651,6 +6652,42 @@ mod tests {
             assert!(workspace.pane(second).is_none());
             assert_eq!(workspace.active_pane, first);
         });
+    }
+
+    /// A click in an empty pane makes it the active pane, and it stays so: it takes the keyboard
+    /// from the other pane's tab, which the frames after follow.
+    #[gpui::test]
+    fn a_click_in_an_empty_pane_makes_it_active(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            cx.set_global(StudioSettings::default());
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let (first, second) = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_item("a", window, cx, |_, cx| Split {
+                field: cx.new(|_| Field),
+                part: cx.new(|_| Part { renders: 0 }),
+                caches: false,
+                focus_handle: cx.focus_handle(),
+            });
+            let first = workspace.active_pane;
+            // A split of a tab that is not copied: the new pane is empty.
+            workspace.split(SplitDirection::Right, window, cx);
+            let second = workspace.active_pane;
+            workspace.activate_in(first, 0, true, window, cx);
+            (first, second)
+        });
+        cx.run_until_parked();
+        assert_eq!(workspace.read_with(cx, |w, _| w.active_pane), first);
+        let selector: &'static str = Box::leak(format!("pane-header-{second}").into_boxed_str());
+        let header = cx.debug_bounds(selector).expect("the empty pane is drawn");
+        cx.simulate_click(header.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            workspace.read_with(cx, |w, _| w.active_pane),
+            second,
+            "the click stays"
+        );
     }
 
     /// Closing a tab moves the keyboard only when that tab held it: one closed while the keyboard

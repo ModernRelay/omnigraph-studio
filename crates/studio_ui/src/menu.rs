@@ -1730,7 +1730,7 @@ mod tests {
     /// into view.
     #[gpui::test]
     fn a_long_menu_scrolls_to_the_highlighted_entry(cx: &mut TestAppContext) {
-        cx.update(|cx| studio_theme::init_test(cx));
+        cx.update(studio_theme::init_test);
         let window = cx
             .update(|cx| {
                 cx.open_window(Default::default(), |window, cx| {
