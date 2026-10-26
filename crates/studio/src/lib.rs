@@ -164,8 +164,12 @@ pub fn init(cx: &mut App) {
             open_settings(workspace, window, cx);
         });
         if let Some(updater) = Updater::global(cx) {
-            let status = cx.new(|cx| update_status::UpdateStatus::new(updater, cx));
-            workspace.set_status_item(status.into(), cx);
+            let status = cx.new(|cx| update_status::UpdateStatus::new(updater.clone(), cx));
+            workspace.set_status_item(
+                status.into(),
+                move |cx| update_status::says_something(updater.read(cx)),
+                cx,
+            );
         }
         // GPUI's frame-time overlay exists only with its `profiler` feature, which the `perf`
         // feature turns on: frame times, then their distribution, then hidden again.

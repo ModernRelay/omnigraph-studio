@@ -140,7 +140,8 @@ from the branch the person was on when the session started.
 
 `session/request_permission` for one of Studio's tools is answered with the agent's
 allow-once option at once: reads are read-only and writes have Studio's own approval, so asking
-twice would only add noise. A call is Studio's by what the agent's adapter, named at
+twice would only add noise. A request that offers no allow-once is shown as a card, as any
+other tool's is: Studio never picks a lasting allow, or a refusal, for the person. A call is Studio's by what the agent's adapter, named at
 `initialize`, says it is, never by its title, which the model writes (claude-agent-acp titles
 a shell call with its command): Claude's `_meta.claudeCode.toolName` is
 `mcp__omnigraph__omnigraph_run` or `…omnigraph_cli`, and a Codex MCP call's input names server

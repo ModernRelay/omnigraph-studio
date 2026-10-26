@@ -213,6 +213,12 @@ mod unix {
             Ok(())
         }
 
+        /// Removes the directory `name` when it is empty; one holding anything stays.
+        pub fn remove_dir(&self, name: &str) -> io::Result<()> {
+            rustix::fs::unlinkat(&self.fd, name, AtFlags::REMOVEDIR)?;
+            Ok(())
+        }
+
         /// Sets this directory's own mode.
         pub fn set_mode(&self, mode: u32) -> io::Result<()> {
             rustix::fs::fchmod(&self.fd, Mode::from_raw_mode(mode as _))?;
@@ -410,6 +416,12 @@ mod pinned {
             } else {
                 std::fs::remove_file(&path)
             }
+        }
+
+        /// Removes the directory `name` when it is empty; one holding anything stays. A link to
+        /// a folder, a junction included, is removed as a link, whatever it points at.
+        pub fn remove_dir(&self, name: &str) -> io::Result<()> {
+            std::fs::remove_dir(self.path.join(name))
         }
 
         /// Windows has no mode bits: a folder takes the access its parent gives, which under the

@@ -377,6 +377,12 @@ const BLOB_READ_MAX: u64 = 16 * 1024 * 1024;
 /// table's longest page, 1,000 rows, would need rows of 33 KB each to reach it.
 const QUERY_ANSWER_MAX: usize = 32 * 1024 * 1024;
 
+/// The most of any other read's answer a read takes ([`GraphClient::read`]), as a query's: a
+/// change-feed page (up to 1,000 changes, each with its images), a commit's changes or a diff
+/// page is decoded whole too. The pages Studio asks for stay far below it; a feed read stopped
+/// by it leaves its later commits unknown, and the views over them read again.
+const READ_ANSWER_MAX: usize = QUERY_ANSWER_MAX;
+
 /// A server address as typed, made into the root URL a client is built on: trimmed, without a
 /// trailing slash, and with `http://` (loopback hosts) or `https://` (any other host) when no
 /// scheme was given. Refused unless it is an `http` or `https` URL with a host.
@@ -783,6 +789,7 @@ impl GraphClient {
         }
     }
 
+    /// [`Self::read_capped`] at [`READ_ANSWER_MAX`].
     async fn read<T: DeserializeOwned>(
         &self,
         method: Method,
@@ -790,7 +797,7 @@ impl GraphClient {
         query: &[(&str, &str)],
         body: Option<Vec<u8>>,
     ) -> Result<T, ReadError> {
-        self.read_capped(method, segments, query, body, usize::MAX)
+        self.read_capped(method, segments, query, body, READ_ANSWER_MAX)
             .await
     }
 
@@ -2933,7 +2940,8 @@ mod tests {
     }
 
     /// A query's answer past its cap is refused whole, read one byte past the cap and no
-    /// further; one of exactly the cap decodes. Every query and stored read takes the cap.
+    /// further; one of exactly the cap decodes. Every query and stored read takes the cap, and
+    /// every other read its own (a change-feed page here).
     #[test]
     fn a_query_answer_over_its_cap_is_refused_and_read_no_further() {
         let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2999,6 +3007,15 @@ mod tests {
             .to_string(),
             "The answer is over 32 MB, the most Studio reads at once"
         );
+        read_count();
+        let page = block_on(client.changes("g", "main", FeedAt::Start("after:c1"), &[], 1_000));
+        assert!(matches!(
+            page,
+            Err(ReadError::TooLarge {
+                limit: READ_ANSWER_MAX
+            })
+        ));
+        assert_eq!(read_count(), READ_ANSWER_MAX + 1);
     }
 
     #[test]

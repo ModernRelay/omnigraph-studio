@@ -56,6 +56,9 @@ pub struct StorageInspector {
     /// Counts the reads of the snapshot begun: only the latest one's answer is shown, so an
     /// older read that finishes later does not put back the storage it saw.
     snapshot_reads: u64,
+    /// After a branch change, the inspector shows the snapshot the session reads for that
+    /// branch's counts ([`GraphSession::snapshot_of`]) rather than reading the same one itself.
+    awaiting_counts: bool,
     /// The branch head the session knew when the snapshot shown was asked for. The snapshot
     /// route names no commit, so a head move is measured against this.
     read_at: Option<String>,
@@ -119,7 +122,8 @@ impl StorageInspector {
         // Its storage is the session branch's: another branch's is read at once. The server's
         // health, readiness and graphs are the same on every branch, and stay.
         let subscription = cx.subscribe(&session, |this: &mut Self, _, event, cx| match event {
-            SessionEvent::BranchChanged => this.reload_snapshot(true, cx),
+            SessionEvent::BranchChanged => this.branch_changed(cx),
+            SessionEvent::CountsChanged if this.awaiting_counts => this.take_session_snapshot(cx),
             // A new token may see less than the one the server's state was read with: none of
             // that shows while it is read again under the new one.
             SessionEvent::CredentialChanged => this.reload(cx),
@@ -139,6 +143,7 @@ impl StorageInspector {
             graphs: Loadable::NotLoaded,
             snapshot: Loadable::NotLoaded,
             snapshot_reads: 0,
+            awaiting_counts: false,
             read_at: None,
             newer: false,
             _task: None,
@@ -179,14 +184,38 @@ impl StorageInspector {
         cx.notify();
     }
 
-    /// Reads the storage of the session's branch again, the server's facts kept; `clear` shows
-    /// it reading meanwhile, as for another branch, rather than the storage read last.
-    fn reload_snapshot(&mut self, clear: bool, cx: &mut Context<Self>) {
+    /// The session moved to another branch, and reads that branch's snapshot for its counts:
+    /// the inspector shows that one once it is in. A session that reads none, or whose read
+    /// fails, leaves the inspector to read its own.
+    fn branch_changed(&mut self, cx: &mut Context<Self>) {
+        self.branch = self.session.read(cx).branch.clone();
+        self.snapshot = Loadable::Loading;
+        self._snapshot_task = None;
+        self.begin_snapshot_read(cx);
+        self.awaiting_counts = true;
+        self.take_session_snapshot(cx);
+        cx.notify();
+    }
+
+    /// The session's snapshot of the inspector's branch, while one is awaited after a branch
+    /// change: taken when it is in, or read here when the session's read failed or never began.
+    fn take_session_snapshot(&mut self, cx: &mut Context<Self>) {
+        let session = self.session.read(cx);
+        if let Some(snapshot) = session.snapshot_of(&self.branch) {
+            self.awaiting_counts = false;
+            self.snapshot = Loadable::Loaded(tables_in_order((*snapshot).clone()));
+            cx.notify();
+        } else if matches!(session.snapshot, Loadable::Failed(_) | Loadable::NotLoaded) {
+            self.awaiting_counts = false;
+            self.reload_snapshot(cx);
+        }
+    }
+
+    /// Reads the storage of the session's branch again, the server's facts kept, and the
+    /// storage read last shown meanwhile.
+    fn reload_snapshot(&mut self, cx: &mut Context<Self>) {
         self.branch = self.session.read(cx).branch.clone();
         let branch = self.branch.clone();
-        if clear {
-            self.snapshot = Loadable::Loading;
-        }
         let snapshot_read = self.begin_snapshot_read(cx);
         let read = self
             .session
@@ -660,7 +689,7 @@ impl Render for StorageInspector {
                                 "The branch moved since its storage was read; read it again",
                             ))
                             .on_click(
-                                cx.listener(|this, _, _, cx| this.reload_snapshot(false, cx)),
+                                cx.listener(|this, _, _, cx| this.reload_snapshot(cx)),
                             ),
                         )
                     })
@@ -718,7 +747,8 @@ mod tests {
     }
 
     /// Another writer's commit leaves the storage shown and offers the newer; Refresh reads it
-    /// again, and another branch is read at once.
+    /// again, and another branch is shown at once, from the snapshot the session reads for its
+    /// counts rather than a second read of it.
     #[gpui::test]
     async fn a_head_move_offers_the_newer_snapshot_and_reads_it_only_on_refresh(
         cx: &mut TestAppContext,
@@ -748,7 +778,7 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(state(cx), (1, true, true), "the storage shown stays");
 
-        inspector.update(cx, |inspector, cx| inspector.reload_snapshot(false, cx));
+        inspector.update(cx, |inspector, cx| inspector.reload_snapshot(cx));
         cx.run_until_parked();
         assert_eq!(state(cx), (2, false, false));
         // The head the snapshot was read at, seen again, offers nothing.
@@ -756,16 +786,22 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(state(cx), (2, false, false));
 
+        let snapshots = served.lock().unwrap().snapshot_reads;
         session.update(cx, |session, cx| session.set_branch("feature".into(), cx));
         cx.run_until_parked();
         assert_eq!(
             state(cx),
             (3, false, false),
-            "another branch is read at once"
+            "another branch is shown at once"
         );
+        inspector.read_with(cx, |inspector, _| {
+            assert_eq!(inspector.branch, "feature");
+            assert!(matches!(inspector.snapshot, Loadable::Loaded(_)));
+        });
         assert_eq!(
-            inspector.read_with(cx, |inspector, _| inspector.branch.clone()),
-            "feature"
+            served.lock().unwrap().snapshot_reads,
+            snapshots + 1,
+            "the session's read of the branch's counts, shown here too"
         );
     }
 

@@ -98,7 +98,7 @@ fn open(
     let saved = SavedQueries {
         graph: session
             .as_ref()
-            .map(|session| session.read(cx).overrides_key(cx)),
+            .map(|session| session.read(cx).overrides_key()),
         open: open_paths,
     };
     let handle = cx.entity().downgrade();

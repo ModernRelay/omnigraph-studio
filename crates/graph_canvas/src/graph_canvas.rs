@@ -1543,7 +1543,7 @@ impl GraphCanvas {
             _ => None,
         };
         let names = match &node.kind {
-            SceneKind::Node { node, .. } => self.session.read(cx).type_naming(&node.type_name, cx),
+            SceneKind::Node { node, .. } => self.session.read(cx).type_naming(&node.type_name),
             _ => None,
         };
         ContextMenu::build(window, cx, move |mut menu, _, _| {

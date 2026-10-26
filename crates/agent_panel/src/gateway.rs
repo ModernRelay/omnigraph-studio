@@ -48,7 +48,8 @@ const HEAD_WITHIN: std::time::Duration = if cfg!(test) {
 } else {
     std::time::Duration::from_secs(10)
 };
-/// The most a write's answer may take before the gateway stops reading it for the card.
+/// The most a write's answer may take. A larger one is neither read for the card nor passed on:
+/// its outcome is unknown, and the CLI hears no answer.
 const MAX_WRITE_ANSWER: usize = 8 * 1024 * 1024;
 /// Request headers passed on to the server; the gateway sets the token and contract itself.
 /// `omnigraph-if-actor` (the CLI's `--as`) can only narrow a request: the server refuses it
@@ -352,19 +353,23 @@ async fn handle(
         },
         &shared.sandbox,
     );
+    // Judged: the body is held once from here, as it came, until it is sent.
+    drop(json);
     match verdict {
         Verdict::Refuse(message) => answer(stream, 403, "forbidden", &message).await,
         Verdict::Read => {
-            let response = shared.client.forward(forward_request(&request, None)).await;
-            stream_back(stream, &request.method, response).await;
+            let method = request.method.clone();
+            let response = shared.client.forward(forward_request(request, None)).await;
+            stream_back(stream, &method, response).await;
         }
         Verdict::ReadWith(body) => {
             let body = serde_json::to_vec(&body).unwrap_or_default();
+            let method = request.method.clone();
             let response = shared
                 .client
-                .forward(forward_request(&request, Some(body)))
+                .forward(forward_request(request, Some(body)))
                 .await;
-            stream_back(stream, &request.method, response).await;
+            stream_back(stream, &method, response).await;
         }
         Verdict::Write(write) => {
             // Whoever ran the command, as they are now (`requester`): on Windows the CLI can
@@ -445,7 +450,7 @@ async fn handle(
             // recorded: the conversation stopping, or the CLI going, would otherwise drop it
             // halfway with the server perhaps committing it unseen.
             let client = shared.client.clone();
-            let forward = forward_request(&request, None);
+            let forward = forward_request(request, None);
             let (reply_tx, reply_rx) = oneshot::channel();
             smol::spawn(async move {
                 let response = client.forward(forward).await;
@@ -514,7 +519,9 @@ enum Undecided {
     Stopped,
 }
 
-fn forward_request(request: &Request, body: Option<Vec<u8>>) -> ForwardRequest {
+/// The request as the server is sent it, with `body` in place of the one that came. Taken whole,
+/// so a large body moves into the forward rather than being copied.
+fn forward_request(request: Request, body: Option<Vec<u8>>) -> ForwardRequest {
     let headers = request
         .headers
         .iter()
@@ -526,7 +533,7 @@ fn forward_request(request: &Request, body: Option<Vec<u8>>) -> ForwardRequest {
                 .then(|| ("content-type".to_owned(), "application/json".to_owned())),
         )
         .collect();
-    let body = body.unwrap_or_else(|| request.body.clone());
+    let body = body.unwrap_or(request.body);
     ForwardRequest {
         method: Method::from_bytes(request.method.as_bytes()).unwrap_or(Method::GET),
         path_and_query: request.target.trim_start_matches('/').to_owned(),
@@ -549,12 +556,20 @@ async fn read_write_answer(
         Err(reason) => return (Seen::Unknown(reason), None),
     };
     let mut body = Vec::new();
+    // One byte past the limit tells a whole answer from a cut one.
     let read = (&mut response.body)
-        .take(MAX_WRITE_ANSWER as u64)
+        .take(MAX_WRITE_ANSWER as u64 + 1)
         .read_to_end(&mut body)
         .await;
     if let Err(error) = read {
         return (Seen::Unknown(error.to_string()), None);
+    }
+    if body.len() > MAX_WRITE_ANSWER {
+        let reason = format!(
+            "the server's answer is larger than the {} MiB Studio reads",
+            MAX_WRITE_ANSWER / (1024 * 1024)
+        );
+        return (Seen::Unknown(reason), None);
     }
     // One contract header, as the server sends it; more than one confirms nothing.
     let mut contracts = response
@@ -598,7 +613,16 @@ fn seen_written(json: &Value, kind: WriteKind) -> Seen {
     let commit = match json.get("commit").filter(|commit| !commit.is_null()) {
         None => None,
         Some(commit) => match commit.get("graph_commit_id").and_then(Value::as_str) {
-            Some(id) if !id.is_empty() => Some((id.to_owned(), kind_of(commit))),
+            Some(id) if !id.is_empty() => {
+                // Read as Studio's own writes read it: a kind this build does not know is
+                // `Other`, and a commit without one is no 0.14 receipt.
+                match commit.get("kind").map(CommitKind::deserialize) {
+                    Some(Ok(kind)) => Some((id.to_owned(), kind)),
+                    _ => {
+                        return Seen::Unknown("the receipt names a commit without its kind".into());
+                    }
+                }
+            }
             _ => {
                 return Seen::Unknown("the receipt names a commit without its id".into());
             }
@@ -609,19 +633,6 @@ fn seen_written(json: &Value, kind: WriteKind) -> Seen {
         nodes: count_of(json, "affected_nodes", "nodes"),
         edges: count_of(json, "affected_edges", "edges"),
         branch_created: json.get("branch_created").and_then(Value::as_bool) == Some(true),
-    }
-}
-
-/// A commit's kind, read as Studio's own writes read it: its `kind`, a kind this build does not
-/// know being `Other`. A receipt written before commits had kinds has none; the server reads one
-/// that says `published: false` as a proposal, and so does Studio.
-fn kind_of(commit: &Value) -> CommitKind {
-    match commit.get("kind") {
-        Some(kind) => CommitKind::deserialize(kind).unwrap_or(CommitKind::Other),
-        None if commit.get("published").and_then(Value::as_bool) == Some(false) => {
-            CommitKind::Unpublished
-        }
-        None => CommitKind::Published,
     }
 }
 
@@ -834,7 +845,7 @@ async fn read_request(
 fn too_large() -> ReadFailure {
     ReadFailure::Answer(
         413,
-        "bad_request",
+        "payload_too_large",
         format!(
             "Studio: a request through Studio may carry at most {} MiB. Load in smaller parts. \
              Nothing was sent.",
@@ -923,9 +934,17 @@ fn same(left: &[u8], right: &[u8]) -> bool {
 }
 
 /// A refusal or error the gateway makes itself, as Omnigraph's `ErrorOutput` with the contract
-/// header, so the CLI shows it as a typed error.
+/// header, so the CLI shows it as a typed error. The gateway answers so only before it sends a
+/// request on, so its disposition says nothing took effect: Studio failing to reach the server
+/// (a 5xx) may be tried again, and anything else is fixed first.
 async fn answer(stream: &mut (impl AsyncWrite + Unpin), status: u16, code: &str, message: &str) {
-    let body = serde_json::to_vec(&json!({ "error": message, "code": code })).unwrap_or_default();
+    let action = if status >= 500 { "retry" } else { "fix" };
+    let body = serde_json::to_vec(&json!({
+        "error": message,
+        "code": code,
+        "disposition": { "effects": "none", "action": action },
+    }))
+    .unwrap_or_default();
     write_simple(stream, status, "application/json", &body).await;
 }
 
@@ -1092,7 +1111,7 @@ mod tests {
             body: b"{}".to_vec(),
         };
         assert_eq!(
-            forward_request(&request, None).headers,
+            forward_request(request, None).headers,
             [
                 ("omnigraph-if-actor", "act-person"),
                 ("omnigraph-if-graph-commit", "c1")
@@ -1123,7 +1142,7 @@ mod tests {
                 let mut body = String::new();
                 request.into_body().read_to_string(&mut body).await.unwrap();
                 let answer = if uri.ends_with("/mutate") {
-                    r#"{"branch":"agent/20261013-101500","query_name":"m","affected_nodes":2,"affected_edges":1,"commit":{"graph_commit_id":"c9"}}"#
+                    r#"{"branch":"agent/20261013-101500","query_name":"m","affected_nodes":2,"affected_edges":1,"commit":{"graph_commit_id":"c9","kind":"published"}}"#
                 } else {
                     r#"{"rows":[{"n":200}]}"#
                 };
@@ -1262,7 +1281,7 @@ mod tests {
                         .header(CONTRACT_HEADER, CONTRACT)
                         .header("content-type", "application/json")
                         .body(AsyncBody::from(
-                            r#"{"branch":"agent/20261013-101500","query_name":"m","affected_nodes":1,"affected_edges":0,"commit":{"graph_commit_id":"c9"}}"#,
+                            r#"{"branch":"agent/20261013-101500","query_name":"m","affected_nodes":1,"affected_edges":0,"commit":{"graph_commit_id":"c9","kind":"published"}}"#,
                         ))
                         .unwrap())
                 }
@@ -1427,9 +1446,8 @@ mod tests {
             answer(WriteKind::Mutate, &mutation("null")),
             written(None, 1, 0, false)
         );
-        // The commit's kind is read as Studio's own writes read it: a proposal, a snapshot, one
-        // of a kind this build does not know, said held or not, and, with no kind, a proposal
-        // when it says `published: false`, as the server reads one. The kind decides over
+        // The commit's kind is read as Studio's own writes read it: a proposal, a snapshot, and
+        // one of a kind this build does not know, said held or not. The kind decides over
         // `published`.
         for (commit, kind) in [
             (
@@ -1449,10 +1467,6 @@ mod tests {
                 CommitKind::Other,
             ),
             (
-                r#"{"graph_commit_id":"c3","published":false}"#,
-                CommitKind::Unpublished,
-            ),
-            (
                 r#"{"graph_commit_id":"c3","kind":"published","published":false}"#,
                 CommitKind::Published,
             ),
@@ -1460,6 +1474,19 @@ mod tests {
             assert_eq!(
                 answer(WriteKind::StoredQuery, &mutation(commit)),
                 written(Some(("c3", kind)), 1, 0, false),
+                "{commit}"
+            );
+        }
+        // A commit without a kind, or with one that is no name, is no 0.14 receipt.
+        for commit in [
+            r#"{"graph_commit_id":"c3","published":false}"#,
+            r#"{"graph_commit_id":"c3","kind":7}"#,
+        ] {
+            assert!(
+                matches!(
+                    answer(WriteKind::StoredQuery, &mutation(commit)),
+                    super::Seen::Unknown(_)
+                ),
                 "{commit}"
             );
         }
@@ -1955,6 +1982,14 @@ mod tests {
             );
             let (status, _, body) = call(cli.clone(), huge).await;
             assert_eq!(status, 413, "{body}");
+            // As the server's own errors do, it says what it did: nothing.
+            let refused: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(refused["code"], "payload_too_large", "{body}");
+            assert_eq!(
+                refused["disposition"],
+                json!({ "effects": "none", "action": "fix" }),
+                "{body}"
+            );
             assert_eq!(seen.lock().unwrap().len(), 3, "nothing was sent");
 
             // A stored query the CLI runs as a read on the agent's branch is forwarded as a

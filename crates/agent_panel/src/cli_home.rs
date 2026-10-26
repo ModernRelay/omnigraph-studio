@@ -1,7 +1,8 @@
 //! The agent's `omnigraph` CLI for one conversation (spec 013). A graph's conversations share
 //! one agent process and one working directory, so nothing per conversation can travel in the
 //! agent's environment or in one instructions file. Each conversation gets a directory of its
-//! own, `<cwd>/.studio/<branch>/`:
+//! own, `<cwd>/.studio/<branch>-<random>/`, so two panels on one branch (a conversation open in
+//! two windows, two begun in one second) never write over each other's files:
 //!
 //! - `config.yaml`, Omnigraph's version-1 operator configuration, names this conversation's
 //!   gateway as the server target `studio`, its default, with the graph, at
@@ -45,11 +46,8 @@ pub struct CliHome {
     /// The agent's working directory, and the home's folder in it. The agent writes there too,
     /// so each write opens the folder again by handle (`confined`).
     cwd: PathBuf,
-    folder: String,
-    /// The token and certificate as written, so a later conversation's files in the same folder
-    /// are left alone when this one ends.
-    token: String,
-    certificate: String,
+    /// The folder's name in `.studio`, which no other conversation's home shares.
+    name: String,
     /// The home `omnigraph_run` uses, outside the working directory; its runs stage there too.
     private: PathBuf,
     /// The CLI chosen for the conversation, which `omnigraph_run` starts itself, or why there
@@ -71,6 +69,8 @@ pub struct GatewayAccess<'a> {
     pub certificate: &'a str,
 }
 
+/// A home's operator configuration.
+const CONFIG_FILE: &str = "config.yaml";
 /// The files of a home besides its config: the session token and the gateway's certificate.
 const TOKEN_FILE: &str = "token";
 const CA_FILE: &str = "ca.pem";
@@ -115,13 +115,15 @@ fn config(home: &Path, port: u16, graph: &str) -> String {
 impl Drop for CliHome {
     fn drop(&mut self) {
         // Opened, not made: a folder removed meanwhile is not made again to be cleaned.
-        if let Ok(home) = Confined::open(&self.cwd).and_then(|cwd| cwd.existing_dirs(&self.folder))
-        {
-            for (name, written) in [(TOKEN_FILE, &self.token), (CA_FILE, &self.certificate)] {
-                if home.holds(name, written.as_bytes()) {
+        if let Ok(studio) = Confined::open(&self.cwd).and_then(|cwd| cwd.existing_dirs(".studio")) {
+            // The folder is this conversation's alone: what Studio wrote there goes, then the
+            // folder, unless the agent left a file of its own in it.
+            if let Ok(home) = studio.existing_dirs(&self.name) {
+                for name in [TOKEN_FILE, CA_FILE, CONFIG_FILE, WRAPPER_NAME] {
                     home.remove(name.as_ref()).ok();
                 }
             }
+            studio.remove_dir(&self.name).ok();
         }
         std::fs::remove_dir_all(&self.private).ok();
     }
@@ -139,12 +141,16 @@ impl CliHome {
         branch: &str,
         base: &str,
     ) -> std::io::Result<Self> {
-        let name = branch.replace('/', "-");
+        let name = format!(
+            "{}-{}",
+            branch.replace('/', "-"),
+            crate::confined::random_hex(4)?
+        );
         let dir = cwd.join(".studio").join(&name);
         // Each home names its own files, by their absolute paths.
         let fill = |home: &Confined, at: &Path| -> std::io::Result<()> {
             let config = config(at, gateway.port, graph);
-            home.write("config.yaml", config.as_bytes(), 0o600)?;
+            home.write(CONFIG_FILE, config.as_bytes(), 0o600)?;
             home.write(TOKEN_FILE, gateway.token.as_bytes(), 0o600)?;
             home.write(CA_FILE, gateway.certificate.as_bytes(), 0o600)?;
             Ok(())
@@ -159,10 +165,9 @@ impl CliHome {
         std::fs::create_dir_all(private_root)?;
         let root = Confined::open(private_root)?;
         root.set_mode(0o700)?;
-        let folder = format!("{name}-{}", crate::confined::random_hex(8)?);
-        let own = root.dir(&folder)?;
+        let own = root.dir(&name)?;
         own.set_mode(0o700)?;
-        let private = private_root.join(folder);
+        let private = private_root.join(&name);
         fill(&own, &private)?;
 
         Ok(Self {
@@ -172,9 +177,7 @@ impl CliHome {
             branch: branch.to_owned(),
             base: base.to_owned(),
             cwd: cwd.to_owned(),
-            folder: format!(".studio/{name}"),
-            token: gateway.token.to_owned(),
-            certificate: gateway.certificate.to_owned(),
+            name,
             private,
             cli: std::sync::Mutex::new(Err("Studio has not chosen an omnigraph CLI yet.".into())),
             wrapper_runs: std::sync::atomic::AtomicBool::new(true),
@@ -218,7 +221,7 @@ impl CliHome {
 
     /// The home's folder, opened by handle.
     fn home(&self) -> std::io::Result<Confined> {
-        Confined::open(&self.cwd)?.dirs(&self.folder)
+        Confined::open(&self.cwd)?.dirs(&format!(".studio/{}", self.name))
     }
 
     /// Points the wrapper and `omnigraph_run` at `cli`: whether the wrapper runs it. On Windows
@@ -360,8 +363,7 @@ pub fn write_agents_md(cwd: &Path, graph: &str) -> std::io::Result<()> {
          publishing or dropping commits are refused. The person merges your branch in Studio's \
          review.\n\n\
          ## Outcomes\n\n\
-         - A refusal from Studio says \"Nothing was sent\": nothing was written, even when the \
-         CLI also prints `effects: unknown`.\n\
+         - A refusal from Studio says \"Nothing was sent\": nothing was written.\n\
          - `effects: unknown` on a write Studio sent means the server's answer was lost. Check \
          `commit list --branch <your branch>` before trying again; never repeat a write blindly.\n\
          - \"server discovery connection failed\" means your sandbox has no network access. \
@@ -914,6 +916,36 @@ fn split_flag(arg: &str) -> (&str, Option<&str>) {
         flag,
         (!rest.is_empty()).then(|| rest.strip_prefix('=').unwrap_or(rest)),
     )
+}
+
+/// The query text an `omnigraph_run` call's arguments give, read as the CLI's parser reads `-e`
+/// and `--query-string`: before their value (`-e TEXT`), or with it (`-eTEXT`, `-e=TEXT`,
+/// `--query-string=TEXT`). The positions of the arguments that give it, and the text; none for
+/// a flag whose next argument is a flag of its own, or after `--`, where every argument is a
+/// value.
+pub fn query_string<'a>(
+    args: impl IntoIterator<Item = &'a str>,
+) -> Option<(std::ops::Range<usize>, &'a str)> {
+    let mut args = args.into_iter().enumerate();
+    while let Some((at, arg)) = args.next() {
+        if arg == "--" {
+            return None;
+        }
+        if !arg.starts_with('-') || arg == "-" {
+            continue;
+        }
+        let (flag, joined) = split_flag(arg);
+        if flag == "-e" || flag == "--query-string" {
+            return match joined {
+                Some(text) => Some((at..at + 1, text)),
+                None => args
+                    .next()
+                    .filter(|(_, text)| !text.starts_with('-') || *text == "-")
+                    .map(|(_, text)| (at..at + 2, text)),
+            };
+        }
+    }
+    None
 }
 
 /// Why `omnigraph_run` does not pass `flag` to `command`, or before a command's words when
@@ -2653,7 +2685,9 @@ mod tests {
             "main",
         )
         .unwrap();
-        assert_eq!(home.dir, cwd.join(".studio/agent-20261013-101500"));
+        assert_eq!(home.dir.parent(), Some(cwd.join(".studio").as_path()));
+        let folder = home.dir.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(folder.starts_with("agent-20261013-101500-"), "{folder}");
         let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&home.dir), 0o700);
         for name in ["config.yaml", TOKEN_FILE, CA_FILE] {
@@ -2718,6 +2752,27 @@ mod tests {
             "{env}"
         );
 
+        // Another panel on the branch (the conversation opened in a second window) has a home
+        // of its own: ending it leaves this one's files, and removes its folder.
+        let other = CliHome::write(
+            &cwd,
+            &cwd.join("private"),
+            access(49153, "def456"),
+            "knowledge",
+            "agent/20261013-101500",
+            "main",
+        )
+        .unwrap();
+        assert_ne!(other.dir, home.dir);
+        let other_dir = other.dir.clone();
+        drop(other);
+        assert!(!other_dir.exists(), "its folder goes with it");
+        assert_eq!(
+            std::fs::read_to_string(home.dir.join(TOKEN_FILE)).unwrap(),
+            "abc123"
+        );
+        assert!(home.dir.join(CONFIG_FILE).is_file());
+
         // Claude Code keeps the first 2,048 characters of a server's instructions, so the
         // server's and the conversation's fit, with a long data directory in the command path.
         // Windows's batch file adds a note on its arguments, and its name is longer; a working
@@ -2725,7 +2780,7 @@ mod tests {
         // turns the agent to omnigraph_run.
         let long = cwd
             .join("d".repeat(120))
-            .join(".studio/agent-20261013-101500");
+            .join(".studio/agent-20261013-101500-0123abcd");
         let network =
             PathBuf::from(r"\\server\share\ada\AppData\Roaming\Omnigraph Studio\agent\graphs\g");
         for (windows, wrapper, at, runs) in [
@@ -2741,9 +2796,7 @@ mod tests {
                 branch: "agent/20261013-101500".into(),
                 base: "b".repeat(64),
                 cwd: at.clone(),
-                folder: ".studio/agent-20261013-101500".into(),
-                token: String::new(),
-                certificate: String::new(),
+                name: "agent-20261013-101500-0123abcd".into(),
                 private: cwd.join("private/longest"),
                 cli: std::sync::Mutex::new(Err(String::new())),
                 wrapper_runs: std::sync::atomic::AtomicBool::new(runs),

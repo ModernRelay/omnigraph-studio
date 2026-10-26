@@ -322,14 +322,22 @@ impl CommitView {
                 }
             };
             let read_any = fold.raw_changes() > start;
-            // Finished, counted and laid out off the main thread; the fold is kept for the
-            // next pages.
+            // Finished, counted and laid out off the main thread. The fold is kept for the next
+            // pages while there are more, which needs a copy of it to finish; with the last page
+            // in it is finished itself, so the commit's changes are held once.
+            let more = token.is_some();
             let schema = session.read_with(cx, |session, _| session.schema_model());
             let made_with = schema.clone();
             let (fold, folded, groups, runs, counts, rows) = cx
                 .background_executor()
                 .spawn(async move {
-                    let folded = fold.clone().finish();
+                    let (fold, folded) = if more {
+                        let folded = fold.clone().finish();
+                        (fold, folded)
+                    } else {
+                        // Nothing is read after the last page.
+                        (ChangeFold::new(), fold.finish())
+                    };
                     let counts = folded.counts();
                     let groups = EntityGroups::new(&folded, schema.as_deref());
                     let (rows, runs) = change_cards::rows(&folded, &groups, |_| true);

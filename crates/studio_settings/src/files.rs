@@ -74,8 +74,8 @@ pub fn write_atomic_in_turn(path: PathBuf, contents: Vec<u8>, access: Access) {
 }
 
 /// Runs `job` on the write thread, after every write asked for before it: a read, edit and
-/// write of a file that must not interleave with another's.
-pub(crate) fn run_in_turn(job: impl FnOnce() + Send + 'static) {
+/// write of a file that must not interleave with another's, or what follows writes landing.
+pub fn run_in_turn(job: impl FnOnce() + Send + 'static) {
     writer().send(Job::Run(Box::new(job))).ok();
 }
 
@@ -180,13 +180,20 @@ fn replace(
 }
 
 /// Moves a file Studio could not read out of the way, to `<name>.unreadable-<seconds>` beside
-/// it, so the next save does not overwrite what the person may want back. Returns where it went.
+/// it, so the next save does not overwrite what the person may want back. One set aside in the
+/// same second is kept: this one takes the next free number (`…-<seconds>-2`). Anything else
+/// in the way (a folder) stops it, as a file held open does on Windows. Returns where it went.
 pub fn set_aside(path: &Path) -> Option<PathBuf> {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
     let name = path.file_name()?.to_string_lossy();
-    let aside = path.with_file_name(format!("{name}.unreadable-{seconds}"));
+    let aside = (1..=1000)
+        .map(|n| match n {
+            1 => path.with_file_name(format!("{name}.unreadable-{seconds}")),
+            n => path.with_file_name(format!("{name}.unreadable-{seconds}-{n}")),
+        })
+        .find(|aside| !aside.symlink_metadata().is_ok_and(|taken| !taken.is_dir()))?;
     std::fs::rename(path, &aside).ok()?;
     Some(aside)
 }
@@ -313,6 +320,18 @@ mod tests {
                 .starts_with("session.json.unreadable-")
         );
         assert_eq!(std::fs::read_to_string(&aside).unwrap(), "{ not json");
+        // Set aside again in the same second, it keeps those before: it takes the next free
+        // number.
+        std::fs::write(&path, "{ again").unwrap();
+        let first = aside.file_name().unwrap().to_string_lossy().into_owned();
+        let after_it = aside.with_file_name(format!("{first}-2"));
+        std::fs::write(&after_it, "taken").unwrap();
+        let again = set_aside(&path).unwrap();
+        assert_ne!(again, aside);
+        assert_ne!(again, after_it);
+        assert_eq!(std::fs::read_to_string(&aside).unwrap(), "{ not json");
+        assert_eq!(std::fs::read_to_string(&after_it).unwrap(), "taken");
+        assert_eq!(std::fs::read_to_string(&again).unwrap(), "{ again");
         std::fs::remove_dir_all(&dir).ok();
     }
 

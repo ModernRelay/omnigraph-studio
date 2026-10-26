@@ -471,6 +471,13 @@ async fn serve_connection(
         }
     }
     drop(replies_tx);
+    // The agent's connection is gone, and no answer can reach it: a call still out stops as its
+    // cancellation would stop it.
+    if let Ok(mut cancels) = cancels.lock() {
+        for (_, cancel) in cancels.drain() {
+            cancel.send(()).ok();
+        }
+    }
     for call in calls {
         call.await;
     }

@@ -171,7 +171,9 @@ Agents (claude-agent-acp 0.89.1 with Claude Agent SDK 0.3.293; codex-acp 2.2.2 w
 A graph's conversations share one agent process and one working directory
 (`<data dir>/agent/graphs/<graph>/`; on Windows under `%LOCALAPPDATA%`, below), so nothing per
 conversation can travel in the agent's environment or in one instructions file. Each
-conversation gets `<cwd>/.studio/<agent branch with / as ->/` (mode `0700`):
+conversation gets `<cwd>/.studio/<agent branch with / as ->-<8 random hex>/` (mode `0700`), its own
+even when two panels write to one branch (a conversation open in two windows); ended, it removes
+what Studio wrote there and the folder once empty:
 
 ```yaml
 # config.yaml (0600): Omnigraph's version-1 operator configuration

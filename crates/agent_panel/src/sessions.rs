@@ -80,6 +80,9 @@ pub struct AgentSessions {
     unread: HashSet<String>,
     /// Conversations deleted in this run: an open tab of one closes.
     deleted: HashSet<String>,
+    /// Agent branches given to conversations begun in this run, by graph, before their records
+    /// are written at Ready ([`Self::claim_branch`]).
+    claimed: HashSet<(String, String)>,
 }
 
 struct GlobalSessions(Entity<AgentSessions>);
@@ -114,6 +117,7 @@ impl AgentSessions {
             live: HashMap::new(),
             unread: HashSet::new(),
             deleted: HashSet::new(),
+            claimed: HashSet::new(),
         }
     }
 
@@ -322,21 +326,28 @@ impl AgentSessions {
         self.deleted.contains(session)
     }
 
-    /// `name`, or `name-2`, `name-3`, … when another of `graph`'s conversations writes to it:
-    /// an agent branch is named after the second a conversation began, which two can share.
-    pub fn unused_branch(&self, graph: &str, name: String) -> String {
+    /// `name`, or `name-2`, `name-3`, … when another of `graph`'s conversations writes to it,
+    /// recorded or begun in this run, and now this one's: an agent branch is named after the
+    /// second a conversation began, which two can share.
+    pub fn claim_branch(&mut self, graph: &str, name: String) -> String {
         let taken = |candidate: &str| {
-            self.records
-                .iter()
-                .any(|record| record.graph == graph && record.branch == candidate)
+            self.claimed
+                .contains(&(graph.to_owned(), candidate.to_owned()))
+                || self
+                    .records
+                    .iter()
+                    .any(|record| record.graph == graph && record.branch == candidate)
         };
-        if !taken(&name) {
-            return name;
-        }
-        (2..)
-            .map(|n| format!("{name}-{n}"))
-            .find(|candidate| !taken(candidate))
-            .expect("a free name")
+        let name = if taken(&name) {
+            (2..)
+                .map(|n| format!("{name}-{n}"))
+                .find(|candidate| !taken(candidate))
+                .expect("a free name")
+        } else {
+            name
+        };
+        self.claimed.insert((graph.to_owned(), name.clone()));
+        name
     }
 
     /// Adds conversations the agent knows and the list does not; returns how many were new.
@@ -344,7 +355,7 @@ impl AgentSessions {
         let mut added = 0;
         for mut record in records {
             if self.get(&record.session).is_none() && !self.deleted.contains(&record.session) {
-                record.branch = self.unused_branch(&record.graph, record.branch);
+                record.branch = self.claim_branch(&record.graph, record.branch);
                 self.records.push(record);
                 added += 1;
             }
@@ -797,10 +808,16 @@ mod tests {
             assert_eq!(store.get("same-a").unwrap().branch, second);
             assert_eq!(store.get("same-b").unwrap().branch, format!("{second}-2"));
             assert_eq!(
-                store.unused_branch("server/crm", second.into()),
+                store.claim_branch("server/crm", second.into()),
                 format!("{second}-3")
             );
-            assert_eq!(store.unused_branch("server/notes", second.into()), second);
+            // Claimed before its record is written: the next one begun that second is told
+            // apart too.
+            assert_eq!(
+                store.claim_branch("server/crm", second.into()),
+                format!("{second}-4")
+            );
+            assert_eq!(store.claim_branch("server/notes", second.into()), second);
         });
         // A write that ended after its tab closed records that its branch exists, only while
         // the conversation still writes to that branch.

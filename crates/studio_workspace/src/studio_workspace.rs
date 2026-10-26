@@ -288,6 +288,13 @@ enum Zoomed {
     Dock(PanelPosition),
 }
 
+/// The view at the right of the status bar ([`Workspace::set_status_item`]), and whether it
+/// has anything to say now.
+struct StatusItem {
+    view: AnyView,
+    shown: Box<dyn Fn(&App) -> bool>,
+}
+
 pub struct Workspace {
     session: Option<Entity<GraphSession>>,
     /// The other graphs open in this window, and every open graph's session in the order they
@@ -345,7 +352,7 @@ pub struct Workspace {
     /// default), read every two seconds while the window is in front.
     performance: Option<Performance>,
     /// A view of the window's own at the right of the status bar: the updater's (spec 017).
-    status_item: Option<AnyView>,
+    status_item: Option<StatusItem>,
     /// Whether this window is in front, which the memory and CPU reading waits for.
     window_active: bool,
     _performance: Option<Task<()>>,
@@ -2144,10 +2151,19 @@ impl Workspace {
         }
     }
 
-    /// The view drawn at the right of the status bar in every state, before the memory and CPU
-    /// readout: the updater's (spec 017).
-    pub fn set_status_item(&mut self, view: AnyView, cx: &mut Context<Self>) {
-        self.status_item = Some(view);
+    /// The view drawn at the right of the status bar in every state, with the memory and CPU
+    /// readout on the window's side of its rule: the updater's (spec 017). `shown` says whether
+    /// it has anything to say now; while it has not, it and its rule take no room.
+    pub fn set_status_item(
+        &mut self,
+        view: AnyView,
+        shown: impl Fn(&App) -> bool + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.status_item = Some(StatusItem {
+            view,
+            shown: Box::new(shown),
+        });
         cx.notify();
     }
 
@@ -3634,6 +3650,13 @@ impl Workspace {
         let docks_right = shown && !(self.bottom.panels.is_empty() && self.right.panels.is_empty());
         let has_end = !status.end.is_empty();
         let performance = self.render_performance();
+        let item = self
+            .status_item
+            .as_ref()
+            .filter(|item| (item.shown)(cx))
+            .map(|item| item.view.clone());
+        // The window's side of the bar: its own item and the memory and CPU readout.
+        let readout = item.is_some() || performance.is_some();
         // Zed's 4 px between the left side's items, which are chips with padding of their own;
         // the right side's are bare text, so they keep 8 px, and a rule sets the window's
         // readout apart from the tab's facts.
@@ -3677,10 +3700,10 @@ impl Workspace {
                         }),
                 )
             })
-            .children(self.status_item.clone())
-            .when(has_end && performance.is_some(), |bar| {
+            .when(has_end && readout, |bar| {
                 bar.child(studio_ui::ds::divider_v(cx))
             })
+            .children(item)
             .children(performance)
             .when(docks_right, |bar| {
                 bar.child(studio_ui::ds::divider_v(cx))
@@ -4251,7 +4274,7 @@ fn address_of(session: &Entity<GraphSession>, cx: &App) -> (String, String) {
 /// name and address and its id (`GraphSession::overrides_key`), as the saved windows name the
 /// graph and its settings, saved queries and conversations are filed (spec 002).
 fn saved_key_of(session: &Entity<GraphSession>, cx: &App) -> String {
-    session.read(cx).overrides_key(cx)
+    session.read(cx).overrides_key()
 }
 
 /// The button on a committed write's toast: Undo for a delete Studio can put back (History
@@ -5501,7 +5524,7 @@ mod tests {
     }
 
     /// The window's own status item (the updater's, spec 017) is drawn in the status bar,
-    /// with no graph open as with one.
+    /// with no graph open as with one, and only while it has something to say.
     #[gpui::test]
     fn the_status_item_is_drawn_in_the_status_bar(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
@@ -5509,12 +5532,19 @@ mod tests {
             studio_settings::init_test(cx);
         });
         let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let says = Rc::new(std::cell::Cell::new(true));
         workspace.update(cx, |workspace, cx| {
             let probe = cx.new(|_| StatusProbe);
-            workspace.set_status_item(probe.into(), cx);
+            let shown = says.clone();
+            workspace.set_status_item(probe.into(), move |_| shown.get(), cx);
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("status-probe").is_some());
+        // With nothing to say, it is not drawn, so it takes no room in the bar.
+        says.set(false);
+        workspace.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("status-probe").is_none());
     }
 
     /// Restart to Update asks as Quit does when a tab holds unsaved work (spec 017), in its

@@ -182,7 +182,10 @@ pub fn candidates() -> Vec<PathBuf> {
         push(path);
     }
     if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
+        // An empty or relative entry (`.`) names Studio's own working directory, which no one
+        // chose to hold the CLI, and a program found there runs again by its relative path:
+        // only absolute directories are looked in, as the Windows launcher does.
+        for dir in std::env::split_paths(&path).filter(|dir| dir.is_absolute()) {
             push(dir.join(CLI_NAME));
         }
     }

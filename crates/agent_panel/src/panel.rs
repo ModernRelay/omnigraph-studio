@@ -64,23 +64,6 @@ const STOPPED_UNSENT: &str = "Not sent: the agent stopped before you decided.";
 /// take seconds; one past this has most likely stalled.
 const SLOW_START: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// Whether a message sent before the agent is ready opens the conversation, shown in the thread
-/// at once ([`AgentPanel::opening`]), rather than waiting in the queue: only when nothing was
-/// sent before it, so the messages go in the order they were sent.
-fn opens(has_opening: bool, queue_holds: bool) -> bool {
-    !has_opening && !queue_holds
-}
-
-/// The write card the approval keys answer: the one waiting longest. A permission request of
-/// the agent's own is answered only by its buttons: there the agent's "always" option is a
-/// lasting rule of its own, which ⌘⌥Y, Always on this branch for a write, must not pick
-/// unseen.
-fn keyed_write(entries: &[Entry]) -> Option<usize> {
-    entries.iter().position(
-        |entry| matches!(entry, Entry::Write(card) if matches!(card.state, WriteState::Waiting(_))),
-    )
-}
-
 /// What a forwarded write's outcome is applied to: its card, what it is, and the agent's branch
 /// it went to with that branch's base.
 #[derive(Debug, Clone)]
@@ -201,7 +184,7 @@ pub fn open(
         workspace.activate_item_by_id(panel.entity_id(), window, cx);
         return Some(panel);
     }
-    let graph = workspace.session()?.read(cx).overrides_key(cx);
+    let graph = workspace.session()?.read(cx).overrides_key();
     let agent = StudioSettings::get(cx).agent.command.join(" ");
     let sessions = AgentSessions::global(cx);
     let latest = sessions
@@ -460,6 +443,8 @@ struct Entries {
     stale_from: usize,
     /// Counts the changes: a draw that finds it as it last was has nothing to bring up to date.
     version: u64,
+    /// No entry before this one waits for the person ([`Entries::first_waiting`]).
+    answered_before: std::cell::Cell<usize>,
 }
 
 impl std::ops::Deref for Entries {
@@ -513,6 +498,7 @@ impl Entries {
         self.list.clear();
         self.hashes.clear();
         self.stale_from = 0;
+        self.answered_before.set(0);
     }
 
     /// Takes the entries from `at` on out of the thread.
@@ -521,7 +507,34 @@ impl Entries {
         self.version += 1;
         self.hashes.truncate(at);
         self.stale_from = self.stale_from.min(at);
+        // Put back, a card taken may wait again where it was.
+        self.answered_before.set(self.answered_before.get().min(at));
         self.list.split_off(at)
+    }
+
+    /// The first card waiting for the person that `also` holds for. A card waits from when it
+    /// is added, at the end, until it is answered, and never again, so the search starts past
+    /// the cards found answered before: asked on every change, as each streamed token makes
+    /// one, it looks at the cards still waiting, not the whole conversation.
+    fn first_waiting(&self, also: impl Fn(&Entry) -> bool) -> Option<usize> {
+        let from = self.answered_before.get().min(self.list.len());
+        let first = self.list[from..]
+            .iter()
+            .position(Entry::waits)
+            .map_or(self.list.len(), |at| from + at);
+        self.answered_before.set(first);
+        self.list[first..]
+            .iter()
+            .position(|entry| entry.waits() && also(entry))
+            .map(|at| first + at)
+    }
+
+    /// The write card the approval keys answer: the one waiting longest. A permission request
+    /// of the agent's own is answered only by its buttons: there the agent's "always" option is
+    /// a lasting rule of its own, which ⌘⌥Y, Always on this branch for a write, must not pick
+    /// unseen.
+    fn keyed_write(&self) -> Option<usize> {
+        self.first_waiting(|entry| matches!(entry, Entry::Write(_)))
     }
 
     fn extend(&mut self, entries: Vec<Entry>) {
@@ -1157,17 +1170,19 @@ impl AgentPanel {
             }
             saved => saved,
         };
-        let graph_key = self.session.read(cx).overrides_key(cx);
+        let graph_key = self.session.read(cx).overrides_key();
         let cwd = crate::sessions::working_dir(saved.as_ref(), &graph_key);
         let base = self.session.read(cx).branch.clone();
         // A resumed conversation keeps writing to its branch.
         let branch = match &saved {
             Some(saved) => AgentBranch::resumed(saved, base),
             None => AgentBranch {
-                name: self.sessions.read(cx).unused_branch(
-                    &graph_key,
-                    format!("agent/{}", chrono::Local::now().format("%Y%m%d-%H%M%S")),
-                ),
+                name: self.sessions.update(cx, |sessions, _| {
+                    sessions.claim_branch(
+                        &graph_key,
+                        format!("agent/{}", chrono::Local::now().format("%Y%m%d-%H%M%S")),
+                    )
+                }),
                 base,
                 created: false,
                 changes: 0,
@@ -1448,7 +1463,7 @@ impl AgentPanel {
         let now = chrono::Utc::now();
         let record = SessionRecord {
             session: session.clone(),
-            graph: self.session.read(cx).overrides_key(cx),
+            graph: self.session.read(cx).overrides_key(),
             agent: Self::command(cx).join(" "),
             title: None,
             title_override: None,
@@ -1896,11 +1911,12 @@ impl AgentPanel {
         cx.notify();
     }
 
-    /// A message sent before the agent is ready for it. With nothing waiting already it is the
-    /// opening ([`Self::opening`]): shown in the thread at once and sent as soon as the agent is
-    /// ready. Any other waits in the queue, behind it.
+    /// A message sent before the agent is ready for it. With nothing waiting already, neither an
+    /// opening nor messages kept in the queue across a stop, it is the opening
+    /// ([`Self::opening`]): shown in the thread at once and sent as soon as the agent is ready.
+    /// Any other waits in the queue, behind it, so the messages go in the order they were sent.
     fn hold_until_ready(&mut self, text: String, first: bool) {
-        if opens(self.opening.is_some(), self.queue.holds_messages()) {
+        if self.opening.is_none() && !self.queue.holds_messages() {
             self.opening = Some(text);
             self.thread.scroll_to_end();
         } else {
@@ -1976,6 +1992,9 @@ impl AgentPanel {
         {
             self.queue.send_after_cancel(text);
             host.commands.unbounded_send(HostCommand::Cancel).ok();
+            // As Stop does: a run the cancelled turn started (a load waiting on its card) must
+            // not land after the new message, which no turn would hear of.
+            self.stop_runs();
             self.entries.cancel_permissions();
             cx.notify();
         } else {
@@ -2045,7 +2064,7 @@ impl AgentPanel {
 
     /// The oldest card still waiting for the person.
     fn pending_index(&self) -> Option<usize> {
-        self.entries.iter().position(Entry::waits)
+        self.entries.first_waiting(|_| true)
     }
 
     /// What closing the tab would drop: a draft in the composer, a message waiting its turn,
@@ -2084,19 +2103,19 @@ impl AgentPanel {
     }
 
     fn allow(&mut self, _: &Allow, _window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(index) = keyed_write(&self.entries) {
+        if let Some(index) = self.entries.keyed_write() {
             self.decide(index, Decision::Allow, cx);
         }
     }
 
     fn allow_always(&mut self, _: &AllowAlways, _window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(index) = keyed_write(&self.entries) {
+        if let Some(index) = self.entries.keyed_write() {
             self.decide(index, Decision::AllowAlways, cx);
         }
     }
 
     fn reject(&mut self, _: &Reject, _window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(index) = keyed_write(&self.entries) {
+        if let Some(index) = self.entries.keyed_write() {
             self.decide(index, Decision::Reject, cx);
         }
     }
@@ -3177,30 +3196,29 @@ fn gutter_row(icon: Option<Icon>, content: impl IntoElement) -> Div {
         .child(div().flex_1().min_w_0().child(content))
 }
 
-/// An `omnigraph_run` call's subcommand and the query text it gives with `-e`, read without
-/// copying them.
+/// An `omnigraph_run` call's subcommand and the query text it gives
+/// ([`cli_home::query_string`]), read without copying them. Arguments that are not text, which
+/// `omnigraph_run` refuses, are passed over.
 fn query_text(entry: &Entry) -> Option<(&str, &str)> {
     let args = run_args(entry)?;
     let command = args.first()?.as_str()?;
-    let at = args.iter().position(|arg| arg.as_str() == Some("-e"))?;
-    Some((command, args.get(at + 1)?.as_str()?))
+    let (_, text) = cli_home::query_string(args.iter().filter_map(Value::as_str))?;
+    Some((command, text))
 }
 
 /// An `omnigraph_run` call shown with its query: the subcommand ("query", "mutate"), the
-/// query text given with `-e`, and the other arguments on one line.
+/// query text ([`query_text`]), and the other arguments on one line.
 fn shown_query(entry: &Entry) -> Option<(String, String, String)> {
     let args: Vec<&str> = run_args(entry)?.iter().filter_map(Value::as_str).collect();
-    let at = args.iter().position(|arg| *arg == "-e")?;
-    let text = (*args.get(at + 1)?).to_owned();
-    let command = (*args.first()?).to_owned();
+    let (at, text) = cli_home::query_string(args.iter().copied())?;
     let rest = args
         .iter()
         .enumerate()
-        .filter(|(index, _)| *index != 0 && *index != at && *index != at + 1)
+        .filter(|(index, _)| *index != 0 && !at.contains(index))
         .map(|(_, arg)| *arg)
         .collect::<Vec<_>>()
         .join(" ");
-    Some((command, text, rest))
+    Some(((*args.first()?).to_owned(), text.to_owned(), rest))
 }
 
 /// An `omnigraph_run` call's arguments.
@@ -3217,11 +3235,7 @@ fn run_args(entry: &Entry) -> Option<&Vec<Value>> {
 /// Whether [`shown_query`] shows the entry, read without copying its text: on every render,
 /// for every tool call in the thread.
 fn shows_query(entry: &Entry) -> bool {
-    let mut args = run_args(entry)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str);
-    args.by_ref().any(|arg| arg == "-e") && args.next().is_some()
+    query_text(entry).is_some()
 }
 
 /// Whether the query call at `index` has its text on the write card the gateway made for it,
@@ -3740,13 +3754,10 @@ impl AgentPanel {
         start..end
     }
 
-    /// A finished turn's actions under its last reply, after the reference chat's: copy the
-    /// turn's reply, and how many tools the agent called for it, muted. There is no retry or
-    /// rating: the agent offers neither.
-    fn render_turn_actions(&self, index: usize) -> AnyElement {
-        let turn = self.turn_of(index);
-        let entries = &self.entries[turn];
-        let reply: String = entries
+    /// The reply of the turn entry `index` is in: its agent messages, each trimmed, a blank line
+    /// apart.
+    fn turn_reply(&self, index: usize) -> String {
+        self.entries[self.turn_of(index)]
             .iter()
             .filter_map(|entry| match entry {
                 Entry::Agent(text) => Some(text.trim()),
@@ -3754,11 +3765,19 @@ impl AgentPanel {
             })
             .filter(|text| !text.is_empty())
             .collect::<Vec<_>>()
-            .join("\n\n");
-        let tools = entries
+            .join("\n\n")
+    }
+
+    /// A finished turn's actions under its last reply, after the reference chat's: copy the
+    /// turn's reply, and how many tools the agent called for it, muted. There is no retry or
+    /// rating: the agent offers neither. The reply is put together when Copy is clicked, not
+    /// on every frame the turn's end is drawn.
+    fn render_turn_actions(&self, index: usize, cx: &Context<Self>) -> AnyElement {
+        let tools = self.entries[self.turn_of(index)]
             .iter()
             .filter(|entry| matches!(entry, Entry::Tool { .. }))
             .count();
+        let panel = cx.entity().downgrade();
         h_flex()
             .gap(px(ds::space::SM))
             .items_center()
@@ -3767,7 +3786,10 @@ impl AgentPanel {
                     .icon_color(Color::Muted)
                     .tooltip(Tooltip::text("Copy the reply"))
                     .on_click(move |_, _, cx| {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(reply.clone()))
+                        if let Some(panel) = panel.upgrade() {
+                            let reply = panel.read(cx).turn_reply(index);
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(reply));
+                        }
                     }),
             )
             .when(tools > 0, |row| {
@@ -3909,7 +3931,7 @@ impl AgentPanel {
                 Some(entry) if ends => v_flex()
                     .gap(px(ds::space::SM))
                     .child(self.render_entry(index, entry, lead, window, cx))
-                    .child(gutter_row(None, self.render_turn_actions(index)))
+                    .child(gutter_row(None, self.render_turn_actions(index, cx)))
                     .into_any_element(),
                 Some(entry) => self.render_entry(index, entry, lead, window, cx),
                 None => div().into_any_element(),
@@ -4445,8 +4467,8 @@ impl AgentPanel {
                 .children(params)
         });
         // The keys answer the write card waiting longest; only that card shows them, so a key
-        // never answers a card other than the one it is shown on ([`keyed_write`]).
-        let keyed = keyed_write(&self.entries) == Some(index);
+        // never answers a card other than the one it is shown on ([`Entries::keyed_write`]).
+        let keyed = self.entries.keyed_write() == Some(index);
         let key = |action: &dyn gpui::Action, cx: &App| {
             keyed.then(|| KeyBinding::for_action_in(action, &focus, cx))
         };
@@ -4948,6 +4970,11 @@ mod tests {
                 tool(run, serde_json::json!({"args": ["query", "-e"]})),
                 false,
             ),
+            // A flag after `-e` is a flag of its own, as the CLI reads it.
+            (
+                tool(run, serde_json::json!({"args": ["query", "-e", "--json"]})),
+                false,
+            ),
             (
                 tool(run, serde_json::json!({"args": ["load", "--data", "x"]})),
                 false,
@@ -4962,13 +4989,21 @@ mod tests {
             assert_eq!(shows_query(&entry), shown, "{:?}", shown_query(&entry));
             assert_eq!(shown_query(&entry).is_some(), shown);
         }
-        assert_eq!(
-            shown_query(&tool(
-                run,
-                serde_json::json!({"args": ["query", "-e", "q", "--json"]})
-            )),
-            Some(("query".into(), "q".into(), "--json".into()))
-        );
+        // Every way the CLI's parser reads the query text shows it, the rest of the call beside
+        // it.
+        for args in [
+            serde_json::json!(["query", "-e", "q", "--json"]),
+            serde_json::json!(["query", "-eq", "--json"]),
+            serde_json::json!(["query", "-e=q", "--json"]),
+            serde_json::json!(["query", "--query-string", "q", "--json"]),
+            serde_json::json!(["query", "--json", "--query-string=q"]),
+        ] {
+            assert_eq!(
+                shown_query(&tool(run, serde_json::json!({ "args": args }))),
+                Some(("query".into(), "q".into(), "--json".into())),
+                "{args}"
+            );
+        }
     }
 
     /// A write's text shows once, on its write card: a `mutate` call whose card carries its text
@@ -5246,20 +5281,39 @@ mod tests {
             answer: None,
         });
         let waiting = || WriteState::Waiting(oneshot::channel().0);
-        let entries = [
+        let mut entries = Entries::default();
+        for entry in [
             Entry::User("change it".into()),
             permission,
             write_card(0, WriteState::Running),
-            write_card(1, waiting()),
-            write_card(2, waiting()),
-        ];
+        ] {
+            entries.push(entry);
+        }
         assert!(entries[1].waits(), "the permission card waits first");
-        assert_eq!(keyed_write(&entries), Some(3));
+        assert_eq!(entries.first_waiting(|_| true), Some(1));
         assert_eq!(
-            keyed_write(&entries[..3]),
+            entries.keyed_write(),
             None,
             "a permission card alone takes no key"
         );
+        entries.push(write_card(1, waiting()));
+        entries.push(write_card(2, waiting()));
+        assert_eq!(entries.keyed_write(), Some(3));
+        // Answered, a card is passed over, and the search starts past it from then on.
+        if let Some(Entry::Write(card)) = entries.get_mut(3) {
+            card.state = WriteState::Running;
+        }
+        assert_eq!(entries.keyed_write(), Some(4));
+        if let Some(Entry::Permission(card)) = entries.get_mut(1) {
+            card.cancel();
+        }
+        assert_eq!(entries.first_waiting(|_| true), Some(4));
+        assert_eq!(entries.answered_before.get(), 4);
+        // Taken out and put back, as a replay does, the cards are found again.
+        let said = entries.take_from(2);
+        assert_eq!(entries.first_waiting(|_| true), None);
+        entries.extend(said);
+        assert_eq!(entries.keyed_write(), Some(4));
     }
 
     /// A write sent before the agent stopped runs on, and its card waits to hear how rather than
@@ -5452,19 +5506,6 @@ mod tests {
         let (rebuilt, kept) = thread_blocks(&ended, &entries, changed, false, false, false);
         assert_eq!(kept, 0);
         assert_eq!(rebuilt, whole(&entries, false));
-    }
-
-    /// A message sent before the agent is ready opens the conversation, in the thread at once,
-    /// only when nothing was sent before it; any later one waits in the queue behind it, so
-    /// the messages go in the order they were sent.
-    #[test]
-    fn a_first_message_opens_the_conversation_and_later_ones_queue() {
-        assert!(opens(false, false), "the first message");
-        assert!(!opens(true, false), "a second, sent while the agent starts");
-        assert!(
-            !opens(false, true),
-            "one sent after messages kept in the queue across a stop"
-        );
     }
 
     #[test]

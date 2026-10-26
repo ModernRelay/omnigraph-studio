@@ -50,7 +50,7 @@ pub struct SettingsView {
 /// The `graphs` key and name a graph is offered as a scope by.
 pub fn graph_scope(session: &Entity<GraphSession>, cx: &App) -> (String, String) {
     let session = session.read(cx);
-    (session.overrides_key(cx), session.graph_id.clone())
+    (session.overrides_key(), session.graph_id.clone())
 }
 
 /// A dropdown's choices: each label and the value it sets.
@@ -290,7 +290,7 @@ impl SettingsView {
             .nodes
             .iter()
             .filter(|node| section_found || node.name.to_lowercase().contains(query))
-            .filter_map(|node| session.read(cx).type_naming(&node.name, cx))
+            .filter_map(|node| session.read(cx).type_naming(&node.name))
             .collect();
         let count = names.len();
         names

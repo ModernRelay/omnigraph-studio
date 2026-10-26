@@ -230,13 +230,18 @@ impl TypesList {
                 };
                 let count = match s.count_of(entity, name) {
                     Some(n) => studio_ui::group_count(n),
-                    None if matches!(s.datasets, Loadable::Loading | Loadable::NotLoaded) => {
+                    None if matches!(s.snapshot, Loadable::Loading | Loadable::NotLoaded) => {
                         "…".into()
                     }
                     None => "—".into(),
                 };
-                let tooltip = match &s.datasets {
-                    Loadable::Failed(error) => format!("Counts could not be read: {error}"),
+                let tooltip = match (&s.snapshot, s.counts_stale()) {
+                    (Loadable::Failed(error), _) => format!("Counts could not be read: {error}"),
+                    (_, Some(error)) => format!(
+                        "Rows as last read on {}: reading them again failed ({error}). They \
+                         are read again shortly.",
+                        s.branch
+                    ),
                     _ => format!("Rows at the head of {}", s.branch),
                 };
                 // The type's table at the head is the active tab ([`crate::table_key`]).

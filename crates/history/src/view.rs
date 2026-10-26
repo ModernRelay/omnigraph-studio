@@ -15,7 +15,7 @@ use gpui::{
 };
 use graph_client::ReadError;
 use graph_client::api::{CommitListOutput, CommitOutput};
-use graph_store::{GraphSession, HeadWatch, SessionEvent};
+use graph_store::{GraphSession, HeadWatch, NetChange, SessionEvent};
 use studio_actions::history::{NewBranchHere, NextMatch, PreviousMatch};
 use studio_actions::workspace::Refresh;
 use studio_ui::menu::ContextMenu;
@@ -70,8 +70,27 @@ const CHANGES_WIDTH: f32 = 112.;
 const LANE_WIDTH: f32 = 14.;
 const GRAPH_PADDING: f32 = studio_ui::ds::space::MD;
 
-/// Changes read per commit for a row's counts.
-const ROW_COUNT_PAGE: u32 = 500;
+/// Changes read per commit for a row's counts: each comes with its before and after images, and a
+/// drawn row asks for its own. A commit with more shows its counts as partial.
+const ROW_COUNT_PAGE: u32 = 100;
+
+/// The entities a page of one commit's changes adds, changes and removes. A commit's changes name
+/// each entity once, so they are counted where the session's memo holds them, with nothing
+/// copied to fold them.
+fn tally(changes: &[graph_client::api::EntityChangeOutput]) -> (usize, usize, usize) {
+    changes.iter().fold(
+        (0, 0, 0),
+        |(added, changed, removed), change| match NetChange::of(
+            change.before.as_ref(),
+            change.after.as_ref(),
+        ) {
+            Some(NetChange::Added) => (added + 1, changed, removed),
+            Some(NetChange::Changed) => (added, changed + 1, removed),
+            Some(NetChange::Removed) => (added, changed, removed + 1),
+            None => (added, changed, removed),
+        },
+    )
+}
 
 /// The read of the listing's first page.
 enum State {
@@ -443,20 +462,15 @@ impl HistoryView {
             Some(session.update(cx, |session, cx| session.watch_head(&view.branch, cx)));
         // Its own branch's commits, and the other branches whose heads it shows: a tab restored
         // before the branch list was read draws them once it is.
-        view._session_subscription =
-            Some(cx.subscribe(&session, |this, _, event, cx| match event {
-                SessionEvent::Committed { branch } if this.shows(branch) => {
-                    this.committed(branch, cx)
-                }
-                SessionEvent::BranchesChanged => this.branches_changed(cx),
-                _ => {}
-            }));
+        view._session_subscription = Some(cx.subscribe(&session, |this, session, event, cx| {
+            this.session_event(&session, event, false, cx)
+        }));
         view
     }
 
-    /// The bottom-dock panel: the window's branch, rows only. It is made when first drawn, and
-    /// reads what the session's events ask of it when next drawn ([`Owed`]), so a hidden panel
-    /// asks the server nothing.
+    /// The bottom-dock panel: the window's branch, rows only. It is made when first drawn, and,
+    /// as a tab does, reads what the session's events ask of it when next drawn
+    /// ([`Self::session_event`]).
     pub fn panel(
         session: Entity<GraphSession>,
         window: &mut Window,
@@ -464,35 +478,47 @@ impl HistoryView {
     ) -> Self {
         let branch = session.read(cx).branch.clone();
         let mut view = Self::build(session.clone(), branch, true, window, cx);
-        view._session_subscription =
-            Some(
-                cx.subscribe(&session, |this, session, event, cx| match event {
-                    // The branch left's commits never show under the new one's name meanwhile.
-                    SessionEvent::BranchChanged => {
-                        this.branch = session.read(cx).branch.clone();
-                        this.forget_branch();
-                        this.owe(|owed| owed.reload = true, cx);
-                    }
-                    SessionEvent::Committed { branch } if *branch == this.branch => {
-                        this.owe(|owed| owed.landed = true, cx)
-                    }
-                    SessionEvent::Committed { branch } if this.shows(branch) => {
-                        let branch = branch.clone();
-                        this.owe(
-                            |owed| {
-                                if !owed.tags.contains(&branch) {
-                                    owed.tags.push(branch);
-                                }
-                            },
-                            cx,
-                        )
-                    }
-                    // The list of other branches, whose heads the history shows.
-                    SessionEvent::BranchesChanged => this.owe(|owed| owed.branches = true, cx),
-                    _ => {}
-                }),
-            );
+        view._session_subscription = Some(cx.subscribe(&session, |this, session, event, cx| {
+            this.session_event(&session, event, true, cx)
+        }));
         view
+    }
+
+    /// What the session's events ask of the history, owed until it is next drawn ([`Owed`]):
+    /// a tab or panel behind another, or in a closed dock, asks the server nothing for the
+    /// commits that land meanwhile. The panel (`follows_window`) follows the window's branch.
+    fn session_event(
+        &mut self,
+        session: &Entity<GraphSession>,
+        event: &SessionEvent,
+        follows_window: bool,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            // The branch left's commits never show under the new one's name meanwhile.
+            SessionEvent::BranchChanged if follows_window => {
+                self.branch = session.read(cx).branch.clone();
+                self.forget_branch();
+                self.owe(|owed| owed.reload = true, cx);
+            }
+            SessionEvent::Committed { branch } if *branch == self.branch => {
+                self.owe(|owed| owed.landed = true, cx)
+            }
+            SessionEvent::Committed { branch } if self.shows(branch) => {
+                let branch = branch.clone();
+                self.owe(
+                    |owed| {
+                        if !owed.tags.contains(&branch) {
+                            owed.tags.push(branch);
+                        }
+                    },
+                    cx,
+                )
+            }
+            // The list of other branches, whose heads the history shows.
+            SessionEvent::BranchesChanged => self.owe(|owed| owed.branches = true, cx),
+            _ => {}
+        }
     }
 
     /// Notes a read the panel owes, and draws it again: a shown panel reads it at that frame
@@ -660,18 +686,6 @@ impl HistoryView {
     /// of the others whose heads it shows.
     fn shows(&self, branch: &str) -> bool {
         self.branch == branch || self.others.iter().any(|other| other == branch)
-    }
-
-    /// A commit landed on `branch`. One to the history's own branch reads its first page again,
-    /// on top of the pages read ([`HistoryRead::first_page`]). One to another branch moves that
-    /// branch's tag alone: its new commits are not this history's, and a merge of them would
-    /// land on this branch.
-    fn committed(&mut self, branch: &str, cx: &mut Context<Self>) {
-        if branch == self.branch {
-            self.load(FirstPage::KEEP, cx);
-        } else {
-            self.read_head(branch.to_owned(), false, cx);
-        }
     }
 
     /// The branch list changed: the tags follow the branches made and gone. A history that
@@ -1613,20 +1627,7 @@ impl HistoryView {
                 };
                 let more = page.next_page_token.is_some();
                 let folded = cx
-                    .background_spawn(async move {
-                        let mut fold = graph_store::ChangeFold::new();
-                        // Shared with the session's memo: copied here, off the main thread.
-                        fold.add_block(graph_client::api::ChangeBlockOutput {
-                            cause: page.cause,
-                            changes: Arc::unwrap_or_clone(page.changes),
-                        });
-                        fold.finish()
-                            .counts()
-                            .iter()
-                            .fold((0, 0, 0), |(a, c, r), t| {
-                                (a + t.added, c + t.changed, r + t.removed)
-                            })
-                    })
+                    .background_spawn(async move { tally(&page.changes) })
                     .await;
                 this.update(cx, |this, cx| {
                     this.count_tasks.remove(&id);
@@ -2977,7 +2978,7 @@ mod tests {
         // asks again for what the Refresh was to.
         view.update(cx, |view, cx| {
             view.refresh(cx);
-            view.committed("main", cx);
+            landed(view, "main", cx);
             assert!(matches!(
                 view.state,
                 State::Loading {
@@ -3005,7 +3006,7 @@ mod tests {
                     ..
                 }
             ));
-            view.committed("main", cx);
+            landed(view, "main", cx);
             assert!(matches!(
                 view.state,
                 State::Loading {
@@ -3620,6 +3621,17 @@ mod tests {
         assert_eq!(fix, ["branch=fix&limit=1", "branch=fix&limit=1"]);
     }
 
+    /// A commit landing on `branch`, as the session tells it, read as a drawn history reads it
+    /// ([`HistoryView::read_owed`]).
+    fn landed(view: &mut HistoryView, branch: &str, cx: &mut Context<HistoryView>) {
+        let session = view.session.clone();
+        let event = SessionEvent::Committed {
+            branch: branch.into(),
+        };
+        view.session_event(&session, &event, false, cx);
+        view.read_owed(cx);
+    }
+
     /// A session on a graph whose `main` holds one commit, `c1`, which changed nothing.
     fn one_commit_session(cx: &mut TestAppContext) -> Entity<GraphSession> {
         let served = Served {
@@ -3716,6 +3728,80 @@ mod tests {
         assert_eq!(listings(&served), 3);
         view.read_with(cx, |view, _| {
             assert_eq!(view.commits[0].graph_commit_id, "m5")
+        });
+    }
+
+    /// Draws a History tab, cached, while it is its pane's active item, as a pane draws it.
+    struct PaneStandIn {
+        tab: Entity<HistoryView>,
+        shown: bool,
+    }
+
+    impl Render for PaneStandIn {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().when(self.shown, |pane| {
+                pane.child(
+                    AnyView::from(self.tab.clone()).cached(StyleRefinement::default().size_full()),
+                )
+            })
+        }
+    }
+
+    /// A History tab behind another in its pane reads nothing for the commits that land on its
+    /// branch, as the panel reads nothing hidden; shown again, it reads its first page once for
+    /// all of them. Before, every commit read the tab's 200 commits again, unseen.
+    #[gpui::test]
+    async fn a_hidden_tab_reads_nothing_until_shown_again(cx: &mut TestAppContext) {
+        let (session, served) = serve(
+            Served {
+                branches: vec![("main".into(), chain("m", 3))],
+                ..Default::default()
+            },
+            cx,
+        );
+        let held = session.clone();
+        let (pane, cx) = cx.add_window_view(move |window, cx| {
+            let tab = cx.new(|cx| HistoryView::new(held, "main".into(), window, cx));
+            PaneStandIn { tab, shown: true }
+        });
+        cx.run_until_parked();
+        // First pages only: the tab's head watch reads the branch's newest commit besides.
+        let pages = |served: &Arc<Mutex<Served>>| {
+            served
+                .lock()
+                .unwrap()
+                .listings()
+                .into_iter()
+                .filter(|listing| listing.contains("limit=200"))
+                .count()
+        };
+        assert_eq!(pages(&served), 1, "the first page");
+        pane.update(cx, |pane, cx| {
+            pane.shown = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        for (id, parent, at) in [("m3", "m2", 1_000), ("m4", "m3", 1_010)] {
+            served
+                .lock()
+                .unwrap()
+                .chain_mut("main")
+                .insert(0, commit(id, at, Some(parent), None));
+            session
+                .update(cx, |session, cx| session.head_now("main", cx))
+                .await;
+            cx.run_until_parked();
+        }
+        assert_eq!(pages(&served), 1, "nothing read while hidden");
+        pane.update(cx, |pane, cx| {
+            pane.shown = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(pages(&served), 2, "one read for both commits");
+        let tab = pane.read_with(cx, |pane, _| pane.tab.clone());
+        tab.read_with(cx, |tab, _| {
+            assert_eq!(ids(tab), ["m4", "m3", "m2", "m1", "m0"])
         });
     }
 

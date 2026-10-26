@@ -304,10 +304,12 @@ A first cut of parts 1 and 4, ahead of the shared cache:
   2026-10-21; before, about twenty pages of a table filled the 4,096 places and evicted a
   node page's relationship groups).
 - A read at the branch head's commit is sent as a read of the branch (part 3, target
-  choice). Refused there, it is sent again pinned only when the branch is gone (404); any
-  other refusal is the read's own, which the commit would answer alike. On `/query` a 409 is a
-  full-text index to rebuild, which no read clears (the 0.14 edge contract), so it is shown,
-  not sent twice (since 2026-10-21).
+  choice). Refused there, it is sent again pinned only when the branch is gone (404) or the
+  credential may not read the branch (403, since 2026-10-26: a policy may scope reads by
+  branch, and the branch was Studio's choice, not the person's); any other refusal is the
+  read's own, which the commit would answer alike. On `/query` a 409 is a full-text index to
+  rebuild, which no read clears (the 0.14 edge contract), so it is shown, not sent twice
+  (since 2026-10-21).
 - Review reads its fork and head from `branches/merge-base` and folds the feed after the base,
   instead of reading both branches' whole commit lists (each about 1.6 s on the personal graph,
   and 3m47s once right after a restart); its commits come from the feed blocks' causes. A

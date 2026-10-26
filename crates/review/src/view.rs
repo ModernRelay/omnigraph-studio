@@ -196,9 +196,8 @@ struct ReviewData {
     folded: Arc<FoldedChanges>,
     /// The changes by entity: each node with the relationship changes reviewed on its card.
     groups: EntityGroups,
-    /// Each change's search text, lowercase, made when it was folded: a search goes through
-    /// these off the main thread, not through every value of every change on each key.
-    search: Arc<[String]>,
+    /// Each change's search text ([`SearchIndex`]).
+    search: SearchIndex,
     counts: Vec<TypeCounts>,
     /// Why each change cannot be reverted, when it cannot: worked out with the fold, off the
     /// main thread, since a review holds up to 20,000 changes.
@@ -358,6 +357,40 @@ fn search_matches(texts: &[String], query: &str) -> Option<Vec<bool>> {
     (!query.is_empty()).then(|| texts.iter().map(|text| text.contains(query)).collect())
 }
 
+/// Each change's search text, lowercase ([`search_text_of`]), made the first time a search is
+/// made, off the main thread: a search goes through these, not through every value of every
+/// change on each key, and a review that is never searched never makes them.
+#[derive(Clone, Default)]
+struct SearchIndex {
+    folded: Arc<FoldedChanges>,
+    texts: Arc<std::sync::OnceLock<Vec<String>>>,
+}
+
+impl SearchIndex {
+    fn new(folded: Arc<FoldedChanges>) -> Self {
+        Self {
+            folded,
+            texts: Arc::default(),
+        }
+    }
+
+    /// Which changes `query` matches, none asked when it is empty ([`search_matches`]).
+    fn matches(&self, query: &str) -> Option<Vec<bool>> {
+        if query.is_empty() {
+            return None;
+        }
+        let texts = self
+            .texts
+            .get_or_init(|| self.folded.changes.iter().map(search_text_of).collect());
+        search_matches(texts, query)
+    }
+
+    /// Whether `other` is this review's index, not one of a review read again since.
+    fn is(&self, other: &SearchIndex) -> bool {
+        Arc::ptr_eq(&self.texts, &other.texts)
+    }
+}
+
 /// Why each change cannot be reverted under `schema`, when it cannot; nothing is said without
 /// a schema, since a revert is made under the one loaded when it is asked for. A review that
 /// does not show what the branch holds now (`shows_head`) reverts no addition.
@@ -464,6 +497,9 @@ pub struct ReviewView {
     /// The dry run is for heads that moved (a fix landed, the target moved) and is read again
     /// once no fix or merge is out.
     preview_again: bool,
+    /// The target moved since the dry run: it is read again at the next frame the review is
+    /// drawn in ([`ReviewView::preview_moved`]), and a hidden review reads nothing.
+    preview_owed: bool,
     /// The target's head as the session knew it when the dry run was asked for.
     preview_target: Option<String>,
     _load_task: Option<Task<()>>,
@@ -540,17 +576,20 @@ impl ReviewView {
                 SessionEvent::HeadMoved { branch, .. } if *branch == this.branch => {
                     this.compare_head(cx)
                 }
-                // The dry run merged into the target as it was.
+                // The dry run merged into the target as it was. It is read again when the review
+                // is next drawn: a review behind another tab asks the server nothing meanwhile.
                 SessionEvent::HeadMoved { branch, head }
                     if *branch == this.target
                         && this.preview_target.as_deref() != Some(head.as_str()) =>
                 {
-                    this.preview_moved(cx)
+                    this.preview_owed = true;
+                    cx.notify();
                 }
                 SessionEvent::SchemaChanged => this.schema_changed(cx),
                 SessionEvent::SchemaMoved => this.schema_moved(cx),
                 SessionEvent::CredentialChanged => this.credential_changed(cx),
                 SessionEvent::ActivityChanged => this.activity_changed(cx),
+                SessionEvent::BranchesChanged => this.branches_changed(cx),
                 // Merge, and deleting the branch with it, follow what the credential may do. An
                 // answer dropped (a 403, a new token) is read again; one held asks nothing.
                 SessionEvent::AccessChanged => {
@@ -605,6 +644,7 @@ impl ReviewView {
             _head_watch: Some(head_watch),
             _target_watch: target_watch,
             preview_again: false,
+            preview_owed: false,
             preview_target: None,
             _load_task: None,
             _names_task: None,
@@ -651,6 +691,28 @@ impl ReviewView {
             if settled {
                 cx.emit(ItemEvent::UpdateTab);
             }
+            cx.notify();
+        }
+    }
+
+    /// The branch list was read. A reviewed branch it no longer holds was deleted: by the delete
+    /// of a merge whose answer was lost and that landed, or outside Studio. Like one the merge
+    /// said it deleted, its head is not watched, nothing is fixed on it, and its review is not
+    /// opened again with the window.
+    fn branches_changed(&mut self, cx: &mut Context<Self>) {
+        if self.branch_deleted {
+            return;
+        }
+        let gone = self
+            .session
+            .read(cx)
+            .branches
+            .loaded()
+            .is_some_and(|branches| !branches.contains(&self.branch));
+        if gone {
+            self._head_watch = None;
+            self.branch_deleted = true;
+            cx.emit(ItemEvent::UpdateTab);
             cx.notify();
         }
     }
@@ -822,7 +884,7 @@ impl ReviewView {
                     let (texts, text) = (data.search.clone(), query.clone());
                     let matched = cx
                         .background_executor()
-                        .spawn(async move { search_matches(&texts, &text) })
+                        .spawn(async move { texts.matches(&text) })
                         .await;
                     Searched { query, matched }
                 }
@@ -1083,13 +1145,13 @@ impl ReviewView {
             let (scanned, text) = (texts.clone(), query.clone());
             let matched = cx
                 .background_executor()
-                .spawn(async move { search_matches(&scanned, &text) })
+                .spawn(async move { scanned.matches(&text) })
                 .await;
             this.update(cx, |this, cx| {
                 if this
                     .data
                     .as_ref()
-                    .is_some_and(|data| Arc::ptr_eq(&data.search, &texts))
+                    .is_some_and(|data| data.search.is(&texts))
                 {
                     this.searched = Searched { query, matched };
                     this.lay_out();
@@ -1694,6 +1756,7 @@ impl ReviewView {
             fix,
             FixState::Reverted { .. } | FixState::Edited { .. } | FixState::Unchanged
         );
+        let unknown = matches!(fix, FixState::Unknown);
         // Found by the change's key: a Refresh while the fix was out may have moved its card.
         if let Some(card) = self.card_of(key).and_then(|ix| self.cards.get_mut(ix)) {
             if matches!(fix, FixState::Reverted { .. }) {
@@ -1702,7 +1765,7 @@ impl ReviewView {
             card.fix = fix;
         }
         if !landed {
-            self.drop_fixes_after(key);
+            self.drop_fixes_after(key, unknown);
         }
         self.send_next_fix(cx);
         self.writes_settled(cx);
@@ -1710,9 +1773,16 @@ impl ReviewView {
         cx.notify();
     }
 
-    /// Drops the queued fixes that wait for the fix with `key`, which did not land: the old
-    /// relationship of a move is not restored with the new one still there.
-    fn drop_fixes_after(&mut self, key: &str) {
+    /// Drops the queued fixes that wait for the fix with `key`, which did not land, or whose
+    /// outcome is `unknown`: the old relationship of a move is not restored with the new one
+    /// perhaps still there.
+    fn drop_fixes_after(&mut self, key: &str, unknown: bool) {
+        let why = if unknown {
+            "Not sent: whether the relationship that replaced it was removed is not known. \
+             Check History before moving it back."
+        } else {
+            "Not sent: the relationship that replaced it was not removed first."
+        };
         let (dropped, kept): (Vec<Fix>, Vec<Fix>) = std::mem::take(&mut self.fix_queue)
             .into_iter()
             .partition(|fix| fix.after.as_deref() == Some(key));
@@ -1721,9 +1791,7 @@ impl ReviewView {
             self.fixes_running = self.fixes_running.saturating_sub(1);
             self.fixes_in_flight.remove(&fix.key);
             if let Some(card) = self.card_of(&fix.key).and_then(|ix| self.cards.get_mut(ix)) {
-                card.fix = FixState::Refused(
-                    "Not sent: the relationship that replaced it was not removed first.".into(),
-                );
+                card.fix = FixState::Refused(why.into());
             }
         }
     }
@@ -3031,7 +3099,7 @@ async fn read_review(
                 fork_read: Some(read),
                 folded: Arc::new(ChangeFold::new().finish()),
                 groups: EntityGroups::default(),
-                search: Vec::new().into(),
+                search: SearchIndex::default(),
                 counts: Vec::new(),
                 revert_blocked: Vec::new(),
                 by_entity: Vec::new(),
@@ -3090,9 +3158,9 @@ impl Fed {
         let (folded, groups, search, revert_blocked, by_entity, by_key, marks) = cx
             .background_executor()
             .spawn(async move {
-                let folded = fold.finish();
+                let folded = Arc::new(fold.finish());
                 let groups = EntityGroups::new(&folded, schema.as_deref());
-                let search: Arc<[String]> = folded.changes.iter().map(search_text_of).collect();
+                let search = SearchIndex::new(folded.clone());
                 let marks = folded.changes.iter().map(mark_of).collect();
                 let revert_blocked = revert_checks(&folded, schema.as_deref(), shows_head);
                 let by_entity = entity_order(&folded.changes);
@@ -3103,7 +3171,7 @@ impl Fed {
                     .map(|(ix, change)| (change.key(), ix))
                     .collect();
                 (
-                    Arc::new(folded),
+                    folded,
                     groups,
                     search,
                     revert_blocked,
@@ -3714,6 +3782,10 @@ async fn merge_shown(
 
 impl Render for ReviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Drawn, so shown: the dry run owed is read once the frame is out, not inside it.
+        if std::mem::take(&mut self.preview_owed) {
+            cx.defer_in(window, |this, _, cx| this.preview_moved(cx));
+        }
         let header = self.render_header(cx);
         let body = match (&self.load, &self.data) {
             (LoadState::Ready, Some(_)) if self.show_conflicts => self.render_conflicts(cx),
@@ -3880,12 +3952,13 @@ pub(crate) mod tests {
             raw_changes: 3,
         };
         let groups = EntityGroups::new(&folded, Some(&schema));
+        let folded = Arc::new(folded);
         let data = ReviewData {
             fork: None,
             head: None,
             commits: Vec::new().into(),
             fork_read: None,
-            search: folded.changes.iter().map(search_text_of).collect(),
+            search: SearchIndex::new(folded.clone()),
             counts: folded.counts(),
             revert_blocked: vec![None; 3],
             by_entity: entity_order(&folded.changes),
@@ -3893,7 +3966,7 @@ pub(crate) mod tests {
             card_rows: CardRows::default(),
             marks: folded.changes.iter().map(mark_of).collect(),
             schema: None,
-            folded: Arc::new(folded),
+            folded,
             groups,
             partial: false,
             moved_while_reading: false,
@@ -3901,7 +3974,7 @@ pub(crate) mod tests {
             commits_capped: None,
         };
         let shown = |query: &str| {
-            let matched = search_matches(&data.search, query);
+            let matched = data.search.matches(query);
             let (rows, headers) = build_rows(&data, matched.as_deref());
             rows.iter()
                 .map(|row| match row {
@@ -4092,7 +4165,13 @@ pub(crate) mod tests {
             assert!(view.fix_queue.is_empty());
             assert_eq!(view.fixes_running, 0);
             assert!(view.fixes_in_flight.is_empty());
-            assert!(matches!(view.cards[1].fix, FixState::Refused(_)));
+            // The first's outcome is unknown, and the second says so: not that it was not
+            // removed.
+            assert!(
+                matches!(&view.cards[1].fix, FixState::Refused(why) if why.contains("is not known")),
+                "{:?}",
+                view.cards[1].fix
+            );
         });
         cx.run_until_parked();
         assert!(
@@ -4947,6 +5026,21 @@ pub(crate) mod tests {
                 assert!(matches!(view.merge, MergeState::Idle));
                 assert_eq!(view.serialize(cx).is_none(), delete);
             });
+            // A branch kept, then deleted outside Studio: once the list no longer holds it, its
+            // review is the deleted branch's.
+            if !delete {
+                let session = view.read_with(cx, |view, _| view.session.clone());
+                session.update(cx, |session, cx| {
+                    session.branches = graph_store::Loadable::Loaded(vec!["main".into()]);
+                    cx.emit(graph_store::SessionEvent::BranchesChanged);
+                });
+                view.update(cx, |view, cx| {
+                    assert!(view._head_watch.is_none());
+                    assert!(view.serialize(cx).is_none());
+                    view.revert(0, cx);
+                    assert_eq!(view.cards[0].fix, FixState::Refused(BRANCH_DELETED.into()));
+                });
+            }
         }
     }
 
@@ -5096,6 +5190,75 @@ pub(crate) mod tests {
             "{:?}",
             asked.lock().unwrap()
         );
+    }
+
+    /// Draws a review tab, cached, while it is its pane's active item, as a pane draws it.
+    struct PaneStandIn {
+        review: Entity<ReviewView>,
+        shown: bool,
+    }
+
+    impl Render for PaneStandIn {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().when(self.shown, |pane| {
+                pane.child(
+                    gpui::AnyView::from(self.review.clone())
+                        .cached(gpui::StyleRefinement::default().size_full()),
+                )
+            })
+        }
+    }
+
+    /// A review behind another tab sends no dry run when its target moves: shown again, it
+    /// sends one for all the moves. Before, every open review asked the server to classify its
+    /// whole merge each time main moved, unseen.
+    #[gpui::test]
+    async fn a_hidden_review_sends_no_dry_run_until_shown_again(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, asked) = reviewed_server(false, cx);
+        let held = session.clone();
+        let (pane, cx) = cx.add_window_view(move |window, cx| {
+            let review =
+                cx.new(|cx| ReviewView::new(held, "feature".into(), "main".into(), window, cx));
+            PaneStandIn {
+                review,
+                shown: true,
+            }
+        });
+        cx.run_until_parked();
+        let dry_runs = |asked: &std::sync::Mutex<Vec<String>>| {
+            asked
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.contains("\"dry_run\":true"))
+                .count()
+        };
+        assert_eq!(dry_runs(&asked), 1, "the review's own dry run");
+        pane.update(cx, |pane, cx| {
+            pane.shown = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        for head in ["m8", "m9"] {
+            session.update(cx, |_, cx| {
+                cx.emit(SessionEvent::HeadMoved {
+                    branch: "main".into(),
+                    head: head.into(),
+                })
+            });
+            cx.run_until_parked();
+        }
+        assert_eq!(dry_runs(&asked), 1, "nothing sent while hidden");
+        pane.update(cx, |pane, cx| {
+            pane.shown = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(dry_runs(&asked), 2, "one for both moves");
     }
 
     /// A review read while another writer changed the schema is newer once it is in, as is

@@ -115,10 +115,12 @@ from Zed with notices).
   rather than keep the pages going on from that continuation (since 2026-10-21; before, a
   failed Refresh had forgotten why the stubs were stubs, and Try again kept the refused
   continuation, which took a second Try again).
-- Built (row counts): a drawn row without counts reads its commit's first 500 changes and nets
+- Built (row counts): a drawn row without counts reads its commit's first 100 changes and nets
   them as the detail does ("+ more" when there are more); answers are kept, since a commit's
   changes never change, and the detail's full count replaces a first-page one. A commit
-  without a first parent shows none.
+  without a first parent shows none. (500 until 2026-10-26: each change carries its before and
+  after images, so 40 rows drawn asked for up to 20,000 of them, and pushed the detail's pages
+  out of the shared memo.)
 - Built (a branch at a commit, E21, 2026-10-20): a published commit's row menu offers "New
   branch here…", and its detail a Branch button beside Table and Query; `b`
   (`NewBranchHere`) does the same for the selected commit in the list, the panel and a

@@ -60,6 +60,11 @@ pub(crate) fn shown(state: &UpdateState, running: &Version, asked: bool) -> Opti
     })
 }
 
+/// Whether the item has anything to say: the workspace leaves it and its rule out otherwise.
+pub(crate) fn says_something(updater: &Updater) -> bool {
+    shown(updater.state(), updater.running(), updater.asked()).is_some()
+}
+
 /// Draws the updater's state; drawn again only when that state changes (the updater notifies
 /// on a change, a download at most once per whole percent).
 pub(crate) struct UpdateStatus {
@@ -78,8 +83,7 @@ impl Render for UpdateStatus {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let updater = self.updater.read(cx);
         let Some(shown) = shown(updater.state(), updater.running(), updater.asked()) else {
-            // Hidden, so the status bar's gap is not kept for it.
-            return div().hidden().into_any_element();
+            return div().into_any_element();
         };
         let text = shown.text;
         h_flex()

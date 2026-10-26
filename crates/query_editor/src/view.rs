@@ -473,6 +473,9 @@ pub struct QueryEditor {
     /// The `.gq` file this tab edits, and its text as last read or written (spec 007).
     path: Option<std::path::PathBuf>,
     saved_text: Option<String>,
+    /// [`content_hash`] of `saved_text`, taken with it ([`Self::set_saved`]): the tab's
+    /// remembered state names it, and is compared often.
+    saved_hash: Option<String>,
     /// The text differs from `saved_text`: found once per edit, not on every draw of the tab.
     unsaved: bool,
     file_error: Option<String>,
@@ -753,7 +756,11 @@ impl Item for QueryEditor {
             (None, Some(_)) if !self.unsaved => {
                 let text = self.editor.read(cx).text(cx);
                 (text.len() <= REMEMBERED_SAVED_TEXT).then(|| Draft {
-                    based_on: Some(content_hash(&text)),
+                    // The text is the file's.
+                    based_on: self
+                        .saved_hash
+                        .clone()
+                        .or_else(|| Some(content_hash(&text))),
                     text,
                     saved: true,
                 })
@@ -765,7 +772,7 @@ impl Item for QueryEditor {
                 based_on: match (&self.disk_change, &self.file_gone) {
                     (Some(change), _) => change.based_on.clone(),
                     (None, Some(gone)) => gone.based_on.clone(),
-                    (None, None) => self.saved_text.as_deref().map(content_hash),
+                    (None, None) => self.saved_hash.clone(),
                 },
                 saved: false,
             }),
@@ -936,6 +943,7 @@ impl QueryEditor {
             session,
             path: None,
             saved_text: None,
+            saved_hash: None,
             unsaved: false,
             file_error: None,
             loading: None,
@@ -1214,7 +1222,7 @@ impl QueryEditor {
         cx: &mut Context<Self>,
     ) {
         self.path = Some(path);
-        self.saved_text = Some(saved.unwrap_or_default());
+        self.set_saved(saved.unwrap_or_default());
         self.sync_unsaved(cx);
         self.file_error = None;
         cx.emit(ItemEvent::UpdateTab);
@@ -1242,13 +1250,13 @@ impl QueryEditor {
         match (draft, disk) {
             (None, None) => return false,
             (None, Some(disk)) | (Some(Draft { saved: true, .. }), Some(disk)) => {
-                self.saved_text = Some(disk.clone());
+                self.set_saved(disk.clone());
                 self.set_text(&disk, window, cx);
             }
             (Some(draft), None) => {
                 // Nothing is on disk: the text is the tab's alone, and closing it asks. What it
                 // was typed over is kept, for the file coming back.
-                self.saved_text = Some(String::new());
+                self.set_saved(String::new());
                 self.file_gone = Some(GoneFile {
                     based_on: draft.based_on,
                 });
@@ -1263,7 +1271,7 @@ impl QueryEditor {
                         asked: false,
                     });
                 }
-                self.saved_text = Some(disk);
+                self.set_saved(disk);
                 self.set_text(&draft.text, window, cx);
             }
         }
@@ -1322,10 +1330,10 @@ impl QueryEditor {
                     asked: false,
                 });
             }
-            self.saved_text = Some(disk);
+            self.set_saved(disk);
             self.sync_unsaved(cx);
         } else {
-            self.saved_text = Some(disk.clone());
+            self.set_saved(disk.clone());
             self.set_text(&disk, window, cx);
         }
         cx.emit(ItemEvent::UpdateTab);
@@ -1355,7 +1363,7 @@ impl QueryEditor {
                 asked: false,
             });
         }
-        self.saved_text = Some(disk);
+        self.set_saved(disk);
         self.sync_unsaved(cx);
     }
 
@@ -1394,6 +1402,23 @@ impl QueryEditor {
         cx.notify();
     }
 
+    /// Takes `text` as the file's text, which the tab's text is compared with.
+    fn set_saved(&mut self, text: String) {
+        self.saved_hash = Some(content_hash(&text));
+        self.saved_text = Some(text);
+    }
+
+    /// Whether the editor holds `text`, compared where it lies: nothing is copied.
+    fn holds_text(&self, text: &str, cx: &App) -> bool {
+        let buffer = self.editor.read(cx).buffer().read(cx).read(cx);
+        let end = buffer.len();
+        studio_ui::text::pieces_are(
+            end.0,
+            buffer.text_for_range(MultiBufferOffset(0)..end),
+            text,
+        )
+    }
+
     /// Whether the text differs from the file's, compared where it lies: a keystroke copies
     /// none of it.
     fn sync_unsaved(&mut self, cx: &App) {
@@ -1401,13 +1426,7 @@ impl QueryEditor {
             self.unsaved = false;
             return;
         };
-        let buffer = self.editor.read(cx).buffer().read(cx).read(cx);
-        let end = buffer.len();
-        self.unsaved = !studio_ui::text::pieces_are(
-            end.0,
-            buffer.text_for_range(MultiBufferOffset(0)..end),
-            saved,
-        );
+        self.unsaved = !self.holds_text(saved, cx);
     }
 
     /// ⌘S: writes the file this tab edits; a new query is saved in this graph's queries folder,
@@ -1450,7 +1469,7 @@ impl QueryEditor {
                 },
             },
             None => {
-                let graph = self.session.read(cx).overrides_key(cx);
+                let graph = self.session.read(cx).overrides_key();
                 let name = gq_language::outline(&self.editor.read(cx).text(cx))
                     .declarations
                     .first()
@@ -1476,7 +1495,7 @@ impl QueryEditor {
         if self.stored.is_some() || self.loading.is_some() {
             return;
         }
-        let graph = self.session.read(cx).overrides_key(cx);
+        let graph = self.session.read(cx).overrides_key();
         let directory = self
             .path
             .as_ref()
@@ -1568,7 +1587,7 @@ impl QueryEditor {
                 match result {
                     Ok(Saved::Written(path)) => {
                         this.path = Some(path);
-                        this.saved_text = Some(text);
+                        this.set_saved(text);
                         this.disk_change = None;
                         this.file_gone = None;
                         // Typing while it was written stays unsaved.
@@ -1593,10 +1612,10 @@ impl QueryEditor {
                         None => {
                             // Nothing was written: the draft stays, and the bar asks.
                             this.disk_change = Some(DiskChange {
-                                based_on: this.saved_text.as_deref().map(content_hash),
+                                based_on: this.saved_hash.clone(),
                                 asked: true,
                             });
-                            this.saved_text = Some(now);
+                            this.set_saved(now);
                             this.sync_unsaved(cx);
                             this.save_next = None;
                             window.focus(&this.file_focus, cx);
@@ -1803,7 +1822,7 @@ impl QueryEditor {
     ) {
         // A check of older text would underline the wrong places and offer the wrong
         // parameters; a newer one is coming.
-        if self.editor.read(cx).text(cx) != analysis.text {
+        if !self.holds_text(&analysis.text, cx) {
             return;
         }
         let error = Color::Error.color(cx);
@@ -2976,7 +2995,7 @@ impl QueryEditor {
                 let params = prepared.params.clone();
                 let branch = branch.clone();
                 self.session.update(cx, |session, cx| {
-                    session.invoke_stored_write(name, params, branch, None, description, cx)
+                    session.invoke_stored_write(name, params, branch, description, cx)
                 })
             }
             None => self.session.update(cx, |session, cx| {
@@ -6782,7 +6801,7 @@ mod tests {
 
                 let long = format!("// {}", "x".repeat(REMEMBERED_SAVED_TEXT));
                 editor.set_text(&long, window, cx);
-                editor.saved_text = Some(long);
+                editor.set_saved(long);
                 editor.unsaved = false;
                 assert!(editor.serialize(cx).unwrap().data.get("text").is_none());
             });

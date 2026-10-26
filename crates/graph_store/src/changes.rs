@@ -103,6 +103,28 @@ pub enum NetChange {
     Added,
 }
 
+impl NetChange {
+    /// What an entity whose first image is `before` and last is `after` did: `None` when it ends
+    /// where it began (inserted then deleted, or changed back).
+    pub fn of(
+        before: Option<&ChangeImageOutput>,
+        after: Option<&ChangeImageOutput>,
+    ) -> Option<NetChange> {
+        match (before, after) {
+            (None, None) => None,
+            (None, Some(_)) => Some(NetChange::Added),
+            (Some(_), None) => Some(NetChange::Removed),
+            (Some(before), Some(after)) => {
+                if before.properties == after.properties && before.endpoints == after.endpoints {
+                    None
+                } else {
+                    Some(NetChange::Changed)
+                }
+            }
+        }
+    }
+}
+
 /// One property's value on each side of a folded change. `None` means the side has no value:
 /// the entity did not exist there, or the property was outside that commit's schema.
 #[derive(Debug, Clone, PartialEq)]
@@ -133,18 +155,7 @@ impl FoldedChange {
 
     /// `None` when the entity ends where it began (inserted then deleted, or changed back).
     pub fn net(&self) -> Option<NetChange> {
-        match (&self.before, &self.after) {
-            (None, None) => None,
-            (None, Some(_)) => Some(NetChange::Added),
-            (Some(_), None) => Some(NetChange::Removed),
-            (Some(before), Some(after)) => {
-                if before.properties == after.properties && before.endpoints == after.endpoints {
-                    None
-                } else {
-                    Some(NetChange::Changed)
-                }
-            }
-        }
+        NetChange::of(self.before.as_ref(), self.after.as_ref())
     }
 
     /// The properties a card shows: for a changed entity only those whose value differs; for

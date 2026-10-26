@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use gpui::{App, Bounds, Context, Global, Pixels, Window, WindowId, point, px, size};
 use serde::{Deserialize, Serialize};
@@ -96,16 +97,45 @@ fn file_name(key: &str) -> String {
     format!("{hash:016x}.json")
 }
 
+/// The saves asked for whose writes have not landed, by file. Saves are written on the write
+/// thread in turn ([`write_private`]), so for a moment the file can hold an older one: a graph
+/// closed and opened again then reads its last save from here.
+fn unwritten() -> MutexGuard<'static, HashMap<PathBuf, Arc<str>>> {
+    static UNWRITTEN: OnceLock<Mutex<HashMap<PathBuf, Arc<str>>>> = OnceLock::new();
+    UNWRITTEN
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
 /// The saved state of the graph whose key is `key`.
 pub(crate) fn load(key: &str) -> Option<SavedWorkspace> {
     let path = workspaces_dir().join(file_name(key));
-    let text = std::fs::read_to_string(&path).ok()?;
+    let pending = unwritten().get(&path).cloned();
+    let text = match pending {
+        Some(text) => text.to_string(),
+        None => read_or_set_aside(&path)?,
+    };
     match serde_json::from_str(&text) {
         Ok(saved) => Some(saved),
         // Kept beside it, so the next save does not overwrite tabs and drafts that may be
         // recoverable.
         Err(_) => {
             studio_settings::set_aside(&path);
+            None
+        }
+    }
+}
+
+/// The text of the file at `path`, or none when there is none. A file that is there but cannot
+/// be read (it is not text, or reading it failed) is set aside, as one that does not parse is:
+/// taken for no file, it would be written over by the next save.
+fn read_or_set_aside(path: &Path) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => {
+            studio_settings::set_aside(path);
             None
         }
     }
@@ -118,7 +148,21 @@ pub(crate) fn save(key: &str, saved: &SavedWorkspace) {
         return;
     }
     if let Ok(text) = serde_json::to_string_pretty(saved) {
-        write_private(&workspaces_dir().join(file_name(key)), &text);
+        let path = workspaces_dir().join(file_name(key));
+        let text: Arc<str> = text.into();
+        unwritten().insert(path.clone(), text.clone());
+        write_private(&path, &text);
+        // Written (or not, said in the log): the file is the graph's state again, unless a
+        // later save is still on its way.
+        studio_settings::run_in_turn(move || {
+            let mut unwritten = unwritten();
+            if unwritten
+                .get(&path)
+                .is_some_and(|last| Arc::ptr_eq(last, &text))
+            {
+                unwritten.remove(&path);
+            }
+        });
     }
 }
 
@@ -187,7 +231,7 @@ pub fn load_windows() -> Vec<SavedWindow> {
         return Vec::new();
     }
     let path = session_path();
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Some(text) = read_or_set_aside(&path) else {
         return Vec::new();
     };
     parse_session(&text).unwrap_or_else(|| {

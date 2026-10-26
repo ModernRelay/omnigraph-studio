@@ -27,6 +27,8 @@ pub struct Served {
     pub schema_fails: bool,
     /// How many times the schema was asked for.
     pub schema_reads: usize,
+    /// How many times a branch's storage snapshot was asked for.
+    pub snapshot_reads: usize,
     /// Each commit with its parent and changes, oldest first.
     pub commits: Vec<(String, String, Vec<Value>)>,
     /// The query string of every feed read.
@@ -129,6 +131,7 @@ pub fn followed_session(
         schema: schema.into(),
         schema_fails: false,
         schema_reads: 0,
+        snapshot_reads: 0,
         commits: Vec::new(),
         feeds: Vec::new(),
         branches: vec!["main".into()],
@@ -152,6 +155,9 @@ pub fn followed_session(
                 }
             }
             let mut served = state.lock().unwrap();
+            if path.ends_with("/snapshot") {
+                served.snapshot_reads += 1;
+            }
             if path.ends_with("/schema") {
                 served.schema_reads += 1;
             }

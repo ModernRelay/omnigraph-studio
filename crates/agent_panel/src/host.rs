@@ -472,20 +472,19 @@ async fn connect(
                         .get(&call.tool_call_id.to_string())
                         .copied()
                 });
-                if studio.is_some() {
-                    // Studio's reads are read-only and its writes go through Studio's own
-                    // approval setting, so the agent's prompt for them is answered at once.
-                    let allow = request
+                // Studio's reads are read-only and its writes go through Studio's own approval
+                // setting, so the agent's prompt for them is allowed at once, for this call
+                // alone. Offered no allow-once (a lasting allow, or a refusal, first), the
+                // person is asked, as for any other tool.
+                if studio.is_some()
+                    && let Some(allow) = request
                         .options
                         .iter()
                         .find(|option| option.kind == PermissionOptionKind::AllowOnce)
-                        .or_else(|| request.options.first());
-                    let outcome = match allow {
-                        Some(option) => RequestPermissionOutcome::Selected(
-                            SelectedPermissionOutcome::new(option.option_id.clone()),
-                        ),
-                        None => RequestPermissionOutcome::Cancelled,
-                    };
+                {
+                    let outcome = RequestPermissionOutcome::Selected(
+                        SelectedPermissionOutcome::new(allow.option_id.clone()),
+                    );
                     return responder.respond(RequestPermissionResponse::new(outcome));
                 }
                 let events = permissions
