@@ -974,10 +974,12 @@ impl Render for OpenGraphModal {
                     .min_h_0()
                     .child(
                         // The columns stretch to the height the dialog leaves them, which their
-                        // lists scroll within.
+                        // lists scroll within (a row centers its children, at their own height,
+                        // unless told otherwise).
                         h_flex()
                             .flex_1()
                             .min_h_0()
+                            .items_stretch()
                             .gap(px(space::XL))
                             .child(servers)
                             .child(
