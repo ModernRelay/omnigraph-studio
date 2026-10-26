@@ -453,11 +453,22 @@ fn bounds_path() -> PathBuf {
 }
 
 /// Where the last moved window was, for a new window, if that still fits on a display.
+/// The window bounds saved last this run: a window opened after the first takes them from here,
+/// not from `window.json` read again on the main thread. `None` until the first is read or
+/// saved.
+fn last_bounds() -> MutexGuard<'static, Option<Option<SavedBounds>>> {
+    static LAST: OnceLock<Mutex<Option<Option<SavedBounds>>>> = OnceLock::new();
+    LAST.get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
 pub fn saved_window_bounds(cx: &App) -> Option<Bounds<Pixels>> {
-    let text = std::fs::read_to_string(bounds_path()).ok()?;
-    serde_json::from_str::<SavedBounds>(&text)
-        .ok()?
-        .on_screen(cx)
+    let saved = *last_bounds().get_or_insert_with(|| {
+        let text = std::fs::read_to_string(bounds_path()).ok()?;
+        serde_json::from_str::<SavedBounds>(&text).ok()
+    });
+    saved?.on_screen(cx)
 }
 
 pub(crate) fn save_window_bounds(bounds: Bounds<Pixels>) {
@@ -465,6 +476,7 @@ pub(crate) fn save_window_bounds(bounds: Bounds<Pixels>) {
         return;
     }
     let saved = SavedBounds::from(bounds);
+    *last_bounds() = Some(Some(saved));
     if let Ok(text) = serde_json::to_string(&saved) {
         write_private(&bounds_path(), &text);
     }

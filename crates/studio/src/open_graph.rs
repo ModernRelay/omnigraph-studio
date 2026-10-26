@@ -6,7 +6,7 @@
 use editor::{Editor, EditorEvent};
 use gpui::{
     App, Context, DismissEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Render,
-    SharedString, Subscription, Task, WeakEntity, Window,
+    ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window,
 };
 use graph_store::cli_config::{self, Platform};
 use graph_store::{
@@ -54,6 +54,10 @@ pub struct OpenGraphModal {
     /// A replacement for a token the selected server refused.
     replacement_token: Entity<Editor>,
     error: Option<SharedString>,
+    /// The server and graph lists, which scroll within the dialog: the keyboard's row is
+    /// scrolled into view ([`Self::move_to`]).
+    servers_scroll: ScrollHandle,
+    graphs_scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -161,6 +165,8 @@ impl OpenGraphModal {
             replacement_token,
             _adding: None,
             error: None,
+            servers_scroll: ScrollHandle::new(),
+            graphs_scroll: ScrollHandle::new(),
             _subscriptions: subscriptions,
         };
         this.follow(connections, window, cx);
@@ -296,6 +302,31 @@ impl OpenGraphModal {
             Place::Graph(_) => window.focus(&self.focus_handle, cx),
             Place::Token => window.focus(&self.replacement_token.focus_handle(cx), cx),
             Place::GraphId => window.focus(&self.graph_id.focus_handle(cx), cx),
+        }
+        // However long its list, the row the keyboard is on shows.
+        match &place {
+            Place::Server(id) => {
+                if let Some(at) = self
+                    .connections
+                    .iter()
+                    .position(|connection| connection.entity_id() == *id)
+                {
+                    self.servers_scroll.scroll_to_item(at);
+                }
+            }
+            Place::Graph(graph) => {
+                let at = self.selected.as_ref().and_then(|connection| {
+                    connection
+                        .read(cx)
+                        .graph_ids()
+                        .iter()
+                        .position(|id| id == graph)
+                });
+                if let Some(at) = at {
+                    self.graphs_scroll.scroll_to_item(at);
+                }
+            }
+            Place::Token | Place::GraphId => {}
         }
         self.cursor = Some(place);
         cx.notify();
@@ -534,37 +565,47 @@ impl OpenGraphModal {
         v_flex()
             .w(px(size::MODAL_WIDE / 3.))
             .flex_none()
+            .min_h_0()
             .gap(px(space::XXS))
             .child(pane_label("Servers"))
-            .children(
-                connections
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, connection)| {
-                        let c = connection.read(cx);
-                        let color = connection_color(&c.state);
-                        let selected = self.selected.as_ref() == Some(&connection);
-                        let source = source_label(&c.server.source, c.login_profile().as_deref());
-                        MenuRow::new(("server", index))
-                            .height(size::FEED_ROW)
-                            .toggle_state(selected)
-                            .start_slot(Indicator::dot().color(color))
-                            .child(
-                                v_flex()
-                                    .min_w_0()
-                                    .child(studio_ui::ds::text::body(c.server.name.clone()))
+            .child(
+                // Scrolls within the dialog, Add server… under it.
+                v_flex()
+                    .id("server-list")
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.servers_scroll)
+                    .children(
+                        connections
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, connection)| {
+                                let c = connection.read(cx);
+                                let color = connection_color(&c.state);
+                                let selected = self.selected.as_ref() == Some(&connection);
+                                let source =
+                                    source_label(&c.server.source, c.login_profile().as_deref());
+                                MenuRow::new(("server", index))
+                                    .height(size::FEED_ROW)
+                                    .toggle_state(selected)
+                                    .start_slot(Indicator::dot().color(color))
                                     .child(
-                                        studio_ui::ds::text::meta(format!(
-                                            "{} · {source}",
-                                            c.server.url
-                                        ))
-                                        .truncate(),
-                                    ),
-                            )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.select(connection.clone(), window, cx)
-                            }))
-                    }),
+                                        v_flex()
+                                            .min_w_0()
+                                            .child(studio_ui::ds::text::body(c.server.name.clone()))
+                                            .child(
+                                                studio_ui::ds::text::meta(format!(
+                                                    "{} · {source}",
+                                                    c.server.url
+                                                ))
+                                                .truncate(),
+                                            ),
+                                    )
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.select(connection.clone(), window, cx)
+                                    }))
+                            }),
+                    ),
             )
             .child(
                 studio_ui::ds::button("add-server", "Add server…")
@@ -608,6 +649,7 @@ impl OpenGraphModal {
         v_flex()
             .flex_1()
             .min_w_0()
+            .min_h_0()
             .gap(px(space::XXS))
             .child(
                 h_flex()
@@ -667,42 +709,48 @@ impl OpenGraphModal {
             .children(
                 listing_note.map(|n| div().px(px(space::MD)).child(studio_ui::ds::text::muted(n))),
             )
-            .children(
-                graphs
-                    .into_iter()
-                    .zip(infos)
-                    .enumerate()
-                    .map(|(index, (graph, info))| {
-                        let detail = match info {
-                            Some(Some((state, writable))) => format!(
-                                "{}{}",
-                                format!("{state:?}").to_lowercase(),
-                                if writable { "" } else { " · read only" }
-                            ),
-                            Some(None) => String::new(),
-                            None => "remembered".into(),
-                        };
-                        let id = graph.clone();
-                        let at_cursor = self.cursor.as_ref() == Some(&Place::Graph(graph.clone()));
-                        MenuRow::new(("graph", index))
-                            .height(size::ROW)
-                            .toggle_state(at_cursor)
-                            .start_slot(studio_ui::ds::icon::lead(IconName::Folder))
-                            .child(
-                                h_flex()
-                                    .gap(px(space::MD))
-                                    .child(studio_ui::ds::text::body(graph))
-                                    .child(studio_ui::ds::text::meta(detail)),
-                            )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open(id.clone(), window, cx)
-                            }))
-                    }),
+            .child(
+                // Scrolls within the dialog: the id field and Open stay under it.
+                v_flex()
+                    .id("graph-list")
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.graphs_scroll)
+                    .children(graphs.into_iter().zip(infos).enumerate().map(
+                        |(index, (graph, info))| {
+                            let detail = match info {
+                                Some(Some((state, writable))) => format!(
+                                    "{}{}",
+                                    format!("{state:?}").to_lowercase(),
+                                    if writable { "" } else { " · read only" }
+                                ),
+                                Some(None) => String::new(),
+                                None => "remembered".into(),
+                            };
+                            let id = graph.clone();
+                            let at_cursor =
+                                self.cursor.as_ref() == Some(&Place::Graph(graph.clone()));
+                            MenuRow::new(("graph", index))
+                                .height(size::ROW)
+                                .toggle_state(at_cursor)
+                                .start_slot(studio_ui::ds::icon::lead(IconName::Folder))
+                                .child(
+                                    h_flex()
+                                        .gap(px(space::MD))
+                                        .child(studio_ui::ds::text::body(graph))
+                                        .child(studio_ui::ds::text::meta(detail)),
+                                )
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open(id.clone(), window, cx)
+                                }))
+                        },
+                    )),
             )
             .child(
                 h_flex()
                     .pt(px(space::SM))
                     .gap(px(space::MD))
+                    .debug_selector(|| "open-graph".into())
                     .child(
                         studio_ui::ds::field_frame(false, cx)
                             .flex_1()
@@ -912,6 +960,7 @@ impl Render for OpenGraphModal {
             }))
             .w(px(size::MODAL_WIDE))
             .max_h(px(size::MODAL_MAX_HEIGHT))
+            .debug_selector(|| "open-graph-dialog".into())
             .child(
                 ds::ModalHeader::new("Open a graph")
                     .description(SharedString::from(
@@ -921,9 +970,14 @@ impl Render for OpenGraphModal {
             )
             .child(
                 ds::modal_body()
+                    .flex_1()
+                    .min_h_0()
                     .child(
+                        // The columns stretch to the height the dialog leaves them, which their
+                        // lists scroll within.
                         h_flex()
-                            .items_start()
+                            .flex_1()
+                            .min_h_0()
                             .gap(px(space::XL))
                             .child(servers)
                             .child(
@@ -1341,6 +1395,26 @@ mod tests {
         );
         assert!(registry.read_with(cx, |registry, _| registry.connections.is_empty()));
         assert!(asked.lock().unwrap().is_empty(), "nothing sent");
+    }
+
+    /// A server with more graphs than the dialog holds scrolls them within it: the id field and
+    /// Open stay in the dialog, and the row the keyboard moves to is scrolled into view.
+    #[gpui::test]
+    fn a_long_graph_list_scrolls_within_the_dialog(cx: &mut TestAppContext) {
+        let names: Vec<String> = (0..40).map(|i| format!("graph-{i:02}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let many = server(&names, cx);
+        let (modal, cx) = dialog(vec![many], cx);
+        cx.run_until_parked();
+        let dialog = cx.debug_bounds("open-graph-dialog").unwrap();
+        let open = cx.debug_bounds("open-graph").unwrap();
+        assert!(open.bottom() <= dialog.bottom(), "{open:?} in {dialog:?}");
+        modal.update_in(cx, |modal, window, cx| {
+            modal.move_to(Place::Graph("graph-39".into()), window, cx)
+        });
+        cx.run_until_parked();
+        let scrolled = modal.read_with(cx, |modal, _| modal.graphs_scroll.offset().y);
+        assert!(scrolled < px(0.), "{scrolled:?}");
     }
 
     /// Where the CLI gives Studio a token (Unix), Add server's token field is a field like the

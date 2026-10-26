@@ -287,6 +287,25 @@ pub struct ReadTargetOutput {
     pub snapshot: Option<String>,
 }
 
+impl ReadOutput {
+    /// The answer of no rows to `query_name` at `commit`, for a read its reader knows holds
+    /// none without asking.
+    pub fn empty(query_name: &str, commit: String) -> Self {
+        Self {
+            query_name: query_name.to_owned(),
+            target: ReadTargetOutput {
+                branch: None,
+                snapshot: Some(commit.clone()),
+            },
+            row_count: 0,
+            columns: Vec::new(),
+            rows: Arc::new(Value::Array(Vec::new())),
+            graph_commit_id: Some(commit),
+            page: None,
+        }
+    }
+}
+
 /// `POST /graphs/{id}/mutate` and `/mutate/if-graph-commit`.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ChangeRequest {

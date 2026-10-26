@@ -905,6 +905,19 @@ fn page_without<'a>(
     }
 }
 
+/// Whether a page at a commit without the properties in `without` holds no row: a filter asks
+/// for a value of one of them, or the page is in the run of rows with a value of a sort on one.
+/// [`node_page_fields`] and [`edge_page_without`] ask for such a page with `limit 0`; a reader
+/// that knows the commit answers it without asking.
+pub fn page_is_empty(
+    filters: &[Filter],
+    sort: Option<&Sort>,
+    start: &PageStart,
+    without: &[String],
+) -> bool {
+    page_without(filters, sort, start, without).2
+}
+
 /// [`node_page`] with each row as columns, as [`node_fields_by_id`] reads one node: for a
 /// commit made before the properties in `without` were added or renamed.
 pub fn node_page_fields(

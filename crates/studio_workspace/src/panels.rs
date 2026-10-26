@@ -86,6 +86,41 @@ pub struct Dock<V = AnyView> {
     pub size: f32,
 }
 
+/// The least a side dock is dragged to, and the most of the window's width it takes.
+const SIDE_MIN: f32 = 200.;
+const SIDE_SHARE: f32 = 0.45;
+/// The least the bottom dock is dragged to, and the most of the window's height it takes.
+const BOTTOM_MIN: f32 = 120.;
+const BOTTOM_SHARE: f32 = 0.6;
+/// The width the document keeps between the side docks, and the height it keeps above the
+/// bottom dock, however small the window: a dock gives way rather than squeezing it out.
+const DOCUMENT_MIN_WIDTH: f32 = 360.;
+const DOCUMENT_MIN_HEIGHT: f32 = 160.;
+
+/// The widths the side docks are drawn at in a window `width` wide, from their sizes (`left`
+/// and `right`, 0 for one not drawn): each at most its share of the window, and together leaving
+/// the document [`DOCUMENT_MIN_WIDTH`], past which they give way in proportion. The sizes held
+/// stay as they are, so a window widened again draws the docks at them.
+pub fn side_widths(left: f32, right: f32, width: f32) -> (f32, f32) {
+    let shared = |size: f32| size.min(width * SIDE_SHARE).max(0.);
+    let (left, right) = (shared(left), shared(right));
+    let room = (width - DOCUMENT_MIN_WIDTH).max(0.);
+    let taken = left + right;
+    if taken <= room {
+        return (left, right);
+    }
+    let scale = room / taken;
+    (left * scale, right * scale)
+}
+
+/// The height the bottom dock is drawn at in a window `height` tall, from its size: at most its
+/// share of the window, leaving the document [`DOCUMENT_MIN_HEIGHT`].
+pub fn bottom_height(size: f32, height: f32) -> f32 {
+    size.min(height * BOTTOM_SHARE)
+        .min(height - DOCUMENT_MIN_HEIGHT)
+        .max(0.)
+}
+
 impl<V> Dock<V> {
     pub fn new(position: PanelPosition, open: bool) -> Self {
         Self {
@@ -101,8 +136,8 @@ impl<V> Dock<V> {
     /// (the window's width for a side dock, its height for the bottom dock).
     pub fn resize(&mut self, size: f32, available: f32) {
         let (min, share) = match self.position {
-            PanelPosition::Left | PanelPosition::Right => (200., 0.45),
-            PanelPosition::Bottom => (120., 0.6),
+            PanelPosition::Left | PanelPosition::Right => (SIDE_MIN, SIDE_SHARE),
+            PanelPosition::Bottom => (BOTTOM_MIN, BOTTOM_SHARE),
         };
         self.size = size.min(available * share).max(min);
     }
@@ -215,6 +250,32 @@ mod tests {
         dock.take("activity");
         assert_eq!(dock.active_id().as_deref(), Some("nodes"), "its neighbor");
         assert!(dock.take("activity").is_none());
+    }
+
+    /// The side docks keep their sizes in a wide window; in a narrow one each stays within its
+    /// share, and together they give way in proportion so the document keeps its width.
+    #[test]
+    fn docks_give_way_to_a_small_window() {
+        assert_eq!(side_widths(260., 320., 1600.), (260., 320.));
+        assert_eq!(side_widths(260., 0., 1600.), (260., 0.));
+        // Half a 1280 px screen: 640 px, of which the document keeps 360. The inspector is
+        // held within its share first (288 px), then both give way in proportion.
+        let (left, right) = side_widths(260., 320., 640.);
+        assert!((left + right - 280.).abs() < 0.01, "{left} + {right}");
+        assert!((left / right - 260. / 288.).abs() < 0.01, "in proportion");
+        // Each within its share of the window.
+        let (wide, none) = side_widths(900., 0., 1600.);
+        assert!((wide - 720.).abs() < 0.01 && none == 0., "{wide}");
+        // Too small for any dock: the document has it all.
+        assert_eq!(side_widths(260., 320., 300.), (0., 0.));
+        assert_eq!(bottom_height(300., 1000.), 300.);
+        assert_eq!(bottom_height(300., 400.), 240., "within its share");
+        assert_eq!(
+            bottom_height(300., 250.),
+            90.,
+            "the document keeps its height"
+        );
+        assert_eq!(bottom_height(300., 100.), 0.);
     }
 
     #[test]

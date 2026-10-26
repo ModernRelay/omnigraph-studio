@@ -14,7 +14,7 @@ use crate::ds::{elevation, radii, size, space, surface};
 use gpui::{
     Action, Anchor, AnyElement, App, Bounds, DismissEvent, Entity, EventEmitter, FocusHandle,
     Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Role,
-    Size, Subscription, TaskExt, anchored, canvas, px, relative,
+    ScrollHandle, Size, Subscription, TaskExt, anchored, canvas, px, relative,
 };
 use gpui::{ClickEvent, ElementId, FontWeight, SharedString};
 use menu::{SelectChild, SelectFirst, SelectLast, SelectNext, SelectParent, SelectPrevious};
@@ -155,6 +155,9 @@ pub struct ContextMenu {
     /// re-selects the first item before the next on_hover(true) clears it.
     /// Always true when accessibility support is disabled.
     suppress_focus_selection: bool,
+    /// The entries' list, which scrolls within the menu's height: the entry selected is
+    /// scrolled into view ([`Self::select_index`]).
+    scroll_handle: ScrollHandle,
 }
 
 impl Focusable for ContextMenu {
@@ -584,6 +587,8 @@ impl ContextMenu {
         let item = self.items.get(ix)?;
         if item.is_selectable() {
             self.selected_index = Some(ix);
+            // A long menu (the font list) keeps the keyboard's entry in view.
+            self.scroll_handle.scroll_to_item(ix);
         }
         Some(ix)
     }
@@ -1284,6 +1289,7 @@ impl ContextMenu {
             submenu_trigger_mouse_down: false,
             ignore_blur_until: None,
             suppress_focus_selection: !window.is_a11y_enabled(),
+            scroll_handle: ScrollHandle::new(),
         }
     }
 }
@@ -1352,110 +1358,118 @@ impl Render for ContextMenu {
             _ => None,
         };
 
-        let render_menu = |cx: &mut Context<Self>, window: &mut Window| {
-            let bounds_cell = self.main_menu_observed_bounds.clone();
-            let menu_bounds_measure = canvas(
-                {
-                    move |bounds, _window, _cx| {
-                        bounds_cell.set(Some(bounds));
-                    }
-                },
-                |_bounds, _state, _window, _cx| {},
-            )
-            .size_full()
-            .absolute()
-            .top_0()
-            .left_0();
+        let render_menu =
+            |cx: &mut Context<Self>, window: &mut Window| {
+                let bounds_cell = self.main_menu_observed_bounds.clone();
+                let menu_bounds_measure = canvas(
+                    {
+                        move |bounds, _window, _cx| {
+                            bounds_cell.set(Some(bounds));
+                        }
+                    },
+                    |_bounds, _state, _window, _cx| {},
+                )
+                .size_full()
+                .absolute()
+                .top_0()
+                .left_0();
 
-            WithRemSize::new(ui_font_size)
-                .occlude()
-                .font_family(ui_font_family.clone())
-                .line_height(line_height)
-                .map(|this| menu_surface(this, cx))
-                .flex()
-                .flex_row()
-                .flex_shrink_0()
-                .child(
-                    v_flex()
-                        .id("context-menu")
-                        .role(Role::Menu)
-                        .max_h(vh(0.75, window))
-                        .flex_shrink_0()
-                        .child(menu_bounds_measure)
-                        .min_w(px(size::MENU_MIN_WIDTH))
-                        .flex_1()
-                        .overflow_y_scroll()
-                        .track_focus(&self.focus_handle(cx))
-                        .key_context("menu")
-                        .on_action(cx.listener(ContextMenu::select_first))
-                        .on_action(cx.listener(ContextMenu::handle_select_last))
-                        .on_action(cx.listener(ContextMenu::select_next))
-                        .on_action(cx.listener(ContextMenu::select_previous))
-                        .on_action(cx.listener(ContextMenu::select_submenu_child))
-                        .on_action(cx.listener(ContextMenu::select_submenu_parent))
-                        .on_action(cx.listener(ContextMenu::confirm))
-                        .on_action(cx.listener(ContextMenu::secondary_confirm))
-                        .on_action(cx.listener(ContextMenu::cancel))
-                        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                            if *hovered {
-                                this.hover_target = HoverTarget::MainMenu;
-                                if let Some(parent) = &this.main_menu {
-                                    parent.update(cx, |parent, _| {
-                                        parent.hover_target = HoverTarget::Submenu;
-                                    });
+                WithRemSize::new(ui_font_size)
+                    .occlude()
+                    .font_family(ui_font_family.clone())
+                    .line_height(line_height)
+                    .map(|this| menu_surface(this, cx))
+                    .flex()
+                    .flex_row()
+                    .flex_shrink_0()
+                    .child(
+                        v_flex()
+                            .id("context-menu")
+                            .role(Role::Menu)
+                            .max_h(vh(0.75, window))
+                            .flex_shrink_0()
+                            .child(menu_bounds_measure)
+                            .min_w(px(size::MENU_MIN_WIDTH))
+                            .flex_1()
+                            .overflow_hidden()
+                            .track_focus(&self.focus_handle(cx))
+                            .key_context("menu")
+                            .on_action(cx.listener(ContextMenu::select_first))
+                            .on_action(cx.listener(ContextMenu::handle_select_last))
+                            .on_action(cx.listener(ContextMenu::select_next))
+                            .on_action(cx.listener(ContextMenu::select_previous))
+                            .on_action(cx.listener(ContextMenu::select_submenu_child))
+                            .on_action(cx.listener(ContextMenu::select_submenu_parent))
+                            .on_action(cx.listener(ContextMenu::confirm))
+                            .on_action(cx.listener(ContextMenu::secondary_confirm))
+                            .on_action(cx.listener(ContextMenu::cancel))
+                            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                                if *hovered {
+                                    this.hover_target = HoverTarget::MainMenu;
+                                    if let Some(parent) = &this.main_menu {
+                                        parent.update(cx, |parent, _| {
+                                            parent.hover_target = HoverTarget::Submenu;
+                                        });
+                                    }
                                 }
-                            }
-                        }))
-                        .on_mouse_down_out(cx.listener(
-                            |this, event: &MouseDownEvent, window, cx| {
-                                if matches!(&this.submenu_state, SubmenuState::Open(_)) {
-                                    if let Some(padded_bounds) = this.padded_submenu_bounds() {
-                                        if padded_bounds.contains(&event.position) {
+                            }))
+                            .on_mouse_down_out(cx.listener(
+                                |this, event: &MouseDownEvent, window, cx| {
+                                    if matches!(&this.submenu_state, SubmenuState::Open(_)) {
+                                        if let Some(padded_bounds) = this.padded_submenu_bounds() {
+                                            if padded_bounds.contains(&event.position) {
+                                                return;
+                                            }
+                                        }
+                                    }
+
+                                    if let Some(parent) = &this.main_menu {
+                                        let overridden_by_parent_trigger = parent
+                                            .read(cx)
+                                            .submenu_trigger_bounds
+                                            .get()
+                                            .is_some_and(|bounds| bounds.contains(&event.position));
+                                        if overridden_by_parent_trigger {
                                             return;
                                         }
                                     }
-                                }
 
-                                if let Some(parent) = &this.main_menu {
-                                    let overridden_by_parent_trigger = parent
-                                        .read(cx)
-                                        .submenu_trigger_bounds
-                                        .get()
-                                        .is_some_and(|bounds| bounds.contains(&event.position));
-                                    if overridden_by_parent_trigger {
-                                        return;
+                                    this.cancel(&menu::Cancel, window, cx)
+                                },
+                            ))
+                            .when(!self.delayed, |mut el| {
+                                for item in self.items.iter() {
+                                    if let ContextMenuItem::Entry(ContextMenuEntry {
+                                        action: Some(action),
+                                        disabled: false,
+                                        ..
+                                    }) = item
+                                    {
+                                        el = el.on_boxed_action(
+                                            &**action,
+                                            cx.listener(ContextMenu::on_action_dispatch),
+                                        );
                                     }
                                 }
-
-                                this.cancel(&menu::Cancel, window, cx)
-                            },
-                        ))
-                        .when(!self.delayed, |mut el| {
-                            for item in self.items.iter() {
-                                if let ContextMenuItem::Entry(ContextMenuEntry {
-                                    action: Some(action),
-                                    disabled: false,
-                                    ..
-                                }) = item
-                                {
-                                    el = el.on_boxed_action(
-                                        &**action,
-                                        cx.listener(ContextMenu::on_action_dispatch),
-                                    );
-                                }
-                            }
-                            el
-                        })
-                        .child(
-                            v_flex().w_full().p(px(space::XS)).children(
-                                self.items
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(ix, item)| self.render_menu_item(ix, item, window, cx)),
+                                el
+                            })
+                            .child(
+                                // The entries scroll, each a child of their own list, so the one
+                                // selected can be scrolled to.
+                                v_flex()
+                                    .id("context-menu-entries")
+                                    .w_full()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .p(px(space::XS))
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.scroll_handle)
+                                    .children(self.items.iter().enumerate().map(|(ix, item)| {
+                                        self.render_menu_item(ix, item, window, cx)
+                                    })),
                             ),
-                        ),
-                )
-        };
+                    )
+            };
 
         if let Some(focus_handle) = focus_submenu.as_ref() {
             window.focus(focus_handle, cx);
@@ -1710,6 +1724,32 @@ mod tests {
         cx.run_until_parked();
         cx.update(|window, cx| window.focus(&menu.focus_handle(cx), cx));
         cx.run_until_parked();
+    }
+
+    /// A menu longer than its height (the font list) scrolls the entry the keyboard highlights
+    /// into view.
+    #[gpui::test]
+    fn a_long_menu_scrolls_to_the_highlighted_entry(cx: &mut TestAppContext) {
+        cx.update(|cx| studio_theme::init_test(cx));
+        let window = cx
+            .update(|cx| {
+                cx.open_window(Default::default(), |window, cx| {
+                    ContextMenu::build(window, cx, |menu, _, _| {
+                        (0..200).fold(menu, |menu, i| {
+                            menu.entry(format!("Font {i}"), None, |_, _| {})
+                        })
+                    })
+                })
+            })
+            .expect("open menu window");
+        let menu = window.root(cx).expect("menu root");
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, _| window.activate_window());
+        focus_menu(&menu, &mut cx);
+        cx.dispatch_action(SelectLast);
+        cx.run_until_parked();
+        let offset = menu.read_with(&cx, |menu, _| menu.scroll_handle.offset().y);
+        assert!(offset < px(0.), "{offset:?}");
     }
 
     fn assert_focus_selection(cx: &mut TestAppContext, persistent: bool, a11y_enabled: bool) {

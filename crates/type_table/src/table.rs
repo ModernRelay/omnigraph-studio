@@ -139,6 +139,9 @@ struct RowLook {
 
 /// How long scrolling must pause before the drawn rows' Blob cells are read.
 const BLOB_READ_AFTER: Duration = Duration::from_millis(120);
+/// How many Blob cells a table reads at once: the reads share the connection's few slots with
+/// the table's pages, relationships and counts, and with every other view's reads.
+const BLOB_READS_AT_ONCE: usize = 4;
 
 /// A cell's save as sent: the value it was bound to, the one written, the text typed, what the
 /// row showed before the new value was put in it, and the cell's draft as the session held it
@@ -487,6 +490,9 @@ pub struct TypeTable {
     /// commit; and the reads under way.
     blobs: CellMap<Loadable<BlobMeta>>,
     blob_tasks: HashMap<(String, String), Task<()>>,
+    /// The Blob cells asked for and not read yet, the first drawn first: at most
+    /// [`BLOB_READS_AT_ONCE`] are out at a time ([`Self::read_queued_blobs`]).
+    blob_queue: std::collections::VecDeque<(String, String)>,
     /// Files dropped on Blob cells being stored, by row id and property, and why one that did
     /// not land did not.
     blob_edits: HashMap<(String, String), BlobEdit>,
@@ -766,6 +772,7 @@ impl TypeTable {
             drafts_due: false,
             blobs: CellMap::default(),
             blob_tasks: HashMap::new(),
+            blob_queue: Default::default(),
             blob_edits: HashMap::new(),
             relations: CellMap::default(),
             relation_tasks: HashMap::new(),
@@ -980,6 +987,30 @@ impl TypeTable {
             self.grouping = None;
         }
         self.reload(false, cx);
+    }
+
+    /// [`Self::read_shown`] of a page from `start` (in the section `section` holds the rows of,
+    /// when grouped): one the builder knows holds no row at the commit is answered here, as
+    /// [`Self::count_query`] answers its count, when the commit is known.
+    fn read_page(
+        &self,
+        query: &BuiltQuery,
+        start: &PageStart,
+        section: Option<&Filter>,
+        snapshot: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ReadOutput, ReadError>> {
+        if let Some(commit) = snapshot.clone()
+            && !self.absent.is_empty()
+        {
+            let mut filters = self.resolved_filters();
+            filters.extend(section.cloned());
+            let without: Vec<String> = self.absent.keys().cloned().collect();
+            if builder::page_is_empty(&filters, self.sort.as_ref(), start, &without) {
+                return Task::ready(Ok(ReadOutput::empty(&query.name, commit)));
+            }
+        }
+        self.read_shown(query, snapshot, cx)
     }
 
     /// Reads what the table shows, through its scope while it follows the branch.
@@ -2333,6 +2364,7 @@ impl TypeTable {
         if !keep_pin {
             self.blobs.clear();
             self.blob_tasks.clear();
+            self.blob_queue.clear();
             // A file still being stored stays shown as going; why one did not land goes.
             self.blob_edits.retain(|_, edit| edit.is_saving());
             self.relations.clear();
@@ -2383,7 +2415,7 @@ impl TypeTable {
     /// forward meanwhile to a head that changed nothing the table reads keeps it: what it holds
     /// is what the head holds.
     fn read_first_page(&mut self, cx: &mut Context<Self>) {
-        let size = self.page_size(cx);
+        let size = self.page_size(cx).saturating_mul(2);
         let query = match self.page_query(&PageStart::First, size, None) {
             Ok(query) => query,
             Err(error) => {
@@ -2397,7 +2429,13 @@ impl TypeTable {
         let asked = self.head_asked(cx);
         let snapshot = self.paging.pinned.clone().or_else(|| asked.clone());
         let sent = self.own_writes;
-        let read = self.read_shown(&query, snapshot, cx);
+        let read = self.read_page(&query, &PageStart::First, None, snapshot, cx);
+        // Pinned already (a filter or the order changed), the counts read at the same commit:
+        // they go now, beside the page, rather than once it is in.
+        let counted = self.paging.pinned.is_some();
+        if counted {
+            self.load_counts(cx);
+        }
         self.page_task = Some(cx.spawn(async move |this, cx| {
             let result = read.await;
             this.update(cx, |this, cx| {
@@ -2406,7 +2444,7 @@ impl TypeTable {
                     this.read_first_page(cx);
                     return;
                 }
-                this.apply_page(result, true, size, cx);
+                this.apply_page(result, Some(counted), size, cx);
                 this.pinned_at(asked, cx);
             })
             .ok();
@@ -2477,7 +2515,7 @@ impl TypeTable {
         {
             return;
         }
-        let size = self.page_size(cx);
+        let size = self.paging.next_page_size(self.page_size(cx));
         let start = self.paging.start.clone();
         let query = match self.page_query(&start, size, None) {
             Ok(query) => query,
@@ -2490,7 +2528,7 @@ impl TypeTable {
         self.loading_more = true;
         self.more_error = None;
         let sent = self.own_writes;
-        let read = self.read_shown(&query, self.paging.pinned.clone(), cx);
+        let read = self.read_page(&query, &start, None, self.paging.pinned.clone(), cx);
         self.page_task = Some(cx.spawn(async move |this, cx| {
             let result = read.await;
             this.update(cx, |this, cx| {
@@ -2501,7 +2539,7 @@ impl TypeTable {
                     this.load_more(cx);
                     return;
                 }
-                this.apply_page(result, false, size, cx)
+                this.apply_page(result, None, size, cx)
             })
             .ok();
         }));
@@ -2669,7 +2707,19 @@ impl TypeTable {
         let property = grouping.property.clone();
         // The sections are read again, and with them which reads are owed.
         self.dropped_sections.clear();
-        let filters = self.resolved_filters();
+        // At a commit made before a property was added or renamed, the groups are counted
+        // without filters on it, as the rows are read; one asking for a value matches no row.
+        let without: Vec<String> = self.absent.keys().cloned().collect();
+        let Some(filters) = builder::filters_without(&self.resolved_filters(), &without) else {
+            if let Some(grouping) = self.grouping.as_mut() {
+                grouping.accept_no_rows();
+            }
+            self.lines_moved();
+            self.first_page = Loadable::Loaded(());
+            self.load_counts(cx);
+            cx.notify();
+            return;
+        };
         // By neighbours: the rows per neighbour or per value they hold, and apart from them the
         // rows with no neighbour, or none with a value.
         let with_none = |op: FilterOp| {
@@ -2776,19 +2826,26 @@ impl TypeTable {
         none: Option<Result<ReadOutput, ReadError>>,
         cx: &mut Context<Self>,
     ) {
-        let Some(grouping) = self
-            .grouping
-            .as_mut()
-            .filter(|g| g.generation == generation)
-        else {
+        if self.grouping.as_ref().map(|g| g.generation) != Some(generation) {
             return;
-        };
+        }
         let none =
             none.map(|read| read.map(|output| count_of(&output.rows).unwrap_or(0).max(0) as u64));
         let result = match (result, none) {
             (Ok(output), Some(Ok(none))) => Ok((output, Some(none))),
             (Ok(output), None) => Ok((output, None)),
             (Err(error), _) | (_, Some(Err(error))) => Err(error),
+        };
+        // Refused for a property the commit shown does not hold: read again without it, as the
+        // rows are ([`Self::apply_page`]).
+        if let Err(ReadError::Refused(refusal)) = &result
+            && self.read_without(refusal.historical_gap())
+        {
+            self.reload(true, cx);
+            return;
+        }
+        let Some(grouping) = self.grouping.as_mut() else {
+            return;
         };
         match result {
             Ok((output, none)) => {
@@ -2845,7 +2902,13 @@ impl TypeTable {
         section.loading = true;
         section.error = None;
         let sent = self.own_writes;
-        let read = self.read_shown(&query, self.paging.pinned.clone(), cx);
+        let read = self.read_page(
+            &query,
+            &start,
+            Some(&filter),
+            self.paging.pinned.clone(),
+            cx,
+        );
         let task = cx.spawn(async move |this, cx| {
             let result = read.await;
             this.update(cx, |this, cx| {
@@ -2893,17 +2956,26 @@ impl TypeTable {
             Ok(output) => {
                 let page = self.rows_from(&output.rows);
                 let sort_column = self.sort.as_ref().map(|sort| sort.property.clone());
+                let nulls_follow = self.sort_nulls_follow();
                 if let Some(section) = self.grouping.as_mut().and_then(|g| g.section_mut(index)) {
                     section.loading = false;
                     section.paging.accept(
                         output.graph_commit_id.as_deref(),
                         &page,
                         size,
+                        size,
                         sort_column.as_deref(),
+                        nulls_follow,
                     );
                 }
                 let page = self.not_placed_here(page);
                 self.not_shown_already(page, Some(index))
+            }
+            // Refused for a property the commit shown does not hold: read again without it, as
+            // the rows are ([`Self::apply_page`]).
+            Err(ReadError::Refused(refusal)) if self.read_without(refusal.historical_gap()) => {
+                self.reload(true, cx);
+                return;
             }
             Err(error) => {
                 if let Some(section) = self.grouping.as_mut().and_then(|g| g.section_mut(index)) {
@@ -3168,38 +3240,49 @@ impl TypeTable {
         }
     }
 
+    /// Takes a page: the first (`first`, whether its counts went with it), or a later one.
     fn apply_page(
         &mut self,
         result: Result<ReadOutput, ReadError>,
-        first: bool,
+        first: Option<bool>,
         size: u32,
         cx: &mut Context<Self>,
     ) {
         match result {
             Ok(output) => {
                 let page = self.rows_from(&output.rows);
+                let base = self.page_size(cx);
+                let nulls_follow = self.sort_nulls_follow();
                 let sort_column = self.sort.as_ref().map(|sort| sort.property.as_str());
-                self.paging
-                    .accept(output.graph_commit_id.as_deref(), &page, size, sort_column);
+                self.paging.accept(
+                    output.graph_commit_id.as_deref(),
+                    &page,
+                    size,
+                    base,
+                    sort_column,
+                    nulls_follow,
+                );
                 let page = self.not_placed_here(page);
                 let page = self.not_shown_already(page, None);
                 let ids: Vec<String> = page.iter().map(|row| row.id.clone()).collect();
                 let added = !page.is_empty();
                 self.rows.extend(page);
                 self.load_relations(ids, cx);
-                if first {
-                    self.first_page = Loadable::Loaded(());
-                    self.load_counts(cx);
-                } else {
-                    self.loading_more = false;
+                match first {
+                    Some(counted) => {
+                        self.first_page = Loadable::Loaded(());
+                        if !counted {
+                            self.load_counts(cx);
+                        }
+                    }
+                    None => self.loading_more = false,
                 }
-                // The next page is asked for as soon as this one is in while no more than a
-                // page is left past the lines drawn, so a scroll finds its rows read rather
-                // than waiting seconds for them; further ahead, the lines drawn ask for it as
-                // they come near ([`Paging::wants_more`]). A read that showed no row and is not
-                // the last (sorted, the rows with a value ran out, and those without one are
-                // next) reads on at once: with none shown the table would say it has no rows
-                // while its count says it has.
+                // The next page is asked for once no more than a page is left past the lines
+                // drawn, so a scroll finds its rows read; the lines drawn ask for it as they
+                // come near ([`Paging::wants_more`]). A read that showed no row and is not the
+                // last (sorted, the rows with a value ran out, and those without one are next)
+                // reads on at once: with none shown the table would say it has no rows while
+                // its count says it has.
                 let ahead = self.paging.wants_more(
                     self.rows.len(),
                     self.lines_drawn.end,
@@ -3214,7 +3297,10 @@ impl TypeTable {
                 return;
             }
             Err(error) => {
-                if first {
+                if first.is_some() {
+                    // Counts sent with the page say nothing of rows that were not read.
+                    self.count_task = None;
+                    self.total_task = None;
                     self.first_page = Loadable::Failed(match &error {
                         ReadError::Refused(refusal) => match refusal.historical_gap() {
                             Some(HistoricalGap::Type { name }) if name == self.type_name => {
@@ -4586,6 +4672,18 @@ impl TypeTable {
         // The footer's key hints read the bindings of the frame drawn before, which still had
         // the editor focused; draw once more so they show the table's keys again.
         cx.on_next_frame(window, |_, window, _| window.refresh());
+    }
+
+    /// Whether rows without a value of the sort's property can follow those with one: not when
+    /// every row must hold it, which the schema says of the branch as it is; a table held at an
+    /// older commit reads them anyway, as that commit's schema may have allowed them.
+    fn sort_nulls_follow(&self) -> bool {
+        self.at_commit.is_some()
+            || self
+                .sort
+                .as_ref()
+                .and_then(|sort| self.property_of(&sort.property))
+                .is_none_or(|property| property.nullable)
     }
 
     fn property_of(&self, column: &str) -> Option<Property> {
@@ -7428,9 +7526,24 @@ impl TypeTable {
                     })
                     .cloned()
                     .collect();
+                let columns = &this.blob_columns;
+                let waiting_gone: Vec<(String, String)> = this
+                    .blob_queue
+                    .iter()
+                    .filter(|(id, property)| {
+                        !drawn.contains(id.as_str()) || !columns.contains(property)
+                    })
+                    .cloned()
+                    .collect();
                 for key in gone {
                     this.blob_tasks.remove(&key);
                     this.blobs.remove(&key.0, &key.1);
+                }
+                for key in &waiting_gone {
+                    this.blob_queue.retain(|waiting| waiting != key);
+                    if matches!(this.blobs.get(&key.0, &key.1), Some(Loadable::Loading)) {
+                        this.blobs.remove(&key.0, &key.1);
+                    }
                 }
                 this.load_blob_metas(rows, cx);
             })
@@ -7538,8 +7651,6 @@ impl TypeTable {
         if properties.is_empty() {
             return;
         }
-        let edge = self.kind == TableKind::Edge;
-        let snapshot = self.paging.pinned.clone();
         let rows: Vec<String> = rows
             .into_iter()
             .filter_map(|ix| self.rows.get(ix))
@@ -7550,42 +7661,61 @@ impl TypeTable {
                 if self.blobs.contains(&id, property) {
                     continue;
                 }
-                let key = (id.clone(), property.clone());
                 self.blobs
                     .insert(id.clone(), property.clone(), Loadable::Loading);
-                let cell = BlobCell {
-                    edge,
-                    type_name: self.type_name.clone(),
-                    id: id.clone(),
-                    property: property.clone(),
-                };
-                let scope = self.scope.clone();
-                let read = self.session.update(cx, |session, cx| match &scope {
-                    Some(scope) => session.blob_meta_in(scope, cell, snapshot.clone(), cx),
-                    None => session.blob_meta(cell, snapshot.clone(), cx),
-                });
-                let task_key = key.clone();
-                let task = cx.spawn(async move |this, cx| {
-                    let result = read.await;
-                    this.update(cx, |this, cx| {
-                        // A reload since this read began leaves its answer out.
-                        if this.blob_tasks.remove(&task_key).is_some() {
-                            let (id, property) = task_key;
-                            this.blobs.insert(
-                                id,
-                                property,
-                                match result {
-                                    Ok(meta) => Loadable::Loaded(meta),
-                                    Err(error) => Loadable::Failed(error.to_string()),
-                                },
-                            );
-                            cx.notify();
-                        }
-                    })
-                    .ok();
-                });
-                self.blob_tasks.insert(key, task);
+                self.blob_queue.push_back((id.clone(), property.clone()));
             }
+        }
+        self.read_queued_blobs(cx);
+    }
+
+    /// Reads the queued Blob cells, the first drawn first, while fewer than
+    /// [`BLOB_READS_AT_ONCE`] are out; each read that ends starts the next. A cell answered
+    /// meanwhile (a write landed its value) or let go (a reload, a scroll away) is passed over.
+    fn read_queued_blobs(&mut self, cx: &mut Context<Self>) {
+        let edge = self.kind == TableKind::Edge;
+        let snapshot = self.paging.pinned.clone();
+        while self.blob_tasks.len() < BLOB_READS_AT_ONCE {
+            let Some(key) = self.blob_queue.pop_front() else {
+                break;
+            };
+            let waiting = matches!(self.blobs.get(&key.0, &key.1), Some(Loadable::Loading));
+            if !waiting || self.blob_tasks.contains_key(&key) {
+                continue;
+            }
+            let cell = BlobCell {
+                edge,
+                type_name: self.type_name.clone(),
+                id: key.0.clone(),
+                property: key.1.clone(),
+            };
+            let scope = self.scope.clone();
+            let read = self.session.update(cx, |session, cx| match &scope {
+                Some(scope) => session.blob_meta_in(scope, cell, snapshot.clone(), cx),
+                None => session.blob_meta(cell, snapshot.clone(), cx),
+            });
+            let task_key = key.clone();
+            let task = cx.spawn(async move |this, cx| {
+                let result = read.await;
+                this.update(cx, |this, cx| {
+                    // A reload since this read began leaves its answer out.
+                    if this.blob_tasks.remove(&task_key).is_some() {
+                        let (id, property) = task_key;
+                        this.blobs.insert(
+                            id,
+                            property,
+                            match result {
+                                Ok(meta) => Loadable::Loaded(meta),
+                                Err(error) => Loadable::Failed(error.to_string()),
+                            },
+                        );
+                        cx.notify();
+                    }
+                    this.read_queued_blobs(cx);
+                })
+                .ok();
+            });
+            self.blob_tasks.insert(key, task);
         }
     }
 
@@ -7874,10 +8004,12 @@ impl TypeTable {
                 let blob = Some((key.0.clone(), key.1.clone(), meta.clone()));
                 self.tell_peek_wrote(Vec::new(), blob, commit, parent.as_deref(), cx);
             }
-            // A read of the cell still out would land the value replaced.
+            // A read of the cell still out would land the value replaced; the next waiting
+            // takes its place.
             self.blob_tasks.remove(&key);
             self.blobs
                 .insert(key.0.clone(), key.1.clone(), Loadable::Loaded(meta.clone()));
+            self.read_queued_blobs(cx);
         }
         match BlobEdit::ended(written, change, &key.1) {
             Some(edit) => self.blob_edits.insert(key, edit),
@@ -10010,8 +10142,8 @@ mod tests {
             ["studio_page", "studio_page_fields"]
         );
 
-        // Sorted and filtered by it there, the table pages without naming it and counts 0
-        // without a read: no row held it.
+        // Sorted and filtered by it there, no row held it: the table answers its page and its
+        // count of 0 without a read.
         let reads_before = read.len();
         table.update(cx, |table, cx| {
             table.sort = Some(builder::Sort {
@@ -10032,10 +10164,102 @@ mod tests {
         });
         let names = names.lock().unwrap().clone();
         let after = &names[reads_before..];
-        assert!(after.iter().all(|name| name != "studio_page"), "{after:?}");
+        assert!(
+            after.iter().all(|name| !name.starts_with("studio_page")),
+            "{after:?}"
+        );
         assert!(
             !after.iter().any(|name| name == "studio_count"),
             "{after:?}"
+        );
+    }
+
+    /// Grouped at a commit made before a property was added, its sections are refused for it
+    /// as the ungrouped rows are, and read again without it; filtered by it there, no row holds
+    /// it, and the groups are counted without a read.
+    #[gpui::test]
+    async fn a_grouped_table_at_a_commit_before_a_property_was_added_reads_the_rest(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let schema = PEOPLE.replace("  name: String\n", "  name: String\n  born: Date?\n");
+        let (session, names) = crate::test_support::session_routing(
+            &schema,
+            |request| match request["name"].as_str() {
+                Some("studio_value_counts") => serde_json::json!([
+                    {"value": "Ada", "n": 1},
+                    {"value": "Grace", "n": 1},
+                ]),
+                Some("studio_page") => serde_json::json!({
+                    "refuse": "property 'born' of node type 'Person' does not exist at this snapshot"
+                }),
+                Some("studio_page_fields") => serde_json::json!([
+                    { "id": "p1", "v_slug": "p1", "v_name": "Ada" },
+                ]),
+                _ => serde_json::json!([]),
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        let opening = Opening {
+            group_by: Some("name".into()),
+            ..Opening::default()
+        };
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::opening(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                Some("c0".into()),
+                opening,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.absent.get("born"), Some(&PropertyThen::Absent));
+            assert!(matches!(table.first_page, Loadable::Loaded(())));
+            let sections = table.grouping.as_ref().unwrap().sections();
+            assert!(!sections.is_empty());
+            assert!(
+                sections.iter().all(|section| section.error.is_none()),
+                "no section shows the refusal"
+            );
+        });
+        assert!(
+            names
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|name| name == "studio_page_fields"),
+            "the sections were read without it"
+        );
+
+        let before = names.lock().unwrap().len();
+        table.update(cx, |table, cx| {
+            table.filters = vec![Filter {
+                property: "born".into(),
+                op: FilterOp::Gt,
+                value: serde_json::json!("1815-12-10"),
+            }];
+            table.reload(true, cx);
+        });
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert!(matches!(table.first_page, Loadable::Loaded(())));
+            assert!(table.grouping.as_ref().unwrap().sections().is_empty());
+            assert_eq!(table.count, Loadable::Loaded(0));
+        });
+        let names = names.lock().unwrap();
+        assert!(
+            !names[before..]
+                .iter()
+                .any(|name| name == "studio_value_counts"),
+            "{names:?}"
         );
     }
 
@@ -10949,10 +11173,10 @@ mod tests {
         assert_eq!(counts[0]["at"], "c2");
     }
 
-    /// The next page is asked for as soon as a page is in while no more than a page is left
-    /// past the lines in view, so a scroll finds its rows read, and no page further. A read out
-    /// when the order changes is dropped, and the rows are read from the start in the new
-    /// order. Before, the next page was asked for only once the view passed 80% of the rows.
+    /// The first page asks for two pages; the next, twice as many, is asked for once the view
+    /// comes within a page of the rows read, and not as the first lands. A read out when the
+    /// order changes is dropped, and the rows are read from the start in the new order. Before,
+    /// the second page was read at once, a cursor scan on every open, sort and filter.
     #[gpui::test]
     async fn the_next_page_is_read_a_page_ahead_and_dropped_when_the_order_changes(
         cx: &mut TestAppContext,
@@ -10961,8 +11185,8 @@ mod tests {
             studio_theme::init_test(cx);
             editor::init(cx);
         });
-        // A thousand people, a hundred a page from the one after `after`: `p…` by id, `s…` by
-        // name.
+        // A thousand people, as many a page as it asks for from the one after `after`: `p…` by
+        // id, `s…` by name.
         let (session, _, served) = crate::test_support::session_served(
             PEOPLE,
             |request| {
@@ -10975,7 +11199,12 @@ mod tests {
                     .as_str()
                     .and_then(|after| after.get(1..)?.parse::<usize>().ok())
                     .map_or(0, |after| after + 1);
-                (from..(from + 100).min(1000))
+                let limit = query
+                    .split("limit ")
+                    .nth(1)
+                    .and_then(|rest| rest.split_whitespace().next()?.parse::<usize>().ok())
+                    .unwrap_or(100);
+                (from..(from + limit).min(1000))
                     .map(|i| {
                         let id = format!("{prefix}{i:03}");
                         serde_json::json!({"n": {"@id": id, "slug": id, "name": id}})
@@ -10997,18 +11226,14 @@ mod tests {
         cx.run_until_parked();
         let after = |read: &Value| read["params"]["after"].as_str().map(str::to_owned);
         let pages: Vec<Option<String>> = served.sent("studio_page").iter().map(after).collect();
-        assert_eq!(
-            pages,
-            [None, Some("p099".into())],
-            "the second page at once"
-        );
+        assert_eq!(pages, [None], "two pages, and nothing more at once");
         table.read_with(cx, |table, _| {
             assert_eq!(table.rows.len(), 200);
             assert!(!table.loading_more);
             assert!(table.lines_drawn.end < 100, "{:?}", table.lines_drawn);
         });
 
-        // Scrolled into the second page, the third is asked for.
+        // Scrolled to within a page of the rows read, the next is asked for, twice as large.
         let third = served.hold(|read| read["params"]["after"] == "p199");
         table.update(cx, |table, cx| {
             let height = table.line_height(cx);
@@ -11019,7 +11244,10 @@ mod tests {
             cx.notify();
         });
         cx.run_until_parked();
-        assert_eq!(served.sent("studio_page").len(), 3);
+        let sent = served.sent("studio_page");
+        assert_eq!(sent.len(), 2);
+        let query = sent[1]["query"].as_str().unwrap_or_default();
+        assert!(query.contains("limit 400"), "{query}");
         table.read_with(cx, |table, _| {
             assert!(table.loading_more);
             assert_eq!(table.rows.len(), 200);
@@ -11046,8 +11274,8 @@ mod tests {
             assert!(!table.loading_more);
         });
         let sorted: Vec<Option<String>> =
-            served.sent("studio_page")[3..].iter().map(after).collect();
-        assert_eq!(sorted, [None, Some("s099".into())]);
+            served.sent("studio_page")[2..].iter().map(after).collect();
+        assert_eq!(sorted, [None]);
     }
 
     /// A head the session sees move while the table's first read is out is compared once the
@@ -11966,7 +12194,7 @@ mod tests {
         ]);
         table.update(cx, |table, cx| {
             assert_eq!(table.paging.pinned.as_deref(), Some("c2"), "its own commit");
-            table.apply_page(page(next), false, 2, cx);
+            table.apply_page(page(next), None, 2, cx);
             let ids: Vec<&str> = table.rows.iter().map(|row| row.id.as_str()).collect();
             assert_eq!(ids, ["p1", "p2", "p3"]);
             assert_eq!(table.rows[0].value("name"), "Zed");
@@ -12703,6 +12931,35 @@ mod tests {
                 Some(Loadable::Loaded(BlobMeta::Managed { size: 4, .. }))
             ));
             assert!(table.blobs.contains("p2", "doc"));
+        });
+        // Many cells asked for at once are read four at a time, the first drawn first, each
+        // read that ends starting the next.
+        table.update(cx, |table, cx| {
+            table.rows = (0..10)
+                .map(|i| Row {
+                    id: format!("r{i}"),
+                    values: Default::default(),
+                    dimmed: false,
+                })
+                .collect();
+            table.load_blob_metas(0..10, cx);
+            assert_eq!(table.blob_tasks.len(), BLOB_READS_AT_ONCE);
+            assert_eq!(table.blob_queue.len(), 10 - BLOB_READS_AT_ONCE);
+            assert_eq!(
+                table.blob_queue.front().map(|(id, _)| id.as_str()),
+                Some("r4")
+            );
+        });
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert!(table.blob_tasks.is_empty() && table.blob_queue.is_empty());
+            for i in 0..10 {
+                let cell = table.blobs.get(&format!("r{i}"), "doc");
+                assert!(
+                    cell.is_some_and(|cell| !matches!(cell, Loadable::Loading)),
+                    "r{i}"
+                );
+            }
         });
     }
 

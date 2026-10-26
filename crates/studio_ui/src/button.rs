@@ -105,10 +105,11 @@ fn paint(variant: Variant, selected: bool, cx: &App) -> Paint {
                 fill: red,
                 hover: red.opacity(0.9),
                 active: red.opacity(0.84),
-                // As the primary, in red.
+                // As the primary, in red: its text the editor's background, as the primary's,
+                // so it reads on a dark theme's lighter red too.
                 border: red,
                 shadows: ds::elevation::filled(red),
-                ink: Color::Custom(gpui::white()),
+                ink: Color::Custom(colors.editor_background),
             }
         }
         // interfaces.dev's secondary button: its hairline and two soft drops

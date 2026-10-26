@@ -42,7 +42,7 @@
       "ctrl-shift-\\": "studio::SplitDown",
       "ctrl-alt-o": "studio::OpenGraph",
       "ctrl-r": "studio::Refresh",
-      "ctrl-alt-t": "studio::CloseOtherItems",
+      "ctrl-shift-alt-t": "studio::CloseOtherItems",
       "ctrl-alt-w": "studio::CloseAllItems",
       "ctrl-alt-right": "studio::ActivateNextPane",
       "ctrl-alt-left": "studio::ActivatePreviousPane",

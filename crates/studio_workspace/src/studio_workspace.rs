@@ -1619,8 +1619,9 @@ impl Workspace {
             .and_then(|pane| pane.items.get(index))
             .map(|item| item.item_id())
         else {
-            // An empty pane takes the focus itself.
-            if self.pane(pane_id).is_some() {
+            // An empty pane takes the focus itself. Past the last tab of a pane that has some
+            // (⌘5 with three open), nothing moves: the tab shown keeps the keyboard.
+            if self.pane(pane_id).is_some_and(|pane| pane.items.is_empty()) {
                 self.active_pane = pane_id;
                 window.focus(&self.focus_handle, cx);
                 cx.notify();
@@ -1674,6 +1675,15 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(item) = self.pane(pane).and_then(|p| p.items.get(index)) else {
+            // ⌘W in an empty pane (a split of a tab that opens once in a window) closes the
+            // pane, as closing its last tab would, unless it is the only one.
+            if self.pane(pane).is_some_and(|p| p.items.is_empty()) && self.panes.len() > 1 {
+                self.remove_pane(pane);
+                let active = self.active_pane;
+                let index = self.pane(active).map_or(0, |p| p.active);
+                self.activate_in(active, index, false, window, cx);
+                cx.notify();
+            }
             return;
         };
         if !item.is_dirty(cx) {
@@ -1708,13 +1718,16 @@ impl Workspace {
         let Some(removed) = self.pane_mut(pane_id).and_then(|pane| pane.remove(index)) else {
             return;
         };
+        // The keyboard moves to the tab shown now only when the one closed held it: a tab
+        // closed from elsewhere (a conversation deleted from the sidebar) leaves it where it is.
+        let held_focus = removed.focus_handle(cx).contains_focused(window, cx);
         self._item_subscriptions
             .retain(|(id, _)| *id != removed.item_id());
         let emptied = self.pane(pane_id).is_some_and(|p| p.items.is_empty());
         if emptied && self.panes.len() > 1 {
             self.remove_pane(pane_id);
         }
-        if pane_id == self.active_pane || !self.center.contains(pane_id) {
+        if held_focus && (pane_id == self.active_pane || !self.center.contains(pane_id)) {
             let active = self.active_pane;
             let index = self.pane(active).map_or(0, |p| p.active);
             self.activate_in(active, index, false, window, cx);
@@ -1817,6 +1830,10 @@ impl Workspace {
             let to = to_index.unwrap_or(pane.items.len().saturating_sub(1));
             let index = pane.move_to(from_index, to);
             self.activate_in(to_pane, index, true, window, cx);
+            return;
+        }
+        // A pane gone by the time the drop lands takes nothing: the tab stays in its own.
+        if self.pane(to_pane).is_none() {
             return;
         }
         let Some(item) = self.pane_mut(from_pane).and_then(|pane| {
@@ -2614,7 +2631,8 @@ impl Workspace {
         lights_room(self.lights_shown, zoomed, cx)
     }
 
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The sidebar, drawn `width` wide ([`panels::side_widths`]).
+    fn render_sidebar(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let panel = studio_ui::ds::surface::chrome(cx);
         let hairline = studio_ui::ds::surface::rule(cx);
         // The column's header is its panel's own, as a Zed panel draws its header: the panel's
@@ -2665,7 +2683,7 @@ impl Workspace {
             .relative()
             .flex()
             .flex_col()
-            .w(px(self.left.size))
+            .w(px(width))
             .h_full()
             .flex_none()
             .child(header)
@@ -3488,8 +3506,13 @@ impl Workspace {
             )
             .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
                 let direction = this.drop_target.take().and_then(|(_, direction)| direction);
+                let own = this
+                    .find_item(dragged.item)
+                    .is_some_and(|(pane, _)| pane == pane_id);
                 match direction {
                     Some(direction) => this.drop_split(dragged, pane_id, direction, window, cx),
+                    // Back on its own pane's content (a drag let go): it stays where it was.
+                    None if own => cx.notify(),
                     None => this.drop_tab(dragged, pane_id, None, window, cx),
                 }
             }));
@@ -3498,8 +3521,12 @@ impl Workspace {
             .size_full()
             .min_w_0()
             .min_h_0()
+            // An empty pane has nothing to take the keyboard: a click in it makes it active.
+            // Any other is made active by its tab taking the keyboard (`render`).
             .capture_any_mouse_down(cx.listener(move |this, _, _, cx| {
-                if this.active_pane != pane_id {
+                if this.active_pane != pane_id
+                    && this.pane(pane_id).is_some_and(|pane| pane.items.is_empty())
+                {
                     this.active_pane = pane_id;
                     cx.notify();
                 }
@@ -3887,9 +3914,15 @@ impl Workspace {
             .children(bottom)
     }
 
-    /// The bottom dock: its panel's header, then the panel. `alone` when it is not inside the
-    /// document column, so on glass it is a sheet of its own.
-    fn render_bottom_dock(&self, alone: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// The bottom dock: its panel's header, then the panel, drawn `height` tall
+    /// ([`panels::bottom_height`]). `alone` when it is not inside the document column, so on
+    /// glass it is a sheet of its own.
+    fn render_bottom_dock(
+        &self,
+        alone: bool,
+        height: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         if !self.bottom.visible() || self.zoomed == Some(Zoomed::Dock(PanelPosition::Bottom)) {
             return None;
         }
@@ -3908,7 +3941,7 @@ impl Workspace {
                 .debug_selector(|| "bottom-dock".into())
                 .flex()
                 .flex_col()
-                .h(px(self.bottom.size))
+                .h(px(height))
                 .w_full()
                 .relative()
                 .flex_none()
@@ -4124,8 +4157,9 @@ impl Workspace {
             )
             .into_any_element()
     }
-    /// The right dock: its panel's header, then the panel.
-    fn render_right_dock(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    /// The right dock: its panel's header, then the panel, drawn `width` wide
+    /// ([`panels::side_widths`]).
+    fn render_right_dock(&self, width: f32, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         if !self.right.visible() || self.zoomed == Some(Zoomed::Dock(PanelPosition::Right)) {
             return None;
         }
@@ -4145,7 +4179,7 @@ impl Workspace {
                 .relative()
                 .flex()
                 .flex_col()
-                .w(px(self.right.size))
+                .w(px(width))
                 .h_full()
                 .flex_none()
                 .child(resize_handle(PanelPosition::Right))
@@ -4357,9 +4391,41 @@ impl Render for Workspace {
                 .ok();
             }));
         }
+        // The active pane is the one whose tab has the keyboard, as Zed follows focus: a press
+        // that moves none (a drag by a pane's header, its empty gutter) changes nothing.
+        let focused_pane = self
+            .panes
+            .iter()
+            .find(|pane| {
+                pane.active_item()
+                    .is_some_and(|item| item.focus_handle(cx).contains_focused(window, cx))
+            })
+            .map(|pane| pane.id);
+        if let Some(pane) = focused_pane {
+            self.active_pane = pane;
+        }
+        // A focused view gone (an inspector replaced, a panel removed, while it held the
+        // keyboard) leaves keys dispatched from the window's root, where no tab hears them: the
+        // active tab takes them once the frame is out.
+        if window.focused(cx).is_none() {
+            cx.defer_in(window, |this, window, cx| {
+                if window.focused(cx).is_none() {
+                    this.focus_active_tab(window, cx);
+                }
+            });
+        }
         // As Zed's workspace does: the window's rem size is the UI font size, which every `ui`
         // size is relative to, and the root carries the UI font.
         let ui_font = theme_settings::setup_ui_font(window, cx);
+        // What the window can do now: an action it cannot is not offered (constitution VIII).
+        let has_graph = self.session.is_some();
+        let other_graphs = self.graph_order.len() > 1;
+        let pane = self.pane(self.active_pane);
+        let (can_back, can_forward) =
+            pane.map_or((false, false), |p| (p.can_step(true), p.can_step(false)));
+        let (closes_others, closes_all) = pane.map_or((false, false), |p| {
+            (!p.others(p.active).is_empty(), !p.all_unpinned().is_empty())
+        });
         let mut root = v_flex()
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
@@ -4405,13 +4471,21 @@ impl Render for Workspace {
                     this.activate_item(last, window, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &ActivateNextGraph, window, cx| {
-                this.show_graph_step(true, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &ActivatePreviousGraph, window, cx| {
-                this.show_graph_step(false, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &CloseGraph, window, cx| this.close_graph(window, cx)))
+            .when(other_graphs, |root| {
+                root.on_action(cx.listener(|this, _: &ActivateNextGraph, window, cx| {
+                    this.show_graph_step(true, window, cx)
+                }))
+                .on_action(cx.listener(
+                    |this, _: &ActivatePreviousGraph, window, cx| {
+                        this.show_graph_step(false, window, cx)
+                    },
+                ))
+            })
+            .when(has_graph, |root| {
+                root.on_action(
+                    cx.listener(|this, _: &CloseGraph, window, cx| this.close_graph(window, cx)),
+                )
+            })
             .on_action(cx.listener(|this, _: &SplitRight, window, cx| {
                 this.split(SplitDirection::Right, window, cx)
             }))
@@ -4443,31 +4517,39 @@ impl Render for Workspace {
                     cx.notify();
                 }
             }))
-            .on_action(cx.listener(|this, _: &CloseOtherItems, window, cx| {
-                let ids = this
-                    .pane(this.active_pane)
-                    .map(|p| p.others(p.active))
-                    .unwrap_or_default();
-                this.close_clean(ids, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &CloseAllItems, window, cx| {
-                let ids = this
-                    .pane(this.active_pane)
-                    .map(|p| p.all_unpinned())
-                    .unwrap_or_default();
-                this.close_clean(ids, window, cx);
-            }))
+            .when(closes_others, |root| {
+                root.on_action(cx.listener(|this, _: &CloseOtherItems, window, cx| {
+                    let ids = this
+                        .pane(this.active_pane)
+                        .map(|p| p.others(p.active))
+                        .unwrap_or_default();
+                    this.close_clean(ids, window, cx);
+                }))
+            })
+            .when(closes_all, |root| {
+                root.on_action(cx.listener(|this, _: &CloseAllItems, window, cx| {
+                    let ids = this
+                        .pane(this.active_pane)
+                        .map(|p| p.all_unpinned())
+                        .unwrap_or_default();
+                    this.close_clean(ids, window, cx);
+                }))
+            })
             .on_action(cx.listener(
                 |this, action: &studio_actions::workspace::ActivatePanel, window, cx| {
                     this.show_panel(&action.id, window, cx)
                 },
             ))
-            .on_action(cx.listener(|this, _: &GoBack, window, cx| {
-                this.navigate(this.active_pane, true, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &GoForward, window, cx| {
-                this.navigate(this.active_pane, false, window, cx)
-            }))
+            .when(can_back, |root| {
+                root.on_action(cx.listener(|this, _: &GoBack, window, cx| {
+                    this.navigate(this.active_pane, true, window, cx)
+                }))
+            })
+            .when(can_forward, |root| {
+                root.on_action(cx.listener(|this, _: &GoForward, window, cx| {
+                    this.navigate(this.active_pane, false, window, cx)
+                }))
+            })
             .on_drag_move(cx.listener(Self::resize_dock))
             .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
                 this.set_dock_open(PanelPosition::Left, !this.left.open, window, cx)
@@ -4479,11 +4561,13 @@ impl Render for Workspace {
                 this.set_dock_open(PanelPosition::Bottom, !this.bottom.open, window, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleZoom, window, cx| this.toggle_zoom(window, cx)))
-            .on_action(cx.listener(|this, _: &Refresh, _, cx| {
-                if let Some(session) = &this.session {
-                    session.update(cx, |s, cx| s.refresh(cx));
-                }
-            }));
+            .when(has_graph, |root| {
+                root.on_action(cx.listener(|this, _: &Refresh, _, cx| {
+                    if let Some(session) = &this.session {
+                        session.update(cx, |s, cx| s.refresh(cx));
+                    }
+                }))
+            });
         for registration in self.actions.clone() {
             if registration.when.as_ref().is_none_or(|when| when(self, cx)) {
                 root = (registration.register)(root, window, cx);
@@ -4562,10 +4646,20 @@ impl Render for Workspace {
             .map(|settings| settings.studio.bottom_dock_layout)
             .unwrap_or_default();
         let contained = layout == BottomDockLayout::Contained;
-        let bottom = self.render_bottom_dock(!contained, cx);
-        let sidebar = sidebar_shown.then(|| self.render_sidebar(cx).into_any_element());
+        // The docks give way to a window made smaller than they are, the sizes held kept.
+        let viewport = window.viewport_size();
+        let right_shown =
+            self.right.visible() && self.zoomed != Some(Zoomed::Dock(PanelPosition::Right));
+        let (left_width, right_width) = panels::side_widths(
+            if sidebar_shown { self.left.size } else { 0. },
+            if right_shown { self.right.size } else { 0. },
+            f32::from(viewport.width),
+        );
+        let bottom_height = panels::bottom_height(self.bottom.size, f32::from(viewport.height));
+        let bottom = self.render_bottom_dock(!contained, bottom_height, cx);
+        let sidebar = sidebar_shown.then(|| self.render_sidebar(left_width, cx).into_any_element());
         let right = self
-            .render_right_dock(cx)
+            .render_right_dock(right_width, cx)
             .map(IntoElement::into_any_element);
         let row = || {
             h_flex()
@@ -5864,6 +5958,47 @@ mod tests {
         });
     }
 
+    /// The keyboard in an inspector another replaces is not left with no view to hear it: the
+    /// active tab takes it, so the table's arrows and ⎋ work again.
+    #[gpui::test]
+    fn the_keyboard_in_a_replaced_inspector_goes_to_the_active_tab(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            cx.set_global(StudioSettings::default());
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let (tab, inspector) = workspace.update_in(cx, |workspace, window, cx| {
+            let tab = cx.focus_handle();
+            let focus_handle = tab.clone();
+            workspace.open_item("a", window, cx, move |_, cx| Split {
+                field: cx.new(|_| Field),
+                part: cx.new(|_| Part { renders: 0 }),
+                caches: false,
+                focus_handle,
+            });
+            let inspector = cx.new(|_| Field);
+            workspace.set_inspector(Some(inspector.clone().into()), cx);
+            workspace.set_dock_open(PanelPosition::Right, true, window, cx);
+            (tab, inspector)
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            let host = workspace.dock_hosts[&inspector.entity_id()]
+                .read(cx)
+                .focus_handle
+                .clone();
+            window.focus(&host, cx);
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(!tab.is_focused(window), "the inspector has the keyboard");
+            let next = cx.new(|_| Field);
+            workspace.set_inspector(Some(next.into()), cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, _| assert!(tab.is_focused(window), "the tab has it"));
+    }
+
     /// As Zed's panel buttons: a button shows its panel and opens the dock; pressed again while
     /// its panel shows, it hides the dock, which keeps that panel for the next time.
     #[gpui::test]
@@ -6488,6 +6623,13 @@ mod tests {
             assert_eq!(active(workspace), Some(0), "back to a");
             workspace.navigate(first, false, window, cx);
             assert_eq!(active(workspace), Some(1), "forward to b");
+            // ⌘5 with two tabs moves nothing, the keyboard included.
+            workspace.activate_item(4, window, cx);
+            assert_eq!(active(workspace), Some(1));
+            assert!(
+                !workspace.focus_handle.is_focused(window),
+                "the keyboard stays on the tab"
+            );
 
             workspace.split(SplitDirection::Right, window, cx);
             let second = workspace.active_pane;
@@ -6501,6 +6643,43 @@ mod tests {
                 workspace.pane(first).unwrap().can_step(true),
                 "the first pane keeps its trail"
             );
+            // Empty (its tab could not be copied), the new pane closes with ⌘W, as it would
+            // with its last tab.
+            assert!(workspace.pane(second).unwrap().items.is_empty());
+            workspace.active_pane = second;
+            workspace.close_item(0, window, cx);
+            assert!(workspace.pane(second).is_none());
+            assert_eq!(workspace.active_pane, first);
+        });
+    }
+
+    /// Closing a tab moves the keyboard only when that tab held it: one closed while the keyboard
+    /// is elsewhere (a conversation deleted from the sidebar's list) leaves it there.
+    #[gpui::test]
+    fn closing_a_tab_moves_the_keyboard_only_from_that_tab(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            cx.set_global(StudioSettings::default());
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update_in(cx, |workspace, window, cx| {
+            for key in ["a", "b"] {
+                workspace.open_item(key, window, cx, |_, cx| Split {
+                    field: cx.new(|_| Field),
+                    part: cx.new(|_| Part { renders: 0 }),
+                    caches: false,
+                    focus_handle: cx.focus_handle(),
+                });
+            }
+            let elsewhere = cx.focus_handle();
+            window.focus(&elsewhere, cx);
+            workspace.close_item(1, window, cx);
+            assert!(
+                elsewhere.is_focused(window),
+                "the keyboard stays where it was"
+            );
+            let pane = workspace.pane(workspace.active_pane).unwrap();
+            assert_eq!((pane.items.len(), pane.active), (1, 0), "a shows");
         });
     }
 

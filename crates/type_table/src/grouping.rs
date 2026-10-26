@@ -203,6 +203,13 @@ impl Grouping {
         self.sections = Loadable::Loaded(sections);
     }
 
+    /// No row holds the table's filters (one asks for a value of a property the commit shown
+    /// does not hold): no section, and none left to read.
+    pub fn accept_no_rows(&mut self) {
+        self.complete = true;
+        self.sections = Loadable::Loaded(Vec::new());
+    }
+
     /// Whether the rows are grouped by a relationship rather than a property.
     pub fn by_relationship(&self) -> bool {
         builder::parse_relationship_key(&self.property).is_some()

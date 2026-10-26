@@ -172,24 +172,12 @@ pub fn init(cx: &mut App) {
             );
         }
         // GPUI's frame-time overlay exists only with its `profiler` feature, which the `perf`
-        // feature turns on: frame times, then their distribution, then hidden again.
+        // feature turns on: frame times, then their distribution, then hidden again. Another
+        // build offers no such action, in the palette or on its key.
+        #[cfg(feature = "perf")]
         workspace.register_action(
-            |_workspace, _: &studio_actions::workspace::ToggleFrameOverlay, window, cx| {
-                #[cfg(feature = "perf")]
-                {
-                    let _ = cx;
-                    window.cycle_debug_frame_overlay_mode();
-                }
-                #[cfg(not(feature = "perf"))]
-                {
-                    let _ = window;
-                    _workspace.show_toast(
-                        studio_workspace::ToastKind::Info,
-                        "The frame overlay needs a build with the perf feature: \
-                         cargo run -p studio --features perf",
-                        cx,
-                    );
-                }
+            |_, _: &studio_actions::workspace::ToggleFrameOverlay, window, _| {
+                window.cycle_debug_frame_overlay_mode();
             },
         );
         workspace.register_action(|workspace, _: &OpenGraph, window, cx| {

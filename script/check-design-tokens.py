@@ -72,8 +72,8 @@ LAYOUT = (
 RULES = [
     ("literal size or space", re.compile(rf"\.({LAYOUT})\(px\(-?(?!0\.?\)|0_f32)[0-9][0-9.]*(_f32)?\.?\)\)")),
     ("rem utility", re.compile(
-        r"\.(h|w|min_h|max_h|min_w|max_w|size|p|px|py|pt|pb|pl|pr|gap|m|mx|my|mt|mb|ml|mr|"
-        r"top|left|right|bottom|inset)_(neg_)?(0p5|1p5|2p5|3p5|[1-9][0-9]*|px)\(\)")),
+        r"\.(h|w|min_h|max_h|min_w|max_w|size|p|px|py|pt|pb|pl|pr|gap|gap_x|gap_y|m|mx|my|mt|mb|"
+        r"ml|mr|top|left|right|bottom|inset)_(neg_)?(0p5|1p5|2p5|3p5|[1-9][0-9]*|px)\(\)")),
     ("literal offset", re.compile(
         r"(point|snap_to_window_with_margin|size)\(\s*px\(-?(?!0\.?\))[0-9][0-9.]*\.?\)")),
     ("literal type size", re.compile(r"\brems(_from_px)?\(\s*[0-9]")),
@@ -95,17 +95,8 @@ RULES = [
      re.compile(r"\b(TextSize|LabelSize)::[A-Z]|\.text_ui(_xs|_sm|_lg)?\(")),
 ]
 EXEMPT = re.compile(r"//\s*ds-exempt:\s*\S")
-# Builder chains that rebuild a role, whichever order the two calls come in.
-LABEL_SIZE = r"\.size\(LabelSize::(?:Small|XSmall)\)"
-LABEL_TONE = r"\.color\(Color::(?:Muted|Error)\)"
-ICON_SIZE = r"\.size\(IconSize::(?:Small|XSmall)\)"
-ROLE_CHAINS = re.compile(
-    rf"\b(?:Label::new\((?:[^()]|\([^()]*\))*\)\s*(?:{LABEL_SIZE}\s*{LABEL_TONE}|{LABEL_TONE}\s*{LABEL_SIZE}"
-    rf"|\.size\(LabelSize::Small\)(?!\s*\.color\()"
-    rf"|\.color\(Color::Muted\)(?!\s*\.size\())"
-    rf"|Icon::new\((?:[^()]|\([^()]*\))*\)\s*(?:{ICON_SIZE}\s*\.color\(Color::Muted\)"
-    rf"|\.color\(Color::Muted\)\s*{ICON_SIZE}))"
-)
+
+
 def chain_end(text, open_at):
     """The index after the parenthesis closing the one at `open_at`, or -1."""
     depth, j, quoted = 0, open_at, False
@@ -152,15 +143,67 @@ BUTTON_ICONS = re.compile(
     r"\.(?:start|end)_icon\(\s*(?:(?:studio_ui|crate)::ds::icon::|"
     r"Icon::new\((?:[^()]|\([^()]*\))*\)\s*\.(?:size|color)\()"
 )
-# The Zed menu fork stays close to upstream.
-ROLE_EXEMPT_FILES = {"crates/studio_ui/src/menu.rs"}
+
+TEST_ATTRIBUTE = re.compile(r"\s*#\[cfg\(test\)\]")
+MODULE = re.compile(r"\s*(?:pub(?:\([a-z]+\))?\s+)?mod\s+(\w+)\s*([;{])")
+
+
+def test_code(lines):
+    """The lines that are test code: a `#[cfg(test)] mod x { … }` block, to the brace that closes
+    it, and a `#[cfg(test)] mod x;` declaration; with the names of the modules so declared,
+    whose files are test code whole."""
+    skipped, declared = set(), []
+    index = 0
+    while index < len(lines):
+        module = TEST_ATTRIBUTE.match(lines[index]) and index + 1 < len(lines) and MODULE.match(
+            lines[index + 1]
+        )
+        if not module:
+            index += 1
+            continue
+        if module.group(2) == ";":
+            declared.append(module.group(1))
+            skipped.update({index, index + 1})
+            index += 2
+            continue
+        # To the brace that closes the module's own; one never closed runs to the file's end.
+        depth, opened, end = 0, False, index + 1
+        while end < len(lines):
+            code = lines[end].split("//")[0]
+            opened = opened or "{" in code
+            depth += code.count("{") - code.count("}")
+            if opened and depth <= 0:
+                break
+            end += 1
+        end = min(end, len(lines) - 1)
+        skipped.update(range(index, end + 1))
+        index = end + 1
+    return skipped, declared
+
+
+def test_files(paths):
+    """The files of the test modules each of `paths` declares in a file of their own."""
+    files = set()
+    for path in paths:
+        _, declared = test_code(path.read_text().splitlines())
+        for name in declared:
+            for candidate in (
+                path.parent / f"{name}.rs",
+                path.parent / name / "mod.rs",
+                path.parent / path.stem / f"{name}.rs",
+                path.parent / path.stem / name / "mod.rs",
+            ):
+                files.add(candidate.relative_to(ROOT).as_posix())
+    return files
 
 
 def views():
-    for path in sorted((ROOT / "crates").glob("*/src/**/*.rs")):
+    paths = sorted((ROOT / "crates").glob("*/src/**/*.rs"))
+    tests = test_files(paths)
+    for path in paths:
         rel = path.relative_to(ROOT).as_posix()
         crate = rel.split("/")[1]
-        if rel in SYSTEM or crate in NOT_VIEWS:
+        if rel in SYSTEM or crate in NOT_VIEWS or rel in tests:
             continue
         yield rel, path
 
@@ -169,27 +212,19 @@ def main() -> int:
     errors = []
     for rel, path in views():
         text = path.read_text()
-        if rel not in ROLE_EXEMPT_FILES:
-            body = text.split("#[cfg(test)]\nmod ")[0]
-            for match in ROLE_CHAINS.finditer(body):
-                line = body.count("\n", 0, match.start()) + 1
-                errors.append(f"{rel}:{line}: role built by hand: {match.group(0).split(chr(10))[0].strip()}")
-            for start in sized_builders(body):
-                line = body.count("\n", 0, start) + 1
-                errors.append(f"{rel}:{line}: size set by hand: {body[start:].split(chr(10))[0].strip()}")
-            for match in BUTTON_ICONS.finditer(body):
-                line = body.count("\n", 0, match.start()) + 1
-                errors.append(f"{rel}:{line}: a button's icon sized or tinted: {match.group(0).strip()}")
         lines = text.splitlines()
-        in_test = False
+        skipped, _ = test_code(lines)
+        # The file with its test code blanked, so a match keeps its line number.
+        body = "\n".join("" if index in skipped else line for index, line in enumerate(lines))
+        for start in sized_builders(body):
+            line = body.count("\n", 0, start) + 1
+            errors.append(f"{rel}:{line}: size set by hand: {body[start:].split(chr(10))[0].strip()}")
+        for match in BUTTON_ICONS.finditer(body):
+            line = body.count("\n", 0, match.start()) + 1
+            errors.append(f"{rel}:{line}: a button's icon sized or tinted: {match.group(0).strip()}")
         for index, line in enumerate(lines):
-            # A test module runs to the end of its file; a test-only item elsewhere is
-            # still checked.
-            if re.match(r"\s*#\[cfg\(test\)\]", line) and re.match(
-                r"\s*(pub(\(crate\))?\s+)?mod\s", lines[index + 1] if index + 1 < len(lines) else ""
-            ):
-                in_test = True
-            if in_test:
+            # Test code is not a view's; a test-only item outside a test module is checked.
+            if index in skipped:
                 continue
             code = line.split("//")[0] if "ds-exempt" not in line else line
             for name, rule in RULES:

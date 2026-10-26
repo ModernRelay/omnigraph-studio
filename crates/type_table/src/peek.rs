@@ -5237,8 +5237,8 @@ impl NodePeek {
             .child(
                 h_flex()
                     .flex_wrap()
-                    .gap_x_3()
-                    .gap_y_1()
+                    .gap_x(px(space::LG))
+                    .gap_y(px(space::XS))
                     .child(studio_ui::ds::meta_code(IconName::Hash, id, cx))
                     .children(at.map(|commit| {
                         div()

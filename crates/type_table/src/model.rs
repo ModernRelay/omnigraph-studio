@@ -520,10 +520,15 @@ pub struct Paging {
     pub moved: bool,
     /// Where the Blob values the view shows hold.
     pub blobs: BlobsAt,
-    /// How many rows the last page asked for: the next is read while no more than this many
-    /// are left past the rows in view ([`Self::wants_more`]).
+    /// How many rows the last page asked for: a page with fewer is the last.
     pub page_size: u32,
+    /// The graph's page size: the next page is read while no more than this many rows are
+    /// left past the rows in view ([`Self::wants_more`]).
+    pub ahead: u32,
 }
+
+/// The most a page asks for, as a multiple of the graph's page size ([`Paging::next_page_size`]).
+const MAX_PAGE_GROWTH: u32 = 8;
 
 impl Default for Paging {
     fn default() -> Self {
@@ -534,6 +539,7 @@ impl Default for Paging {
             moved: false,
             blobs: BlobsAt::Pin,
             page_size: 0,
+            ahead: 0,
         }
     }
 }
@@ -558,21 +564,41 @@ impl Paging {
         *self = Self::default();
     }
 
-    /// Records a page. The first page's commit becomes the pin; later pages were read at it.
-    /// With a sort (`sort_column`, the rows' column for it), a short page of rows with values
-    /// moves on to the rows without one rather than ending the list.
+    /// How many rows the next page asks for, `base` being the graph's page size. The first asks
+    /// for twice `base`: it is read with no cursor, which costs the server little more than a
+    /// smaller page, and holds the first screens with room to scroll. Each later page asks for
+    /// twice the last, up to [`MAX_PAGE_GROWTH`] times `base`: a page after a cursor costs a
+    /// scan to it whatever its size, so rows read cost fewer of them.
+    pub fn next_page_size(&self, base: u32) -> u32 {
+        let base = base.max(1);
+        match self.start {
+            PageStart::First => base.saturating_mul(2),
+            _ => self
+                .page_size
+                .saturating_mul(2)
+                .clamp(base, base.saturating_mul(MAX_PAGE_GROWTH)),
+        }
+    }
+
+    /// Records a page that asked for `asked` rows, `base` being the graph's page size. The first
+    /// page's commit becomes the pin; later pages were read at it. With a sort (`sort_column`,
+    /// the rows' column for it), a short page of rows with values moves on to the rows without
+    /// one rather than ending the list, when there can be any (`nulls_follow`).
     pub fn accept(
         &mut self,
         commit: Option<&str>,
         page: &[Row],
-        page_size: u32,
+        asked: u32,
+        base: u32,
         sort_column: Option<&str>,
+        nulls_follow: bool,
     ) {
         if self.pinned.is_none() {
             self.pinned = commit.map(str::to_owned);
         }
-        self.page_size = page_size;
-        let short = page.len() < page_size as usize;
+        self.page_size = asked;
+        self.ahead = base;
+        let short = page.len() < asked as usize;
         let in_nulls = matches!(self.start, PageStart::Nulls { .. });
         match (sort_column, page.last()) {
             (Some(_), Some(last)) if in_nulls => {
@@ -594,7 +620,7 @@ impl Paging {
             }
             (_, None) => {}
         }
-        if sort_column.is_some() && short && !in_nulls {
+        if sort_column.is_some() && short && !in_nulls && nulls_follow {
             self.start = PageStart::Nulls {
                 after: String::new(),
             };
@@ -605,14 +631,14 @@ impl Paging {
     }
 
     /// Whether another page should be read, the view ending at row `visible_end` of the
-    /// `loaded` rows: while no more than a page is left past it. A page is read one page ahead
-    /// of the rows in view, so scrolling finds its rows read, and no further: the rows past
-    /// the view stay within two pages.
+    /// `loaded` rows: once no more than a page ([`Self::ahead`]) is left past it, so a scroll
+    /// finds its rows read. Not before: a page landing with no row drawn yet reads nothing more,
+    /// and a view nobody scrolls costs no read past the first page.
     pub fn wants_more(&self, loaded: usize, visible_end: usize, loading: bool) -> bool {
         !self.exhausted
             && !loading
             && loaded > 0
-            && loaded <= visible_end.saturating_add(self.page_size as usize)
+            && loaded <= visible_end.saturating_add(self.ahead as usize)
     }
 
     /// A write this view made committed. When it was made on top of the pinned commit, the
@@ -1298,12 +1324,12 @@ mod tests {
     #[test]
     fn paging_pins_the_first_commit_and_pages_by_key() {
         let mut paging = Paging::default();
-        paging.accept(Some("c1"), &rows(&["a", "b"]), 2, None);
+        paging.accept(Some("c1"), &rows(&["a", "b"]), 2, 2, None, true);
         assert_eq!(paging.pinned.as_deref(), Some("c1"));
         assert_eq!(paging.start, after("b", Value::Null));
         assert!(!paging.exhausted);
         // A later page read at the pin cannot move it.
-        paging.accept(Some("c9"), &rows(&["c"]), 2, None);
+        paging.accept(Some("c9"), &rows(&["c"]), 2, 2, None, true);
         assert_eq!(paging.pinned.as_deref(), Some("c1"));
         assert_eq!(paging.start, after("c", Value::Null));
         assert!(paging.exhausted);
@@ -1328,16 +1354,13 @@ mod tests {
         };
         let mut paging = Paging::default();
         let first = [row("p1", "Analyst".into()), row("p7", "CTO".into())];
-        paging.accept(Some("c1"), &first, 2, Some("title"));
+        paging.accept(Some("c1"), &first, 2, 2, Some("title"), true);
         assert_eq!(paging.start, after("p7", "CTO".into()));
         assert!(!paging.exhausted);
         // A short page of values goes on to the rows without one.
-        paging.accept(
-            Some("c1"),
-            &[row("p3", "Engineer".into())],
-            2,
-            Some("title"),
-        );
+        let short = [row("p3", "Engineer".into())];
+        let mut required = paging.clone();
+        paging.accept(Some("c1"), &short, 2, 2, Some("title"), true);
         assert_eq!(
             paging.start,
             PageStart::Nulls {
@@ -1345,35 +1368,47 @@ mod tests {
             }
         );
         assert!(!paging.exhausted);
-        paging.accept(Some("c1"), &[row("p2", Value::Null)], 2, Some("title"));
+        paging.accept(
+            Some("c1"),
+            &[row("p2", Value::Null)],
+            2,
+            2,
+            Some("title"),
+            true,
+        );
         assert_eq!(paging.start, PageStart::Nulls { after: "p2".into() });
         assert!(paging.exhausted, "a short page of nulls ends the list");
+        // Sorted by a property every row must hold, the short page of values is the last.
+        required.accept(Some("c1"), &short, 2, 2, Some("title"), false);
+        assert!(required.exhausted, "no row without a value follows");
     }
 
-    /// The next page is read while no more than a page is left past the rows in view: at once
-    /// after a first page, before any row is drawn, and then a page ahead of the view.
+    /// The first page asks for two pages, read with no cursor; the next is read once the view
+    /// comes within a page of the rows read, not as the first lands; each later page asks for
+    /// twice the last, up to eight pages.
     #[test]
     fn the_next_page_is_read_a_page_ahead_of_the_view() {
         let mut paging = Paging::default();
         assert!(!paging.wants_more(0, 0, false), "nothing read yet");
-        let ids: Vec<String> = (0..100).map(|i| format!("p{i:03}")).collect();
+        assert_eq!(paging.next_page_size(100), 200, "the first, two pages");
+        let ids: Vec<String> = (0..200).map(|i| format!("p{i:03}")).collect();
         let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
-        paging.accept(Some("c1"), &rows(&ids), 100, None);
+        paging.accept(Some("c1"), &rows(&ids), 200, 100, None, true);
         assert!(
-            paging.wants_more(100, 0, false),
-            "read as the first page lands"
+            !paging.wants_more(200, 0, false),
+            "nothing more as the first page lands"
         );
-        assert!(paging.wants_more(100, 30, false));
-        assert!(!paging.wants_more(100, 30, true), "one read at a time");
-        assert!(
-            !paging.wants_more(200, 30, false),
-            "a page ahead and no further"
-        );
-        assert!(!paging.wants_more(200, 99, false));
+        assert!(!paging.wants_more(200, 99, false), "a screen in");
         assert!(
             paging.wants_more(200, 100, false),
-            "the view reached the next page"
+            "the view came within a page"
         );
+        assert!(!paging.wants_more(200, 100, true), "one read at a time");
+        assert_eq!(paging.next_page_size(100), 400);
+        paging.page_size = 400;
+        assert_eq!(paging.next_page_size(100), 800);
+        paging.page_size = 800;
+        assert_eq!(paging.next_page_size(100), 800, "eight pages at most");
         let done = Paging {
             exhausted: true,
             ..paging

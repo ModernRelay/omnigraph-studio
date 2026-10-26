@@ -598,7 +598,8 @@ than styling one-off elements.
     what CPU counts. Other Unix systems show CPU only, and Windows shows neither.
   - Frame times are not in the footer: an FPS counter reads 0 when idle and draws frames
     itself. A build with the `perf` feature (GPUI's `profiler`) has its frame-time overlay,
-    `studio::ToggleFrameOverlay` (⌘⌥⇧F); other builds say how to get one.
+    `studio::ToggleFrameOverlay` (⌘⌥⇧F); other builds offer no such action (until 2026-10-26
+    they listed it, and said how to get one).
 - **Window styles.** `studio.window_style`: `flat` splits columns with hairlines; `glass`
   floats the three columns as sheets over a soft wash, with one gap around and between them,
   and moves the traffic lights into the sidebar sheet. They sit centered in the first header

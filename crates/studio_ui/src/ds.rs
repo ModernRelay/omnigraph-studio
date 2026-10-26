@@ -983,7 +983,6 @@ pub enum Status {
     Idle,
 }
 
-/// A status dot.
 /// A node type's colour as a small dot, centred in the width of a type mark so rows with
 /// either line up: for rows whose context already names the type, where a lettered mark would
 /// repeat it.
@@ -996,6 +995,7 @@ pub fn type_dot(type_name: &str) -> Div {
     )
 }
 
+/// A status dot.
 pub fn status_dot(status: Status) -> Div {
     div()
         .size(px(size::DOT))
@@ -2730,8 +2730,6 @@ pub fn fold_row(
         .child(div().flex_1())
 }
 
-/// A card, as Zed draws a tool call: a tinted header, a body and a footer of actions. Compose
-/// with [`card_header`], [`card_footer`].
 /// interfaces.dev's `shadow-custom` on a surface: its ring outside the box and its two soft
 /// drops ([`elevation::custom`]), over a clear 1 px border, so the layout keeps the hairline's
 /// room.
@@ -2742,6 +2740,8 @@ pub fn lifted<E: Styled>(element: E, cx: &App) -> E {
         .shadow(elevation::custom(cx))
 }
 
+/// A card, as Zed draws a tool call: a tinted header, a body and a footer of actions. Compose
+/// with [`card_header`], [`card_footer`].
 pub fn card(cx: &App) -> Div {
     // interfaces.dev's card (`.preview-card`).
     lifted(
@@ -3051,7 +3051,9 @@ pub fn meta_row(items: impl IntoIterator<Item = AnyElement>) -> Div {
 }
 
 /// A composer's icon action (send, stop): a control-sized square at the scale's corner, solid
-/// ink when it is the action to take.
+/// ink when it is the action to take. Pressing it leaves the keyboard in the composer: a press
+/// otherwise focuses the nearest focusable ancestor (the panel), and the next message typed
+/// would go nowhere.
 pub fn composer_button(
     id: impl Into<ElementId>,
     icon: IconName,
@@ -3069,6 +3071,7 @@ pub fn composer_button(
         .justify_center()
         .rounded(px(radii(cx).sm))
         .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
         .map(|button| {
             if filled {
                 button.bg(colors.text).child(

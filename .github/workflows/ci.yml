@@ -64,6 +64,9 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          # A pull request whose lockfile changed starts from the build it had before, rather
+          # than from nothing.
+          restore-keys: ${{ runner.os }}-cargo-
       - run: cargo fmt --all --check
       # `--keep-going` reports every crate's problems in one run.
       - run: cargo clippy --workspace --all-targets --keep-going -- -D warnings

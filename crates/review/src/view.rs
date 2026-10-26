@@ -2257,8 +2257,8 @@ impl ReviewView {
         let counts = self.data.as_ref().map(|data| {
             h_flex()
                 .flex_wrap()
-                .gap_x_4()
-                .gap_y_1()
+                .gap_x(px(space::XL))
+                .gap_y(px(space::XS))
                 .children(data.counts.iter().map(|count| {
                     h_flex()
                         .gap(px(space::SM))
