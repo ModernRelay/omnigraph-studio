@@ -721,11 +721,22 @@ impl Connection {
         latency: Duration,
         cx: &mut Context<Self>,
     ) {
+        // How soon a ready server whose check failed once is checked again.
+        const RECHECK: Duration = Duration::from_secs(5);
+        // The first failure of a ready server after a look that answered (a slow answer, a
+        // moment without network) is checked again soon, the server still shown ready: only a
+        // second failure in a row shows it unreachable. The latency is that look's answer.
+        let first_failure =
+            health.is_err() && self.state == ConnectionState::Ready && self.latency.is_some();
         let latency = health.is_ok().then_some(latency);
         // Shown in whole milliseconds, so a change under one is not a change.
         if latency.map(|l| l.as_millis()) != self.latency.map(|l| l.as_millis()) {
             self.latency = latency;
             cx.notify();
+        }
+        if first_failure {
+            self.check_health_after(RECHECK, cx);
+            return;
         }
         let next = match served(health) {
             Ok(_) if self.state == ConnectionState::Ready => ConnectionState::Ready,
@@ -1234,6 +1245,65 @@ mod tests {
             assert!(!connection.watched());
             assert_eq!(connection.state, ConnectionState::Ready);
         });
+    }
+
+    /// One failed check of a ready server is checked again soon, the server still shown ready;
+    /// a second failure in a row shows it unreachable.
+    #[gpui::test]
+    async fn one_failed_check_of_a_ready_server_is_checked_again_soon(cx: &mut TestAppContext) {
+        let down = Arc::new(AtomicBool::new(false));
+        let failing = down.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let health = request.uri().path().ends_with("/healthz");
+            let failed = health && failing.load(Ordering::SeqCst);
+            async move {
+                let (status, body) = if failed {
+                    (503, r#"{"error":"down"}"#)
+                } else if health {
+                    (
+                        200,
+                        r#"{"status":"ok","version":"0.14.0","internal_schema_version":16}"#,
+                    )
+                } else {
+                    (200, r#"{"graphs":[]}"#)
+                };
+                Ok(Response::builder()
+                    .status(status)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Cli,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let _shown = connection.update(cx, |connection, cx| {
+            connection.connect(cx);
+            connection.watch(cx)
+        });
+        cx.run_until_parked();
+        let state = |cx: &mut TestAppContext| connection.read_with(cx, |c, _| c.state.clone());
+        assert_eq!(state(cx), ConnectionState::Ready);
+
+        down.store(true, Ordering::SeqCst);
+        cx.executor().advance_clock(DEFAULT_CHECK_INTERVAL);
+        cx.run_until_parked();
+        assert_eq!(
+            state(cx),
+            ConnectionState::Ready,
+            "one failure is checked again"
+        );
+        cx.executor().advance_clock(Duration::from_secs(5));
+        cx.run_until_parked();
+        assert!(
+            matches!(state(cx), ConnectionState::Unreachable(_)),
+            "{:?}",
+            state(cx)
+        );
     }
 
     /// A server that speaks contract 0.13 (Omnigraph 0.13, or a 0.14 build before the contract

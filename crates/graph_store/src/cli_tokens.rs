@@ -1086,16 +1086,18 @@ async fn run_once(
         .kill_on_drop(true)
         .spawn()
         .map_err(|error| Unrun::Failed(error.to_string()))?;
-    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
-        use futures::AsyncWriteExt as _;
-        // Small (an entry, a token), so it fits the pipe before anything is read; the pipe is
-        // closed after it, which ends the command's input.
-        stdin
-            .write_all(input)
-            .await
-            .map_err(|error| Unrun::Failed(error.to_string()))?;
-        drop(stdin);
-    }
+    // Written while the output is read and within the timeout: a token may be larger than a
+    // pipe holds, and a command that reads none of it must not hold the CLI's turn for good.
+    // The pipe is closed after it, which ends the command's input.
+    let stdin = child.stdin.take();
+    let write = async move {
+        if let (Some(input), Some(mut stdin)) = (input, stdin) {
+            use futures::AsyncWriteExt as _;
+            stdin.write_all(input).await?;
+            drop(stdin);
+        }
+        Ok::<_, std::io::Error>(())
+    };
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
         return Err(Unrun::Failed("its output could not be read".to_owned()));
     };
@@ -1106,10 +1108,12 @@ async fn run_once(
         Ok::<_, std::io::Error>(read)
     };
     let work = async move {
-        let (out, err) = futures::join!(
+        let (written, out, err) = futures::join!(
+            write,
             read(Box::new(stdout), limit),
             read(Box::new(stderr), MAX_ANSWER_BYTES),
         );
+        written.map_err(|error| error.to_string())?;
         let (out, err) = (
             out.map_err(|error| error.to_string())?,
             err.map_err(|error| error.to_string())?,
@@ -2122,6 +2126,27 @@ exit 64
         let refused = token_of(&source).unwrap_err();
         assert!(refused.contains(LOCK_REFUSED), "{refused}");
         assert_eq!(cli.commands().len(), 1 + LOCK_RETRIES as usize);
+    }
+
+    /// A command's input is written within its timeout: one that reads none of an input larger
+    /// than a pipe holds is stopped when its time is up, not waited on for good.
+    #[test]
+    fn input_a_command_does_not_read_ends_at_its_timeout() {
+        let dir =
+            std::env::temp_dir().join(format!("studio-cli-unread-input-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("deaf");
+        std::fs::write(&program, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let input = vec![b'x'; 1 << 20];
+        let ran = smol::block_on(run_once(
+            std::process::Command::new(&program),
+            Some(&input),
+            Duration::from_millis(500),
+            1024,
+        ));
+        assert!(matches!(ran, Err(Unrun::Timeout)));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A program that could not be run, or did not answer in time, is asked again at the next
