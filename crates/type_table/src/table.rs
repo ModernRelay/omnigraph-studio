@@ -5663,6 +5663,7 @@ impl TypeTable {
         );
         // The canvas's floating bar: its text at a control's inset, its buttons the bar's.
         let pill = studio_ui::ds::float_bar("drafts-bar", cx)
+            .occlude()
             .max_w(px(studio_ui::ds::size::READING_WIDTH))
             .pl(px(space::CONTROL_INSET))
             .gap(px(space::MD))

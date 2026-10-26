@@ -1949,7 +1949,8 @@ pub fn popover_list(cx: &App) -> Div {
 /// A floating group of controls over a canvas: a glass bar 28 px tall holding
 /// [`bar_button`]s, [`bar_icon_button`]s (22 px) and [`segment`]s, 3 px inside its edge and
 /// rounded concentrically around them (`Radii::bar`). A medium button would not fit inside its
-/// border.
+/// border. The caller occludes it (`.occlude()`) unless what is drawn under it must keep the
+/// pointer, as a drag across a canvas does.
 pub fn float_bar(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
     let gap = (size::CONTROL - size::BAR_BUTTON) / 2.;
     let colors = cx.theme().colors();
@@ -1965,7 +1966,6 @@ pub fn float_bar(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
         .border_1()
         .border_color(gpui::transparent_black())
         .shadow(elevation::custom(cx))
-        .occlude()
 }
 
 /// The widest a [`tag`] grows before its label truncates.

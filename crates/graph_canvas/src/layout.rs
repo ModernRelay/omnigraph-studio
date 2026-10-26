@@ -421,17 +421,23 @@ fn cell_of(point: Vec2, cell: f32) -> (i32, i32) {
     )
 }
 
-/// The smallest box around every node, with its room: `(min, max)`.
+/// The smallest box around every node, with its room: `(min, max)`. A node takes `space` to
+/// each side, and as much above and below up to a chip's half height: a chip is wider than
+/// it is tall.
 pub fn extent(positions: &[Vec2], space: impl Fn(usize) -> f32) -> Option<(Vec2, Vec2)> {
+    let pads = |index: usize| {
+        let across = space(index);
+        Vec2::new(across, across.min(CHIP_HALF_HEIGHT))
+    };
     let mut iter = positions.iter().enumerate();
     let (first, point) = iter.next()?;
-    let pad = space(first);
-    let mut min = Vec2::new(point.x - pad, point.y - pad);
-    let mut max = Vec2::new(point.x + pad, point.y + pad);
+    let pad = pads(first);
+    let mut min = Vec2::new(point.x - pad.x, point.y - pad.y);
+    let mut max = Vec2::new(point.x + pad.x, point.y + pad.y);
     for (index, point) in iter {
-        let pad = space(index);
-        min = Vec2::new(min.x.min(point.x - pad), min.y.min(point.y - pad));
-        max = Vec2::new(max.x.max(point.x + pad), max.y.max(point.y + pad));
+        let pad = pads(index);
+        min = Vec2::new(min.x.min(point.x - pad.x), min.y.min(point.y - pad.y));
+        max = Vec2::new(max.x.max(point.x + pad.x), max.y.max(point.y + pad.y));
     }
     Some((min, max))
 }

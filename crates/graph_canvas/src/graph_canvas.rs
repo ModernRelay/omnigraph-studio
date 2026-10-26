@@ -2275,7 +2275,12 @@ impl GraphCanvas {
         // Floating pills are white cards in the light theme, like the chips. The canvas's
         // floating controls (what is drawn, search and zoom) read as one family, each
         // concentric around what it holds.
-        let panel = |id: &'static str| studio_ui::ds::float_bar(id, cx);
+        // A press on one is not one on a chip drawn under it; a drag passes over them, as over
+        // the caption.
+        let dragging = self.drag.is_some();
+        let panel = |id: &'static str| {
+            studio_ui::ds::float_bar(id, cx).when(!dragging, |bar| bar.occlude())
+        };
         let mode = self.mode();
         v_flex()
             .absolute()

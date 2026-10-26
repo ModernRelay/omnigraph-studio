@@ -854,8 +854,6 @@ fn paint_chip_body(rect: Bounds<Pixels>, radius: f32, style: &PillStyle, window:
     ));
 }
 
-/// A chip centred on `at`: an optional letter mark, then the pieces of text. Returns its bounds.
-#[allow(clippy::too_many_arguments)]
 /// A chip's pieces shaped at `text_size`, and the pill around them centred on `at`: one line
 /// high, its mark (when it has one) before them. What painting the chip draws, and what an
 /// opened chip grows from.
@@ -902,6 +900,7 @@ fn pill_layout(
     (rect, lines)
 }
 
+/// A chip centred on `at`: an optional letter mark, then the pieces of text. Returns its bounds.
 #[allow(clippy::too_many_arguments)]
 fn paint_pill(
     at: Point<Pixels>,
