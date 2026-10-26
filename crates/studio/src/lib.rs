@@ -20,6 +20,7 @@ use gpui::{
     WindowHandle, WindowOptions, px, size,
 };
 use graph_store::{ConnectionRegistry, open_session, open_session_behind};
+use studio_actions::offered;
 use studio_actions::update::{CheckForUpdates, DownloadUpdate, RestartToUpdate, ViewReleaseNotes};
 use studio_actions::workspace::{
     About, NewWindow, OpenGraph, OpenLink, OpenSettings, Quit, RevealLog,
@@ -87,11 +88,48 @@ pub fn init(cx: &mut App) {
         .ok();
     });
     cx.on_action(|_: &About, cx| about::open_about(cx));
+    // App-wide, so the app menu reaches them with no Studio window in front, and each offered
+    // only where it applies (spec 017, "What the person sees"; constitution VIII).
     cx.on_action(|_: &CheckForUpdates, cx| {
         if let Some(updater) = Updater::global(cx) {
             updater.update(cx, |updater, cx| updater.check(cx));
         }
     });
+    offered::when::<CheckForUpdates>(
+        |cx| {
+            update_is(cx, |state| {
+                matches!(
+                    state,
+                    UpdateState::Idle
+                        | UpdateState::UpToDate
+                        | UpdateState::Failed { .. }
+                        | UpdateState::Off
+                )
+            })
+        },
+        cx,
+    );
+    // Deferred, as Quit is: the window the action came from is held while it dispatches, and
+    // restarting may ask in it.
+    cx.on_action(|_: &RestartToUpdate, cx| {
+        if update_is(cx, |state| matches!(state, UpdateState::Ready { .. })) {
+            cx.defer(|cx| studio_workspace::restart(false, cx));
+        }
+    });
+    offered::when::<RestartToUpdate>(
+        |cx| update_is(cx, |state| matches!(state, UpdateState::Ready { .. })),
+        cx,
+    );
+    cx.on_action(|_: &DownloadUpdate, cx| {
+        if let Some(updater) = Updater::global(cx) {
+            let url = updater.read(cx).download_url();
+            cx.open_url(&url);
+        }
+    });
+    offered::when::<DownloadUpdate>(
+        |cx| update_is(cx, |state| matches!(state, UpdateState::Available { .. })),
+        cx,
+    );
     cx.on_action(|_: &ViewReleaseNotes, cx| {
         if let Some(updater) = Updater::global(cx) {
             let url = updater.read(cx).release_notes_url();
@@ -129,21 +167,6 @@ pub fn init(cx: &mut App) {
             let status = cx.new(|cx| update_status::UpdateStatus::new(updater, cx));
             workspace.set_status_item(status.into(), cx);
         }
-        // Offered only when they can run (constitution VIII). Deferred, as Quit is: the window
-        // is held while the action dispatches, and restarting may ask in it.
-        workspace.register_action_when(
-            |_, cx| update_is(cx, |state| matches!(state, UpdateState::Ready { .. })),
-            |_, _: &RestartToUpdate, _, cx| cx.defer(|cx| studio_workspace::restart(false, cx)),
-        );
-        workspace.register_action_when(
-            |_, cx| update_is(cx, |state| matches!(state, UpdateState::Available { .. })),
-            |_, _: &DownloadUpdate, _, cx| {
-                if let Some(updater) = Updater::global(cx) {
-                    let url = updater.read(cx).download_url();
-                    cx.open_url(&url);
-                }
-            },
-        );
         // GPUI's frame-time overlay exists only with its `profiler` feature, which the `perf`
         // feature turns on: frame times, then their distribution, then hidden again.
         workspace.register_action(

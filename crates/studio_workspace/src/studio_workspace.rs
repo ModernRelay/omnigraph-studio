@@ -4983,6 +4983,15 @@ enum Closing {
 }
 
 impl Closing {
+    /// The confirm button's label: what pressing it does.
+    fn confirm(self) -> &'static str {
+        match self {
+            Closing::Quit => "Quit",
+            Closing::Restart => "Restart",
+            Closing::Tab(_) | Closing::Graph | Closing::Window => "Close",
+        }
+    }
+
     /// How much it closes: each holds the ones before it.
     fn reach(self) -> u8 {
         match self {
@@ -5192,15 +5201,9 @@ impl Render for ConfirmClose {
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(
-                        studio_ui::ds::action_button(
-                            "close-anyway",
-                            match self.closing {
-                                Closing::Quit => "Quit",
-                                _ => "Close",
-                            },
-                        )
-                        .key_binding(ui::KeyBinding::for_action_in(&menu::Confirm, &focus, cx))
-                        .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                        studio_ui::ds::action_button("close-anyway", self.closing.confirm())
+                            .key_binding(ui::KeyBinding::for_action_in(&menu::Confirm, &focus, cx))
+                            .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
                     ),
             )
     }
@@ -5538,6 +5541,7 @@ mod tests {
                 SharedString::from("Restart to update Omnigraph Studio?")
             );
             assert_eq!(dialog.unsaved, [SharedString::from("Draft")]);
+            assert_eq!(dialog.closing.confirm(), "Restart");
         });
     }
 

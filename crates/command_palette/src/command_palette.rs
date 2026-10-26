@@ -1233,7 +1233,9 @@ fn add_action_rows(
     let documentation = cx.action_documentation();
     for action in window.available_actions(cx) {
         let name = action.name();
-        if hidden(name) {
+        // An app-wide action is available everywhere; one offered only in some states is
+        // listed only in them.
+        if hidden(name) || !studio_actions::offered::is_offered(action.as_ref(), cx) {
             continue;
         }
         if mode == Mode::Keys {

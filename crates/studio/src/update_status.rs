@@ -12,16 +12,17 @@ pub(crate) struct Shown {
     pub text: String,
     /// A button's label and the action it runs.
     pub button: Option<(String, Box<dyn Action>)>,
-    /// Work under way: a spinner before the text.
+    /// Work under way that the person asked for: a spinner before the text. Work in the
+    /// background shows its text alone, so nothing moves on screen unasked (constitution VII).
     pub busy: bool,
     pub error: bool,
 }
 
-pub(crate) fn shown(state: &UpdateState, running: &Version) -> Option<Shown> {
+pub(crate) fn shown(state: &UpdateState, running: &Version, asked: bool) -> Option<Shown> {
     let said = |text: String, busy: bool| Shown {
         text,
         button: None,
-        busy,
+        busy: busy && asked,
         error: false,
     };
     Some(match state {
@@ -76,8 +77,9 @@ impl UpdateStatus {
 impl Render for UpdateStatus {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let updater = self.updater.read(cx);
-        let Some(shown) = shown(updater.state(), updater.running()) else {
-            return div().into_any_element();
+        let Some(shown) = shown(updater.state(), updater.running(), updater.asked()) else {
+            // Hidden, so the status bar's gap is not kept for it.
+            return div().hidden().into_any_element();
         };
         let text = shown.text;
         h_flex()
@@ -107,8 +109,19 @@ mod tests {
     use semver::Version;
 
     fn text(state: UpdateState) -> Option<(String, Option<String>, bool)> {
-        shown(&state, &Version::new(0, 2, 1))
+        shown(&state, &Version::new(0, 2, 1), true)
             .map(|shown| (shown.text, shown.button.map(|(label, _)| label), shown.busy))
+    }
+
+    #[test]
+    fn work_in_the_background_shows_its_progress_without_a_spinner() {
+        let downloading = UpdateState::Downloading {
+            version: Version::new(0, 3, 0),
+            percent: Some(42),
+        };
+        let shown = shown(&downloading, &Version::new(0, 2, 1), false).unwrap();
+        assert_eq!(shown.text, "Downloading 0.3.0 · 42%");
+        assert!(!shown.busy);
     }
 
     #[test]

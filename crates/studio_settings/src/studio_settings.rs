@@ -169,7 +169,7 @@ pub struct StudioOptions {
     #[schemars(title = "Show memory and CPU", extend("x-section" = "Appearance"))]
     pub show_performance: bool,
     /// Check for a newer Studio half a minute after launch and every hour, and install it on
-    /// macOS, ready at the next restart. Off, Studio checks only when asked (spec 017).
+    /// macOS, ready at the next restart. Off, Studio checks only when asked.
     #[schemars(title = "Update automatically", extend("x-section" = "Updates"))]
     pub auto_update: bool,
 }

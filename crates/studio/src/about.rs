@@ -40,7 +40,10 @@ pub(crate) fn open_about(cx: &mut App) {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitlebarOptions {
             title: Some("About Omnigraph Studio".into()),
-            appears_transparent: true,
+            // On macOS the window's title bar draws over its content, which leaves room for it.
+            // Elsewhere GPUI then draws no title bar at all, and this window draws no drag area
+            // or close control of its own, so it keeps the system's.
+            appears_transparent: cfg!(target_os = "macos"),
             traffic_light_position: None,
         }),
         is_resizable: false,

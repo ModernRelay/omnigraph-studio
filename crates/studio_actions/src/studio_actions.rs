@@ -1,4 +1,5 @@
-//! Every action Studio defines. Doc comments on actions become palette descriptions.
+//! Every action Studio defines, and when an app-wide one is offered ([`offered`]). Doc
+//! comments on actions become palette descriptions.
 //!
 //! Layer 0 (`docs/architecture.md`). Plan: `specs/002-app-shell/plan.md`.
 //!
@@ -699,4 +700,52 @@ pub mod update {
             ViewReleaseNotes,
         ]
     );
+}
+/// When an app-wide action is offered (constitution VIII). An action registered with
+/// `App::on_action` is available in every window and from the app menu with none in front,
+/// which GPUI cannot make conditional; one that runs only in some states says so here, and the
+/// command palette lists it only while [`is_offered`] holds.
+pub mod offered {
+    use std::any::TypeId;
+    use std::collections::HashMap;
+
+    use gpui::{Action, App, Global};
+
+    #[derive(Default)]
+    struct Offered(HashMap<TypeId, fn(&App) -> bool>);
+
+    impl Global for Offered {}
+
+    /// Offers `A` only while `when` holds.
+    pub fn when<A: Action>(when: fn(&App) -> bool, cx: &mut App) {
+        cx.default_global::<Offered>()
+            .0
+            .insert(TypeId::of::<A>(), when);
+    }
+
+    /// Whether `action` is offered now: always, unless [`when`] made it conditional.
+    pub fn is_offered(action: &dyn Action, cx: &App) -> bool {
+        cx.try_global::<Offered>()
+            .and_then(|offered| offered.0.get(&action.as_any().type_id()))
+            .is_none_or(|when| when(cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::offered;
+    use super::update::{CheckForUpdates, RestartToUpdate};
+
+    #[gpui::test]
+    fn an_action_is_offered_unless_it_says_when(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            assert!(offered::is_offered(&RestartToUpdate, cx));
+            offered::when::<RestartToUpdate>(|_| false, cx);
+            assert!(!offered::is_offered(&RestartToUpdate, cx));
+            assert!(
+                offered::is_offered(&CheckForUpdates, cx),
+                "another action is untouched"
+            );
+        });
+    }
 }
