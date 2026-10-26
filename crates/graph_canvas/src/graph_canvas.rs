@@ -365,6 +365,9 @@ pub(crate) struct GraphCanvas {
     _open: Option<Task<()>>,
     /// A rebuild waiting for reads that finish together.
     _loaded: Option<Task<()>>,
+    /// The camera and placed chips the last frame drew: one that moves them under a pointer
+    /// resting on a chip finds the chip under it again once painted ([`Self::hover_at`]).
+    drawn: Option<(Camera, usize)>,
     char_widths: CharWidths,
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// Each node's chip on screen as last painted, for hit testing.
@@ -540,6 +543,7 @@ impl GraphCanvas {
             read_ahead: None,
             _open: None,
             _loaded: None,
+            drawn: None,
             char_widths: CharWidths::default(),
             bounds: Rc::new(Cell::new(None)),
             chips: Rc::new(RefCell::new(Vec::new())),
@@ -1404,7 +1408,13 @@ impl GraphCanvas {
             }
             return;
         }
-        let hovered = self.hit(event.position);
+        self.hover_at(event.position, cx);
+    }
+
+    /// The chip under the pointer at `position` is the one it points at, by the chips as last
+    /// painted: what resting on it reads ahead and opens follows it.
+    fn hover_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let hovered = self.hit(position);
         if hovered != self.hovered {
             self.hovered = hovered;
             self.prefetch_hovered(cx);
@@ -2572,6 +2582,19 @@ impl Render for GraphCanvas {
             Loadable::Loaded(_) => None,
         };
         let now = Instant::now();
+        // The view or the chips moved under a pointer resting on a chip (a fit, a zoom key, a
+        // glide, a layout): the chip under it is found again once this frame is painted, as a
+        // pointer move would find it. A drag keeps its own.
+        let drawn = (self.camera_now(now), Arc::as_ptr(&self.positions) as usize);
+        let moving = !self.appear.is_empty() || self.glide.is_some();
+        if self.hovered.is_some() && self.drag.is_none() && (moving || self.drawn != Some(drawn)) {
+            let this = cx.entity().downgrade();
+            window.on_next_frame(move |window, cx| {
+                let position = window.mouse_position();
+                this.update(cx, |this, cx| this.hover_at(position, cx)).ok();
+            });
+        }
+        self.drawn = Some(drawn);
         self.appear.retain(|_, tween| tween.is_running(now));
         if self.glide.as_ref().is_some_and(|g| !g.is_running(now)) {
             self.glide = None;
