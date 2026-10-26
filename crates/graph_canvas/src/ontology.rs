@@ -508,6 +508,17 @@ impl OntologyPage {
         }
     }
 
+    /// The pointer entered (`hovered`) or left `at`'s row. Leaving lets go only of the row
+    /// pointed at: moving down from one row to the next, GPUI tells the row entered before the
+    /// row left, which must not take the new row's highlight away.
+    fn point_at(&mut self, at: Pointed, hovered: bool, cx: &mut Context<Self>) {
+        if hovered {
+            self.point(Some(at), cx);
+        } else if self.pointed == Some(at) {
+            self.point(None, cx);
+        }
+    }
+
     /// The width the page lays its views out in, as it was last laid out (a change draws the
     /// page again); before that, the window's less the sidebar.
     fn page_width(&self, window: &Window) -> f32 {
@@ -679,7 +690,7 @@ impl OntologyPage {
                 })
                 .children(count.map(ds::text::meta))
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                    this.point(hovered.then_some(Pointed::Type(ty)), cx)
+                    this.point_at(Pointed::Type(ty), *hovered, cx)
                 }))
                 .on_click(cx.listener(move |this, _, _, cx| this.focus_on(&name, cx))),
             cx,
@@ -707,7 +718,7 @@ impl OntologyPage {
         div()
             .id(SharedString::from(format!("type-hover-{ty}")))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                this.point(hovered.then_some(Pointed::Type(ty)), cx)
+                this.point_at(Pointed::Type(ty), *hovered, cx)
             }))
             .child(
                 ds::SidebarRow::new(SharedString::from(format!("type-{name}")), name.clone())
@@ -878,7 +889,7 @@ impl OntologyPage {
                         )
                         .children(count.map(ds::text::meta))
                         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                            this.point(hovered.then_some(Pointed::Type(ty)), cx)
+                            this.point_at(Pointed::Type(ty), *hovered, cx)
                         }))
                         .on_click(cx.listener(move |this, _, _, cx| this.focus_on(&target, cx))),
                     cx,
@@ -1158,7 +1169,7 @@ impl OntologyPage {
                             })
                             .tooltip(Tooltip::text(tooltip))
                             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                                this.point(hovered.then_some(Pointed::Line(side, at)), cx)
+                                this.point_at(Pointed::Line(side, at), *hovered, cx)
                             }))
                             .on_click(cx.listener(move |this, _, _, cx| this.focus_on(&target, cx)))
                             .into_any_element()

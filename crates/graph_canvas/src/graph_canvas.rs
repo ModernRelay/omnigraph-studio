@@ -228,12 +228,21 @@ impl Drag {
     }
 }
 
-/// What "+K more" does: draws neighbours already read, reads more of a list, or opens a value
-/// of a grouped relationship.
+/// What "+K more" does: draws neighbours already read, reads more of a list, opens a value of a
+/// grouped relationship, or reads again a page whose read failed.
 enum More {
     Drawn,
     Read(GroupKey),
     Open(ExplorePath),
+    Retry(GroupKey),
+}
+
+/// A layout to work out once the one running is applied ([`GraphCanvas::lay_out`]).
+struct PendingLayout {
+    generation: u64,
+    scene: Scene,
+    widths: Vec<f32>,
+    place: Box<dyn FnOnce() -> Vec<Vec2> + Send>,
 }
 
 /// The key a placed chip is remembered by: a node or a relationship pill. "+K more" follows
@@ -307,6 +316,15 @@ pub(crate) struct GraphCanvas {
     /// The layout being worked out off the main thread, until it is applied: a fit waits
     /// for it, rather than framing the layout it replaces.
     layout_task: Option<Task<()>>,
+    /// The newest layout asked for while one runs. A running layout is one poll of the
+    /// background executor and cannot be stopped, so the newest waits for it, and those it
+    /// replaced never start.
+    next_layout: Option<PendingLayout>,
+    /// The walk changed since the scene was laid out: it is laid out when the canvas is next
+    /// drawn ([`Self::lay_out_owed`]), so a canvas tab behind another lays out nothing.
+    layout_owed: bool,
+    /// The node cap of the scene last asked for, laid out or on its way.
+    requested_cap: usize,
     hub_limits: HashMap<GroupKey, usize>,
     center: Vec2,
     zoom: f32,
@@ -435,18 +453,14 @@ impl GraphCanvas {
         let exploration = Exploration::for_session(&session, cx);
         let subscriptions = vec![
             cx.subscribe(&exploration, |this, _, event, cx| match event {
-                // A results canvas draws none of the exploration: only the tab's mark for newer
-                // data and the caption follow it, and nothing is laid out.
+                // A results canvas draws none of the exploration, and its tab marks no newer
+                // data ([`Self::is_stale`]): the walk's changes are nothing to it.
                 ExplorationEvent::Changed | ExplorationEvent::Loaded
-                    if !this.draws_exploration() =>
-                {
-                    cx.emit(ItemEvent::UpdateTab);
-                    cx.notify();
-                }
+                    if !this.draws_exploration() => {}
                 ExplorationEvent::Changed => {
                     this._loaded = None;
                     cx.emit(ItemEvent::UpdateTab);
-                    this.rebuild(cx);
+                    this.owe_layout(cx);
                 }
                 // Reads that finish together (a node's counts) are laid out in one go.
                 ExplorationEvent::Loaded => {
@@ -456,7 +470,7 @@ impl GraphCanvas {
                             this.update(cx, |this, cx| {
                                 this._loaded = None;
                                 cx.emit(ItemEvent::UpdateTab);
-                                this.rebuild(cx);
+                                this.owe_layout(cx);
                             })
                             .ok();
                         }));
@@ -478,7 +492,7 @@ impl GraphCanvas {
             // A new node cap (the setting, or the graph's own) is drawn at once, so the canvas
             // and its banner never show different limits.
             cx.observe_global::<StudioSettings>(|this, cx| {
-                if this.scene.cap != this.node_cap(cx) {
+                if this.requested_cap != this.node_cap(cx) {
                     this.rebuild(cx);
                 }
             }),
@@ -499,6 +513,9 @@ impl GraphCanvas {
             layout_key: None,
             layout_generation: 0,
             layout_task: None,
+            next_layout: None,
+            layout_owed: false,
+            requested_cap: 0,
             hub_limits: HashMap::new(),
             center: Vec2::default(),
             zoom: 1.,
@@ -559,16 +576,16 @@ impl GraphCanvas {
     /// Shows `node`: selects it where the exploration shows it, else roots the exploration
     /// there; then centers on it.
     fn show_node(&mut self, node: NodeRef, cx: &mut Context<Self>) {
+        // A results canvas draws none of the walk, which stays as it is.
+        if !self.draws_exploration() {
+            return;
+        }
         let id = SceneId::Node(node.clone());
         self.center_on = Some(id.clone());
         self.selected = Some(id.clone());
         let shown = self
             .exploration
             .update(cx, |exploration, cx| exploration.reveal(node.clone(), cx));
-        if !self.draws_exploration() {
-            self.rebuild(cx);
-            return;
-        }
         // Not shown, the exploration was rooted at it, and that change is laid out
         // (`ExplorationEvent::Changed`). Shown in the tree but not drawn here (a hub draws some of
         // its neighbours): rooted at it, it is. Asked of the scene the exploration makes now, not
@@ -589,9 +606,10 @@ impl GraphCanvas {
     /// Roots the exploration at `node`, which `path` reaches, keeping what is open below it.
     fn explore_from(&mut self, path: &ExplorePath, node: NodeRef, cx: &mut Context<Self>) {
         self.selected = Some(SceneId::Node(node));
+        // The reroot says it changed, which lays it out; the selection shows either way.
         self.exploration
             .update(cx, |exploration, cx| exploration.reroot(path, cx));
-        self.rebuild(cx);
+        cx.notify();
     }
 
     /// The explorer's scene as the exploration stands, under the node cap; none without a
@@ -608,7 +626,22 @@ impl GraphCanvas {
         ))
     }
 
+    /// Lays the walk out when the canvas is next drawn ([`Self::layout_owed`]).
+    fn owe_layout(&mut self, cx: &mut Context<Self>) {
+        self.layout_owed = true;
+        cx.notify();
+    }
+
+    /// Lays out what the walk's changes left to lay out: called when the canvas is drawn.
+    fn lay_out_owed(&mut self, cx: &mut Context<Self>) {
+        if self.layout_owed {
+            self.rebuild(cx);
+        }
+    }
+
     fn rebuild(&mut self, cx: &mut Context<Self>) {
+        // A layout of the scene as it stands covers what is owed.
+        self.layout_owed = false;
         if self.session.read(cx).schema_model().is_none() {
             self.scene = Arc::default();
             self.texts = Arc::default();
@@ -689,7 +722,8 @@ impl GraphCanvas {
     }
 
     /// Places `scene` off the main thread with `place`, and shows it unless a newer layout
-    /// began meanwhile.
+    /// was asked for meanwhile. One runs at a time: asked for while one runs, it waits for it,
+    /// in place of any other waiting.
     fn lay_out(
         &mut self,
         scene: Scene,
@@ -697,7 +731,29 @@ impl GraphCanvas {
         place: impl FnOnce() -> Vec<Vec2> + Send + 'static,
         cx: &mut Context<Self>,
     ) {
-        let generation = self.layout_generation;
+        self.requested_cap = scene.cap;
+        // A layout of the scene as it stands covers what is owed.
+        self.layout_owed = false;
+        let layout = PendingLayout {
+            generation: self.layout_generation,
+            scene,
+            widths,
+            place: Box::new(place),
+        };
+        if self.layout_task.is_some() {
+            self.next_layout = Some(layout);
+            return;
+        }
+        self.start_layout(layout, cx);
+    }
+
+    fn start_layout(&mut self, layout: PendingLayout, cx: &mut Context<Self>) {
+        let PendingLayout {
+            generation,
+            scene,
+            widths,
+            place,
+        } = layout;
         let positions = cx.background_spawn(async move { place() });
         self.layout_task = Some(cx.spawn(async move |this, cx| {
             let positions = positions.await;
@@ -705,6 +761,9 @@ impl GraphCanvas {
                 this.layout_task = None;
                 if this.layout_generation == generation {
                     this.apply_layout(scene, widths, positions, cx);
+                }
+                if let Some(next) = this.next_layout.take() {
+                    this.start_layout(next, cx);
                 }
             })
             .ok();
@@ -767,9 +826,17 @@ impl GraphCanvas {
                 *position = *pinned;
             }
         }
-        for (node, position) in scene.nodes.iter().zip(&positions) {
-            self.known.insert(node.id.clone(), *position);
-        }
+        // The chips drawn now keep their places; one no longer drawn is placed again when it
+        // comes back, beside what is drawn then, not over it.
+        self.known = scene
+            .nodes
+            .iter()
+            .zip(&positions)
+            .map(|(node, position)| (node.id.clone(), *position))
+            .collect();
+        // So do the marks: an action on the marked chips acts on chips drawn.
+        let known = &self.known;
+        self.marked.retain(|id| known.contains_key(id));
         // Every node glides from where it is drawn now to its new place; a new one from where
         // the node it hangs off is drawn, so expanding reads as growing.
         let now = Instant::now();
@@ -945,7 +1012,7 @@ impl GraphCanvas {
     }
 
     /// The node whose chip is under `position`, topmost first, by the chips as last painted.
-    fn hit(&self, position: Point<Pixels>, _window: &Window) -> Option<usize> {
+    fn hit(&self, position: Point<Pixels>) -> Option<usize> {
         let chips = self.chips.borrow();
         // An opened chip lies over its neighbours.
         if let Some(index) = self.opened_index()
@@ -1090,6 +1157,10 @@ impl GraphCanvas {
     /// Closes every one of `ids` (nodes and relationships; "+K more" closes its relationship),
     /// as one change.
     fn close_all(&mut self, ids: &[SceneId], cx: &mut Context<Self>) {
+        // A results canvas draws none of the walk, which it does not close.
+        if !self.draws_exploration() {
+            return;
+        }
         let exploration = self.exploration.read(cx);
         let entries = exploration.entries();
         let paths = model::open_paths(&entries, exploration.state(), ids);
@@ -1110,6 +1181,12 @@ impl GraphCanvas {
                 .is_some_and(|list| list.status == PageStatus::Idle && !list.exhausted)
         };
         let loaded = |key: &GroupKey| state.neighbours.get(key).map_or(0, |list| list.rows.len());
+        let failed = |key: &GroupKey| {
+            state
+                .neighbours
+                .get(key)
+                .is_some_and(|list| matches!(list.status, PageStatus::Failed(_)))
+        };
         let more = if exploration.grouping(&key.group).is_some() {
             // A grouped relationship is read a value at a time (spec 005), and its hub draws
             // the neighbours of the values open: more are those of an open value with more to
@@ -1135,6 +1212,11 @@ impl GraphCanvas {
                 .sum();
             if drawn >= wanted {
                 More::Drawn
+            } else if let Some((value, ..)) = values
+                .iter()
+                .find(|(value, _, open)| *open && failed(value))
+            {
+                More::Retry((*value).clone())
             } else if let Some((value, ..)) =
                 values.iter().find(|(value, _, open)| *open && ready(value))
             {
@@ -1144,6 +1226,8 @@ impl GraphCanvas {
             } else {
                 More::Drawn
             }
+        } else if failed(&key) {
+            More::Retry(key)
         } else if loaded(&key) < wanted && ready(&key) {
             More::Read(key)
         } else {
@@ -1153,6 +1237,9 @@ impl GraphCanvas {
             More::Drawn => self.rebuild(cx),
             More::Read(key) => self.exploration.update(cx, |e, cx| e.load_more(&key, cx)),
             More::Open(path) => self.exploration.update(cx, |e, cx| e.expand(&path, cx)),
+            More::Retry(key) => self
+                .exploration
+                .update(cx, |e, cx| e.retry(&graph_store::LoadTarget::Page(key), cx)),
         }
     }
 
@@ -1160,7 +1247,7 @@ impl GraphCanvas {
         window.focus(&self.focus_handle, cx);
         self.context_menu = None;
         self.settle_camera();
-        let hit = self.hit(event.position, window);
+        let hit = self.hit(event.position);
         let node = hit
             .filter(|index| pin_key(&self.scene.nodes[*index].id).is_some())
             .and_then(|index| Some((index, *self.positions.get(index)?)));
@@ -1278,7 +1365,7 @@ impl GraphCanvas {
         out
     }
 
-    fn mouse_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if let (Some(drag), true) = (&mut self.drag, event.dragging()) {
             drag.follow(&self.scene);
             let dx = f32::from(event.position.x - drag.start.x);
@@ -1316,7 +1403,7 @@ impl GraphCanvas {
             }
             return;
         }
-        let hovered = self.hit(event.position, window);
+        let hovered = self.hit(event.position);
         if hovered != self.hovered {
             self.hovered = hovered;
             self.prefetch_hovered(cx);
@@ -1353,7 +1440,7 @@ impl GraphCanvas {
             self.place_dragged(&drag, cx);
             return;
         }
-        let hit = self.hit(event.position, window);
+        let hit = self.hit(event.position);
         // ⌘-click marks a chip, or unmarks it, as ⌘-click picks rows in a table.
         if event.modifiers.secondary() {
             if let Some(index) = hit {
@@ -1484,7 +1571,7 @@ impl GraphCanvas {
     ) {
         window.focus(&self.focus_handle, cx);
         self.settle_camera();
-        let hit = self.hit(event.position, window);
+        let hit = self.hit(event.position);
         let group = hit.is_some_and(|index| self.is_marked(index)) && self.marked.len() > 1;
         if let Some(index) = hit
             && !group
@@ -2032,7 +2119,7 @@ impl GraphCanvas {
 
     // ---- painting ----
 
-    fn render_canvas(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_canvas(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = paint::Palette {
             text: Color::Default.color(cx),
             muted: Color::Muted.color(cx),
@@ -2312,18 +2399,21 @@ impl GraphCanvas {
                         .child(studio_ui::ds::text::body(format!(
                             "Too many nodes to draw · {hidden} not shown (limit {cap})"
                         )))
-                        .child(
-                            studio_ui::ds::bar_button("canvas-tree", "Show in tree")
-                                .style(ButtonStyle::Outlined)
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(
-                                        Box::new(studio_actions::workspace::ActivatePanel {
-                                            id: "explore".into(),
-                                        }),
-                                        cx,
-                                    )
-                                }),
-                        )
+                        // The tree shows the walk, which a results canvas does not draw.
+                        .when(mode == Mode::Explore, |banner| {
+                            banner.child(
+                                studio_ui::ds::bar_button("canvas-tree", "Show in tree")
+                                    .style(ButtonStyle::Outlined)
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(
+                                            Box::new(studio_actions::workspace::ActivatePanel {
+                                                id: "explore".into(),
+                                            }),
+                                            cx,
+                                        )
+                                    }),
+                            )
+                        })
                         .child(
                             studio_ui::ds::bar_button("canvas-table", "Open as table")
                                 .style(ButtonStyle::Filled)
@@ -2441,10 +2531,14 @@ fn to_world(screen: Point<Pixels>, viewport: Bounds<Pixels>, center: Vec2, zoom:
 
 impl Render for GraphCanvas {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // What the session's events left to read is read once the walk is drawn.
+        // What the session's events left to read is read once the walk is drawn, and what its
+        // changes left to lay out is laid out.
         if self.draws_exploration() && self.exploration.read(cx).owes_reads() {
             let exploration = self.exploration.clone();
             cx.defer(move |cx| exploration.update(cx, |e, cx| e.read_owed(cx)));
+        }
+        if self.layout_owed {
+            cx.defer_in(window, |this, _, cx| this.lay_out_owed(cx));
         }
         let schema = self.session.read(cx).schema.clone();
         let body = match schema {
@@ -2494,7 +2588,7 @@ impl Render for GraphCanvas {
             }
         }
         let background = studio_ui::ds::surface::canvas(cx);
-        let canvas = self.render_canvas(window, cx).into_any_element();
+        let canvas = self.render_canvas(cx).into_any_element();
         let overlay = self.render_overlay(cx).into_any_element();
         // The area being drawn: a tinted rectangle from where the drag began to the pointer.
         let area = self
@@ -2880,9 +2974,12 @@ mod tests {
             exploration.root_at(NodeRef::new("Person", "p1"), cx)
         });
         cx.run_until_parked();
-        // Answers that come in together are laid out after a short wait.
+        // Answers that come in together are laid out after a short wait, when the canvas is
+        // drawn (here, by hand: it has no window).
         cx.executor()
             .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        canvas.update(cx, |canvas, cx| canvas.lay_out_owed(cx));
         cx.run_until_parked();
         let (hub, key) = canvas.read_with(cx, |canvas, _| {
             canvas

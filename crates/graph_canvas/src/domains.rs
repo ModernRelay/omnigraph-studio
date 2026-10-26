@@ -73,8 +73,16 @@ pub fn domains(types: usize, relationships: &[(usize, usize)]) -> Domains {
             degree,
         };
     }
+    // How many other types each type is related to: a shared type is related to many types, not
+    // related many times to a few.
+    let mut related = vec![0usize; types];
+    for &(a, b) in weight.keys() {
+        related[a] += 1;
+        related[b] += 1;
+    }
+    let others = (types - 1) as f64;
     let mut shared: Vec<usize> = (0..types)
-        .filter(|&t| degree[t] as f64 > SHARED_SHARE * types as f64)
+        .filter(|&t| related[t] as f64 > SHARED_SHARE * others)
         .collect();
     by_degree(&mut shared);
     let is_shared = |t: usize| shared.contains(&t);
@@ -290,9 +298,15 @@ mod tests {
 
     #[test]
     fn related_types_group_and_a_hub_is_shared() {
-        let (types, relationships) = cliques(4, 6);
+        let (types, mut relationships) = cliques(4, 6);
+        // Many relationships between two types make neither shared.
+        relationships.extend(std::iter::repeat_n((1, 2), 10));
         let found = domains(types, &relationships);
-        assert_eq!(found.shared, vec![0], "the hub is related to every type");
+        assert_eq!(
+            found.shared,
+            vec![0],
+            "the hub is related to every type, and only the hub to many"
+        );
         assert_eq!(found.groups.len(), 4, "{:?}", found.groups);
         assert!(!found.rest);
         for clique in 0..4 {
