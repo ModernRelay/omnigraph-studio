@@ -64,13 +64,68 @@ pub struct Choice {
     pub description: Option<String>,
 }
 
+/// The settings document's JSON schema, made once.
+static SCHEMA: LazyLock<Value> = LazyLock::new(|| {
+    serde_json::to_value(schemars::schema_for!(StudioSettings))
+        .expect("the settings schema is JSON")
+});
+
 static FIELDS: LazyLock<Vec<SettingField>> = LazyLock::new(|| {
-    let schema = serde_json::to_value(schemars::schema_for!(StudioSettings))
-        .expect("the settings schema is JSON");
     let mut fields = Vec::new();
-    walk(&schema, &schema, &mut Vec::new(), "General", &mut fields);
+    walk(&SCHEMA, &SCHEMA, &mut Vec::new(), "General", &mut fields);
     fields
 });
+
+/// Whether the setting at `path` is a list of objects by the schema, as saved views are: each
+/// element is a value of its own. `path` holds the document's keys, `None` for a list's
+/// position; a key under a map (a graph's key under `graphs`) stands for any of its entries.
+pub(crate) fn holds_records(path: &[Option<&str>]) -> bool {
+    let root: &Value = &SCHEMA;
+    let mut node = present(root, root);
+    for step in path {
+        let next = match step {
+            Some(key) => node
+                .get("properties")
+                .and_then(|properties| properties.get(*key))
+                .or_else(|| {
+                    node.get("additionalProperties")
+                        .filter(|map| map.is_object())
+                }),
+            None => node.get("items"),
+        };
+        let Some(next) = next else {
+            return false;
+        };
+        node = present(root, next);
+    }
+    node.get("items")
+        .map(|items| present(root, items))
+        .is_some_and(|items| {
+            items.get("properties").is_some()
+                || match items.get("type") {
+                    Some(Value::String(kind)) => kind == "object",
+                    Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind == "object"),
+                    _ => false,
+                }
+        })
+}
+
+/// `schema` resolved, and, when it is one of several (an optional value's `anyOf`), the one that
+/// is not null.
+fn present(root: &Value, schema: &Value) -> Value {
+    let resolved = resolve(root, schema);
+    let alternatives = resolved
+        .get("anyOf")
+        .or_else(|| resolved.get("oneOf"))
+        .and_then(Value::as_array);
+    match alternatives.and_then(|all| {
+        all.iter()
+            .find(|one| one.get("type") != Some(&Value::from("null")))
+    }) {
+        Some(one) => resolve(root, one),
+        None => resolved,
+    }
+}
 
 /// Every visible setting, in the order the document declares them.
 pub fn fields() -> &'static [SettingField] {

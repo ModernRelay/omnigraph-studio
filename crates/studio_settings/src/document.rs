@@ -71,7 +71,7 @@ fn read_setting_aside(text: &str) -> Result<(Reading, Vec<Vec<Step>>), String> {
                 return Ok((Reading { settings, problems }, aside));
             }
             Err((failed, reason)) => {
-                let Some(dropped) = drop_target(&document, &failed) else {
+                let Some(dropped) = drop_target(&failed) else {
                     return Err(reason);
                 };
                 let in_text = in_text(&aside, &dropped);
@@ -138,17 +138,17 @@ fn parse(text: &str) -> Result<Value, String> {
 
 /// What to set aside for a value that does not fit at `failed`. A list element with a part that
 /// does not fit (one saved view) is set aside alone, and so is one that is itself wrong in a
-/// list whose every other element is an object (a view that is `null`): the others apply, and a
-/// later save keeps them. Any other list whose element is wrong (a number, or an object, in the
+/// list the schema makes of objects (a view that is `null`): the others apply, and a later save
+/// keeps them. A list of plain values whose element is wrong (a number, or an object, in the
 /// agent's command) is set aside whole, so no setting runs with part of its list missing.
 /// `None` when the failure is the document itself.
-fn drop_target(document: &Value, failed: &[Step]) -> Option<Vec<Step>> {
+fn drop_target(failed: &[Step]) -> Option<Vec<Step>> {
     match failed
         .iter()
         .position(|step| matches!(step, Step::Index(_)))
     {
         Some(index) if index + 1 < failed.len() => Some(failed[..=index].to_vec()),
-        Some(index) if index > 0 && records_but(document, &failed[..index], &failed[index]) => {
+        Some(index) if index > 0 && holds_records(&failed[..index]) => {
             Some(failed[..=index].to_vec())
         }
         Some(index) => (index > 0).then(|| failed[..index].to_vec()),
@@ -187,23 +187,16 @@ fn out_of_range(document: &Value) -> Option<(Vec<Step>, String)> {
     None
 }
 
-/// Whether every element of the list at `path` but the one at `wrong` is an object: the list
-/// holds records, each its own value. One object among plain values does not make it so.
-fn records_but(document: &Value, path: &[Step], wrong: &Step) -> bool {
-    let Step::Index(wrong) = *wrong else {
-        return false;
-    };
-    path.iter()
-        .try_fold(document, |value, step| match step {
-            Step::Key(key) => value.get(key.as_str()),
-            Step::Index(index) => value.get(*index),
+/// Whether the list at `path` holds objects by the settings' schema ([`crate::fields`]).
+fn holds_records(path: &[Step]) -> bool {
+    let keys: Vec<Option<&str>> = path
+        .iter()
+        .map(|step| match step {
+            Step::Key(key) => Some(key.as_str()),
+            Step::Index(_) => None,
         })
-        .and_then(Value::as_array)
-        .is_some_and(|list| {
-            list.iter()
-                .enumerate()
-                .all(|(index, element)| index == wrong || element.is_object())
-        })
+        .collect();
+    crate::fields::holds_records(&keys)
 }
 
 /// A deserializer's message in the words of a settings file: a number, a whole number, a list,
@@ -864,6 +857,11 @@ mod tests {
                 .collect()
         };
         assert_eq!(names(text), ["Kept"]);
+        let two = r#"{"graphs": {"dev/knowledge": {
+            "views": [null, 3, {"name": "Kept", "type": "Person"}]
+        }}}"#;
+        assert_eq!(names(two), ["Kept"], "however many views are wrong");
+        assert_eq!(read(two).unwrap().problems.len(), 2);
         let reading = read(text).unwrap();
         assert_eq!(reading.problems.len(), 1, "{:?}", reading.problems);
         assert!(
