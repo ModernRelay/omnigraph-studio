@@ -2,8 +2,8 @@
 //! angles, each end in a small ring, as interfaces.dev draws its connectors; every node, type,
 //! hub and "+K more" a chip, a white pill with interfaces.dev's shadow (a 1 px ring and two soft
 //! drops, on its `#fcfcfc` ground), with the type's letter mark and a muted count. Pointing at a
-//! chip lights its lines and fades the rest; the selected chip carries a warm ring. Colour is
-//! kept to the small type marks.
+//! chip lights its lines; the selected chip carries a warm ring. Colour is kept to the small
+//! type marks.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -36,7 +36,7 @@ pub(crate) struct Palette {
     pub grid_dot: Hsla,
     /// The canvas behind the chips: a line end's ring is filled with it.
     pub canvas: Hsla,
-    /// A closed hub's dot from afar.
+    /// A hub's or "+K more"'s dot from afar.
     pub hub_dot: Hsla,
     pub font: Font,
 }
@@ -61,7 +61,7 @@ pub(crate) const CHIP_LABEL_CHARS: usize = 32;
 const OPEN_CHIP_MAX_WIDTH: f32 = 320.;
 /// Below this text size a node is drawn as its mark alone, unless it is selected or pointed at.
 const MARK_ONLY_BELOW: f32 = 8.5;
-/// A closed hub's dot from afar: its radius, in screen pixels.
+/// A hub's or "+K more"'s dot from afar: its radius, in screen pixels.
 const HUB_DOT: f32 = 4.;
 /// A node's letter mark from afar, across, in screen pixels.
 const MARK_SIZE: f32 = 12.;

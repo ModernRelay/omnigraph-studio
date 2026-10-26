@@ -78,7 +78,7 @@ fn ring_positions(count: usize) -> Vec<Vec2> {
         1 => vec![Vec2::default()],
         2 => vec![Vec2::new(-170., 0.), Vec2::new(170., 0.)],
         _ => {
-            // Room for a chip per type around the ring.
+            // Room for a chip per place around the ring.
             let radius = (count as f32 * 210. / TAU).max(190.);
             (0..count)
                 .map(|i| Vec2::polar(-PI / 2. + TAU * i as f32 / count as f32, radius))

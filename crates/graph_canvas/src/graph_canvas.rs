@@ -3,9 +3,10 @@
 //! same walk, and a query's result nodes. The schema's types have a page of their own, the
 //! ontology ([`ontology`]).
 //!
-//! One `canvas()` element paints everything: edges batched by color into paths in one paint
-//! layer, nodes as quads, labels above a zoom threshold. Layout runs on a background thread
-//! (`layout::explore_positions`); the main thread only paints. Nodes already drawn never move.
+//! One `canvas()` element paints everything: dashed lines and chips as quads, a chip's name
+//! above a zoom threshold and its letter mark (a hub, a dot) below it. Layout runs on a
+//! background thread (`layout::explore_positions`); the main thread only paints. Nodes already
+//! drawn never move.
 //!
 //! Layer 5 (`docs/architecture.md`). Plan: `specs/006-graph-canvas/plan.md`.
 
