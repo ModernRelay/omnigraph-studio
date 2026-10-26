@@ -178,8 +178,11 @@ python3 script/test_release_files.py
 
 A release's updates are signed with an update key (spec 017). Make it once with `cargo packager
 signer generate` (cargo-packager 0.11.8): its public half goes in
-`crates/studio_update/update-key.pub`, the private half and its password in the release
-workflow's `STUDIO_UPDATER_KEY` and `STUDIO_UPDATER_KEY_PASSWORD` secrets.
+`crates/studio_update/update-key.pub`, the private half and its password in the
+`STUDIO_UPDATER_KEY` and `STUDIO_UPDATER_KEY_PASSWORD` secrets of the repository's
+`update-signing` environment. Give that environment required reviewers: the release workflow
+signs a tag's update there, so no workflow change alone can sign one. Once `update-key.pub`
+holds the key, a release whose macOS update is not signed with it is refused.
 
 CI runs these checks on macOS, Linux and Windows for each pull request that changes more than
 documentation, and not again on merge. `crates/studio/examples/snapshot.rs` renders Studio

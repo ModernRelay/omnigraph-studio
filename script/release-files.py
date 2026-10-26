@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Add a release's version-free copies and its update manifest to its files (spec 017).
 
-    script/release-files.py dist 0.3.0
+    script/release-files.py dist 0.3.0 crates/studio_update/update-key.pub
 
 `releases/latest/download/<name>` then always serves the newest first-install file, and
 `latest.json` tells Studio's updater the newest version and, for macOS, the signed update
 (`Omnigraph-Studio-<version>-arm64.app.tar.gz` with its `.sig`, which `cargo packager signer
-sign` writes as base64). Without the `.sig` no platform is offered an update to install, and
-Studio offers the download instead. GITHUB_REPOSITORY names the repository.
+sign` writes as base64). While the committed update key is empty no platform is offered an
+update to install, and Studio offers the download instead; once it holds the key, a release
+without the `.sig` stops here, since every Studio would otherwise stop updating without a
+word. GITHUB_REPOSITORY names the repository.
 """
 import datetime
 import json
@@ -38,7 +40,9 @@ def stable_copies(dist, version):
         shutil.copyfile(source, dist / stable)
 
 
-def manifest(dist, version, repository, date):
+def manifest(dist, version, repository, date, keyed=False):
+    """The manifest for the files in `dist`; `keyed` when the update key is committed, which
+    makes every update's signature required."""
     releases = f"https://github.com/{repository}/releases"
     platforms = {}
     for key, name, kind in UPDATES:
@@ -50,22 +54,25 @@ def manifest(dist, version, repository, date):
                 "signature": signature.read_text().strip(),
                 "format": kind,
             }
+        elif keyed:
+            sys.exit(f"release-files: the update key is committed, but {signature.name} or its "
+                     "update is missing; every Studio would refuse or miss this release")
     return {
         "version": version,
-        "notes": f"{releases}/tag/v{version}",
         "pub_date": date,
         "platforms": platforms,
     }
 
 
 def main():
-    if len(sys.argv) != 3:
-        sys.exit("usage: script/release-files.py <dist> <version>")
+    if len(sys.argv) != 4:
+        sys.exit("usage: script/release-files.py <dist> <version> <update-key.pub>")
     dist, version = pathlib.Path(sys.argv[1]), sys.argv[2]
+    keyed = bool(pathlib.Path(sys.argv[3]).read_text().strip())
     repository = os.environ.get("GITHUB_REPOSITORY", "ModernRelay/omnigraph-studio")
     date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     stable_copies(dist, version)
-    written = manifest(dist, version, repository, date)
+    written = manifest(dist, version, repository, date, keyed)
     (dist / "latest.json").write_text(json.dumps(written, indent=2) + "\n")
     offered = ", ".join(written["platforms"]) or "no platform"
     print(f"latest.json: {version}, an update to install for {offered}")

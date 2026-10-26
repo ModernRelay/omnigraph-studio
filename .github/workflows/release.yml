@@ -19,8 +19,11 @@ name: Release
 #   APPLE_NOTARY_ISSUER          its issuer ID
 #
 # Studio's updater installs a macOS update only when it is signed with the update key, whose
-# public half is crates/studio_update/update-key.pub. Without these the release still says
-# which version is newest (latest.json), and Studio offers the download instead:
+# public half is crates/studio_update/update-key.pub. The `sign-update` job signs it, for a tag
+# only, with these secrets of the `update-signing` environment (give that environment required
+# reviewers, so a workflow change alone cannot sign a release). While update-key.pub is empty
+# the release still says which version is newest (latest.json), and Studio offers the download
+# instead; once it holds the key, a release without a signature is refused.
 #
 #   STUDIO_UPDATER_KEY           the private key `cargo packager signer generate` writes
 #   STUDIO_UPDATER_KEY_PASSWORD  its password
@@ -30,8 +33,9 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# Only the publish job writes; the builds and the signing read.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -56,7 +60,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       SIGNED: ${{ secrets.APPLE_CERTIFICATE_P12 != '' }}
-      UPDATER_KEYED: ${{ secrets.STUDIO_UPDATER_KEY != '' }}
     steps:
       # Zed's checkout has paths past Windows's 260-character limit; git fetches it.
       - name: Long paths
@@ -157,27 +160,11 @@ jobs:
             -R="identifier \"com.modernrelay.omnigraph-studio\" and anchor apple generic and certificate leaf[subject.OU] = \"$team\"" \
             "target/bundle/Omnigraph Studio.app"
 
-      - uses: taiki-e/install-action@v2
-        if: runner.os == 'macOS' && env.UPDATER_KEYED == 'true'
-        with:
-          tool: cargo-packager@0.11.8
-
-      # Writes the .sig beside the update archive: base64 of its minisign signature.
-      - name: Sign the update
-        if: runner.os == 'macOS' && env.UPDATER_KEYED == 'true'
-        env:
-          CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.STUDIO_UPDATER_KEY }}
-          CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.STUDIO_UPDATER_KEY_PASSWORD }}
-        run: |
-          for update in target/bundle/*.app.tar.gz; do
-            cargo packager signer sign "$update"
-          done
-
       - name: Collect
         shell: bash
         run: |
           mkdir -p dist
-          cp target/bundle/*.dmg target/bundle/*.tar.gz target/bundle/*.sig target/bundle/*.zip dist/ 2>/dev/null || true
+          cp target/bundle/*.dmg target/bundle/*.tar.gz target/bundle/*.zip dist/ 2>/dev/null || true
           ls -la dist
 
       - uses: actions/upload-artifact@v4
@@ -186,11 +173,83 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  publish:
-    name: Publish
+  # Signs the macOS update with the update key, apart from the builds: only for a tag, in the
+  # `update-signing` environment, whose secrets no other job can read. Give that environment
+  # required reviewers, so a workflow change or a dispatched run alone cannot sign a release
+  # (spec 017, open question 2). The key's public half is committed; while it is empty, no
+  # release is signed and Studio offers the download instead.
+  sign-update:
+    name: Sign the update
     needs: build
     if: github.event_name == 'push'
     runs-on: ubuntu-24.04
+    environment: update-signing
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Whether the update key is published
+        id: key
+        run: |
+          if [[ -s crates/studio_update/update-key.pub ]]; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/download-artifact@v4
+        if: steps.key.outputs.published == 'true'
+        with:
+          name: macos-arm64
+          path: dist
+
+      # Built from crates.io's source with its lock file, so the signer is the published crate.
+      - name: cargo-packager
+        if: steps.key.outputs.published == 'true'
+        run: cargo install cargo-packager --version 0.11.8 --locked
+
+      # Writes the .sig beside the update archive: base64 of its minisign signature.
+      - name: Sign
+        if: steps.key.outputs.published == 'true'
+        env:
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.STUDIO_UPDATER_KEY }}
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.STUDIO_UPDATER_KEY_PASSWORD }}
+        run: |
+          if [[ -z "$CARGO_PACKAGER_SIGN_PRIVATE_KEY" ]]; then
+            echo "update-key.pub is published, but the update-signing environment has no STUDIO_UPDATER_KEY" >&2
+            exit 1
+          fi
+          shopt -s nullglob
+          updates=(dist/*.app.tar.gz)
+          if (( ${#updates[@]} != 1 )); then
+            echo "expected one macOS update archive, found ${#updates[@]}" >&2
+            exit 1
+          fi
+          cargo packager signer sign "${updates[0]}"
+
+      # Every updating Studio checks the signature against the committed key; a release signed
+      # with any other key would be downloaded and refused by every one of them.
+      - name: The signature verifies with the committed key
+        if: steps.key.outputs.published == 'true'
+        run: |
+          sudo apt-get install -y minisign
+          base64 --decode crates/studio_update/update-key.pub > "$RUNNER_TEMP/update.pub"
+          for update in dist/*.app.tar.gz; do
+            base64 --decode "$update.sig" > "$RUNNER_TEMP/update.minisig"
+            minisign -V -p "$RUNNER_TEMP/update.pub" -m "$update" -x "$RUNNER_TEMP/update.minisig"
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: steps.key.outputs.published == 'true'
+        with:
+          name: update-signature
+          path: dist/*.sig
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: [build, sign-update]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -202,7 +261,7 @@ jobs:
       # The first-install files under names without the version, which `latest/download` always
       # serves, and latest.json for Studio's updater (spec 017).
       - name: Version-free copies and the update manifest
-        run: python3 script/release-files.py dist "${GITHUB_REF_NAME#v}"
+        run: python3 script/release-files.py dist "${GITHUB_REF_NAME#v}" crates/studio_update/update-key.pub
 
       - name: Checksums
         run: |
@@ -243,7 +302,12 @@ jobs:
 
           Studio connects to an Omnigraph server of v0.14.0 or later (HTTP contract 0.14); see the README for connecting and for a sample graph. The servers of your \`omnigraph\` CLI's targets, and the agent panel, need that CLI at v0.14.0 or later.
           NOTES
-          # A full release, so `latest` names it: Studio's updater and the CLI read it there.
-          flags=(--latest)
+          # A full release, so `latest` names it: Studio's updater and the CLI read it there. A
+          # pre-release (`v0.3.0-rc.1`) is published as one, so no Studio installs it.
+          if [[ "$version" == *-* ]]; then
+            flags=(--prerelease --latest=false)
+          else
+            flags=(--latest)
+          fi
           gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
             --title "Omnigraph Studio $version" --notes-file notes.md "${flags[@]}"

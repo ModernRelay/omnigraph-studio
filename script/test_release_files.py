@@ -54,8 +54,7 @@ class ReleaseFiles(unittest.TestCase):
                                           "2026-11-02T10:00:00Z")
         self.assertEqual(manifest["version"], "0.3.0")
         self.assertEqual(manifest["pub_date"], "2026-11-02T10:00:00Z")
-        self.assertEqual(manifest["notes"],
-                         "https://github.com/ModernRelay/omnigraph-studio/releases/tag/v0.3.0")
+        self.assertNotIn("notes", manifest, "no Studio reads it")
         self.assertEqual(manifest["platforms"], {
             "macos-aarch64": {
                 "url": "https://github.com/ModernRelay/omnigraph-studio/releases/download/"
@@ -70,6 +69,15 @@ class ReleaseFiles(unittest.TestCase):
                                           "2026-11-02T10:00:00Z")
         self.assertEqual(manifest["platforms"], {})
         self.assertEqual(manifest["version"], "0.3.0", "Linux and Windows still learn of it")
+
+    def test_with_the_key_committed_a_missing_signature_stops_the_release(self):
+        with self.assertRaises(SystemExit):
+            release_files.manifest(self.dist, "0.3.0", "ModernRelay/omnigraph-studio",
+                                   "2026-11-02T10:00:00Z", keyed=True)
+        (self.dist / "Omnigraph-Studio-0.3.0-arm64.app.tar.gz.sig").write_text("c2lnbmF0dXJl")
+        manifest = release_files.manifest(self.dist, "0.3.0", "ModernRelay/omnigraph-studio",
+                                          "2026-11-02T10:00:00Z", keyed=True)
+        self.assertIn("macos-aarch64", manifest["platforms"])
 
     def test_the_manifest_studio_reads_is_this_scripts(self):
         (self.dist / "Omnigraph-Studio-0.3.0-arm64.app.tar.gz.sig").write_text("c2lnbmF0dXJl")
