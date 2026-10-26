@@ -346,9 +346,10 @@ impl Connection {
     }
 
     /// Sends through `http` from now on, as when the CLI target's proxy or certificate authority
-    /// changed: every holder of the client moves to it (the agent's gateway among them), and what
-    /// was read through the old one is read again. The registry asks the token source again too,
-    /// since the target changed.
+    /// changed: every holder of the client moves to it (the agent's gateway among them), and a
+    /// server in use is checked again through it, so one the old transport could not reach does
+    /// not wait for its next health check. The registry asks the token source again too, since
+    /// the target changed.
     pub(crate) fn replace_http(&mut self, http: Arc<dyn HttpClient>, cx: &mut Context<Self>) {
         self.http = http.clone();
         self.client.set_http(http.clone());
@@ -362,6 +363,9 @@ impl Connection {
             source.reach_through(http);
         }
         cx.emit(ConnectionEvent::CredentialChanged);
+        if self.state != ConnectionState::Idle {
+            self.connect(cx);
+        }
     }
 
     /// Stops the connection for good, as when its CLI target is gone or names a transport Studio
@@ -501,7 +505,6 @@ impl Connection {
                 let renewal = std::mem::take(&mut self.renewing)
                     && !connecting
                     && self.has_token
-                    && self.state == ConnectionState::Ready
                     && lease.is_some()
                     && lease.as_ref().map(|lease| &lease.holder) == self.holder.as_ref();
                 self.holder = lease.map(|lease| lease.holder);

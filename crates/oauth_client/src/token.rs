@@ -5,7 +5,7 @@
 //! that. Studio's check only keeps it from sending a token issued for another resource, issuer
 //! or client, or one that lives longer than the server accepts (spec 016, Checking the token).
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -33,7 +33,8 @@ pub struct Tokens {
     /// A new refresh token, which replaces the one held; `None` when the answer gave none, and
     /// the one held stands (RFC 6749 §6).
     pub refresh_token: Option<String>,
-    /// When the access token stops being accepted: its `expires_in` or its `exp`, the earlier.
+    /// When the access token stops being accepted: `expires_in` after it was given. Its `exp` is
+    /// the service's clock, not this machine's, so it does not move this.
     pub expires_at: SystemTime,
     pub account: Account,
 }
@@ -267,15 +268,12 @@ fn checked(
                 .map_or("no organization".to_owned(), shown)
         ));
     }
-    let since_epoch = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let exp = claims
-        .get("exp")
-        .and_then(Value::as_u64)
-        .ok_or("The sign-in service gave a token that does not say when it expires.")?;
-    if exp <= since_epoch {
-        return Err("The sign-in service gave a token that has expired already.".into());
+    // The server checks `exp` against its own clock. Measured against this machine's, a clock
+    // ahead would shorten every token, renewing it in a loop, or refuse the sign-in outright.
+    if claims.get("exp").and_then(Value::as_u64).is_none() {
+        return Err("The sign-in service gave a token that does not say when it expires.".into());
     }
-    let lives = Duration::from_secs(expires_in.min(exp - since_epoch));
+    let lives = Duration::from_secs(expires_in);
     Ok(Tokens {
         access_token: access_token.to_owned(),
         refresh_token: body
@@ -308,6 +306,8 @@ fn claims(token: &str) -> Option<Map<String, Value>> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::UNIX_EPOCH;
+
     use super::*;
     use serde_json::json;
 
@@ -357,11 +357,12 @@ mod tests {
         assert_eq!(tokens.refresh_token.as_deref(), Some("r2"));
         assert_eq!(tokens.expires_at, now + Duration::from_secs(300));
 
-        // `exp` sooner than `expires_in` sets the expiry.
-        let mut soon = good(secs);
-        soon["exp"] = json!(secs + 60);
-        let tokens = checked(&answer(soon, 300), expected(None), now).unwrap();
-        assert_eq!(tokens.expires_at, now + Duration::from_secs(60));
+        // This machine's clock ten minutes ahead of the service's: the token still lives its
+        // `expires_in`, and is not refused as expired.
+        let mut behind = good(secs);
+        behind["exp"] = json!(secs - 600);
+        let tokens = checked(&answer(behind, 300), expected(None), now).unwrap();
+        assert_eq!(tokens.expires_at, now + Duration::from_secs(300));
 
         let refused = |claims: Value, expires_in: u64, organization| {
             checked(&answer(claims, expires_in), expected(organization), now).unwrap_err()
@@ -382,8 +383,8 @@ mod tests {
         assert!(
             refused(good(secs), 300, Some("org_2")).contains("org_1, and this target is in org_2")
         );
-        let mut expired = good(secs);
-        expired["exp"] = json!(secs);
-        assert!(refused(expired, 300, None).contains("expired"));
+        let mut no_expiry = good(secs);
+        no_expiry.as_object_mut().unwrap().remove("exp");
+        assert!(refused(no_expiry, 300, None).contains("does not say when it expires"));
     }
 }

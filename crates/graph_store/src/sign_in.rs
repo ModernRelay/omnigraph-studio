@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 use futures::FutureExt as _;
 use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, Shared};
 use gpui::App;
 use http_client::HttpClient;
 use oauth_client::{
@@ -34,6 +34,9 @@ const REGISTERED: &[(&str, &str)] = &[];
 /// How long before an access token ends Studio asks for the next (spec 016, Limits); for a
 /// token that lives two minutes or less, halfway through its life.
 pub(crate) const REFRESH_LEAD: Duration = Duration::from_secs(60);
+
+/// The soonest a token is renewed after it was given.
+const MIN_RENEWAL: Duration = Duration::from_secs(1);
 
 /// The wait before a failed refresh is tried once more.
 const REFRESH_RETRY: Duration = Duration::from_secs(5);
@@ -323,6 +326,10 @@ struct Inner {
 struct Held {
     access: Option<Access>,
     refresh: Option<String>,
+    /// The refresh under way, which every ask joins. It runs on a task of its own to its end, so
+    /// an ask dropped mid-exchange (a connect replaced, a renewal overtaken) cannot lose the
+    /// refresh token the service has rotated by then.
+    running: Option<Shared<oneshot::Receiver<Result<(), String>>>>,
 }
 
 struct Access {
@@ -338,7 +345,8 @@ impl Access {
         Self {
             token,
             expires_at,
-            renew_at: expires_at - REFRESH_LEAD.min(lives / 2),
+            // Never sooner than a second away, so no token, however short, renews in a loop.
+            renew_at: (expires_at - REFRESH_LEAD.min(lives / 2)).max(now + MIN_RENEWAL),
         }
     }
 }
@@ -359,6 +367,7 @@ impl OAuthSource {
             Held {
                 access: Some(Access::new(tokens.access_token, tokens.expires_at)),
                 refresh: tokens.refresh_token,
+                running: None,
             },
             tokens.account,
             kept,
@@ -380,6 +389,7 @@ impl OAuthSource {
             Held {
                 access: None,
                 refresh: Some(refresh),
+                running: None,
             },
             Account {
                 subject,
@@ -480,8 +490,7 @@ impl OAuthSource {
 
 impl TokenSource for OAuthSource {
     fn token(&self, _hurry: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, String>> {
-        let inner = self.inner.clone();
-        async move { inner.token().await }.boxed()
+        Inner::token(self.inner.clone()).boxed()
     }
 
     fn note_refused(&self) {
@@ -497,17 +506,65 @@ impl Inner {
             .client_for(&self.service.server.token_endpoint)
     }
 
-    async fn token(&self) -> Result<Token, String> {
+    /// The access token held while it is fresh; otherwise the one the refresh under way gives,
+    /// starting it when none is. The refresh is not this ask's: dropped, the ask leaves it running.
+    async fn token(self: Arc<Self>) -> Result<Token, String> {
+        let running = {
+            let mut held = self.held.lock().await;
+            if self.ended.load(Ordering::SeqCst) {
+                return Err("Signed out.".into());
+            }
+            let refused = self.refused.swap(false, Ordering::SeqCst);
+            if !refused
+                && let Some(access) = &held.access
+                && SystemTime::now() < access.renew_at
+            {
+                return Ok(self.leased(access));
+            }
+            if held.refresh.is_none() {
+                held.access = None;
+                return Err("The sign-in has ended. Sign in again.".into());
+            }
+            match &held.running {
+                Some(running) => running.clone(),
+                None => {
+                    let (done, running) = oneshot::channel();
+                    let running = running.shared();
+                    held.running = Some(running.clone());
+                    let inner = self.clone();
+                    smol::spawn(async move {
+                        let refreshed = inner.refresh().await;
+                        done.send(refreshed).ok();
+                    })
+                    .detach();
+                    running
+                }
+            }
+        };
+        match running.await {
+            Ok(Ok(())) => {
+                let held = self.held.lock().await;
+                held.access
+                    .as_ref()
+                    .map(|access| self.leased(access))
+                    .ok_or_else(|| "The sign-in has ended. Sign in again.".into())
+            }
+            Ok(Err(why)) => Err(why),
+            Err(_) => Err("The sign-in's refresh stopped before it answered.".into()),
+        }
+    }
+
+    /// Refreshes the access token from the refresh token held, keeping what the service gives.
+    async fn refresh(&self) -> Result<(), String> {
         let mut held = self.held.lock().await;
+        let refreshed = self.refresh_held(&mut held).await;
+        held.running = None;
+        refreshed
+    }
+
+    async fn refresh_held(&self, held: &mut Held) -> Result<(), String> {
         if self.ended.load(Ordering::SeqCst) {
             return Err("Signed out.".into());
-        }
-        let refused = self.refused.swap(false, Ordering::SeqCst);
-        if !refused
-            && let Some(access) = &held.access
-            && SystemTime::now() < access.renew_at
-        {
-            return Ok(self.leased(access));
         }
         let Some(refresh) = held.refresh.clone() else {
             held.access = None;
@@ -544,11 +601,9 @@ impl Inner {
                         self.kept.store(kept, Ordering::SeqCst);
                         held.refresh = Some(rotated.clone());
                     }
-                    let access = Access::new(tokens.access_token, tokens.expires_at);
+                    held.access = Some(Access::new(tokens.access_token, tokens.expires_at));
                     *self.account.lock().unwrap_or_else(PoisonError::into_inner) = tokens.account;
-                    let token = self.leased(&access);
-                    held.access = Some(access);
-                    return Ok(token);
+                    return Ok(());
                 }
                 Err(TokenError::InvalidGrant(why)) => {
                     held.access = None;
@@ -631,6 +686,9 @@ mod tests {
         issuer: String,
         /// The server holds its sign-in details' answer until this is lowered.
         hold_metadata: bool,
+        /// The sign-in service holds a token answer, made already (a refresh token rotated),
+        /// until this is lowered.
+        hold_token: bool,
         /// The tokens the server refused, in order.
         refused: Vec<String>,
         /// Each request, after the name of the client it went through.
@@ -813,6 +871,11 @@ mod tests {
                 }
                 let (status, headers, page) =
                     answer(&mut served.lock().unwrap(), &method, &url, bearer, body);
+                if url.ends_with("/token") {
+                    while served.lock().unwrap().hold_token {
+                        smol::Timer::after(Duration::from_millis(10)).await;
+                    }
+                }
                 let mut response = Response::builder()
                     .status(status)
                     .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT);
@@ -1087,6 +1150,11 @@ mod tests {
             "the keychain is not read"
         );
         assert_eq!(served.lock().unwrap().issued, 1);
+        // The server is checked again through the new client, unasked.
+        let checked = format!("next {SERVER}/healthz");
+        until(cx, "the check through the new client", |_| {
+            served.lock().unwrap().requests.contains(&checked)
+        });
 
         // The token lapses: the server refuses it, and the sign-in refreshes it.
         served.lock().unwrap().accepted.clear();
@@ -1167,6 +1235,66 @@ mod tests {
         ] {
             assert!(!requests.contains(&stale), "{requests:?}");
         }
+    }
+
+    /// A refresh is not the ask's that started it: an ask dropped once the service has rotated
+    /// the refresh token (a connect replaced, a renewal overtaken) leaves the refresh to finish,
+    /// and the next ask is answered with what it gave, without asking the service again. Before,
+    /// the dropped ask took the exchange with it, the next refresh sent the rotated-away token,
+    /// and the person was signed out.
+    #[test]
+    fn a_dropped_ask_leaves_its_refresh_to_finish() {
+        let served = Arc::new(Mutex::new(Served {
+            lives: 300,
+            hold_token: true,
+            ..Served::default()
+        }));
+        served.lock().unwrap().refresh.insert("kept".into());
+        let http = fake(served.clone());
+        let clients = Clients::new(url::Url::parse(SERVER).unwrap(), http.clone(), http);
+        let identities = ClientIdentities {
+            metadata_document: Some(CLIENT.into()),
+            registered: Vec::new(),
+            development: None,
+        };
+        let metadata = format!("{SERVER}/.well-known/oauth-protected-resource/mcp");
+        let service = smol::block_on(discover(clients, metadata, identities)).unwrap();
+        let keychain = Arc::new(MemoryKeychain::default());
+        let source = OAuthSource::kept(
+            service,
+            "work",
+            keychain.clone(),
+            "user_1".into(),
+            "kept".into(),
+        );
+        let rotated = || {
+            served
+                .lock()
+                .unwrap()
+                .log
+                .iter()
+                .any(|line| line.starts_with("token refresh_token"))
+        };
+        let dropped = smol::block_on(smol::future::or(
+            async { Some(source.token(Arc::default()).await) },
+            async {
+                while !rotated() {
+                    smol::Timer::after(Duration::from_millis(10)).await;
+                }
+                None
+            },
+        ));
+        assert!(dropped.is_none(), "the ask was dropped mid-exchange");
+        served.lock().unwrap().hold_token = false;
+        let token = smol::block_on(source.token(Arc::default()));
+        assert!(token.is_ok(), "{token:?}");
+        assert_eq!(
+            served.lock().unwrap().issued,
+            1,
+            "the service was asked once"
+        );
+        let key = format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}");
+        assert_eq!(keychain.items.lock().unwrap()[&key].1, b"r1".to_vec());
     }
 
     #[gpui::test]

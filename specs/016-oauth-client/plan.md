@@ -171,6 +171,9 @@ Studio restarts; they hold no secrets.
 - The code is exchanged at the token endpoint (`grant_type=authorization_code`, `code`,
   `redirect_uri`, `client_id`, `code_verifier`, `resource`), 15 seconds, at most 64 KiB. The
   answer must have `token_type` `Bearer`, an `access_token` and an `expires_in` of 300 or less.
+  The token lives its `expires_in`. Its `exp` is the service's clock and is not compared with
+  this machine's, which would shorten every token, or refuse the sign-in, when this clock runs
+  ahead. A token is renewed no sooner than a second after it was given.
 - **Checking the token.** Studio reads the access token's JWT claims without verifying its
   signature (the server does that, with the same claims) and refuses to use it unless `aud` is
   one string equal to the resource, `iss` the issuer and `client_id` Studio's own. `sub` is the
@@ -209,7 +212,9 @@ Studio restarts; they hold no secrets.
   way finishes and is kept. Reading a second sign-in from the keychain then would race that
   refresh for the refresh token it rotates.
 - One refresh runs at a time per target (its client, issuer, resource and account), for
-  every view and window; others wait for its answer. These tokens are never mixed with a static token or the
+  every view and window; others wait for its answer. A refresh runs on a task of its own to its
+  end: an ask dropped mid-exchange (a connect replaced, a renewal overtaken) does not take it
+  along, so a refresh token the service has rotated is never lost. These tokens are never mixed with a static token or the
   CLI's credentials.
 - Every refresh sends `grant_type=refresh_token`, `refresh_token`, `client_id` and `resource`;
   without the resource an authorization server may issue a token for a default audience. The
@@ -337,6 +342,8 @@ Studio restarts; they hold no secrets.
 | 2026-10-26 | The protocol rules hold | `oauth_client` tests (RFC 7636 vector, discovery refusals, callback state and `iss`, token claims), `graph_store` `sign_in` tests (browser sign-in, keychain custody, rotation, quiet renewal, `invalid_grant`, one refresh after a refusal, no sign-in over a CLI credential) | Pass; a refreshed token applied as a quiet renewal after a 401 was never sent, found by the bed and fixed with a test that fails without the fix |
 
 | 2026-10-26 | Three review findings on ModernRelay/omnigraph-studio#12 (Cursor Bugbot) hold | `graph_store` `sign_in` tests, each extended to fail without its fix: `a_sign_in_the_service_ended_or_the_server_does_not_admit_is_said` (a watched server with two-second tokens refreshed again after Not admitted), `a_server_that_offers_sign_in_is_signed_in_through_the_browser` (a second account whose grant gives no refresh token left the first account's in the keychain, unrevoked), `a_new_transport_keeps_the_sign_in_through_it` (after `replace_http`, nothing read the sign-in again until a probe; then a second finding, that reading it again from the keychain raced a refresh under way) | Fixed: a 401 cancels the renewal and a renewal runs only while ready; the replaced sign-in is revoked and the keychain item replaced or deleted; `replace_http` keeps the sign-in and points its requests to the server at the new client (`OAuthSource::reach_through`, `Clients::through`), reading nothing from the keychain |
+
+| 2026-10-26 | A second review of #12 (the session sharing the checkout, read-only) | `graph_store` `a_dropped_ask_leaves_its_refresh_to_finish` (the service holds its answer after rotating the refresh token; the ask is dropped there; the next ask is answered without asking again), `a_new_transport_keeps_the_sign_in_through_it` (extended: the server is checked again through the new client unasked); `oauth_client` token test (a clock ten minutes ahead keeps `expires_in`) | Fixed: refreshes run on their own task and asks join them; a renewal is quiet by its flag and holder, not only when the server is ready; the lifetime is `expires_in` alone, renewed no sooner than a second; a transport change checks a server in use again. Not taken here, as older than this PR: a token source's temporary failure dropping a working token, one failed health check showing Unreachable for two minutes, the CLI's stdin write without a timeout |
 
 ## Corrections
 
