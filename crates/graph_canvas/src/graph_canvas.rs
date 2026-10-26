@@ -599,7 +599,7 @@ impl GraphCanvas {
     fn explore_scene(&self, cx: &App) -> Option<Scene> {
         self.session.read(cx).schema_model()?;
         let exploration = self.exploration.read(cx);
-        let entries = exploration.entries(cx);
+        let entries = exploration.entries();
         Some(model::explore_scene(
             &entries,
             exploration.state(),
@@ -1091,7 +1091,7 @@ impl GraphCanvas {
     /// as one change.
     fn close_all(&mut self, ids: &[SceneId], cx: &mut Context<Self>) {
         let exploration = self.exploration.read(cx);
-        let entries = exploration.entries(cx);
+        let entries = exploration.entries();
         let paths = model::open_paths(&entries, exploration.state(), ids);
         self.exploration
             .update(cx, |e, cx| e.set_open(&paths, false, cx));
@@ -1114,7 +1114,7 @@ impl GraphCanvas {
             // A grouped relationship is read a value at a time (spec 005), and its hub draws
             // the neighbours of the values open: more are those of an open value with more to
             // read, else those of the next value not open.
-            let entries = exploration.entries(cx);
+            let entries = exploration.entries();
             let values: Vec<(&GroupKey, &ExplorePath, bool)> = entries
                 .iter()
                 .filter_map(|entry| match &entry.kind {
@@ -1537,7 +1537,7 @@ impl GraphCanvas {
         let exploring = self.mode() == Mode::Explore;
         // The schema the rows shown were read under, which can be older than the session's
         // until Refresh, so the grouping choices match the rows.
-        let schema = self.exploration.read(cx).schema(cx);
+        let schema = self.exploration.read(cx).schema();
         let grouping = match &node.kind {
             SceneKind::Hub { key, .. } => self.exploration.read(cx).grouping(&key.group).cloned(),
             _ => None,
@@ -2441,6 +2441,11 @@ fn to_world(screen: Point<Pixels>, viewport: Bounds<Pixels>, center: Vec2, zoom:
 
 impl Render for GraphCanvas {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // What the session's events left to read is read once the walk is drawn.
+        if self.draws_exploration() && self.exploration.read(cx).owes_reads() {
+            let exploration = self.exploration.clone();
+            cx.defer(move |cx| exploration.update(cx, |e, cx| e.read_owed(cx)));
+        }
         let schema = self.session.read(cx).schema.clone();
         let body = match schema {
             Loadable::NotLoaded | Loadable::Loading => {

@@ -457,6 +457,24 @@ impl ExploreState {
         }
     }
 
+    /// Whether `path` is the path of `key`'s group, or of its value: [`Self::group_key`] without
+    /// making the key.
+    fn is_group_path(&self, root: &NodeRef, path: &ExplorePath, key: &GroupKey) -> bool {
+        let Some((group, value)) = path.group_step() else {
+            return false;
+        };
+        if *group != key.group || *path.node(root) != key.node {
+            return false;
+        }
+        match (value, &key.within) {
+            (None, None) => true,
+            (Some(value), Some(within)) => {
+                within.value == *value && self.grouping.get(group) == Some(&within.by)
+            }
+            _ => false,
+        }
+    }
+
     /// Groups a relationship's neighbours by a property wherever it appears, or stops; values
     /// opened under the old grouping close.
     pub fn set_grouping(&mut self, group: &RelationshipGroup, by: Option<GroupBy>) {
@@ -745,6 +763,24 @@ impl ExploreState {
             if !group_expanded {
                 continue;
             }
+            // Opened before its count is in (Expand All opens every relationship of a node):
+            // its first page, or its values, wait for the count, so a relationship with none
+            // reads nothing more. What was read ahead for it is shown.
+            let held = match self.grouping.get(group) {
+                Some(by) => self.values.contains_key(&(key.clone(), by.clone())),
+                None => self.neighbours.contains_key(&key),
+            };
+            if matches!(count, Loadable::NotLoaded | Loadable::Loading) && !held {
+                out.push(Entry {
+                    path: group_path,
+                    depth: depth + 2,
+                    parent: Some(group_index),
+                    kind: EntryKind::Loading {
+                        target: LoadTarget::Count(key),
+                    },
+                });
+                continue;
+            }
             match self.grouping.get(group) {
                 Some(by) => self.push_values(
                     schema,
@@ -943,7 +979,7 @@ impl ExploreState {
         let group_open = |key: &GroupKey| {
             self.expanded
                 .iter()
-                .any(|path| self.group_key(path).as_ref() == Some(key))
+                .any(|path| self.is_group_path(root, path, key))
         };
         match target {
             LoadTarget::Root => true,
@@ -1275,6 +1311,11 @@ pub struct Exploration {
     /// A look for what is missing is due at the end of this turn: many answers come in one
     /// turn (a node's counts), and each look walks the whole tree.
     missing_due: bool,
+    /// A look for what is missing that the session's events asked for (another branch,
+    /// schema or token), owed until a view that draws the exploration is drawn
+    /// ([`Self::read_owed`]): a hidden tree, a results canvas or a background tab reads nothing
+    /// for it.
+    owed: bool,
     _subscription: Subscription,
 }
 
@@ -1322,23 +1363,30 @@ impl Exploration {
                     }
                     // Another text: what was read under the old one is read again under it,
                     // at the head, as Refresh reads it.
-                    (Some(was), Some(now)) if was.source != now.source => this.refresh(cx),
+                    (Some(was), Some(now)) if was.source != now.source => {
+                        this.forget_at_head(cx);
+                        this.owed = true;
+                    }
                     _ => {
                         this.schema = now;
-                        this.request_missing(cx);
+                        this.owe(cx);
                     }
                 }
             }
             // Another writer changed the schema: what is shown stays, under the schema it was
             // read under, until Refresh. Nothing read at a commit yet is read under the new.
-            SessionEvent::SchemaMoved if this.pin.is_none() => this.refresh(cx),
+            SessionEvent::SchemaMoved if this.pin.is_none() => {
+                this.forget_at_head(cx);
+                this.owed = true;
+            }
             SessionEvent::SchemaMoved if !this.newer_available => {
                 this.newer_available = true;
                 this.changed(cx);
             }
             SessionEvent::BranchChanged => {
                 if let Some(root) = this.state.root.clone() {
-                    this.root_at(root, cx);
+                    this.start_over_at(root, cx);
+                    this.owed = true;
                 }
             }
             // A new token may see less than the old one did: nothing it read stays shown, and
@@ -1369,6 +1417,7 @@ impl Exploration {
             scope,
             awaiting_changes: false,
             missing_due: false,
+            owed: false,
             _subscription: subscription,
         }
     }
@@ -1416,7 +1465,7 @@ impl Exploration {
 
     /// The schema what is shown was read under, which may be older than the session's until
     /// Refresh ([`Self::newer_available`]).
-    pub fn schema(&self, _cx: &App) -> Option<Arc<SchemaModel>> {
+    pub fn schema(&self) -> Option<Arc<SchemaModel>> {
         self.schema.clone()
     }
 
@@ -1438,7 +1487,7 @@ impl Exploration {
     /// The exploration flattened in tree order under the schema it was read under
     /// ([`Self::schema`]); empty until the schema loads. Made once per change to it, whoever
     /// asks.
-    pub fn entries(&self, _cx: &App) -> Arc<Vec<Entry>> {
+    pub fn entries(&self) -> Arc<Vec<Entry>> {
         match &self.schema {
             Some(schema) => self.state.entries(schema),
             None => Arc::default(),
@@ -1447,11 +1496,17 @@ impl Exploration {
 
     /// Starts a new exploration at `node`, at the branch head.
     pub fn root_at(&mut self, node: NodeRef, cx: &mut Context<Self>) {
+        self.start_over_at(node, cx);
+        self.request_missing(cx);
+    }
+
+    /// [`Self::root_at`] without reading: what it reads is missing, and the views hear the
+    /// change.
+    fn start_over_at(&mut self, node: NodeRef, cx: &mut Context<Self>) {
         self.reset_reads(cx);
         let grouping = std::mem::take(&mut self.state.grouping);
         *self.state = ExploreState::rooted(node);
         self.state.grouping = grouping;
-        self.request_missing(cx);
         self.changed(cx);
         cx.emit(ExplorationEvent::SelectionChanged);
     }
@@ -1460,7 +1515,7 @@ impl Exploration {
     /// was visible.
     pub fn reveal(&mut self, node: NodeRef, cx: &mut Context<Self>) -> bool {
         let path = self
-            .schema(cx)
+            .schema()
             .and_then(|schema| path_in(&self.state.entries(&schema), &node));
         let shown = path.is_some();
         match path {
@@ -1549,7 +1604,7 @@ impl Exploration {
     }
 
     pub fn expand_all(&mut self, path: &ExplorePath, cx: &mut Context<Self>) {
-        if let Some(schema) = self.schema(cx) {
+        if let Some(schema) = self.schema() {
             self.state.expand_all(&schema, path);
             self.request_missing(cx);
             self.changed(cx);
@@ -1589,7 +1644,8 @@ impl Exploration {
 
     pub fn select(&mut self, path: Option<ExplorePath>, cx: &mut Context<Self>) {
         if self.state.selection != path {
-            self.state.selection = path;
+            // The rows do not show the selection: the flattening stays.
+            self.state.unseen().selection = path;
             cx.emit(ExplorationEvent::SelectionChanged);
             cx.notify();
         }
@@ -1614,16 +1670,32 @@ impl Exploration {
             self.state.searches.insert(key.clone(), text.to_owned());
         }
         self.state.neighbours.remove(key);
-        self.start(LoadTarget::Page(key.clone()), cx);
+        // The old search's page, if still out, would land under the new one.
+        let target = LoadTarget::Page(key.clone());
+        self.tasks.remove(&target);
+        // A group that is not open reads its first page when it opens, as missing.
+        if self
+            .schema
+            .as_ref()
+            .is_none_or(|schema| self.state.shows(schema, &target))
+        {
+            self.start(target, cx);
+        }
         self.changed(cx);
     }
 
-    /// Ends every group search, reading those groups' first pages again.
+    /// Ends every group search. Those groups' first pages are read again when a view that
+    /// draws the exploration is next drawn ([`Self::read_owed`]): the tree ends them on leaving
+    /// a graph, which then is not drawn.
     pub fn clear_searches(&mut self, cx: &mut Context<Self>) {
-        let keys: Vec<GroupKey> = self.state.searches.keys().cloned().collect();
-        for key in keys {
-            self.search_group(&key, "", cx);
+        if self.state.searches.is_empty() {
+            return;
         }
+        for (key, _) in std::mem::take(&mut self.state.searches) {
+            self.state.neighbours.remove(&key);
+            self.tasks.remove(&LoadTarget::Page(key));
+        }
+        self.owe(cx);
     }
 
     /// Reads ahead what opening `path` will show, without opening it, so it opens at once
@@ -1635,7 +1707,7 @@ impl Exploration {
         if self.pin.is_none() {
             return;
         }
-        let Some(schema) = self.schema(cx) else {
+        let Some(schema) = self.schema() else {
             return;
         };
         if self.ahead.as_ref().is_some_and(|(ahead, _)| ahead == path) {
@@ -1744,23 +1816,49 @@ impl Exploration {
     /// Drops the pin and everything read, and reads what is visible again at the branch head,
     /// under the schema the session reads under now.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.forget_at_head(cx);
+        self.request_missing(cx);
+    }
+
+    /// [`Self::refresh`] without reading: what it reads is missing, and the views hear the
+    /// change.
+    fn forget_at_head(&mut self, cx: &mut Context<Self>) {
         self.reset_reads(cx);
         self.state.clear_loaded();
-        self.request_missing(cx);
         self.changed(cx);
     }
 
-    /// Lets go of everything read and reads what is shown again at the same commit, with every
-    /// path left open or closed as it was: the schema names some type's nodes otherwise, or the
-    /// token changed. Reads still out are dropped, and their answers land nowhere.
+    /// Lets go of everything read, to read what is shown again at the same commit with every
+    /// path left open or closed as it was, once a view that draws it is drawn: the schema names
+    /// some type's nodes otherwise, or the token changed. Reads still out are dropped, and
+    /// their answers land nowhere.
     fn read_again(&mut self, cx: &mut Context<Self>) {
         self.generation += 1;
         self.tasks.clear();
         self.ahead = None;
         self.prune_at = KEPT_READS;
         self.state.clear_loaded();
-        self.request_missing(cx);
+        self.owe(cx);
+    }
+
+    /// Owes a look for what is missing, and says the exploration changed: a view that draws
+    /// it reads what it owes when drawn ([`Self::read_owed`]).
+    fn owe(&mut self, cx: &mut Context<Self>) {
+        self.owed = true;
         self.changed(cx);
+    }
+
+    /// Whether a look for what is missing waits for a view that draws the exploration.
+    pub fn owes_reads(&self) -> bool {
+        self.owed
+    }
+
+    /// Reads what the session's events left missing ([`Self::owes_reads`]): called by a view
+    /// that draws the exploration, when it is drawn.
+    pub fn read_owed(&mut self, cx: &mut Context<Self>) {
+        if self.owed {
+            self.request_missing(cx);
+        }
     }
 
     /// Drops the pin: what is read next is read at the branch head, under the session's schema.
@@ -1786,7 +1884,9 @@ impl Exploration {
     }
 
     fn request_missing(&mut self, cx: &mut Context<Self>) {
-        let Some(schema) = self.schema(cx) else {
+        // A look reads everything missing, what is owed included.
+        self.owed = false;
+        let Some(schema) = self.schema() else {
             return;
         };
         // Until the first read returns its commit, nothing else is read, so every read of the
@@ -1825,7 +1925,7 @@ impl Exploration {
         {
             return;
         }
-        let Some(schema) = self.schema(cx) else {
+        let Some(schema) = self.schema() else {
             return;
         };
         if target == LoadTarget::Root && self.state.root.is_none() {
@@ -1869,7 +1969,7 @@ impl Exploration {
                         cx,
                     )
                 });
-                self.spawn_count(target.clone(), count, snapshot, cx);
+                self.spawn_count(key.clone(), count, snapshot, cx);
                 return;
             }
             LoadTarget::Page(key) => {
@@ -1928,13 +2028,9 @@ impl Exploration {
             }
         };
         match query {
-            Ok(query) => self.spawn_read(target, query, cx),
+            Ok(query) => self.spawn_read_with(target, query, None, cx),
             Err(error) => self.apply_failure(&target, error.to_string()),
         }
-    }
-
-    fn spawn_read(&mut self, target: LoadTarget, query: BuiltQuery, cx: &mut Context<Self>) {
-        self.spawn_read_with(target, query, None, cx);
     }
 
     /// Reads `query`, and then `without` at the same commit: the count of a relationship
@@ -2048,12 +2144,13 @@ impl Exploration {
     /// the pin that names another commit is a failure.
     fn spawn_count(
         &mut self,
-        target: LoadTarget,
+        group: GroupKey,
         count: Task<Result<(u64, Option<String>), String>>,
         sent_at: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let generation = self.generation;
+        let target = LoadTarget::Count(group.clone());
         let key = target.clone();
         let ticket = self.next_ticket();
         let task = cx.spawn(async move |this, cx| {
@@ -2064,16 +2161,15 @@ impl Exploration {
                 }
                 this.finished(&key, ticket);
                 let unpinned = this.pin.is_none();
-                match (&key, count) {
-                    (LoadTarget::Count(group), Ok((count, commit))) => {
+                match count {
+                    Ok((count, commit)) => {
                         match this.pinned_at(&key, commit.as_deref(), sent_at.as_deref(), cx) {
-                            Pinned::Taken => this.state_for(&key).apply_count(group.clone(), count),
+                            Pinned::Taken => this.state_for(&key).apply_count(group, count),
                             Pinned::Again => return,
                             Pinned::Elsewhere(message) => this.apply_failure(&key, message),
                         }
                     }
-                    (_, Ok(_)) => {}
-                    (_, Err(message)) => this.apply_failure(&key, message),
+                    Err(message) => this.apply_failure(&key, message),
                 }
                 this.loaded(&key, cx);
                 // A count that pinned the exploration: a head seen move meanwhile is compared
@@ -2130,7 +2226,7 @@ impl Exploration {
     fn loaded(&mut self, key: &LoadTarget, cx: &mut Context<Self>) {
         self.bound_reads();
         let shows = self
-            .schema(cx)
+            .schema()
             .is_some_and(|schema| self.state.shows(&schema, key));
         if !shows {
             return;
@@ -2751,6 +2847,27 @@ mod tests {
         state.expand_all(&schema, &ExplorePath::root());
         // Every group but the field.
         assert_eq!(state.expanded.len(), 1 + 4);
+        // Opened before their counts are in, the groups read only their counts: a page waits for
+        // its count, and a relationship with none reads nothing more.
+        let pages = |state: &ExploreState| {
+            state
+                .missing_loads(&schema)
+                .into_iter()
+                .filter(|target| match target {
+                    LoadTarget::Page(key) => !is_field(&schema, &key.group),
+                    LoadTarget::Values(..) => true,
+                    _ => false,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pages(&state), Vec::new());
+        let works = group(&schema, "Person", "WorksAt", Direction::Outgoing);
+        state.apply_count(GroupKey::new(person("ada"), knows.clone()), 2);
+        state.apply_count(GroupKey::new(person("ada"), works), 0);
+        assert_eq!(
+            pages(&state),
+            vec![LoadTarget::Page(GroupKey::new(person("ada"), knows))]
+        );
     }
 
     #[test]
@@ -2945,7 +3062,6 @@ mod tests {
         // A count is held to the pin as every other answer is: read at the head before the pin
         // and answered at another commit, it is read again at the pin; read at the pin and
         // naming another commit, it fails. Neither shows the other commit's count.
-        let count = LoadTarget::Count(key.clone());
         let counted = |cx: &mut gpui::TestAppContext| {
             exploration.read_with(cx, |exploration, _| {
                 exploration.state().counts.get(&key).cloned()
@@ -2953,7 +3069,7 @@ mod tests {
         };
         let at_c3 = || Task::ready(Ok((9, Some("c3".to_owned()))));
         exploration.update(cx, |exploration, cx| {
-            exploration.spawn_count(count.clone(), at_c3(), None, cx)
+            exploration.spawn_count(key.clone(), at_c3(), None, cx)
         });
         cx.run_until_parked();
         assert_eq!(
@@ -2963,7 +3079,7 @@ mod tests {
         );
         assert!(taken().iter().all(|(_, at)| at.as_deref() == Some("c2")));
         exploration.update(cx, |exploration, cx| {
-            exploration.spawn_count(count.clone(), at_c3(), Some("c2".into()), cx)
+            exploration.spawn_count(key.clone(), at_c3(), Some("c2".into()), cx)
         });
         cx.run_until_parked();
         assert!(matches!(counted(cx), Some(Loadable::Failed(_))));
@@ -2971,7 +3087,7 @@ mod tests {
         // read after it is held to.
         exploration.update(cx, |exploration, cx| {
             exploration.pin = None;
-            exploration.spawn_count(count.clone(), at_c3(), None, cx)
+            exploration.spawn_count(key.clone(), at_c3(), None, cx)
         });
         cx.run_until_parked();
         let pin = exploration.read_with(cx, |exploration, _| exploration.pin().map(str::to_owned));
@@ -3081,8 +3197,8 @@ mod tests {
         exploration.update(cx, |exploration, cx| exploration.root_at(person("p1"), cx));
         cx.run_until_parked();
         let shown = |cx: &mut gpui::TestAppContext| {
-            exploration.read_with(cx, |exploration, cx| {
-                let groups = kinds(&exploration.entries(cx))
+            exploration.read_with(cx, |exploration, _| {
+                let groups = kinds(&exploration.entries())
                     .into_iter()
                     .filter(|row| row.trim_start().starts_with("group"))
                     .collect::<Vec<_>>();
@@ -3180,10 +3296,9 @@ mod tests {
             "a commit the pin never was at"
         );
 
-        let count = LoadTarget::Count(key.clone());
         exploration.update(cx, |exploration, cx| {
             let answer = Task::ready(Ok((5, Some("c1".to_owned()))));
-            exploration.spawn_count(count, answer, Some("c1".into()), cx)
+            exploration.spawn_count(key.clone(), answer, Some("c1".into()), cx)
         });
         cx.run_until_parked();
         let counted = exploration.read_with(cx, |exploration, _| {
@@ -3284,6 +3399,11 @@ mod tests {
         assert_eq!(label, None, "the old token's label is gone at once");
         assert!(!matches!(status, Loadable::Loaded(())));
         cx.run_until_parked();
+        // Read again once a view that draws the exploration is drawn, not before.
+        assert!(sent.lock().unwrap().is_empty());
+        assert!(exploration.read_with(cx, |exploration, _| exploration.owes_reads()));
+        exploration.update(cx, |exploration, cx| exploration.read_owed(cx));
+        cx.run_until_parked();
         // At the pin, which is the head: sent as a read of the branch whose commit is checked.
         let again: Vec<String> = std::mem::take(&mut *sent.lock().unwrap())
             .into_iter()
@@ -3356,7 +3476,7 @@ mod tests {
         let exploration = cx.update(|cx| Exploration::for_session(&session, cx));
         exploration.update(cx, |exploration, cx| exploration.root_at(person("p1"), cx));
         cx.run_until_parked();
-        let schema = exploration.read_with(cx, |exploration, cx| exploration.schema(cx).unwrap());
+        let schema = exploration.read_with(cx, |exploration, _| exploration.schema().unwrap());
         let e0 = group(&schema, "Person", "E0", Direction::Outgoing);
         let under_e0 = |id: &str| ExplorePath::root().child_group(&e0).child_node(&person(id));
         let ahead_of = |exploration: &Exploration, id: &str| {
@@ -3399,7 +3519,7 @@ mod tests {
 
         // Answered, they stay; finished reads let go of their tasks; and the answers, for a row
         // that is closed, leave the flattening as it was made.
-        let made = exploration.read_with(cx, |exploration, cx| exploration.entries(cx));
+        let made = exploration.read_with(cx, |exploration, _| exploration.entries());
         exploration.update(cx, |exploration, cx| {
             exploration.prefetch(&under_e0("p3"), cx)
         });
@@ -3411,7 +3531,7 @@ mod tests {
             );
             assert!(exploration.tasks.is_empty(), "finished reads let go");
             assert!(
-                Arc::ptr_eq(&made, &exploration.entries(cx)),
+                Arc::ptr_eq(&made, &exploration.entries()),
                 "a closed row's answers leave the flattening as made"
             );
             exploration.end_prefetch(&under_e0("p3"), cx);
@@ -3557,12 +3677,18 @@ mod tests {
         session.update(cx, |session, cx| session.set_shown(true, cx));
         cx.run_until_parked();
         assert_eq!(heard(), 1);
-        assert!(
+        let read_node = |asked: &Arc<std::sync::Mutex<Vec<String>>>| {
             asked
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|name| name == "studio_node"),
+                .any(|name| name == "studio_node")
+        };
+        assert!(!read_node(&asked), "nothing read until the tree is drawn");
+        exploration.update(cx, |exploration, cx| exploration.read_owed(cx));
+        cx.run_until_parked();
+        assert!(
+            read_node(&asked),
             "read again under the new names: {:?}",
             asked.lock()
         );

@@ -64,6 +64,9 @@ pub struct StorageInspector {
     read_at: Option<String>,
     /// The branch moved since the snapshot shown was asked for.
     newer: bool,
+    /// Everything is read again when the inspector is next drawn ([`Self::read_owed`]): a tab
+    /// restored behind another, or one that heard of a new token while hidden, reads when shown.
+    owes_reload: bool,
     _task: Option<Task<()>>,
     _snapshot_task: Option<Task<()>>,
     _subscription: Subscription,
@@ -126,7 +129,7 @@ impl StorageInspector {
             SessionEvent::CountsChanged if this.awaiting_counts => this.take_session_snapshot(cx),
             // A new token may see less than the one the server's state was read with: none of
             // that shows while it is read again under the new one.
-            SessionEvent::CredentialChanged => this.reload(cx),
+            SessionEvent::CredentialChanged => this.owe_reload(cx),
             // A commit, Studio's or another writer's, moves the tables' versions and rows: the
             // storage shown stays, and the tab offers the newer.
             SessionEvent::HeadMoved { branch, head } if *branch == this.branch => {
@@ -146,16 +149,39 @@ impl StorageInspector {
             awaiting_counts: false,
             read_at: None,
             newer: false,
+            owes_reload: false,
             _task: None,
             _snapshot_task: None,
             _subscription: subscription,
         };
-        view.reload(cx);
+        view.owe_reload(cx);
         view
+    }
+
+    /// Reads everything again when the inspector is next drawn, showing none of what was read
+    /// meanwhile; reads still out land nowhere.
+    fn owe_reload(&mut self, cx: &mut Context<Self>) {
+        self.health = Loadable::Loading;
+        self.readiness = Loadable::Loading;
+        self.graphs = Loadable::Loading;
+        self.snapshot = Loadable::Loading;
+        self.awaiting_counts = false;
+        self._task = None;
+        self._snapshot_task = None;
+        self.owes_reload = true;
+        cx.notify();
+    }
+
+    /// Reads what the inspector owes ([`Self::owe_reload`]): called when it is drawn.
+    pub fn read_owed(&mut self, cx: &mut Context<Self>) {
+        if self.owes_reload {
+            self.reload(cx);
+        }
     }
 
     /// Reads everything again, at the session's current branch.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.owes_reload = false;
         self.branch = self.session.read(cx).branch.clone();
         let branch = self.branch.clone();
         self.health = Loadable::Loading;
@@ -664,7 +690,10 @@ fn section(title: &str, error: Option<String>, rows: Vec<AnyElement>, cx: &App) 
 }
 
 impl Render for StorageInspector {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.owes_reload {
+            cx.defer_in(window, |this, _, cx| this.read_owed(cx));
+        }
         let graph_id = self.session.read(cx).graph_id.clone();
         let loading = self.snapshot.is_loading();
         let server = self.render_server(cx);
@@ -774,6 +803,13 @@ mod tests {
         cx.run_until_parked();
         let inspector = cx.new(|cx| StorageInspector::new(session.clone(), cx));
         cx.run_until_parked();
+        // Nothing is read until the inspector is drawn.
+        assert_eq!(
+            inspector.read_with(cx, |inspector, _| inspector.snapshot_reads),
+            0
+        );
+        inspector.update(cx, |inspector, cx| inspector.read_owed(cx));
+        cx.run_until_parked();
         let state = |cx: &mut TestAppContext| {
             inspector.read_with(cx, |inspector, cx| {
                 (
@@ -831,6 +867,7 @@ mod tests {
         );
         cx.run_until_parked();
         let inspector = cx.new(|cx| StorageInspector::new(session.clone(), cx));
+        inspector.update(cx, |inspector, cx| inspector.read_owed(cx));
         cx.run_until_parked();
         let reads = |cx: &mut TestAppContext| {
             inspector.read_with(cx, |inspector, _| inspector.snapshot_reads)
@@ -847,6 +884,9 @@ mod tests {
             );
             assert!(inspector.snapshot.is_loading());
         });
+        cx.run_until_parked();
+        assert_eq!(reads(cx), 1, "read again only once drawn");
+        inspector.update(cx, |inspector, cx| inspector.read_owed(cx));
         cx.run_until_parked();
         assert_eq!(reads(cx), 2, "read again under the new token");
         inspector.read_with(cx, |inspector, _| {

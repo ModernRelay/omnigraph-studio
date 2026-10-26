@@ -254,9 +254,13 @@ impl RelationshipTree {
         if exploration == self.exploration {
             return;
         }
-        // The filter goes with the graph shown, and so do the server searches it asked for.
+        // The filter goes with the graph shown, and so do the server searches it asked for and
+        // what was read ahead for the row the pointer rests on.
         if !self.filter.is_empty() {
             self.with_exploration(cx, |e, cx| e.clear_searches(cx));
+        }
+        if let Some((path, _)) = self.prefetch.take() {
+            self.with_exploration(cx, |e, cx| e.end_prefetch(&path, cx));
         }
         if let (Some(exploration), Some(session)) = (&exploration, &session) {
             self.kept.insert(session.entity_id(), exploration.clone());
@@ -304,7 +308,7 @@ impl RelationshipTree {
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         self.entries = match &self.exploration {
-            Some(exploration) => exploration.read(cx).entries(cx),
+            Some(exploration) => exploration.read(cx).entries(),
             None => Arc::default(),
         };
         self.any_empty = self.entries.iter().any(|entry| {
@@ -329,7 +333,7 @@ impl RelationshipTree {
                 rows::filter(
                     &self.entries,
                     exploration.state(),
-                    exploration.schema(cx).as_deref(),
+                    exploration.schema().as_deref(),
                     &self.filter,
                     self.hide_empty,
                 )
@@ -525,7 +529,9 @@ impl RelationshipTree {
 
     /// What ↵ and a double click do on a row.
     fn activate(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let entry = self.entries[self.visible[row]].clone();
+        let Some(entry) = self.visible.get(row).map(|ix| self.entries[*ix].clone()) else {
+            return;
+        };
         match entry.kind {
             EntryKind::Node { node, .. } => open_node(&node, window, cx),
             EntryKind::Field {
@@ -911,7 +917,7 @@ impl RelationshipTree {
                     .within
                     .as_ref()
                     .is_none_or(|within| within.value.is_null());
-                let schema = exploration.read(cx).schema(cx);
+                let schema = exploration.read(cx).schema();
                 let text = rows::bucket_row_text(key, state, schema.as_deref());
                 h_flex()
                     .min_w_0()
@@ -1025,6 +1031,9 @@ impl RelationshipTree {
             _ => None,
         };
 
+        // A click goes to the listeners of the frame drawn last, and the rows may have changed
+        // since: it acts on the row it was drawn for, found again by what that row is.
+        let identity = rows::row_id(entry);
         // Keyed by what the row is, not where it is: GPUI keeps an element's hover by its id, so
         // a row the pointer rests on while rows above it come or go stays the row its read
         // ahead is for, and leaving it stops that read, not another row's.
@@ -1058,6 +1067,9 @@ impl RelationshipTree {
                 d.tooltip(Tooltip::element(move |_, cx| card.render(cx)))
             })
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                let Some(row) = rows::find(&this.visible, &this.entries, &identity) else {
+                    return;
+                };
                 this.select_row(row, cx);
                 window.focus(&this.focus_handle, cx);
                 let kind = this.visible.get(row).map(|ix| &this.entries[*ix].kind);
@@ -1094,7 +1106,7 @@ impl RelationshipTree {
         cx: &App,
     ) -> Option<AnyElement> {
         let exploration = self.exploration.clone()?;
-        let schema = exploration.read(cx).schema(cx)?;
+        let schema = exploration.read(cx).schema()?;
         if !GroupBy::has_choices(&schema, group) {
             return None;
         }
@@ -1387,6 +1399,13 @@ fn open_node(node: &NodeRef, window: &mut Window, cx: &mut App) {
 
 impl Render for RelationshipTree {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // What the session's events left to read is read once the tree is drawn.
+        if let Some(exploration) = &self.exploration
+            && exploration.read(cx).owes_reads()
+        {
+            let exploration = exploration.clone();
+            cx.defer(move |cx| exploration.update(cx, |e, cx| e.read_owed(cx)));
+        }
         let mut context = KeyContext::new_with_defaults();
         context.add("Tree");
         if !self.filter.is_empty() {
@@ -1679,18 +1698,23 @@ mod tests {
     }
 
     /// ⌘R where the tree has the keyboard reads it again at the branch head, as its "Newer
-    /// data · Refresh" does, and takes the offer down.
+    /// data · Refresh" does, and takes the offer down. A new token reads it again too, once the
+    /// tree is drawn, with nothing else asking.
     #[gpui::test]
     async fn cmd_r_reads_the_tree_again(cx: &mut gpui::TestAppContext) {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         cx.update(studio_theme::init_test);
         let reads = Arc::new(AtomicUsize::new(0));
-        let counted = reads.clone();
+        let roots = Arc::new(AtomicUsize::new(0));
+        let (counted, rooted) = (reads.clone(), roots.clone());
         let (session, served) = followed_session(
             "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\n",
-            move |_| {
+            move |asked| {
                 counted.fetch_add(1, Ordering::SeqCst);
+                if asked["name"] == "studio_node" {
+                    rooted.fetch_add(1, Ordering::SeqCst);
+                }
                 serde_json::json!([{ "id": "p1", "label": "Ada", "n": 0 }])
             },
             cx,
@@ -1734,6 +1758,18 @@ mod tests {
         settle(cx);
         assert!(reads.load(Ordering::SeqCst) > before, "read again");
         assert!(!exploration.read_with(cx, |exploration, _| exploration.newer_available()));
+
+        let before = roots.load(Ordering::SeqCst);
+        let connection = session.read_with(cx, |session, _| session.connection.clone());
+        connection.update(cx, |connection, cx| {
+            connection.set_token(Some("another".into()), cx)
+        });
+        settle(cx);
+        assert!(
+            roots.load(Ordering::SeqCst) > before,
+            "the drawn tree reads its root again under the new token"
+        );
+        assert!(!exploration.read_with(cx, |exploration, _| exploration.owes_reads()));
     }
 
     /// The rows take what the tree's dock leaves below its header, not the window's height, so

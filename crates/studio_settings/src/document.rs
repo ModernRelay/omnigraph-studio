@@ -6,7 +6,7 @@
 
 use serde_json::{Map, Value};
 
-use crate::StudioSettings;
+use crate::{FieldKind, StudioSettings};
 
 /// What reading `settings.json` found.
 #[derive(Debug, Clone, PartialEq)]
@@ -27,9 +27,10 @@ enum Step {
 /// The most values the reader sets aside in one file before it gives up on the file.
 const MOST_PROBLEMS: usize = 100;
 
-/// Reads a settings document. A value that does not fit is set aside and its setting takes the
-/// default; the problem is reported with every other one. An error means the text is not a JSON
-/// object at all (its syntax), so nothing in it can be used.
+/// Reads a settings document. A value that does not fit, a number outside its setting's range
+/// among them, is set aside and its setting takes the default; the problem is reported with
+/// every other one. An error means the text is not a JSON object at all (its syntax), or that
+/// more than [`MOST_PROBLEMS`] values do not fit, so nothing in it is used.
 pub fn read(text: &str) -> Result<Reading, String> {
     read_setting_aside(text).map(|(reading, _)| reading)
 }
@@ -48,6 +49,17 @@ fn read_setting_aside(text: &str) -> Result<(Reading, Vec<Vec<Step>>), String> {
                 ignored.push(ignored_steps(&path))
             }),
         );
+        // A number outside its range reads as the type it is: it does not fit all the same.
+        let attempt = match attempt {
+            Ok(settings) => match out_of_range(&document) {
+                Some(found) => Err(found),
+                None => Ok(settings),
+            },
+            Err(error) => {
+                let failed = error_steps(error.path());
+                Err((failed, plain(&error.into_inner().to_string())))
+            }
+        };
         match attempt {
             Ok(settings) => {
                 problems.extend(ignored.into_iter().map(|steps| {
@@ -58,12 +70,10 @@ fn read_setting_aside(text: &str) -> Result<(Reading, Vec<Vec<Step>>), String> {
                 let problems = problems.into_iter().map(|(_, problem)| problem).collect();
                 return Ok((Reading { settings, problems }, aside));
             }
-            Err(error) => {
-                let failed = error_steps(error.path());
-                let Some(dropped) = drop_target(&failed) else {
-                    return Err(error.into_inner().to_string());
+            Err((failed, reason)) => {
+                let Some(dropped) = drop_target(&document, &failed) else {
+                    return Err(reason);
                 };
-                let reason = plain(&error.into_inner().to_string());
                 let in_text = in_text(&aside, &dropped);
                 let (line, at) = locate(text, &in_text);
                 problems.push((
@@ -127,18 +137,65 @@ fn parse(text: &str) -> Result<Value, String> {
 }
 
 /// What to set aside for a value that does not fit at `failed`. A list element with a part that
-/// does not fit (one saved view) is set aside alone; a list whose element is itself wrong (a
-/// number in the agent's command) is set aside whole, so no setting runs with part of its list
-/// missing. `None` when the failure is the document itself.
-fn drop_target(failed: &[Step]) -> Option<Vec<Step>> {
+/// does not fit (one saved view) is set aside alone, and so is one that is itself wrong in a
+/// list of objects (a view that is `null`): the others apply, and a later save keeps them. A
+/// list of plain values whose element is wrong (a number in the agent's command) is set aside
+/// whole, so no setting runs with part of its list missing. `None` when the failure is the
+/// document itself.
+fn drop_target(document: &Value, failed: &[Step]) -> Option<Vec<Step>> {
     match failed
         .iter()
         .position(|step| matches!(step, Step::Index(_)))
     {
         Some(index) if index + 1 < failed.len() => Some(failed[..=index].to_vec()),
+        Some(index) if index > 0 && holds_objects(document, &failed[..index]) => {
+            Some(failed[..=index].to_vec())
+        }
         Some(index) => (index > 0).then(|| failed[..index].to_vec()),
         None => (!failed.is_empty()).then(|| failed.to_vec()),
     }
+}
+
+/// The first number outside its setting's range, the shared value or a graph's own, and why.
+fn out_of_range(document: &Value) -> Option<(Vec<Step>, String)> {
+    let graphs = document.get("graphs").and_then(Value::as_object);
+    for field in crate::fields() {
+        let FieldKind::Number { min, max, .. } = field.kind else {
+            continue;
+        };
+        let own = graphs
+            .filter(|_| field.per_graph)
+            .into_iter()
+            .flat_map(Map::keys)
+            .filter_map(|graph| {
+                let key = field.path.last()?;
+                Some(vec!["graphs".to_owned(), graph.clone(), key.clone()])
+            });
+        for path in std::iter::once(field.path.clone()).chain(own) {
+            let Some(number) = value_at(document, &path).and_then(Value::as_f64) else {
+                continue;
+            };
+            if number < min || number > max {
+                let steps = path.into_iter().map(Step::Key).collect();
+                return Some((
+                    steps,
+                    format!("`{number}` is out of range, expected {min} to {max}"),
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Whether the list at `path` holds an object: its elements are records, each its own value.
+fn holds_objects(document: &Value, path: &[Step]) -> bool {
+    path.iter()
+        .try_fold(document, |value, step| match step {
+            Step::Key(key) => value.get(key.as_str()),
+            Step::Index(index) => value.get(*index),
+        })
+        .and_then(Value::as_array)
+        .is_some_and(|list| list.iter().any(Value::is_object))
 }
 
 /// A deserializer's message in the words of a settings file: a number, a whole number, a list,
@@ -691,8 +748,9 @@ mod tests {
   "ui_density": "compact",
   "theme": { "mode": "purple", "dark": "Ayu Dark" },
   "stuido": { "tree_page_size": 20 },
-  "studio": { "tree_page_size": 20, "canvas_max_nodes": -1 },
-  "agent": { "command": ["claude", 3] }
+  "studio": { "tree_page_size": 20, "canvas_max_nodes": -1, "corner_radius": 50 },
+  "agent": { "command": ["claude", 3] },
+  "graphs": { "dev/knowledge": { "tree_page_size": 100000, "canvas_max_nodes": 1000 } }
 }"#;
         let reading = read(text).unwrap();
         let settings = &reading.settings;
@@ -710,6 +768,12 @@ mod tests {
             settings.agent.command.is_empty(),
             "no command runs with part of its list"
         );
+        let graph = &settings.graphs["dev/knowledge"];
+        assert_eq!(
+            graph.tree_page_size, None,
+            "a graph's own value out of range"
+        );
+        assert_eq!(graph.canvas_max_nodes, Some(1000));
         let problems = reading.problems.join("\n");
         for expected in [
             "`ui_font_size` (line 2) was not applied: invalid type: string \"large\", expected a \
@@ -720,10 +784,15 @@ mod tests {
             "`agent.command` (line 7) was not applied: `[1]`: invalid type: integer `3`, expected \
              a string.",
             "`stuido` (line 5) is not a setting, so it does nothing.",
+            "`graphs.\"dev/knowledge\".tree_page_size` (line 8) was not applied: `100000` is out \
+             of range, expected 10 to 500.",
+            "`studio.corner_radius` (line 6) was not applied: `50` is out of range, expected 0 \
+             to 20.",
         ] {
             assert!(problems.contains(expected), "{expected}\nin\n{problems}");
         }
-        assert_eq!(reading.problems.len(), 5, "{problems}");
+        assert_eq!(reading.problems.len(), 7, "{problems}");
+        assert_eq!(settings.studio.corner_radius, defaults.studio.corner_radius);
     }
 
     #[test]
@@ -768,6 +837,34 @@ mod tests {
             "{}",
             reading.problems[0]
         );
+
+        // A view that is not an object at all is set aside alone too, and a save keeps the rest.
+        let text = r#"{"graphs": {"dev/knowledge": {
+            "views": [null, {"name": "Kept", "type": "Person"}]
+        }}}"#;
+        let names = |text: &str| -> Vec<String> {
+            read(text).unwrap().settings.graphs["dev/knowledge"]
+                .views
+                .iter()
+                .map(|v| v.name.clone())
+                .collect()
+        };
+        assert_eq!(names(text), ["Kept"]);
+        let reading = read(text).unwrap();
+        assert_eq!(reading.problems.len(), 1, "{:?}", reading.problems);
+        assert!(
+            reading.problems[0].starts_with("`graphs.\"dev/knowledge\".views[0]` (line 2)"),
+            "{}",
+            reading.problems[0]
+        );
+        let view = SavedView {
+            name: "New".into(),
+            type_name: "Person".into(),
+            ..Default::default()
+        };
+        let out = edited(text, |s| s.save_view("dev/knowledge", view));
+        assert_eq!(names(&out), ["Kept", "New"], "{out}");
+        assert!(out.contains("null"), "the view set aside stays: {out}");
     }
 
     /// A key the file sets twice is edited where it first appears while the last one applies:
