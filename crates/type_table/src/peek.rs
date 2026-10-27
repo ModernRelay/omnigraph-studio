@@ -3128,6 +3128,15 @@ impl NodePeek {
                 .is_some_and(|edge| edge.at_most_one)
     }
 
+    /// Why group `index` takes no relationship change now: one to it is out, and a second sent
+    /// meanwhile would be sent on top of a result not known yet (a second edge to the same node,
+    /// a removal of one already gone).
+    fn edge_write_refusal(&self, index: usize) -> Option<String> {
+        self.edge_writes
+            .contains(&index)
+            .then(|| "A change to this relationship is being saved".to_owned())
+    }
+
     /// "+ Add": a search over the other type, this node already the relationship's end.
     fn start_add(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self
@@ -3136,6 +3145,7 @@ impl NodePeek {
             .is_some_and(|adding| adding.index == index)
             || self.change_refusal(cx).is_some()
             || self.replace_refusal(index).is_some()
+            || self.edge_write_refusal(index).is_some()
         {
             return;
         }
@@ -3328,6 +3338,9 @@ impl NodePeek {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.edge_write_refusal(index).is_some() {
+            return;
+        }
         if self.removing.as_deref() == Some(edge_id.as_str()) {
             self.removing = None;
             self.write_edge(index, EdgeChange::Remove(edge_id), None, window, cx);
@@ -3359,6 +3372,10 @@ impl NodePeek {
         let Some(group) = self.groups.get(index).map(|group| group.group.clone()) else {
             return;
         };
+        // One change to the group at a time: a second waits for the first's result.
+        if self.edge_write_refusal(index).is_some() {
+            return;
+        }
         // Asked for before the access route refused the branch: nothing is sent, and the group
         // says why.
         if let Some(reason) = self.change_refusal(cx) {
@@ -4550,6 +4567,7 @@ impl NodePeek {
             && matches!(self.groups[index].count, Loadable::Loaded(n) if n > 0);
         let refused = self
             .change_refusal(cx)
+            .or_else(|| self.edge_write_refusal(index))
             .or_else(|| self.replace_refusal(index));
         let tooltip = if let Some(reason) = refused.clone() {
             reason
@@ -4667,6 +4685,7 @@ impl NodePeek {
                 "Remove",
             )
             .style(ButtonStyle::Tinted(ui::TintColor::Error))
+            .disabled(self.edge_write_refusal(index).is_some())
             .tooltip(Tooltip::text(format!(
                 "Remove this {edge}; both nodes stay"
             )))
@@ -4676,7 +4695,9 @@ impl NodePeek {
             }))
             .into_any_element();
         }
-        let refused = self.change_refusal(cx);
+        let refused = self
+            .change_refusal(cx)
+            .or_else(|| self.edge_write_refusal(index));
         studio_ui::ds::value_remove(SharedString::from(format!("peek-remove-{index}-{n}")))
             .disabled(refused.is_some())
             .tooltip(Tooltip::text(
@@ -6590,7 +6611,8 @@ mod tests {
     }
 
     /// A relationship is removed on the second press of its ×, as its own commit, which the
-    /// view moves to (spec 014).
+    /// view moves to (spec 014). While that write is out, the group takes no other change:
+    /// presses and an add send nothing more.
     #[gpui::test]
     async fn a_relationship_is_removed_on_the_second_press(cx: &mut TestAppContext) {
         let (view, cx) = page(session(KNOWS, cx), cx);
@@ -6601,6 +6623,11 @@ mod tests {
             assert!(view.edge_writes.is_empty(), "nothing is written yet");
             view.press_remove(0, "e1".into(), window, cx);
             assert!(view.edge_writes.contains(&0), "the second press writes");
+            view.press_remove(0, "e1".into(), window, cx);
+            view.press_remove(0, "e1".into(), window, cx);
+            assert!(view.removing.is_none(), "no press while the write is out");
+            view.start_add(0, window, cx);
+            assert!(view.adding.is_none(), "no add while the write is out");
         });
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
