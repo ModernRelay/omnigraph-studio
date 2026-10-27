@@ -2970,10 +2970,12 @@ mod tests {
                         wait.await.ok();
                     }
                     let commit = snapshot.unwrap_or_else(|| at.lock().unwrap().clone());
-                    let rows = if name == "studio_node" {
-                        json!([{ "id": "ada", "label": "Ada" }])
-                    } else {
-                        json!([])
+                    // Ada has neighbours to count, so the group searched reads its page once
+                    // its count is in.
+                    let rows = match name.as_str() {
+                        "studio_node" => json!([{ "id": "ada", "label": "Ada" }]),
+                        "studio_page_degrees" => json!([{ "id": "ada", "n": 2 }]),
+                        _ => json!([]),
                     };
                     json!({ "query_name": name, "target": { "branch": "main" }, "row_count": 0,
                         "columns": [], "rows": rows, "graph_commit_id": commit })

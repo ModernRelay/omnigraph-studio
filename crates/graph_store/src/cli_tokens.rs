@@ -1113,7 +1113,14 @@ async fn run_once(
             read(Box::new(stdout), limit),
             read(Box::new(stderr), MAX_ANSWER_BYTES),
         );
-        written.map_err(|error| error.to_string())?;
+        // A command that stopped reading its input (it exited, refused a lock) says why in its
+        // output and how it ended: those decide, not the pipe it closed.
+        written
+            .or_else(|error| match error.kind() {
+                std::io::ErrorKind::BrokenPipe => Ok(()),
+                _ => Err(error),
+            })
+            .map_err(|error| error.to_string())?;
         let (out, err) = (
             out.map_err(|error| error.to_string())?,
             err.map_err(|error| error.to_string())?,
@@ -2129,7 +2136,8 @@ exit 64
     }
 
     /// A command's input is written within its timeout: one that reads none of an input larger
-    /// than a pipe holds is stopped when its time is up, not waited on for good.
+    /// than a pipe holds is stopped when its time is up, not waited on for good, and one that
+    /// ends without reading it is judged by its own answer.
     #[test]
     fn input_a_command_does_not_read_ends_at_its_timeout() {
         let dir =
@@ -2146,6 +2154,22 @@ exit 64
             1024,
         ));
         assert!(matches!(ran, Err(Unrun::Timeout)));
+
+        // One that refuses and ends without reading it is judged by what it said.
+        let refusing = dir.join("refusing");
+        std::fs::write(&refusing, "#!/bin/sh\necho 'lock refused' >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&refusing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ran = smol::block_on(run_once(
+            std::process::Command::new(&refusing),
+            Some(&input),
+            Duration::from_secs(10),
+            1024,
+        ));
+        let Ok(ran) = ran else {
+            panic!("the command's own answer, not the broken pipe");
+        };
+        assert!(!ran.status.success());
+        assert!(String::from_utf8_lossy(&ran.stderr).contains("lock refused"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
