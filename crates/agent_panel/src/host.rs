@@ -171,12 +171,18 @@ pub enum ConnectionCommand {
 struct Routes {
     sessions: HashMap<SessionId, mpsc::UnboundedSender<HostEvent>>,
     early: HashMap<SessionId, VecDeque<SessionUpdate>>,
+    /// The sessions in `early` in the order they began keeping updates, the oldest first (and
+    /// ids since let go, skipped): a new one takes the oldest's place when they are full.
+    early_order: VecDeque<SessionId>,
     /// The tool calls that are Studio's own, by id, as their first update said: Codex asks
     /// permission for an MCP call with its id alone.
     studio_calls: HashMap<String, tools::StudioTool>,
     /// Sessions their conversation closed: an update that comes after is not kept as early,
     /// where it would take the place of a session about to open.
     closed: HashSet<SessionId>,
+    /// The sessions in `closed` in the order they closed, the oldest first (and ids since
+    /// opened again, skipped): the oldest is forgotten first.
+    closed_order: VecDeque<SessionId>,
     /// Sessions the agent is asked to close for a conversation whose panel let go of them, until
     /// it answers: a load sent before that answer runs beside the close, which can take the
     /// session from under it.
@@ -200,6 +206,14 @@ enum Claim {
 
 /// The most closed sessions remembered, so their late updates are dropped.
 const CLOSED_SESSIONS: usize = 256;
+
+/// Drops from `order` the ids `kept` no longer holds once it is past twice `bound`, so an order
+/// whose ids come and go stays bounded.
+fn compact(order: &mut VecDeque<SessionId>, bound: usize, kept: impl Fn(&SessionId) -> bool) {
+    if order.len() > 2 * bound {
+        order.retain(|id| kept(id));
+    }
+}
 /// The most of Studio's tool calls remembered for their permission requests.
 const STUDIO_CALLS: usize = 256;
 
@@ -232,14 +246,28 @@ impl Routes {
             }
             None if self.closed.contains(&session) => {}
             // Kept for a session about to be routed (a load's replay can come first), for a
-            // few sessions at a time.
-            None if self.early.contains_key(&session) || self.early.len() < EARLY_SESSIONS => {
+            // few sessions at a time: a new one takes the place of the one that began longest
+            // ago, so sessions never routed (strays) do not keep one about to open from its own.
+            None => {
+                if !self.early.contains_key(&session) {
+                    if self.early.len() >= EARLY_SESSIONS {
+                        while let Some(oldest) = self.early_order.pop_front() {
+                            if self.early.remove(&oldest).is_some() {
+                                break;
+                            }
+                        }
+                    }
+                    self.early_order.push_back(session.clone());
+                    let early = &self.early;
+                    compact(&mut self.early_order, EARLY_SESSIONS, |id| {
+                        early.contains_key(id)
+                    });
+                }
                 let early = self.early.entry(session).or_default();
                 if early.len() < EARLY_UPDATES {
                     early.push_back(update);
                 }
             }
-            None => {}
         }
     }
 
@@ -260,10 +288,20 @@ impl Routes {
             .is_some_and(|routed| routed.same_receiver(events))
         {
             self.sessions.remove(session);
-            if self.closed.len() >= CLOSED_SESSIONS {
-                self.closed.clear();
+            // The session closed longest ago is forgotten first: its late updates are over.
+            if self.closed.insert(session.clone()) {
+                self.closed_order.push_back(session.clone());
+                while self.closed.len() > CLOSED_SESSIONS {
+                    let Some(oldest) = self.closed_order.pop_front() else {
+                        break;
+                    };
+                    self.closed.remove(&oldest);
+                }
+                let closed = &self.closed;
+                compact(&mut self.closed_order, CLOSED_SESSIONS, |id| {
+                    closed.contains(id)
+                });
             }
-            self.closed.insert(session.clone());
             if closing {
                 self.closing.insert(session.clone());
             } else {
@@ -1270,6 +1308,11 @@ mod tests {
         for n in 0..EARLY_SESSIONS * 2 {
             routes.update(SessionId::new(format!("stray-{n}")), chunk("x"));
         }
+        assert!(routes.early.len() <= EARLY_SESSIONS);
+        // A session about to open keeps its updates however many strays came first: the oldest
+        // stray gives its place.
+        routes.update(SessionId::new("about-to-open"), chunk("x"));
+        assert!(routes.early.contains_key(&SessionId::new("about-to-open")));
         assert!(routes.early.len() <= EARLY_SESSIONS);
 
         // The session reopened by another conversation keeps its route when the first one
