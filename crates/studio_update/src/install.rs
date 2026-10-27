@@ -94,10 +94,11 @@ fn plist_string(plist: &str, key: &str) -> Option<String> {
 /// Hidden, and Studio's own, so cleaning up never touches another app's files.
 const STAGING_PREFIX: &str = ".omnigraph-studio-update-";
 
-/// Replaces `bundle` with the bundle in `archive`: unpacked into a folder beside it, then
-/// exchanged with it in one rename, so `bundle` holds the old app or the new one whatever
-/// happens; the old one is then deleted with that folder. Nothing outside the folder is
-/// written while unpacking, and a failure before the exchange leaves `bundle` as it was.
+/// Replaces `bundle` with the bundle in `archive`: unpacked into a folder beside it, written to
+/// the disk, then exchanged with it in one rename, which is written to the disk too, so `bundle`
+/// holds the old app or the whole new one whatever happens, a power loss included; the old one
+/// is then deleted with that folder. Nothing outside the folder is written while unpacking, and
+/// a failure before the exchange leaves `bundle` as it was.
 pub fn replace_bundle(bundle: &Path, archive: &[u8]) -> Result<()> {
     let folder = bundle
         .parent()
@@ -111,8 +112,14 @@ pub fn replace_bundle(bundle: &Path, archive: &[u8]) -> Result<()> {
     tar.unpack(staging.path())
         .context("the update could not be unpacked")?;
     let update = only_bundle(staging.path())?;
+    // Unpacking leaves the files in memory: made the bundle before they reach the disk, a
+    // power loss would leave a bundle that does not launch, with the old one deleted.
+    sync_tree(&update).context("the update could not be written to the disk")?;
     exchange(&update, bundle)
         .with_context(|| format!("Studio can't replace itself in {}", folder.display()))?;
+    if let Err(error) = std::fs::File::open(folder).and_then(|folder| folder.sync_all()) {
+        log::warn!("the bundle's exchange was not written to the disk: {error}");
+    }
     // A new modification time tells Finder and Launch Services the bundle changed.
     if let Err(error) = std::fs::File::open(bundle)
         .and_then(|bundle| bundle.set_modified(std::time::SystemTime::now()))
@@ -125,6 +132,21 @@ pub fn replace_bundle(bundle: &Path, archive: &[u8]) -> Result<()> {
         log::warn!("the old bundle was not deleted: {error}");
     }
     Ok(())
+}
+
+/// Writes every file and folder under `root` to the disk (`sync_all`, a full sync on macOS),
+/// the folders last so their entries name what is there. A link is not followed.
+fn sync_tree(root: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            sync_tree(&entry.path())?;
+        } else if kind.is_file() {
+            std::fs::File::open(entry.path())?.sync_all()?;
+        }
+    }
+    std::fs::File::open(root)?.sync_all()
 }
 
 /// The one app bundle an update unpacks to: a real directory named `*.app`, never a link.
@@ -370,6 +392,22 @@ mod tests {
         );
         assert!(!bundle.join("Contents/Old.txt").exists());
         assert_eq!(folder_names(folder.path()), ["Omnigraph Studio.app"]);
+    }
+
+    /// Every file and folder of a tree is written to the disk, a link left as it is: bundles
+    /// hold links (a framework's `Versions/Current`).
+    #[cfg(unix)]
+    #[test]
+    fn a_tree_is_written_to_the_disk_without_following_its_links() {
+        let root = tempfile::tempdir().unwrap();
+        let inner = root
+            .path()
+            .join("Contents/Frameworks/Kit.framework/Versions/A");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("Kit"), "binary").unwrap();
+        std::os::unix::fs::symlink("A", inner.parent().unwrap().join("Current")).unwrap();
+        std::os::unix::fs::symlink("/nowhere", root.path().join("dangling")).unwrap();
+        sync_tree(root.path()).unwrap();
     }
 
     #[test]
