@@ -307,6 +307,16 @@ impl Routes {
         Claim::Routed
     }
 
+    /// Waits for `session` to be free of every conversation and of a close the agent has not
+    /// answered, as its delete must; `None` when it is free now.
+    fn until_free(&mut self, session: &SessionId) -> Option<oneshot::Receiver<()>> {
+        let held = self.sessions.contains_key(session) || self.closing.contains(session);
+        match held.then(|| self.wait(session.clone())) {
+            Some(Claim::Wait(freed)) => Some(freed),
+            _ => None,
+        }
+    }
+
     /// Waits for `session` to be freed. Conversations that stopped waiting (their panel let go,
     /// or they waited too long) are dropped from the list, so restarts do not pile up in it.
     fn wait(&mut self, session: SessionId) -> Claim {
@@ -601,18 +611,23 @@ async fn connect(
                     ConnectionCommand::Delete { session, reply } => {
                         let connection_for_delete = connection.clone();
                         let can_delete = agent.delete;
+                        let routes = routes.clone();
                         connection.spawn(async move {
-                            let result = if can_delete {
+                            let session = SessionId::new(session);
+                            // A conversation that holds the session lets it go first, cancelled
+                            // and closed: deleted under it, the session would be deleted
+                            // mid-turn, then closed once gone.
+                            let result = if !can_delete {
+                                Err("The agent cannot delete its conversations.".to_owned())
+                            } else if let Err(reason) = free(&routes, &session).await {
+                                Err(reason)
+                            } else {
                                 connection_for_delete
-                                    .send_request(DeleteSessionRequest::new(SessionId::new(
-                                        session,
-                                    )))
+                                    .send_request(DeleteSessionRequest::new(session))
                                     .block_task()
                                     .await
                                     .map(|_| ())
                                     .map_err(|error| error.to_string())
-                            } else {
-                                Err("The agent cannot delete its conversations.".to_owned())
                             };
                             reply.send(result).ok();
                             Ok(())
@@ -875,6 +890,29 @@ impl NotRouted {
                 failed: false,
             })
             .ok();
+    }
+}
+
+/// Waits, at most [`FREED_WITHIN`], for `session` to be free ([`Routes::until_free`]).
+async fn free(routes: &SharedRoutes, session: &SessionId) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + FREED_WITHIN;
+    loop {
+        let freed = routes
+            .lock()
+            .ok()
+            .and_then(|mut routes| routes.until_free(session));
+        let Some(freed) = freed else {
+            return Ok(());
+        };
+        let freed = futures::FutureExt::fuse(freed);
+        let late = futures::FutureExt::fuse(smol::Timer::at(deadline));
+        futures::pin_mut!(freed, late);
+        futures::select_biased! {
+            _ = freed => {}
+            _ = late => {
+                return Err("the conversation is still open at the agent".to_owned());
+            }
+        }
     }
 }
 
@@ -1172,6 +1210,32 @@ mod tests {
             exited |= matches!(event, HostEvent::Exited { failed: true, .. });
         }
         assert!(exited, "the conversation is told the agent stopped");
+    }
+
+    /// A delete waits for the session to be free: routed to a conversation, it is freed when that
+    /// one lets go; being closed, when the agent answers the close.
+    #[test]
+    fn a_session_is_free_once_let_go_and_its_close_answered() {
+        let mut routes = Routes::default();
+        let session = SessionId::new("a");
+        assert!(routes.until_free(&session).is_none(), "nobody holds it");
+        let (tx, _rx) = mpsc::unbounded();
+        routes.add(session.clone(), tx.clone());
+        let mut freed = routes
+            .until_free(&session)
+            .expect("a conversation holds it");
+        assert!(matches!(freed.try_recv(), Ok(None)));
+        assert!(routes.remove(&session, &tx, true));
+        assert!(
+            matches!(freed.try_recv(), Ok(None)),
+            "the close is not answered yet"
+        );
+        let mut closed = routes
+            .until_free(&session)
+            .expect("the agent is closing it");
+        routes.close_answered(&session);
+        assert!(freed.try_recv().is_err() && closed.try_recv().is_err());
+        assert!(routes.until_free(&session).is_none());
     }
 
     #[test]
