@@ -839,6 +839,20 @@ impl NodePeek {
         self.groups.clear();
         self.absent.clear();
         self.groups_absent.clear();
+        // So do the Blob values shown, their previews and the reads still out: nothing of them
+        // shows, or is saved to a file, under the new read, which reads them again if the node
+        // is there. A value being saved to a file, or a file being stored, goes on.
+        self.release_images(cx);
+        self.blobs.retain(|slot| {
+            slot._save.is_some() || slot.edit.as_ref().is_some_and(BlobEdit::is_saving)
+        });
+        for slot in &mut self.blobs {
+            slot.meta = Loadable::NotLoaded;
+            slot.preview = Loadable::NotLoaded;
+            slot.head.clear();
+            slot.bytes_at = None;
+            slot._task = None;
+        }
         // What it showed is let go; what it reads now is told again, under the new schema too.
         if let Some(scope) = &self.scope {
             self.session.update(cx, |session, _| {
@@ -3547,9 +3561,26 @@ impl NodePeek {
         if self.saving_drafts || !self.edits_relationships() || self.change_refusal(cx).is_some() {
             return;
         }
-        // An open field joins the others.
+        // An open field joins the others with what it holds now. One showing a notice stays open,
+        // its reason in view, so its text is taken into its draft here: the draft would else be
+        // what an earlier leave kept, older than what the field shows.
         let open: Vec<String> = self.edits.keys().cloned().collect();
         for name in open {
+            let typed = self
+                .edits
+                .get(&name)
+                .filter(|edit| edit.notice.is_some())
+                .map(|edit| {
+                    let text = edit.editor.read(cx).text(cx);
+                    (
+                        self.asks_nothing(&name, edit, &text),
+                        edit.old.clone(),
+                        text,
+                    )
+                });
+            if let Some((false, old, text)) = typed {
+                self.put_draft(&name, old, text, cx);
+            }
             self.left_field(&name, cx);
         }
         let (PeekSubject::Node { type_name, id }, Some(schema)) =
@@ -5794,6 +5825,36 @@ mod tests {
         });
     }
 
+    /// ⌘S saves what an open field holds now, one kept open by a notice too, not the older
+    /// draft an earlier leave kept.
+    #[gpui::test]
+    async fn save_takes_what_an_open_field_with_a_notice_holds(cx: &mut TestAppContext) {
+        let session = session(PEOPLE, cx);
+        let (view, cx) = page(session.clone(), cx);
+        view.update_in(cx, |view, window, cx| {
+            let person = view.schema.as_ref().unwrap().node("Person").unwrap();
+            let property = person.property("name").unwrap().clone();
+            view.start_edit(property.clone(), window, cx);
+            let editor = view.edits["name"].editor.clone();
+            editor.update(cx, |editor, cx| editor.set_text("First", window, cx));
+            view.left_field("name", cx);
+            view.start_edit(property, window, cx);
+            let editor = view.edits["name"].editor.clone();
+            editor.update(cx, |editor, cx| editor.set_text("Second", window, cx));
+            // Refused, the field stays open with its reason.
+            view.edits.get_mut("name").unwrap().notice = Some(Notice::new(Tone::Refused, "no"));
+            view.save_drafts(&SaveNodeDrafts, window, cx)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.value_of("name"),
+                json!("Second"),
+                "what the field holds"
+            );
+        });
+    }
+
     const KNOWS: &str =
         "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\n";
 
@@ -7643,6 +7704,21 @@ mod tests {
         });
         cx.run_until_parked();
         (view, session, blobs, cx)
+    }
+
+    /// A reload lets go of the Blob values shown, as of everything read at the old commit: on a
+    /// branch where the node is not, none of the old branch's values shows or is saved.
+    #[gpui::test]
+    async fn a_reload_lets_go_of_the_blob_values_shown(cx: &mut TestAppContext) {
+        let (view, _, _, cx) = page_with_doc(Some(b"hello"), None, cx);
+        view.update(cx, |view, cx| {
+            assert!(matches!(view.blobs[0].meta, Loadable::Loaded(_)));
+            view.forget_shown(cx);
+            assert!(
+                view.blobs.is_empty(),
+                "nothing of the old commit's values stays"
+            );
+        });
     }
 
     /// Save… reads the value a slot shows where it is held, the value its size is: a file
