@@ -242,6 +242,7 @@ enum More {
 struct PendingLayout {
     generation: u64,
     scene: Scene,
+    texts: Vec<paint::ChipText>,
     widths: Vec<f32>,
     place: Box<dyn FnOnce() -> Vec<Vec2> + Send>,
 }
@@ -696,7 +697,7 @@ impl GraphCanvas {
             }
             _ => HashMap::new(),
         };
-        let widths = half_widths(&scene, &measurer(cx, &self.char_widths));
+        let (texts, widths) = chip_texts(&scene, &measurer(cx, &self.char_widths));
         let nodes: Vec<LayoutNode> = scene
             .nodes
             .iter()
@@ -723,7 +724,13 @@ impl GraphCanvas {
                 },
             })
             .collect();
-        self.lay_out(scene, widths, move || layout::explore_positions(&nodes), cx);
+        self.lay_out(
+            scene,
+            texts,
+            widths,
+            move || layout::explore_positions(&nodes),
+            cx,
+        );
     }
 
     /// Places `scene` off the main thread with `place`, and shows it unless a newer layout
@@ -732,6 +739,7 @@ impl GraphCanvas {
     fn lay_out(
         &mut self,
         scene: Scene,
+        texts: Vec<paint::ChipText>,
         widths: Vec<f32>,
         place: impl FnOnce() -> Vec<Vec2> + Send + 'static,
         cx: &mut Context<Self>,
@@ -742,6 +750,7 @@ impl GraphCanvas {
         let layout = PendingLayout {
             generation: self.layout_generation,
             scene,
+            texts,
             widths,
             place: Box::new(place),
         };
@@ -756,6 +765,7 @@ impl GraphCanvas {
         let PendingLayout {
             generation,
             scene,
+            texts,
             widths,
             place,
         } = layout;
@@ -765,7 +775,7 @@ impl GraphCanvas {
             this.update(cx, |this, cx| {
                 this.layout_task = None;
                 if this.layout_generation == generation {
-                    this.apply_layout(scene, widths, positions, cx);
+                    this.apply_layout(scene, texts, widths, positions, cx);
                 }
                 if let Some(next) = this.next_layout.take() {
                     this.start_layout(next, cx);
@@ -795,7 +805,7 @@ impl GraphCanvas {
         for (node, parent) in scene.nodes.iter_mut().zip(&parent) {
             node.parent = *parent;
         }
-        let widths = half_widths(&scene, &measurer(cx, &self.char_widths));
+        let (texts, widths) = chip_texts(&scene, &measurer(cx, &self.char_widths));
         let nodes: Vec<LayoutNode> = scene
             .nodes
             .iter()
@@ -814,12 +824,19 @@ impl GraphCanvas {
         }
         self.layout_key = Some((Mode::Results, None));
         self.layout_generation += 1;
-        self.lay_out(scene, widths, move || layout::explore_positions(&nodes), cx);
+        self.lay_out(
+            scene,
+            texts,
+            widths,
+            move || layout::explore_positions(&nodes),
+            cx,
+        );
     }
 
     fn apply_layout(
         &mut self,
         scene: Scene,
+        texts: Vec<paint::ChipText>,
         widths: Vec<f32>,
         mut positions: Vec<Vec2>,
         cx: &mut Context<Self>,
@@ -879,7 +896,7 @@ impl GraphCanvas {
             .hovered
             .and_then(|index| self.scene.nodes.get(index))
             .map(|node| node.id.clone());
-        self.texts = Arc::new(scene.nodes.iter().map(paint::chip_text).collect());
+        self.texts = Arc::new(texts);
         self.node_count = scene
             .nodes
             .iter()
@@ -2480,12 +2497,21 @@ fn measurer(cx: &App, widths: &CharWidths) -> impl Fn(&str, f32, gpui::FontWeigh
 type CharWidths = Rc<RefCell<(SharedString, HashMap<(char, u32, u32), f32>)>>;
 
 /// Half of each node's chip width at zoom 1, measured as the painter draws it.
-fn half_widths(scene: &Scene, measure: &impl Fn(&str, f32, gpui::FontWeight) -> f32) -> Vec<f32> {
+/// Each chip's text, and half its width as `measure` measures it: made once a layout, for the
+/// layout's room and for drawing the chips it places.
+fn chip_texts(
+    scene: &Scene,
+    measure: &impl Fn(&str, f32, gpui::FontWeight) -> f32,
+) -> (Vec<paint::ChipText>, Vec<f32>) {
     scene
         .nodes
         .iter()
-        .map(|node| paint::chip_width(&paint::chip_text(node), measure) / 2.)
-        .collect()
+        .map(|node| {
+            let text = paint::chip_text(node);
+            let half = paint::chip_width(&text, measure) / 2.;
+            (text, half)
+        })
+        .unzip()
 }
 
 /// How long finished reads are gathered before the canvas is laid out again: about a frame.
@@ -2829,6 +2855,11 @@ mod tests {
         (canvas, exploration, ada)
     }
 
+    /// The chips' texts of [`scene_of`]'s scene.
+    fn texts_of(names: &[&str]) -> Vec<paint::ChipText> {
+        scene_of(names).nodes.iter().map(paint::chip_text).collect()
+    }
+
     fn scene_of(names: &[&str]) -> Scene {
         Scene {
             nodes: names
@@ -2864,6 +2895,7 @@ mod tests {
         canvas.update(cx, |canvas, cx| {
             canvas.apply_layout(
                 scene_of(&["A", "B"]),
+                texts_of(&["A", "B"]),
                 vec![10.; 2],
                 vec![Vec2::default(); 2],
                 cx,
@@ -2871,6 +2903,7 @@ mod tests {
             canvas.hovered = Some(1);
             canvas.apply_layout(
                 scene_of(&["New", "A", "B"]),
+                texts_of(&["New", "A", "B"]),
                 vec![10.; 3],
                 vec![Vec2::default(); 3],
                 cx,
@@ -2890,6 +2923,7 @@ mod tests {
             });
             canvas.apply_layout(
                 scene_of(&["Z", "New", "A", "B"]),
+                texts_of(&["Z", "New", "A", "B"]),
                 vec![10.; 4],
                 vec![Vec2::default(); 4],
                 cx,
