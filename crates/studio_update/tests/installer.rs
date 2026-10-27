@@ -55,7 +55,6 @@ fn serve(body: Vec<u8>) -> String {
 fn job(url: String, bundle: std::path::PathBuf) -> Job {
     Job {
         version: Version::new(0, 3, 0),
-        running: Version::new(0, 2, 1),
         update: PlatformUpdate {
             url,
             signature: base64(SIGNATURE),

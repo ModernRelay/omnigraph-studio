@@ -7,7 +7,7 @@ mod bundle;
 pub mod install;
 pub mod manifest;
 
-pub use bundle::{BundleInstaller, MAX_UPDATE_BYTES};
+pub use bundle::BundleInstaller;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -19,7 +19,7 @@ use futures::channel::mpsc;
 use futures::future::BoxFuture;
 use futures::{AsyncReadExt as _, FutureExt as _, StreamExt as _};
 use gpui::{App, AppContext as _, Context, Entity, Global, Task};
-use http_client::{AsyncBody, HttpClient};
+use http_client::HttpClient;
 use semver::Version;
 
 use install::Blocked;
@@ -86,7 +86,6 @@ pub struct Options {
 #[derive(Debug, Clone)]
 pub struct Job {
     pub version: Version,
-    pub running: Version,
     pub update: PlatformUpdate,
     pub bundle: PathBuf,
     pub public_key: String,
@@ -96,7 +95,8 @@ pub struct Job {
 pub enum InstallError {
     /// The file is not a genuine update: never fetched again this run.
     Refused(String),
-    /// The download or install did not finish.
+    /// The download or install did not finish. Said, and not tried again this run, as a
+    /// refused one is not: the person asks again (Check for Updates).
     Failed(String),
 }
 
@@ -139,12 +139,7 @@ struct GlobalUpdater(Entity<Updater>);
 impl Global for GlobalUpdater {}
 
 impl Updater {
-    pub fn new(
-        options: Options,
-        http: Arc<dyn HttpClient>,
-        installer: Arc<dyn Installer>,
-        _cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(options: Options, http: Arc<dyn HttpClient>, installer: Arc<dyn Installer>) -> Self {
         Self {
             options,
             http,
@@ -290,7 +285,6 @@ impl Updater {
         ) {
             (Some(update), Some(bundle), Some(key)) => Job {
                 version: version.clone(),
-                running: self.options.running.clone(),
                 update: update.clone(),
                 bundle: bundle.clone(),
                 public_key: key.clone(),
@@ -545,7 +539,7 @@ fn init_with(
     installer: Arc<dyn Installer>,
     cx: &mut App,
 ) {
-    let updater = cx.new(|cx| Updater::new(options, http, installer, cx));
+    let updater = cx.new(|_| Updater::new(options, http, installer));
     cx.set_global(GlobalUpdater(updater.clone()));
     let automatic = |cx: &App| {
         cx.try_global::<studio_settings::StudioSettings>()
@@ -563,7 +557,7 @@ fn init_with(
 /// Reads the newest release's manifest through Studio's HTTP client, at most
 /// [`manifest::MAX_MANIFEST_BYTES`].
 async fn fetch(http: Arc<dyn HttpClient>, platform: String) -> Result<Release> {
-    let mut response = http.get(manifest::FEED, AsyncBody::default(), true).await?;
+    let mut response = bundle::get_over_https(&http, manifest::FEED, None).await?;
     if !response.status().is_success() {
         bail!("the release host answered {}", response.status());
     }
@@ -704,7 +698,7 @@ mod tests {
         installer: Arc<FakeInstaller>,
         cx: &mut TestAppContext,
     ) -> Entity<Updater> {
-        cx.new(|cx| Updater::new(options, http, installer, cx))
+        cx.new(|_| Updater::new(options, http, installer))
     }
 
     fn state(updater: &Entity<Updater>, cx: &mut TestAppContext) -> UpdateState {

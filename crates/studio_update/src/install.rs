@@ -11,7 +11,8 @@ use anyhow::{Context as _, Result, bail};
 /// Why Studio cannot replace its own bundle where it runs; it offers the download instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Blocked {
-    /// On a disk image or another volume (`/Volumes/…`), often read-only.
+    /// On a disk image: a read-only volume under `/Volumes` (or one whose volume cannot be
+    /// asked). A bundle on a writable drive there is replaced as any other.
     DiskImage,
     /// Run in place from Downloads: macOS moved it to a random read-only path.
     Translocated,
@@ -22,7 +23,7 @@ pub enum Blocked {
 /// Whether Studio must not install over `bundle`: checked before the download, so a bundle
 /// Studio cannot replace is offered as a download instead of being fetched in vain.
 pub fn blocked(bundle: &Path) -> Option<Blocked> {
-    if bundle.starts_with("/Volumes") {
+    if bundle.starts_with("/Volumes") && !on_writable_volume(bundle) {
         return Some(Blocked::DiskImage);
     }
     if bundle
@@ -36,6 +37,21 @@ pub fn blocked(bundle: &Path) -> Option<Blocked> {
         return Some(Blocked::NotWritable(folder.to_path_buf()));
     }
     None
+}
+
+/// Whether the volume holding `path` is mounted for writing; false when it cannot be asked.
+#[cfg(unix)]
+fn on_writable_volume(path: &Path) -> bool {
+    rustix::fs::statvfs(path).is_ok_and(|volume| {
+        !volume
+            .f_flag
+            .contains(rustix::fs::StatVfsMountFlags::RDONLY)
+    })
+}
+
+#[cfg(not(unix))]
+fn on_writable_volume(_: &Path) -> bool {
+    false
 }
 
 #[cfg(unix)]
