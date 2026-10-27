@@ -209,12 +209,14 @@ mod unix {
 
         /// Removes the file or link `name`; a link's target is never touched.
         pub fn remove(&self, name: &std::ffi::OsStr) -> io::Result<()> {
+            check_os_name(name)?;
             rustix::fs::unlinkat(&self.fd, name, AtFlags::empty())?;
             Ok(())
         }
 
         /// Removes the directory `name` when it is empty; one holding anything stays.
         pub fn remove_dir(&self, name: &str) -> io::Result<()> {
+            check_name(name)?;
             rustix::fs::unlinkat(&self.fd, name, AtFlags::REMOVEDIR)?;
             Ok(())
         }
@@ -407,6 +409,7 @@ mod pinned {
         /// refuses: it is removed as one, which removes the link itself, whatever it points at.
         pub fn remove(&self, name: &std::ffi::OsStr) -> io::Result<()> {
             use std::os::windows::fs::FileTypeExt as _;
+            check_os_name(name)?;
             let path = self.path.join(name);
             if std::fs::symlink_metadata(&path)?
                 .file_type()
@@ -421,6 +424,7 @@ mod pinned {
         /// Removes the directory `name` when it is empty; one holding anything stays. A link to
         /// a folder, a junction included, is removed as a link, whatever it points at.
         pub fn remove_dir(&self, name: &str) -> io::Result<()> {
+            check_name(name)?;
             std::fs::remove_dir(self.path.join(name))
         }
 
@@ -438,6 +442,21 @@ mod pinned {
             format!("{name} is a link or not what Studio expects there; Studio does not use it"),
         )
     }
+}
+
+/// [`check_name`] for a name an entry listing gave, which may not be text: it names one entry of
+/// the folder, never the folder itself, its parent or a path. A `\` parts a path on Windows
+/// alone; elsewhere it is a name's own.
+fn check_os_name(name: &std::ffi::OsStr) -> io::Result<()> {
+    let bytes = name.as_encoded_bytes();
+    let parts = |byte: &u8| *byte == b'/' || *byte == 0 || (cfg!(windows) && *byte == b'\\');
+    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.iter().any(parts) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name:?} is not a file name"),
+        ));
+    }
+    Ok(())
 }
 
 /// A name of one part: no separator, not `.` or `..`.

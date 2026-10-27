@@ -87,10 +87,19 @@ const FILES: &[(&str, &str)] = &[
 /// handle, never through a link the agent left (`confined`), and another folder is not walked.
 pub fn write(cwd: &Path) -> std::io::Result<()> {
     let cwd = Confined::open(cwd)?;
+    // Each agent's folder on its own: one that cannot be written (an agent left a link there)
+    // does not keep the other agent's skill from being written. The first failure is said.
+    let mut failed = None;
     for root in ROOTS {
-        write_tree(&cwd.dirs(root)?.dir(NAME)?)?;
+        let written = cwd
+            .dirs(root)
+            .and_then(|dirs| dirs.dir(NAME))
+            .and_then(|dir| write_tree(&dir));
+        if let Err(error) = written {
+            failed.get_or_insert(error);
+        }
     }
-    Ok(())
+    failed.map_or(Ok(()), Err)
 }
 
 fn write_tree(dir: &Confined) -> std::io::Result<()> {
