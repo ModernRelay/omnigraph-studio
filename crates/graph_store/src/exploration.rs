@@ -3074,9 +3074,10 @@ mod tests {
             exploration.spawn_count(key.clone(), at_c3(), None, cx)
         });
         cx.run_until_parked();
+        // The pin's count, as the server answers it there.
         assert_eq!(
             counted(cx),
-            Some(Loadable::Loaded(0)),
+            Some(Loadable::Loaded(2)),
             "read again at the pin"
         );
         assert!(taken().iter().all(|(_, at)| at.as_deref() == Some("c2")));
