@@ -32,8 +32,9 @@ pub struct SessionRecord {
     /// The person's own name for it, which wins over the agent's.
     pub title_override: Option<String>,
     pub created_at: DateTime<Utc>,
-    /// The last message the person sent. The list sorts by it, as Zed's sorts by the last
-    /// interaction, so a conversation finishing in the background does not move its row.
+    /// When the person last wrote in it, or it last opened ready (or was imported, at the
+    /// agent's last activity). The list sorts by it, as Zed's sorts by the last interaction, so
+    /// a conversation finishing in the background does not move its row.
     pub updated_at: DateTime<Utc>,
     /// The agent's branch, and whether it was created yet.
     pub branch: String,
@@ -213,7 +214,8 @@ impl AgentSessions {
         }
     }
 
-    /// Records a conversation, or updates its branch, keeping its title, times and marks.
+    /// Records a conversation, or updates its branch, keeping its title, times and pin; one
+    /// opened again leaves the archive.
     pub fn upsert(&mut self, record: SessionRecord, cx: &mut Context<Self>) {
         match self
             .records
@@ -268,14 +270,18 @@ impl AgentSessions {
         );
     }
 
-    /// The agent's title, which replaces any earlier one.
+    /// The agent's title, which replaces any earlier one: one line, cut ([`title_of`]), so it
+    /// fits a row and can be typed into the delete confirmation. One without text is not taken.
     pub fn set_title(&mut self, session: &str, title: String, cx: &mut Context<Self>) {
+        let Some(title) = title_of(&title) else {
+            return;
+        };
         self.update(session, |record| record.title = Some(title), cx);
     }
 
     /// The start of the first message, until the agent names the conversation.
     pub fn suggest_title(&mut self, session: &str, message: &str, cx: &mut Context<Self>) {
-        let Some(title) = provisional_title(message) else {
+        let Some(title) = title_of(message) else {
             return;
         };
         self.update(
@@ -463,8 +469,10 @@ pub fn private_homes() -> PathBuf {
     agent_dir().join("homes")
 }
 
-/// The first line of a message, cut to a title's length on a character.
-fn provisional_title(message: &str) -> Option<String> {
+/// A title as Studio keeps one: the first line with text, cut to a title's length on a
+/// character; `None` for text without any. The start of the first message is one until the
+/// agent names the conversation, and the agent's titles and imported ones are taken so too.
+pub(crate) fn title_of(message: &str) -> Option<String> {
     const TITLE_CHARS: usize = 80;
     let line = message
         .lines()
@@ -505,13 +513,6 @@ fn read_text(path: &Path) -> Result<Option<String>, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.to_string()),
     }
-}
-
-/// Moves a state file Studio could not use out of the way of the next save, renamed beside
-/// itself: whether it may be saved over now. Not when the rename fails (on Windows, another
-/// program holds it open without letting it be renamed): the file then stays as it is.
-fn set_aside(path: &Path) -> bool {
-    studio_settings::set_aside(path).is_some()
 }
 
 /// The records on disk, and what the person is told when the file was set aside. A file that
@@ -583,9 +584,12 @@ fn read(path: &Path) -> Stored<Map<String, Value>> {
             value,
             saving: true,
         },
+        // A file Studio could not use is moved out of the way of the next save, renamed beside
+        // itself; when that fails (on Windows, another program holds it open), it stays as it
+        // is and is not saved over.
         None => Stored {
             value: Map::new(),
-            saving: set_aside(path),
+            saving: studio_settings::set_aside(path).is_some(),
         },
     }
 }
@@ -1158,9 +1162,9 @@ mod tests {
     #[test]
     fn a_long_first_line_is_cut_on_a_character() {
         let long = "word ".repeat(40);
-        let title = provisional_title(&long).unwrap();
+        let title = title_of(&long).unwrap();
         assert!(title.chars().count() <= 80 && title.ends_with('…'));
-        assert_eq!(provisional_title("  \n "), None);
+        assert_eq!(title_of("  \n "), None);
     }
 
     #[test]

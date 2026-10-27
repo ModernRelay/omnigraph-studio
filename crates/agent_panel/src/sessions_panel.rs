@@ -1,8 +1,8 @@
 //! The Conversations panel of the left sidebar (spec 011): the graph's conversations with
 //! agents, as Delta's sidebar lists threads and Zed's lists its agent threads. Pinned ones
 //! first, then by the person's last message; each row is the conversation's title with what it
-//! is doing (running, waiting for the person, failed, finished unseen) or when it was last
-//! active, and pin and archive on hover. A right click renames, pins, archives or deletes. The
+//! is doing (running, waiting for the person, failed, finished unseen), when it was last active
+//! in its tooltip, and pin and archive on hover. A right click renames, pins, archives or deletes. The
 //! Filter button narrows the list by title or agent; archived ones fold away at the end; the agent's
 //! own conversations in the graph's directory can be imported. A row opens the conversation in
 //! its own tab, or shows the tab it is in.
@@ -34,6 +34,22 @@ use crate::sessions::{AgentSessions, Live, SessionRecord, graph_cwd};
 use studio_workspace::ModalView;
 
 pub const PANEL_ID: &str = "agent-conversations";
+
+/// How long an import or a delete waits for the agent's answer: past it the answer is given up,
+/// and the connection with it, so an agent that never answers keeps no process for it.
+const AGENT_ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// `answer`, or `None` when the agent has not answered within [`AGENT_ANSWER_WITHIN`].
+async fn within_time<T>(
+    answer: futures::channel::oneshot::Receiver<T>,
+    cx: &gpui::AsyncApp,
+) -> Option<Result<T, futures::channel::oneshot::Canceled>> {
+    let late = cx.background_executor().timer(AGENT_ANSWER_WITHIN);
+    match futures::future::select(answer, late).await {
+        futures::future::Either::Left((answer, _)) => Some(answer),
+        futures::future::Either::Right(_) => None,
+    }
+}
 
 pub struct SessionsPanel {
     workspace: WeakEntity<Workspace>,
@@ -264,7 +280,10 @@ impl SessionsPanel {
         let connection = connection::connection(agent, cx);
         let answer = connection.delete(id);
         cx.spawn(async move |this, cx| {
-            let (kind, note) = match answer.await {
+            let answer = within_time(answer, cx)
+                .await
+                .unwrap_or_else(|| Ok(Err("it did not answer in two minutes".to_owned())));
+            let (kind, note) = match answer {
                 Ok(Ok(())) => (
                     ToastKind::Success,
                     "Deleted, here and at the agent.".to_owned(),
@@ -296,8 +315,13 @@ impl SessionsPanel {
     }
 
     fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.search_open = !self.search_open;
-        if self.search_open {
+        self.set_search_open(!self.search_open, window, cx);
+    }
+
+    /// Opens the search field with the keyboard in it, or closes it and lets its text go.
+    fn set_search_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_open = open;
+        if open {
             window.focus(&self.search.focus_handle(cx), cx);
         } else {
             self.search
@@ -316,8 +340,27 @@ impl SessionsPanel {
         let connection: Arc<AgentConnection> = connection::connection(agent, cx);
         let answer = connection.list(cwd.clone());
         cx.spawn(async move |this, cx| {
-            let result = answer.await;
+            let result = within_time(answer, cx)
+                .await
+                .unwrap_or_else(|| Ok(Err("The agent did not answer in two minutes.".to_owned())));
             drop(connection);
+            // The list is asked for this graph's folder, a filter an agent may not keep: one
+            // elsewhere is no conversation of this graph, and opened here it would be handed the
+            // graph's gateway. Compared off the main thread, links resolved.
+            let result = match result {
+                Ok(Ok(found)) => {
+                    let cwd = cwd.clone();
+                    Ok(Ok(cx
+                        .background_spawn(async move {
+                            found
+                                .into_iter()
+                                .filter(|info| same_folder(&info.cwd, &cwd))
+                                .collect::<Vec<_>>()
+                        })
+                        .await))
+                }
+                other => other,
+            };
             this.update(cx, |this, cx| {
                 let (kind, note) = match result {
                     Ok(Ok(found)) => {
@@ -551,8 +594,16 @@ fn conversation_row(
     })
 }
 
-/// A conversation the agent knows and the list does not, as a record: the agent's title and
-/// time, a branch named for when it was last active.
+/// Whether `a` and `b` name one folder: the same path, or the same once links are resolved.
+fn same_folder(a: &Path, b: &Path) -> bool {
+    a == b
+        || std::fs::canonicalize(a)
+            .ok()
+            .is_some_and(|a| std::fs::canonicalize(b).is_ok_and(|b| a == b))
+}
+
+/// A conversation the agent knows and the list does not, as a record: the agent's title (one
+/// line, cut as a title Studio makes is) and time, a branch named for when it was last active.
 fn imported(info: SessionInfo, graph: &str, agent: &str, cwd: &Path) -> SessionRecord {
     let updated = info
         .updated_at
@@ -564,7 +615,7 @@ fn imported(info: SessionInfo, graph: &str, agent: &str, cwd: &Path) -> SessionR
         session: info.session_id.0.to_string(),
         graph: graph.to_owned(),
         agent: agent.to_owned(),
-        title: info.title.filter(|title| !title.trim().is_empty()),
+        title: info.title.as_deref().and_then(crate::sessions::title_of),
         title_override: None,
         created_at: updated,
         updated_at: updated,
@@ -656,8 +707,7 @@ impl SessionsPanel {
             ListRow::Search => ds::sidebar_search(self.search.clone(), cx)
                 .key_context("ConversationSearch")
                 .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
-                    this.search_open = true;
-                    this.toggle_search(window, cx);
+                    this.set_search_open(false, window, cx)
                 }))
                 .into_any_element(),
             ListRow::Note(Note::NoMatch) => {
