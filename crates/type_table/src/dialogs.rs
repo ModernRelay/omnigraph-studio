@@ -41,6 +41,26 @@ trait InsertForm: EventEmitter<DismissEvent> + Sized + 'static {
     /// Whether its write is under way, and why the last one did not land.
     fn outcome_mut(&mut self) -> (&mut bool, &mut Option<Notice>);
 
+    /// Whether the last write's outcome is unknown and the form has not changed since: sent
+    /// again as it is, an insert may land twice, so Insert waits and the dialog offers History.
+    fn held_back(&mut self) -> bool {
+        let (_, shown) = self.outcome_mut();
+        shown
+            .as_ref()
+            .is_some_and(|notice| notice.tone == Tone::Unknown)
+    }
+
+    /// The form changed: an unknown outcome no longer holds Insert back.
+    fn form_changed(&mut self) {
+        let (_, shown) = self.outcome_mut();
+        if shown
+            .as_ref()
+            .is_some_and(|notice| notice.tone == Tone::Unknown)
+        {
+            *shown = None;
+        }
+    }
+
     /// The write is in: with no notice the dialog closes, else it says why.
     fn finish_insert(&mut self, notice: Option<Notice>, cx: &mut Context<Self>) {
         let (saving, shown) = self.outcome_mut();
@@ -99,6 +119,7 @@ fn property_fields<T: InsertForm>(
                                 field.error = None;
                             }
                         }
+                        this.form_changed();
                         cx.notify();
                     }
                 },
@@ -171,6 +192,14 @@ fn send_insert<T: InsertForm>(
             .ok();
     })
     .detach();
+}
+
+/// "Open history", after an unknown outcome: where whether the write landed is read
+/// (constitution III). The dialog stays, its values with it.
+fn open_history_button(id: &'static str) -> impl IntoElement {
+    studio_ui::ds::button(id, "Open history").on_click(|_, window, cx| {
+        window.dispatch_action(Box::new(studio_actions::graph::OpenHistory), cx)
+    })
 }
 
 fn field_box(editor: &Entity<Editor>, invalid: bool, cx: &App) -> impl IntoElement {
@@ -254,7 +283,7 @@ impl InsertRowModal {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.saving || self.blocked.is_some() {
+        if self.saving || self.blocked.is_some() || self.held_back() {
             return;
         }
         let Some(values) = field_values(&mut self.fields, cx) else {
@@ -367,6 +396,7 @@ impl Render for InsertRowModal {
             .map(|field| render_field(field, cx))
             .collect();
         let saving = self.saving;
+        let unknown = self.held_back();
         let blocked = self.blocked.clone();
         modal(cx)
             .key_context("InsertRowModal")
@@ -401,9 +431,12 @@ impl Render for InsertRowModal {
                             .disabled(saving)
                             .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                     )
+                    .when(unknown, |footer| {
+                        footer.child(open_history_button("insert-history"))
+                    })
                     .child(
                         action_button("insert", if saving { "Inserting…" } else { "Insert" })
-                            .disabled(saving || self.blocked.is_some())
+                            .disabled(saving || self.blocked.is_some() || unknown)
                             .key_binding(ui::KeyBinding::for_action(&menu::Confirm, cx))
                             .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
@@ -507,6 +540,7 @@ impl InsertEdgeModal {
                 move |this: &mut Self, _, event: &EditorEvent, cx| {
                     if let EditorEvent::BufferEdited = event {
                         this.endpoint_mut(end).error = None;
+                        this.form_changed();
                         this.search(end, cx);
                     }
                 },
@@ -655,7 +689,7 @@ impl InsertEdgeModal {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.saving || self.blocked.is_some() {
+        if self.saving || self.blocked.is_some() || self.held_back() {
             return;
         }
         let mut valid = true;
@@ -785,6 +819,7 @@ impl Render for InsertEdgeModal {
             .map(|field| render_field(field, cx))
             .collect();
         let saving = self.saving;
+        let unknown = self.held_back();
         let blocked = self.blocked.clone();
         modal(cx)
             .key_context("InsertEdgeModal")
@@ -821,9 +856,12 @@ impl Render for InsertEdgeModal {
                             .disabled(saving)
                             .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                     )
+                    .when(unknown, |footer| {
+                        footer.child(open_history_button("insert-edge-history"))
+                    })
                     .child(
                         action_button("insert-edge", if saving { "Inserting…" } else { "Insert" })
-                            .disabled(saving || self.blocked.is_some())
+                            .disabled(saving || self.blocked.is_some() || unknown)
                             .key_binding(ui::KeyBinding::for_action(&menu::Confirm, cx))
                             .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
