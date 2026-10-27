@@ -366,6 +366,9 @@ pub(crate) struct GraphCanvas {
     _open: Option<Task<()>>,
     /// A rebuild waiting for reads that finish together.
     _loaded: Option<Task<()>>,
+    /// Each drawn chip's place in `scene`, by its id: made with the scene, so finding a chip
+    /// (the selected one, the one opened, a menu's) walks nothing, at every frame and move.
+    scene_index: HashMap<SceneId, usize>,
     /// The camera and placed chips the last frame drew: one that moves them under a pointer
     /// resting on a chip finds the chip under it again once painted ([`Self::hover_at`]).
     drawn: Option<(Camera, usize)>,
@@ -544,6 +547,7 @@ impl GraphCanvas {
             read_ahead: None,
             _open: None,
             _loaded: None,
+            scene_index: HashMap::new(),
             drawn: None,
             char_widths: CharWidths::default(),
             bounds: Rc::new(Cell::new(None)),
@@ -650,6 +654,7 @@ impl GraphCanvas {
         self.layout_owed = false;
         if self.session.read(cx).schema_model().is_none() {
             self.scene = Arc::default();
+            self.scene_index.clear();
             self.texts = Arc::default();
             self.node_count = 0;
             self.positions = Arc::default();
@@ -902,8 +907,14 @@ impl GraphCanvas {
             .iter()
             .filter(|n| matches!(n.kind, SceneKind::Node { .. }))
             .count();
+        self.scene_index = scene
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (node.id.clone(), index))
+            .collect();
         self.scene = Arc::new(scene);
-        self.hovered = hovered.and_then(|id| self.scene.index_of(&id));
+        self.hovered = hovered.and_then(|id| self.index_of(&id));
         self.positions = Arc::new(positions);
         // Chips being dragged stay under the pointer, not where the new layout put them.
         if let Some(drag) = self.drag.as_mut().filter(|drag| drag.moved) {
@@ -923,7 +934,7 @@ impl GraphCanvas {
         // paint hits nothing rather than another node.
         self.chips.borrow_mut().clear();
         if let Some(target) = self.center_on.clone()
-            && let Some(index) = self.scene.index_of(&target)
+            && let Some(index) = self.index_of(&target)
         {
             let from = self.camera_now(now);
             self.center = self.positions[index];
@@ -1077,8 +1088,13 @@ impl GraphCanvas {
         cx.notify();
     }
 
+    /// The drawn chip with this id, by [`Self::scene_index`].
+    fn index_of(&self, id: &SceneId) -> Option<usize> {
+        self.scene_index.get(id).copied()
+    }
+
     fn selected_index(&self) -> Option<usize> {
-        self.scene.index_of(self.selected.as_ref()?)
+        self.index_of(self.selected.as_ref()?)
     }
 
     /// The pointer left the canvas, or went over something drawn on it: no chip is under it,
@@ -1124,7 +1140,7 @@ impl GraphCanvas {
         };
         self.opened
             .as_ref()
-            .and_then(|id| self.scene.index_of(id))
+            .and_then(|id| self.index_of(id))
             .filter(cut)
             .or_else(|| self.selected_index().filter(cut))
     }
@@ -1693,7 +1709,7 @@ impl GraphCanvas {
                                     "Expand",
                                     Some(Box::new(ExpandNode)),
                                     Self::on_menu(&this, move |canvas, window, cx| {
-                                        if let Some(index) = canvas.scene.index_of(&id) {
+                                        if let Some(index) = canvas.index_of(&id) {
                                             canvas.activate(index, true, window, cx);
                                         }
                                     }),
@@ -1753,7 +1769,7 @@ impl GraphCanvas {
                         None,
                         Self::on_menu(&this, {
                             move |canvas, window, cx| {
-                                if let Some(index) = canvas.scene.index_of(&id) {
+                                if let Some(index) = canvas.index_of(&id) {
                                     canvas.activate(index, false, window, cx);
                                 }
                             }
@@ -2073,7 +2089,7 @@ impl GraphCanvas {
     fn walk_forward(&mut self, _: &WalkForward, _: &mut Window, cx: &mut Context<Self>) {
         let mut walked = std::mem::take(&mut self.walked);
         while let Some(id) = walked.pop() {
-            if let Some(index) = self.scene.index_of(&id) {
+            if let Some(index) = self.index_of(&id) {
                 self.select(Some(index), cx);
                 break;
             }
