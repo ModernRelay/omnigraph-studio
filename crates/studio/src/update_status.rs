@@ -61,8 +61,10 @@ pub(crate) fn shown(state: &UpdateState, running: &Version, asked: bool) -> Opti
 }
 
 /// Whether the item has anything to say: the workspace leaves it and its rule out otherwise.
+/// Asked at each frame of the workspace, so it reads the state alone: every state but
+/// [`UpdateState::Idle`] says something ([`shown`]).
 pub(crate) fn says_something(updater: &Updater) -> bool {
-    shown(updater.state(), updater.running(), updater.asked()).is_some()
+    !matches!(updater.state(), UpdateState::Idle)
 }
 
 /// Draws the updater's state; drawn again only when that state changes (the updater notifies
