@@ -938,10 +938,13 @@ Built: `omnigraph-studio://` links (`studio::deep_link`), registered with macOS 
 `Info.plist`. `graph?server=…&graph=…[&branch=…]` opens a graph; `node?…&type=…&id=…` opens it
 and shows the node in Explore and the inspector; `query?…&text=…` opens it with a new query tab
 holding the text, which is not run (at most 64 KB). A link opens in the window that already has
-that graph on that branch, else in the active window, else in a new one. It never runs a query,
-writes, adds a server or carries a token: the server must already be known (compared after
-`graph_client::server_root`, so `127.0.0.1:8787` matches `http://127.0.0.1:8787`), and an unknown
-one is refused with the reason. `studio::OpenLink { url }` opens a link from inside Studio.
+that graph open (a graph is open in one window at a time), else in the active window, else in a
+new one. A graph open there on another branch moves to the branch the link names, and the window
+says so in a toast, since every tab of it reads and writes that branch from then on. It never
+runs a query, writes, adds a server or carries a token: the server must already be known
+(compared after `graph_client::server_root`, so `127.0.0.1:8787` matches
+`http://127.0.0.1:8787`), and an unknown one is refused with the reason. `studio::OpenLink { url }`
+opens a link from inside Studio.
 
 ## Deferred
 

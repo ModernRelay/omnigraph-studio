@@ -625,6 +625,16 @@ pub fn open_link(link: &str, cx: &mut App) {
         // shown at a start with no graph) gives way to it. One that cannot close yet (a write
         // running) keeps the focus, with the link opened under it.
         let dialog_stays = !workspace.update(cx, |workspace, cx| workspace.hide_modal(window, cx));
+        // The branch the graph is open on, when the link names another: every tab of it reads,
+        // and writes to, the link's from now on, which the window says.
+        let moved_from = named_branch.as_ref().and_then(|named| {
+            let url = connection.read(cx).server.url.clone();
+            let session = workspace
+                .read(cx)
+                .open_session_for(&url, &target.graph, cx)?;
+            let now = session.read(cx).branch.clone();
+            (now != *named).then_some(now)
+        });
         // The graph, if the window has it open, moved to the branch the link names; else opened
         // here.
         show_graph_in(
@@ -638,6 +648,15 @@ pub fn open_link(link: &str, cx: &mut App) {
         if !dialog_stays {
             let focus = workspace.read(cx).focus_handle(cx);
             window.focus(&focus, cx);
+        }
+        if let (Some(from), Some(to)) = (moved_from, &named_branch) {
+            let message = format!(
+                "{} moved from {from} to {to}, the branch the link names",
+                target.graph
+            );
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_toast(ToastKind::Info, message, cx)
+            });
         }
         match &link {
             DeepLink::Node { type_name, id, .. } => window.dispatch_action(
