@@ -139,6 +139,7 @@ impl SessionsPanel {
                 }
             }));
         }
+        let shown_conversation = shown_in(&workspace, cx);
         Self {
             workspace,
             sessions,
@@ -149,7 +150,7 @@ impl SessionsPanel {
             list_state: ListState::new(0, ListAlignment::Top, px(ds::size::SIDEBAR_ROW * 8.)),
             rows: Vec::new(),
             rows_stale: true,
-            shown_conversation: None,
+            shown_conversation,
             _subscriptions: subscriptions,
         }
     }
@@ -168,15 +169,18 @@ impl SessionsPanel {
 
     /// The conversation in the shown tab; a new one has none until the agent names it.
     fn shown(&self, cx: &App) -> Option<String> {
-        let workspace = self.workspace.upgrade()?;
-        let key = workspace.read(cx).active_item()?.dedupe_key(cx)?;
-        key.strip_prefix("agent:").map(str::to_owned)
+        shown_in(&self.workspace, cx)
+    }
+
+    /// Whether the settings name an agent, asked without making its launch.
+    fn has_agent(cx: &App) -> bool {
+        !StudioSettings::get(cx).agent.command.is_empty()
     }
 
     /// The agent the settings name, as this panel runs it to import or delete conversations.
     fn agent(cx: &App) -> Option<AgentLaunch> {
         let settings = &StudioSettings::get(cx).agent;
-        (!settings.command.is_empty()).then(|| AgentLaunch {
+        Self::has_agent(cx).then(|| AgentLaunch {
             command: settings.command.clone(),
             env: settings.env.clone(),
         })
@@ -690,7 +694,9 @@ impl SessionsPanel {
                     .into_any_element()
             }
             ListRow::Conversation(record) => {
-                let shown = self.shown(cx).as_deref() == Some(record.session.as_str());
+                // As last seen ([`Self::shown_conversation`]): a running conversation's spinner
+                // draws the list at every frame, and the workspace is not asked at each.
+                let shown = self.shown_conversation.as_deref() == Some(record.session.as_str());
                 self.row(&record, shown, cx)
             }
             ListRow::End => div().h(px(ds::space::SM)).into_any_element(),
@@ -747,6 +753,13 @@ impl Render for SessionsPanel {
 }
 
 /// The Conversations panel's header buttons: search, More (import), and a new conversation.
+/// The conversation of the tab `workspace` shows, if it shows one.
+fn shown_in(workspace: &WeakEntity<Workspace>, cx: &App) -> Option<String> {
+    let workspace = workspace.upgrade()?;
+    let key = workspace.read(cx).active_item()?.dedupe_key(cx)?;
+    key.strip_prefix("agent:").map(str::to_owned)
+}
+
 pub struct SessionsActions {
     panel: WeakEntity<SessionsPanel>,
     _observe: Subscription,
@@ -767,7 +780,7 @@ impl Render for SessionsActions {
             .panel
             .upgrade()
             .is_some_and(|panel| panel.read(cx).search_open);
-        let has_agent = SessionsPanel::agent(cx).is_some();
+        let has_agent = SessionsPanel::has_agent(cx);
         let panel = self.panel.clone();
         h_flex()
             .gap(px(ds::space::XXS))
