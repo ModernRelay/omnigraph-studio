@@ -2064,19 +2064,10 @@ impl GraphCanvas {
         self.walked = walked;
     }
 
+    /// Space: inspects the selected chip as ⇧-click does, a relationship's pill its node.
     fn peek_selected(&mut self, _: &PeekSelected, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(index) = self.selected_index() else {
-            return;
-        };
-        if let SceneKind::Node { node, .. } = &self.scene.nodes[index].kind {
-            window.dispatch_action(
-                Box::new(PeekNode {
-                    type_name: node.type_name.clone(),
-                    id: node.id.clone(),
-                    at_commit: None,
-                }),
-                cx,
-            );
+        if let Some(index) = self.selected_index() {
+            self.peek(index, window, cx);
         }
     }
 
