@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# Serve Studio's development graphs behind a sign-in, for trying Studio's OAuth client (spec 016)
+# on this machine: an Omnigraph server that trusts a stand-in sign-in service, behind TLS from a
+# certificate authority of the script's own.
+#
+#   script/dev-sign-in            # first run makes the keys, applies the cluster, loads the seeds
+#   script/dev-sign-in --reset    # start again from nothing
+#
+#   https://127.0.0.1:8791        the server, through the bed's TLS front; issuer /oauth, resource /mcp
+#   http://127.0.0.1:8792         the sign-in page, which approves at once as user_alice
+#
+# It writes an operator home with one anonymous server target, `oauth-bed`, that trusts the
+# bed's CA. Studio has no client ID for the bed's sign-in service of its own, so give it one:
+#
+#   OMNIGRAPH_HOME=dev/.sign-in/studio-home \
+#     OMNIGRAPH_STUDIO_OAUTH_CLIENT=https://studio.test/client.json cargo run
+#
+# POST {"subject": "user_mallory"} to https://127.0.0.1:8791/oauth/_bed to sign in as an account
+# the server does not admit; GET it for the requests the bed saw. Needs openssl, python3, and
+# Omnigraph's `omnigraph` and `omnigraph-server` of v0.14.0 or later, on PATH or named by
+# OMNIGRAPH_BIN and OMNIGRAPH_SERVER_BIN. The end-to-end test runs against it:
+#
+#   STUDIO_SIGN_IN_E2E_DATA=dev/.sign-in cargo test -p graph_store --lib a_real_server -- --ignored
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+BED=${STUDIO_SIGN_IN_DATA:-$ROOT/dev/.sign-in}
+CLI=${OMNIGRAPH_BIN:-omnigraph}
+SERVER=${OMNIGRAPH_SERVER_BIN:-omnigraph-server}
+export BED_SERVER=8790 BED_FRONT=8791 BED_LOGIN=8792
+
+if [[ "${1:-}" == "--reset" ]]; then
+  rm -rf "$BED"
+fi
+for port in "$BED_SERVER" "$BED_FRONT" "$BED_LOGIN"; do
+  if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "dev-sign-in: something already listens on 127.0.0.1:$port; stop it first" >&2
+    exit 1
+  fi
+done
+
+DATA=$BED/data
+KEYS=$BED/keys
+export BED_DATA=$DATA BED_KEYS=$KEYS BED_TRUST=$BED/trust.json
+
+mkdir -p "$KEYS"
+if [[ ! -f "$KEYS/signing.pem" ]]; then
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout "$KEYS/ca-key.pem" -out "$KEYS/ca.pem" \
+    -days 30 -subj "/CN=Omnigraph Studio sign-in bed CA" \
+    -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null
+  openssl req -newkey rsa:2048 -nodes -keyout "$KEYS/front-key.pem" -out "$KEYS/front.csr" \
+    -subj "/CN=127.0.0.1" 2>/dev/null
+  printf 'subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n' > "$KEYS/front.ext"
+  openssl x509 -req -in "$KEYS/front.csr" -CA "$KEYS/ca.pem" -CAkey "$KEYS/ca-key.pem" \
+    -CAcreateserial -out "$KEYS/front.pem" -days 30 -extfile "$KEYS/front.ext" 2>/dev/null
+  openssl genrsa -out "$KEYS/signing.pem" 2048 2>/dev/null
+fi
+
+# The cluster is applied and loaded through a direct target in an operator home of the script's
+# own. A direct apply or load keeps the cluster lock when it ends; each is released after it.
+home=$BED/apply-home
+mkdir -p "$home"
+uri="file://$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$DATA")"
+printf 'version: 1\ntargets:\n  dev: {kind: direct, scope: root, uri: %s}\n' "$uri" > "$home/config.yaml"
+quietly() {
+  local output
+  if ! output=$(OMNIGRAPH_HOME=$home "$CLI" "$@" 2>&1); then
+    echo "$output" >&2
+    echo "dev-sign-in: omnigraph $* failed; its output is above" >&2
+    exit 1
+  fi
+}
+unlock() {
+  [[ -f "$DATA/__cluster/lock.json" ]] || return 0
+  local lock
+  lock=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["lock_id"])' "$DATA/__cluster/lock.json")
+  OMNIGRAPH_HOME=$home "$CLI" cluster force-unlock "$lock" --target dev >/dev/null 2>&1 || true
+}
+if [[ ! -d "$DATA/__cluster" ]]; then
+  mkdir -p "$DATA"
+  cp "$ROOT"/dev/cluster/*.yaml "$ROOT"/dev/cluster/*.pg "$DATA"/
+  # The dev policy's developers, and the principal user_alice is admitted as.
+  sed -i.orig 's/developers: \[act-dev\]/developers: [act-dev, "principal:alice"]/' \
+    "$DATA"/server.policy.yaml "$DATA"/graph.policy.yaml
+  rm -f "$DATA"/*.orig
+  [[ -f "$ROOT/dev/seed.jsonl" ]] || python3 "$ROOT/script/dev-seed.py" > "$ROOT/dev/seed.jsonl"
+  quietly cluster apply --config "$DATA" --target dev
+  unlock
+  quietly load --target dev --graph knowledge --data "$ROOT/dev/seed.jsonl" --mode overwrite
+  unlock
+  quietly load --target dev --graph notes --data "$ROOT/dev/notes-seed.jsonl" --mode overwrite
+fi
+unlock
+
+mkdir -p "$BED/studio-home"
+cat > "$BED/studio-home/config.yaml" <<EOF
+version: 1
+targets:
+  oauth-bed:
+    kind: server
+    endpoint: https://127.0.0.1:$BED_FRONT
+    auth: {provider: anonymous}
+    default_graph: knowledge
+    transport: {tls: {ca: {mode: append, file: $KEYS/ca.pem}}}
+EOF
+
+# The server reads its trust at boot; the bed rewrites it every 30 seconds after.
+python3 "$ROOT/script/sign-in-bed.py" --publish-once
+python3 "$ROOT/script/sign-in-bed.py" &
+bed=$!
+"$SERVER" --cluster "$DATA" --bind "127.0.0.1:$BED_SERVER" --oidc-identity-trust "$BED_TRUST" &
+server=$!
+trap 'kill $server $bed 2>/dev/null; wait $server 2>/dev/null' EXIT
+for _ in $(seq 60); do
+  curl -fsS -o /dev/null "http://127.0.0.1:$BED_SERVER/readyz" 2>/dev/null && break
+  if ! kill -0 "$server" 2>/dev/null; then
+    echo "dev-sign-in: $SERVER exited before it served; its output is above" >&2
+    exit 1
+  fi
+  sleep 0.5
+done
+challenge=$(curl -sS --cacert "$KEYS/ca.pem" -o /dev/null -D - "https://127.0.0.1:$BED_FRONT/graphs" \
+  | tr -d '\r' | sed -n 's/^www-authenticate: //Ip')
+if [[ "$challenge" != *resource_metadata=* ]]; then
+  echo "dev-sign-in: the server's 401 offers no sign-in ($challenge); it needs omnigraph-server v0.14.0 or later" >&2
+  exit 1
+fi
+echo "Serving https://127.0.0.1:$BED_FRONT behind a sign-in · target oauth-bed in OMNIGRAPH_HOME=$BED/studio-home"
+wait $server

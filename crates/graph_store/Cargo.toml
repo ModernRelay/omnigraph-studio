@@ -12,6 +12,7 @@ path = "src/graph_store.rs"
 futures = { workspace = true }
 gpui = { workspace = true }
 graph_client = { workspace = true }
+oauth_client = { workspace = true }
 gq_language = { workspace = true }
 http_client = { workspace = true }
 reqwest_client = { workspace = true }
@@ -25,6 +26,7 @@ smol = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+base64 = { workspace = true }
 gpui = { workspace = true, features = ["test-support"] }
 futures-rustls = { workspace = true }
 rcgen = { workspace = true }

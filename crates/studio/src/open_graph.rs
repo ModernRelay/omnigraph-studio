@@ -9,6 +9,7 @@ use gpui::{
     ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window,
 };
 use graph_store::cli_config::{self, Platform};
+use graph_store::sign_in::SignIn;
 use graph_store::{
     Connection, ConnectionEvent, ConnectionRegistry, ConnectionState, ConnectionWatch,
     GraphListing, ServerSource,
@@ -212,7 +213,8 @@ impl OpenGraphModal {
     }
 
     /// Where the keyboard can go, in order: the servers, the field for a new token when the
-    /// server asks for one, the chosen server's graphs, then the graph id field. None while a
+    /// server asks for one (not one it signs in to), the chosen server's graphs, then the graph
+    /// id field. None while a
     /// server is added.
     fn places(&self, cx: &App) -> Vec<Place> {
         if self.adding {
@@ -225,7 +227,9 @@ impl OpenGraphModal {
             .collect();
         if let Some(selected) = &self.selected {
             let connection = selected.read(cx);
-            if connection.state == ConnectionState::Unauthorized {
+            if connection.state == ConnectionState::Unauthorized
+                && connection.sign_in == SignIn::NotOffered
+            {
                 places.push(Place::Token);
             }
             places.extend(connection.graph_ids().into_iter().map(Place::Graph));
@@ -623,9 +627,10 @@ impl OpenGraphModal {
         let status = server_status(c);
         let state = c.state.clone();
         let offers_retry = retries_on_select(c);
+        let sign_in = c.sign_in.clone();
         // A token typed in replaces one the server refused, or one the CLI would not give to a
-        // server that asks for one.
-        let asks_token = state == ConnectionState::Unauthorized;
+        // server that asks for one. A server that offers a sign-in is signed in to instead.
+        let asks_token = state == ConnectionState::Unauthorized && sign_in == SignIn::NotOffered;
         let token_tooltip = token_tooltip(c, self.platform);
         let selected = connection.clone();
         let listing_note = match &c.graphs {
@@ -664,8 +669,45 @@ impl OpenGraphModal {
                             .min_w_0()
                             .child(studio_ui::ds::text::muted(status)),
                     )
-                    .map(|row| match &state {
-                        ConnectionState::Connecting => row.child(
+                    .map(|row| match (&state, &sign_in) {
+                        (_, SignIn::Waiting { .. }) => row.child(
+                            studio_ui::ds::button("cancel-sign-in", "Cancel")
+                                .style(ButtonStyle::Subtle)
+                                .on_click(cx.listener({
+                                    let selected = selected.clone();
+                                    move |_, _, _, cx| {
+                                        selected.update(cx, |c, cx| c.cancel_sign_in(cx));
+                                    }
+                                })),
+                        ),
+                        (ConnectionState::Unauthorized, SignIn::Offered { service, .. }) => row
+                            .child(
+                                studio_ui::ds::button("sign-in", "Sign in")
+                                    .style(ButtonStyle::Filled)
+                                    .tooltip(ui::Tooltip::text(format!(
+                                        "Opens {service} in your browser to sign in to this server."
+                                    )))
+                                    .on_click(cx.listener({
+                                        let selected = selected.clone();
+                                        move |_, _, _, cx| {
+                                            selected.update(cx, |c, cx| c.sign_in(cx))
+                                        }
+                                    })),
+                            ),
+                        (ConnectionState::Unauthorized, SignIn::SignedIn { .. }) => row
+                            .child(
+                                studio_ui::ds::button("sign-in-again", "Sign in as someone else")
+                                    .style(ButtonStyle::Subtle)
+                                    .on_click(cx.listener({
+                                        let selected = selected.clone();
+                                        move |_, _, _, cx| {
+                                            selected.update(cx, |c, cx| c.sign_in(cx))
+                                        }
+                                    })),
+                            )
+                            .child(sign_out_button(&selected, cx)),
+                        (_, SignIn::SignedIn { .. }) => row.child(sign_out_button(&selected, cx)),
+                        (ConnectionState::Connecting, _) => row.child(
                             studio_ui::ds::button("cancel-connect", "Cancel")
                                 .style(ButtonStyle::Subtle)
                                 .on_click(cx.listener(move |_, _, _, cx| {
@@ -819,10 +861,66 @@ impl OpenGraphModal {
     }
 }
 
+/// Signs out of the chosen server (spec 016).
+fn sign_out_button(selected: &Entity<Connection>, cx: &mut Context<OpenGraphModal>) -> ds::Button {
+    let selected = selected.clone();
+    studio_ui::ds::button("sign-out", "Sign out")
+        .style(ButtonStyle::Subtle)
+        .tooltip(ui::Tooltip::text(
+            "Forgets this sign-in, and asks the sign-in service to end it where it can.",
+        ))
+        .on_click(cx.listener(move |_, _, _, cx| selected.update(cx, |c, cx| c.sign_out(cx))))
+}
+
 /// What the chosen server's line says of its state. A 401 says what it was an answer to: no
 /// token at all (a server Studio has none configured for asks for one), or the token sent. A
-/// CLI server the CLI gave no token is asked nothing, and says why.
+/// CLI server the CLI gave no token is asked nothing, and says why. A server that offers a
+/// sign-in says where, and who is signed in (spec 016).
 fn server_status(c: &Connection) -> String {
+    match (&c.sign_in, &c.state) {
+        (SignIn::Waiting { service }, _) => {
+            return format!("Finish signing in at {service} in your browser.");
+        }
+        (SignIn::Reading, ConnectionState::Unauthorized) => {
+            return "This server asks you to sign in. Studio is reading how.".into();
+        }
+        (SignIn::Offered { service, why }, ConnectionState::Unauthorized) => {
+            return match why {
+                Some(why) => format!("{why} The sign-in is at {service}."),
+                None => format!("This server asks you to sign in at {service}."),
+            };
+        }
+        (SignIn::Unavailable(why), ConnectionState::Unauthorized) => {
+            return format!("This server asks for a sign-in Studio cannot make. {why}");
+        }
+        (
+            SignIn::SignedIn {
+                service, account, ..
+            },
+            ConnectionState::Unauthorized,
+        ) => {
+            return format!(
+                "The server refused {account}, signed in at {service}: it may not admit this \
+                 account."
+            );
+        }
+        (
+            SignIn::SignedIn {
+                service,
+                account,
+                kept,
+            },
+            ConnectionState::Ready,
+        ) => {
+            let lasts = if *kept {
+                ""
+            } else {
+                " The keychain did not keep the sign-in, so it lasts until Studio quits."
+            };
+            return format!("Signed in as {account} at {service}.{lasts}");
+        }
+        _ => {}
+    }
     match (&c.state, &c.token_unread) {
         (ConnectionState::Unreachable(error), _) => {
             format!("Could not reach the server: {error}")
@@ -1174,6 +1272,73 @@ mod tests {
             modal.select(beta.clone(), window, cx)
         });
         assert_eq!(typed(cx), "beta-kept");
+    }
+
+    /// A server that offers a sign-in says where, while waiting says to finish in the browser,
+    /// and signed in says as whom; one that refuses the account signed in says so (spec 016).
+    #[gpui::test]
+    fn a_server_that_offers_a_sign_in_says_where_and_as_whom(cx: &mut TestAppContext) {
+        let connection = server(&[], cx);
+        let said = |state: ConnectionState, sign_in: SignIn, cx: &mut TestAppContext| {
+            connection.update(cx, |connection, _| {
+                connection.state = state;
+                connection.sign_in = sign_in;
+                (server_status(connection), connection.label())
+            })
+        };
+        let offered = SignIn::Offered {
+            service: "id.example".into(),
+            why: None,
+        };
+        assert_eq!(
+            said(ConnectionState::Unauthorized, offered, cx),
+            (
+                "This server asks you to sign in at id.example.".to_owned(),
+                "Sign in needed".to_owned()
+            )
+        );
+        let ended = SignIn::Offered {
+            service: "id.example".into(),
+            why: Some("Signed out: The sign-in is no longer valid. Sign in again.".into()),
+        };
+        assert_eq!(
+            said(ConnectionState::Unauthorized, ended, cx).0,
+            "Signed out: The sign-in is no longer valid. Sign in again. The sign-in is at \
+             id.example."
+        );
+        let waiting = SignIn::Waiting {
+            service: "id.example".into(),
+        };
+        assert_eq!(
+            said(ConnectionState::Unauthorized, waiting, cx),
+            (
+                "Finish signing in at id.example in your browser.".to_owned(),
+                "Signing in…".to_owned()
+            )
+        );
+        let signed_in = |kept| SignIn::SignedIn {
+            service: "id.example".into(),
+            account: "user_1".into(),
+            kept,
+        };
+        assert_eq!(
+            said(ConnectionState::Ready, signed_in(true), cx).0,
+            "Signed in as user_1 at id.example."
+        );
+        assert!(
+            said(ConnectionState::Ready, signed_in(false), cx)
+                .0
+                .ends_with("lasts until Studio quits.")
+        );
+        assert_eq!(
+            said(ConnectionState::Unauthorized, signed_in(true), cx),
+            (
+                "The server refused user_1, signed in at id.example: it may not admit this \
+                 account."
+                    .to_owned(),
+                "Not admitted".to_owned()
+            )
+        );
     }
 
     /// A 401 to a request that carried no token says the server asks for one, not that it

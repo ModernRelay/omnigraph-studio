@@ -4209,12 +4209,14 @@ name = "graph_store"
 version = "0.2.1"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "futures",
  "futures-rustls",
  "gpui",
  "gq_language",
  "graph_client",
  "http_client",
+ "oauth_client",
  "rcgen",
  "reqwest_client",
  "serde",
@@ -6611,6 +6613,23 @@ dependencies = [
  "futures",
  "log",
  "tiny_http",
+ "url",
+]
+
+[[package]]
+name = "oauth_client"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "futures",
+ "getrandom 0.3.4",
+ "http_client",
+ "httparse",
+ "serde",
+ "serde_json",
+ "sha2",
+ "smol",
  "url",
 ]
 

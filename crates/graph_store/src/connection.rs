@@ -3,7 +3,7 @@
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui::{Context, EventEmitter, Task};
 use graph_client::api::{GraphInfo, HealthOutput};
@@ -11,7 +11,8 @@ use graph_client::{GraphClient, ReadError};
 use http_client::HttpClient;
 use studio_settings::StudioSettings;
 
-use crate::cli_tokens::{Token, TokenSource};
+use crate::cli_tokens::{Lease, Token, TokenSource};
+use crate::sign_in::{self, OAuthSource, Service, SignIn, SignInContext};
 
 /// Where Studio learned about a server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +165,29 @@ pub struct Connection {
     watchers: Rc<()>,
     /// A health check came while nothing watched the server: the next watch checks at once.
     check_missed: bool,
+    /// What the person sees of signing in to the server (spec 016).
+    pub sign_in: SignIn,
+    /// What Studio needs to sign in to a server that asks; `None` for a connection that never
+    /// signs in (the environment's server, tests).
+    sign_in_context: Option<SignInContext>,
+    /// The client the server is reached with, which a sign-in's requests to its address take.
+    http: Arc<dyn HttpClient>,
+    /// The sign-in service the server's 401 named, once read and checked.
+    service: Option<Service>,
+    /// The sign-in the token comes from, when it comes from one.
+    oauth: Option<OAuthSource>,
+    /// Whose short-lived token is held ([`Lease::holder`]): the next one of the same holder
+    /// replaces it quietly.
+    holder: Option<String>,
+    /// The sign-in under way: reading its service, or waiting for the browser.
+    _signing_in: Option<Task<()>>,
+    /// The ask for the next short-lived token, before the one held ends.
+    _renewal: Option<Task<()>>,
+    /// The renewal came while nothing watched the server: the next watch asks.
+    renewal_missed: bool,
+    /// The ask under way is a renewal, before the token held ends: its answer replaces the
+    /// token quietly. An ask after a refusal is not one, and its token is tried at once.
+    renewing: bool,
 }
 
 /// The HTTP client of a retired connection ([`Connection::retire`]): every request fails with
@@ -203,6 +227,16 @@ impl Connection {
     /// server asks for one, and a token source that gave none says so, rather than that a token
     /// was refused.
     pub fn label(&self) -> String {
+        if self.state == ConnectionState::Unauthorized {
+            match &self.sign_in {
+                SignIn::NotOffered => {}
+                SignIn::Reading => return "Reading how to sign in".into(),
+                SignIn::Offered { .. } => return "Sign in needed".into(),
+                SignIn::Unavailable(_) => return "Sign-in unavailable".into(),
+                SignIn::Waiting { .. } => return "Signing in…".into(),
+                SignIn::SignedIn { .. } => return "Not admitted".into(),
+            }
+        }
         match (&self.state, &self.token_unread) {
             (ConnectionState::Unauthorized, Some(_)) => "No token from the CLI".into(),
             (ConnectionState::Unauthorized, None) if !self.refused_with_token => {
@@ -218,7 +252,7 @@ impl Connection {
         http: Arc<dyn HttpClient>,
     ) -> anyhow::Result<Self> {
         let has_token = token.is_some();
-        let client = GraphClient::new(&server.url, token, http)?;
+        let client = GraphClient::new(&server.url, token, http.clone())?;
         Ok(Self {
             server,
             client,
@@ -242,7 +276,24 @@ impl Connection {
             _health_check: None,
             watchers: Rc::new(()),
             check_missed: false,
+            sign_in: SignIn::NotOffered,
+            sign_in_context: None,
+            http,
+            service: None,
+            oauth: None,
+            holder: None,
+            _signing_in: None,
+            _renewal: None,
+            renewal_missed: false,
+            renewing: false,
         })
+    }
+
+    /// Signs in to the server through OAuth when it asks and the connection has no other
+    /// credential (spec 016).
+    pub(crate) fn with_sign_in(mut self, context: Option<SignInContext>) -> Self {
+        self.sign_in_context = context;
+        self
     }
 
     /// Takes its token from `source` each time it is asked: on each connect, before anything is
@@ -277,6 +328,13 @@ impl Connection {
         source: Option<Arc<dyn TokenSource>>,
         cx: &mut Context<Self>,
     ) {
+        // An anonymous target signed in keeps its sign-in: the CLI names no credential for it.
+        if source.is_none() && self.oauth.is_some() {
+            return;
+        }
+        if source.is_some() {
+            self.drop_sign_in();
+        }
         let had = self.token_source.is_some();
         self.token_source = source;
         if self.token_source.is_some() {
@@ -288,12 +346,26 @@ impl Connection {
     }
 
     /// Sends through `http` from now on, as when the CLI target's proxy or certificate authority
-    /// changed: every holder of the client moves to it (the agent's gateway among them), and what
-    /// was read through the old one is read again. The registry asks the token source again too,
-    /// since the target changed.
+    /// changed: every holder of the client moves to it (the agent's gateway among them), and a
+    /// server in use is checked again through it, so one the old transport could not reach does
+    /// not wait for its next health check. The registry asks the token source again too, since
+    /// the target changed.
     pub(crate) fn replace_http(&mut self, http: Arc<dyn HttpClient>, cx: &mut Context<Self>) {
-        self.client.set_http(http);
+        self.http = http.clone();
+        self.client.set_http(http.clone());
+        // A sign-in keeps going through the new client: its requests to the server's address
+        // take it from now on, and a refresh under way finishes and is kept. A new sign-in read
+        // from the keychain here would race that refresh for the refresh token it rotates.
+        if let Some(service) = &mut self.service {
+            service.clients = service.clients.through(http.clone());
+        }
+        if let Some(source) = &self.oauth {
+            source.reach_through(http);
+        }
         cx.emit(ConnectionEvent::CredentialChanged);
+        if self.state != ConnectionState::Idle {
+            self.connect(cx);
+        }
     }
 
     /// Stops the connection for good, as when its CLI target is gone or names a transport Studio
@@ -301,6 +373,7 @@ impl Connection {
     /// without leaving Studio, and nothing is checked again. A window showing one of its graphs
     /// says so; opening the graph again reaches the target as the CLI lists it now.
     pub(crate) fn retire(&mut self, why: String, cx: &mut Context<Self>) {
+        self.drop_sign_in();
         self.token_source = None;
         self.token_given = false;
         self.token_answered = true;
@@ -336,6 +409,7 @@ impl Connection {
         if let Some(source) = &self.token_source {
             source.note_refused();
         }
+        self.renewing = false;
         self.ask_for_token(false, cx);
     }
 
@@ -366,6 +440,7 @@ impl Connection {
         if self.token_source.is_none() {
             return;
         }
+        self.renewing = false;
         self.token_given = false;
         self.asked_after_refusal = false;
         if self.state != ConnectionState::Idle {
@@ -414,6 +489,31 @@ impl Connection {
         }
         match answer {
             Ok(token) => {
+                let lease = token.lease().cloned();
+                if let Some(source) = &self.oauth {
+                    self.sign_in = SignIn::SignedIn {
+                        service: source.service().host(),
+                        account: source.account(),
+                        kept: source.kept_in_keychain(),
+                    };
+                }
+                if let Some(lease) = &lease {
+                    self.schedule_renewal(lease, cx);
+                }
+                // A renewal, the same holder's next short-lived token while the connection
+                // stands: nothing read with the last one is read again.
+                let renewal = std::mem::take(&mut self.renewing)
+                    && !connecting
+                    && self.has_token
+                    && lease.is_some()
+                    && lease.as_ref().map(|lease| &lease.holder) == self.holder.as_ref();
+                self.holder = lease.map(|lease| lease.holder);
+                if renewal {
+                    self.client.renew_token(token.into_string());
+                    cx.emit(ConnectionEvent::StateChanged);
+                    cx.notify();
+                    return;
+                }
                 self.has_token = true;
                 let changed = self.client.set_token(Some(token.into_string()));
                 if changed {
@@ -430,10 +530,21 @@ impl Connection {
             }
             Err(reason) => {
                 self.has_token = false;
+                self.holder = None;
+                self._renewal = None;
                 if self.client.set_token(None) {
                     cx.emit(ConnectionEvent::CredentialChanged);
                 }
-                self.token_unread = Some(reason);
+                // A sign-in that could not give a token has ended: the server offers it again.
+                if let Some(source) = self.oauth.take() {
+                    self.token_source = None;
+                    self.sign_in = SignIn::Offered {
+                        service: source.service().host(),
+                        why: Some(reason),
+                    };
+                } else {
+                    self.token_unread = Some(reason);
+                }
                 if connecting || self.state != ConnectionState::Idle {
                     self._task = None;
                     self.refused_with_token = false;
@@ -528,6 +639,10 @@ impl Connection {
             _alive: self.watchers.clone(),
         };
         self.list_graphs_again(cx);
+        if std::mem::take(&mut self.renewal_missed) {
+            self.renewing = true;
+            self.ask_for_token(false, cx);
+        }
         if std::mem::take(&mut self.check_missed)
             && !matches!(
                 self.state,
@@ -661,15 +776,312 @@ impl Connection {
     fn refused(&mut self, failed: Failed, token_sent: bool, cx: &mut Context<Self>) {
         if failed.state == ConnectionState::Unauthorized {
             self.refused_with_token = failed.token_refused.unwrap_or(token_sent);
+            // A refused token is not renewed: the ask below is the one more try, and a token
+            // the server takes schedules its own renewal.
+            self._renewal = None;
+            self.renewal_missed = false;
             if token_sent && !self.asked_after_refusal && self.asks_token_source() {
                 self.asked_after_refusal = true;
                 if let Some(source) = &self.token_source {
                     source.note_refused();
                 }
+                self.renewing = false;
                 self.ask_for_token(false, cx);
+            }
+            if let Some(metadata) = failed.sign_in {
+                self.offered_sign_in(metadata, cx);
             }
         }
         self.state = failed.state;
+    }
+
+    /// The server's 401 offers a sign-in, its details at `metadata`: Studio reads them, and a
+    /// sign-in the keychain kept for this target is refreshed without asking. A connection whose
+    /// credential comes from the CLI keeps it: a refused one is said as refused (spec 016, When
+    /// Studio signs in). Read once; a sign-out or a failed sign-in keeps what was read.
+    fn offered_sign_in(&mut self, metadata: String, cx: &mut Context<Self>) {
+        let Some(context) = self.sign_in_context.clone() else {
+            return;
+        };
+        if (self.token_source.is_some() && self.oauth.is_none())
+            || self.sign_in != SignIn::NotOffered
+            || self._signing_in.is_some()
+        {
+            return;
+        }
+        let Ok(endpoint) = url::Url::parse(&self.server.url) else {
+            return;
+        };
+        self.sign_in = SignIn::Reading;
+        let clients =
+            oauth_client::Clients::new(endpoint, self.http.clone(), context.elsewhere.clone());
+        let target = self.server.name.clone();
+        self._signing_in = Some(cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(sign_in::discover(
+                    clients,
+                    metadata,
+                    context.identities.clone(),
+                ))
+                .await;
+            let kept = match &found {
+                Ok(service) => context
+                    .keychain
+                    .read(service.key(&target))
+                    .await
+                    .ok()
+                    .flatten(),
+                Err(_) => None,
+            };
+            this.update(cx, |this, cx| {
+                this._signing_in = None;
+                match found {
+                    Err(why) => this.sign_in = SignIn::Unavailable(why),
+                    Ok(service) => {
+                        let service = this.current(service);
+                        let host = service.host();
+                        this.service = Some(service.clone());
+                        this.sign_in = SignIn::Offered {
+                            service: host,
+                            why: None,
+                        };
+                        if let Some((subject, refresh)) = kept
+                            && let Ok(refresh) = String::from_utf8(refresh)
+                        {
+                            let source = OAuthSource::kept(
+                                service,
+                                &target,
+                                context.keychain.clone(),
+                                subject,
+                                refresh,
+                            );
+                            this.use_sign_in(source, cx);
+                        }
+                    }
+                }
+                cx.emit(ConnectionEvent::StateChanged);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Signs in through the person's browser, as they asked (spec 016, Signing in): Studio
+    /// listens on a loopback port, opens the sign-in service's page, and exchanges the code it
+    /// returns with. The listener closes after one answer, five minutes, or Cancel.
+    pub fn sign_in(&mut self, cx: &mut Context<Self>) {
+        let (Some(service), Some(context)) = (self.service.clone(), self.sign_in_context.clone())
+        else {
+            return;
+        };
+        let started = oauth_client::Callback::bind().and_then(|callback| {
+            Ok((
+                callback,
+                oauth_client::Pkce::new()?,
+                oauth_client::random_token()?,
+            ))
+        });
+        let (callback, pkce, state) = match started {
+            Ok(started) => started,
+            Err(error) => {
+                self.sign_in = SignIn::Offered {
+                    service: service.host(),
+                    why: Some(format!("Studio could not wait for the sign-in: {error}.")),
+                };
+                cx.emit(ConnectionEvent::StateChanged);
+                cx.notify();
+                return;
+            }
+        };
+        let page = oauth_client::authorization_url(
+            &service.server,
+            &service.client_id,
+            callback.redirect_uri(),
+            &pkce,
+            &state,
+            &service.resource.resource,
+        );
+        cx.open_url(page.as_str());
+        self.sign_in = SignIn::Waiting {
+            service: service.host(),
+        };
+        cx.emit(ConnectionEvent::StateChanged);
+        cx.notify();
+        let target = self.server.name.clone();
+        let host = oauth_client::host_of(&self.server.url);
+        // The sign-in this one replaces, as another account after Not admitted.
+        let previous = self.oauth.clone();
+        self._signing_in = Some(cx.spawn(async move |this, cx| {
+            let redirect = callback.redirect_uri().to_owned();
+            let issuer = service.server.issuer.clone();
+            let exchanged = service.clone();
+            let signed_in = cx
+                .background_executor()
+                .spawn(async move {
+                    let code = smol::future::or(
+                        async { Some(callback.code(&state, &issuer, &host).await) },
+                        async {
+                            smol::Timer::after(oauth_client::SIGN_IN_WAIT).await;
+                            None
+                        },
+                    )
+                    .await
+                    .ok_or("The sign-in was not finished within five minutes.".to_owned())?
+                    .map_err(|error| error.to_string())?;
+                    let service = exchanged;
+                    oauth_client::exchange(
+                        service.clients.for_url(&service.server.token_endpoint),
+                        &service.server,
+                        &code,
+                        &redirect,
+                        &pkce.verifier,
+                        service.expected(),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())
+                })
+                .await;
+            // One account per target: the one replaced ends, its refresh token revoked, and the
+            // keychain keeps only the new one's, or none, never the old account's.
+            if signed_in.is_ok()
+                && let Some(previous) = &previous
+            {
+                previous.replaced().await;
+            }
+            let kept = match &signed_in {
+                Ok(tokens) => match &tokens.refresh_token {
+                    Some(refresh) => context
+                        .keychain
+                        .write(
+                            service.key(&target),
+                            tokens.account.subject.clone(),
+                            refresh.as_bytes().to_vec(),
+                        )
+                        .await
+                        .is_ok(),
+                    None => {
+                        context.keychain.delete(service.key(&target)).await.ok();
+                        false
+                    }
+                },
+                Err(_) => false,
+            };
+            this.update(cx, |this, cx| {
+                this._signing_in = None;
+                match signed_in {
+                    Ok(tokens) => {
+                        let source = OAuthSource::signed_in(
+                            this.current(service),
+                            &target,
+                            context.keychain.clone(),
+                            tokens,
+                            kept,
+                        );
+                        this.use_sign_in(source, cx);
+                    }
+                    Err(why) => {
+                        this.sign_in = SignIn::Offered {
+                            service: service.host(),
+                            why: Some(why),
+                        };
+                        cx.emit(ConnectionEvent::StateChanged);
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Stops waiting for the browser: its listener closes, and nothing it returns is taken.
+    pub fn cancel_sign_in(&mut self, cx: &mut Context<Self>) {
+        if let SignIn::Waiting { service } = &self.sign_in {
+            self.sign_in = SignIn::Offered {
+                service: service.clone(),
+                why: None,
+            };
+            self._signing_in = None;
+            cx.emit(ConnectionEvent::StateChanged);
+            cx.notify();
+        }
+    }
+
+    /// Signs out: the tokens are dropped, the keychain item deleted and, where the service
+    /// takes it, the refresh token revoked; the connection checks again without a token.
+    pub fn sign_out(&mut self, cx: &mut Context<Self>) {
+        let Some(source) = self.oauth.take() else {
+            return;
+        };
+        self.token_source = None;
+        self.holder = None;
+        self._renewal = None;
+        cx.background_executor().spawn(source.sign_out()).detach();
+        self.sign_in = SignIn::Offered {
+            service: source.service().host(),
+            why: None,
+        };
+        self.replace_token(None, None, cx);
+        cx.emit(ConnectionEvent::StateChanged);
+        cx.notify();
+    }
+
+    /// `service`, read or signed in through clients the connection may have replaced since it
+    /// started ([`Self::replace_http`]): its requests to the server's address take the client
+    /// held now, not the one a discovery or browser wait started with.
+    fn current(&self, service: Service) -> Service {
+        Service {
+            clients: service.clients.through(self.http.clone()),
+            ..service
+        }
+    }
+
+    /// Takes the token from `source`, a sign-in just made or kept, and connects with it.
+    fn use_sign_in(&mut self, source: OAuthSource, cx: &mut Context<Self>) {
+        self.oauth = Some(source.clone());
+        self.token_source = Some(Arc::new(source));
+        self.token_given = false;
+        self.asked_after_refusal = false;
+        self.holder = None;
+        self._renewal = None;
+        self.renewal_missed = false;
+        self.connect(cx);
+    }
+
+    /// Forgets the sign-in, which the CLI's credential for the target replaces. The keychain
+    /// keeps it, for the target made anonymous again.
+    fn drop_sign_in(&mut self) {
+        self.oauth = None;
+        self.service = None;
+        self.holder = None;
+        self._renewal = None;
+        self._signing_in = None;
+        self.sign_in = SignIn::NotOffered;
+    }
+
+    /// Asks for the next short-lived token when `lease` says, if a view still shows the server;
+    /// otherwise the next view to show it asks.
+    fn schedule_renewal(&mut self, lease: &Lease, cx: &mut Context<Self>) {
+        let wait = lease
+            .renew_at
+            .duration_since(SystemTime::now())
+            .unwrap_or_default();
+        self._renewal = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            this.update(cx, |this, cx| {
+                // A server not ready is asked again by its next connect, which asks for a token.
+                if this.state != ConnectionState::Ready {
+                    return;
+                }
+                if this.watched() {
+                    this.renewing = true;
+                    this.ask_for_token(false, cx);
+                } else {
+                    this.renewal_missed = true;
+                }
+            })
+            .ok();
+        }));
     }
 
     /// Checks `/healthz` again after the settings' interval while the server is ready, and
@@ -775,6 +1187,9 @@ enum Probe {
 struct Failed {
     state: ConnectionState,
     token_refused: Option<bool>,
+    /// Where the 401's challenge says the server's sign-in details are
+    /// (`resource_metadata`), when it offers a sign-in.
+    sign_in: Option<String>,
 }
 
 impl From<ConnectionState> for Failed {
@@ -782,6 +1197,7 @@ impl From<ConnectionState> for Failed {
         Self {
             state,
             token_refused: None,
+            sign_in: None,
         }
     }
 }
@@ -833,6 +1249,11 @@ async fn list_graphs(client: &GraphClient) -> Result<GraphListing, Failed> {
             return Err(Failed {
                 state: ConnectionState::Unauthorized,
                 token_refused: summary.challenge.as_deref().map(|c| c.token_refused()),
+                sign_in: summary
+                    .challenge
+                    .as_deref()
+                    .and_then(|c| c.resource_metadata())
+                    .map(str::to_owned),
             });
         }
         // A credential that may not list the server's graphs may still discover its own.

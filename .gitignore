@@ -6,3 +6,4 @@
 *.profraw
 /dev/.data
 /.claude/worktrees/
+/dev/.sign-in

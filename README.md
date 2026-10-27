@@ -71,6 +71,15 @@ Or both in one step: `script/dev` starts `script/dev-server` unless a server alr
 its address, runs Studio on `knowledge` once the graphs are seeded, and stops the server it
 started when Studio quits. Its arguments go to `cargo run` (`script/dev --release`).
 
+To try signing in (spec 016), `script/dev-sign-in` serves the same graphs on
+`https://127.0.0.1:8791` behind a sign-in: an `omnigraph-server` that trusts a stand-in sign-in
+service, through TLS from a certificate authority of the script's own. It writes an operator
+home with one anonymous target, `oauth-bed`, that trusts that authority:
+
+```bash
+OMNIGRAPH_HOME=dev/.sign-in/studio-home OMNIGRAPH_STUDIO_OAUTH_CLIENT=https://studio.test/client.json cargo run
+```
+
 A clean debug build takes about 2.5 minutes on an Apple M5 Pro and about 8 GB of `target/`; a
 release build (`cargo run --release`) about 10 minutes.
 
@@ -85,6 +94,7 @@ CLI too (`omnigraph target add`, and `credentials set` for its token).
 | `OMNIGRAPH_STUDIO_TOKEN` | Its bearer token |
 | `OMNIGRAPH_STUDIO_GRAPH` | Opens this graph on that server at launch |
 | `OMNIGRAPH_STUDIO_BRANCH` | The branch to open (default `main`) |
+| `OMNIGRAPH_STUDIO_OAUTH_CLIENT` | The client ID Studio signs in with at any sign-in service, for development (spec 016) |
 | `OMNIGRAPH_STUDIO_DATA` | Directory of `settings.json`, `keymap.json` and the session (default `~/Library/Application Support/Omnigraph Studio`, `%APPDATA%\Omnigraph Studio` on Windows, or `$XDG_CONFIG_HOME/omnigraph-studio`) |
 
 Packaging: `script/bundle-mac` builds an app bundle and a DMG, ad hoc signed unless a signing
