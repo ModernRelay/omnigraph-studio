@@ -81,9 +81,10 @@ const FILES: &[(&str, &str)] = &[
     ),
 ];
 
-/// Writes the skill under `cwd` for every agent, replacing files that differ and removing files
-/// a previous Studio wrote that this one does not. Nothing outside the skill's folders changes:
-/// the folders are opened by handle, never through a link the agent left (`confined`).
+/// Writes the skill under `cwd` for every agent, replacing files that differ and removing, in the
+/// folders the skill ships, every file this Studio does not (one a previous Studio wrote, or an
+/// agent left there). Nothing outside the skill's folders changes: the folders are opened by
+/// handle, never through a link the agent left (`confined`), and another folder is not walked.
 pub fn write(cwd: &Path) -> std::io::Result<()> {
     let cwd = Confined::open(cwd)?;
     for root in ROOTS {
@@ -111,21 +112,35 @@ fn write_tree(dir: &Confined) -> std::io::Result<()> {
 }
 
 /// Removes files under `dir` that are not in [`FILES`]; `prefix` is `dir`'s path in the skill.
+/// Only a folder [`FILES`] holds files in is walked: another (an agent's, of any depth) holds
+/// nothing Studio wrote, and is left as it is, so walking costs what the skill ships.
 fn remove_stale(dir: &Confined, prefix: &str) -> std::io::Result<()> {
     for (name, kind) in dir.entries()? {
         let relative = match prefix {
             "" => name.to_string_lossy().into_owned(),
             prefix => format!("{prefix}/{}", name.to_string_lossy()),
         };
-        match (kind, name.to_str()) {
-            (Kind::Dir, Some(folder)) => remove_stale(&dir.dir(folder)?, &relative)?,
-            _ if FILES.iter().any(|(known, _)| *known == relative) => {}
-            // A folder whose name is not text holds nothing Studio wrote; it is left alone.
-            (Kind::Dir, None) => {}
-            (Kind::Other, _) => dir.remove(&name)?,
+        match kind {
+            Kind::Dir => {
+                if let Some(folder) = name.to_str()
+                    && ships_folder(&relative)
+                {
+                    remove_stale(&dir.dir(folder)?, &relative)?;
+                }
+            }
+            Kind::Other if FILES.iter().any(|(known, _)| *known == relative) => {}
+            Kind::Other => dir.remove(&name)?,
         }
     }
     Ok(())
+}
+
+/// Whether the skill ships a file in the folder at `relative` (`references`).
+fn ships_folder(relative: &str) -> bool {
+    FILES.iter().any(|(path, _)| {
+        path.strip_prefix(relative)
+            .is_some_and(|rest| rest.starts_with('/'))
+    })
 }
 
 #[cfg(test)]
@@ -208,6 +223,13 @@ mod tests {
             .join("references/old.md");
         std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
         std::fs::write(&stale, "old").unwrap();
+        // A folder an agent made inside the skill's, deep: not walked, so left as it is.
+        let deep = cwd
+            .join(".agents/skills")
+            .join(NAME)
+            .join("references/notes/a/a/a/a/a/a/a/a");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("mine.md"), "mine").unwrap();
 
         write(&cwd).unwrap();
         for root in ROOTS {
@@ -218,6 +240,11 @@ mod tests {
         }
         assert!(!stale.exists());
         assert_eq!(std::fs::read_to_string(&neighbour).unwrap(), "keep");
+        assert_eq!(
+            std::fs::read_to_string(deep.join("mine.md")).unwrap(),
+            "mine",
+            "a folder the skill does not ship is not walked"
+        );
         // A second write changes nothing.
         write(&cwd).unwrap();
         std::fs::remove_dir_all(&cwd).ok();
