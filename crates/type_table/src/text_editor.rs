@@ -372,15 +372,13 @@ impl TextEditor {
             }
             None => return,
         };
-        let write = match crate::write::write_property(
+        let write = match crate::write::write_properties(
             &self.session,
             &self.branch,
             &schema,
             &self.type_name,
             &self.id,
-            &self.property,
-            &old,
-            &new,
+            &[(self.property.clone(), old.clone(), new.clone())],
             None,
             cx,
         ) {

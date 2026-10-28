@@ -2708,15 +2708,13 @@ impl NodePeek {
             cx.notify();
             return;
         }
-        let write = match crate::write::write_property(
+        let write = match crate::write::write_properties(
             &self.session,
             &self.branch,
             &schema,
             &type_name,
             &id,
-            &name,
-            &old,
-            &new,
+            &[(name.clone(), old.clone(), new.clone())],
             None,
             cx,
         ) {
@@ -3692,6 +3690,7 @@ impl NodePeek {
             &type_name,
             &id,
             &cells,
+            None,
             cx,
         ) {
             Ok(write) => write,
@@ -7876,7 +7875,11 @@ mod tests {
             session.schema_model().unwrap()
         });
         let (ada, ida) = (json!("Ada"), json!("Ida"));
-        let query = builder::update_cell(&schema, "Person", "name", "p1", &ada, &ida).unwrap();
+        let edit = builder::RowEdit {
+            id: "p1".into(),
+            cells: vec![("name".into(), ada, ida)],
+        };
+        let query = builder::update_rows(&schema, "Person", &[edit]).unwrap();
         view.update(cx, |view, cx| view.reload(cx));
         session
             .update(cx, |session, cx| {

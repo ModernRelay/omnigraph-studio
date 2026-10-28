@@ -2241,41 +2241,6 @@ pub fn search_narrows(previous: &str, text: &str) -> bool {
         })
 }
 
-/// Sets one property of one node, bound to the value the cell showed (spec 004). Zero affected
-/// nodes means the value changed elsewhere. List properties cannot be compared, so they are
-/// bound to the row only.
-pub fn update_cell(
-    schema: &SchemaModel,
-    type_name: &str,
-    property_name: &str,
-    id: &str,
-    old: &Value,
-    new: &Value,
-) -> Result<BuiltQuery, BuildError> {
-    let node = node(schema, type_name)?;
-    let property = property(node, property_name)?;
-    if !property.editable_in_cell() {
-        return Err(BuildError::NotEditable(property.name.clone()));
-    }
-    let mut params = Params::new();
-    let id = params.add("id", "String", Value::String(id.to_owned()));
-    let new = params.add("new", &property.param_type(true), new.clone());
-    let predicate = format!("@id = {id}{}", bound_to(property, old, "old", &mut params)?);
-    let text = format!(
-        "query studio_set({sig}) {{\n  update {ty} set {{ {prop}: {new} }} where {predicate}\n}}\n",
-        sig = params.signature(),
-        ty = node.name,
-        prop = property.name,
-    );
-    Ok(BuiltQuery {
-        name: "studio_set".into(),
-        text,
-        params: params.values,
-        depends: Depends::Unknown,
-        seeds: None,
-    })
-}
-
 /// The condition that binds a statement to the value its row showed for `property` (`old`, as
 /// parameter `param`), so a row changed elsewhere matches nothing; a list is not bound. A
 /// property named by a reserved word cannot be named in a mutation's `where`, so no write to it
@@ -2308,9 +2273,10 @@ pub struct RowEdit {
 }
 
 /// Saves edits of different values on several rows in one mutation, so they publish as one
-/// commit (spec 004, drafts). Each row is one statement setting all its edited properties, bound
-/// to every value the row showed: a row changed elsewhere is left alone whole, and
-/// `affected_nodes` comes back short by it.
+/// commit (spec 004, drafts); a cell's edit is one row's of one property. Each row is one
+/// statement setting all its edited properties, bound to every value the row showed: a row
+/// changed elsewhere is left alone whole, and `affected_nodes` comes back short by it, zero for
+/// a single row. List properties cannot be compared, so they are bound to the row only.
 pub fn update_rows(
     schema: &SchemaModel,
     type_name: &str,
@@ -2748,16 +2714,11 @@ mod tests {
             "node Box {\n  slug: String @key\n  in: String?\n  label: String?\n}\n",
         )
         .unwrap();
-        let refused = update_cell(&schema, "Box", "in", "b1", &json!("x"), &json!("y"));
+        let refused = one_cell(&schema, "Box", "in", "b1", json!("x"), json!("y"));
         assert!(matches!(refused, Err(BuildError::Unbindable(ref name)) if name == "in"));
         let rows = [("b1".to_owned(), json!("x"))];
         assert!(update_cells(&schema, "Box", "in", &rows, &json!("y")).is_err());
-        let edit = RowEdit {
-            id: "b1".into(),
-            cells: vec![("in".into(), json!("x"), json!("y"))],
-        };
-        assert!(update_rows(&schema, "Box", &[edit]).is_err());
-        let label = update_cell(&schema, "Box", "label", "b1", &json!("x"), &json!("y")).unwrap();
+        let label = one_cell(&schema, "Box", "label", "b1", json!("x"), json!("y")).unwrap();
         assert_compiles_in(&schema, &label);
     }
 
@@ -3970,53 +3931,50 @@ mod tests {
         ));
     }
 
+    /// One property of one node set, as a cell's edit is: one row of one cell.
+    fn one_cell(
+        schema: &SchemaModel,
+        type_name: &str,
+        property: &str,
+        id: &str,
+        old: Value,
+        new: Value,
+    ) -> Result<BuiltQuery, BuildError> {
+        let edit = RowEdit {
+            id: id.into(),
+            cells: vec![(property.into(), old, new)],
+        };
+        update_rows(schema, type_name, &[edit])
+    }
+
     #[test]
     fn writes_compile() {
         let schema = dev();
-        assert_compiles(
-            &update_cell(
-                &schema,
-                "Person",
-                "title",
-                "person-000000",
-                &json!("Founder"),
-                &json!("CEO"),
-            )
-            .unwrap(),
+        let person = "person-000000";
+        for (old, new) in [
+            (json!("Founder"), json!("CEO")),
+            (Value::Null, json!("CEO")),
+        ] {
+            assert_compiles(&one_cell(&schema, "Person", "title", person, old, new).unwrap());
+        }
+        let tags = one_cell(
+            &schema,
+            "Person",
+            "tags",
+            person,
+            json!(["a"]),
+            json!(["b"]),
         );
-        assert_compiles(
-            &update_cell(
-                &schema,
-                "Person",
-                "title",
-                "person-000000",
-                &Value::Null,
-                &json!("CEO"),
-            )
-            .unwrap(),
+        assert_compiles(&tags.unwrap());
+        let status = one_cell(
+            &schema,
+            "Project",
+            "status",
+            "project-00000",
+            json!("active"),
+            json!("done"),
         );
-        assert_compiles(
-            &update_cell(
-                &schema,
-                "Person",
-                "tags",
-                "person-000000",
-                &json!(["a"]),
-                &json!(["b"]),
-            )
-            .unwrap(),
-        );
-        assert_compiles(
-            &update_cell(
-                &schema,
-                "Project",
-                "status",
-                "project-00000",
-                &json!("active"),
-                &json!("done"),
-            )
-            .unwrap(),
-        );
+        assert_compiles(&status.unwrap());
         assert_compiles(
             &insert_node(
                 &schema,
@@ -4051,7 +4009,7 @@ mod tests {
             Err(BuildError::UnknownProperty { .. })
         ));
         assert!(matches!(
-            update_cell(&schema, "Person", "slug", "x", &json!("a"), &json!("b")),
+            one_cell(&schema, "Person", "slug", "x", json!("a"), json!("b")),
             Err(BuildError::NotEditable(_))
         ));
     }

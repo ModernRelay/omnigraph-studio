@@ -4797,15 +4797,13 @@ impl TypeTable {
             .pinned
             .clone()
             .filter(|_| same_value(&old, &shown));
-        let write = match write::write_property(
+        let write = match write::write_properties(
             &self.session,
             &self.branch,
             &schema,
             &self.type_name,
             &row_id,
-            &property.name,
-            &old,
-            &new,
+            &[(property.name.clone(), old.clone(), new.clone())],
             read_at,
             cx,
         ) {
@@ -11417,15 +11415,11 @@ mod tests {
             assert_eq!(session.head("main"), Some("c1"));
             session.schema_model().unwrap()
         });
-        let query = builder::update_cell(
-            &schema,
-            "Person",
-            "name",
-            "p1",
-            &"Ada".into(),
-            &"Ida".into(),
-        )
-        .unwrap();
+        let edit = builder::RowEdit {
+            id: "p1".into(),
+            cells: vec![("name".into(), "Ada".into(), "Ida".into())],
+        };
+        let query = builder::update_rows(&schema, "Person", &[edit]).unwrap();
         // Read again as a schema or a naming change reads it: from the head the session holds.
         table.update(cx, |table, cx| table.reload(false, cx));
         session
