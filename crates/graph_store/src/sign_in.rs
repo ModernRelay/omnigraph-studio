@@ -24,9 +24,11 @@ use oauth_client::{
 
 use crate::cli_tokens::{Lease, NoToken, Token, TokenSource};
 
-/// The URL of Studio's Client ID Metadata Document. Not published yet (spec 016, open question
-/// 1): until it is, a sign-in service that takes only metadata documents does not accept Studio.
-const METADATA_DOCUMENT: Option<&str> = None;
+/// The URL of Studio's Client ID Metadata Document, served by omnigraph.dev (spec 016, Client
+/// identity). It is Studio's client ID at every sign-in service that takes metadata documents:
+/// another URL is another client, and everyone signed in would sign in again.
+const METADATA_DOCUMENT: Option<&str> =
+    Some("https://www.omnigraph.dev/oauth/studio-client-metadata.json");
 
 /// Client IDs registered for Studio, by issuer: none yet (spec 016, Client identity).
 const REGISTERED: &[(&str, &str)] = &[];
@@ -935,6 +937,19 @@ mod tests {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_secs()
+    }
+
+    /// A metadata-document client ID is an `https` URL with a path other than `/`, no query and
+    /// no fragment; a sign-in service compares it as a string with the document's `client_id`.
+    #[test]
+    fn studio_s_client_id_is_a_metadata_document_url() {
+        let id = METADATA_DOCUMENT.expect("Studio has a metadata document");
+        let url = url::Url::parse(id).unwrap();
+        assert_eq!(url.scheme(), "https");
+        assert_ne!(url.path(), "/");
+        assert_eq!((url.query(), url.fragment()), (None, None));
+        // Parsing removes dot segments, so an ID with one would not survive unchanged.
+        assert_eq!(url.as_str(), id, "the client ID is sent as written");
     }
 
     impl Served {

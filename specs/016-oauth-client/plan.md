@@ -2,11 +2,12 @@
 
 Status: implemented for a CLI server target with `auth: anonymous` whose server offers sign-in
 (`oauth_client`, `graph_store::sign_in`, 2026-10-26), and tested end to end against Omnigraph
-v0.14.0 (`script/dev-sign-in`). Studio has no client identity yet (open question 1): until its
-metadata document is published or it is registered, a real sign-in service refuses it, and only
-`OMNIGRAPH_STUDIO_OAUTH_CLIENT` (development) signs in. A managed target still reaches its
-cluster on the CLI's login (spec 003, since 2026-10-25) until the managed control plane's
-prerequisites below are met · 2026-10-26
+v0.14.0 (`script/dev-sign-in`). Studio's client ID is its metadata document,
+`https://www.omnigraph.dev/oauth/studio-client-metadata.json` (ModernRelay/brand#26);
+whether the managed control plane's sign-in service accepts it, on any loopback port, is not yet
+tried (open questions 1 and 2). A managed target still reaches its cluster on the CLI's login
+(spec 003, since 2026-10-25) until the managed control plane's prerequisites below are met ·
+2026-10-29
 
 ## Problem
 
@@ -135,13 +136,18 @@ Studio restarts; they hold no secrets.
 
 ### Client identity
 
-- Studio's `client_id` is the URL of its Client ID Metadata Document, an HTTPS JSON document
-  ModernRelay publishes at a stable address (open question 1), used with an authorization
+- Studio's `client_id` is the URL of its Client ID Metadata Document,
+  `https://www.omnigraph.dev/oauth/studio-client-metadata.json`, served by the omnigraph.dev
+  site (ModernRelay/brand, `apps/omnigraph/public/oauth/`) and used with an authorization
   server whose metadata says `client_id_metadata_document_supported: true`:
-  `{"client_id": <its URL>, "client_name": "Omnigraph Studio", "redirect_uris":
-  ["http://127.0.0.1/callback"], "grant_types": ["authorization_code", "refresh_token"],
-  "response_types": ["code"], "token_endpoint_auth_method": "none"}`. The loopback redirect is
-  listed without a port; the authorization server must accept any port on it (RFC 8252 §7.3).
+  `{"client_id": <its URL>, "client_name": "Omnigraph Studio", "client_uri":
+  "https://www.omnigraph.dev", "logo_uri": <its logo beside it>, "application_type": "native",
+  "redirect_uris": ["http://127.0.0.1/callback"], "grant_types": ["authorization_code",
+  "refresh_token"], "response_types": ["code"], "token_endpoint_auth_method": "none"}`. The
+  loopback redirect is listed without a port; the authorization server must accept any port on
+  it (RFC 8252 §7.3), as it must for Claude Code's document, which does the same. The URL is on
+  `www.` because the apex redirects, and a service must not follow a redirect to the document.
+  It is Studio's identity: another URL is another client, and everyone signed in signs in again.
 - An authorization server that does not accept a metadata-document client ID may have Studio
   pre-registered as a public client with loopback redirects. Its ID is kept in Studio per
   issuer, as data shipped with Studio, not typed by the person. A registered ID is used before
@@ -297,6 +303,7 @@ Studio restarts; they hold no secrets.
   Its authorization server is AuthKit. Studio must not depend on `/openapi.json` being
   reachable through every deployment's proxy.
 - **ModernRelay**: publish Studio's Client ID Metadata Document at a stable HTTPS address.
+  Proposed in ModernRelay/brand#26 (2026-10-29).
 - **Omnigraph**: nothing beyond what 0.14.0 serves (A1 is implemented); tracked in #1025.
 - **Studio's CLI finder** (spec 003): it chooses a CLI by `version --json`, and 0.14.0's CLI
   reports access protocol 2 (target and credential 2 as well); Studio must accept it before a
@@ -332,10 +339,10 @@ Studio restarts; they hold no secrets.
 
 ## Open questions
 
-1. Where Studio's Client ID Metadata Document is published, and whether the managed control
-   plane's authorization server accepts it for Studio, or Studio is pre-registered there (and
-   with which ID per environment). The managed control plane prefers metadata-document
-   clients and keeps pre-registration for clients that need it.
+1. Whether the managed control plane's authorization server accepts Studio's metadata
+   document, or Studio is pre-registered there (and with which ID per environment). The
+   document is published on omnigraph.dev (Client identity); AuthKit takes metadata documents
+   once they are enabled for an environment (enabled 2026-10-29).
 2. Whether that authorization server accepts a loopback redirect on any port (RFC 8252 §7.3)
    for a public client.
 3. Which scopes Studio requests so that a refresh token is issued (for example
@@ -374,6 +381,7 @@ Studio restarts; they hold no secrets.
 | 2026-10-29 | The two items left open are closed | `graph_store` `sign_in::tests::a_rotation_the_keychain_refuses_leaves_what_it_holds_said` (extended: a refused rotation forgets the token from before, and says one the keychain will not delete), `connection::tests::a_token_answered_after_its_source_was_replaced_is_not_taken`, `a_connect_whose_source_was_replaced_asks_the_new_one` | Pass. A refused rotation left this account's token from before in the keychain while saying the sign-in lasts until Studio quits; a service that keeps old refresh tokens honoured would have signed the next launch in with it. It is forgotten now, as a sign-in that keeps nothing forgets. A token source's answer was taken whatever source the connection had come to take its token from: a Refresh or renewal under way at a sign-out could put the signed-out token back. An answer is now taken only from the source still in use, and a connect that waited on a source replaced meanwhile asks the one now in use, which may give the token already held and so start no connect of its own |
 | 2026-10-29 | A fifth independent review, of the last three commits | `graph_store` `connection::tests::a_connect_whose_source_was_replaced_asks_the_new_one` (extended: a window waiting after a Cancel), `sign_in::tests::a_sign_in_dropped_during_a_refresh_is_decided_after_it` | Pass. It found no answer of the source in use dropped, no double revocation and no guard held across an await. Taken: a connect's answer dropped for a replaced source, the connection idle after a Cancel, left a waiting window without its token; a sign-in dropped for the CLI's credential was judged before a refresh under way settled, so a token it rotated could be left with nobody; a sign-in given up while it waited for the one it replaced could lose that one's revocation. Endings now run on their own once begun |
 | 2026-10-29 | A sixth independent review, of the endings commit | `graph_store` `sign_in::tests::a_refresh_that_answers_after_its_sign_out_keeps_nothing` (extended: the sign-in reads not kept), `connection::tests::a_connect_whose_source_was_replaced_asks_the_new_one` (extended: the target made anonymous while a window waits) | Pass. It found no defect in that commit. Taken, from its edges: a refresh answered after its sign-in ended still said the keychain held the sign-in, so an ending deciding by that (the CLI's credential) could leave the rotated token unrevoked; a window waiting for a source's answer did not hear the token was ready when the source went |
+| 2026-10-29 | Studio's metadata document follows the draft and the clients that use it | draft-ietf-oauth-client-id-metadata-document (July 2026) §3 (URL rules), §4 (`client_id` equal to the fetched URL, served 200 as JSON), §4.2 (exact redirect match), §5 (no redirect followed); the documents Claude Code and VS Code publish; `graph_store` `sign_in::tests::studio_s_client_id_is_a_metadata_document_url` | The URL is `https` with a path and no query or fragment, on `www.` since the apex redirects. §4.2 asks for an exact redirect match while Studio's port changes at each sign-in; Claude Code lists `http://127.0.0.1/callback` without a port too, so a sign-in through AuthKit on a free port is the check that remains (open question 2) |
 
 ## Corrections
 
