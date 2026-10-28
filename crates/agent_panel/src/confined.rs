@@ -227,13 +227,6 @@ mod unix {
             Ok(())
         }
     }
-
-    fn refused(name: &str) -> io::Error {
-        io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("{name} is a link or not what Studio expects there; Studio does not use it"),
-        )
-    }
 }
 
 /// Windows opens no name relative to a directory's handle through the standard library, so
@@ -435,13 +428,15 @@ mod pinned {
             Ok(())
         }
     }
+}
 
-    fn refused(name: &str) -> io::Error {
-        io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("{name} is a link or not what Studio expects there; Studio does not use it"),
-        )
-    }
+/// Why a name was not used: it is a link, or not the kind of entry Studio expects there.
+#[cfg(any(unix, windows))]
+fn refused(name: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("{name} is a link or not what Studio expects there; Studio does not use it"),
+    )
 }
 
 /// [`check_name`] for a name an entry listing gave, which may not be text: it names one entry of

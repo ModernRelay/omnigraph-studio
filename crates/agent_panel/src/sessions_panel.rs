@@ -239,8 +239,12 @@ impl SessionsPanel {
             return;
         };
         let title = editor.read(cx).text(cx);
-        self.sessions
-            .update(cx, |sessions, cx| sessions.rename(&id, &title, cx));
+        // The conversation may have been rebound since the field opened (its agent could not
+        // load it): the name goes to it under the id it has now.
+        self.sessions.update(cx, |sessions, cx| {
+            let id = sessions.current(&id);
+            sessions.rename(&id, &title, cx)
+        });
         cx.notify();
     }
 
@@ -270,7 +274,8 @@ impl SessionsPanel {
 
     /// Forgets the conversation here and asks the agent to delete it, when it can.
     fn delete(&mut self, record: &SessionRecord, cx: &mut Context<Self>) {
-        let id = record.session.clone();
+        // Under the id it has now: it may have been rebound while the confirmation was open.
+        let id = self.sessions.read(cx).current(&record.session);
         self.sessions
             .update(cx, |sessions, cx| sessions.remove(&id, cx));
         let Some(agent) = Self::agent(cx).filter(|agent| agent.command.join(" ") == record.agent)

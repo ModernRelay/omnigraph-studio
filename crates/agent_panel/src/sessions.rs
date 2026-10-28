@@ -84,7 +84,15 @@ pub struct AgentSessions {
     /// Agent branches given to conversations begun in this run, by graph, before their records
     /// are written at Ready ([`Self::claim_branch`]).
     claimed: HashSet<(String, String)>,
+    /// The ids conversations were rebound from in this run, oldest first, each with the id it
+    /// moved to ([`Self::rebind`]), [`REBOUND_KEPT`] at most: a rename or a delete begun on a
+    /// conversation's old id finishes on its new one ([`Self::current`]).
+    rebound: Vec<(String, String)>,
 }
+
+/// How many rebinds [`AgentSessions`] keeps: one happens when an agent could not load a
+/// conversation it was asked for, so a run sees few.
+const REBOUND_KEPT: usize = 64;
 
 struct GlobalSessions(Entity<AgentSessions>);
 
@@ -119,6 +127,7 @@ impl AgentSessions {
             unread: HashSet::new(),
             deleted: HashSet::new(),
             claimed: HashSet::new(),
+            rebound: Vec::new(),
         }
     }
 
@@ -206,12 +215,29 @@ impl AgentSessions {
     /// load it, and a new conversation took its place on its branch.
     pub fn rebind(&mut self, old: &str, new: String, cx: &mut Context<Self>) {
         if let Some(record) = self.records.iter_mut().find(|record| record.session == old) {
-            record.session = new;
+            record.session = new.clone();
             self.live.remove(old);
             self.unread.remove(old);
+            if self.rebound.len() == REBOUND_KEPT {
+                self.rebound.remove(0);
+            }
+            self.rebound.push((old.to_owned(), new));
             self.save();
             cx.notify();
         }
+    }
+
+    /// The id conversation `id` has now: the one it was rebound to, if it was, through each
+    /// rebind since.
+    pub fn current(&self, id: &str) -> String {
+        let mut id = id.to_owned();
+        // Each rebind is looked through once, so a cycle cannot hold it.
+        for (old, new) in &self.rebound {
+            if *old == id {
+                id = new.clone();
+            }
+        }
+        id
     }
 
     /// Records a conversation, or updates its branch, keeping its title, times and pin; one
@@ -688,6 +714,27 @@ mod tests {
             archived: false,
             cwd: graph_cwd(graph),
         }
+    }
+
+    /// A conversation rebound in this run is found by an id it had before, through each rebind
+    /// since, and its old ids keep none of its state.
+    #[gpui::test]
+    fn a_rebound_conversation_is_found_by_its_old_id(cx: &mut gpui::TestAppContext) {
+        let path = std::env::temp_dir().join(format!("studio-rebind-{}.json", std::process::id()));
+        let sessions = cx.new(|_| AgentSessions::load(path.clone()));
+        sessions.update(cx, |sessions, cx| {
+            sessions.upsert(record("a", "server/crm", "claude", 0), cx);
+            sessions.rebind("a", "b".into(), cx);
+            sessions.rebind("b", "c".into(), cx);
+            assert_eq!(sessions.current("a"), "c");
+            assert_eq!(sessions.current("b"), "c");
+            assert_eq!(sessions.current("c"), "c");
+            assert_eq!(sessions.current("other"), "other");
+            // A rebind of an id no record has changes nothing.
+            sessions.rebind("gone", "d".into(), cx);
+            assert_eq!(sessions.current("gone"), "gone");
+        });
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
