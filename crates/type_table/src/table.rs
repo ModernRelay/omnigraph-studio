@@ -8986,15 +8986,6 @@ mod tests {
         table.read_with(cx, |table, cx| table.grid.read(cx).renders)
     }
 
-    /// A root that draws nothing, for a window whose table is never drawn.
-    struct Blank;
-
-    impl Render for Blank {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div()
-        }
-    }
-
     /// A table not drawn (restored with the workspace behind another tab) reads no rows: not
     /// when it is made, nor when the branch moves. Drawn, it reads them. Before, every such
     /// table read its first page at start and again at every branch move.
@@ -9006,7 +8997,7 @@ mod tests {
         });
         let session = session(PEOPLE, cx);
         cx.run_until_parked();
-        let (_blank, cx) = cx.add_window_view(|_, _| Blank);
+        let (_blank, cx) = cx.add_window_view(|_, _| gpui::EmptyView);
         let hidden = cx.update(|window, cx| {
             let session = session.clone();
             cx.new(|cx| {

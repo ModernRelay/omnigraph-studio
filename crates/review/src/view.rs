@@ -4044,15 +4044,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// A root that draws nothing, for a window whose review is never drawn.
-    struct Blank;
-
-    impl Render for Blank {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div()
-        }
-    }
-
     /// A review not drawn (restored with the workspace behind another tab) reads no diff until
     /// it is shown; drawn, it reads. Before, every restored review read its whole diff at start.
     #[gpui::test]
@@ -4062,7 +4053,7 @@ pub(crate) mod tests {
             editor::init(cx);
         });
         let (session, _) = reviewed_server_writing(false, cx);
-        let (_blank, cx) = cx.add_window_view(|_, _| Blank);
+        let (_blank, cx) = cx.add_window_view(|_, _| gpui::EmptyView);
         let hidden = cx.update(|window, cx| {
             let session = session.clone();
             cx.new(|cx| ReviewView::new(session, "feature".into(), "main".into(), window, cx))

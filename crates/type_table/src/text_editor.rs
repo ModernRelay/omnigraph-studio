@@ -776,15 +776,6 @@ mod tests {
         });
     }
 
-    /// A root that draws nothing, for a window whose editor is never drawn.
-    struct Blank;
-
-    impl Render for Blank {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div()
-        }
-    }
-
     /// A tab not drawn (restored with the workspace behind another) reads nothing: not when it
     /// is made, nor when the branch moves; it saves nothing until it has read. Before, every such
     /// tab read its node at start and at each branch move.
@@ -796,7 +787,7 @@ mod tests {
         });
         let session = session_answering(PEOPLE, 200, committed("c2", "c1"), cx);
         cx.run_until_parked();
-        let (_blank, cx) = cx.add_window_view(|_, _| Blank);
+        let (_blank, cx) = cx.add_window_view(|_, _| gpui::EmptyView);
         let hidden = cx.update(|window, cx| {
             let session = session.clone();
             cx.new(|cx| {
