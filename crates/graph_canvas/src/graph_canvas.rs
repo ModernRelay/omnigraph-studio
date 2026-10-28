@@ -642,11 +642,30 @@ impl GraphCanvas {
         cx.notify();
     }
 
-    /// Lays out what the walk's changes left to lay out: called when the canvas is drawn.
+    /// Lays out what the walk's changes left to lay out: called when the canvas is drawn. A
+    /// change that leaves the walk's scene as it is drawn (a page asked for and not in yet, a
+    /// selection, a read that changes no chip) lays out nothing: with no layout under way and
+    /// no chip being dragged, the chips stay where they are. Pins and Reset layout ask for a
+    /// layout of the same scene, and go through [`Self::rebuild`].
     fn lay_out_owed(&mut self, cx: &mut Context<Self>) {
-        if self.layout_owed {
-            self.rebuild(cx);
+        if !self.layout_owed {
+            return;
         }
+        let settled = self.draws_exploration()
+            && self.layout_task.is_none()
+            && self.next_layout.is_none()
+            && !self.drag.as_ref().is_some_and(|drag| drag.moved);
+        if settled && let Some(scene) = self.explore_scene(cx) {
+            let root = self.exploration.read(cx).root().cloned();
+            if self.layout_key == Some((Mode::Explore, root)) && *self.scene == scene {
+                self.layout_owed = false;
+                return;
+            }
+            self.layout_owed = false;
+            self.lay_out_explore(scene, cx);
+            return;
+        }
+        self.rebuild(cx);
     }
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
@@ -3082,6 +3101,57 @@ mod tests {
         canvas.update(cx, |canvas, cx| canvas.pointer_left(cx));
         cx.run_until_parked();
         assert!(!asked(cx), "stopped, and nothing says they were asked for");
+    }
+
+    /// A walk's change that leaves its scene as drawn lays out nothing: the chips stay put, and
+    /// no layout runs off the main thread for them. Before, every change laid the same scene
+    /// out again, as "+K more" did while its page was read. A change of the scene lays out.
+    #[gpui::test]
+    async fn a_change_that_moves_no_chip_lays_out_nothing(cx: &mut gpui::TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let (session, _served) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\n",
+            |_| serde_json::json!([{ "id": "p1", "label": "Ada", "n": 1 }]),
+            cx,
+        );
+        cx.run_until_parked();
+        let canvas = cx.new(|cx| GraphCanvas::new(session, cx));
+        let exploration = canvas.read_with(cx, |canvas, _| canvas.exploration.clone());
+        exploration.update(cx, |exploration, cx| {
+            exploration.root_at(NodeRef::new("Person", "p1"), cx)
+        });
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        canvas.update(cx, |canvas, cx| canvas.lay_out_owed(cx));
+        cx.run_until_parked();
+        let laid_out = canvas.read_with(cx, |canvas, _| {
+            assert!(!canvas.scene.nodes.is_empty());
+            canvas.layout_generation
+        });
+
+        canvas.update(cx, |canvas, cx| {
+            canvas.owe_layout(cx);
+            canvas.lay_out_owed(cx);
+            assert!(!canvas.layout_owed);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            canvas.read_with(cx, |canvas, _| canvas.layout_generation),
+            laid_out,
+            "the same scene is not laid out again"
+        );
+
+        exploration.update(cx, |exploration, cx| {
+            exploration.root_at(NodeRef::new("Person", "p2"), cx)
+        });
+        canvas.update(cx, |canvas, cx| canvas.lay_out_owed(cx));
+        cx.run_until_parked();
+        assert!(
+            canvas.read_with(cx, |canvas, _| canvas.layout_generation) > laid_out,
+            "another scene is"
+        );
     }
 
     /// Show on canvas of a node the exploration shows selects it there: it does not start the
