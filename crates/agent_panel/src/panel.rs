@@ -1336,12 +1336,21 @@ impl AgentPanel {
             // (`omnigraph_cli`), so the agent and Studio take the same CLI.
             let configured = graph_store::cli::configured();
             tasks.push(cx.spawn(async move |this, cx| {
-                let chosen = cx
+                let (chosen, passed_over) = cx
                     .background_spawn(async move {
-                        cli_home::choose_cli(&home, graph_store::cli::candidates()).await
+                        let chosen =
+                            cli_home::choose_cli(&home, graph_store::cli::candidates()).await;
+                        let passed_over = configured.filter(|configured| match &chosen {
+                            cli_home::CliChoice::Chosen { cli, .. } => {
+                                std::fs::canonicalize(configured).ok()
+                                    != std::fs::canonicalize(cli).ok()
+                            }
+                            _ => false,
+                        });
+                        (chosen, passed_over)
                     })
                     .await;
-                this.update(cx, |this, cx| this.cli_chosen(chosen, configured, cx))
+                this.update(cx, |this, cx| this.cli_chosen(chosen, passed_over, cx))
                     .ok();
             }));
         }
@@ -2330,12 +2339,12 @@ impl AgentPanel {
     }
 
     /// Studio found (or did not find) a CLI that speaks the graph's API for this conversation.
-    /// A configured CLI it passed over, every CLI it found when none fits, and one the agent's
-    /// shell cannot run through the wrapper, are named.
+    /// The configured CLI it passed over for another (`passed_over`), every CLI it found when
+    /// none fits, and one the agent's shell cannot run through the wrapper, are named.
     fn cli_chosen(
         &mut self,
         choice: cli_home::CliChoice,
-        configured: Option<PathBuf>,
+        passed_over: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) {
         let contract = graph_client::CONTRACT;
@@ -2357,9 +2366,7 @@ impl AgentPanel {
                 version,
                 wrapper,
             } => {
-                if let Some(configured) = configured
-                    && std::fs::canonicalize(&configured).ok() != std::fs::canonicalize(&cli).ok()
-                {
+                if let Some(configured) = passed_over {
                     self.say(
                         format!(
                             "`omnigraph_cli` ({}) does not speak this graph's HTTP API \
