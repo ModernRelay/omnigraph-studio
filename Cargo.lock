@@ -203,6 +203,7 @@ dependencies = [
  "smol",
  "studio_actions",
  "studio_settings",
+ "studio_theme",
  "studio_ui",
  "studio_workspace",
  "uds_windows",

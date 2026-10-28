@@ -4956,6 +4956,70 @@ impl AgentPanel {
 mod tests {
     use super::*;
 
+    /// A conversation restored with the workspace behind another tab starts no agent: its start
+    /// waits for the tab's first draw, which takes it. Before, every restored conversation
+    /// started its agent at launch, a process and a replay each. (A drawn tab here has no agent
+    /// to start, so the test starts no process.)
+    #[gpui::test]
+    async fn a_restored_conversation_starts_its_agent_when_shown(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+            editor::init(cx);
+        });
+        let agent = |command: &[&str], cx: &mut gpui::TestAppContext| {
+            cx.update(|cx| {
+                let mut settings = StudioSettings::get(cx).clone();
+                settings.agent.command = command.iter().map(|part| (*part).to_owned()).collect();
+                cx.set_global(settings);
+            })
+        };
+        agent(&["an-agent"], cx);
+        let (session, _) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n}\n",
+            |_| serde_json::json!([]),
+            cx,
+        );
+        cx.run_until_parked();
+        let (_root, cx) = cx.add_window_view(|_, _| gpui::EmptyView);
+        let hidden = cx.update(|window, cx| {
+            let session = session.clone();
+            cx.new(|cx| {
+                let mut panel = AgentPanel::new(
+                    session,
+                    WeakEntity::new_invalid(),
+                    Some("s1".into()),
+                    window,
+                    cx,
+                );
+                panel.start_when_shown(cx);
+                panel
+            })
+        });
+        cx.run_until_parked();
+        hidden.read_with(cx, |panel, _| {
+            assert!(matches!(panel.state, State::Idle), "no agent started");
+            assert!(panel.start_owed, "it starts when drawn");
+        });
+
+        agent(&[], &mut cx.cx);
+        let (shown, cx) = cx.add_window_view(|window, cx| {
+            let mut panel = AgentPanel::new(
+                session,
+                WeakEntity::new_invalid(),
+                Some("s2".into()),
+                window,
+                cx,
+            );
+            panel.start_when_shown(cx);
+            panel
+        });
+        cx.run_until_parked();
+        shown.read_with(cx, |panel, _| {
+            assert!(!panel.start_owed, "the draw took it")
+        });
+    }
+
     /// Rendering asks [`shows_query`] of every tool call; it agrees with [`shown_query`].
     #[test]
     fn a_run_shows_its_query_only_when_it_gives_one() {
