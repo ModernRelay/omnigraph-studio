@@ -536,19 +536,22 @@ impl BlobView {
     }
 
     /// Hands the value to the system's own application for its kind, through an owner-only
-    /// folder in Studio's data directory that keeps a day's worth.
+    /// folder in Studio's data directory that keeps a day's worth, in a folder of its own
+    /// ([`open_folder`]).
     fn open_elsewhere(&mut self, cx: &mut Context<Self>) {
         let directory = studio_settings::data_dir().join("blobs");
-        let path = directory.join(self.file_name());
+        let name = self.file_name();
         self.export = Some(Export::Busy("Opening…"));
         cx.notify();
-        // The folder is made private and emptied of day-old files off the main thread.
+        // The folder is made private and emptied of day-old values off the main thread.
         self._export = Some(cx.spawn(async move |this, cx| {
             let prepared = cx
-                .background_spawn(async move { prepare_open_folder(&directory) })
+                .background_spawn(async move {
+                    prepare_open_folder(&directory).and_then(|()| open_folder(&directory))
+                })
                 .await;
             this.update(cx, |this, cx| match prepared {
-                Ok(()) => this.write_to(path, true, cx),
+                Ok(folder) => this.write_to(folder.join(name), true, cx),
                 Err(error) => {
                     this.export = Some(Export::Failed(format!("Could not write: {error}")));
                     cx.notify();
@@ -1039,8 +1042,26 @@ impl BlobView {
     }
 }
 
+/// A folder of its own, in `directory`, for one value handed to another application: a value
+/// is named by its node and property (`blob::file_name`), which another graph's or another
+/// commit's value can share, and a file written over would change under the application still
+/// showing the first.
+fn open_folder(directory: &std::path::Path) -> std::io::Result<PathBuf> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    let folder = directory.join(format!(
+        "{stamp:x}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&folder)?;
+    Ok(folder)
+}
+
 /// The folder values are handed to other applications from: owner-only, emptied of anything a
-/// day old.
+/// day old, a value's own folder ([`open_folder`]) with the value in it.
 fn prepare_open_folder(directory: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(directory)?;
     #[cfg(unix)]
@@ -1057,7 +1078,11 @@ fn prepare_open_folder(directory: &std::path::Path) -> std::io::Result<()> {
             .and_then(|modified| modified.elapsed().ok())
             .is_some_and(|age| age > day);
         if old {
-            std::fs::remove_file(entry.path()).ok();
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                std::fs::remove_dir_all(entry.path()).ok();
+            } else {
+                std::fs::remove_file(entry.path()).ok();
+            }
         }
     }
     Ok(())
@@ -2397,13 +2422,30 @@ mod tests {
         assert_eq!(pages[0].1, PDF_DRAW_WIDTH);
     }
 
+    /// The folder values are opened from keeps a day: a fresh value stays, a day-old value's
+    /// own folder goes with what it holds. Two opens of values of one name (another graph's,
+    /// another commit's) are written to two places, so neither replaces the other.
     #[test]
     fn the_open_folder_keeps_a_day() {
         let dir = std::env::temp_dir().join(format!("studio-blob-open-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
         prepare_open_folder(&dir).unwrap();
         std::fs::write(dir.join("fresh.txt"), b"x").unwrap();
+        let (first, second) = (open_folder(&dir).unwrap(), open_folder(&dir).unwrap());
+        assert_ne!(first, second, "each open its own folder");
+        std::fs::write(first.join("p1-photo.png"), b"one").unwrap();
+        std::fs::write(second.join("p1-photo.png"), b"two").unwrap();
+        assert_eq!(std::fs::read(first.join("p1-photo.png")).unwrap(), b"one");
+        let two_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 60 * 60);
+        std::fs::File::open(&first)
+            .unwrap()
+            .set_modified(two_days_ago)
+            .unwrap();
         prepare_open_folder(&dir).unwrap();
         assert!(dir.join("fresh.txt").exists());
+        assert!(!first.exists(), "a day-old value's folder goes whole");
+        assert!(second.join("p1-photo.png").exists());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
