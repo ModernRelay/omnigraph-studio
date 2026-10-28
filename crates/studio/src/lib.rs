@@ -63,16 +63,22 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &Quit, cx| cx.defer(|cx| studio_workspace::quit(false, cx)));
     // The file when it exists; a run from a terminal logs to its output, so then the folder.
     // A folder that cannot be made is said, with its path and why: the menu item would
-    // otherwise do nothing at all.
-    cx.on_action(
-        |_: &RevealLog, cx| match log_to_reveal(&logging::log_file()) {
-            Ok(LogPlace::File(file)) => cx.reveal_path(&file),
-            Ok(LogPlace::Folder(dir)) => cx.open_with_system(&dir),
-            // Deferred: the window the action came from is held for dispatch, and the toast
-            // goes there.
-            Err(message) => cx.defer(move |cx| tell(cx, ToastKind::Error, message)),
-        },
-    );
+    // otherwise do nothing at all. Looked for and made off the main thread; the window the
+    // action came from is no longer held for dispatch when the answer comes.
+    cx.on_action(|_: &RevealLog, cx| {
+        let file = logging::log_file();
+        cx.spawn(async move |cx| {
+            let place = cx
+                .background_spawn(async move { log_to_reveal(&file) })
+                .await;
+            cx.update(|cx| match place {
+                Ok(LogPlace::File(file)) => cx.reveal_path(&file),
+                Ok(LogPlace::Folder(dir)) => cx.open_with_system(&dir),
+                Err(message) => tell(cx, ToastKind::Error, message),
+            });
+        })
+        .detach();
+    });
     // Deferred: an action reaches here while its window is held for dispatch, and opening the
     // link updates that window.
     cx.on_action(|action: &OpenLink, cx| {
@@ -411,7 +417,7 @@ fn reopen_window(
     {
         connection.update(cx, |connection, cx| connection.connect_if_idle(cx));
     }
-    let mut last = None;
+    // Every graph left is on a listed target ([`reopenable`]), the one shown among them.
     for (index, graph) in saved.session.graphs.iter().enumerate() {
         let Some(connection) = connection_of(graph, cx) else {
             continue;
@@ -426,19 +432,10 @@ fn reopen_window(
         } else {
             // Parked: it sends nothing, its first reads included, until it is first shown.
             let session = open_session_behind(connection, graph_id, branch, cx);
-            last = Some(session.entity_id());
             workspace.update(cx, |workspace, cx| {
                 workspace.add_session_behind(session, cx)
             });
         }
-    }
-    // The graph it showed could not be reopened: the last one that could is shown instead.
-    if let Some(id) = last {
-        workspace.update(cx, |workspace, cx| {
-            if workspace.session().is_none() {
-                workspace.show_graph(id, window, cx)
-            }
-        });
     }
 }
 
@@ -592,26 +589,9 @@ pub fn open_link(link: &str, cx: &mut App) {
                 .into(),
         );
     };
-    let wanted = graph_client::server_root(&target.server).unwrap_or(target.server.clone());
-    let connection = ConnectionRegistry::global(cx)
-        .read(cx)
-        .connections
-        .iter()
-        .find(|connection| {
-            let url = &connection.read(cx).server.url;
-            graph_client::server_root(url).as_deref().unwrap_or(url) == wanted
-        })
-        .cloned();
-    let Some(connection) = connection else {
-        return tell(
-            cx,
-            ToastKind::Error,
-            format!(
-                "Studio does not know the server {}. Add it under “Open a graph” first; a link \
-                 never adds a server.",
-                target.server
-            ),
-        );
+    let connection = match link_connection(&target, cx) {
+        Ok(connection) => connection,
+        Err(message) => return tell(cx, ToastKind::Error, message),
     };
     // A link that names no branch opens a graph on main, and leaves one the window has open on
     // its own branch, as "Open a graph" does.
@@ -694,6 +674,53 @@ pub fn open_link(link: &str, cx: &mut App) {
         }
     }
     cx.activate(true);
+}
+
+/// The known server a link's `target` opens with, matched by its address
+/// (`graph_client::server_root`): the one server there, or, of two CLI targets at one address,
+/// each with its own credential, the one a window has the graph open on. The link names only
+/// the address, so it picks no credential the person has not: otherwise why not, naming them.
+fn link_connection(
+    target: &deep_link::Target,
+    cx: &App,
+) -> Result<Entity<graph_store::Connection>, String> {
+    let wanted = graph_client::server_root(&target.server).unwrap_or(target.server.clone());
+    let at: Vec<Entity<graph_store::Connection>> = ConnectionRegistry::global(cx)
+        .read(cx)
+        .connections
+        .iter()
+        .filter(|connection| {
+            let url = &connection.read(cx).server.url;
+            graph_client::server_root(url).as_deref().unwrap_or(url) == wanted
+        })
+        .cloned()
+        .collect();
+    match at.as_slice() {
+        [] => Err(format!(
+            "Studio does not know the server {}. Add it under “Open a graph” first; a link never \
+             adds a server.",
+            target.server
+        )),
+        [one] => Ok(one.clone()),
+        several => several
+            .iter()
+            .find(|connection| window_holding(connection, &target.graph, cx).is_some())
+            .cloned()
+            .ok_or_else(|| {
+                let names: Vec<String> = several
+                    .iter()
+                    .map(|connection| connection.read(cx).server.name.clone())
+                    .collect();
+                format!(
+                    "Studio knows {} servers at {}: {}. A link names only the address, so open \
+                     {} from “Open a graph”, which says which.",
+                    several.len(),
+                    target.server,
+                    names.join(", "),
+                    target.graph
+                )
+            }),
+    }
 }
 
 /// The workspace window that has `graph` on `connection`'s server open, with its session there.
@@ -1037,6 +1064,49 @@ mod start_tests {
             assert!(!workspace.has_modal(), "no dialog over the link's graph");
             assert_eq!(workspace.session().unwrap().read(cx).graph_id, "g");
         });
+    }
+
+    /// A link names a server by its address alone. Of two CLI targets there, each with its own
+    /// credential, it opens with the one a window has the graph open on, and with neither open
+    /// it is refused, naming both. Before, it took whichever was listed first.
+    #[gpui::test]
+    fn a_link_to_two_servers_at_one_address_picks_no_credential(cx: &mut TestAppContext) {
+        let (registry, _servers, _asked) = studio_with_servers(cx);
+        let (work, admin) = registry.update(cx, |registry, cx| {
+            registry.set_listed_for_tests(true, cx);
+            (
+                registry.add_server_for_tests("work", "http://shared.test", None, cx),
+                registry.add_server_for_tests("admin", "http://shared.test", None, cx),
+            )
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let link = "omnigraph-studio://graph?server=http://shared.test&graph=g";
+        // From the app, as `OpenLink` defers it: a toast cannot be put in a window being updated.
+        cx.cx.update(|cx| open_link(link, cx));
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.session().is_none(), "nothing opened");
+            let said = workspace.toast_messages();
+            assert_eq!(said.len(), 1);
+            assert!(said[0].contains("work, admin"), "{said:?}");
+        });
+
+        // The graph open on `admin`: the link opens there.
+        cx.update(|window, cx| {
+            show_graph_in(&workspace, admin.clone(), "g".into(), None, window, cx)
+        });
+        cx.cx.update(|cx| open_link(link, cx));
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            let session = workspace.session().unwrap().read(cx);
+            assert_eq!(session.graph_id, "g");
+            assert_eq!(session.connection.read(cx).server.name, "admin");
+        });
+        assert_eq!(
+            work.read_with(cx, |work, _| work.state.clone()),
+            ConnectionState::Idle,
+            "the other credential is not used"
+        );
     }
 
     /// A window opens with every feature's part of the workspace made and drawn. Each feature
