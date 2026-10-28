@@ -113,7 +113,8 @@ title bar; Ragnor's choice over a Zed-style title bar) over one status bar acros
   traffic lights' room, the panel's title and search.
 - The status bar (30 px, `ds::size::STATUS_BAR`: Zed's 22 px buttons with 4 px around them)
   reads, after the sidebar toggle and the left dock's buttons: the
-  server chip (state and round trip; the graph switcher), the graph chip and the branch menu,
+  graph switcher (the connection's dot, server / graph; its state beside it only when not
+  ready, and in its tooltip with the round trip) and the branch menu,
   then the few facts the open tab adds (`Item::status`: a query's rows and time, a Blob's size;
   not what the tab shows itself, such as a table's row count or a schema's counts); at the
   right, what is running, a keyboard button whose menu lists the tab's keys (`ItemStatus::keys`,
@@ -183,9 +184,11 @@ what was last saved at most every 250 ms rather than serializing every tab on ev
   header (the sidebar's, else the top-left pane's), and every header strip moves the window.
   As in Zed's title bar, that room is left on macOS only, and not in full screen, where the
   lights hide with the menu bar; there the strip starts at its own edge.
-- Status bar left: the docks' panel buttons, then the connection chip (`ready`,
-  `connecting…`, `contract mismatch`, `unauthorized`, `unreachable`, with the contract and the
-  round trip), the graph and the branch menu, which switches branch for the window. Right: what
+- Status bar left: the docks' panel buttons, then one breadcrumb (since 2026-10-29, when a
+  server chip and a graph chip side by side both switched graphs): the graph switcher, the
+  connection's dot with server / graph (its state, `connecting…`, `contract mismatch`,
+  `unauthorized`, `unreachable`, spelled out beside it only when not ready; the contract and
+  the round trip in its tooltip), then the branch menu, which switches branch for the window. Right: what
   is running ("2 queries running", "Writing (1)…"), memory and CPU, the other docks' buttons.
 - What the credential may do (E15, below): "read only" follows the branch's name when the
   access route refuses `change` there, its tooltip naming what the credential lacks; the actor
@@ -575,9 +578,9 @@ than styling one-off elements.
   Delta and Zed put a list's search and "new" there rather than as rows in the list; the
   Conversations panel does (spec 011).
 - **Status bar, after Zed's** (until 2026-10-16 two footers, after Delta's). One bar across the
-  window: the left dock's panel buttons, the connection (a status dot, the server and its
-  state, opening the graph switcher), where the open tab reads and writes (graph / branch with
-  the branch menu), then the tab's own facts; at the end what is running, the tab's controls,
+  window: the left dock's panel buttons, where the open tab reads and writes as one breadcrumb
+  (the connection's dot and server / graph, opening the graph switcher; then / branch with the
+  branch menu), then the tab's own facts; at the end what is running, the tab's controls,
   memory and CPU, and the bottom and right docks' panel buttons. A tab supplies its part through
   `Item::status` (`ItemStatus { start, end, keys }`): the table its loaded count, read commit and key
   hints; the agent its restart, agent pill and send. A pane's header holds its Back and Forward

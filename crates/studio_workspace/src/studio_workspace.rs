@@ -2956,28 +2956,37 @@ impl Workspace {
         self.activate_in(self.active_pane, index, false, window, cx);
     }
 
-    /// The server this window is connected to: a status dot, the server and its state, as
-    /// Delta's sidebar shows the account. It opens the graph switcher: the graphs open in this
-    /// window, another graph, closing this one.
-    fn render_server_switcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (color, server, url, state, actor) = match &self.session {
+    /// Where the window reads, the first part of the bar's breadcrumb: the connection's status
+    /// dot, the server and the graph. It opens the graph switcher: the graphs open in this
+    /// window, another graph, closing this one. The connection's state shows beside it only
+    /// when it is not ready, and always in its tooltip, with the round trip and the actor.
+    fn render_graph_switcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (color, server, url, state, ready, actor, graph, unavailable) = match &self.session {
             Some(session) => {
-                let actor = session.read(cx).actor().map(str::to_owned);
-                let connection = session.read(cx).connection.read(cx);
-                let color = connection_color(&connection.state);
+                let s = session.read(cx);
+                let actor = s.actor().map(str::to_owned);
+                let connection = s.connection.read(cx);
+                let ready = connection.state == ConnectionState::Ready;
                 // The server's round trip from the last health check, beside its state.
                 let state = match (&connection.state, connection.latency) {
                     (ConnectionState::Ready, Some(latency)) => {
-                        format!("{} · {} ms", connection.label(), latency.as_millis())
+                        format!(
+                            "{} · {}",
+                            connection.label(),
+                            studio_ui::format_elapsed(latency)
+                        )
                     }
                     _ => connection.label(),
                 };
                 (
-                    color,
+                    connection_color(&connection.state),
                     connection.server.name.clone(),
                     connection.server.url.clone(),
                     state,
+                    ready,
                     actor,
+                    Some(s.graph_id.clone()),
+                    s.unavailable.clone(),
                 )
             }
             None => (
@@ -2985,6 +2994,9 @@ impl Workspace {
                 "No server".to_owned(),
                 String::new(),
                 "Not connected".to_owned(),
+                false,
+                None,
+                None,
                 None,
             ),
         };
@@ -3003,7 +3015,12 @@ impl Workspace {
                 )
             })
             .collect();
-        let tooltip = connection_tooltip(&url, &state, actor.as_deref());
+        let mut tooltip = connection_tooltip(&url, &state, actor.as_deref());
+        if let Some(reason) = &unavailable {
+            tooltip = format!(
+                "This graph is unavailable: {reason}. Reads resume when it is ready. · {tooltip}"
+            );
+        }
         let trigger = ButtonLike::new("graph-switcher")
             .tooltip(Tooltip::text(tooltip))
             .child(
@@ -3012,8 +3029,18 @@ impl Workspace {
                     .gap(px(studio_ui::ds::space::SM))
                     .items_center()
                     .child(Indicator::dot().color(color))
-                    .child(studio_ui::ds::text::body(server).single_line())
-                    .child(studio_ui::ds::text::muted(state).single_line())
+                    .child(studio_ui::ds::text::muted(server).single_line())
+                    .when_some(graph, |row, graph| {
+                        row.child(studio_ui::ds::text::body("/").color(Color::Disabled))
+                            .child(studio_ui::ds::text::body(graph).single_line())
+                    })
+                    .when(unavailable.is_some(), |row| {
+                        row.child(Indicator::dot().color(Color::Warning))
+                    })
+                    // Ready, the dot says so; anything else is spelled out.
+                    .when(!ready, |row| {
+                        row.child(studio_ui::ds::text::muted(state).single_line())
+                    })
                     .when(others > 0, |row| {
                         row.child(studio_ui::ds::sidebar_count(format!(
                             "+{}",
@@ -3669,8 +3696,8 @@ impl Workspace {
                     .child(self.render_panel_buttons(PanelPosition::Left, cx))
                     .child(studio_ui::ds::divider_v(cx))
             })
-            .child(self.render_server_switcher(cx))
-            .children(self.render_graph_and_branch(cx))
+            .child(self.render_graph_switcher(cx))
+            .children(self.render_branch(cx))
             .when(has_start, |bar| bar.child(studio_ui::ds::divider_v(cx)))
             .children(status.start);
         let docks_right = shown && !(self.bottom.panels.is_empty() && self.right.panels.is_empty());
@@ -3759,14 +3786,12 @@ impl Workspace {
             .child(right)
     }
 
-    /// The graph the open tab reads, and its branch: a chip that opens another graph, then the
-    /// branch menu.
-    fn render_graph_and_branch(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    /// The breadcrumb's last part, after the graph switcher: the branch the window reads and
+    /// edits, its menu switching it, and "read only" when the credential may not change it.
+    fn render_branch(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let session = self.session.as_ref()?;
         let s = session.read(cx);
-        let graph = s.graph_id.clone();
         let branch = s.branch.clone();
-        let unavailable = s.unavailable.clone();
         // The access route refused changes on the window's branch: its edits are disabled, so
         // the bar says so beside the name (spec 002).
         let read_only = s.refusal(AccessAction::Change, &AccessScope::branch(&branch));
@@ -3784,44 +3809,6 @@ impl Workspace {
                 .gap(px(studio_ui::ds::space::XS))
                 .items_center()
                 .flex_none()
-                .child(
-                    h_flex()
-                        .id("status-graph")
-                        .h(px(studio_ui::ds::size::BAR_BUTTON))
-                        // A 22 px button's inset, so it reads as the branch button beside it.
-                        .px(px(studio_ui::ds::space::MD))
-                        .gap(px(studio_ui::ds::space::XS))
-                        .items_center()
-                        .rounded(px(studio_ui::ds::radii(cx).sm))
-                        .cursor_pointer()
-                        .hover(|style| style.bg(studio_ui::ds::surface::highlight(cx)))
-                        .map(|button| match unavailable.clone() {
-                            Some(reason) => button.tooltip(Tooltip::text(format!(
-                                "This graph is unavailable: {reason}. Reads resume when it is \
-                                 ready."
-                            ))),
-                            None => button.tooltip(|_, cx| {
-                                Tooltip::for_action(
-                                    "Open another graph",
-                                    &studio_actions::workspace::OpenGraph,
-                                    cx,
-                                )
-                            }),
-                        })
-                        .child(
-                            // As a button's icon: 80 % of the label's ink.
-                            studio_ui::ds::icon::meta(IconName::DatabaseZap)
-                                .color(studio_ui::ds::text::icon_ink(cx)),
-                        )
-                        .when(unavailable.is_some(), |button| {
-                            button.child(Indicator::dot().color(Color::Warning))
-                        })
-                        .child(studio_ui::ds::text::body(graph).single_line())
-                        .on_click(|_, window, cx| {
-                            window
-                                .dispatch_action(Box::new(studio_actions::workspace::OpenGraph), cx)
-                        }),
-                )
                 .child(studio_ui::ds::text::body("/").color(Color::Disabled))
                 .child(
                     PopoverMenu::new("branch-menu")
