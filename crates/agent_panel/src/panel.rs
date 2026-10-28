@@ -198,7 +198,7 @@ pub fn open(
 }
 
 /// Opens one of the graph's conversations in its own tab, or shows the tab it is in; the agent
-/// starts and replays it.
+/// starts and replays it once the tab is shown ([`AgentPanel::start_when_shown`]).
 ///
 /// A conversation has one tab, in whichever pane it is, also while a split or a restore fills
 /// a pane with copies: a second tab would load the session again and take the first one's
@@ -222,7 +222,7 @@ pub fn open_session(
     let panel = workspace.open_item(format!("agent:{id}"), window, cx, move |window, cx| {
         AgentPanel::new(session, handle, Some(id), window, cx)
     })?;
-    panel.update(cx, |panel, cx| panel.start_if_idle(cx));
+    panel.update(cx, |panel, cx| panel.start_when_shown(cx));
     Some(panel)
 }
 
@@ -882,6 +882,10 @@ pub struct AgentPanel {
     /// The conversation this tab holds: the one it loads before the agent answers, then the one
     /// the agent opened. `None` starts a new one.
     session_id: Option<String>,
+    /// The agent starts when the tab is next drawn ([`AgentPanel::start_when_shown`]): a
+    /// conversation restored with the workspace behind another tab starts no agent until it is
+    /// shown.
+    start_owed: bool,
     /// The agent stopped with an error.
     failed: bool,
     /// The directory the agent works in for this conversation.
@@ -1095,6 +1099,7 @@ impl AgentPanel {
             replace_on_replay: None,
             said_while_starting: Vec::new(),
             session_id,
+            start_owed: false,
             failed: false,
             cwd: None,
             _focus: Some(focus),
@@ -1134,9 +1139,15 @@ impl AgentPanel {
 
     // ---- lifecycle ----
 
-    /// Starts the agent at once for a conversation to come back to, so it is on screen
-    /// without sending anything first.
-    pub fn start_if_idle(&mut self, cx: &mut Context<Self>) {
+    /// Starts the agent for a conversation to come back to when the tab is next drawn, so it is
+    /// on screen without sending anything first, and a tab not shown runs no agent.
+    pub fn start_when_shown(&mut self, cx: &mut Context<Self>) {
+        self.start_owed = true;
+        cx.notify();
+    }
+
+    /// Starts the agent at once for a conversation to come back to.
+    fn start_if_idle(&mut self, cx: &mut Context<Self>) {
         if matches!(self.state, State::Idle) && self.session_id.is_some() {
             self.start(cx);
         }
@@ -3443,6 +3454,9 @@ fn tool_verb(title: &str, studio: Option<StudioTool>) -> String {
 
 impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.start_owed) {
+            cx.defer_in(window, |this, _, cx| this.start_if_idle(cx));
+        }
         let editor_bg = ds::surface::document(cx);
         let body = match &self.state {
             State::Setup => self.render_setup(cx).into_any_element(),
