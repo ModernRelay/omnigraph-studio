@@ -583,6 +583,37 @@ impl GraphClient {
             .or_default() += 1;
     }
 
+    /// A request to the server as every one is made: with the contract this build speaks and
+    /// this client's token, following no redirect. No route answers with a redirect to follow;
+    /// a Blob's external reference answers 302 with a URI Studio shows and never fetches.
+    fn request(&self, method: Method, url: &Url) -> http_client::Builder {
+        let builder = Request::builder()
+            .method(method)
+            .uri(url.as_str())
+            .header(CONTRACT_HEADER, CONTRACT)
+            .follow_redirects(RedirectPolicy::NoFollow);
+        match self.token() {
+            Some(token) => builder.header("authorization", format!("Bearer {token}")),
+            None => builder,
+        }
+    }
+
+    /// Sends `request`, made by [`Self::request`] for `url`, and counts a refusal of it
+    /// ([`Self::note_refusal`]).
+    async fn dispatch(
+        &self,
+        url: &Url,
+        request: Request<AsyncBody>,
+    ) -> Result<http_client::Response<AsyncBody>, String> {
+        let response = self
+            .http()
+            .send(request)
+            .await
+            .map_err(|error| describe_transport(&error))?;
+        self.note_refusal(url, response.status(), response.headers());
+        Ok(response)
+    }
+
     /// The HTTP client requests go through now.
     fn http(&self) -> Arc<dyn HttpClient> {
         self.http
@@ -689,17 +720,7 @@ impl GraphClient {
         timeout: Duration,
         limit: BodyLimit,
     ) -> Result<RawResponse, String> {
-        // No route answers with a redirect to follow; a Blob's external reference answers 302
-        // with a URI Studio shows and never fetches.
-        let mut builder = Request::builder()
-            .method(method)
-            .uri(url.as_str())
-            .header(CONTRACT_HEADER, CONTRACT)
-            .follow_redirects(RedirectPolicy::NoFollow)
-            .timeout(timeout);
-        if let Some(token) = self.token() {
-            builder = builder.header("authorization", format!("Bearer {token}"));
-        }
+        let mut builder = self.request(method, &url).timeout(timeout);
         // A body is JSON unless the caller names its type: a Blob put's is raw bytes.
         if body.is_some()
             && !headers
@@ -714,13 +735,8 @@ impl GraphClient {
         let request = builder
             .body(body.map(AsyncBody::from).unwrap_or_else(AsyncBody::empty))
             .map_err(|error| error.to_string())?;
-        let response = self
-            .http()
-            .send(request)
-            .await
-            .map_err(|error| describe_transport(&error))?;
+        let response = self.dispatch(&url, request).await?;
         let status = response.status();
-        self.note_refusal(&url, status, response.headers());
         let contract = response
             .headers()
             .get(CONTRACT_HEADER)
@@ -1078,31 +1094,17 @@ impl GraphClient {
         {
             return Err(format!("refused path {:?}", request.path_and_query));
         }
-        let mut builder = Request::builder()
-            .method(request.method)
-            .uri(url.as_str())
-            .header(CONTRACT_HEADER, CONTRACT)
-            .follow_redirects(RedirectPolicy::NoFollow);
-        if let Some(token) = self.token() {
-            builder = builder.header("authorization", format!("Bearer {token}"));
-        }
+        let mut builder = self.request(request.method, &url);
         for (name, value) in &request.headers {
             builder = builder.header(name.as_str(), value.as_str());
         }
         let request = builder
             .body(request.body)
             .map_err(|error| error.to_string())?;
-        let response = self
-            .http()
-            .send(request)
-            .await
-            .map_err(|error| describe_transport(&error))?;
-        let status = response.status();
-        self.note_refusal(&url, status, response.headers());
-        let headers = response.headers().clone();
+        let response = self.dispatch(&url, request).await?;
         Ok(ForwardResponse {
-            status,
-            headers,
+            status: response.status(),
+            headers: response.headers().clone(),
             body: response.into_body(),
         })
     }
@@ -1624,12 +1626,13 @@ pub fn judge_write<'a>(
                     ),
                 }
             }
-            // An effect this build does not know, or none at all: Omnigraph 0.14.0 and later
-            // state one on every error, so the answer cannot rule the change out.
+            // An effect this build does not know, or none at all: Omnigraph 0.14.0 states one
+            // on every error, so the answer cannot rule the change out. A server that speaks
+            // the contract and states none is a 0.14 build from before that release.
             Some(DispositionEffects::Other) | None => WriteOutcome::Unknown {
                 reason: format!(
                     "the server answered {status} without saying whether the change was made \
-                     (Omnigraph before 0.14.0 does not say): {}",
+                     (a build of Omnigraph from before 0.14.0 does not say): {}",
                     body.error
                 ),
             },
@@ -1941,7 +1944,7 @@ mod tests {
         assert_eq!(
             judge(409, None),
             "unknown",
-            "a server before 0.14.0: the status rules nothing out"
+            "a 0.14 build from before the release: the status rules nothing out"
         );
         assert_eq!(judge(503, None), "unknown");
         // A detail this build does not read leaves the disposition to decide.
