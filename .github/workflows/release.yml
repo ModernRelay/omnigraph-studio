@@ -8,8 +8,10 @@ name: Release
 # publishing them, to check a release before tagging it.
 #
 # macOS builds are signed and notarized when the Apple secrets below are set, and signed ad hoc
-# otherwise; a tag's release needs them, so an unsigned macOS build is never published
-# (spec 017). Linux builds are tarballs, the Windows build a zip.
+# otherwise. A tag's release is the latest only when they are set: without them it is published
+# as a pre-release, which neither Studio's updater nor `omnigraph studio` reads (both take
+# `latest`), so no unsigned app reaches them (spec 017). Linux builds are tarballs, the Windows
+# build a zip.
 #
 #   APPLE_CERTIFICATE_P12        base64 of a "Developer ID Application" certificate (.p12)
 #   APPLE_CERTIFICATE_PASSWORD   its export password
@@ -84,15 +86,6 @@ jobs:
             echo "tag $GITHUB_REF_NAME does not name the workspace version $version" >&2
             exit 1
           fi
-
-      # Every updating Studio and `omnigraph studio` refuse an app not signed with the Developer
-      # ID, so a tag's release stops here rather than after the builds.
-      - name: A tag's macOS build is signed
-        if: github.event_name == 'push' && runner.os == 'macOS' && env.SIGNED != 'true'
-        shell: bash
-        run: |
-          echo "a release needs the Apple secrets listed at the top of release.yml" >&2
-          exit 1
 
       - name: Linux packages
         if: runner.os == 'Linux'
@@ -303,8 +296,10 @@ jobs:
           Studio connects to an Omnigraph server of v0.14.0 or later (HTTP contract 0.14); see the README for connecting and for a sample graph. The servers of your \`omnigraph\` CLI's targets, and the agent panel, need that CLI at v0.14.0 or later.
           NOTES
           # A full release, so `latest` names it: Studio's updater and the CLI read it there. A
-          # pre-release (`v0.3.0-rc.1`) is published as one, so no Studio installs it.
-          if [[ "$version" == *-* ]]; then
+          # pre-release (`v0.3.0-rc.1`), or a release whose macOS app is not signed with the
+          # Developer ID, which every updating Studio and `omnigraph studio` refuse, is published
+          # as a pre-release, so no Studio installs it.
+          if [[ "$version" == *-* || "$SIGNED" != "true" ]]; then
             flags=(--prerelease --latest=false)
           else
             flags=(--latest)
