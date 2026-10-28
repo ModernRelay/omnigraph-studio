@@ -1467,7 +1467,7 @@ impl TypeTable {
         .detach();
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn finish_bulk(
         &mut self,
         bound: Bound,
@@ -5358,7 +5358,7 @@ impl TypeTable {
         .detach();
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn finish_drafts(
         &mut self,
         bound: Bound,

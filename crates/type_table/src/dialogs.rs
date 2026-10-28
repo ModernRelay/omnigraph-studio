@@ -156,7 +156,7 @@ fn field_values(fields: &mut [Field], cx: &App) -> Option<Vec<(String, Value)>> 
 /// and shows its outcome; `no_match` says why one that matched nothing inserted nothing. The
 /// write is never cancelled with the dialog: the table hears the outcome even when the dialog
 /// was closed meanwhile, and keeps the row (`key`, `values`) it inserted.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn send_insert<T: InsertForm>(
     session: &Entity<GraphSession>,
     table: WeakEntity<TypeTable>,
@@ -938,7 +938,7 @@ impl Focusable for DeleteRowModal {
 }
 
 impl DeleteRowModal {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         table: WeakEntity<TypeTable>,
         session: Entity<GraphSession>,

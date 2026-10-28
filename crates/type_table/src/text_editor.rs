@@ -91,7 +91,7 @@ impl TextEditor {
     /// edited at, so saves stay bound to what was read) or the branch head, showing `typed`
     /// when text was typed before it was opened here. Typed text that is the property's draft
     /// on the session's branch is bound, as the draft is, to the value it was typed over.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         session: Entity<GraphSession>,
         type_name: String,

@@ -644,7 +644,7 @@ impl ExploreState {
         out
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn push_node(
         &self,
         schema: &SchemaModel,
@@ -809,7 +809,7 @@ impl ExploreState {
     }
 
     /// A group's values, each with its count, and the neighbours of each value opened.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn push_values(
         &self,
         schema: &SchemaModel,
@@ -891,7 +891,7 @@ impl ExploreState {
     }
 
     /// The neighbours read so far under a group or a value, then a row to read more.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn push_list(
         &self,
         schema: &SchemaModel,

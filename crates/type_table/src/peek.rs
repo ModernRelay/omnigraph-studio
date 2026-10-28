@@ -512,7 +512,7 @@ impl NodePeek {
     /// [`Self::new`] for a row a table shows: its Blob values are where the table's hold
     /// (`blobs`), which may be past `snapshot` after the table's own Blob write, and each one
     /// the table read is shown as its cell shows it.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn from_table(
         session: Entity<GraphSession>,
         subject: PeekSubject,
@@ -563,7 +563,7 @@ impl NodePeek {
         page
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn build(
         session: Entity<GraphSession>,
         subject: PeekSubject,
@@ -2229,7 +2229,7 @@ impl NodePeek {
     /// the same commit (`snapshot`), once per property: `read_without` is what this read left
     /// out already. Otherwise a group read whole says why on its count, and one whose count was
     /// shown says why under it.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn group_refused(
         &mut self,
         index: usize,

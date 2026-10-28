@@ -30,7 +30,7 @@ pub(crate) fn change_refusal(
 /// How a write bound to the values it was read at ended: sent, with the server's outcome, or
 /// not sent.
 // Made once per write and matched at once, into the outcome: boxing it saves nothing.
-#[allow(clippy::large_enum_variant)]
+#[expect(clippy::large_enum_variant)]
 pub(crate) enum Bound {
     Sent(WriteOutcome<ChangeOutput>),
     /// A list read at the branch's head holds another value than the one the write is bound
@@ -70,7 +70,7 @@ type Read = (String, Vec<(String, Value)>);
 /// `(property, the value it was read at, the new value)`, and resolves with how it ended; `Err`
 /// when no write can be built. `read_at` is the commit the caller read the values at, when it
 /// read them there (see [`send_bound`]).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn write_properties(
     session: &Entity<GraphSession>,
     branch: &str,
@@ -106,7 +106,7 @@ pub(crate) fn write_properties(
 /// Saves edits of several nodes in one commit, each row's cells `(property, the value it was
 /// read at, the new value)`: a row whose values changed elsewhere is left alone whole, and the
 /// commit's `affected_nodes` comes back short by it.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn write_rows(
     session: &Entity<GraphSession>,
     branch: &str,
@@ -144,7 +144,7 @@ pub(crate) fn write_rows(
 
 /// Sets `property` to `new` on several nodes in one commit, each `(id, the value it was read
 /// at)`, as [`write_rows`] saves rows.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn write_cells(
     session: &Entity<GraphSession>,
     branch: &str,
@@ -183,7 +183,7 @@ pub(crate) fn write_cells(
 /// otherwise the nodes holding a list are read together at the branch's head, and the write is
 /// bound to the commit they were found at. A change made elsewhere since the values were read
 /// is found by the comparison, and one made after it by the head having moved.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn send_bound(
     session: &Entity<GraphSession>,
     branch: &str,

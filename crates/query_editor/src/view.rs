@@ -4548,7 +4548,7 @@ impl QueryEditor {
 
     /// An outcome or a failure: its icon and title, then what to do, its facts and the place
     /// in the query the server pointed at.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn render_message(
         &self,
         icon: IconName,

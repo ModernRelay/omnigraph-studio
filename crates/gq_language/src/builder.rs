@@ -813,7 +813,7 @@ fn relationship_clause(
 /// block, so a node with several such neighbours stays one row: `exists { $r0: Company
 /// $n worksAt $r0  $r0.city = $f0 }`. "Is empty" is `not { … $r0.city is not null }`: no
 /// neighbour holds a value, including when there is no neighbour.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn neighbour_property_clause(
     schema: &SchemaModel,
     var: &str,
