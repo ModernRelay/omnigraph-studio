@@ -1579,7 +1579,9 @@ impl QueryEditor {
                     }
                     path
                 }
-                SaveTarget::New { dir, name } => unused_path(&dir, &name),
+                SaveTarget::New { dir, name } => {
+                    return write_unused(&dir, &name, written.as_bytes()).map(Saved::Written);
+                }
             };
             studio_settings::write_atomic(&path, written.as_bytes(), studio_settings::Access::Keep)
                 .map(|()| Saved::Written(path))
@@ -4825,8 +4827,14 @@ fn param_type(param: &ParamDescriptor) -> String {
     }
 }
 
-/// `dir/name.gq`, or `dir/name-2.gq` and so on when that is taken.
-fn unused_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+/// Writes `contents` to `dir/name.gq`, or to `dir/name-2.gq` and so on when that is taken,
+/// and returns where. Never over a file: one made at the name between the look and the write, by
+/// the person or another program, is kept, and the next name is tried.
+fn write_unused(
+    dir: &std::path::Path,
+    name: &str,
+    contents: &[u8],
+) -> std::io::Result<std::path::PathBuf> {
     let safe: String = name
         .chars()
         .map(|c| {
@@ -4837,13 +4845,19 @@ fn unused_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
             }
         })
         .collect();
-    let mut candidate = dir.join(format!("{safe}.gq"));
-    let mut n = 2;
-    while candidate.exists() {
-        candidate = dir.join(format!("{safe}-{n}.gq"));
-        n += 1;
+    for n in 1.. {
+        let candidate = match n {
+            1 => dir.join(format!("{safe}.gq")),
+            n => dir.join(format!("{safe}-{n}.gq")),
+        };
+        // A name taken (a link to nothing included) is passed over without writing.
+        if candidate.symlink_metadata().is_err()
+            && studio_settings::write_new(&candidate, contents, studio_settings::Access::Keep)?
+        {
+            return Ok(candidate);
+        }
     }
-    candidate
+    unreachable!("a free name is found before the numbers run out")
 }
 
 /// A declaration's last outcome, shown on its run line.
@@ -4987,6 +5001,29 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// A new query is written beside the files of its name, never over one: `name.gq` taken,
+    /// it goes to `name-2.gq`, and what was there is kept.
+    #[test]
+    fn a_new_query_is_written_beside_files_of_its_name() {
+        let dir = std::env::temp_dir().join(format!("query-editor-unused-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            write_unused(&dir, "top people", b"first").unwrap(),
+            dir.join("top_people.gq")
+        );
+        assert_eq!(
+            write_unused(&dir, "top people", b"second").unwrap(),
+            dir.join("top_people-2.gq")
+        );
+        assert_eq!(std::fs::read(dir.join("top_people.gq")).unwrap(), b"first");
+        assert_eq!(
+            std::fs::read(dir.join("top_people-2.gq")).unwrap(),
+            b"second"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// The confirm bar names the whole statement, its target included when it is on a line of
     /// its own.
