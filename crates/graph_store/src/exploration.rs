@@ -554,12 +554,12 @@ impl ExploreState {
             .collect();
         self.expanded.insert(ExplorePath::root());
         self.selection = Some(ExplorePath::root());
-        self.root = Some(new_root);
-        self.root_status = if self.labels.contains_key(self.root.as_ref().unwrap()) {
+        self.root_status = if self.labels.contains_key(&new_root) {
             Loadable::Loaded(())
         } else {
             Loadable::NotLoaded
         };
+        self.root = Some(new_root);
         true
     }
 

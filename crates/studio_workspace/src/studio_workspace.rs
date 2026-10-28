@@ -3546,22 +3546,20 @@ impl Workspace {
         floor: SheetFloor,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Member::Split {
-            axis,
-            members,
-            flexes,
-        } = member
-        else {
-            let Member::Pane(id) = member else {
-                unreachable!()
-            };
-            // A zoomed pane is drawn over the document area instead (`render_zoomed`).
-            if self.zoomed == Some(Zoomed::Pane(*id)) {
-                return div().size_full().into_any_element();
+        let (axis, members, flexes) = match member {
+            Member::Pane(id) => {
+                // A zoomed pane is drawn over the document area instead (`render_zoomed`).
+                if self.zoomed == Some(Zoomed::Pane(*id)) {
+                    return div().size_full().into_any_element();
+                }
+                return self.render_pane(*id, floor, cx);
             }
-            return self.render_pane(*id, floor, cx);
+            Member::Split {
+                axis,
+                members,
+                flexes,
+            } => (*axis, members, flexes),
         };
-        let axis = *axis;
         let hairline = studio_ui::ds::surface::rule(cx);
         let horizontal = axis == SplitAxis::Horizontal;
         let split_id = SharedString::from(format!(
