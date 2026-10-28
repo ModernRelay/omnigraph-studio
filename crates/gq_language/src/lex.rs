@@ -456,24 +456,12 @@ pub fn outline(source: &str) -> Outline {
         let word = text(token);
         match token.kind {
             TokenKind::Keyword if word == "explain" && (depth == 0 || declares(index + 1)) => {
-                if let Some((start, explained, name)) = current.take() {
-                    outline.declarations.push(Declaration {
-                        name,
-                        range: start..token.range.start,
-                        explained,
-                    });
-                }
+                close(&mut current, token.range.start, &mut outline.declarations);
                 depth = 0;
                 explain_pending = true;
             }
             TokenKind::Keyword if word == "query" && (depth == 0 || declares(index)) => {
-                if let Some((start, explained, name)) = current.take() {
-                    outline.declarations.push(Declaration {
-                        name,
-                        range: start..token.range.start,
-                        explained,
-                    });
-                }
+                close(&mut current, token.range.start, &mut outline.declarations);
                 depth = 0;
                 let name = tokens[index + 1..]
                     .iter()
@@ -492,27 +480,31 @@ pub fn outline(source: &str) -> Outline {
             TokenKind::Punctuation if word == "}" => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 && opened {
-                    if let Some((start, explained, name)) = current.take() {
-                        outline.declarations.push(Declaration {
-                            name,
-                            range: start..token.range.end,
-                            explained,
-                        });
-                    }
+                    close(&mut current, token.range.end, &mut outline.declarations);
                     opened = false;
                 }
             }
             _ => {}
         }
     }
-    if let Some((start, explained, name)) = current {
-        outline.declarations.push(Declaration {
+    close(&mut current, source.len(), &mut outline.declarations);
+    outline
+}
+
+/// Ends the declaration open in `current` (where it starts, whether it is explained, its name),
+/// if one is, at `end`.
+fn close(
+    current: &mut Option<(usize, bool, String)>,
+    end: usize,
+    declarations: &mut Vec<Declaration>,
+) {
+    if let Some((start, explained, name)) = current.take() {
+        declarations.push(Declaration {
             name,
-            range: start..source.len(),
+            range: start..end,
             explained,
         });
     }
-    outline
 }
 
 impl Outline {
