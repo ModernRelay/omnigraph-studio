@@ -1027,25 +1027,29 @@ pub fn node_by_id(
     type_name: &str,
     id: &str,
 ) -> Result<BuiltQuery, BuildError> {
-    let node = node(schema, type_name)?;
-    let depends = Depends::Node {
-        type_name: node.name.clone(),
-        id: id.to_owned(),
-    };
+    Ok(one_by_id(node(schema, type_name)?, id, "studio_node", "$n"))
+}
+
+/// Query `name`: the node of `node`'s type whose `@id` is `id`, at most one row, returning
+/// `returns`.
+fn one_by_id(node: &NodeType, id: &str, name: &str, returns: &str) -> BuiltQuery {
     let mut params = Params::new();
-    let id = params.add("id", "String", Value::String(id.to_owned()));
+    let id_param = params.add("id", "String", Value::String(id.to_owned()));
     let text = format!(
-        "query studio_node({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id}\n  }}\n  return {{ $n }}\n  limit 1\n}}\n",
+        "query {name}({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id_param}\n  }}\n  return {{ {returns} }}\n  limit 1\n}}\n",
         sig = params.signature(),
         ty = node.name,
     );
-    Ok(BuiltQuery {
-        name: "studio_node".into(),
+    BuiltQuery {
+        name: name.into(),
         text,
         params: params.values,
-        depends,
+        depends: Depends::Node {
+            type_name: node.name.clone(),
+            id: id.to_owned(),
+        },
         seeds: None,
-    })
+    }
 }
 
 /// Nodes of one type by `@id`, in one read, with only `properties`: a row for each that exists,
@@ -1122,25 +1126,8 @@ pub fn node_fields_by_id(
     without: &[String],
 ) -> Result<BuiltQuery, BuildError> {
     let node = node(schema, type_name)?;
-    let depends = Depends::Node {
-        type_name: node.name.clone(),
-        id: id.to_owned(),
-    };
-    let mut params = Params::new();
-    let id = params.add("id", "String", Value::String(id.to_owned()));
-    let text = format!(
-        "query studio_node_fields({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id}\n  }}\n  return {{ {columns} }}\n  limit 1\n}}\n",
-        sig = params.signature(),
-        ty = node.name,
-        columns = field_columns(node, without),
-    );
-    Ok(BuiltQuery {
-        name: "studio_node_fields".into(),
-        text,
-        params: params.values,
-        depends,
-        seeds: None,
-    })
+    let columns = field_columns(node, without);
+    Ok(one_by_id(node, id, "studio_node_fields", &columns))
 }
 
 /// A read that returns no rows, sent only for the commit its answer names: a branch's head
