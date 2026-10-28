@@ -1038,6 +1038,29 @@ mod start_tests {
             assert_eq!(workspace.session().unwrap().read(cx).graph_id, "g");
         });
     }
+
+    /// A window opens with every feature's part of the workspace made and drawn. Each feature
+    /// makes its part while the workspace is being made (`observe_new`), when reading the
+    /// workspace panics: the Conversations panel's read of the shown tab there aborted every
+    /// launch before a window showed.
+    #[gpui::test]
+    fn a_window_opens_with_every_feature(cx: &mut TestAppContext) {
+        studio_with_servers(cx);
+        cx.update(|cx| {
+            command_palette::init(cx);
+            type_table::init(cx);
+            relationship_tree::init(cx);
+            graph_canvas::init(cx);
+            query_editor::init(cx);
+            review::init(cx);
+            history::init(cx);
+            inspectors::init(cx);
+            agent_panel::init(cx);
+        });
+        let (_workspace, cx) = cx.add_window_view(Workspace::new);
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+    }
 }
 
 #[cfg(test)]

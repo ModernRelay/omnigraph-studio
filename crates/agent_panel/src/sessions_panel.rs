@@ -155,7 +155,12 @@ impl SessionsPanel {
                 }
             }));
         }
-        let shown_conversation = shown_in(&workspace, cx);
+        // Made while its workspace is being made (`observe_new`), so the workspace is read once
+        // that is done.
+        cx.defer_in(window, |this, _, cx| {
+            this.shown_conversation = this.shown(cx);
+            cx.notify();
+        });
         Self {
             workspace,
             sessions,
@@ -166,7 +171,7 @@ impl SessionsPanel {
             list_state: ListState::new(0, ListAlignment::Top, px(ds::size::SIDEBAR_ROW * 8.)),
             rows: Vec::new(),
             rows_stale: true,
-            shown_conversation,
+            shown_conversation: None,
             _subscriptions: subscriptions,
         }
     }
