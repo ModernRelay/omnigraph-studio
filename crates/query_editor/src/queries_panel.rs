@@ -3,7 +3,7 @@
 //! opens one, as ↵ opens the one ↑ and ↓ select; ⌘S in a new query saves it here.
 
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use gpui::{
     Action, Context, Entity, EntityId, FocusHandle, Focusable, ListAlignment, ListState, Render,
@@ -22,7 +22,13 @@ pub const QUERIES_PANEL: &str = "queries";
 
 pub struct QueriesPanel {
     session: Option<Entity<GraphSession>>,
+    /// The saved files of the graph [`Self::files_of`] names, newest first.
     files: Vec<(PathBuf, SystemTime)>,
+    /// The graph the files were listed for: after a switch, the last graph's are not shown,
+    /// nor opened, while this one's are listed.
+    files_of: Option<String>,
+    /// The folder is listed again at the next draw: a hidden panel lists nothing.
+    folder_owed: bool,
     /// The list drawn, as descriptors: only the visible rows are built (constitution IX).
     list_state: ListState,
     rows: Vec<PanelRow>,
@@ -39,8 +45,14 @@ pub struct QueriesPanel {
     /// The folder's latest listing: an earlier one, of another graph's folder perhaps, is
     /// dropped rather than landing after it.
     _listing: Option<Task<()>>,
+    /// The next draw of the saved files' ages ("2 min ago"), a minute after the last: each
+    /// draw schedules it, so a hidden panel stops.
+    _tick: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
+
+/// How often a drawn panel's saved files' ages are drawn again.
+const AGE_TICK: Duration = Duration::from_secs(60);
 
 /// One row of the panel, as what it shows rather than its element, so the list is told only of
 /// the rows that changed and keeps its scroll position.
@@ -116,7 +128,7 @@ impl QueriesPanel {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut subscriptions =
-            vec![cx.observe_global::<SavedQueriesChanged>(|this, cx| this.read_folder(cx))];
+            vec![cx.observe_global::<SavedQueriesChanged>(|this, cx| this.owe_folder(cx))];
         if let Some(workspace) = workspace.upgrade() {
             subscriptions.push(cx.subscribe_in(
                 &workspace,
@@ -125,7 +137,7 @@ impl QueriesPanel {
                     WorkspaceEvent::SessionChanged => {
                         let session = workspace.read(cx).session().cloned();
                         this.watch_session(session, cx);
-                        this.read_folder(cx);
+                        this.owe_folder(cx);
                     }
                 },
             ));
@@ -137,6 +149,8 @@ impl QueriesPanel {
         let mut this = Self {
             session: None,
             files: Vec::new(),
+            files_of: None,
+            folder_owed: true,
             list_state: ListState::new(
                 0,
                 ListAlignment::Top,
@@ -148,10 +162,10 @@ impl QueriesPanel {
             _session_subscription: None,
             catalog_asked: None,
             _listing: None,
+            _tick: None,
             _subscriptions: subscriptions,
         };
         this.watch_session(session, cx);
-        this.read_folder(cx);
         this
     }
 
@@ -175,13 +189,16 @@ impl QueriesPanel {
     /// serves.
     fn panel_rows(&self, cx: &App) -> Vec<PanelRow> {
         let mut rows = Vec::new();
-        if self.files.is_empty() {
-            rows.push(PanelRow::SavedEmpty);
+        // Until this graph's folder is listed, none are shown, and nothing says it has none.
+        if self.files_of == self.graph_key(cx) {
+            if self.files.is_empty() {
+                rows.push(PanelRow::SavedEmpty);
+            }
+            rows.extend(self.files.iter().map(|(path, modified)| PanelRow::Saved {
+                path: path.clone(),
+                modified: *modified,
+            }));
         }
-        rows.extend(self.files.iter().map(|(path, modified)| PanelRow::Saved {
-            path: path.clone(),
-            modified: *modified,
-        }));
         let Some(session) = &self.session else {
             return rows;
         };
@@ -366,19 +383,29 @@ impl QueriesPanel {
         Some(self.session.as_ref()?.read(cx).overrides_key())
     }
 
+    /// The graph's queries folder changed, or the graph did: it is listed again when the
+    /// panel is next drawn.
+    fn owe_folder(&mut self, cx: &mut Context<Self>) {
+        self.folder_owed = true;
+        cx.notify();
+    }
+
     /// Lists the graph's queries folder again, off the main thread.
     fn read_folder(&mut self, cx: &mut Context<Self>) {
         let Some(graph) = self.graph_key(cx) else {
             self._listing = None;
             self.files.clear();
+            self.files_of = None;
             cx.notify();
             return;
         };
-        let listing = cx.background_spawn(async move { studio_settings::saved_queries(&graph) });
+        let of = graph.clone();
+        let listing = cx.background_spawn(async move { studio_settings::saved_queries(&of) });
         self._listing = Some(cx.spawn(async move |this, cx| {
             let files = listing.await;
             this.update(cx, |this, cx| {
                 this.files = files;
+                this.files_of = Some(graph);
                 cx.notify();
             })
             .ok();
@@ -387,12 +414,25 @@ impl QueriesPanel {
 }
 
 impl Render for QueriesPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(session) = self.session.clone()
             && self.catalog_asked != Some(session.entity_id())
         {
             self.catalog_asked = Some(session.entity_id());
             cx.defer(move |cx| session.update(cx, |session, cx| session.want_stored_queries(cx)));
+        }
+        if std::mem::take(&mut self.folder_owed) {
+            cx.defer_in(window, |this, _, cx| this.read_folder(cx));
+        }
+        if !self.files.is_empty() && self._tick.is_none() {
+            self._tick = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(AGE_TICK).await;
+                this.update(cx, |this, cx| {
+                    this._tick = None;
+                    cx.notify();
+                })
+                .ok();
+            }));
         }
         let rows = self.panel_rows(cx);
         studio_ui::rows::sync(&self.list_state, &mut self.rows, rows);
@@ -496,9 +536,9 @@ mod tests {
 
     use super::*;
 
-    /// A session on a server whose graph serves two stored queries, `people_titled` and
+    /// A session on a server whose graph `graph` serves two stored queries, `people_titled` and
     /// `set_title`.
-    fn session(cx: &mut TestAppContext) -> Entity<GraphSession> {
+    fn session_of(graph: &str, cx: &mut TestAppContext) -> Entity<GraphSession> {
         let http = FakeHttpClient::create(|request| {
             let body = if request.uri().path().ends_with("/queries") {
                 r#"{"queries":[{"name":"people_titled"},{"name":"set_title","mutation":true}]}"#
@@ -520,7 +560,11 @@ mod tests {
             known_graphs: Vec::new(),
         };
         let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
-        cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx))
+        cx.new(|cx| GraphSession::new(connection, graph.into(), "main".into(), cx))
+    }
+
+    fn session(cx: &mut TestAppContext) -> Entity<GraphSession> {
+        session_of("knowledge", cx)
     }
 
     /// The panel takes the keyboard: ↓ and ↑ move among the rows that open a query, passing
@@ -556,6 +600,7 @@ mod tests {
         let people = PathBuf::from("/queries/people.gq");
         panel.update(cx, |panel, cx| {
             panel.files = vec![(people.clone(), SystemTime::UNIX_EPOCH)];
+            panel.files_of = panel.graph_key(cx);
             cx.notify();
         });
         cx.update(|window, cx| window.focus(&panel.focus_handle(cx), cx));
@@ -603,5 +648,20 @@ mod tests {
         cx.run_until_parked();
         cx.simulate_keystrokes("down");
         assert_eq!(selected(cx), Some(RowKey::Stored("set_title".into())));
+
+        // Another graph shown: the last graph's files are neither shown nor opened while its
+        // own folder is listed. Before, they stayed until the listing landed.
+        let other = session_of("other", cx);
+        panel.update(cx, |panel, cx| {
+            panel.watch_session(Some(other), cx);
+            panel.owe_folder(cx);
+            let rows = panel.panel_rows(cx);
+            assert!(
+                !rows
+                    .iter()
+                    .any(|row| matches!(row, PanelRow::Saved { .. } | PanelRow::SavedEmpty)),
+                "no saved rows before the folder of `other` is listed"
+            );
+        });
     }
 }

@@ -90,6 +90,9 @@ struct Prepared {
     publication: Publication,
     /// Which page of a paged read (`branch diff`) this asks for, from 1; 0 for any other run.
     page: usize,
+    /// It asks for a plan (`explain`): only its answer is shown as one, whatever another
+    /// read's columns are called.
+    explain: bool,
 }
 
 /// Where a read's rows came from, as its answer says.
@@ -210,9 +213,10 @@ impl Answer {
         result: Result<ReadOutput, ReadError>,
         columns: Option<&[ResultColumn]>,
         schema: Option<Arc<SchemaModel>>,
+        explain: bool,
     ) -> Self {
         match result {
-            Ok(output) if is_plan(&output.columns) => Answer::Plan(output),
+            Ok(output) if explain && is_plan(&output.columns) => Answer::Plan(output),
             Ok(mut output) => {
                 let built = BuiltRows::new(&mut output, columns, schema);
                 Answer::Rows(output, built)
@@ -2143,6 +2147,7 @@ impl QueryEditor {
             destroys: None,
             publication: Publication::Branch,
             page: 0,
+            explain: false,
         })
     }
 
@@ -2393,6 +2398,7 @@ impl QueryEditor {
                 publication: gq_language::check::statement_publication(&source),
                 // A diff answers a page at a time; this asks for its first.
                 page: usize::from(is_branch_diff(&source)),
+                explain: statement == gq_language::Statement::ExplainLoad,
                 text: source.clone(),
                 name: None,
                 label,
@@ -2480,6 +2486,7 @@ impl QueryEditor {
             destroys,
             publication,
             page: 0,
+            explain: explained,
         })
     }
 
@@ -2700,8 +2707,11 @@ impl QueryEditor {
             let elapsed = started.elapsed();
             // The rows are built off the main thread: a large answer would hold up frames.
             let columns = prepared.columns.clone();
+            let explain = prepared.explain;
             let answer = cx
-                .background_spawn(async move { Answer::of(result, columns.as_deref(), schema) })
+                .background_spawn(
+                    async move { Answer::of(result, columns.as_deref(), schema, explain) },
+                )
                 .await;
             this.update(cx, |this, cx| {
                 // A new output replaces the plan whose operator lit the text.
@@ -2729,7 +2739,12 @@ impl QueryEditor {
         elapsed: Duration,
         schema: Option<Arc<SchemaModel>>,
     ) {
-        let answer = Answer::of(result, prepared.columns.as_deref(), schema);
+        let answer = Answer::of(
+            result,
+            prepared.columns.as_deref(),
+            schema,
+            prepared.explain,
+        );
         self.show_read(prepared, read_at, answer, elapsed);
     }
 
@@ -5211,6 +5226,41 @@ mod tests {
                 Output::Rows(rows) => rows.widths.clone(),
                 _ => panic!("no rows"),
             }
+        }
+
+        /// Only a run that explained shows its answer as a plan: a read that returns columns
+        /// named as `explain`'s are shows them as rows. Before, the column names alone decided,
+        /// so such a read's rows were drawn as a plan's operators.
+        #[gpui::test]
+        async fn only_an_explain_is_shown_as_a_plan(cx: &mut TestAppContext) {
+            init(cx);
+            let session = session(cx);
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(1, session, window, cx));
+            editor.update(cx, |editor, _| {
+                let output = || -> ReadOutput {
+                    serde_json::from_value(json!({
+                        "query_name": "people",
+                        "target": {"branch": "main"},
+                        "row_count": 1,
+                        "columns": ["tree", "depth", "node", "detail"],
+                        "rows": [{"tree": "logical", "depth": 0, "node": "Scan", "detail": ""}],
+                    }))
+                    .unwrap()
+                };
+                let at = || ReadAt::Branch("main".into());
+                editor.finish_read(people(), at(), Ok(output()), Duration::ZERO, None);
+                assert!(matches!(editor.output, Output::Rows(_)), "a read's rows");
+                let explained = Prepared {
+                    explain: true,
+                    ..people()
+                };
+                editor.finish_read(explained, at(), Ok(output()), Duration::ZERO, None);
+                assert!(
+                    matches!(editor.output, Output::Plan(_)),
+                    "an explain's plan"
+                );
+            });
         }
 
         /// A result column dragged to a width keeps it in the next result that has a column of
