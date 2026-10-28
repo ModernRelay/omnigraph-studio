@@ -780,17 +780,14 @@ impl CommitView {
                     .collect();
                 let mut card = card.relationships(counts, lines);
                 if left_out > 0 {
-                    card = card.relationships_footer(
-                        studio_ui::ds::button(
-                            ("more-relationships", ix),
-                            change_cards::more_lines_label(left_out),
-                        )
-                        .style(ButtonStyle::Subtle)
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                    card = card.relationships_footer(change_cards::more_lines_button(
+                        ix,
+                        left_out,
+                        cx.listener(move |this, _, _, cx| {
                             this.card_lines.show_more(card_key.clone(), shown);
                             cx.notify();
-                        })),
-                    );
+                        }),
+                    ));
                 }
                 div()
                     .px(px(studio_ui::ds::space::EDGE))

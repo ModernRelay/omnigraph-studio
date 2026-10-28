@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 use editor::{Editor, EditorEvent};
 use gpui::{
     AnyElement, AnyView, App, AsyncApp, Bounds, ClipboardItem, Context, Entity, EventEmitter,
-    FocusHandle, Focusable, Hsla, KeyContext, PathBuilder, Pixels, Render, ScrollStrategy,
-    SharedString, StyleRefinement, Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
-    canvas, point, px, uniform_list,
+    FocusHandle, Focusable, Hsla, PathBuilder, Pixels, Render, ScrollStrategy, SharedString,
+    StyleRefinement, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, canvas,
+    point, px, uniform_list,
 };
 use graph_client::ReadError;
 use graph_client::api::{CommitListOutput, CommitOutput};
@@ -2252,11 +2252,8 @@ impl Render for HistoryView {
             }
         };
         // Typing in the search box must not move the selection.
-        let mut context = KeyContext::new_with_defaults();
-        context.add("History");
-        if self.search.focus_handle(cx).is_focused(window) {
-            context.add("searching");
-        }
+        let context =
+            studio_ui::ds::search_key_context("History", &self.search.focus_handle(cx), window);
         v_flex()
             .key_context(context)
             .track_focus(&self.focus_handle)

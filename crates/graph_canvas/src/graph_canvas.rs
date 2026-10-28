@@ -26,8 +26,8 @@ use std::time::Instant;
 use gpui::{
     App, AppContext as _, Bounds, ContentMask, Context, Entity, EventEmitter, FocusHandle,
     Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Pixels,
-    Point, Render, ScrollWheelEvent, SharedString, Size, Subscription, Task, Window, anchored,
-    canvas, deferred, point, px,
+    Point, Render, ScrollWheelEvent, SharedString, Size, Subscription, Task, Window, canvas, point,
+    px,
 };
 use graph_store::{
     EntryKind, Exploration, ExplorationEvent, ExplorePath, GraphSession, GroupKey, Loadable,
@@ -2746,16 +2746,11 @@ impl Render for GraphCanvas {
             .children(area)
             .children(body.map(|body| div().absolute().size_full().top_0().left_0().child(body)))
             .child(overlay)
-            .children(self.context_menu.as_ref().map(|(menu, position, _)| {
-                deferred(
-                    anchored()
-                        .position(*position)
-                        .anchor(gpui::Anchor::TopLeft)
-                        .snap_to_window_with_margin(px(space::MD))
-                        .child(menu.clone()),
-                )
-                .with_priority(1)
-            }))
+            .children(
+                self.context_menu
+                    .as_ref()
+                    .map(|(menu, position, _)| studio_ui::ds::menu_at(menu.clone(), *position)),
+            )
             // Nothing drawn yet: the start state says it all.
             .when(!self.scene.nodes.is_empty(), |canvas| {
                 canvas.child(self.render_caption(cx))

@@ -8838,16 +8838,11 @@ impl Render for TypeTable {
                     })
                     .children(drafts_bar),
             )
-            .children(self.header_menu.as_ref().map(|(menu, position, _)| {
-                deferred(
-                    anchored()
-                        .position(*position)
-                        .anchor(Anchor::TopLeft)
-                        .snap_to_window_with_margin(px(space::MD))
-                        .child(menu.clone()),
-                )
-                .with_priority(1)
-            }))
+            .children(
+                self.header_menu
+                    .as_ref()
+                    .map(|(menu, position, _)| studio_ui::ds::menu_at(menu.clone(), *position)),
+            )
     }
 }
 

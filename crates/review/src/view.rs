@@ -2901,17 +2901,14 @@ impl ReviewView {
             .collect();
         card = card.relationships(counts, lines);
         if left_out > 0 {
-            card = card.relationships_footer(
-                studio_ui::ds::button(
-                    ("more-relationships", ix),
-                    change_cards::more_lines_label(left_out),
-                )
-                .style(ButtonStyle::Subtle)
-                .on_click(cx.listener(move |this, _, _, cx| {
+            card = card.relationships_footer(change_cards::more_lines_button(
+                ix,
+                left_out,
+                cx.listener(move |this, _, _, cx| {
                     this.card_lines.show_more(card_key.clone(), shown);
                     cx.notify();
-                })),
-            );
+                }),
+            ));
         }
         card.on_click(cx.listener(move |this, _, _, cx| {
             let primary = this
@@ -3831,11 +3828,8 @@ impl Render for ReviewView {
             _ => studio_ui::ds::loading_state("Reading changes…").into_any_element(),
         };
         // Typing in the search box must not move between cards.
-        let mut context = gpui::KeyContext::new_with_defaults();
-        context.add("Review");
-        if self.search.focus_handle(cx).is_focused(window) {
-            context.add("searching");
-        }
+        let context =
+            studio_ui::ds::search_key_context("Review", &self.search.focus_handle(cx), window);
         v_flex()
             .key_context(context)
             .track_focus(&self.focus_handle)

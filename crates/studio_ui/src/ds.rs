@@ -1732,6 +1732,22 @@ pub fn sidebar_search(editor: impl IntoElement, cx: &App) -> Div {
         .child(field_input(editor))
 }
 
+/// A view's key context: `name`, and `searching` while its search field (`search`) has the
+/// keyboard. The keymaps bind the keys that move the view's selection only outside a search
+/// (`History && !searching`), so typing in the field does not move it.
+pub fn search_key_context(
+    name: &'static str,
+    search: &gpui::FocusHandle,
+    window: &Window,
+) -> gpui::KeyContext {
+    let mut context = gpui::KeyContext::new_with_defaults();
+    context.add(name);
+    if search.is_focused(window) {
+        context.add("searching");
+    }
+    context
+}
+
 /// The text of a single-line field that sits among `Small` labels (a filter value, a search
 /// box): an editor's text at the label's size rather than the body size.
 pub fn field_text(cx: &App) -> gpui::TextStyleRefinement {
@@ -1974,21 +1990,22 @@ pub const TAG_MAX_WIDTH: f32 = 160.;
 /// A tag: a name in a quiet pill, as a table shows a row's neighbours. The UI font, unlike
 /// `ui::Chip`, which is for code-like values such as enum members.
 pub fn tag(label: impl Into<SharedString>, cx: &App) -> Div {
-    div()
-        .flex_none()
-        .max_w(px(TAG_MAX_WIDTH))
-        .h(px(size::TAG))
-        .px(px(space::SM))
-        .flex()
-        .items_center()
-        .rounded(px(radii(cx).xs))
-        .bg(surface::tag(cx))
-        .child(crate::cell_text(label, cx).meta(cx).hug())
+    tag_box(crate::cell_text(label, cx).meta(cx).hug(), cx)
 }
 
 /// A code-like value in a quiet box, as a table shows an enum member: [`tag`] with the value
 /// in the buffer font. Zed's `Chip` keeps its own corner and hairline.
 pub fn chip(label: impl Into<SharedString>, cx: &App) -> Div {
+    tag_box(
+        crate::cell_text(label, cx).meta(cx).buffer_font(cx).hug(),
+        cx,
+    )
+}
+
+/// The quiet box of a [`tag`] and a [`chip`], around their text: a cell text, not a truncating
+/// label, since every cell of a column of them draws one, and a truncating label is shaped
+/// again on every pass of every frame.
+fn tag_box(text: impl IntoElement, cx: &App) -> Div {
     div()
         .flex_none()
         .max_w(px(TAG_MAX_WIDTH))
@@ -1998,9 +2015,20 @@ pub fn chip(label: impl Into<SharedString>, cx: &App) -> Div {
         .items_center()
         .rounded(px(radii(cx).xs))
         .bg(surface::tag(cx))
-        // A cell text, not a truncating label: every enum cell draws one, and a truncating
-        // label is shaped again on every pass of every frame.
-        .child(crate::cell_text(label, cx).meta(cx).buffer_font(cx).hug())
+        .child(text)
+}
+
+/// A menu opened at `position`, where the right click was: drawn over everything else, and
+/// kept inside the window by a margin.
+pub fn menu_at(menu: impl IntoElement, position: gpui::Point<Pixels>) -> gpui::Deferred {
+    gpui::deferred(
+        gpui::anchored()
+            .position(position)
+            .anchor(gpui::Anchor::TopLeft)
+            .snap_to_window_with_margin(px(space::MD))
+            .child(menu),
+    )
+    .with_priority(1)
 }
 
 /// A checkbox and its label: a box of the scale's extra-small corner, filled with the ink
