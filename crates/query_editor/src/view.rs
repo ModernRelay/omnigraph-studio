@@ -3823,7 +3823,6 @@ impl QueryEditor {
     fn render_confirm(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         use studio_ui::ds::{self, size, space};
         let pending = self.pending_write.as_ref()?;
-        let (background, border) = (ds::surface::warning(cx), ds::surface::warning_border(cx));
         let (said, button) = confirm_words(&pending.prepared, &pending.branch);
         let what = match &pending.typed {
             Some(typed) => typed.what.clone(),
@@ -3841,21 +3840,11 @@ impl QueryEditor {
             None => self.confirm_focus.clone(),
         };
         Some(
-            h_flex()
+            warning_bar(what, cx)
                 .key_context("QueryConfirm")
                 .track_focus(&self.confirm_focus)
                 .on_action(cx.listener(Self::confirm_write))
                 .on_action(cx.listener(Self::cancel_write))
-                .flex_none()
-                .min_h(px(size::STRIP))
-                .px(px(space::EDGE))
-                .gap(px(space::INLINE))
-                .items_center()
-                .bg(background)
-                .border_b_1()
-                .border_color(border)
-                .child(studio_ui::ds::icon::lead(IconName::Warning).color(Color::Warning))
-                .child(div().flex_1().min_w_0().child(ds::text::body(what)))
                 .children(typed)
                 .child(
                     h_flex()
@@ -3892,7 +3881,7 @@ impl QueryEditor {
     /// is kept, and the person saves it over the file (↵ once ⌘S asked) or takes the file's
     /// text. Nothing is written over the file without it.
     fn render_disk_change(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        use studio_ui::ds::{self, size, space};
+        use studio_ui::ds::{self, space};
         let change = self.disk_change.as_ref()?;
         let name = self.path.as_deref().map(file_name).unwrap_or_default();
         let said = if change.asked {
@@ -3908,7 +3897,7 @@ impl QueryEditor {
         };
         let focus = self.file_focus.clone();
         Some(
-            h_flex()
+            warning_bar(said, cx)
                 .key_context("QueryConfirm")
                 .track_focus(&self.file_focus)
                 .on_action(
@@ -3918,16 +3907,6 @@ impl QueryEditor {
                     window.focus(&this.editor_focus, cx);
                     cx.notify();
                 }))
-                .flex_none()
-                .min_h(px(size::STRIP))
-                .px(px(space::EDGE))
-                .gap(px(space::INLINE))
-                .items_center()
-                .bg(ds::surface::warning(cx))
-                .border_b_1()
-                .border_color(ds::surface::warning_border(cx))
-                .child(studio_ui::ds::icon::lead(IconName::Warning).color(Color::Warning))
-                .child(div().flex_1().min_w_0().child(ds::text::body(said)))
                 .child(
                     h_flex()
                         .gap(px(space::XS))
@@ -3958,25 +3937,16 @@ impl QueryEditor {
     /// The bar that says the tab's file is gone, so the text it holds is on no disk: Save As
     /// keeps it elsewhere, and Save writes it back where it was.
     fn render_file_gone(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        use studio_ui::ds::{self, size, space};
+        use studio_ui::ds;
         self.file_gone.as_ref()?;
         let name = self.path.as_deref().map(file_name).unwrap_or_default();
         let focus = self.editor_focus.clone();
+        let said = format!(
+            "{name} is not on disk any more: it was moved or deleted. This is the text the tab \
+             last held; Save As keeps it, and Save writes it back where it was."
+        );
         Some(
-            h_flex()
-                .flex_none()
-                .min_h(px(size::STRIP))
-                .px(px(space::EDGE))
-                .gap(px(space::INLINE))
-                .items_center()
-                .bg(ds::surface::warning(cx))
-                .border_b_1()
-                .border_color(ds::surface::warning_border(cx))
-                .child(studio_ui::ds::icon::lead(IconName::Warning).color(Color::Warning))
-                .child(div().flex_1().min_w_0().child(ds::text::body(format!(
-                    "{name} is not on disk any more: it was moved or deleted. This is the text \
-                     the tab last held; Save As keeps it, and Save writes it back where it was."
-                ))))
+            warning_bar(said, cx)
                 .child(
                     ds::button("file-gone-save-as", "Save As…")
                         .style(ButtonStyle::Filled)
@@ -4825,6 +4795,23 @@ fn param_type(param: &ParamDescriptor) -> String {
         ParamKind::List => format!("[{}]", scalar(param.item_kind.unwrap_or(ParamKind::Other))),
         kind => scalar(kind).to_owned(),
     }
+}
+
+/// A bar across the top of the tab that holds it up (a write to confirm, its file changed or
+/// gone): the warning icon and what it says; the caller adds its actions at the end.
+fn warning_bar(said: impl Into<SharedString>, cx: &App) -> Div {
+    use studio_ui::ds::{self, size, space};
+    h_flex()
+        .flex_none()
+        .min_h(px(size::STRIP))
+        .px(px(space::EDGE))
+        .gap(px(space::INLINE))
+        .items_center()
+        .bg(ds::surface::warning(cx))
+        .border_b_1()
+        .border_color(ds::surface::warning_border(cx))
+        .child(ds::icon::lead(IconName::Warning).color(Color::Warning))
+        .child(div().flex_1().min_w_0().child(ds::text::body(said)))
 }
 
 /// Writes `contents` to `dir/name.gq`, or to `dir/name-2.gq` and so on when that is taken,
