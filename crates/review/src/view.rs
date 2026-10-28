@@ -500,6 +500,9 @@ pub struct ReviewView {
     /// The target moved since the dry run: it is read again at the next frame the review is
     /// drawn in ([`ReviewView::preview_moved`]), and a hidden review reads nothing.
     preview_owed: bool,
+    /// The review is read when it is next drawn ([`Self::owe_read`]): a review restored behind
+    /// another tab reads no diff, nor after a new token, until it is shown.
+    read_owed: bool,
     /// The target's head as the session knew it when the dry run was asked for.
     preview_target: Option<String>,
     _load_task: Option<Task<()>>,
@@ -645,6 +648,7 @@ impl ReviewView {
             _target_watch: target_watch,
             preview_again: false,
             preview_owed: false,
+            read_owed: false,
             preview_target: None,
             _load_task: None,
             _names_task: None,
@@ -655,12 +659,20 @@ impl ReviewView {
             _fix_task: None,
             _subscriptions: vec![subscription, search_subscription],
         };
-        // Read as any Refresh is: a merge of these branches whose response was lost and may
-        // still land, sent from a review closed since or open elsewhere, is where this one
-        // starts, from the session's log.
-        view.reload(cx);
+        // Read as any Refresh is, once shown: a merge of these branches whose response was lost
+        // and may still land, sent from a review closed since or open elsewhere, is where this
+        // one starts, from the session's log.
+        view.owe_read(cx);
         view.logged_merge_held = view.logged_merge_may_land(cx);
         view
+    }
+
+    /// Reads the review again from the branch head when it is next drawn ([`Self::read_owed`]),
+    /// as [`Self::reload`] does at once.
+    fn owe_read(&mut self, cx: &mut Context<Self>) {
+        self.load = LoadState::Loading { folded: 0 };
+        self.read_owed = true;
+        cx.notify();
     }
 
     /// The session logged an outcome, recorded what a target's history showed of a lost merge,
@@ -754,7 +766,7 @@ impl ReviewView {
         self._names_task = None;
         self.preview = Preview::Unread;
         self._preview_task = None;
-        self.reload(cx);
+        self.owe_read(cx);
     }
 
     /// Another writer's schema: the cards were made under the one before, as are those of a
@@ -3786,6 +3798,9 @@ impl Render for ReviewView {
         if std::mem::take(&mut self.preview_owed) {
             cx.defer_in(window, |this, _, cx| this.preview_moved(cx));
         }
+        if std::mem::take(&mut self.read_owed) {
+            cx.defer_in(window, |this, _, cx| this.reload(cx));
+        }
         let header = self.render_header(cx);
         let body = match (&self.load, &self.data) {
             (LoadState::Ready, Some(_)) if self.show_conflicts => self.render_conflicts(cx),
@@ -4027,6 +4042,44 @@ pub(crate) mod tests {
             mark_of(&change("p2", json!({"name": "Ada"}))),
             "another entity"
         );
+    }
+
+    /// A root that draws nothing, for a window whose review is never drawn.
+    struct Blank;
+
+    impl Render for Blank {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    /// A review not drawn (restored with the workspace behind another tab) reads no diff until
+    /// it is shown; drawn, it reads. Before, every restored review read its whole diff at start.
+    #[gpui::test]
+    async fn a_review_not_drawn_reads_no_diff(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _) = reviewed_server_writing(false, cx);
+        let (_blank, cx) = cx.add_window_view(|_, _| Blank);
+        let hidden = cx.update(|window, cx| {
+            let session = session.clone();
+            cx.new(|cx| ReviewView::new(session, "feature".into(), "main".into(), window, cx))
+        });
+        cx.run_until_parked();
+        hidden.read_with(cx, |view, _| {
+            assert!(
+                view._load_task.is_none() && view.data.is_none(),
+                "no diff read"
+            );
+            assert!(view.read_owed, "it reads when drawn");
+        });
+        let (shown, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        shown.read_with(cx, |view, _| assert!(matches!(view.load, LoadState::Ready)));
     }
 
     /// Fixes asked for one after the other go one at a time, each bound to the commit the one
