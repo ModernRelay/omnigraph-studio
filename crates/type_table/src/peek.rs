@@ -2677,9 +2677,12 @@ impl NodePeek {
             return;
         };
         let name = property.name.clone();
-        // A field open when the access route refused the branch: what was typed stays as its
-        // draft, and nothing is sent.
-        if self.change_refusal(cx).is_some() {
+        // A field open when the access route refused the branch, or a property already being
+        // written (here, or by another view of the node; a switch clicked twice before it was
+        // drawn again): what was typed stays as its draft, and nothing is sent. One write of a
+        // property is out at a time, so two never land in an order nobody chose.
+        let writing = self.saving.contains(&name) || self.saving_elsewhere.contains(&name);
+        if writing || self.change_refusal(cx).is_some() {
             self.edits.remove(&name);
             if !same_value(&old, &new) {
                 self.put_draft(&name, old, text, cx);
@@ -2789,7 +2792,7 @@ impl NodePeek {
             SaveResult::NoMatch => {
                 self.put_back(&name, &new, shown);
                 self.newer = true;
-                self.reread_conflict(property, (old, text), sent, window, cx);
+                self.reread_conflict(property, (old, new, text), sent, window, cx);
             }
             SaveResult::Refused(notice) | SaveResult::Unknown(notice) => {
                 self.put_back(&name, &new, shown);
@@ -2807,18 +2810,22 @@ impl NodePeek {
     /// the session then holds ([`Self::reread_at_head`]). The field opens again bound to the
     /// value the view then shows, which the notice names. When the node could not be read, or
     /// the read still finds the value the field was typed over, it stays bound to that value.
-    /// The field shows as saving until the read lands. `edit` is the value the field was bound
-    /// to and its text; `sent` the property's draft as the write went out, which a draft
-    /// retyped or let go elsewhere meanwhile no longer is, and stands.
+    /// A read that finds the value the write would have made has nothing left to write: an
+    /// earlier try whose outcome was unknown landed, or the same change was made elsewhere. The
+    /// field closes and its draft goes, as ⌘S's drafts do ([`Self::drafts_read`]), rather than
+    /// the person's own change being said to be another's. The field shows as saving until the
+    /// read lands. `edit` is the value the field was bound to, the value it would have written
+    /// and its text; `sent` the property's draft as the write went out, which a draft retyped
+    /// or let go elsewhere meanwhile no longer is, and stands.
     fn reread_conflict(
         &mut self,
         property: gq_language::Property,
-        edit: (Value, String),
+        edit: (Value, Value, String),
         sent: Option<DraftEntry>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (old, text) = edit;
+        let (old, new, text) = edit;
         let name = property.name.clone();
         self.saving.insert(name.clone());
         let (session, branch, key) = (
@@ -2848,6 +2855,20 @@ impl NodePeek {
                 if this.branch == branch {
                     // Without a read of its own, it settles against what the view shows.
                     let now = found.or_else(|| this.values.loaded().cloned().map(Some));
+                    let written = match &now {
+                        Some(Some(values)) => {
+                            same_value(values.get(&name).unwrap_or(&Value::Null), &new)
+                        }
+                        _ => false,
+                    };
+                    if written {
+                        this.settle_draft_on(&branch, &name, sent.as_ref(), None, cx);
+                        if !this.writes_out() {
+                            this.compare_head(cx);
+                        }
+                        cx.notify();
+                        return;
+                    }
                     let (bound, notice) = match &now {
                         Some(Some(values)) => {
                             let value = values.get(&name).cloned().unwrap_or(Value::Null);
@@ -3836,10 +3857,28 @@ impl NodePeek {
             return;
         };
         // Runs every frame: a text is parsed only when it is new, so an unchanged view costs a
-        // comparison per property.
+        // comparison per property, and nothing is made or kept.
         let Some(schema) = self.schema.clone() else {
             return;
         };
+        let mut shown = 0;
+        let unchanged = listed_properties(&schema, &self.subject)
+            .into_iter()
+            .filter(|property| reads_as_markdown(property))
+            .filter_map(|property| {
+                let text = values.get(&property.name).and_then(Value::as_str)?;
+                Some((&property.name, text))
+            })
+            .all(|(name, text)| {
+                shown += 1;
+                self.markdown
+                    .get(name)
+                    .is_some_and(|(drawn, _)| drawn == text)
+                    || self.plain_text.get(name).is_some_and(|drawn| drawn == text)
+            });
+        if unchanged && shown == self.markdown.len() + self.plain_text.len() {
+            return;
+        }
         let mut wanted: HashSet<String> = HashSet::new();
         for property in listed_properties(&schema, &self.subject) {
             let name = property.name.clone();
@@ -7073,6 +7112,43 @@ mod tests {
         );
     }
 
+    /// One write of a property is out at a time: a second, from a control drawn before the first
+    /// went out, sends nothing and keeps its text as the property's draft. Before, both went,
+    /// and landed in whatever order the server took them.
+    #[gpui::test]
+    async fn a_second_write_of_a_property_waits_as_a_draft(cx: &mut TestAppContext) {
+        let session = session(PEOPLE, cx);
+        let (view, cx) = page(session.clone(), cx);
+        view.update_in(cx, |view, window, cx| {
+            let person = view.schema.as_ref().unwrap().node("Person").unwrap();
+            let property = person.property("name").unwrap().clone();
+            let old = view.value_of("name");
+            let first = json!("Ada Lovelace");
+            view.write_value(
+                property.clone(),
+                old,
+                first.clone(),
+                "Ada Lovelace".into(),
+                window,
+                cx,
+            );
+            assert!(view.saving.contains("name"), "the first is out");
+            view.write_value(
+                property,
+                first.clone(),
+                json!("Ada King"),
+                "Ada King".into(),
+                window,
+                cx,
+            );
+            assert_eq!(view.value_of("name"), first, "the second was not sent");
+            assert_eq!(
+                view.draft_of("name", cx).map(|draft| draft.text).as_deref(),
+                Some("Ada King")
+            );
+        });
+    }
+
     /// A write refused after the view followed the window to another branch keeps its text as
     /// the property's draft on the branch it was typed on, and leaves the new branch alone.
     #[gpui::test]
@@ -7207,6 +7283,34 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert_eq!(view.snapshot.as_deref(), Some("c1"));
             assert_eq!(view.value_of("name"), json!("Ada"), "what c1 holds");
+        });
+    }
+
+    /// A write that matched nothing because what it would make is there already (an earlier
+    /// try whose outcome was unknown landed, or the same change was made elsewhere) is written:
+    /// the field closes, its draft goes, and nothing says the value changed elsewhere. Before,
+    /// the person's own change was named as another's, and the field stayed open on it.
+    #[gpui::test]
+    async fn a_conflict_with_the_value_typed_closes_the_field(cx: &mut TestAppContext) {
+        let (session, writer) = crate::test_support::session_routing_unmatched(
+            PEOPLE,
+            |request| {
+                let name = match request["at"].as_str() {
+                    Some("c2") => "Ada Lovelace",
+                    _ => "Ada",
+                };
+                json!([{ "n": { "@id": "p1", "slug": "p1", "name": name } }])
+            },
+            cx,
+        );
+        let (view, cx) = page(session.clone(), cx);
+        writer.commit("c2", vec![changed("node", "Person", "p1", None)]);
+        edit_name(&view, "Ada Lovelace", cx);
+        view.read_with(cx, |view, cx| {
+            assert!(!view.edits.contains_key("name"), "the field closed");
+            assert_eq!(view.value_of("name"), json!("Ada Lovelace"));
+            assert!(view.draft_of("name", cx).is_none(), "no draft is left");
+            assert!(view.saving.is_empty());
         });
     }
 
@@ -7718,6 +7822,45 @@ mod tests {
                 view.blobs.is_empty(),
                 "nothing of the old commit's values stays"
             );
+        });
+    }
+
+    /// A text with markup is parsed once while it stands: a frame that finds it as drawn makes
+    /// nothing, a changed text is parsed again, and one that reads as itself is a label.
+    #[gpui::test]
+    async fn a_texts_markdown_is_made_once_while_it_stands(cx: &mut TestAppContext) {
+        let session = session(PEOPLE, cx);
+        let (view, cx) = page(session, cx);
+        view.update(cx, |view, cx| {
+            let set = |view: &mut NodePeek, text: &str| {
+                let Loadable::Loaded(values) = &mut view.values else {
+                    panic!("the node is read");
+                };
+                values.insert("name".into(), json!(text));
+            };
+            let made = |view: &NodePeek| view.markdown.get("name").map(|(_, md)| md.entity_id());
+            set(view, "**Ada** Lovelace");
+            view.sync_markdown(cx);
+            let first = made(view).expect("a markdown view");
+            view.sync_markdown(cx);
+            assert_eq!(made(view), Some(first), "the same text is not parsed again");
+            set(view, "**Ada** King");
+            view.sync_markdown(cx);
+            assert!(
+                made(view).is_some_and(|again| again != first),
+                "a changed one is"
+            );
+            set(view, "Ada");
+            view.sync_markdown(cx);
+            assert_eq!(made(view), None);
+            assert_eq!(view.plain_text.get("name").map(String::as_str), Some("Ada"));
+            // A text gone (cleared) leaves nothing drawn for it, though every other is as drawn.
+            let Loadable::Loaded(values) = &mut view.values else {
+                panic!("the node is read");
+            };
+            values.insert("name".into(), Value::Null);
+            view.sync_markdown(cx);
+            assert!(view.plain_text.is_empty() && view.markdown.is_empty());
         });
     }
 
