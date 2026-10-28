@@ -559,6 +559,9 @@ pub struct TypeTable {
     /// What the table's own writes past its pin change in its counts: a count read at the pin
     /// lands with it added, whether it was out when they landed or is read after.
     count_shift: Option<CountShift>,
+    /// The rows are read when the table is next drawn ([`Self::owe_reload`]): a table behind
+    /// another tab reads nothing when it is restored, nor when the branch or the schema moves.
+    rows_owed: bool,
     _subscriptions: Vec<Subscription>,
     /// How often the table drew, for the test that moving through the offers draws it and
     /// leaves the grid alone.
@@ -801,6 +804,7 @@ impl TypeTable {
             count_task: None,
             total_task: None,
             count_shift: None,
+            rows_owed: false,
             _subscriptions: subscriptions,
             #[cfg(test)]
             renders: 0,
@@ -868,7 +872,7 @@ impl TypeTable {
                 self.cells.clear();
                 self.draft_notices.clear();
                 self.sync_drafts(cx);
-                self.reload(false, cx);
+                self.owe_reload(cx);
             }
             SessionEvent::DraftsChanged => self.drafts_changed(cx),
             SessionEvent::HeadMoved { branch, .. } if *branch == self.branch => {
@@ -986,7 +990,7 @@ impl TypeTable {
         {
             self.grouping = None;
         }
-        self.reload(false, cx);
+        self.owe_reload(cx);
     }
 
     /// [`Self::read_shown`] of a page from `start` (in the section `section` holds the rows of,
@@ -2329,8 +2333,27 @@ impl TypeTable {
     /// Reads the first page again. `keep_pin` re-reads the same commit (new filters);
     /// otherwise the table moves to the branch head (Refresh).
     fn reload(&mut self, keep_pin: bool, cx: &mut Context<Self>) {
+        if self.forget_rows(keep_pin, cx) {
+            self.rows_owed = false;
+            self.read_rows(cx);
+        }
+    }
+
+    /// [`Self::reload`] at the branch head, its reads made when the table is next drawn
+    /// ([`Self::rows_owed`]): what it showed goes now, so a table in view shows it reading.
+    fn owe_reload(&mut self, cx: &mut Context<Self>) {
+        if self.forget_rows(false, cx) {
+            self.rows_owed = true;
+            cx.notify();
+        }
+    }
+
+    /// Lets go of the rows read, and of the reads out for them, before they are read again
+    /// ([`Self::reload`]); `false` when there is nothing to read (no schema yet, or the type is
+    /// gone).
+    fn forget_rows(&mut self, keep_pin: bool, cx: &mut Context<Self>) -> bool {
         if self.schema.is_none() || self.missing {
-            return;
+            return false;
         }
         if keep_pin {
             self.paging.restart();
@@ -2400,12 +2423,17 @@ impl TypeTable {
             .read(cx)
             .scroll_handle
             .scroll_to_item(0, ScrollStrategy::Top);
+        true
+    }
+
+    /// Reads the rows [`Self::forget_rows`] let go of: the sections of a grouping, else the
+    /// first page.
+    fn read_rows(&mut self, cx: &mut Context<Self>) {
         if self.grouping.is_some() {
             self.read_groups(cx);
-            cx.notify();
-            return;
+        } else {
+            self.read_first_page(cx);
         }
-        self.read_first_page(cx);
         cx.notify();
     }
 
@@ -8708,6 +8736,9 @@ impl Render for TypeTable {
         {
             self.renders += 1;
         }
+        if std::mem::take(&mut self.rows_owed) {
+            cx.defer_in(window, |this, _, cx| this.read_rows(cx));
+        }
         // An edit taken from the cell (a reload kept it as a draft) leaves the cell editor
         // focused but no longer drawn: the keys come back to the table.
         if self.editing.is_none() && self.cell_editor.focus_handle(cx).is_focused(window) {
@@ -8953,6 +8984,64 @@ mod tests {
 
     fn grid_renders(table: &Entity<TypeTable>, cx: &mut VisualTestContext) -> usize {
         table.read_with(cx, |table, cx| table.grid.read(cx).renders)
+    }
+
+    /// A root that draws nothing, for a window whose table is never drawn.
+    struct Blank;
+
+    impl Render for Blank {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    /// A table not drawn (restored with the workspace behind another tab) reads no rows: not
+    /// when it is made, nor when the branch moves. Drawn, it reads them. Before, every such
+    /// table read its first page at start and again at every branch move.
+    #[gpui::test]
+    async fn a_table_not_drawn_reads_no_rows(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let session = session(PEOPLE, cx);
+        cx.run_until_parked();
+        let (_blank, cx) = cx.add_window_view(|_, _| Blank);
+        let hidden = cx.update(|window, cx| {
+            let session = session.clone();
+            cx.new(|cx| {
+                TypeTable::new(
+                    WeakEntity::new_invalid(),
+                    session,
+                    "Person".into(),
+                    None,
+                    window,
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+        session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        cx.run_until_parked();
+        hidden.read_with(cx, |table, _| {
+            assert!(table.page_task.is_none(), "no page read");
+            assert!(table.rows_owed, "it reads when drawn");
+            assert!(table.rows.is_empty());
+        });
+        let (shown, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        shown.read_with(cx, |table, _| {
+            assert!(!table.rows.is_empty(), "drawn, it reads")
+        });
     }
 
     /// Another writer's commit that changed none of the types the table reads moves its pin to
