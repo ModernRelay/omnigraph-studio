@@ -1626,13 +1626,11 @@ pub fn judge_write<'a>(
                     ),
                 }
             }
-            // An effect this build does not know, or none at all: Omnigraph 0.14.0 states one
-            // on every error, so the answer cannot rule the change out. A server that speaks
-            // the contract and states none is a 0.14 build from before that release.
+            // An effect this build does not know, or none: the contract states one on every
+            // error, so an answer without one cannot rule the change out.
             Some(DispositionEffects::Other) | None => WriteOutcome::Unknown {
                 reason: format!(
-                    "the server answered {status} without saying whether the change was made \
-                     (a build of Omnigraph from before 0.14.0 does not say): {}",
+                    "the server answered {status} without saying whether the change was made: {}",
                     body.error
                 ),
             },
@@ -1944,7 +1942,7 @@ mod tests {
         assert_eq!(
             judge(409, None),
             "unknown",
-            "a 0.14 build from before the release: the status rules nothing out"
+            "no disposition: the status rules nothing out"
         );
         assert_eq!(judge(503, None), "unknown");
         // A detail this build does not read leaves the disposition to decide.
