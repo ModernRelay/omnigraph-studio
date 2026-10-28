@@ -148,6 +148,9 @@ pub struct BlobView {
     /// The read, started when the tab is first drawn: tabs restored with the workspace read
     /// nothing until they are shown.
     _load: Option<Task<()>>,
+    /// The read is asked for by a draw, and starts once the draw is done ([`Self::start_load`]):
+    /// it asks the session, which a draw does not change.
+    load_asked: bool,
     _export: Option<Task<()>>,
     /// Draws the tab again when what the credential may do is read, or the branch list, which
     /// Choose File and Clear follow, and when the schema is, which a tab opened at the head
@@ -201,6 +204,7 @@ impl BlobView {
             export: None,
             focus_handle: cx.focus_handle(),
             _load: None,
+            load_asked: false,
             _export: None,
             _session: events,
         }
@@ -1331,55 +1335,82 @@ impl Item for BlobView {
     }
 }
 
-impl Render for BlobView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self._load.is_none() {
-            match self.reading_at() {
-                Some(at) => {
-                    let load = Self::load(
-                        &self.session,
-                        &self.cell,
-                        &self.branch,
-                        Some(at),
-                        None,
-                        window,
-                        cx,
-                    );
-                    self._load = Some(load);
+impl BlobView {
+    /// Whether the read can start: the tab reads at a commit, or the schema it reads the head
+    /// with is in. Asked by a draw, which changes nothing in the session.
+    fn can_load(&self, cx: &App) -> bool {
+        self.reading_at().is_some() || matches!(self.session.read(cx).schema, Loadable::Loaded(_))
+    }
+
+    /// Starts the read a draw asked for ([`Self::load_asked`]), unless one is out.
+    fn start_load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self._load.is_some() {
+            return;
+        }
+        match self.reading_at() {
+            Some(at) => {
+                let load = Self::load(
+                    &self.session,
+                    &self.cell,
+                    &self.branch,
+                    Some(at),
+                    None,
+                    window,
+                    cx,
+                );
+                self._load = Some(load);
+            }
+            // Opened at the head, the value is the session's branch's, which a write goes to,
+            // or the branch the tab was saved on: the head is read first with the schema's
+            // probe, so this waits for the schema, and is drawn again when it comes.
+            None => {
+                let session = self.session.read(cx);
+                if !self.branch_given {
+                    self.branch = session.branch.clone();
                 }
-                // Opened at the head, the value is the session's branch's, which a write goes
-                // to, or the branch the tab was saved on: the head is read first with the
-                // schema's probe, so this waits for the schema, and is drawn again when it comes.
-                None => {
-                    let session = self.session.read(cx);
-                    if !self.branch_given {
-                        self.branch = session.branch.clone();
+                match &session.schema {
+                    Loadable::Loaded(schema) => {
+                        let probe = builder::head_probe(schema);
+                        self.content = Loadable::Loading;
+                        let load = Self::load(
+                            &self.session,
+                            &self.cell,
+                            &self.branch,
+                            None,
+                            probe,
+                            window,
+                            cx,
+                        );
+                        self._load = Some(load);
                     }
-                    match &session.schema {
-                        Loadable::Loaded(schema) => {
-                            let probe = builder::head_probe(schema);
-                            self.content = Loadable::Loading;
-                            let load = Self::load(
-                                &self.session,
-                                &self.cell,
-                                &self.branch,
-                                None,
-                                probe,
-                                window,
-                                cx,
-                            );
-                            self._load = Some(load);
-                        }
-                        Loadable::Failed(error) => self.content = Loadable::Failed(error.clone()),
-                        Loadable::NotLoaded | Loadable::Loading => {}
-                    }
+                    // A schema that failed, or is not in any more, leaves the tab to its next
+                    // draw.
+                    Loadable::Failed(_) | Loadable::NotLoaded | Loadable::Loading => {}
                 }
             }
         }
+    }
+}
+
+impl Render for BlobView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Asked only when it can start, so a tab waiting for the schema draws once and waits
+        // for it, which draws the tab again ([`SessionEvent::SchemaChanged`]).
+        if self._load.is_none() && !self.load_asked {
+            if self.can_load(cx) {
+                self.load_asked = true;
+                cx.defer_in(window, |this, window, cx| {
+                    this.load_asked = false;
+                    this.start_load(window, cx);
+                });
+            } else if let Loadable::Failed(error) = &self.session.read(cx).schema {
+                self.content = Loadable::Failed(error.clone());
+            }
+        }
         // The branch the tab writes to is known once it is first drawn; a list held then may
-        // be older than it.
+        // be older than it. Asked after the draw, as the read is.
         if self.branch_listed == BranchListed::Unseen {
-            self.follow_branch_list(cx);
+            cx.defer_in(window, |this, _, cx| this.follow_branch_list(cx));
         }
         let body = match &self.content {
             Loadable::Loading | Loadable::NotLoaded => {
