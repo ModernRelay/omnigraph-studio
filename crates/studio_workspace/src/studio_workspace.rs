@@ -3016,8 +3016,8 @@ impl Workspace {
                     .child(studio_ui::ds::text::muted(state).single_line())
                     .when(others > 0, |row| {
                         row.child(studio_ui::ds::sidebar_count(format!(
-                            "+{others} graph{}",
-                            if others == 1 { "" } else { "s" }
+                            "+{}",
+                            studio_ui::plural(others, "graph", "graphs")
                         )))
                     })
                     .child(studio_ui::ds::icon::meta(IconName::ChevronUpDown)),
@@ -3652,8 +3652,8 @@ impl Workspace {
             match (s.reads_in_flight, s.writes_in_flight) {
                 (0, 0) => None,
                 (reads, 0) => Some(format!(
-                    "{reads} quer{} running",
-                    if reads == 1 { "y" } else { "ies" }
+                    "{} running",
+                    studio_ui::plural(reads, "query", "queries")
                 )),
                 (_, writes) => Some(format!("Writing ({writes})…")),
             }

@@ -28,7 +28,7 @@ use gq_language::{
 use graph_client::api::ReadOutput;
 use graph_client::{BlobCell, BlobMeta, HistoricalGap, PropertyThen, ReadError};
 use graph_store::scope::{ReadScope, ScopeSince};
-use graph_store::{DraftEntry, DraftKey, GraphSession, Loadable, SessionEvent, plural};
+use graph_store::{DraftEntry, DraftKey, GraphSession, Loadable, SessionEvent};
 use serde_json::Value;
 use studio_actions::blob::{ChooseFile, ClearValue};
 use studio_actions::table::{
@@ -39,6 +39,7 @@ use studio_actions::table::{
 use studio_ui::ds::Button;
 use studio_ui::ds::space;
 use studio_ui::menu::{ContextMenu, ContextMenuEntry};
+use studio_ui::plural;
 use studio_ui::{ColumnDrag, ColumnResize, GridPlace, ROW_HEIGHT, columns_in_view, grid_places};
 use studio_workspace::{Item, ItemEvent, ItemStatus, KeyHint, SavedItem, ToastKind, Workspace};
 use ui::prelude::*;

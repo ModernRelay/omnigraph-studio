@@ -530,11 +530,7 @@ impl CommitView {
         let changes = match &self.state {
             State::Ready => {
                 let total = self.folded.entity_count() + self.folded.relationship_count();
-                let mut text = format!(
-                    "{} change{}",
-                    studio_ui::group_digits(total),
-                    if total == 1 { "" } else { "s" }
-                );
+                let mut text = studio_ui::plural(total, "change", "changes");
                 if self.next_page_token.is_some() {
                     text.push_str(" so far");
                 }

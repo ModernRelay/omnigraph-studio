@@ -727,8 +727,8 @@ impl OntologyPage {
                     .selected(self.pointed == Some(Pointed::Type(ty)))
                     .muted(self.dimmed(ty, lit))
                     .tooltip(format!(
-                        "{name} · related to {related} {}",
-                        if related == 1 { "type" } else { "types" }
+                        "{name} · related to {}",
+                        studio_ui::plural(related, "type", "types")
                     ))
                     .on_click(cx.listener(move |this, _, _, cx| this.focus_on(&target, cx))),
             )
@@ -1272,10 +1272,7 @@ impl OntologyPage {
                 view.schema.edges.len()
             );
             if view.map.is_none() {
-                summary += &format!(
-                    " · {groups} {}",
-                    if groups == 1 { "domain" } else { "domains" }
-                );
+                summary += &format!(" · {}", studio_ui::plural(groups, "domain", "domains"));
             }
             summary
         });

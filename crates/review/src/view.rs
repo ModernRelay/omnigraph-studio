@@ -2433,9 +2433,8 @@ impl ReviewView {
                 Preview::Conflicts(conflicts) => (
                     Severity::Warning,
                     format!(
-                        "{} conflict{} would stop a merge into {} now. {}",
-                        conflicts.len(),
-                        if conflicts.len() == 1 { "" } else { "s" },
+                        "{} would stop a merge into {} now. {}",
+                        studio_ui::plural(conflicts.len(), "conflict", "conflicts"),
                         self.target,
                         resolution_hint(&self.branch, &self.target)
                     ),
@@ -2544,9 +2543,8 @@ impl ReviewView {
             MergeState::Conflicts(conflicts) => (
                 Severity::Error,
                 format!(
-                    "{} conflict{} stopped the merge, and nothing was merged. {}",
-                    conflicts.len(),
-                    if conflicts.len() == 1 { "" } else { "s" },
+                    "{} stopped the merge, and nothing was merged. {}",
+                    studio_ui::plural(conflicts.len(), "conflict", "conflicts"),
                     resolution_hint(&self.branch, &self.target)
                 ),
                 Some(
@@ -2966,13 +2964,7 @@ fn unknown_merge_words(reason: &str, landed: Check, target: &str) -> String {
 /// lists. Counts are of commits at or below the reviewed head, never of the commits the branch
 /// made after it, which the pages read too.
 fn capped_commits_note(data: &ReviewData, branch: &str, target: &str) -> Option<String> {
-    let commits = |n: usize| {
-        format!(
-            "{} commit{}",
-            group_digits(n),
-            if n == 1 { "" } else { "s" }
-        )
-    };
+    let commits = |n: usize| studio_ui::plural(n, "commit", "commits");
     Some(match data.commits_capped.as_ref()? {
         Capped::Own { read: 0 } => format!(
             "{branch} has more than {} commits since this review was read: Studio read no \

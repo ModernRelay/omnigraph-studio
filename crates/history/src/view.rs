@@ -1972,11 +1972,7 @@ fn commit_menu(
 /// below them, and how many of them were merged in, each count grouped as Studio writes every
 /// count.
 fn summary(count: usize, merged: usize, complete: bool) -> String {
-    let mut summary = format!(
-        "{} commit{}",
-        group_digits(count),
-        if count == 1 { "" } else { "s" }
-    );
+    let mut summary = studio_ui::plural(count, "commit", "commits");
     if !complete {
         summary.push_str(" so far");
     }

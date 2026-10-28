@@ -2301,13 +2301,12 @@ impl GraphCanvas {
         let summary = match self.mode() {
             Mode::Results => {
                 let count = self.scene.nodes.len();
-                let noun = if count == 1 { "node" } else { "nodes" };
                 let title = self
                     .results
                     .as_ref()
                     .map(|(_, r)| r.title.clone())
                     .unwrap_or_default();
-                format!("{title} · {count} {noun}")
+                format!("{title} · {}", studio_ui::plural(count, "node", "nodes"))
             }
             Mode::Explore => {
                 let root = exploration
@@ -2319,9 +2318,8 @@ impl GraphCanvas {
                             .unwrap_or_else(|| root.id.clone())
                     })
                     .unwrap_or_default();
-                let nodes = self.node_count;
-                let noun = if nodes == 1 { "node" } else { "nodes" };
-                format!("From {root} · {nodes} {noun}")
+                let nodes = studio_ui::plural(self.node_count, "node", "nodes");
+                format!("From {root} · {nodes}")
             }
         };
         let root_error = match (&state.root_status, self.mode()) {

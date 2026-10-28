@@ -40,6 +40,13 @@ pub fn group_digits(n: usize) -> String {
     out
 }
 
+/// "1 draft", "3 drafts", "1,200 rows": a count, its digits grouped, and the word for it, as
+/// Studio writes every count.
+pub fn plural(count: usize, one: &str, many: &str) -> String {
+    let word = if count == 1 { one } else { many };
+    format!("{} {word}", group_digits(count))
+}
+
 /// A count with its thousands grouped, as Studio writes every count: `-12480` → `-12,480`.
 pub fn group_count(n: i64) -> String {
     let grouped = group_digits(n.unsigned_abs() as usize);

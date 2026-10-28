@@ -4457,14 +4457,19 @@ impl QueryEditor {
                 counts,
                 elapsed,
             } => {
-                let count =
-                    |n: i64, one: &str| format!("{n} {one}{}", if n == 1 { "" } else { "s" });
+                let count = |n: i64, one: &str, many: &str| {
+                    studio_ui::plural(usize::try_from(n).unwrap_or(0), one, many)
+                };
                 let mut facts = Vec::new();
                 if let Some((nodes, edges)) = counts {
                     facts.push(
                         ds::meta(
                             IconName::Hash,
-                            format!("{}, {}", count(*nodes, "node"), count(*edges, "edge")),
+                            format!(
+                                "{}, {}",
+                                count(*nodes, "node", "nodes"),
+                                count(*edges, "edge", "edges")
+                            ),
                         )
                         .into_any_element(),
                     );

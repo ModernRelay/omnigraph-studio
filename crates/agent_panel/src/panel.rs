@@ -2765,11 +2765,14 @@ fn query_rows(output: &str) -> Option<QueryRows> {
 /// icon and the column's name) over the values.
 fn record_card(rows: &QueryRows, cx: &App) -> Div {
     let shown = rows.rows.len();
-    let noun = |count: usize| if count == 1 { "row" } else { "rows" };
     let title = if shown < rows.total_rows {
-        format!("{shown} of {} {}", rows.total_rows, noun(rows.total_rows))
+        format!(
+            "{} of {}",
+            studio_ui::group_digits(shown),
+            studio_ui::plural(rows.total_rows, "row", "rows")
+        )
     } else {
-        format!("{shown} {}", noun(shown))
+        studio_ui::plural(shown, "row", "rows")
     };
     let mut meta: Vec<String> = rows.read_at.iter().cloned().collect();
     if rows.columns.len() < rows.total_columns {
@@ -3435,14 +3438,17 @@ impl ToolKind {
     /// What `count` calls of this kind did. Beside Studio's own tools in the same run, the
     /// agent's others are its "other" tools, so the parts add up to the turn's tool calls.
     fn phrase(self, count: usize, beside_studios: bool) -> String {
-        let plural = |one: &str, many: &str| if count == 1 { one } else { many }.to_owned();
+        let plural = studio_ui::plural;
         match self {
             Self::Cli => "looked up the CLI".into(),
-            Self::Run => format!("ran {count} omnigraph {}", plural("command", "commands")),
+            Self::Run => format!(
+                "ran {}",
+                plural(count, "omnigraph command", "omnigraph commands")
+            ),
             Self::Other if beside_studios => {
-                format!("used {count} other {}", plural("tool", "tools"))
+                format!("used {}", plural(count, "other tool", "other tools"))
             }
-            Self::Other => format!("used {count} {}", plural("tool", "tools")),
+            Self::Other => format!("used {}", plural(count, "tool", "tools")),
         }
     }
 }
@@ -3453,8 +3459,8 @@ fn activity_summary(thoughts: usize, tools: &[ToolKind]) -> String {
     let mut parts = Vec::new();
     if thoughts > 0 {
         parts.push(format!(
-            "thought {thoughts} {}",
-            if thoughts == 1 { "time" } else { "times" }
+            "thought {}",
+            studio_ui::plural(thoughts, "time", "times")
         ));
     }
     let mut seen: Vec<ToolKind> = Vec::new();
