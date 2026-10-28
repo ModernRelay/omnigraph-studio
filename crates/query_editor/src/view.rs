@@ -38,9 +38,9 @@ use studio_actions::workspace::Refresh;
 use studio_ui::ds::{Dotted as _, space};
 use studio_ui::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::{
-    ColumnDrag, ColumnResize, GridColumn, GridPlace, ROW_HEIGHT, columns_in_view, format_value,
-    grid_cell, grid_header, grid_places, is_numeric, resizable_grid_header, short_commit_id,
-    value_text,
+    ColumnDrag, ColumnResize, GridColumn, GridPlace, ROW_HEIGHT, columns_in_view, format_elapsed,
+    format_value, grid_cell, grid_header, grid_places, is_numeric, resizable_grid_header,
+    short_commit_id, value_text,
 };
 use studio_workspace::{Item, ItemEvent, ItemStatus, KeyHint, SavedItem};
 use ui::prelude::*;
@@ -50,7 +50,7 @@ use crate::analysis::Analysis;
 use crate::completion::GqCompletionProvider;
 use crate::results::{
     PlanItem, ResultGraph, ResultTable, ServerDiagnostic, SourceMap, WriteEffect, diff_page_text,
-    format_elapsed, is_branch_diff, is_plan, plan_items, rows_label, server_diagnostic, type_label,
+    is_branch_diff, is_plan, plan_items, rows_label, server_diagnostic, type_label,
 };
 
 /// How long typing pauses before the source is checked again.

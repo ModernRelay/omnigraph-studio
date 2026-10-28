@@ -1,6 +1,6 @@
 //! Small value helpers: commit ids, relative and absolute times, copyable values.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{App, ClipboardItem, ElementId, SharedString, Window};
 use ui::Tooltip;
@@ -38,6 +38,17 @@ pub fn group_digits(n: usize) -> String {
         out.push(c);
     }
     out
+}
+
+/// `34 ms`, `1.2 s`: how long something took, as Studio writes every duration. Whole
+/// milliseconds first, so 999.6 ms reads `1.0 s`, not `1000 ms`.
+pub fn format_elapsed(elapsed: Duration) -> String {
+    let ms = (elapsed.as_secs_f64() * 1000.).round() as u64;
+    if ms < 1000 {
+        format!("{ms} ms")
+    } else {
+        format!("{:.1} s", ms as f64 / 1000.)
+    }
 }
 
 /// "1 draft", "3 drafts", "1,200 rows": a count, its digits grouped, and the word for it, as
@@ -223,6 +234,14 @@ mod tests {
         );
         assert_eq!(short_commit_id("abc"), "abc");
         assert_eq!(group_digits(20_000), "20,000");
+    }
+
+    #[test]
+    fn durations_read_in_milliseconds_then_seconds() {
+        assert_eq!(format_elapsed(Duration::from_millis(34)), "34 ms");
+        assert_eq!(format_elapsed(Duration::from_millis(1250)), "1.2 s");
+        assert_eq!(format_elapsed(Duration::from_micros(999_600)), "1.0 s");
+        assert_eq!(format_elapsed(Duration::from_micros(999_400)), "999 ms");
     }
 
     #[test]
