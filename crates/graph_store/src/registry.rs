@@ -993,14 +993,17 @@ mod tests {
     }
 
     impl TokenSource for FakeExport {
-        fn token(&self, _: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, String>> {
+        fn token(
+            &self,
+            _: Arc<AtomicBool>,
+        ) -> BoxFuture<'static, Result<Token, cli_tokens::NoToken>> {
             self.cli.asked.lock().unwrap().push(self.target.clone());
             let token = self.cli.tokens.lock().unwrap().get(&self.target).cloned();
             let target = self.target.clone();
             async move {
                 token
                     .map(|token| Token::new(&token))
-                    .ok_or_else(|| format!("no token for '{target}'"))
+                    .ok_or_else(|| cli_tokens::NoToken::lasting(format!("no token for '{target}'")))
             }
             .boxed()
         }

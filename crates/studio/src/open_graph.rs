@@ -893,6 +893,11 @@ fn server_status(c: &Connection) -> String {
         (SignIn::Unavailable(why), ConnectionState::Unauthorized) => {
             return format!("This server asks for a sign-in Studio cannot make. {why}");
         }
+        // The sign-in's service did not answer: the sign-in stands, and is asked again.
+        (SignIn::SignedIn { service, .. }, ConnectionState::Unauthorized) if c.token_unanswered => {
+            let why = c.token_unread.as_deref().unwrap_or_default();
+            return format!("{why} You stay signed in at {service}; Studio asks again.");
+        }
         (
             SignIn::SignedIn {
                 service, account, ..
@@ -1337,6 +1342,21 @@ mod tests {
                  account."
                     .to_owned(),
                 "Not admitted".to_owned()
+            )
+        );
+        // A sign-in whose service did not answer stands; it was not refused.
+        connection.update(cx, |connection, _| {
+            connection.token_unanswered = true;
+            connection.token_unread =
+                Some("The sign-in service could not be reached: offline.".into());
+        });
+        assert_eq!(
+            said(ConnectionState::Unauthorized, signed_in(true), cx),
+            (
+                "The sign-in service could not be reached: offline. You stay signed in at \
+                 id.example; Studio asks again."
+                    .to_owned(),
+                "Sign-in not answering".to_owned()
             )
         );
     }

@@ -22,7 +22,7 @@ use oauth_client::{
     TokenError, Tokens,
 };
 
-use crate::cli_tokens::{Lease, Token, TokenSource};
+use crate::cli_tokens::{Lease, NoToken, Token, TokenSource};
 
 /// The URL of Studio's Client ID Metadata Document. Not published yet (spec 016, open question
 /// 1): until it is, a sign-in service that takes only metadata documents does not accept Studio.
@@ -38,8 +38,13 @@ pub(crate) const REFRESH_LEAD: Duration = Duration::from_secs(60);
 /// The soonest a token is renewed after it was given.
 const MIN_RENEWAL: Duration = Duration::from_secs(1);
 
-/// The wait before a failed refresh is tried once more.
-const REFRESH_RETRY: Duration = Duration::from_secs(5);
+/// The wait before a failed refresh is tried once more: a moment in tests, whose clock it does
+/// not follow.
+const REFRESH_RETRY: Duration = if cfg!(test) {
+    Duration::from_millis(50)
+} else {
+    Duration::from_secs(5)
+};
 
 /// Studio's client identity: its metadata document and the IDs registered for it, and for
 /// development the client ID `OMNIGRAPH_STUDIO_OAUTH_CLIENT` names, used at any sign-in service
@@ -329,7 +334,7 @@ struct Held {
     /// The refresh under way, which every ask joins. It runs on a task of its own to its end, so
     /// an ask dropped mid-exchange (a connect replaced, a renewal overtaken) cannot lose the
     /// refresh token the service has rotated by then.
-    running: Option<Shared<oneshot::Receiver<Result<(), String>>>>,
+    running: Option<Shared<oneshot::Receiver<Result<(), NoToken>>>>,
 }
 
 struct Access {
@@ -489,7 +494,7 @@ impl OAuthSource {
 }
 
 impl TokenSource for OAuthSource {
-    fn token(&self, _hurry: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, String>> {
+    fn token(&self, _hurry: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, NoToken>> {
         Inner::token(self.inner.clone()).boxed()
     }
 
@@ -508,11 +513,12 @@ impl Inner {
 
     /// The access token held while it is fresh; otherwise the one the refresh under way gives,
     /// starting it when none is. The refresh is not this ask's: dropped, the ask leaves it running.
-    async fn token(self: Arc<Self>) -> Result<Token, String> {
+    /// A refresh that did not end may pass; a sign-in that ended does not.
+    async fn token(self: Arc<Self>) -> Result<Token, NoToken> {
         let running = {
             let mut held = self.held.lock().await;
             if self.ended.load(Ordering::SeqCst) {
-                return Err("Signed out.".into());
+                return Err(NoToken::lasting("Signed out."));
             }
             let refused = self.refused.swap(false, Ordering::SeqCst);
             if !refused
@@ -523,7 +529,7 @@ impl Inner {
             }
             if held.refresh.is_none() {
                 held.access = None;
-                return Err("The sign-in has ended. Sign in again.".into());
+                return Err(NoToken::lasting("The sign-in has ended. Sign in again."));
             }
             match &held.running {
                 Some(running) => running.clone(),
@@ -547,28 +553,30 @@ impl Inner {
                 held.access
                     .as_ref()
                     .map(|access| self.leased(access))
-                    .ok_or_else(|| "The sign-in has ended. Sign in again.".into())
+                    .ok_or_else(|| NoToken::lasting("The sign-in has ended. Sign in again."))
             }
-            Ok(Err(why)) => Err(why),
-            Err(_) => Err("The sign-in's refresh stopped before it answered.".into()),
+            Ok(Err(no)) => Err(no),
+            Err(_) => Err(NoToken::passing(
+                "The sign-in's refresh stopped before it answered.",
+            )),
         }
     }
 
     /// Refreshes the access token from the refresh token held, keeping what the service gives.
-    async fn refresh(&self) -> Result<(), String> {
+    async fn refresh(&self) -> Result<(), NoToken> {
         let mut held = self.held.lock().await;
         let refreshed = self.refresh_held(&mut held).await;
         held.running = None;
         refreshed
     }
 
-    async fn refresh_held(&self, held: &mut Held) -> Result<(), String> {
+    async fn refresh_held(&self, held: &mut Held) -> Result<(), NoToken> {
         if self.ended.load(Ordering::SeqCst) {
-            return Err("Signed out.".into());
+            return Err(NoToken::lasting("Signed out."));
         }
         let Some(refresh) = held.refresh.clone() else {
             held.access = None;
-            return Err("The sign-in has ended. Sign in again.".into());
+            return Err(NoToken::lasting("The sign-in has ended. Sign in again."));
         };
         let service = &self.service;
         let mut failed_once = false;
@@ -610,21 +618,24 @@ impl Inner {
                     held.refresh = None;
                     self.ended.store(true, Ordering::SeqCst);
                     self.keychain.delete(self.key.clone()).await.ok();
-                    return Err(format!("Signed out: {why} Sign in again."));
+                    return Err(NoToken::lasting(format!(
+                        "Signed out: {why} Sign in again."
+                    )));
                 }
                 Err(TokenError::Refused(why)) => {
                     held.access = None;
-                    return Err(why);
+                    return Err(NoToken::lasting(why));
                 }
                 // A refresh that failed may have rotated the token anyway: once more, after a
-                // pause, and then the person is asked (spec 016, Refresh).
+                // pause. Then the sign-in stands, and the connection asks again later (spec
+                // 016, Refresh).
                 Err(TokenError::Failed(_)) if !failed_once => {
                     failed_once = true;
                     smol::Timer::after(REFRESH_RETRY).await;
                 }
                 Err(TokenError::Failed(why)) => {
                     held.access = None;
-                    return Err(format!("{why} Sign in again, or try later."));
+                    return Err(NoToken::passing(why));
                 }
             }
         }
@@ -689,6 +700,8 @@ mod tests {
         /// The sign-in service holds a token answer, made already (a refresh token rotated),
         /// until this is lowered.
         hold_token: bool,
+        /// The sign-in service fails every token request (503) and keeps its grants.
+        token_down: bool,
         /// The tokens the server refused, in order.
         refused: Vec<String>,
         /// Each request, after the name of the client it went through.
@@ -815,6 +828,9 @@ mod tests {
                     form["grant_type"],
                     form.get("resource").map_or("-", String::as_str)
                 ));
+                if served.token_down {
+                    return (503, vec![], json!({}));
+                }
                 let granted = match form["grant_type"].as_str() {
                     "authorization_code" => served.codes.remove(&form["code"]),
                     _ => served.refresh.remove(&form["refresh_token"]),
@@ -1110,6 +1126,83 @@ mod tests {
         );
     }
 
+    /// A sign-in whose service does not answer stands. At launch, with no token yet, the server
+    /// says the sign-in is not answering, opens no browser, keeps the keychain's sign-in and asks
+    /// again at the next health check. While a token lives, a renewal that fails leaves it in
+    /// use, unsaid. Before, either ended the sign-in, and a moment without network cost a
+    /// browser sign-in. (The renewal asked again halfway to the token's end is the connection's,
+    /// `connection::tests::a_renewal_that_cannot_be_answered_keeps_the_token_held`.)
+    #[gpui::test]
+    async fn a_sign_in_whose_service_does_not_answer_stands(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        // Tokens that live four seconds are renewed after two.
+        let served = Arc::new(Mutex::new(Served {
+            lives: 4,
+            token_down: true,
+            ..Served::default()
+        }));
+        served.lock().unwrap().refresh.insert("kept".into());
+        let keychain = Arc::new(MemoryKeychain::default());
+        let key = format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}");
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key.clone(), ("user_1".into(), b"kept".to_vec()));
+        let refreshes = || {
+            served
+                .lock()
+                .unwrap()
+                .log
+                .iter()
+                .filter(|line| line.starts_with("token refresh_token"))
+                .count()
+        };
+        let signed_in = SignIn::SignedIn {
+            service: "id.test".into(),
+            account: "user_1".into(),
+            kept: true,
+        };
+        let connection = connection(&served, keychain.clone(), cx);
+        let _watch = connection.update(cx, |c, cx| c.watch(cx));
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the refresh and its retry", |_| refreshes() == 2);
+        cx.run_until_parked();
+        let (state, sign_in, label) = sign_in_state(&connection, cx);
+        assert_eq!(state, ConnectionState::Unauthorized);
+        assert_eq!(sign_in, signed_in);
+        assert_eq!(label, "Sign-in not answering");
+        assert!(connection.read_with(cx, |c, _| c.token_unanswered));
+        assert_eq!(cx.opened_url(), None);
+        assert_eq!(keychain.items.lock().unwrap()[&key].1, b"kept".to_vec());
+
+        // The service answers again: the next health check asks, and the server is ready.
+        served.lock().unwrap().token_down = false;
+        cx.executor().advance_clock(Duration::from_secs(120));
+        until(cx, "the sign-in's token", |cx| {
+            sign_in_state(&connection, cx).0 == ConnectionState::Ready
+        });
+        assert_eq!(served.lock().unwrap().issued, 1);
+
+        // Down again when the token is renewed, halfway through its life: it stays in use.
+        served.lock().unwrap().token_down = true;
+        let changes = connection.read_with(cx, |c, _| c.client().credential_changes());
+        std::thread::sleep(Duration::from_millis(2100));
+        cx.executor().advance_clock(Duration::from_secs(2));
+        until(cx, "the failed renewal", |_| refreshes() == 5);
+        cx.run_until_parked();
+        let (state, sign_in, _) = sign_in_state(&connection, cx);
+        assert_eq!(state, ConnectionState::Ready);
+        assert_eq!(sign_in, signed_in);
+        assert!(!connection.read_with(cx, |c, _| c.token_unanswered));
+        assert_eq!(
+            connection.read_with(cx, |c, _| c.client().credential_changes()),
+            changes,
+            "the token held stands"
+        );
+        assert_eq!(keychain.items.lock().unwrap()[&key].1, b"r1".to_vec());
+    }
+
     /// A target whose transport changed (another certificate authority, another proxy) is
     /// reached through a new client, and its sign-in goes on through it: nothing is read from
     /// the keychain, which a refresh under way could rotate under a second sign-in, and a token
@@ -1368,7 +1461,7 @@ mod tests {
     async fn a_server_given_a_token_by_the_cli_is_not_signed_in_to(cx: &mut TestAppContext) {
         struct Refused;
         impl TokenSource for Refused {
-            fn token(&self, _: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, String>> {
+            fn token(&self, _: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, NoToken>> {
                 futures::future::ready(Ok(Token::typed("from-the-cli".into()))).boxed()
             }
         }

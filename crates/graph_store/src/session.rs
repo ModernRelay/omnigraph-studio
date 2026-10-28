@@ -4317,7 +4317,7 @@ mod tests {
     use http_client::{AsyncBody, FakeHttpClient};
 
     use super::*;
-    use crate::cli_tokens::{Token, TokenSource};
+    use crate::cli_tokens::{NoToken, Token, TokenSource};
     use crate::connection::{ConnectionState, ServerEntry, ServerSource};
 
     /// A scope on main showing answers that depend on these node and edge types.
@@ -7436,11 +7436,14 @@ mod tests {
         fn token(
             &self,
             _: Arc<AtomicBool>,
-        ) -> futures::future::BoxFuture<'static, Result<Token, String>> {
+        ) -> futures::future::BoxFuture<'static, Result<Token, NoToken>> {
             let gate = self.0.lock().unwrap().take();
             async move {
                 match gate {
-                    Some(gate) => gate.await.map(Token::new).map_err(|_| "gone".into()),
+                    Some(gate) => gate
+                        .await
+                        .map(Token::new)
+                        .map_err(|_| NoToken::lasting("gone")),
                     None => Ok(Token::new("good")),
                 }
             }

@@ -151,12 +151,47 @@ impl std::fmt::Debug for Token {
     }
 }
 
+/// Why a token source gave no token, in words the person reads ([`NoToken::why`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoToken {
+    pub why: String,
+    /// The source could not answer now: the CLI was busy, did not answer in time or could not
+    /// be run, or a sign-in's service did not answer. A token it gave before still stands
+    /// (`Connection` keeps it while it lives). Otherwise the source answered that it has no
+    /// token to give: none is configured, the target changed, the sign-in ended.
+    pub passing: bool,
+}
+
+impl NoToken {
+    /// The source answered that it has no token.
+    pub fn lasting(why: impl Into<String>) -> Self {
+        Self {
+            why: why.into(),
+            passing: false,
+        }
+    }
+
+    /// The source could not answer now.
+    pub fn passing(why: impl Into<String>) -> Self {
+        Self {
+            why: why.into(),
+            passing: true,
+        }
+    }
+}
+
+impl From<NoToken> for String {
+    fn from(no: NoToken) -> Self {
+        no.why
+    }
+}
+
 /// Where a connection's token comes from each time it is asked (`Connection`): on each connect,
-/// once more after a 401, and on Refresh. A failure says why, in words the person reads.
+/// once more after a 401, and on Refresh. A failure says why, and whether it may pass.
 /// `hurry` is raised while a window waits for the token: its ask goes before the others
 /// waiting for the CLI ([`TURN`]), however long it has waited already.
 pub trait TokenSource: Send + Sync + 'static {
-    fn token(&self, hurry: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, String>>;
+    fn token(&self, hurry: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, NoToken>>;
 
     /// The CLI profile whose managed token this is, when it is the CLI's own managed data token
     /// rather than a token for the server: said where the connection is shown.
@@ -365,11 +400,21 @@ impl Unfit {
 /// none the CLI still lists its targets, and a target that takes a token is refused as it is
 /// listed ([`crate::cli_config::Platform`]). Otherwise why none is, naming each program found.
 pub(crate) async fn find_cli(programs: &[PathBuf], turn: &Held) -> Result<FoundCli, String> {
+    Ok(found_cli(programs, turn).await?)
+}
+
+/// [`find_cli`], whose failure may pass when a program's probe did not end: a CLI just
+/// replaced can be slow to start its first run.
+async fn found_cli(programs: &[PathBuf], turn: &Held) -> Result<FoundCli, NoToken> {
     let mut unfit: Vec<String> = Vec::new();
+    let mut passing = false;
     for program in installed(programs) {
-        match probe(&program, turn).await {
+        match probed(&program, turn).await {
             Ok(found) => return Ok(found),
-            Err(why) => unfit.push(format!("{} {why}", shown(&program))),
+            Err(why) => {
+                passing |= !why.lasting;
+                unfit.push(format!("{} {}", shown(&program), why.why));
+            }
         }
     }
     let looked = if unfit.is_empty() {
@@ -378,12 +423,15 @@ pub(crate) async fn find_cli(programs: &[PathBuf], turn: &Held) -> Result<FoundC
     } else {
         unfit.join("; ")
     };
-    Err(format!(
-        "Studio found no Omnigraph CLI it can drive (Omnigraph {FIRST_CLI_RELEASE} or later, \
-         speaking HTTP contract {} and reporting target, credential and access protocol \
-         {PROTOCOL}): {looked}",
-        graph_client::CONTRACT
-    ))
+    Err(NoToken {
+        why: format!(
+            "Studio found no Omnigraph CLI it can drive (Omnigraph {FIRST_CLI_RELEASE} or \
+             later, speaking HTTP contract {} and reporting target, credential and access \
+             protocol {PROTOCOL}): {looked}",
+            graph_client::CONTRACT
+        ),
+        passing,
+    })
 }
 
 /// `program` as the CLI Studio runs: one whose `version --json` reports Studio's HTTP contract
@@ -391,17 +439,25 @@ pub(crate) async fn find_cli(programs: &[PathBuf], turn: &Held) -> Result<FoundC
 /// 0.15.0, whose target protocol 3 Studio does not know"). What it was found to be is
 /// remembered while its file is unchanged ([`Probes`]); otherwise it is probed in the turn held.
 pub async fn probe(program: &Path, turn: &Held) -> Result<FoundCli, String> {
+    probed(program, turn).await.map_err(|unfit| unfit.why)
+}
+
+/// [`probe`], saying whether a failure stands: only those that do are remembered.
+async fn probed(program: &Path, turn: &Held) -> Result<FoundCli, Unfit> {
     let stamp = crate::cli_config::stamp(&[program.to_owned()])
         .pop()
         .flatten();
     if let Some(found) = stamp.and_then(|stamp| Probes::lock().find(program, stamp)) {
-        return found;
+        return found.map_err(Unfit::lasting);
     }
     let probed = probe_now(program, turn).await;
     let lasting = probed.as_ref().err().is_none_or(|unfit| unfit.lasting);
-    let probed = probed.map_err(|unfit| unfit.why);
     if lasting && let Some(stamp) = stamp {
-        Probes::lock().keep(program, stamp, probed.clone());
+        let kept = match &probed {
+            Ok(found) => Ok(found.clone()),
+            Err(unfit) => Err(unfit.why.clone()),
+        };
+        Probes::lock().keep(program, stamp, kept);
     }
     probed
 }
@@ -486,7 +542,7 @@ pub(crate) async fn list_targets(
 }
 
 /// What `target inspect NAME --json` says of one target, without a server or a secret.
-async fn inspect_target(cli: &FoundCli, turn: &Held, name: &str) -> Result<Value, String> {
+async fn inspect_target(cli: &FoundCli, turn: &Held, name: &str) -> Result<Value, NoToken> {
     json_answer(cli, turn, &[], &["target", "inspect", name, "--json"]).await
 }
 
@@ -572,13 +628,13 @@ async fn say(
 
 /// What `cli` prints as JSON for `args`, or what it says when it refuses: a refusal asked for as
 /// JSON comes on standard output as `{"error": …, "code": …}`, any other failure on standard
-/// error.
+/// error. A run that did not end may pass; an answer does not.
 async fn json_answer(
     cli: &FoundCli,
     turn: &Held,
     kept: &[String],
     args: &[&str],
-) -> Result<Value, String> {
+) -> Result<Value, NoToken> {
     let asked = format!("`omnigraph {}`", args.join(" "));
     let ran = match run(
         turn,
@@ -589,11 +645,19 @@ async fn json_answer(
     .await
     {
         Ok(ran) => ran,
-        Err(unrun) => return Err(unrun.said(&cli.path, &asked, READ_TIMEOUT)),
+        Err(unrun) => {
+            return Err(NoToken::passing(unrun.said(
+                &cli.path,
+                &asked,
+                READ_TIMEOUT,
+            )));
+        }
     };
     let json = serde_json::from_slice::<Value>(&ran.stdout).ok();
     if ran.status.success() {
-        return json.ok_or_else(|| format!("the Omnigraph CLI's answer to {asked} is not JSON"));
+        return json.ok_or_else(|| {
+            NoToken::lasting(format!("the Omnigraph CLI's answer to {asked} is not JSON"))
+        });
     }
     let refused = json
         .as_ref()
@@ -601,7 +665,10 @@ async fn json_answer(
         .and_then(Value::as_str)
         .map(str::to_owned)
         .unwrap_or_else(|| said(&ran.stderr));
-    Err(format!("{refused} ({asked}, {})", exit(&ran.status)))
+    Err(NoToken::lasting(format!(
+        "{refused} ({asked}, {})",
+        exit(&ran.status)
+    )))
 }
 
 /// A CLI server's token: `credentials status`, then `credentials export`, then `target inspect`
@@ -649,11 +716,13 @@ impl CliTokenSource {
     /// The token, its commands run in one turn at the CLI, which waits for the turn as long as
     /// the export may take: the turn goes to this ask before those nobody hurries while
     /// `hurry` is raised.
-    async fn resolve(&self, hurry: Arc<AtomicBool>) -> Result<Token, String> {
+    async fn resolve(&self, hurry: Arc<AtomicBool>) -> Result<Token, NoToken> {
         let programs = self.programs.clone().unwrap_or_else(candidates);
         let asked = format!("`omnigraph credentials export --target {}`", self.target);
-        let turn = take_turn(&hurry, self.timeout, &asked).await?;
-        let cli = find_cli(&programs, &turn).await?;
+        let turn = take_turn(&hurry, self.timeout, &asked)
+            .await
+            .map_err(NoToken::passing)?;
+        let cli = found_cli(&programs, &turn).await?;
         let target = self.target.as_str();
         let kept = self.kept();
 
@@ -672,9 +741,13 @@ impl CliTokenSource {
             let availability = status.get("availability").and_then(Value::as_str);
             let route = status.pointer("/owner/route").and_then(Value::as_str);
             match availability {
-                Some("absent" | "unavailable") => return Err(self.no_credential()),
-                Some("anonymous") => return Err(self.changed()),
-                _ if route != Some(self.endpoint.as_str()) => return Err(self.changed()),
+                Some("absent" | "unavailable") => {
+                    return Err(NoToken::lasting(self.no_credential()));
+                }
+                Some("anonymous") => return Err(NoToken::lasting(self.changed())),
+                _ if route != Some(self.endpoint.as_str()) => {
+                    return Err(NoToken::lasting(self.changed()));
+                }
                 _ => {}
             }
         }
@@ -691,13 +764,13 @@ impl CliTokenSource {
                 .and_then(Value::as_str)
                 == Some(self.endpoint.as_str());
         if !still {
-            return Err(self.changed());
+            return Err(NoToken::lasting(self.changed()));
         }
         Ok(token)
     }
 
     /// Runs the export with `cli` and takes the token it prints.
-    async fn export(&self, cli: &FoundCli, turn: &Held, kept: &[String]) -> Result<Token, String> {
+    async fn export(&self, cli: &FoundCli, turn: &Held, kept: &[String]) -> Result<Token, NoToken> {
         let args = ["credentials", "export", "--target", self.target.as_str()];
         let asked = format!("`omnigraph credentials export --target {}`", self.target);
         let ran = match run(
@@ -710,23 +783,31 @@ impl CliTokenSource {
         {
             Ok(ran) => ran,
             Err(Unrun::Timeout) => {
-                return Err(format!(
+                return Err(NoToken::passing(format!(
                     "the Omnigraph CLI gave no token within {} s ({asked}), and was stopped",
                     self.timeout.as_secs()
-                ));
+                )));
             }
-            Err(unrun) => return Err(unrun.said(&cli.path, &asked, self.timeout)),
+            Err(unrun) => {
+                return Err(NoToken::passing(unrun.said(
+                    &cli.path,
+                    &asked,
+                    self.timeout,
+                )));
+            }
         };
         if !ran.status.success() {
             // What it printed is never shown: it may be part of a token.
-            return Err(format!(
+            return Err(NoToken::lasting(format!(
                 "{} ({asked}, {})",
                 said(&ran.stderr),
                 exit(&ran.status)
-            ));
+            )));
         }
         exported_token(ran.stdout).ok_or_else(|| {
-            format!("the Omnigraph CLI's answer to {asked} was not one token and a newline")
+            NoToken::lasting(format!(
+                "the Omnigraph CLI's answer to {asked} was not one token and a newline"
+            ))
         })
     }
 
@@ -759,7 +840,7 @@ impl CliTokenSource {
 }
 
 impl TokenSource for CliTokenSource {
-    fn token(&self, hurry: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, String>> {
+    fn token(&self, hurry: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, NoToken>> {
         let source = self.clone();
         async move { source.resolve(hurry).await }.boxed()
     }
@@ -1461,7 +1542,7 @@ exit 64
     }
 
     /// A token from `source`, asked as a connection nobody waits on asks.
-    fn token_of(source: &CliTokenSource) -> Result<Token, String> {
+    fn token_of(source: &CliTokenSource) -> Result<Token, NoToken> {
         smol::block_on(source.token(Arc::default()))
     }
 
@@ -1963,6 +2044,8 @@ exit 64
         let moved =
             token_of(&cli.source("moving", "https://store.example.com/", CliCredential::Store))
                 .unwrap_err();
+        assert!(!moved.passing, "a moved target is an answer");
+        let moved = moved.why;
         assert!(
             moved.contains("changed while Studio read its token"),
             "{moved}"
@@ -2014,6 +2097,8 @@ exit 64
             ),
         );
         let turned = token_of(&source).unwrap_err();
+        assert!(!turned.passing, "a changed target is an answer");
+        let turned = turned.why;
         assert!(
             turned.contains("changed while Studio read its token"),
             "{turned}"
@@ -2034,6 +2119,8 @@ exit 64
         let why =
             token_of(&cli.source("stored", "https://store.example.com/", CliCredential::Store))
                 .unwrap_err();
+        assert!(!why.passing, "a refusal is an answer");
+        let why = why.why;
         assert_eq!(
             why,
             "no credential: no token is stored for stored (`omnigraph credentials export \
@@ -2054,7 +2141,10 @@ exit 64
         .unwrap_err();
         assert_eq!(
             missing,
-            "No credential is configured for 'filed': its token file /tokens/filed is not there"
+            NoToken::lasting(
+                "No credential is configured for 'filed': its token file /tokens/filed is not \
+                 there"
+            )
         );
         assert!(
             cli.calls()
@@ -2070,8 +2160,10 @@ exit 64
         let mut slow = cli.source("slow", "https://slow.example.com/", CliCredential::Store);
         slow.timeout = Duration::from_millis(300);
         let stopped = smol::block_on(async {
-            let turn = take_turn(&Arc::default(), READ_TIMEOUT, "a test's export").await?;
-            let found = find_cli(&cli.programs(), &turn).await?;
+            let turn = take_turn(&Arc::default(), READ_TIMEOUT, "a test's export")
+                .await
+                .map_err(NoToken::passing)?;
+            let found = found_cli(&cli.programs(), &turn).await?;
             slow.export(&found, &turn, &[])
                 .await
                 .map(Token::into_string)
@@ -2079,8 +2171,10 @@ exit 64
         .unwrap_err();
         assert_eq!(
             stopped,
-            "the Omnigraph CLI gave no token within 0 s (`omnigraph credentials export --target \
-             slow`), and was stopped"
+            NoToken::passing(
+                "the Omnigraph CLI gave no token within 0 s (`omnigraph credentials export \
+                 --target slow`), and was stopped"
+            )
         );
     }
 
@@ -2163,7 +2257,8 @@ exit 64
         );
         std::fs::create_dir(&held).unwrap();
         let refused = token_of(&source).unwrap_err();
-        assert!(refused.contains(LOCK_REFUSED), "{refused}");
+        assert!(!refused.passing, "the CLI answered");
+        assert!(refused.why.contains(LOCK_REFUSED), "{refused:?}");
         assert_eq!(cli.commands().len(), 1 + LOCK_RETRIES as usize);
     }
 
@@ -2335,9 +2430,10 @@ exit 64
         let answer = waiting.join().unwrap();
         drop(held);
         let said = answer.unwrap_err();
+        assert!(said.passing, "a busy CLI may answer later");
         assert!(
-            said.contains("busy with another of Studio's commands"),
-            "{said}"
+            said.why.contains("busy with another of Studio's commands"),
+            "{said:?}"
         );
         assert!(cli.calls().is_empty(), "nothing was run");
     }
@@ -2557,20 +2653,20 @@ exit 64
     /// A token source standing in for the CLI: the answers it gives in turn, the last one
     /// again and again, and how many times it was asked.
     struct Answers {
-        answers: std::sync::Mutex<Vec<Result<&'static str, &'static str>>>,
+        answers: std::sync::Mutex<Vec<Result<&'static str, NoToken>>>,
         asked: std::sync::atomic::AtomicUsize,
     }
 
     impl TokenSource for Answers {
-        fn token(&self, _: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, String>> {
+        fn token(&self, _: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, NoToken>> {
             self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut answers = self.answers.lock().unwrap();
             let answer = if answers.len() > 1 {
                 answers.remove(0)
             } else {
-                answers[0]
+                answers[0].clone()
             };
-            async move { answer.map(Token::new).map_err(str::to_owned) }.boxed()
+            async move { answer.map(Token::new) }.boxed()
         }
     }
 
@@ -2622,7 +2718,7 @@ exit 64
 
     /// A CLI server whose token comes from `answers`.
     fn connection_with(
-        answers: Vec<Result<&'static str, &'static str>>,
+        answers: Vec<Result<&'static str, NoToken>>,
         cx: &mut TestAppContext,
     ) -> (
         gpui::Entity<Connection>,
@@ -2722,17 +2818,25 @@ exit 64
     #[gpui::test]
     async fn no_credential_sends_nothing(cx: &mut TestAppContext) {
         let reason = "No credential is configured for 'stored': its token file /t is not there";
-        let (connection, source, lists) = connection_with(vec![Err(reason)], cx);
-        connection.update(cx, |connection, cx| connection.connect(cx));
+        let (connection, source, lists) = connection_with(vec![Err(NoToken::lasting(reason))], cx);
+        let _shown = connection.update(cx, |connection, cx| {
+            connection.connect(cx);
+            connection.watch(cx)
+        });
         cx.run_until_parked();
         assert_eq!(asked(&source), 1);
         assert_eq!(lists.load(std::sync::atomic::Ordering::SeqCst), 0);
         connection.read_with(cx, |connection, _| {
             assert_eq!(connection.state, ConnectionState::Unauthorized);
             assert!(!connection.refused_with_token);
+            assert!(!connection.token_unanswered);
             assert_eq!(connection.token_unread.as_deref(), Some(reason));
             assert_eq!(connection.label(), "No token from the CLI");
         });
+        // The CLI answered: health checks do not ask it again.
+        cx.executor().advance_clock(Duration::from_secs(240));
+        cx.run_until_parked();
+        assert_eq!(asked(&source), 0);
         connection.update(cx, |connection, cx| {
             connection.set_token(Some("good".into()), cx)
         });
@@ -2747,6 +2851,73 @@ exit 64
         assert_eq!(asked(&source), 1);
         connection.read_with(cx, |connection, _| {
             assert_eq!(connection.state, ConnectionState::Unauthorized)
+        });
+    }
+
+    /// A CLI that cannot answer now (busy, slow, not started) leaves the token it gave in use:
+    /// Refresh and a connect go on with it, and nothing is said. Before, the working token was
+    /// dropped and the server shown refused until the person acted.
+    #[gpui::test]
+    async fn a_cli_that_cannot_answer_leaves_its_token_in_use(cx: &mut TestAppContext) {
+        let busy = NoToken::passing("the Omnigraph CLI was busy");
+        let (connection, source, lists) = connection_with(vec![Ok("good"), Err(busy)], cx);
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        cx.run_until_parked();
+        assert_eq!(asked(&source), 1);
+        let changes = connection.read_with(cx, |connection, _| {
+            assert_eq!(connection.state, ConnectionState::Ready);
+            connection.client().credential_changes()
+        });
+
+        connection.update(cx, |connection, cx| connection.refresh_token(cx));
+        cx.run_until_parked();
+        assert_eq!(asked(&source), 1, "Refresh asks");
+        connection.read_with(cx, |connection, _| {
+            assert_eq!(connection.state, ConnectionState::Ready);
+            assert_eq!(connection.token_unread, None);
+            assert_eq!(connection.client().credential_changes(), changes);
+        });
+
+        // A connect sends the token held: the server lists the graphs only for it.
+        let listed = lists.load(std::sync::atomic::Ordering::SeqCst);
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        cx.run_until_parked();
+        assert_eq!(asked(&source), 1);
+        assert_eq!(lists.load(std::sync::atomic::Ordering::SeqCst), listed + 1);
+        connection.read_with(cx, |connection, _| {
+            assert_eq!(connection.state, ConnectionState::Ready)
+        });
+    }
+
+    /// A CLI that cannot answer the ask after the server refused its token leaves no token:
+    /// the refused one is not kept. The server says why, and the next health check asks again,
+    /// which a CLI that answered it has none is not.
+    #[gpui::test]
+    async fn a_cli_that_cannot_answer_after_a_refusal_is_asked_again(cx: &mut TestAppContext) {
+        let busy = "the Omnigraph CLI was busy";
+        let (connection, source, _) = connection_with(
+            vec![Ok("stale"), Err(NoToken::passing(busy)), Ok("good")],
+            cx,
+        );
+        let _shown = connection.update(cx, |connection, cx| {
+            connection.connect(cx);
+            connection.watch(cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(asked(&source), 2, "once at connect, once after the 401");
+        connection.read_with(cx, |connection, _| {
+            assert_eq!(connection.state, ConnectionState::Unauthorized);
+            assert!(connection.token_unanswered);
+            assert_eq!(connection.token_unread.as_deref(), Some(busy));
+            assert_eq!(connection.label(), "No token from the CLI");
+        });
+        cx.executor().advance_clock(Duration::from_secs(120));
+        cx.run_until_parked();
+        assert_eq!(asked(&source), 1);
+        connection.read_with(cx, |connection, _| {
+            assert_eq!(connection.state, ConnectionState::Ready);
+            assert!(!connection.token_unanswered);
+            assert_eq!(connection.token_unread, None);
         });
     }
 

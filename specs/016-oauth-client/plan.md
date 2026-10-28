@@ -223,8 +223,13 @@ Studio restarts; they hold no secrets.
   token is used.
 - `invalid_grant` signs the person out of that server ("Signed out: sign in again"). A refresh
   that fails or times out may have rotated the refresh token anyway; Studio tries once more
-  after 5 seconds, and after a second failure asks the person to sign in again. No refresh is
-  retried a third time.
+  after 5 seconds. No refresh is retried a third time. A second failure does not end the
+  sign-in: the service may answer later, and the keychain's refresh token is still good. While
+  the access token held still lives it stays in use, unsaid, and the renewal is asked again
+  halfway to the token's end (no sooner than 5 seconds before it); with none held the server
+  reads **Sign-in not answering** with why, and the next health check asks again. Only
+  `invalid_grant`, a refusal, a sign-out or a sign-in with no refresh token ends it, and after a
+  401 no failure keeps the refused token.
 
 ### 401 and 403
 
@@ -246,6 +251,7 @@ Studio restarts; they hold no secrets.
 | Browser open | Signing in… | Cancel |
 | Signed in | as today, Ready | Signed in as <account> · <issuer host> · Sign out |
 | Refreshing | unchanged | unchanged |
+| The service does not answer, no token held | Sign-in not answering | Signed in as <account> · <issuer host> · Sign out |
 | Refused after sign-in | Not admitted | Sign in as someone else · Sign out |
 
 ### Limits
@@ -344,6 +350,7 @@ Studio restarts; they hold no secrets.
 | 2026-10-26 | Three review findings on ModernRelay/omnigraph-studio#12 (Cursor Bugbot) hold | `graph_store` `sign_in` tests, each extended to fail without its fix: `a_sign_in_the_service_ended_or_the_server_does_not_admit_is_said` (a watched server with two-second tokens refreshed again after Not admitted), `a_server_that_offers_sign_in_is_signed_in_through_the_browser` (a second account whose grant gives no refresh token left the first account's in the keychain, unrevoked), `a_new_transport_keeps_the_sign_in_through_it` (after `replace_http`, nothing read the sign-in again until a probe; then a second finding, that reading it again from the keychain raced a refresh under way) | Fixed: a 401 cancels the renewal and a renewal runs only while ready; the replaced sign-in is revoked and the keychain item replaced or deleted; `replace_http` keeps the sign-in and points its requests to the server at the new client (`OAuthSource::reach_through`, `Clients::through`), reading nothing from the keychain |
 
 | 2026-10-26 | A second review of #12 (the session sharing the checkout, read-only) | `graph_store` `a_dropped_ask_leaves_its_refresh_to_finish` (the service holds its answer after rotating the refresh token; the ask is dropped there; the next ask is answered without asking again), `a_new_transport_keeps_the_sign_in_through_it` (extended: the server is checked again through the new client unasked); `oauth_client` token test (a clock ten minutes ahead keeps `expires_in`) | Fixed: refreshes run on their own task and asks join them; a renewal is quiet by its flag and holder, not only when the server is ready; the lifetime is `expires_in` alone, renewed no sooner than a second; a transport change checks a server in use again. Not taken here, as older than this PR: a token source's temporary failure dropping a working token, one failed health check showing Unreachable for two minutes, the CLI's stdin write without a timeout |
+| 2026-10-28 | A sign-in whose service does not answer stands | `graph_store` `sign_in::tests::a_sign_in_whose_service_does_not_answer_stands` (a kept sign-in whose service answers 503 at launch, then again at a renewal), `connection::tests::a_renewal_that_cannot_be_answered_keeps_the_token_held` (asked again halfway to the token's end, then renewed quietly); `studio` `a_server_that_offers_a_sign_in_says_where_and_as_whom` (extended: the status line and chip) | All pass. At launch the server read Sign-in not answering, signed in as the keychain's account, with no browser opened and the keychain item kept; the next health check signed in. At the renewal the token stayed in use with the same credential. Before, both ended the sign-in and offered a browser sign-in. This takes the first of the three items the 2026-10-26 review left; the other two (a single failed health check, the CLI's stdin write) were fixed on main in #13 |
 
 ## Corrections
 

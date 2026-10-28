@@ -11,7 +11,7 @@ use graph_client::{GraphClient, ReadError};
 use http_client::HttpClient;
 use studio_settings::StudioSettings;
 
-use crate::cli_tokens::{Lease, Token, TokenSource};
+use crate::cli_tokens::{Lease, NoToken, Token, TokenSource};
 use crate::sign_in::{self, OAuthSource, Service, SignIn, SignInContext};
 
 /// Where Studio learned about a server.
@@ -123,9 +123,13 @@ pub struct Connection {
     /// it. `None` until one answers, and after one fails.
     pub latency: Option<Duration>,
     pub graphs: GraphListing,
-    /// Why the token source gave no token (the Omnigraph CLI's reason): Studio then sends the
-    /// server nothing. `None` once a token is set.
+    /// Why the token source gave no token (the Omnigraph CLI's reason, or why a sign-in's service
+    /// did not answer): Studio then sends the server nothing. `None` once a token is set.
     pub token_unread: Option<String>,
+    /// The source could not answer the last ask ([`NoToken::passing`]) and no token is held:
+    /// [`Self::token_unread`] says why, a sign-in stands, and the next health check connects
+    /// again, which asks again.
+    pub token_unanswered: bool,
     /// Whether the server refused the token of the request it answered with 401
     /// ([`ConnectionState::Unauthorized`]): its challenge says `error="invalid_token"`, or, from
     /// a server that sends no challenge, the request carried one. Otherwise the server asks for
@@ -133,6 +137,9 @@ pub struct Connection {
     pub refused_with_token: bool,
     /// Whether the client holds a token, so the next request sends one.
     has_token: bool,
+    /// The token held is the one the current source last gave: an ask that fails for a reason
+    /// that may pass leaves it in use while it lives ([`Self::keeps_token`]).
+    token_from_source: bool,
     /// Where the token comes from each time it is asked ([`Connection::with_token_source`]): a
     /// CLI server's is the CLI's `credentials export`. `None` for a server given its token.
     token_source: Option<Arc<dyn TokenSource>>,
@@ -176,19 +183,35 @@ pub struct Connection {
     service: Option<Service>,
     /// The sign-in the token comes from, when it comes from one.
     oauth: Option<OAuthSource>,
-    /// Whose short-lived token is held ([`Lease::holder`]): the next one of the same holder
-    /// replaces it quietly.
-    holder: Option<String>,
+    /// How long the short-lived token held stands, and whose it is: the next one of the same
+    /// holder ([`Lease::holder`]) replaces it quietly.
+    lease: Option<Lease>,
     /// The sign-in under way: reading its service, or waiting for the browser.
     _signing_in: Option<Task<()>>,
     /// The ask for the next short-lived token, before the one held ends.
     _renewal: Option<Task<()>>,
     /// The renewal came while nothing watched the server: the next watch asks.
     renewal_missed: bool,
-    /// The ask under way is a renewal, before the token held ends: its answer replaces the
-    /// token quietly. An ask after a refusal is not one, and its token is tried at once.
-    renewing: bool,
 }
+
+/// What an ask for a token is for, which decides what its answer does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ask {
+    /// A connect waits for it, and goes on with what it gives.
+    Connect,
+    /// The token held is near its end: the next one of the same holder replaces it quietly.
+    Renewal,
+    /// The server refused the token held: its answer is tried at once, and no failure keeps
+    /// the refused token.
+    AfterRefusal,
+    /// Asked again while the connection stands (Refresh, a changed target): a token that
+    /// changed connects again.
+    Again,
+}
+
+/// A renewal that failed for a reason that may pass is asked again halfway to the end of the
+/// token held, while that is this far away or more.
+const RENEWAL_RETRY_MIN: Duration = Duration::from_secs(5);
 
 /// The HTTP client of a retired connection ([`Connection::retire`]): every request fails with
 /// why, and nothing is sent.
@@ -228,6 +251,10 @@ impl Connection {
     /// was refused.
     pub fn label(&self) -> String {
         if self.state == ConnectionState::Unauthorized {
+            // A sign-in whose service did not answer stands; it was neither refused nor ended.
+            if self.token_unanswered && matches!(self.sign_in, SignIn::SignedIn { .. }) {
+                return "Sign-in not answering".into();
+            }
             match &self.sign_in {
                 SignIn::NotOffered => {}
                 SignIn::Reading => return "Reading how to sign in".into(),
@@ -261,8 +288,10 @@ impl Connection {
             latency: None,
             graphs: GraphListing::Unknown,
             token_unread: None,
+            token_unanswered: false,
             refused_with_token: false,
             has_token,
+            token_from_source: false,
             token_source: None,
             token_given: false,
             token_fresh: false,
@@ -281,11 +310,10 @@ impl Connection {
             http,
             service: None,
             oauth: None,
-            holder: None,
+            lease: None,
             _signing_in: None,
             _renewal: None,
             renewal_missed: false,
-            renewing: false,
         })
     }
 
@@ -313,7 +341,7 @@ impl Connection {
             fn token(
                 &self,
                 _: Arc<AtomicBool>,
-            ) -> futures::future::BoxFuture<'static, Result<Token, String>> {
+            ) -> futures::future::BoxFuture<'static, Result<Token, NoToken>> {
                 use futures::FutureExt as _;
                 futures::future::pending().boxed()
             }
@@ -337,6 +365,8 @@ impl Connection {
         }
         let had = self.token_source.is_some();
         self.token_source = source;
+        // The token held is the old source's: the new one's failure does not keep it.
+        self.token_from_source = false;
         if self.token_source.is_some() {
             self.refresh_token(cx);
         } else if had {
@@ -379,6 +409,8 @@ impl Connection {
         self.token_answered = true;
         self.client.set_token(None);
         self.has_token = false;
+        self.token_from_source = false;
+        self.token_unanswered = false;
         self.client.set_http(Arc::new(Unusable(why.clone())));
         self._asking = None;
         self._task = None;
@@ -409,8 +441,7 @@ impl Connection {
         if let Some(source) = &self.token_source {
             source.note_refused();
         }
-        self.renewing = false;
-        self.ask_for_token(false, cx);
+        self.ask_for_token(Ask::AfterRefusal, cx);
     }
 
     /// Whether requests sent now carry the token they would carry once the token source has
@@ -440,121 +471,171 @@ impl Connection {
         if self.token_source.is_none() {
             return;
         }
-        self.renewing = false;
         self.token_given = false;
         self.asked_after_refusal = false;
         if self.state != ConnectionState::Idle {
-            self.ask_for_token(false, cx);
+            self.ask_for_token(Ask::Again, cx);
         }
     }
 
-    /// Asks the token source for a token. For a connect (`connecting`), the connect goes on with
-    /// it; asked again, only a token that changed connects again.
-    fn ask_for_token(&mut self, connecting: bool, cx: &mut Context<Self>) {
+    /// Asks the token source for a token, for what `ask` says. A connect's ask is the connect's
+    /// task; another replaces the one before it.
+    fn ask_for_token(&mut self, ask: Ask, cx: &mut Context<Self>) {
         let Some(source) = self.token_source.clone() else {
             return;
         };
         let hurry = self.hurry.clone();
         let asking = cx.spawn(async move |this, cx| {
             let answer = cx.background_executor().spawn(source.token(hurry)).await;
-            this.update(cx, |this, cx| this.token_answered(answer, connecting, cx))
+            this.update(cx, |this, cx| this.token_answered(answer, ask, cx))
                 .ok();
         });
-        if connecting {
+        if ask == Ask::Connect {
             self._task = Some(asking);
         } else {
             self._asking = Some(asking);
         }
     }
 
-    /// Takes the source's answer. A token connects (for a connect under way, or when it changed);
-    /// no token sends nothing more, the connection refused with why. The answer to a connect
-    /// cancelled while a window waited for its token ([`Self::cancel`]) is taken, and the
-    /// connection stays as Cancel left it.
-    fn token_answered(
-        &mut self,
-        answer: Result<Token, String>,
-        connecting: bool,
-        cx: &mut Context<Self>,
-    ) {
-        if !connecting {
+    /// Whether a failure that may pass leaves the token held in use: the current source gave
+    /// it, and it has not ended.
+    fn keeps_token(&self) -> bool {
+        self.has_token
+            && self.token_from_source
+            && self
+                .lease
+                .as_ref()
+                .is_none_or(|lease| SystemTime::now() < lease.expires_at)
+    }
+
+    /// Takes the source's answer to `ask`. A token connects (for a connect under way, or when it
+    /// changed). A source that could not answer leaves a token it gave in use while it lives
+    /// ([`Self::keeps_token`]), unless the server just refused that token. Otherwise no token
+    /// sends nothing more, the connection refused with why. The answer to a connect cancelled
+    /// while a window waited for its token ([`Self::cancel`]) is taken, and the connection
+    /// stays as Cancel left it.
+    fn token_answered(&mut self, answer: Result<Token, NoToken>, ask: Ask, cx: &mut Context<Self>) {
+        if ask != Ask::Connect {
             self._asking = None;
         }
-        let connecting = connecting && self.state == ConnectionState::Connecting;
+        let connecting = ask == Ask::Connect && self.state == ConnectionState::Connecting;
         let was_ready = self.token_ready();
         self.token_answered = true;
         self.hurry.store(false, Ordering::SeqCst);
         if !was_ready {
             cx.emit(ConnectionEvent::TokenReady);
         }
-        match answer {
-            Ok(token) => {
-                let lease = token.lease().cloned();
-                if let Some(source) = &self.oauth {
-                    self.sign_in = SignIn::SignedIn {
-                        service: source.service().host(),
-                        account: source.account(),
-                        kept: source.kept_in_keychain(),
-                    };
-                }
-                if let Some(lease) = &lease {
-                    self.schedule_renewal(lease, cx);
-                }
-                // A renewal, the same holder's next short-lived token while the connection
-                // stands: nothing read with the last one is read again.
-                let renewal = std::mem::take(&mut self.renewing)
-                    && !connecting
-                    && self.has_token
-                    && lease.is_some()
-                    && lease.as_ref().map(|lease| &lease.holder) == self.holder.as_ref();
-                self.holder = lease.map(|lease| lease.holder);
-                if renewal {
-                    self.client.renew_token(token.into_string());
-                    cx.emit(ConnectionEvent::StateChanged);
-                    cx.notify();
-                    return;
-                }
-                self.has_token = true;
-                let changed = self.client.set_token(Some(token.into_string()));
-                if changed {
-                    cx.emit(ConnectionEvent::CredentialChanged);
-                }
-                let unread_changed = self.token_unread.take().is_some();
-                if connecting || (changed && self.state != ConnectionState::Idle) {
-                    self.token_fresh = true;
-                    self.connect(cx);
-                } else if unread_changed {
-                    cx.emit(ConnectionEvent::StateChanged);
-                    cx.notify();
-                }
+        let token = match answer {
+            Ok(token) => token,
+            Err(no) if no.passing && ask != Ask::AfterRefusal && self.keeps_token() => {
+                self.keep_token(ask, connecting, cx);
+                return;
             }
-            Err(reason) => {
-                self.has_token = false;
-                self.holder = None;
-                self._renewal = None;
-                if self.client.set_token(None) {
-                    cx.emit(ConnectionEvent::CredentialChanged);
-                }
-                // A sign-in that could not give a token has ended: the server offers it again.
-                if let Some(source) = self.oauth.take() {
-                    self.token_source = None;
-                    self.sign_in = SignIn::Offered {
-                        service: source.service().host(),
-                        why: Some(reason),
-                    };
-                } else {
-                    self.token_unread = Some(reason);
-                }
-                if connecting || self.state != ConnectionState::Idle {
-                    self._task = None;
-                    self.refused_with_token = false;
-                    self.state = ConnectionState::Unauthorized;
-                    self.schedule_health_check(cx);
-                }
-                cx.emit(ConnectionEvent::StateChanged);
-                cx.notify();
+            Err(no) => {
+                self.no_token(no, connecting, cx);
+                return;
+            }
+        };
+        let lease = token.lease().cloned();
+        self.note_signed_in();
+        if let Some(lease) = &lease {
+            self.schedule_renewal(lease.renew_at, cx);
+        }
+        // A renewal, the same holder's next short-lived token while the connection stands:
+        // nothing read with the last one is read again.
+        let renewal = ask == Ask::Renewal
+            && self.has_token
+            && lease.is_some()
+            && lease.as_ref().map(|lease| &lease.holder)
+                == self.lease.as_ref().map(|lease| &lease.holder);
+        self.lease = lease;
+        self.token_from_source = true;
+        self.token_unanswered = false;
+        if renewal {
+            self.client.renew_token(token.into_string());
+            cx.emit(ConnectionEvent::StateChanged);
+            cx.notify();
+            return;
+        }
+        self.has_token = true;
+        let changed = self.client.set_token(Some(token.into_string()));
+        if changed {
+            cx.emit(ConnectionEvent::CredentialChanged);
+        }
+        let unread_changed = self.token_unread.take().is_some();
+        if connecting || (changed && self.state != ConnectionState::Idle) {
+            self.token_fresh = true;
+            self.connect(cx);
+        } else if unread_changed {
+            cx.emit(ConnectionEvent::StateChanged);
+            cx.notify();
+        }
+    }
+
+    /// Says the sign-in the token comes from as signed in, when it comes from one.
+    fn note_signed_in(&mut self) {
+        if let Some(source) = &self.oauth {
+            self.sign_in = SignIn::SignedIn {
+                service: source.service().host(),
+                account: source.account(),
+                kept: source.kept_in_keychain(),
+            };
+        }
+    }
+
+    /// The source could not answer `ask` now, and the token it gave before still lives: it
+    /// stands, unchanged and unsaid (spec 016, refreshes are silent). A connect goes on with it,
+    /// and a renewal is asked again halfway to the token's end.
+    fn keep_token(&mut self, ask: Ask, connecting: bool, cx: &mut Context<Self>) {
+        if ask == Ask::Renewal
+            && let Some(lease) = &self.lease
+        {
+            let now = SystemTime::now();
+            let left = lease.expires_at.duration_since(now).unwrap_or_default();
+            if left / 2 >= RENEWAL_RETRY_MIN {
+                self.schedule_renewal(now + left / 2, cx);
             }
         }
+        if connecting {
+            self.token_fresh = true;
+            self.connect(cx);
+        }
+    }
+
+    /// The source gave no token, and none is kept: nothing more is sent, and the connection says
+    /// why. A source that answered it has none ends a sign-in, which the server offers again;
+    /// one that could not answer leaves a sign-in standing, and is asked again at the next
+    /// health check ([`Self::token_unanswered`]).
+    fn no_token(&mut self, no: NoToken, connecting: bool, cx: &mut Context<Self>) {
+        self.has_token = false;
+        self.token_from_source = false;
+        self.lease = None;
+        self._renewal = None;
+        if self.client.set_token(None) {
+            cx.emit(ConnectionEvent::CredentialChanged);
+        }
+        self.token_unanswered = no.passing;
+        if no.passing {
+            self.note_signed_in();
+            self.token_unread = Some(no.why);
+        } else if let Some(source) = self.oauth.take() {
+            self.token_source = None;
+            self.token_unread = None;
+            self.sign_in = SignIn::Offered {
+                service: source.service().host(),
+                why: Some(no.why),
+            };
+        } else {
+            self.token_unread = Some(no.why);
+        }
+        if connecting || self.state != ConnectionState::Idle {
+            self._task = None;
+            self.refused_with_token = false;
+            self.state = ConnectionState::Unauthorized;
+            self.schedule_health_check(cx);
+        }
+        cx.emit(ConnectionEvent::StateChanged);
+        cx.notify();
     }
 
     pub(crate) fn client(&self) -> &GraphClient {
@@ -617,6 +698,8 @@ impl Connection {
         cx: &mut Context<Self>,
     ) {
         self.has_token = token.is_some();
+        self.token_from_source = false;
+        self.token_unanswered = false;
         if self.client.set_token(token) {
             cx.emit(ConnectionEvent::CredentialChanged);
         }
@@ -640,8 +723,7 @@ impl Connection {
         };
         self.list_graphs_again(cx);
         if std::mem::take(&mut self.renewal_missed) {
-            self.renewing = true;
-            self.ask_for_token(false, cx);
+            self.ask_for_token(Ask::Renewal, cx);
         }
         if std::mem::take(&mut self.check_missed)
             && !matches!(
@@ -722,7 +804,7 @@ impl Connection {
         cx.notify();
         // A server with a token source is asked nothing before the source answers.
         if !std::mem::take(&mut self.token_fresh) && self.asks_token_source() {
-            self.ask_for_token(true, cx);
+            self.ask_for_token(Ask::Connect, cx);
             return;
         }
         let client = self.client.clone();
@@ -785,8 +867,7 @@ impl Connection {
                 if let Some(source) = &self.token_source {
                     source.note_refused();
                 }
-                self.renewing = false;
-                self.ask_for_token(false, cx);
+                self.ask_for_token(Ask::AfterRefusal, cx);
             }
             if let Some(metadata) = failed.sign_in {
                 self.offered_sign_in(metadata, cx);
@@ -1014,7 +1095,7 @@ impl Connection {
             return;
         };
         self.token_source = None;
-        self.holder = None;
+        self.lease = None;
         self._renewal = None;
         cx.background_executor().spawn(source.sign_out()).detach();
         self.sign_in = SignIn::Offered {
@@ -1042,7 +1123,9 @@ impl Connection {
         self.token_source = Some(Arc::new(source));
         self.token_given = false;
         self.asked_after_refusal = false;
-        self.holder = None;
+        // The token held, if any, is another credential's: the sign-in's failure does not keep it.
+        self.token_from_source = false;
+        self.lease = None;
         self._renewal = None;
         self.renewal_missed = false;
         self.connect(cx);
@@ -1053,19 +1136,16 @@ impl Connection {
     fn drop_sign_in(&mut self) {
         self.oauth = None;
         self.service = None;
-        self.holder = None;
+        self.lease = None;
         self._renewal = None;
         self._signing_in = None;
         self.sign_in = SignIn::NotOffered;
     }
 
-    /// Asks for the next short-lived token when `lease` says, if a view still shows the server;
+    /// Asks for the next short-lived token `at` that time, if a view still shows the server;
     /// otherwise the next view to show it asks.
-    fn schedule_renewal(&mut self, lease: &Lease, cx: &mut Context<Self>) {
-        let wait = lease
-            .renew_at
-            .duration_since(SystemTime::now())
-            .unwrap_or_default();
+    fn schedule_renewal(&mut self, at: SystemTime, cx: &mut Context<Self>) {
+        let wait = at.duration_since(SystemTime::now()).unwrap_or_default();
         self._renewal = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(wait).await;
             this.update(cx, |this, cx| {
@@ -1074,8 +1154,7 @@ impl Connection {
                     return;
                 }
                 if this.watched() {
-                    this.renewing = true;
-                    this.ask_for_token(false, cx);
+                    this.ask_for_token(Ask::Renewal, cx);
                 } else {
                     this.renewal_missed = true;
                 }
@@ -1154,8 +1233,11 @@ impl Connection {
             Ok(_) if self.state == ConnectionState::Ready => ConnectionState::Ready,
             // `/healthz` asks for no token, so it passes for a refused one too: probing again
             // would be refused alike, and would take the token field away while it is typed
-            // in. A new token connects again.
-            Ok(_) if self.state == ConnectionState::Unauthorized => ConnectionState::Unauthorized,
+            // in. A new token connects again, and a source that could not answer is asked
+            // again by the connect below.
+            Ok(_) if self.state == ConnectionState::Unauthorized && !self.token_unanswered => {
+                ConnectionState::Unauthorized
+            }
             // Recovered: probe the graphs again, which schedules the next check.
             Ok(_) => {
                 self.connect(cx);
@@ -1762,7 +1844,7 @@ mod tests {
             fn token(
                 &self,
                 _: Arc<AtomicBool>,
-            ) -> futures::future::BoxFuture<'static, Result<Token, String>> {
+            ) -> futures::future::BoxFuture<'static, Result<Token, NoToken>> {
                 self.asked.fetch_add(1, Ordering::SeqCst);
                 let mut given = self.given.lock().unwrap();
                 let token = if given.len() > 1 {
@@ -1838,5 +1920,110 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(asked(), 3, "a token typed in is not asked about");
+    }
+
+    /// A renewal the source cannot answer now leaves the token held in use, unsaid: the
+    /// connection stays ready, the credential is the same, and the renewal is asked again
+    /// halfway to the token's end, whose answer replaces it quietly. Before, the working
+    /// token was dropped and the server shown refused.
+    #[gpui::test]
+    async fn a_renewal_that_cannot_be_answered_keeps_the_token_held(cx: &mut TestAppContext) {
+        use std::sync::atomic::AtomicUsize;
+        /// Tokens that live two minutes and are renewed after one, or `None` for an ask it
+        /// cannot answer now.
+        struct Leasing {
+            given: std::sync::Mutex<Vec<Option<&'static str>>>,
+            asked: AtomicUsize,
+        }
+        impl TokenSource for Leasing {
+            fn token(
+                &self,
+                _: Arc<AtomicBool>,
+            ) -> futures::future::BoxFuture<'static, Result<Token, NoToken>> {
+                self.asked.fetch_add(1, Ordering::SeqCst);
+                let given = self.given.lock().unwrap().remove(0);
+                let now = SystemTime::now();
+                let answer = given
+                    .map(|token| {
+                        Token::leased(
+                            token.into(),
+                            Lease {
+                                expires_at: now + Duration::from_secs(120),
+                                renew_at: now + Duration::from_secs(60),
+                                holder: "user_1".into(),
+                            },
+                        )
+                    })
+                    .ok_or_else(|| NoToken::passing("the sign-in service did not answer"));
+                Box::pin(async move { answer })
+            }
+        }
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            async move {
+                let body = if path.ends_with("/healthz") {
+                    r#"{"status":"ok","version":"0.14.0","internal_schema_version":16}"#
+                } else {
+                    r#"{"graphs":[]}"#
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let source = Arc::new(Leasing {
+            given: std::sync::Mutex::new(vec![Some("first"), None, Some("second")]),
+            asked: AtomicUsize::new(0),
+        });
+        let server = ServerEntry {
+            name: "signed".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Cli,
+            known_graphs: Vec::new(),
+        };
+        let held: Arc<dyn TokenSource> = source.clone();
+        let connection = cx.new(|_| {
+            Connection::new(server, None, http)
+                .unwrap()
+                .with_token_source(Some(held))
+        });
+        let _watch = connection.update(cx, |connection, cx| {
+            connection.connect(cx);
+            connection.watch(cx)
+        });
+        cx.run_until_parked();
+        let asked = || source.asked.load(Ordering::SeqCst);
+        let held = |cx: &mut TestAppContext| {
+            connection.read_with(cx, |connection, _| {
+                (
+                    connection.state.clone(),
+                    connection.client().credential_changes(),
+                    connection.token_unread.clone(),
+                )
+            })
+        };
+        assert_eq!(asked(), 1);
+        let (state, changes, unread) = held(cx);
+        assert_eq!((state, unread), (ConnectionState::Ready, None));
+
+        // The renewal, a minute in, is not answered: the token stands, and is asked for again
+        // halfway to its end, a minute later, not before.
+        cx.executor().advance_clock(Duration::from_secs(60));
+        cx.run_until_parked();
+        assert_eq!(asked(), 2);
+        assert_eq!(held(cx), (ConnectionState::Ready, changes, None));
+        cx.executor().advance_clock(Duration::from_secs(50));
+        cx.run_until_parked();
+        assert_eq!(asked(), 2, "not asked again before halfway");
+        cx.executor().advance_clock(Duration::from_secs(15));
+        cx.run_until_parked();
+        assert_eq!(asked(), 3);
+        assert_eq!(
+            held(cx),
+            (ConnectionState::Ready, changes, None),
+            "the next token replaced it quietly"
+        );
     }
 }
