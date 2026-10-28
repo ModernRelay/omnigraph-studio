@@ -17,7 +17,7 @@ use futures::channel::{mpsc, oneshot};
 use futures::future::Shared;
 use futures::{FutureExt as _, StreamExt as _};
 use gpui::{
-    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, FollowMode,
+    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, FollowMode, Hsla,
     ListAlignment, ListState, Render, SharedString, Subscription, Task, WeakEntity, Window, list,
 };
 use graph_client::api::CommitKind;
@@ -674,6 +674,31 @@ struct Usage {
     used: u64,
     size: u64,
     cost: Option<(f64, String)>,
+}
+
+impl Usage {
+    /// How much of the window is used, from 0 to 1, of a window whose size is known.
+    fn ratio(&self) -> f32 {
+        (self.used as f32 / self.size as f32).clamp(0., 1.)
+    }
+
+    /// The tokens used of the window's, as "12k of 200k tokens".
+    fn tokens(&self) -> String {
+        format!(
+            "{} of {} tokens",
+            humanize_tokens(self.used),
+            humanize_tokens(self.size)
+        )
+    }
+
+    /// The window as a ring filled to how much is used, in `color`, over a visible track, so it
+    /// reads as a gauge, not a spinner.
+    fn gauge(&self, color: Hsla, cx: &App) -> CircularProgress {
+        CircularProgress::new(self.used as f32, self.size as f32, px(ds::size::GAUGE), cx)
+            .stroke_width(px(ds::size::GAUGE_STROKE))
+            .bg_color(ds::surface::control_border(cx))
+            .progress_color(color)
+    }
 }
 
 /// A message sent while the agent was working, waiting for its turn.
@@ -4724,7 +4749,7 @@ impl AgentPanel {
     /// with the percentage then; the share, token counts and cost so far on hover.
     fn render_usage(&self, cx: &App) -> Option<AnyElement> {
         let usage = self.usage.as_ref().filter(|usage| usage.size > 0)?;
-        let ratio = (usage.used as f32 / usage.size as f32).clamp(0., 1.);
+        let ratio = usage.ratio();
         let nearly_full = ratio >= CONTEXT_NEARLY_FULL;
         let color = if nearly_full {
             Color::Warning.color(cx)
@@ -4732,11 +4757,7 @@ impl AgentPanel {
             Color::Muted.color(cx)
         };
         let title = format!("{}% of the context window", (ratio * 100.).round() as u32);
-        let mut meta = format!(
-            "{} of {} tokens",
-            humanize_tokens(usage.used),
-            humanize_tokens(usage.size)
-        );
+        let mut meta = usage.tokens();
         if let Some((amount, currency)) = &usage.cost {
             meta.push_str(&format!(" · {} so far", format_cost(*amount, currency)));
         }
@@ -4746,18 +4767,7 @@ impl AgentPanel {
                 .flex_none()
                 .gap(px(ds::space::XS))
                 .items_center()
-                .child(
-                    CircularProgress::new(
-                        usage.used as f32,
-                        usage.size as f32,
-                        px(ds::size::GAUGE),
-                        cx,
-                    )
-                    .stroke_width(px(ds::size::GAUGE_STROKE))
-                    // A visible track, so the ring reads as a gauge, not a spinner.
-                    .bg_color(ds::surface::control_border(cx))
-                    .progress_color(color),
-                )
+                .child(usage.gauge(color, cx))
                 // Nearly empty, a ring still reads as a spinner; its number says it is a gauge.
                 .child(
                     ds::text::meta(format!("{}%", (ratio * 100.).round() as u32)).color(
@@ -4905,30 +4915,16 @@ impl AgentPanel {
     fn render_notices(&self, cx: &mut Context<Self>) -> Option<Div> {
         let mut lines = Vec::new();
         if let Some(usage) = self.usage.as_ref().filter(|usage| usage.size > 0) {
-            let ratio = (usage.used as f32 / usage.size as f32).clamp(0., 1.);
+            let ratio = usage.ratio();
             if ratio >= CONTEXT_NEARLY_FULL {
                 lines.push(
                     ds::notice_line()
-                        .child(
-                            CircularProgress::new(
-                                usage.used as f32,
-                                usage.size as f32,
-                                px(ds::size::GAUGE),
-                                cx,
-                            )
-                            .stroke_width(px(ds::size::GAUGE_STROKE))
-                            .bg_color(ds::surface::control_border(cx))
-                            .progress_color(Color::Warning.color(cx)),
-                        )
+                        .child(usage.gauge(Color::Warning.color(cx), cx))
                         .child(ds::text::body(format!(
                             "{}% of the context window used",
                             (ratio * 100.).round() as u32
                         )))
-                        .child(ds::text::muted(format!(
-                            "{} of {} tokens",
-                            humanize_tokens(usage.used),
-                            humanize_tokens(usage.size)
-                        ))),
+                        .child(ds::text::muted(usage.tokens())),
                 );
             }
         }
