@@ -90,6 +90,9 @@ pub struct CommitView {
     _task: Option<Task<()>>,
     /// The wait before a stepped-to commit's first read; dropped with the view.
     _pause: Option<Task<()>>,
+    /// The commit and its changes are read when the tab is next drawn ([`Self::when_shown`]):
+    /// a tab restored with the workspace behind another reads nothing until it is shown.
+    read_owed: bool,
     _regroup_task: Option<Task<()>>,
     _schema_subscription: Subscription,
 }
@@ -138,6 +141,18 @@ impl CommitView {
         let mut view = Self::unread(session, commit_id, commit, cx);
         view.read_commit(cx);
         view.load_more(cx);
+        view
+    }
+
+    /// A commit tab restored with the workspace, which reads the commit and its changes once it
+    /// is first drawn ([`Self::read_owed`]).
+    pub fn when_shown(
+        session: Entity<GraphSession>,
+        commit_id: String,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut view = Self::unread(session, commit_id, None, cx);
+        view.read_owed = true;
         view
     }
 
@@ -199,6 +214,7 @@ impl CommitView {
             focus_handle: cx.focus_handle(),
             _task: None,
             _pause: None,
+            read_owed: false,
             _regroup_task: None,
             _schema_subscription: schema_subscription,
         }
@@ -954,7 +970,13 @@ fn describe(error: &ReadError) -> String {
 
 /// The list's rows: a header for each run of one type, then its cards.
 impl Render for CommitView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.read_owed) {
+            cx.defer_in(window, |this, _, cx| {
+                this.read_commit(cx);
+                this.load_more(cx);
+            });
+        }
         let header = self.render_header(cx);
         let more = usize::from(self.next_page_token.is_some());
         let body = match &self.state {
@@ -1423,6 +1445,34 @@ mod tests {
         let session =
             cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
         (session, asked)
+    }
+
+    /// A commit tab restored with the workspace reads nothing until it is drawn: not the commit,
+    /// nor its changes. Drawn, it reads both. Before, every restored commit tab read them at
+    /// start, shown or not.
+    #[gpui::test]
+    async fn a_restored_commit_tab_reads_when_it_is_shown(cx: &mut TestAppContext) {
+        let (session, asked) = held_commit_session(Duration::ZERO, cx);
+        cx.run_until_parked();
+        asked.lock().unwrap().clear();
+        let hidden = cx.new(|cx| CommitView::when_shown(session.clone(), "c9".into(), cx));
+        cx.run_until_parked();
+        assert!(
+            !asked
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|path| path.contains("/commits/c9")),
+            "nothing read while it is not drawn"
+        );
+        hidden.read_with(cx, |view, _| assert!(view.read_owed));
+        let (shown, cx) =
+            cx.add_window_view(|_, cx| CommitView::when_shown(session.clone(), "c9".into(), cx));
+        cx.run_until_parked();
+        shown.read_with(cx, |view, _| {
+            assert!(matches!(view.state, State::Ready));
+            assert_eq!(view.folded.changes.len(), 1);
+        });
     }
 
     /// A commit named by its id alone (a restored tab, a toast's "View commit", a parent link)
