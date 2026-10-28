@@ -471,10 +471,7 @@ async fn connect(
         if let Ok(mut lines) = stderr.lock() {
             // Cut by bytes, the budget's unit, on a character: a long line cut by characters
             // could still be over the budget and push itself out.
-            let mut end = line.len().min(STDERR_BYTES);
-            while !line.is_char_boundary(end) {
-                end -= 1;
-            }
+            let end = line.floor_char_boundary(STDERR_BYTES);
             lines.push_back(line[..end].to_owned());
             while lines.len() > STDERR_LINES
                 || lines.iter().map(String::len).sum::<usize>() > STDERR_BYTES

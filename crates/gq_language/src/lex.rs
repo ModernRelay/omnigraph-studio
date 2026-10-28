@@ -594,10 +594,7 @@ pub fn problem_range(source: &str, byte: usize) -> Range<usize> {
     {
         return token.range;
     }
-    let mut start = byte;
-    while start > 0 && !source.is_char_boundary(start) {
-        start -= 1;
-    }
+    let start = source.floor_char_boundary(byte);
     let end = source[start..]
         .chars()
         .next()

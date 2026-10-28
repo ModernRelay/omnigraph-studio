@@ -4816,13 +4816,15 @@ fn warning_bar(said: impl Into<SharedString>, cx: &App) -> Div {
 
 /// Writes `contents` to `dir/name.gq`, or to `dir/name-2.gq` and so on when that is taken,
 /// and returns where. Never over a file: one made at the name between the look and the write, by
-/// the person or another program, is kept, and the next name is tried.
+/// the person or another program, is kept, and the next name is tried. The name is cut to 200
+/// bytes on a character's edge: a file system refuses one over 255, and the write's temporary
+/// file beside it takes a few more.
 fn write_unused(
     dir: &std::path::Path,
     name: &str,
     contents: &[u8],
 ) -> std::io::Result<std::path::PathBuf> {
-    let safe: String = name
+    let mut safe: String = name
         .chars()
         .map(|c| {
             if c.is_alphanumeric() || matches!(c, '-' | '_') {
@@ -4832,6 +4834,7 @@ fn write_unused(
             }
         })
         .collect();
+    safe.truncate(safe.floor_char_boundary(200));
     for n in 1.. {
         let candidate = match n {
             1 => dir.join(format!("{safe}.gq")),
@@ -5004,6 +5007,10 @@ mod tests {
             write_unused(&dir, "top people", b"second").unwrap(),
             dir.join("top_people-2.gq")
         );
+        // A query of any name is saved: its file's name is cut to what a file system takes.
+        let long = write_unused(&dir, &"週次".repeat(150), b"long").unwrap();
+        assert!(long.file_name().unwrap().len() <= 255);
+        assert_eq!(std::fs::read(&long).unwrap(), b"long");
         assert_eq!(std::fs::read(dir.join("top_people.gq")).unwrap(), b"first");
         assert_eq!(
             std::fs::read(dir.join("top_people-2.gq")).unwrap(),
