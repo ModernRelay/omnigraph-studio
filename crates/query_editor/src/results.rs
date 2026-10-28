@@ -359,13 +359,13 @@ pub fn summarize_detail(detail: &str) -> String {
         .join(", ")
 }
 
-/// `34 ms`, `1.2 s`.
+/// `34 ms`, `1.2 s`: whole milliseconds first, so 999.6 ms reads `1.0 s`, not `1000 ms`.
 pub fn format_elapsed(elapsed: Duration) -> String {
-    let ms = elapsed.as_secs_f64() * 1000.;
-    if ms < 1000. {
-        format!("{} ms", ms.round() as u64)
+    let ms = (elapsed.as_secs_f64() * 1000.).round() as u64;
+    if ms < 1000 {
+        format!("{ms} ms")
     } else {
-        format!("{:.1} s", ms / 1000.)
+        format!("{:.1} s", ms as f64 / 1000.)
     }
 }
 
@@ -1223,6 +1223,8 @@ mod tests {
     fn small_formats() {
         assert_eq!(format_elapsed(Duration::from_millis(34)), "34 ms");
         assert_eq!(format_elapsed(Duration::from_millis(1250)), "1.2 s");
+        assert_eq!(format_elapsed(Duration::from_micros(999_600)), "1.0 s");
+        assert_eq!(format_elapsed(Duration::from_micros(999_400)), "999 ms");
         assert_eq!(rows_label(1), "1 row");
         assert_eq!(rows_label(0), "0 rows");
         assert_eq!(rows_label(12_480), "12,480 rows");
