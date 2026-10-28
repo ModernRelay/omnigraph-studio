@@ -1771,6 +1771,31 @@ impl GroupBy {
         choices
     }
 
+    /// [`Self::choices`] in the sections a menu shows them in, each under its heading: the
+    /// other type's properties (its name), the edge's (the edge's name), then the other type's
+    /// relationships. A section with no choice is left out.
+    pub fn sections(
+        schema: &SchemaModel,
+        group: &RelationshipGroup,
+    ) -> Vec<(String, Vec<GroupBy>)> {
+        let choices = Self::choices(schema, group);
+        [
+            (GroupOn::Node, group.other_type.clone()),
+            (GroupOn::Edge, group.edge.clone()),
+            (
+                GroupOn::Relationship,
+                format!("{}'s relationships", group.other_type),
+            ),
+        ]
+        .into_iter()
+        .map(|(on, heading)| {
+            let section = choices.iter().filter(|by| by.on == on).cloned().collect();
+            (heading, section)
+        })
+        .filter(|(_, section): &(String, Vec<GroupBy>)| !section.is_empty())
+        .collect()
+    }
+
     /// For a grouping by the neighbours' relationship: the type at its other end, and the hop
     /// from a neighbour `$m` to a value `$v`.
     fn hop<'a>(
@@ -3735,6 +3760,30 @@ mod tests {
                 "Relationship in:Knows"
             ],
             "the key, lists, and vectors are left out"
+        );
+        let sections: Vec<(String, usize)> = GroupBy::sections(&schema, works_at)
+            .into_iter()
+            .map(|(heading, section)| (heading, section.len()))
+            .collect();
+        assert_eq!(
+            sections,
+            [
+                ("Person".to_owned(), 4),
+                ("WorksAt".to_owned(), 2),
+                ("Person's relationships".to_owned(), 4),
+            ],
+            "the choices in their sections, in order"
+        );
+        let knows_group = schema
+            .relationships_of("Person")
+            .iter()
+            .find(|group| group.edge == "Knows")
+            .unwrap();
+        assert!(
+            GroupBy::sections(&schema, knows_group)
+                .iter()
+                .all(|(heading, _)| heading != "Knows"),
+            "an edge with no property has no section"
         );
         let by_company = GroupBy {
             on: GroupOn::Relationship,

@@ -1794,11 +1794,11 @@ impl GraphCanvas {
                             }
                         }),
                     );
-                    let choices = schema
+                    let sections = schema
                         .as_ref()
-                        .map(|schema| gq_language::builder::GroupBy::choices(schema, &group))
+                        .map(|schema| gq_language::builder::GroupBy::sections(schema, &group))
                         .unwrap_or_default();
-                    if exploring && !choices.is_empty() {
+                    if exploring && !sections.is_empty() {
                         let (this, path, current) =
                             (this.clone(), node.path.clone(), grouping.clone());
                         let group = group.clone();
@@ -1821,14 +1821,18 @@ impl GraphCanvas {
                                 None,
                                 set(None),
                             );
-                            for by in &choices {
-                                menu = menu.toggleable_entry(
-                                    by.label(),
-                                    current.as_ref() == Some(by),
-                                    IconPosition::Start,
-                                    None,
-                                    set(Some(by.clone())),
-                                );
+                            // As the tree's menu shows them (spec 005).
+                            for (heading, section) in &sections {
+                                menu = menu.separator().header(heading.clone());
+                                for by in section {
+                                    menu = menu.toggleable_entry(
+                                        by.label(),
+                                        current.as_ref() == Some(by),
+                                        IconPosition::Start,
+                                        None,
+                                        set(Some(by.clone())),
+                                    );
+                                }
                             }
                             menu
                         });
