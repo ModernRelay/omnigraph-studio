@@ -908,15 +908,13 @@ impl OntologyPage {
                 .h(px(LABEL_HEIGHT))
                 .justify_center()
                 .child(
-                    div()
+                    ds::lifted(div(), cx)
                         .h(px(LABEL_HEIGHT))
                         .px(px(space::SM))
                         .flex()
                         .items_center()
                         .rounded(px(ds::radii(cx).xs))
                         .bg(ds::surface::canvas_label(cx))
-                        .border_1()
-                        .border_color(ds::surface::divider(cx))
                         .child(if strong {
                             ds::text::meta(name).color(Color::Default)
                         } else {

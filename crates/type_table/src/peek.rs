@@ -1734,7 +1734,6 @@ impl NodePeek {
     }
 
     fn render_blobs(&self, cx: &mut Context<Self>) -> AnyElement {
-        let border = studio_ui::ds::surface::rule(cx);
         let drop_bg = studio_ui::ds::surface::drop_target(cx);
         v_flex()
             .gap(px(space::MD))
@@ -1797,14 +1796,12 @@ impl NodePeek {
                         Some(studio_ui::ds::text::muted("Empty value").into_any_element())
                     }
                     (_, Loadable::Loaded(Preview::Image(image))) => Some(
-                        div()
+                        studio_ui::ds::lifted(div(), cx)
                             .w_full()
                             .flex()
                             .justify_center()
                             .p(px(space::MD))
                             .rounded(px(studio_ui::ds::radii(cx).md))
-                            .border_1()
-                            .border_color(border)
                             .child(
                                 gpui::img(image.source())
                                     .max_w_full()
@@ -5361,7 +5358,7 @@ impl NodePeek {
                     )
                     .child(div().flex_1())
                     .children(open_page.map(|open| {
-                        studio_ui::ds::toolbar_icon_button("peek-open-page", IconName::ArrowUpRight)
+                        studio_ui::ds::icon_button("peek-open-page", IconName::ArrowUpRight)
                             .icon_color(Color::Muted)
                             .tooltip(Tooltip::text("Open the node's page"))
                             .on_click(move |_, window, cx| {
@@ -5374,7 +5371,7 @@ impl NodePeek {
                             id: id.clone(),
                         };
                         header.child(
-                            studio_ui::ds::toolbar_button("peek-explore", "Explore")
+                            studio_ui::ds::button("peek-explore", "Explore")
                                 .style(ButtonStyle::Subtle)
                                 .start_icon(
                                     Icon::new(IconName::Crosshair),

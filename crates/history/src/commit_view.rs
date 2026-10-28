@@ -647,7 +647,7 @@ impl CommitView {
             .child(
                 PopoverMenu::new("open-table-at")
                     .trigger(
-                        studio_ui::ds::toolbar_button("open-table-at-button", "Table")
+                        studio_ui::ds::button("open-table-at-button", "Table")
                             .style(ButtonStyle::Subtle)
                             .start_icon(Icon::new(IconName::Table))
                             .tooltip(Tooltip::text(
@@ -690,7 +690,7 @@ impl CommitView {
                     }),
             )
             .child(
-                studio_ui::ds::toolbar_button("query-at", "Query")
+                studio_ui::ds::button("query-at", "Query")
                     .style(ButtonStyle::Subtle)
                     .start_icon(Icon::new(IconName::FileCode))
                     .tooltip(Tooltip::text("Open a query that reads this commit"))
@@ -706,7 +706,7 @@ impl CommitView {
             .when_some(branch_at, |row, commit| {
                 let cli = branch_here_cli(&commit);
                 row.child(
-                    studio_ui::ds::toolbar_button("branch-here", "Branch")
+                    studio_ui::ds::button("branch-here", "Branch")
                         .style(ButtonStyle::Subtle)
                         .start_icon(Icon::new(IconName::GitBranch))
                         .tooltip(move |_, cx| {

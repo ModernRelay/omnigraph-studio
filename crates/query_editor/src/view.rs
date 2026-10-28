@@ -1173,7 +1173,7 @@ impl QueryEditor {
         };
         PopoverMenu::new("snapshot-picker")
             .trigger(
-                studio_ui::ds::toolbar_button("snapshot-picker-button", label)
+                studio_ui::ds::button("snapshot-picker-button", label)
                     .style(ButtonStyle::Subtle)
                     .start_icon(Icon::new(if pinned.is_some() {
                         IconName::GitCommit
@@ -3283,7 +3283,7 @@ impl QueryEditor {
                 if rows.next.is_some() {
                     let focus = self.main_focus(cx);
                     end.push(
-                        ds::toolbar_button("result-next-page", "Next page")
+                        ds::button("result-next-page", "Next page")
                             .style(ButtonStyle::Subtle)
                             .start_icon(Icon::new(IconName::ArrowRight))
                             .key_binding(KeyBinding::for_action_in(&NextPage, &focus, cx))
@@ -3316,7 +3316,7 @@ impl QueryEditor {
                 if let Some(graph) = rows.graph.clone() {
                     let title = format!("{} · result", rows.label);
                     end.push(
-                        ds::toolbar_button("result-canvas", "Canvas")
+                        ds::button("result-canvas", "Canvas")
                             .style(ButtonStyle::Subtle)
                             .start_icon(Icon::new(IconName::GitGraph))
                             .tooltip(Tooltip::text(format!(
@@ -3462,7 +3462,7 @@ impl QueryEditor {
             .when(self.is_stale(cx), |toolbar| {
                 let focus = focus.clone();
                 toolbar.child(
-                    studio_ui::ds::toolbar_button("newer-rows", "Newer data · Refresh")
+                    studio_ui::ds::button("newer-rows", "Newer data · Refresh")
                         .style(ButtonStyle::Tinted(ui::TintColor::Accent))
                         .disabled(busy)
                         .tooltip(move |_window, cx| {
@@ -3481,7 +3481,7 @@ impl QueryEditor {
             // A stored query's plan needs its text, which the server does not send.
             .when(self.stored.is_none(), |toolbar| {
                 toolbar.child(
-                    studio_ui::ds::toolbar_button("explain", "Explain")
+                    studio_ui::ds::button("explain", "Explain")
                         .start_icon(Icon::new(IconName::ListTree))
                         .key_binding(KeyBinding::for_action_in(&Explain, &focus, cx))
                         .tooltip({
@@ -3501,7 +3501,7 @@ impl QueryEditor {
                 )
             })
             .child(
-                studio_ui::ds::toolbar_button("run", "Run")
+                studio_ui::ds::button("run", "Run")
                     .style(ButtonStyle::Filled)
                     .start_icon(Icon::new(IconName::PlayFilled))
                     .key_binding(KeyBinding::for_action_in(&Run, &focus, cx))

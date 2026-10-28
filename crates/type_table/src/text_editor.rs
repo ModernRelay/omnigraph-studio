@@ -534,7 +534,7 @@ impl TextEditor {
                     .child(segment("text-preview", "Preview", Mode::Preview, cx)),
             )
             .child(
-                studio_ui::ds::toolbar_button("text-save", "Save")
+                studio_ui::ds::button("text-save", "Save")
                     .style(if dirty {
                         ButtonStyle::Filled
                     } else {

@@ -102,7 +102,7 @@ impl Render for UpdateStatus {
                 })
             })
             .children(shown.button.map(|(label, action)| {
-                studio_ui::ds::toolbar_button("update-action", label)
+                studio_ui::ds::button("update-action", label)
                     .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
             }))
             .into_any_element()

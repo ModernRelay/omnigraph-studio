@@ -2172,7 +2172,7 @@ impl ReviewView {
         let mergeable = self.mergeable(cx);
         let merge_refused = self.merge_refusal(cx);
         let delete_refused = self.delete_refusal(cx);
-        let merge_button = studio_ui::ds::toolbar_button(
+        let merge_button = studio_ui::ds::button(
             "merge",
             format!("Merge {} into {}", self.branch, self.target),
         )
@@ -2202,7 +2202,7 @@ impl ReviewView {
             move |_, cx| Tooltip::with_meta(title.clone(), None, cli.clone(), cx)
         })
         .on_click(cx.listener(|this, _, _, cx| this.merge(cx)));
-        let refresh = studio_ui::ds::toolbar_icon_button("refresh", IconName::RotateCw)
+        let refresh = studio_ui::ds::icon_button("refresh", IconName::RotateCw)
             .tooltip(refresh_tooltip(
                 "Read the branch and its target again",
                 &self.focus_handle,
@@ -2361,7 +2361,7 @@ impl ReviewView {
         let view = cx.entity().downgrade();
         let scope_menu = PopoverMenu::new("review-scope")
             .trigger(
-                studio_ui::ds::toolbar_button("review-scope-button", scope_label)
+                studio_ui::ds::button("review-scope-button", scope_label)
                     .style(ButtonStyle::Outlined)
                     .end_icon(Icon::new(IconName::ChevronDown)),
             )
@@ -2630,15 +2630,12 @@ impl ReviewView {
             .px(px(space::XL))
             .pb(px(space::MD))
             .child(
-                h_flex()
-                    .id(("conflict", ix))
+                studio_ui::ds::lifted(h_flex().id(("conflict", ix)), cx)
                     .w_full()
                     .gap(px(space::LG))
                     .px(px(space::LG))
                     .py(px(space::MD))
                     .rounded(px(radii(cx).md))
-                    .border_1()
-                    .border_color(studio_ui::ds::surface::rule(cx))
                     .bg(studio_ui::ds::surface::document(cx))
                     .child(Icon::new(IconName::GitMergeConflict).color(Color::Conflict))
                     .child(

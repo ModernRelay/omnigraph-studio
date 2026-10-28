@@ -933,9 +933,15 @@ impl BlobView {
                         ds::surface::chrome(cx),
                         ds::space::MD * scale.max(0.5),
                     ))
-                    .border_1()
-                    .border_color(ds::surface::rule(cx))
                     .child(img(image.source()).size_full())
+                    // On the image's edge, over it: a border would sit outside it.
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .border_1()
+                            .border_color(ds::surface::image_outline(cx)),
+                    )
                     .into_any_element()
             }
             // An SVG, or before the tab is measured: fitted by the element.

@@ -189,10 +189,10 @@ pub mod size {
     /// The slot a sidebar row's icon or type mark sits in, so every label of a list starts on
     /// one edge whatever leads it.
     pub const ROW_ICON: f32 = 16.;
-    /// A control: a medium button, a field, a segmented track, a floating bar, a tile.
+    /// A control: a field, a segmented track, a floating bar, a tile.
     pub const CONTROL: f32 = 28.;
-    /// A button inside a floating bar ([`super::bar_button`]): Zed's default size, 3 px inside
-    /// the bar's edge.
+    /// A button, a pill or not, and an icon button's square ([`super::button`]): Zed's default
+    /// size, 3 px inside a floating bar's edge.
     pub const BAR_BUTTON: f32 = 22.;
     /// A button inside a row, a card or beside a value: a tag's height, so a row action sits
     /// in the row as its chips do.
@@ -622,6 +622,17 @@ pub mod surface {
                 status.warning_border.opacity(0.4),
             ),
             ui::Severity::Error => (status.error.opacity(0.1), status.error.opacity(0.2)),
+        }
+    }
+
+    /// The line around an image on its edge (interfaces.dev's image outline): black at 10 % in
+    /// a light theme, white at 10 % in a dark one, so an image's edge shows on a fill of its
+    /// own colour whatever the background.
+    pub fn image_outline(cx: &App) -> Hsla {
+        if cx.theme().appearance.is_light() {
+            gpui::black().opacity(0.1)
+        } else {
+            gpui::white().opacity(0.1)
         }
     }
 
@@ -1449,17 +1460,6 @@ pub fn toolbar(cx: &App) -> Div {
         .border_color(surface::rule(cx))
 }
 
-/// A button in a document's toolbar: Zed's 22 px size (Tower's `xs`), small type and icons, so
-/// the toolbar reads as the document's chrome rather than as its content.
-pub fn toolbar_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
-    button(id, label).size(ButtonSize::Default)
-}
-
-/// An icon button in a document's toolbar, beside [`toolbar_button`]s.
-pub fn toolbar_icon_button(id: impl Into<ElementId>, icon: IconName) -> IconButton {
-    icon_button(id, icon).size(ButtonSize::Default)
-}
-
 /// A switch: a pill track and a round knob. On, the track is the primary button's ink; off,
 /// the [`surface::divider`]'s grey; the knob is the solid surface with interfaces.dev's shadow
 /// in both, so it reads on either. Studio draws it rather than Zed's `Switch`, whose knob takes
@@ -1613,9 +1613,10 @@ pub fn meta_code(icon: IconName, value: impl Into<SharedString>, cx: &App) -> Di
         .child(text::code(value, cx).color(Color::Muted).single_line())
 }
 
-/// A button in a toolbar, strip, panel or dialog: 28 px tall with a 6 px inset and a small
-/// label, so its hover and pressed fills have room around the label without padding it out
-/// (`crate::button`). A button inside a row or a card is a [`row_button`].
+/// A button with a label, in a toolbar, strip, panel or dialog: a pill of Zed's 22 px size
+/// (Tower's `xs`), its label small and 8 px in, the size of a [`bar_button`] and an
+/// [`icon_button`] beside it (`crate::button`). A button inside a row or a card is a
+/// [`row_button`].
 pub fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
     Button::new(id, label)
 }
@@ -1629,21 +1630,15 @@ pub fn spinner() -> impl IntoElement {
         .with_rotate_animation(2)
 }
 
-/// [`button`] inside a [`float_bar`]: Zed's default size, `size::BAR_BUTTON` tall.
+/// [`button`] inside a [`float_bar`]: the same size, with the scale's corner (spec 002, "Round
+/// ends only for buttons with a label").
 pub fn bar_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
-    button(id, label)
-        .size(ButtonSize::Default)
-        .shape(Shape::Rounded)
+    button(id, label).shape(Shape::Rounded)
 }
 
-/// [`icon_button`] inside a [`float_bar`].
-pub fn bar_icon_button(id: impl Into<ElementId>, icon: IconName) -> IconButton {
-    icon_button(id, icon).size(ButtonSize::Default)
-}
-
-/// [`button`] for an icon alone: a 28 px square.
+/// [`button`] for an icon alone: a square as tall as a button, wherever it sits.
 pub fn icon_button(id: impl Into<ElementId>, icon: IconName) -> IconButton {
-    IconButton::new(id, icon).size(ButtonSize::Medium)
+    IconButton::new(id, icon)
 }
 
 /// A labelled action inside a row or a card ("Show all", "Load more", "Discard"):
@@ -1669,7 +1664,6 @@ pub fn inline_icon_button(id: impl Into<ElementId>, icon: IconName) -> IconButto
 pub fn sheet_close_button(id: impl Into<ElementId>) -> IconButton {
     IconButton::new(id, IconName::Close)
         .variant(Variant::Outline)
-        .size(ButtonSize::Default)
         .icon_size(IconSize::XSmall)
 }
 
@@ -1848,7 +1842,7 @@ pub fn chip_button(
     label: impl Into<SharedString>,
     value: Option<SharedString>,
 ) -> Button {
-    toolbar_button(id, label)
+    button(id, label)
         .start_icon(Icon::new(icon))
         .value(value)
         .shape(crate::button::Shape::Pill)
@@ -1943,29 +1937,30 @@ pub fn pill_button(
 }
 
 /// A padded list of rounded rows in a form or a dialog (a field's offers, what a delete takes
-/// with it): rows of radius `Radii::xs` on the document's fill inside a floating surface's
-/// hairline, the list concentric around them.
+/// with it): rows of radius `Radii::xs` on the document's fill, raised as a field is
+/// ([`lifted`]), the list concentric around them.
 pub fn row_list(cx: &App) -> Div {
-    v_flex()
-        .p(px(space::XS))
-        .border_1()
-        .rounded(px(radii(cx).row_list()))
-        .bg(surface::document(cx))
-        .border_color(surface::floating_border(cx))
+    lifted(
+        v_flex()
+            .p(px(space::XS))
+            .rounded(px(radii(cx).row_list()))
+            .bg(surface::document(cx)),
+        cx,
+    )
 }
 
-/// A [`row_list`] floating over the page under a field (a filter's values): a menu's fill
-/// and shadow.
+/// A [`row_list`] floating over the page under a field (a filter's values): a menu's fill,
+/// hairline and shadow.
 pub fn popover_list(cx: &App) -> Div {
     row_list(cx)
         .bg(surface::floating(cx))
+        .border_color(surface::floating_border(cx))
         .shadow(elevation::floating(cx))
 }
 
 /// A floating group of controls over a canvas: a glass bar 28 px tall holding
-/// [`bar_button`]s, [`bar_icon_button`]s (22 px) and [`segment`]s, 3 px inside its edge and
-/// rounded concentrically around them (`Radii::bar`). A medium button would not fit inside its
-/// border. The caller occludes it (`.occlude()`) unless what is drawn under it must keep the
+/// [`bar_button`]s, [`icon_button`]s (22 px) and [`segment`]s, 3 px inside its edge and
+/// rounded concentrically around them (`Radii::bar`). The caller occludes it (`.occlude()`) unless what is drawn under it must keep the
 /// pointer, as a drag across a canvas does.
 pub fn float_bar(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
     let gap = (size::CONTROL - size::BAR_BUTTON) / 2.;
@@ -2057,8 +2052,7 @@ pub fn checkbox(
                 .color(Color::Custom(surface::document(cx))),
         )
     } else {
-        mark.bg(surface::document(cx))
-            .border_color(surface::control_border(cx))
+        lifted(mark.bg(surface::document(cx)), cx)
     };
     h_flex()
         .id(id.into())
@@ -2712,7 +2706,6 @@ pub fn value_list() -> Div {
 /// its end.
 pub fn value_select(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
     button(id, label)
-        .size(ButtonSize::Default)
         .variant(crate::button::Variant::Outline)
         .end_icon(Icon::new(IconName::ChevronDown))
 }
@@ -3108,9 +3101,7 @@ pub fn composer_button(
                         .color(Color::Custom(surface::document(cx))),
                 )
             } else {
-                button
-                    .border_1()
-                    .border_color(surface::control_border(cx))
+                lifted(button, cx)
                     .hover(move |style| style.bg(hover))
                     .child(icon::lead(icon))
             }

@@ -667,8 +667,7 @@ impl Render for DesignGallery {
                         .child(ds::meta(IconName::Pencil, "1"))
                         .child(div().flex_1())
                         .child(
-                            ds::toolbar_button("g-review", "Review")
-                                .start_icon(Icon::new(IconName::Eye)),
+                            ds::button("g-review", "Review").start_icon(Icon::new(IconName::Eye)),
                         ),
                 ),
                 ds::composer_card(cx)
@@ -753,18 +752,13 @@ impl Render for DesignGallery {
                 h_flex()
                     .gap(px(space::MD))
                     .items_center()
-                    .child(ds::button("g-size-control", "Control").variant(ds::Variant::Outline))
+                    .child(ds::button("g-size-pill", "Pill").variant(ds::Variant::Outline))
                     .child(
-                        ds::toolbar_button("g-size-toolbar", "Toolbar")
-                            .variant(ds::Variant::Outline),
+                        ds::bar_button("g-size-rounded", "Rounded").variant(ds::Variant::Outline),
                     )
                     .child(ds::row_button("g-size-row", "Row").variant(ds::Variant::Outline))
                     .child(
-                        ds::icon_button("g-icon-control", IconName::Plus)
-                            .variant(ds::Variant::Outline),
-                    )
-                    .child(
-                        ds::toolbar_icon_button("g-icon-toolbar", IconName::Plus)
+                        ds::icon_button("g-icon-button", IconName::Plus)
                             .variant(ds::Variant::Outline),
                     )
                     .child(

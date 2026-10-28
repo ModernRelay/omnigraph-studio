@@ -6570,7 +6570,7 @@ impl TypeTable {
             })
             .when(self.newer, |d| {
                 d.child(
-                    studio_ui::ds::toolbar_button("newer-data", "Newer data · Refresh")
+                    studio_ui::ds::button("newer-data", "Newer data · Refresh")
                         .style(ButtonStyle::Tinted(TintColor::Accent))
                         .tooltip(|_, cx| {
                             Tooltip::for_action("Read the branch head again", &RefreshTable, cx)
@@ -6627,7 +6627,7 @@ impl TypeTable {
                             })),
                     ))
                     .child(
-                        studio_ui::ds::toolbar_icon_button("refresh-table", IconName::RotateCw)
+                        studio_ui::ds::icon_button("refresh-table", IconName::RotateCw)
                             .tooltip(|_, cx| Tooltip::for_action("Refresh", &RefreshTable, cx))
                             .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
                     ),
@@ -6855,31 +6855,19 @@ impl TypeTable {
             Rc::new(move |index, window, cx| pick(&index, window, cx)),
             cx,
         );
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .child(
-                deferred(
-                    anchored()
-                        .anchor(Anchor::TopLeft)
-                        // Under the value field, its list's rows on the field's text.
-                        .offset(point(px(-space::XS), px(studio_ui::ds::size::CONTROL)))
-                        .snap_to_window_with_margin(px(space::MD))
-                        .child(
-                            studio_ui::ds::popover_list(cx)
-                                .id("filter-suggestions")
-                                .occlude()
-                                .min_w(px(studio_ui::ds::size::POPOVER_MIN))
-                                .max_w(px(studio_ui::ds::size::POPOVER_MAX))
-                                .max_h(px(studio_ui::ds::size::LIST_MAX_HEIGHT))
-                                .overflow_y_scroll()
-                                .children(items),
-                        ),
-                )
-                .with_priority(1),
-            )
-            .into_any_element()
+        // Under the value field, its list's rows on the field's text.
+        floating_under(
+            point(px(-space::XS), px(studio_ui::ds::size::CONTROL)),
+            1,
+            studio_ui::ds::popover_list(cx)
+                .id("filter-suggestions")
+                .occlude()
+                .min_w(px(studio_ui::ds::size::POPOVER_MIN))
+                .max_w(px(studio_ui::ds::size::POPOVER_MAX))
+                .max_h(px(studio_ui::ds::size::LIST_MAX_HEIGHT))
+                .overflow_y_scroll()
+                .children(items),
+        )
     }
 
     fn render_body(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
@@ -8553,66 +8541,46 @@ impl TypeTable {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .child(
-                deferred(
-                    anchored()
-                        .anchor(Anchor::TopLeft)
-                        // Under the cell, its edge on the cell's, a hairline's gap below it.
-                        .offset(point(
-                            px(-studio_ui::ds::size::HAIRLINE),
-                            px(ROW_HEIGHT + space::XXS),
-                        ))
-                        .snap_to_window_with_margin(px(space::MD))
-                        .child(
-                            v_flex()
-                                .min_w(px(studio_ui::ds::size::POPOVER_MIN))
-                                .max_w(px(studio_ui::ds::size::POPOVER_MAX))
-                                .px(px(space::MD))
-                                .py(px(space::SM))
-                                .gap(px(space::XS))
-                                .map(|callout| studio_ui::ds::menu_surface(callout, cx))
-                                .children(notice.map(|notice| {
-                                    let unknown = notice.tone == Tone::Unknown;
-                                    h_flex()
-                                        .gap(px(space::SM))
-                                        .child(Indicator::dot().color(notice.tone.color()))
-                                        .child(
-                                            studio_ui::ds::text::body(notice.message)
-                                                .color(notice.tone.color()),
+        // Under the cell, its edge on the cell's, a hairline's gap below it.
+        floating_under(
+            point(
+                px(-studio_ui::ds::size::HAIRLINE),
+                px(ROW_HEIGHT + space::XXS),
+            ),
+            2,
+            v_flex()
+                .min_w(px(studio_ui::ds::size::POPOVER_MIN))
+                .max_w(px(studio_ui::ds::size::POPOVER_MAX))
+                .px(px(space::MD))
+                .py(px(space::SM))
+                .gap(px(space::XS))
+                .map(|callout| studio_ui::ds::menu_surface(callout, cx))
+                .children(notice.map(|notice| {
+                    let unknown = notice.tone == Tone::Unknown;
+                    h_flex()
+                        .gap(px(space::SM))
+                        .child(Indicator::dot().color(notice.tone.color()))
+                        .child(studio_ui::ds::text::body(notice.message).color(notice.tone.color()))
+                        // Whether the save landed is in the branch's history.
+                        .when(unknown, |row| {
+                            row.child(
+                                studio_ui::ds::button("open-history", "Open history")
+                                    .style(ButtonStyle::Subtle)
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(
+                                            Box::new(studio_actions::graph::OpenHistory),
+                                            cx,
                                         )
-                                        // Whether the save landed is in the branch's history.
-                                        .when(unknown, |row| {
-                                            row.child(
-                                                studio_ui::ds::button(
-                                                    "open-history",
-                                                    "Open history",
-                                                )
-                                                .style(ButtonStyle::Subtle)
-                                                .on_click(|_, window, cx| {
-                                                    window.dispatch_action(
-                                                        Box::new(
-                                                            studio_actions::graph::OpenHistory,
-                                                        ),
-                                                        cx,
-                                                    )
-                                                }),
-                                            )
-                                        })
-                                }))
-                                .children(hint.map(studio_ui::ds::text::meta))
-                                .child(studio_ui::ds::text::meta(format!(
-                                    "↵ save · esc cancel · write · {}",
-                                    self.branch
-                                ))),
-                        ),
-                )
-                .with_priority(2),
-            )
-            .into_any_element()
+                                    }),
+                            )
+                        })
+                }))
+                .children(hint.map(studio_ui::ds::text::meta))
+                .child(studio_ui::ds::text::meta(format!(
+                    "↵ save · esc cancel · write · {}",
+                    self.branch
+                ))),
+        )
     }
 
     /// The table's part of the status bar ([`Item::status`]): a page being read, or a Retry
@@ -8966,6 +8934,31 @@ fn sideways_scroll(
     .top_0()
     .left_0()
     .size_full()
+}
+
+/// `content` floating under the element this is placed in, `offset` from its top-left corner:
+/// drawn over the rest of the window, `priority` among other overlays, and kept inside it by a
+/// margin.
+fn floating_under(
+    offset: gpui::Point<Pixels>,
+    priority: usize,
+    content: impl IntoElement,
+) -> AnyElement {
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .child(
+            deferred(
+                anchored()
+                    .anchor(Anchor::TopLeft)
+                    .offset(offset)
+                    .snap_to_window_with_margin(px(space::MD))
+                    .child(content),
+            )
+            .with_priority(priority),
+        )
+        .into_any_element()
 }
 
 #[cfg(test)]

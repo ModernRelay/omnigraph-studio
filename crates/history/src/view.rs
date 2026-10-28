@@ -2199,7 +2199,7 @@ impl Render for HistoryView {
                             ),
                     )
                     .child(
-                        studio_ui::ds::toolbar_button("retry-history", "Try again")
+                        studio_ui::ds::button("retry-history", "Try again")
                             .style(ButtonStyle::Subtle)
                             .tooltip(Tooltip::text(
                                 "Read the branch's newest commits again; the commits read stay \
@@ -2211,7 +2211,7 @@ impl Render for HistoryView {
             .child(div().flex_1())
             .child(search)
             .child(
-                studio_ui::ds::toolbar_icon_button("refresh-history", IconName::RotateCw)
+                studio_ui::ds::icon_button("refresh-history", IconName::RotateCw)
                     .icon_color(Color::Muted)
                     .tooltip(|_, cx| Tooltip::for_action("Read the history again", &Refresh, cx))
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),

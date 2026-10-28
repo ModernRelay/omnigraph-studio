@@ -4945,7 +4945,7 @@ impl AgentPanel {
                     })
                     .child(div().flex_1())
                     .child(
-                        ds::toolbar_button("review", "Review")
+                        ds::button("review", "Review")
                             .start_icon(Icon::new(IconName::Eye))
                             .on_click(cx.listener(|this, _, window, cx| this.review(window, cx))),
                     ),
