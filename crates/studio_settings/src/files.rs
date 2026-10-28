@@ -91,7 +91,23 @@ pub fn writes_done() {
 /// Replaces `path` with `contents` in one step. A link is written through to its target, so the
 /// link stays. A failed write leaves the old file as it was and no temporary file behind.
 pub fn write_atomic(path: &Path, contents: &[u8], access: Access) -> std::io::Result<()> {
-    replace(path, contents, access, |_| Ok(true)).map(|_| ())
+    replace(path, contents, access, Place::Over, |_| Ok(true)).map(|_| ())
+}
+
+/// Writes `contents` to `path` whole, in one step, only where nothing is there: whether it was
+/// written. A file made at `path` meanwhile, by the person or another program, is kept, where a
+/// look then a [`write_atomic`] would replace it.
+pub fn write_new(path: &Path, contents: &[u8], access: Access) -> std::io::Result<bool> {
+    replace(path, contents, access, Place::IfAbsent, |_| Ok(true))
+}
+
+/// How [`replace`] puts its contents at the path.
+#[derive(Clone, Copy, PartialEq)]
+enum Place {
+    /// Over what is there (a rename).
+    Over,
+    /// Only where nothing is (a hard link, which refuses a path that is taken).
+    IfAbsent,
 }
 
 /// What [`write_atomic_unless_changed`] did.
@@ -114,7 +130,7 @@ pub(crate) fn write_atomic_unless_changed(
     unchanged: impl FnOnce() -> bool,
 ) -> std::io::Result<Replaced> {
     let mut modified = None;
-    let replaced = replace(path, contents, access, |file| {
+    let replaced = replace(path, contents, access, Place::Over, |file| {
         modified = file.metadata()?.modified().ok();
         Ok(unchanged())
     })?;
@@ -125,12 +141,13 @@ pub(crate) fn write_atomic_unless_changed(
     })
 }
 
-/// Writes and syncs `contents` beside `path`, then renames them over it if `ready` says so:
-/// whether it was replaced. Anything but a replacement leaves no temporary file behind.
+/// Writes and syncs `contents` beside `path`, then puts them there as `place` says if `ready`
+/// says so: whether it was. No temporary file is left behind but the one renamed into place.
 fn replace(
     path: &Path,
     contents: &[u8],
     access: Access,
+    place: Place,
     ready: impl FnOnce(&std::fs::File) -> std::io::Result<bool>,
 ) -> std::io::Result<bool> {
     let target = match std::fs::symlink_metadata(path) {
@@ -170,10 +187,20 @@ fn replace(
         if !ready(&file)? {
             return Ok(false);
         }
-        std::fs::rename(&temp, &target)?;
+        match place {
+            Place::Over => std::fs::rename(&temp, &target)?,
+            Place::IfAbsent => match std::fs::hard_link(&temp, &target) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            },
+        }
         Ok(true)
     })();
-    if !matches!(written, Ok(true)) {
+    // A link leaves the temporary name beside the file's own.
+    if !matches!(written, Ok(true)) || place == Place::IfAbsent {
         std::fs::remove_file(&temp).ok();
     }
     written
@@ -215,6 +242,29 @@ mod tests {
             .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
             .filter(|name| name.ends_with(".tmp"))
             .collect()
+    }
+
+    /// A new file is written whole where none is, and one already there is kept as it is, with
+    /// nothing left behind either way.
+    #[test]
+    fn a_new_file_never_replaces_one() {
+        let dir = scratch("new");
+        let path = dir.join("keymap.json");
+        assert!(write_new(&path, b"starting", Access::Private).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "starting");
+        std::fs::write(&path, "the person's own").unwrap();
+        assert!(!write_new(&path, b"starting", Access::Private).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "the person's own");
+        assert!(leftovers(&dir).is_empty());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let made = dir.join("private.json");
+            write_new(&made, b"x", Access::Private).unwrap();
+            let mode = std::fs::metadata(&made).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

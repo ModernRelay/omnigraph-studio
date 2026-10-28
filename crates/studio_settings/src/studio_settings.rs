@@ -23,7 +23,9 @@ mod files;
 
 pub use document::Reading;
 
-pub use files::{Access, run_in_turn, set_aside, write_atomic, write_atomic_in_turn, writes_done};
+pub use files::{
+    Access, run_in_turn, set_aside, write_atomic, write_atomic_in_turn, write_new, writes_done,
+};
 
 pub use fields::{Choice, FieldKind, Scope, SettingField, SettingsValues, fields, sections};
 
