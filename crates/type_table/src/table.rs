@@ -9289,28 +9289,58 @@ mod tests {
         });
     }
 
-    /// A node's page reads the node by id and names its tab by the node's label; it is one tab
-    /// per node and commit, and comes back after a restart as it was (spec 014).
+    /// A node's page reads the node by id once it is shown and names its tab by the node's
+    /// label; it is one tab per node and commit, and comes back after a restart as it was,
+    /// named by the label it was saved with until it is shown and reads the node (spec 014).
     #[gpui::test]
     async fn a_nodes_page_reads_it_and_names_its_tab(cx: &mut TestAppContext) {
-        cx.update(studio_theme::init_test);
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
         let session = session(PEOPLE, cx);
         cx.run_until_parked();
-        let page = cx.new(|cx| {
-            crate::NodePage::new(session.clone(), "Person".into(), "p1".into(), None, cx)
+        let (page, cx) = cx.add_window_view({
+            let session = session.clone();
+            move |_, cx| crate::NodePage::new(session, "Person".into(), "p1".into(), None, None, cx)
         });
         cx.run_until_parked();
-        page.read_with(cx, |page, cx| {
+        let saved = page.read_with(cx, |page, cx| {
             assert_eq!(page.tab_title(cx).as_ref(), "Ada", "the label, once read");
             assert_eq!(page.dedupe_key(cx).as_deref(), Some("node:Person:p1"));
             let saved = page.serialize(cx).expect("a page is remembered");
             assert_eq!(saved.kind, "node");
             assert_eq!(saved.data["type_name"], "Person");
             assert_eq!(saved.data["id"], "p1");
+            assert_eq!(saved.data["label"], "Ada");
             assert!(saved.data["at_commit"].is_null(), "it reads the head");
+            saved
+        });
+        // Restored behind another tab: named as it was saved, though it has read nothing.
+        let label = saved.data["label"].as_str().map(str::to_owned);
+        let restored = cx.new(|cx| {
+            crate::NodePage::new(
+                session.clone(),
+                "Person".into(),
+                "p1".into(),
+                None,
+                label,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        restored.read_with(cx, |page, cx| {
+            assert_eq!(page.tab_title(cx).as_ref(), "Ada", "named before it reads");
         });
         let held = cx.new(|cx| {
-            crate::NodePage::new(session, "Person".into(), "p1".into(), Some("c0".into()), cx)
+            crate::NodePage::new(
+                session,
+                "Person".into(),
+                "p1".into(),
+                Some("c0".into()),
+                None,
+                cx,
+            )
         });
         cx.run_until_parked();
         held.read_with(cx, |page, cx| {

@@ -81,6 +81,9 @@ pub struct TextEditor {
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
     _read: Option<Task<()>>,
+    /// The node is read when the tab is next drawn ([`Self::owe_read`]): a tab restored with the
+    /// workspace, or one behind another when the branch moves, reads nothing until it is shown.
+    read_owed: bool,
 }
 
 impl TextEditor {
@@ -151,14 +154,15 @@ impl TextEditor {
         });
         // On another branch, an editor with nothing unsaved reads the property there; one
         // with unsaved text keeps writing to the branch it was read on, and says so.
-        let follow = cx.subscribe_in(&session, window, |this, _, event, window, cx| {
-            // The schema in at last (a tab restored as Studio starts): the node is read now.
+        let follow = cx.subscribe_in(&session, window, |this, _, event, _, cx| {
+            // The schema in at last (a tab restored as Studio starts): the node is read when the
+            // tab is shown.
             if let SessionEvent::SchemaChanged = event {
                 let schema = this.session.read(cx).schema_model();
                 let waited = this.schema.is_none() && schema.is_some();
                 this.schema = schema;
                 if waited {
-                    this.read(window, cx);
+                    this.owe_read(cx);
                 }
                 cx.notify();
             } else if let SessionEvent::BranchChanged = event
@@ -169,13 +173,13 @@ impl TextEditor {
             {
                 this.state = State::Idle;
                 this.branch = this.session.read(cx).branch.clone();
-                this.read(window, cx);
+                this.owe_read(cx);
             } else if let SessionEvent::BranchChanged | SessionEvent::AccessChanged = event {
                 cx.notify();
             }
         });
         subscriptions.push(follow);
-        let mut this = Self {
+        Self {
             session,
             branch,
             schema,
@@ -199,9 +203,17 @@ impl TextEditor {
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
             _read: None,
-        };
-        this.read(window, cx);
-        this
+            read_owed: true,
+        }
+    }
+
+    /// Reads the node when the tab is next drawn ([`Self::read_owed`]). Until then nothing is
+    /// saved: the value saves were bound to was the branch left's, or none was read yet.
+    fn owe_read(&mut self, cx: &mut Context<Self>) {
+        self._read = None;
+        self.set_old(Loadable::Loading);
+        self.read_owed = true;
+        cx.notify();
     }
 
     /// One editor per node property.
@@ -617,7 +629,10 @@ impl Render for Preview {
 }
 
 impl Render for TextEditor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.read_owed) {
+            cx.defer_in(window, |this, window, cx| this.read(window, cx));
+        }
         let rule = studio_ui::ds::surface::rule(cx);
         let body = match &self.old {
             Loadable::Failed(error) => {
@@ -758,6 +773,55 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert!(matches!(&view.old, Loadable::Loaded(old) if old == "Ada"));
+        });
+    }
+
+    /// A root that draws nothing, for a window whose editor is never drawn.
+    struct Blank;
+
+    impl Render for Blank {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    /// A tab not drawn (restored with the workspace behind another) reads nothing: not when it
+    /// is made, nor when the branch moves; it saves nothing until it has read. Before, every such
+    /// tab read its node at start and at each branch move.
+    #[gpui::test]
+    async fn a_tab_not_drawn_reads_nothing(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let session = session_answering(PEOPLE, 200, committed("c2", "c1"), cx);
+        cx.run_until_parked();
+        let (_blank, cx) = cx.add_window_view(|_, _| Blank);
+        let hidden = cx.update(|window, cx| {
+            let session = session.clone();
+            cx.new(|cx| {
+                TextEditor::new(
+                    session,
+                    "Person".into(),
+                    "p1".into(),
+                    "name".into(),
+                    None,
+                    None,
+                    window,
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+        session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        cx.run_until_parked();
+        hidden.read_with(cx, |hidden, _| {
+            assert!(hidden._read.is_none(), "no read sent");
+            assert!(hidden.read_owed, "it reads when drawn");
+            assert!(
+                matches!(hidden.old, Loadable::Loading),
+                "nothing to save against"
+            );
         });
     }
 
