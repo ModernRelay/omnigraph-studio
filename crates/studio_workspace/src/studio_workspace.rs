@@ -25,8 +25,8 @@ use gpui::{
     WindowControlArea, WindowHandle, deferred, div, point,
 };
 use graph_store::{
-    AccessAction, AccessScope, ConnectionRegistry, ConnectionState, GraphSession, OutcomeKind,
-    SessionEvent,
+    AccessAction, AccessScope, ConnectionRegistry, ConnectionState, GraphSession, Loadable,
+    OutcomeKind, SessionEvent,
 };
 use studio_actions::graph::{OpenCommit, OpenHistory};
 use studio_actions::workspace::{
@@ -3823,20 +3823,44 @@ impl Workspace {
                         .menu(move |window, cx| {
                             let session = session_for_menu.clone();
                             // Read when the menu opens, not copied at every frame drawn.
-                            let branches = session
-                                .read(cx)
-                                .branches
-                                .loaded()
-                                .cloned()
-                                .unwrap_or_default();
+                            let (current, branches) = {
+                                let s = session.read(cx);
+                                (s.branch.clone(), s.branches.clone())
+                            };
+                            // A list not read, or that could not be, is read for the next look.
+                            if matches!(branches, Loadable::NotLoaded | Loadable::Failed(_)) {
+                                session.update(cx, |s, cx| s.reload_branches(cx));
+                            }
                             Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                                 menu = menu.header("Branches");
-                                for branch in branches {
-                                    let session = session.clone();
-                                    let name = branch.clone();
-                                    menu = menu.entry(branch, None, move |_, cx| {
-                                        session.update(cx, |s, cx| s.set_branch(name.clone(), cx));
-                                    });
+                                let note =
+                                    |text: String| ContextMenuEntry::new(text).disabled(true);
+                                match &branches {
+                                    Loadable::Loaded(list) => {
+                                        for branch in list {
+                                            let session = session.clone();
+                                            let name = branch.clone();
+                                            menu = menu.toggleable_entry(
+                                                branch.clone(),
+                                                *branch == current,
+                                                IconPosition::Start,
+                                                None,
+                                                move |_, cx| {
+                                                    session.update(cx, |s, cx| {
+                                                        s.set_branch(name.clone(), cx)
+                                                    });
+                                                },
+                                            );
+                                        }
+                                    }
+                                    Loadable::Failed(why) => {
+                                        menu = menu.item(note(format!(
+                                            "The branches could not be read: {why}"
+                                        )));
+                                    }
+                                    Loadable::NotLoaded | Loadable::Loading => {
+                                        menu = menu.item(note("Reading the branches…".into()));
+                                    }
                                 }
                                 menu
                             }))

@@ -188,7 +188,9 @@ what was last saved at most every 250 ms rather than serializing every tab on ev
   server chip and a graph chip side by side both switched graphs): the graph switcher, the
   connection's dot with server / graph (its state, `connecting…`, `contract mismatch`,
   `unauthorized`, `unreachable`, spelled out beside it only when not ready; the contract and
-  the round trip in its tooltip), then the branch menu, which switches branch for the window. Right: what
+  the round trip in its tooltip), then the branch menu, which switches branch for the window,
+  marks the window's branch, and says when the list is being read or could not be (it is read
+  again when the menu opens). Right: what
   is running ("2 queries running", "Writing (1)…"), memory and CPU, the other docks' buttons.
 - What the credential may do (E15, below): "read only" follows the branch's name when the
   access route refuses `change` there, its tooltip naming what the credential lacks; the actor
