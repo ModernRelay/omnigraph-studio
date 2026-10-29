@@ -229,9 +229,10 @@ const ROW_GROUP: &str = "table-row";
 /// since the grid runs to the document's edges. The other cells keep a cell's inset.
 const KEY_INSET: f32 = space::EDGE;
 
-/// Where the key column's text starts: after its checkbox and a gap, so the text does not
-/// move when a row's checkbox shows.
-const KEY_TEXT_INSET: f32 = KEY_INSET + studio_ui::ds::size::CHECK + space::MD;
+/// Where the key column's text starts: after its checkbox, as far from the box as the box is
+/// from the page's edge, so the box sits evenly between them and the text does not move when a
+/// row's checkbox shows.
+const KEY_TEXT_INSET: f32 = KEY_INSET + studio_ui::ds::size::CHECK + KEY_INSET;
 
 use crate::peek::property_icon;
 

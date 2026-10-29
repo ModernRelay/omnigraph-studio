@@ -362,8 +362,9 @@ its open section.
   check that merge mode leaves unspecified properties untouched before using it.
   Built (bulk set): a row's checkbox picks it, as ⌘-click does, and ⇧ on either picks the
   rows between (since 2026-10-29). The box sits on the page's gutter at the start of the
-  pinned key cell, the key's text after it; it shows under the pointer, and on every row
-  while any is picked, so a table nobody picks from stays plain. A click on it moves no
+  pinned key cell, the key's text as far after it as the gutter is wide (16 px either side); it
+  shows under the pointer, and on every row while any is picked, so a table nobody picks from
+  stays plain. A click on it moves no
   cursor and opens nothing. The key column's header holds a select-all: it picks every loaded
   row (a grouped row once), shows a dash while some are picked and, with all picked, takes
   them out. With one row picked or more (two or more, before checkboxes), a bar says how many,
