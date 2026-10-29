@@ -2393,9 +2393,10 @@ mod tests {
 
     /// A connection released while a sign-in finishes (its target gone from the CLI) lets the
     /// sign-in's keychain work finish, which runs on its own: the write over an earlier item
-    /// lands, and that item's token, held by nothing then, is revoked; the new token, which
-    /// nobody takes, is revoked too. Before, the release cut the work off mid-write, and the
-    /// earlier token, overwritten, was left with nobody.
+    /// lands, and that item's token, held by nothing then, is revoked. The new sign-in is
+    /// dropped as for a retired connection, kept for the target's return, and a connection to
+    /// it later takes its turn at the item and signs in with it. Before, the release cut the
+    /// work off mid-write, leaving the overwritten token with nobody.
     #[gpui::test]
     async fn a_connection_released_while_a_sign_in_finishes_lets_it_finish(
         cx: &mut TestAppContext,
@@ -2413,7 +2414,8 @@ mod tests {
             .unwrap()
             .insert(key("work"), ("user_9".into(), b"earlier".to_vec()));
         keychain.refuses_deletes.store(true, Ordering::SeqCst);
-        let connection = connection(&served, keychain.clone(), cx);
+        let context = context(&served, keychain.clone());
+        let connection = connection_in(&served, context.clone(), cx);
         connection.update(cx, |c, cx| c.connect(cx));
         until(cx, "the earlier sign-in refused", |cx| {
             matches!(
@@ -2441,10 +2443,20 @@ mod tests {
         until(cx, "the earlier token revoked", |_| {
             logged("revoke earlier")
         });
-        until(cx, "the token nobody took revoked", |_| logged("revoke r1"));
         assert_eq!(
             keychain.items.lock().unwrap()[&key("work")].1,
             b"r1".to_vec()
+        );
+        // A connection to the target later reads the item in its turn, and signs in with it.
+        let again = connection_in(&served, context, cx);
+        again.update(cx, |c, cx| c.connect(cx));
+        until(cx, "signed in with the sign-in kept", |cx| {
+            let (state, sign_in, _) = sign_in_state(&again, cx);
+            state == ConnectionState::Ready && matches!(sign_in, SignIn::SignedIn { .. })
+        });
+        assert!(
+            !logged("revoke r1"),
+            "kept for the target's return, so not revoked"
         );
     }
 

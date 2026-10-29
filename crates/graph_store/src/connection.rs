@@ -222,6 +222,30 @@ impl SigningIn {
     }
 }
 
+/// A finishing sign-in's keychain work, done: what the keychain holds for the target, the token
+/// of an earlier item the keychain still holds (`left`) or let go of (`let_go`), and the guard on
+/// the new refresh token, which the connection takes or the drop decides.
+struct Finished {
+    kept: Kept,
+    left: Option<String>,
+    let_go: Option<String>,
+    unclaimed: sign_in::Unclaimed,
+}
+
+impl Finished {
+    /// Drops the sign-in, its connection gone before it took it, as for a retired connection
+    /// ([`End::Dropped`]): kept for the target's return when the keychain holds its token,
+    /// revoked otherwise; the earlier token let go of is revoked through `service`.
+    fn dropped(self, service: &Service) {
+        if let Some(token) = self.let_go {
+            service.revoke(service.token_client(), token);
+        }
+        if self.kept == Kept::This {
+            self.unclaimed.claim();
+        }
+    }
+}
+
 /// What becomes of a sign-in finishing (given its tokens, its keychain work under way) once its
 /// keychain work is done.
 enum Finish {
@@ -1187,15 +1211,11 @@ impl Connection {
                     })
                 })
                 .await;
-            let (signed_in, unclaimed) = match signed_in {
-                Ok((tokens, unclaimed)) => (Ok(tokens), Some(unclaimed)),
-                Err(why) => (Err(why), None),
-            };
             // Finishing from here, not to be cancelled: the sign-in this one replaces (another
             // account, after Not admitted) ends in its turn, and the keychain work runs on its own
             // to its end, the connection released meanwhile or not.
             let signed_in = match signed_in {
-                Ok(tokens) => {
+                Ok((tokens, unclaimed)) => {
                     let Ok(taken) = this.update(cx, |this, cx| {
                         this.sign_in = SignIn::Finishing {
                             service: service.host(),
@@ -1221,6 +1241,7 @@ impl Connection {
                         return;
                     };
                     let ((before, done), previous, current) = taken;
+                    let fallback = current.clone();
                     let keychain = context.keychain.clone();
                     let key = service.key(&target);
                     let refresh = tokens.refresh_token.clone();
@@ -1268,27 +1289,35 @@ impl Connection {
                                 sign_in::forgotten(keychain.as_ref(), key).await
                             };
                             // The earlier item's token: gone from the keychain, it is held by
-                            // nothing and revoked, through the client in use; still there (the
-                            // keychain would not let go), the sign-in keeps it, to revoke once the
-                            // item no longer holds it.
-                            let left = match (&kept, earlier) {
-                                (Kept::Left(_), earlier) => earlier,
-                                (_, Some(earlier)) => {
-                                    current.revoke(current.token_client(), earlier);
-                                    None
-                                }
-                                (_, None) => None,
+                            // nothing and revoked; still there (the keychain would not let go), the
+                            // sign-in keeps it, to revoke once the item no longer holds it.
+                            let (left, let_go) = match (&kept, earlier) {
+                                (Kept::Left(_), earlier) => (earlier, None),
+                                (_, earlier) => (None, earlier),
                             };
                             done.send(()).ok();
-                            answer.send((kept, left)).ok();
+                            let finished = Finished {
+                                kept,
+                                left,
+                                let_go,
+                                unclaimed,
+                            };
+                            // The connection gone meanwhile: dropped here, as for a retired one.
+                            if let Err(finished) = answer.send(finished) {
+                                finished.dropped(&current);
+                            }
                         })
                         .detach();
                     match answered.await {
-                        Ok((kept, left)) => Ok((tokens, kept, left)),
+                        Ok(finished) => Ok((tokens, finished, fallback)),
                         Err(_) => Err("Studio stopped before it kept the sign-in.".to_owned()),
                     }
                 }
                 Err(why) => Err(why),
+            };
+            let (signed_in, mut finished, fallback_for_release) = match signed_in {
+                Ok((tokens, finished, fallback)) => (Ok(tokens), Some(finished), Some(fallback)),
+                Err(why) => (Err(why), None, None),
             };
             let taken = this.update(cx, |this, cx| {
                 let (finish, replaced) = this.signing_in.take().map_or((None, None), |under_way| {
@@ -1296,7 +1325,19 @@ impl Connection {
                 });
                 let service = this.current(service);
                 match signed_in {
-                    Ok((tokens, kept, left)) => {
+                    Ok(tokens) => {
+                        let Finished {
+                            kept,
+                            left,
+                            let_go,
+                            unclaimed,
+                        } = finished.take().expect("a finished sign-in's keychain work");
+                        // Through the client in use now.
+                        if let Some(token) = let_go {
+                            service.revoke(service.token_client(), token);
+                        }
+                        // The source, taken or ended below, answers for the token from here.
+                        unclaimed.claim();
                         let source = OAuthSource::signed_in(
                             service,
                             &target,
@@ -1319,7 +1360,6 @@ impl Connection {
                             }
                             _ => this.use_sign_in(source, cx),
                         }
-                        true
                     }
                     Err(why) => {
                         // And why the one it would have replaced ended meanwhile, if it did.
@@ -1333,14 +1373,14 @@ impl Connection {
                         };
                         cx.emit(ConnectionEvent::StateChanged);
                         cx.notify();
-                        false
                     }
                 }
             });
-            if matches!(taken, Ok(true))
-                && let Some(unclaimed) = unclaimed
+            // The connection gone before it took the sign-in: dropped, as for a retired one.
+            if taken.is_err()
+                && let (Some(finished), Some(fallback)) = (finished, fallback_for_release)
             {
-                unclaimed.claim();
+                finished.dropped(&fallback);
             }
         })));
     }
