@@ -154,6 +154,9 @@ pub struct Connection {
     asked_after_refusal: bool,
     /// The credential generation ([`GraphClient::credential_changes`]) a graph read was last
     /// refused under ([`Connection::read_refused`]): the source is asked again once for each.
+    /// Also the one a token given after a refusal arrived under, which is that one more try: a
+    /// read it carries that is refused asks nothing, so a server that does not admit the
+    /// account is not asked in a loop by a source that gives a new token each time.
     read_refused_under: Option<u64>,
     /// The source has answered since it was set, with a token or why it gave none: requests
     /// sent from then carry what it gave ([`Connection::token_ready`]).
@@ -162,8 +165,8 @@ pub struct Connection {
     /// the CLI serves this ask before the others waiting for it. Lowered when it answers.
     hurry: Arc<AtomicBool>,
     /// The source asked again while the connection stands (after a 401, on Refresh, for a
-    /// changed target).
-    _asking: Option<Task<()>>,
+    /// changed target, for a renewal), and what for.
+    _asking: Option<(Ask, Task<()>)>,
     _task: Option<Task<()>>,
     /// The graph list read again after it could not be read ([`Connection::list_graphs_again`]).
     _listing: Option<Task<()>>,
@@ -181,8 +184,12 @@ pub struct Connection {
     sign_in_context: Option<SignInContext>,
     /// The client the server is reached with, which a sign-in's requests to its address take.
     http: Arc<dyn HttpClient>,
-    /// The sign-in service the server's 401 named, once read and checked.
+    /// The sign-in service the server's 401 named, once read and checked; none again after a
+    /// sign-in failed, as what it named may be what failed.
     service: Option<Service>,
+    /// Where the server's 401 said its sign-in details are, read again for a sign-in after one
+    /// failed.
+    sign_in_details: Option<String>,
     /// The sign-in the token comes from, when it comes from one.
     oauth: Option<OAuthSource>,
     /// How long the short-lived token held stands, and whose it is: the next one of the same
@@ -329,7 +336,7 @@ impl HttpClient for Unusable {
 }
 
 /// Health re-check interval after a failure (spec 003).
-const FAILED_CHECK_INTERVAL: Duration = Duration::from_secs(120);
+pub(crate) const FAILED_CHECK_INTERVAL: Duration = Duration::from_secs(120);
 /// Interval when settings are not loaded, as in tests.
 const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -409,6 +416,7 @@ impl Connection {
             sign_in_context: None,
             http,
             service: None,
+            sign_in_details: None,
             oauth: None,
             lease: None,
             signing_in: None,
@@ -595,6 +603,17 @@ impl Connection {
         let Some(source) = self.token_source.clone() else {
             return;
         };
+        // A renewal leaves an ask after a refusal or a Refresh to answer: that answer replaces
+        // the token as a new credential, reads again what was refused, and schedules the next
+        // renewal. Taken as a renewal, it would replace the token quietly.
+        if ask == Ask::Renewal
+            && self
+                ._asking
+                .as_ref()
+                .is_some_and(|(asking, _)| *asking != Ask::Renewal)
+        {
+            return;
+        }
         let hurry = self.hurry.clone();
         let asked = source.clone();
         let asking = cx.spawn(async move |this, cx| {
@@ -626,7 +645,7 @@ impl Connection {
         if ask == Ask::Connect {
             self._task = Some(asking);
         } else {
-            self._asking = Some(asking);
+            self._asking = Some((ask, asking));
         }
     }
 
@@ -710,6 +729,9 @@ impl Connection {
         self.has_token = true;
         let changed = self.client.set_token(Some(token.into_string()));
         if changed {
+            if ask == Ask::AfterRefusal {
+                self.read_refused_under = Some(self.client.credential_changes());
+            }
             cx.emit(ConnectionEvent::CredentialChanged);
         }
         let unread_changed = self.token_unread.take().is_some();
@@ -1046,13 +1068,15 @@ impl Connection {
     /// The server's 401 offers a sign-in, its details at `metadata`: Studio reads them, and a
     /// sign-in the keychain kept for this target is refreshed without asking. A connection whose
     /// credential comes from the CLI keeps it: a refused one is said as refused (spec 016, When
-    /// Studio signs in). Read once; a sign-out or a failed sign-in keeps what was read.
+    /// Studio signs in). Read once; a sign-out or a failed sign-in keeps what was read. Details
+    /// that could not be read are read again at the next offer.
     fn offered_sign_in(&mut self, metadata: String, cx: &mut Context<Self>) {
         let Some(context) = self.sign_in_context.clone() else {
             return;
         };
+        self.sign_in_details = Some(metadata.clone());
         if (self.token_source.is_some() && self.oauth.is_none())
-            || self.sign_in != SignIn::NotOffered
+            || !matches!(self.sign_in, SignIn::NotOffered | SignIn::Unavailable(_))
             || self.signing_in.is_some()
         {
             return;
@@ -1138,8 +1162,13 @@ impl Connection {
         {
             return;
         }
-        let (Some(service), Some(context)) = (self.service.clone(), self.sign_in_context.clone())
-        else {
+        let Some(context) = self.sign_in_context.clone() else {
+            return;
+        };
+        let Some(service) = self.service.clone() else {
+            if let Some(details) = self.sign_in_details.clone() {
+                self.read_details_then_sign_in(details, context, cx);
+            }
             return;
         };
         let started = oauth_client::Callback::bind().and_then(|callback| {
@@ -1355,6 +1384,9 @@ impl Connection {
                 match signed_in {
                     Ok(finished) => this.take_sign_in(finished, cx),
                     Err(why) => {
+                        // What the sign-in service's details named may be what failed: the next
+                        // sign-in reads them again (spec 016, discovery).
+                        this.service = None;
                         // And why the one it would have replaced ended meanwhile, if it did.
                         let why = match replaced {
                             Some((_, ended)) => format!("{why} {ended}"),
@@ -1399,6 +1431,52 @@ impl Connection {
                 self.use_sign_in(source, cx);
             }
         }
+    }
+
+    /// Reads the sign-in service's details at `details` again, then signs in, for a sign-in after
+    /// one failed. Details that cannot be read are said: beside a sign-in held, which stands, as
+    /// why another could not start.
+    fn read_details_then_sign_in(
+        &mut self,
+        details: String,
+        context: SignInContext,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(endpoint) = url::Url::parse(&self.server.url) else {
+            return;
+        };
+        self.sign_in = SignIn::Reading;
+        cx.emit(ConnectionEvent::StateChanged);
+        cx.notify();
+        let clients =
+            oauth_client::Clients::new(endpoint, self.http.clone(), context.elsewhere.clone());
+        self.signing_in = Some(SigningIn::new(cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(sign_in::discover(clients, details, context.identities))
+                .await;
+            this.update(cx, |this, cx| {
+                this.signing_in = None;
+                match found {
+                    Ok(service) => {
+                        this.service = Some(this.current(service));
+                        this.sign_in(cx);
+                    }
+                    Err(why) => {
+                        this.sign_in = match &this.oauth {
+                            Some(held) => SignIn::Offered {
+                                service: held.service().host(),
+                                why: Some(why),
+                            },
+                            None => SignIn::Unavailable(why),
+                        };
+                        cx.emit(ConnectionEvent::StateChanged);
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })));
     }
 
     /// Stops waiting for the browser: its listener closes, and nothing it returns is taken. A
@@ -1662,6 +1740,7 @@ impl Connection {
         let held = self.oauth.take();
         self.end_sign_ins(held, End::Dropped, cx);
         self.service = None;
+        self.sign_in_details = None;
         self.lease = None;
         self._renewal = None;
         self.sign_in = SignIn::NotOffered;
@@ -1758,9 +1837,13 @@ impl Connection {
             Ok(_) if self.state == ConnectionState::Ready => ConnectionState::Ready,
             // `/healthz` asks for no token, so it passes for a refused one too: probing again
             // would be refused alike, and would take the token field away while it is typed
-            // in. A new token connects again, and a source that could not answer is asked
-            // again by the connect below.
-            Ok(_) if self.state == ConnectionState::Unauthorized && !self.token_unanswered => {
+            // in. A new token connects again; a source that could not answer is asked again,
+            // and sign-in details that could not be read are read again, by the connect below.
+            Ok(_)
+                if self.state == ConnectionState::Unauthorized
+                    && !self.token_unanswered
+                    && !matches!(self.sign_in, SignIn::Unavailable(_)) =>
+            {
                 ConnectionState::Unauthorized
             }
             // Recovered: probe the graphs again, which schedules the next check.
@@ -2502,9 +2585,11 @@ mod tests {
     }
 
     /// A graph read refused with 401 while it carried the source's token asks the source again,
-    /// once for that token and telling it first: a renewed token replaces the lapsed one, a
-    /// second refusal of the same token asks nothing more, and a token typed in is not asked
-    /// about.
+    /// once for that token and telling it first: a renewed token replaces the lapsed one, and a
+    /// read refused under the renewed one asks nothing more, though the source would give a new
+    /// token each time, as a sign-in's refresh does; a token typed in is not asked about.
+    /// Before, each refusal under each new token asked again, so a server that does not admit
+    /// the account was asked in a loop, every read sent again each time.
     #[gpui::test]
     async fn a_read_refused_for_its_token_asks_the_source_once(cx: &mut TestAppContext) {
         use std::sync::atomic::AtomicUsize;
@@ -2548,7 +2633,7 @@ mod tests {
             }
         });
         let source = Arc::new(Renewing::default());
-        *source.given.lock().unwrap() = vec!["lapsed", "renewed"];
+        *source.given.lock().unwrap() = vec!["lapsed", "renewed", "again", "and again"];
         let server = ServerEntry {
             name: "managed".into(),
             url: "http://127.0.0.1:8787".into(),
@@ -2576,16 +2661,15 @@ mod tests {
         assert_eq!((asked(), refused()), (2, 1));
         assert_eq!(changes(cx), lapsed + 1, "the renewed token replaced it");
 
-        // Refused again under the renewed token: asked once more, which gives the same one.
-        connection.update(cx, |connection, cx| connection.read_refused(cx));
-        cx.run_until_parked();
-        assert_eq!((asked(), refused()), (3, 2));
-        connection.update(cx, |connection, cx| connection.read_refused(cx));
-        cx.run_until_parked();
+        // Refused again under the renewed token, read again after it came: asked nothing more.
+        for _ in 0..3 {
+            connection.update(cx, |connection, cx| connection.read_refused(cx));
+            cx.run_until_parked();
+        }
         assert_eq!(
-            (asked(), refused()),
-            (3, 2),
-            "the same token is not asked about twice"
+            (asked(), refused(), changes(cx)),
+            (2, 1, lapsed + 1),
+            "a token renewed for a refusal is not asked about again"
         );
 
         connection.update(cx, |connection, cx| {
@@ -2593,7 +2677,98 @@ mod tests {
             connection.read_refused(cx);
         });
         cx.run_until_parked();
-        assert_eq!(asked(), 3, "a token typed in is not asked about");
+        assert_eq!(asked(), 2, "a token typed in is not asked about");
+    }
+
+    /// A renewal due while the source is asked again after a refused read leaves that ask to
+    /// answer: its token replaces the refused one as a new credential, so what was refused is
+    /// read again. Before, the renewal took the ask's place and replaced the token quietly, and
+    /// the refused read was never read again.
+    #[gpui::test]
+    async fn a_renewal_leaves_an_ask_after_a_refusal_to_answer(cx: &mut TestAppContext) {
+        use std::sync::atomic::AtomicUsize;
+        /// Leased tokens of one holder, each ask's answer held while a gate is set.
+        #[derive(Default)]
+        struct Gated {
+            asked: AtomicUsize,
+            gate: std::sync::Mutex<Option<futures::future::Shared<oneshot::Receiver<()>>>>,
+        }
+        impl TokenSource for Gated {
+            fn token(
+                &self,
+                _: Arc<AtomicBool>,
+            ) -> futures::future::BoxFuture<'static, Result<Token, NoToken>> {
+                let asked = self.asked.fetch_add(1, Ordering::SeqCst) + 1;
+                let gate = self.gate.lock().unwrap().clone();
+                Box::pin(async move {
+                    if let Some(gate) = gate {
+                        gate.await.ok();
+                    }
+                    let now = SystemTime::now();
+                    Ok(Token::leased(
+                        format!("token {asked}"),
+                        Lease {
+                            expires_at: now + Duration::from_secs(3600),
+                            renew_at: now + Duration::from_secs(1800),
+                            holder: "user_1".into(),
+                        },
+                    ))
+                })
+            }
+        }
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            async move {
+                let body = if path.ends_with("/healthz") {
+                    r#"{"status":"ok","version":"0.14.0","internal_schema_version":16}"#
+                } else {
+                    r#"{"graphs":[]}"#
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let source = Arc::new(Gated::default());
+        let server = ServerEntry {
+            name: "signed".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Cli,
+            known_graphs: Vec::new(),
+        };
+        let held: Arc<dyn TokenSource> = source.clone();
+        let connection = cx.new(|_| {
+            Connection::new(server, None, http)
+                .unwrap()
+                .with_token_source(Some(held))
+        });
+        let _watch = connection.update(cx, |connection, cx| {
+            connection.connect(cx);
+            connection.watch(cx)
+        });
+        cx.run_until_parked();
+        let changes = |cx: &mut TestAppContext| {
+            connection.read_with(cx, |connection, _| connection.client().credential_changes())
+        };
+        let refused_under = changes(cx);
+        let (release, gate) = oneshot::channel::<()>();
+        *source.gate.lock().unwrap() = Some(gate.shared());
+        connection.update(cx, |connection, cx| connection.read_refused(cx));
+        cx.run_until_parked();
+        assert_eq!(source.asked.load(Ordering::SeqCst), 2);
+        // The renewal comes due while that ask waits.
+        connection.update(cx, |connection, cx| {
+            connection.ask_for_token(Ask::Renewal, cx)
+        });
+        release.send(()).unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            (source.asked.load(Ordering::SeqCst), changes(cx)),
+            (2, refused_under + 1),
+            "the ask after the refusal answered, its token a new credential"
+        );
     }
 
     /// A renewal the source cannot answer now leaves the token held in use, unsaid: the

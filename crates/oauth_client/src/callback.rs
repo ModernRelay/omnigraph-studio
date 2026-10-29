@@ -4,7 +4,8 @@
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
-use futures::{AsyncReadExt as _, AsyncWriteExt as _};
+use futures::stream::FuturesUnordered;
+use futures::{AsyncReadExt as _, AsyncWriteExt as _, StreamExt as _};
 use smol::net::{TcpListener, TcpStream};
 use url::Url;
 
@@ -14,6 +15,8 @@ use crate::shown;
 const REQUEST_WAIT: Duration = Duration::from_secs(10);
 /// The most of one request's head the listener reads.
 const MAX_REQUEST_BYTES: usize = 8 * 1024;
+/// The most connections answered at once; more wait to be accepted until one is answered.
+const MAX_ANSWERING: usize = 8;
 
 /// Why a sign-in ended without a code.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +48,12 @@ enum Answered {
     Other,
 }
 
+/// What the listener heard next: a connection, or the answer to one.
+enum Heard {
+    Connection(std::io::Result<TcpStream>),
+    Answered(Answered),
+}
+
 impl Callback {
     /// Listens on `127.0.0.1` (an IPv4 literal, never `localhost`, RFC 8252 §8.3) on a port the
     /// system chooses.
@@ -64,7 +73,9 @@ impl Callback {
 
     /// Waits for the browser to return with the sign-in's answer, `state` matching, and gives its
     /// code. Every request is answered with a short page; any other request is answered 404, or
-    /// 400 for a callback that is not this sign-in's, and the listener waits on. The caller
+    /// 400 for a callback that is not this sign-in's, and the listener waits on. Connections are
+    /// answered at once, up to [`MAX_ANSWERING`], so one that sends nothing (a browser's
+    /// speculative preconnect) does not hold back the one that brings the answer. The caller
     /// bounds the wait ([`crate::SIGN_IN_WAIT`]) and cancels it by dropping it; the listener
     /// closes when this returns. `host` is the server the page says Studio signed in to.
     pub async fn code(
@@ -73,14 +84,34 @@ impl Callback {
         issuer: &str,
         host: &str,
     ) -> Result<String, CallbackError> {
+        let mut answering = FuturesUnordered::new();
         loop {
-            let (stream, _) = self.listener.accept().await.map_err(|error| {
-                CallbackError::Failed(format!("the sign-in listener failed: {error}"))
-            })?;
-            match answer(stream, state, issuer, host).await {
-                Answered::Code(code) => return Ok(code),
-                Answered::Denied(why) => return Err(CallbackError::Denied(why)),
-                Answered::Other => {}
+            let accepting = answering.len() < MAX_ANSWERING;
+            let heard = smol::future::or(
+                async {
+                    if !accepting {
+                        futures::future::pending::<()>().await;
+                    }
+                    Heard::Connection(self.listener.accept().await.map(|(stream, _)| stream))
+                },
+                async {
+                    match answering.next().await {
+                        Some(answered) => Heard::Answered(answered),
+                        None => futures::future::pending().await,
+                    }
+                },
+            )
+            .await;
+            match heard {
+                Heard::Connection(stream) => {
+                    let stream = stream.map_err(|error| {
+                        CallbackError::Failed(format!("the sign-in listener failed: {error}"))
+                    })?;
+                    answering.push(answer(stream, state, issuer, host));
+                }
+                Heard::Answered(Answered::Code(code)) => return Ok(code),
+                Heard::Answered(Answered::Denied(why)) => return Err(CallbackError::Denied(why)),
+                Heard::Answered(Answered::Other) => {}
             }
         }
     }
@@ -245,6 +276,32 @@ mod tests {
         assert!(signed_in.contains("Signed in to graphs.example. You can close this tab."));
         // Answered, the listener is gone.
         assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+    }
+
+    /// A connection that sends nothing, as a browser's speculative preconnect, does not hold
+    /// back the one that brings the answer: each is answered on its own. Before, the listener
+    /// read one connection at a time, so the answer waited up to ten seconds behind it.
+    #[test]
+    fn a_silent_connection_does_not_hold_back_the_answer() {
+        let callback = Callback::bind().unwrap();
+        let port = port_of(&callback);
+        let silent = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let browser = std::thread::spawn(move || {
+            get(
+                port,
+                "/callback?code=the-code&state=s1&iss=https%3A%2F%2Fid.example",
+            )
+        });
+        let started = std::time::Instant::now();
+        let code = smol::block_on(callback.code("s1", "https://id.example", "graphs.example"));
+        assert_eq!(code, Ok("the-code".to_owned()));
+        assert!(
+            started.elapsed() < REQUEST_WAIT / 2,
+            "answered after {:?}",
+            started.elapsed()
+        );
+        browser.join().unwrap();
+        drop(silent);
     }
 
     #[test]

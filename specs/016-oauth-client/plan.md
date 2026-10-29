@@ -131,8 +131,10 @@ a token, as today.
    client, as the CLI's identity-provider traffic does not inherit a target's transport
    (Omnigraph `docs/user/cli/targets.md`, Transport and capability boundaries).
 
-Discovery answers are kept in memory per endpoint and fetched again after a sign-in fails or
-Studio restarts; they hold no secrets.
+Discovery answers are kept in memory per endpoint and fetched again after a sign-in fails, before
+the next sign-in opens the browser, or Studio restarts; they hold no secrets. Details that could
+not be read are read again on Retry and at each health check while the server still asks for a
+sign-in.
 
 ### Client identity
 
@@ -169,7 +171,9 @@ Studio restarts; they hold no secrets.
   and `scope=offline_access` when the authorization server lists that scope (open question 3).
 - The listener takes `GET /callback` whose `state` matches; a callback with another `state` is
   answered 400 and the listener waits on, and anything else is 404. An `iss` that is not the
-  issuer ends the sign-in (RFC 9207). It takes one callback, answers it with a short page
+  issuer ends the sign-in (RFC 9207). It answers its connections at once, up to eight, so one
+  that sends nothing (a browser's preconnect) does not hold back the callback. It takes one
+  callback, answers it with a short page
   ("Signed in to <host>. You can close this tab." or the error), and closes. It closes after 5
   minutes, on Cancel, or when the server is removed. An `error` in the callback is shown with its
   `error_description`, as plain text, cut at 300 characters. Each request has 10 seconds and 8 KiB
@@ -300,11 +304,14 @@ Studio restarts; they hold no secrets.
   halfway to the token's end (no sooner than 5 seconds before it); with none held the server
   reads **Sign-in not answering** with why, and the next health check asks again. Only
   `invalid_grant`, a refusal, a sign-out or a sign-in with no refresh token ends it, and after a
-  401 no failure keeps the refused token.
+  401 no failure keeps the refused token. A sign-in with no refresh token keeps its access token
+  until it ends, and ends then.
 
 ### 401 and 403
 
-- A 401 to a request sent with an OAuth token refreshes once. A read is then sent again once;
+- A 401 to a request sent with an OAuth token refreshes once. A renewal due meanwhile leaves
+  that refresh to answer, and a 401 to the token it gives refreshes nothing more: only the next
+  renewal, a Refresh or a sign-in gives another. A read is then sent again once;
   a write is not sent again: it ran nothing, and Studio says so ("Signed out before the change
   was sent; nothing was written") and keeps what the person typed, as for any refused write.
 - When the refresh fails, or the request is refused again, the connection becomes **Sign in
@@ -449,6 +456,7 @@ Studio restarts; they hold no secrets.
 | 2026-10-30 | A review of the released connection's drop | `graph_store` `sign_in::tests`: `a_sign_out_while_a_sign_in_finishes_stands_when_the_connection_is_released` (new: a sign-out, then the retirement and release; the item deleted, both tokens revoked, and a later connection, its read held while the deletion is, offered a sign-in; fails without either fix, checked by removing each), `a_sign_out_while_a_sign_in_finishes_offers_one_once_it_is_kept` (extended: another connection to the target, waiting while the sign-in finishes, reads the item only after the sign-out's deletion; fails when the sign-out ends in a turn of its own, checked), `a_connection_released_while_a_sign_in_finishes_lets_it_finish` (changed: released once retired, as the registry does, and once without, as at quitting; fails when a sign-in released after the retirement, or untold, ends as signed out of, each checked); each 20 runs, none failing | Pass. Taken: a connection released after a sign-out while a sign-in finished dropped the sign-in, so the keychain kept the token the person signed out of; a sign-in taken after a sign-out, or dropped by a release, passed its item's keychain turn on before it ended, so other work could read the item between its write and the deletion; and a released connection revoked the new token through the client captured when the sign-in began, not the one it was finishing with. The sign-in finished is now a guard (`Finished`) holding the sign-in and its turn: taken, it ends in that turn as told; dropped untaken, by any path, it ends as the connection last told it through a shared cell, and passes the turn on only once that ending has dealt with the item. Both fallbacks of the released connection's drop are removed |
 | 2026-10-30 | A review of the finished sign-in's guard | `graph_store` `sign_in::tests::a_connection_released_while_a_sign_in_finishes_lets_it_finish` (changed: released once retired and once untold; fails when either ends as signed out of, each checked); 20 runs, none failing | Pass. It found no high or medium defect: every path that drops a sign-in finished ends it as told and passes its turn on, no turn is left waiting, and nothing that releases a turn waits for one. Taken: no test released a sign-in untold; what it was told is an `Option<End>`, not an enum of its own; the sign-in under way that owns the task is required rather than given a fallback that would leave it untold; and a test's doc comment the previous commit removed is restored |
 | 2026-10-30 | A review for legacy code and abstractions finds the token field's rule written twice | `studio` `open_graph::tests::the_keyboard_reaches_the_token_field_only_where_it_is_drawn` (new; fails without its fix, checked by restoring the dialog's own copy of the rule); 20 runs, none failing | Taken: the dialog drew the token field only with no sign-in under way, but its keyboard order included the field without that condition, so while a sign-in finished after a drop the keyboard could move to a field nobody saw. The rule is now the connection's (`Connection::asks_token`), which the drawing and the keyboard both read |
+| 2026-10-30 | A whole-feature review of sign-in, beyond the custody change | `graph_store` `connection::tests`: `a_read_refused_for_its_token_asks_the_source_once` (changed: a read refused under the renewed token asks nothing more, though the source gives a new token each time), `a_renewal_leaves_an_ask_after_a_refusal_to_answer` (new); `sign_in::tests`: `a_grant_without_a_refresh_token_stands_until_its_token_ends`, `sign_in_details_that_could_not_be_read_are_read_again`, `a_sign_in_after_one_failed_reads_the_details_again` (new); `studio` `open_graph::tests::retry_stands_beside_a_sign_in_where_connecting_again_helps` (new); `oauth_client` `callback::tests::a_silent_connection_does_not_hold_back_the_answer` (new). Each fails without its fix (checked by removing it) and passes 20 runs | Taken, all present on main before the custody change: a server that did not admit the signed-in account was refreshed in a loop while a graph window was open, each OAuth refresh a new token that read everything again; a renewal due during the refresh after a 401 took its answer as quiet, so the refused read was never read again; "Sign-in unavailable" stood for the connection's life with no button; a failed sign-in's discovery answers were used again; a grant with no refresh token ended a minute before its token; Retry was hidden beside a sign-in held; and a silent loopback connection held the callback back up to 10 seconds. Open: nothing refreshes before sending a token that lapsed while the machine slept (the executor's timers stand still in sleep, so the renewal fires late and the first request is refused, then read again; a write must be sent again), and a late 401 to an older token refreshes once more than needed |
 
 ## Corrections
 

@@ -853,6 +853,15 @@ impl Inner {
                     return Ok(self.leased(access));
                 }
                 if held.refresh.is_none() {
+                    // Nothing to refresh with: the token held stands until it ends, its renewal
+                    // due then, which ends the sign-in, not while the token still holds.
+                    if !refused
+                        && let Some(access) = &mut held.access
+                        && SystemTime::now() < access.expires_at
+                    {
+                        access.renew_at = access.expires_at;
+                        return Ok(self.leased(access));
+                    }
                     held.access = None;
                     return Err(NoToken::lasting("The sign-in has ended. Sign in again."));
                 }
@@ -1134,6 +1143,8 @@ mod tests {
         issuer: String,
         /// The server holds its sign-in details' answer until this is lowered.
         hold_metadata: bool,
+        /// The server fails this many more requests for its sign-in details (503).
+        fails_metadata: u32,
         /// The sign-in service holds a token answer, made already (a refresh token rotated),
         /// until this is lowered.
         hold_token: bool,
@@ -1265,6 +1276,13 @@ mod tests {
                     json!({"error": "one bearer credential is required", "code": "unauthorized"}),
                 ),
             },
+            ("GET", u)
+                if u == format!("{SERVER}/.well-known/oauth-protected-resource/mcp")
+                    && served.fails_metadata > 0 =>
+            {
+                served.fails_metadata -= 1;
+                (503, vec![], json!({"error": "unavailable"}))
+            }
             ("GET", u) if u == format!("{SERVER}/.well-known/oauth-protected-resource/mcp") => (
                 200,
                 vec![],
@@ -3276,6 +3294,108 @@ mod tests {
         assert_eq!(keychain.items.lock().unwrap()[&key].1, b"r2".to_vec());
     }
 
+    /// A sign-in after one failed reads the sign-in service's details again before it opens the
+    /// browser, as what they named may be what failed (spec 016, discovery), then signs in.
+    /// Before, the details a failed sign-in used were used for every later one until Studio
+    /// restarted.
+    #[gpui::test]
+    async fn a_sign_in_after_one_failed_reads_the_details_again(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served {
+            lives: 300,
+            fails_tokens: 1,
+            ..Served::default()
+        }));
+        let details = || {
+            served
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .filter(|r| r.contains("oauth-protected-resource"))
+                .count()
+        };
+        let connection = connection(&served, Arc::default(), cx);
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the offer", |cx| {
+            matches!(sign_in_state(&connection, cx).1, SignIn::Offered { .. })
+        });
+        assert_eq!(details(), 1);
+        connection.update(cx, |c, cx| c.sign_in(cx));
+        let browser = approve(&served, &cx.opened_url().unwrap());
+        until(cx, "the sign-in failed", |cx| {
+            matches!(
+                sign_in_state(&connection, cx).1,
+                SignIn::Offered { why: Some(_), .. }
+            )
+        });
+        browser.join().unwrap();
+        assert_eq!(
+            details(),
+            1,
+            "a sign-in that failed reads nothing more by itself"
+        );
+
+        connection.update(cx, |c, cx| c.sign_in(cx));
+        until(cx, "waiting for the browser", |cx| {
+            matches!(sign_in_state(&connection, cx).1, SignIn::Waiting { .. })
+        });
+        assert_eq!(details(), 2, "read again before the browser opened");
+        let browser = approve(&served, &cx.opened_url().unwrap());
+        until(cx, "the sign-in", |cx| {
+            sign_in_state(&connection, cx).0 == ConnectionState::Ready
+        });
+        browser.join().unwrap();
+    }
+
+    /// Sign-in details the server named that could not be read are read again: by Retry, which
+    /// connects again, and by the health check that finds the server still asking for a
+    /// sign-in. Before, "Sign-in unavailable" stood for the life of the connection, with no
+    /// button, until the target was renamed or Studio restarted.
+    #[gpui::test]
+    async fn sign_in_details_that_could_not_be_read_are_read_again(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served {
+            lives: 300,
+            fails_metadata: 1,
+            ..Served::default()
+        }));
+        let unavailable = |connection: &Entity<Connection>, cx: &mut TestAppContext| {
+            matches!(sign_in_state(connection, cx).1, SignIn::Unavailable(_))
+        };
+        let offered = |connection: &Entity<Connection>, cx: &mut TestAppContext| {
+            matches!(
+                sign_in_state(connection, cx).1,
+                SignIn::Offered { why: None, .. }
+            )
+        };
+
+        // Retry.
+        let retried = connection(&served, Arc::default(), cx);
+        retried.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the details unavailable", |cx| {
+            unavailable(&retried, cx)
+        });
+        retried.update(cx, |c, cx| c.connect(cx));
+        until(cx, "a sign-in offered on Retry", |cx| offered(&retried, cx));
+
+        // The health check.
+        served.lock().unwrap().fails_metadata = 1;
+        let checked = connection(&served, Arc::default(), cx);
+        let _watch = checked.update(cx, |c, cx| {
+            c.connect(cx);
+            c.watch(cx)
+        });
+        until(cx, "the details unavailable", |cx| {
+            unavailable(&checked, cx)
+        });
+        cx.executor()
+            .advance_clock(crate::connection::FAILED_CHECK_INTERVAL);
+        until(cx, "a sign-in offered at the next check", |cx| {
+            offered(&checked, cx)
+        });
+    }
+
     /// A sign-in read, or made in the browser, while the target's transport changes takes the
     /// new client when it finishes: requests to the server's address, to a sign-in service there
     /// included, do not stay on the proxy or certificate authority the task started with.
@@ -3508,6 +3628,67 @@ mod tests {
         assert_eq!(
             keychain.items.lock().unwrap()[&key].1,
             b"kept-again".to_vec()
+        );
+    }
+
+    /// A sign-in whose grant gave no refresh token keeps its access token until that ends: its
+    /// renewal, due before the end, has nothing to refresh with, so the token held stands, the
+    /// next renewal due at its end, which ends the sign-in. Before, that renewal ended the
+    /// sign-in while its token still held, up to a minute early.
+    #[test]
+    fn a_grant_without_a_refresh_token_stands_until_its_token_ends() {
+        let served = Arc::new(Mutex::new(Served {
+            lives: 300,
+            ..Served::default()
+        }));
+        let expires_at = SystemTime::now() + Duration::from_secs(3);
+        let source = OAuthSource::signed_in(
+            discovered(&served),
+            "work",
+            Arc::new(MemoryKeychain::default()),
+            Tokens {
+                access_token: "held".into(),
+                refresh_token: None,
+                expires_at,
+                account: Account {
+                    subject: "user_1".into(),
+                    organization: None,
+                },
+            },
+            Kept::Nothing,
+            None,
+        );
+        let ask = || smol::block_on(source.token(Arc::new(AtomicBool::new(false))));
+        let first = ask().expect("the token given");
+        let renew_at = first.lease().expect("a lease").renew_at;
+        assert!(renew_at < expires_at, "renewed before it ends");
+        std::thread::sleep(
+            renew_at
+                .duration_since(SystemTime::now())
+                .unwrap_or_default()
+                + Duration::from_millis(100),
+        );
+        assert!(
+            SystemTime::now() < expires_at,
+            "asked while the token holds"
+        );
+        let renewed = ask().expect("the token held stands until it ends");
+        assert_eq!(renewed.lease().expect("a lease").renew_at, expires_at);
+        assert_eq!(renewed.into_string(), "held");
+        std::thread::sleep(
+            expires_at
+                .duration_since(SystemTime::now())
+                .unwrap_or_default()
+                + Duration::from_millis(100),
+        );
+        assert!(ask().is_err(), "ended with its token");
+        assert!(
+            served
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .all(|r| !r.contains("token"))
         );
     }
 
