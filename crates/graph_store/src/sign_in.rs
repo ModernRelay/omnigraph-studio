@@ -341,10 +341,16 @@ pub struct Service {
 }
 
 impl Service {
-    /// Revokes `refresh` through `http` where the service publishes a revocation endpoint: once,
-    /// within 10 seconds, and not retried, in the background, so nobody waits on the network
-    /// (spec 016, Custody). The sign-in ends whatever the service answers.
-    pub(crate) fn revoke(&self, http: Arc<dyn HttpClient>, refresh: String) {
+    /// Revokes `refresh` where the service publishes a revocation endpoint: once, within 10
+    /// seconds, and not retried, in the background, so nobody waits on the network (spec 016,
+    /// Custody). The sign-in ends whatever the service answers.
+    pub(crate) fn revoke(&self, refresh: String) {
+        self.revoke_through(self.token_client(), refresh);
+    }
+
+    /// [`Self::revoke`], through `http`: a sign-in's client now, which a transport change may
+    /// have replaced since the service was read.
+    fn revoke_through(&self, http: Arc<dyn HttpClient>, refresh: String) {
         let service = self.clone();
         smol::spawn(async move {
             oauth_client::revoke(http.as_ref(), &service.server, &service.client_id, &refresh)
@@ -643,12 +649,7 @@ impl OAuthSource {
     }
 
     pub(crate) fn account(&self) -> String {
-        self.inner
-            .account
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .subject
-            .clone()
+        self.inner.subject()
     }
 
     /// The key of its keychain item.
@@ -657,11 +658,13 @@ impl OAuthSource {
     }
 
     pub(crate) fn kept_in_keychain(&self) -> Kept {
-        self.inner
-            .kept
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        self.inner.kept()
+    }
+
+    /// Revokes `token`, an earlier item's the keychain let go of, through the sign-in's client
+    /// now.
+    pub(crate) fn revoke(&self, token: String) {
+        self.inner.revoke(token);
     }
 
     /// Sends the sign-in's requests to the server's address through `http` from now on: the
@@ -679,12 +682,9 @@ impl OAuthSource {
     /// Ends the sign-in for `how`. No refresh begins after this, and one under way touches the
     /// keychain no more but holds what it is given. Once `before` (the keychain work ahead of
     /// this at its item) has settled, and a keychain write a refresh has in progress, the item is
-    /// dealt with as `how` says; a drop, which gives the keychain a token rotated meanwhile or
-    /// forgets one the refresh found spent, waits for that refresh too. The refresh token is
-    /// revoked after, once any refresh has settled, in the background, so no one waits on the
-    /// network (spec 016, Custody). It runs on its own
-    /// once begun, resolves to what the keychain holds for the target then, and ends the sign-in
-    /// once: a second ending answers with the first's.
+    /// dealt with as `how` says; the refresh token is revoked after, in the background (spec 016,
+    /// Custody). It runs on its own once begun, resolves to what the keychain holds for the
+    /// target then, and ends the sign-in once: a second ending answers with the first's.
     pub(crate) fn end(&self, how: End, before: Option<KeychainTurn>) -> BoxFuture<'static, Kept> {
         let mut ending = self
             .inner
@@ -710,36 +710,23 @@ impl OAuthSource {
                 End::SignOut | End::Replaced => None,
             };
             let writing = inner.writing.lock().await;
-            let was = inner
-                .kept
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone();
-            let subject = inner
-                .account
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .subject
-                .clone();
+            let was = inner.kept();
             let kept = match (how, &was, &settled) {
-                (End::SignOut, ..) => forgotten(inner.keychain.as_ref(), inner.key()).await,
+                (End::SignOut, ..) => inner.forget().await,
                 // Kept for the target made anonymous again, a token a refresh rotated after the
                 // drop began included; one the keychain will not take is forgotten instead.
                 (End::Dropped, Kept::This, Some((Some(refresh), Some(Stale::Rotated)))) => {
-                    let written = inner
-                        .keychain
-                        .write(inner.key(), subject, refresh.as_bytes().to_vec())
-                        .await;
-                    match written {
-                        Ok(()) => Kept::This,
-                        Err(_) => forgotten(inner.keychain.as_ref(), inner.key()).await,
-                    }
+                    written_or_forgotten(
+                        inner.keychain.as_ref(),
+                        inner.key(),
+                        inner.subject(),
+                        Some(refresh),
+                    )
+                    .await
                 }
                 // Its token no longer refreshes: forgotten, as the refresh would have before the
                 // drop.
-                (End::Dropped, Kept::This, Some((_, Some(Stale::Spent)))) => {
-                    forgotten(inner.keychain.as_ref(), inner.key()).await
-                }
+                (End::Dropped, Kept::This, Some((_, Some(Stale::Spent)))) => inner.forget().await,
                 // A replaced sign-in's item is the replacing sign-in's to answer for.
                 (End::Dropped | End::Replaced, ..) => was,
             };
@@ -754,7 +741,7 @@ impl OAuthSource {
                 None => inner.settle().await,
             };
             if !keeps_token && let Some(refresh) = refresh {
-                inner.service.revoke(inner.token_client(), refresh);
+                inner.revoke(refresh);
             }
         })
         .detach();
@@ -764,6 +751,25 @@ impl OAuthSource {
         *ending = Some(shared.clone());
         shared.boxed()
     }
+}
+
+/// Writes `refresh` for `subject` at `key`, or, with none given or one the keychain will not take,
+/// forgets the item there ([`forgotten`]): what the keychain then holds for the target.
+pub(crate) async fn written_or_forgotten(
+    keychain: &dyn Keychain,
+    key: String,
+    subject: String,
+    refresh: Option<&str>,
+) -> Kept {
+    if let Some(refresh) = refresh
+        && keychain
+            .write(key.clone(), subject, refresh.as_bytes().to_vec())
+            .await
+            .is_ok()
+    {
+        return Kept::This;
+    }
+    forgotten(keychain, key).await
 }
 
 /// A refresh token the service gave that no sign-in holds yet: dropped unclaimed (the sign-in
@@ -788,7 +794,7 @@ impl Unclaimed {
 impl Drop for Unclaimed {
     fn drop(&mut self) {
         if let Some(refresh) = self.refresh.take() {
-            self.service.revoke(self.service.token_client(), refresh);
+            self.service.revoke(refresh);
         }
     }
 }
@@ -806,6 +812,32 @@ impl TokenSource for OAuthSource {
 impl Inner {
     fn key(&self) -> String {
         self.key.clone()
+    }
+
+    /// What the keychain holds for the target, as this sign-in last said it.
+    fn kept(&self) -> Kept {
+        self.kept
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn subject(&self) -> String {
+        self.account
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .subject
+            .clone()
+    }
+
+    /// Deletes its keychain item ([`forgotten`]).
+    async fn forget(&self) -> Kept {
+        forgotten(self.keychain.as_ref(), self.key()).await
+    }
+
+    /// Revokes `token` through the sign-in's client now.
+    fn revoke(&self, token: String) {
+        self.service.revoke_through(self.token_client(), token);
     }
 
     /// The refresh token held once a refresh in flight has settled, taken for the ending, and
@@ -932,7 +964,7 @@ impl Inner {
                 .unwrap_or_else(PoisonError::into_inner)
                 .take()
         {
-            self.service.revoke(self.token_client(), token);
+            self.revoke(token);
         }
     }
 
@@ -979,20 +1011,13 @@ impl Inner {
                             .write(self.key(), subject.clone(), rotated.as_bytes().to_vec())
                             .await
                             .is_ok();
-                        let was = self
-                            .kept
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .clone();
-                        let kept = match (written, was) {
+                        let kept = match (written, self.kept()) {
                             (true, _) => Kept::This,
                             // What it holds is this account's token from before, which no longer
                             // refreshes, or which a service that keeps old tokens honoured would
                             // sign the next launch in with: forgotten, as a sign-in that keeps
                             // nothing forgets, and said when the keychain will not let go.
-                            (false, Kept::This) => {
-                                forgotten(self.keychain.as_ref(), self.key()).await
-                            }
+                            (false, Kept::This) => self.forget().await,
                             // An earlier sign-in it holds instead stays said.
                             (false, was) => was,
                         };
@@ -1012,7 +1037,7 @@ impl Inner {
                         held.stale = Some(Stale::Spent);
                     } else {
                         self.ended.store(true, Ordering::SeqCst);
-                        let kept = forgotten(self.keychain.as_ref(), self.key()).await;
+                        let kept = self.forget().await;
                         self.keep(kept);
                     }
                     return Err(NoToken::lasting(format!(
@@ -1030,18 +1055,13 @@ impl Inner {
                 Err(TokenError::Unusable { why, refresh_token }) => {
                     held.access = None;
                     if let Some(rotated) = refresh_token.filter(|new| *new != refresh) {
-                        self.service.revoke(self.token_client(), rotated);
+                        self.revoke(rotated);
                         // The token held is spent by that rotation: nothing to revoke later.
                         held.refresh = None;
-                        let was = self
-                            .kept
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .clone();
                         if ended {
                             held.stale = Some(Stale::Spent);
-                        } else if was == Kept::This {
-                            let kept = forgotten(self.keychain.as_ref(), self.key()).await;
+                        } else if self.kept() == Kept::This {
+                            let kept = self.forget().await;
                             self.keep(kept);
                         }
                     }
@@ -1065,12 +1085,7 @@ impl Inner {
     }
 
     fn leased(&self, access: &Access) -> Token {
-        let holder = self
-            .account
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .subject
-            .clone();
+        let holder = self.subject();
         Token::leased(
             access.token.clone(),
             Lease {
@@ -1125,8 +1140,8 @@ mod tests {
     }
 
     /// A server that takes the access tokens its sign-in service issued, and that service:
-    /// codes and refresh tokens are single-use, and each refresh rotates.
-    #[derive(Default)]
+    /// codes and refresh tokens are single-use, and each refresh rotates. Its tokens live five
+    /// minutes unless a test says otherwise.
     struct Served {
         accepted: HashSet<String>,
         codes: HashSet<String>,
@@ -1163,6 +1178,70 @@ mod tests {
         /// Each request, after the name of the client it went through.
         requests: Vec<String>,
         log: Vec<String>,
+    }
+
+    impl Default for Served {
+        fn default() -> Self {
+            Self {
+                accepted: Default::default(),
+                codes: Default::default(),
+                refresh: Default::default(),
+                issued: Default::default(),
+                lives: 300,
+                admits_nobody: Default::default(),
+                no_refresh: Default::default(),
+                issuer: Default::default(),
+                hold_metadata: Default::default(),
+                fails_metadata: Default::default(),
+                hold_token: Default::default(),
+                token_down: Default::default(),
+                fails_tokens: Default::default(),
+                fails_status: Default::default(),
+                fails_error: Default::default(),
+                refuses_target: Default::default(),
+                refused: Default::default(),
+                requests: Default::default(),
+                log: Default::default(),
+            }
+        }
+    }
+
+    /// A keychain holding the sign-in `user_1` kept for the target `work`, whose grant `served`
+    /// honours: the launch reads it and refreshes.
+    fn kept_at_launch(served: &Arc<Mutex<Served>>) -> Arc<MemoryKeychain> {
+        served.lock().unwrap().refresh.insert("kept".into());
+        let keychain = Arc::new(MemoryKeychain::default());
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
+        keychain
+    }
+
+    /// Signs `connection` in through the browser, its keychain write held: the sign-in is
+    /// finishing when this returns, and sending on the returned sender lets the write land.
+    fn sign_in_with_its_write_held(
+        served: &Arc<Mutex<Served>>,
+        keychain: &MemoryKeychain,
+        connection: &Entity<Connection>,
+        cx: &mut TestAppContext,
+    ) -> oneshot::Sender<()> {
+        let (release, gate) = oneshot::channel::<()>();
+        *keychain.write_gate.lock().unwrap() = Some(gate.shared());
+        let writes = keychain.writes.load(Ordering::SeqCst);
+        connection.update(cx, |c, cx| c.sign_in(cx));
+        let browser = approve(served, &cx.opened_url().unwrap());
+        until(cx, "the new sign-in's write under way", |_| {
+            keychain.writes.load(Ordering::SeqCst) > writes
+        });
+        browser.join().unwrap();
+        release
+    }
+
+    /// Whether the fake server logged `line`: a token request, a revocation.
+    fn logged(served: &Arc<Mutex<Served>>, line: &str) -> bool {
+        served.lock().unwrap().log.iter().any(|l| l == line)
     }
 
     fn jwt(claims: Value) -> String {
@@ -1491,10 +1570,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
-        let served = Arc::new(Mutex::new(Served {
-            lives: 300,
-            ..Served::default()
-        }));
+        let served = Arc::new(Mutex::new(Served::default()));
         let keychain = Arc::new(MemoryKeychain::default());
         let connection = connection(&served, keychain.clone(), cx);
         connection.update(cx, |c, cx| c.connect(cx));
@@ -1550,9 +1626,7 @@ mod tests {
         until(cx, "the sign-out", |cx| {
             sign_in_state(&connection, cx).0 == ConnectionState::Unauthorized
         });
-        until(cx, "the revocation", |_| {
-            served.lock().unwrap().log.iter().any(|l| l == "revoke r1")
-        });
+        until(cx, "the revocation", |_| logged(&served, "revoke r1"));
         assert!(keychain.items.lock().unwrap().is_empty());
         assert_eq!(
             sign_in_state(&connection, cx).1,
@@ -1582,7 +1656,7 @@ mod tests {
         });
         browser.join().unwrap();
         until(cx, "the replaced sign-in's revocation", |_| {
-            served.lock().unwrap().log.iter().any(|l| l == "revoke r2")
+            logged(&served, "revoke r2")
         });
         assert!(keychain.items.lock().unwrap().is_empty());
         connection.update(cx, |c, cx| c.sign_out(cx));
@@ -1722,10 +1796,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
-        let served = Arc::new(Mutex::new(Served {
-            lives: 300,
-            ..Served::default()
-        }));
+        let served = Arc::new(Mutex::new(Served::default()));
         served.lock().unwrap().refresh.insert("kept".into());
         let keychain = Arc::new(MemoryKeychain::default());
         let key = key("work");
@@ -1813,7 +1884,7 @@ mod tests {
             kept(&connection, cx) == Kept::This
         });
         never(cx, "the dropped sign-in kept, so not revoked", |_| {
-            served.lock().unwrap().log.iter().any(|l| l == "revoke r3")
+            logged(&served, "revoke r3")
         });
     }
 
@@ -1828,10 +1899,7 @@ mod tests {
     #[gpui::test]
     async fn a_sign_in_dropped_while_it_finishes_is_kept_then_dropped(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
-        let served = Arc::new(Mutex::new(Served {
-            lives: 300,
-            ..Served::default()
-        }));
+        let served = Arc::new(Mutex::new(Served::default()));
         served.lock().unwrap().refresh.insert("kept".into());
         let keychain = Arc::new(MemoryKeychain::default());
         let key = key("work");
@@ -1854,14 +1922,13 @@ mod tests {
                 .map(|(_, secret)| String::from_utf8(secret.clone()).unwrap())
         };
         assert_eq!(held().as_deref(), Some("r1"), "rotated at launch");
-        let logged = |line: &str| served.lock().unwrap().log.iter().any(|l| l == line);
         // Signs in as someone else, the keychain slow to take the new token.
         let (release, gate) = oneshot::channel::<()>();
         *keychain.write_gate.lock().unwrap() = Some(gate.shared());
         connection.update(cx, |c, cx| c.sign_in(cx));
         let browser = approve(&served, &cx.opened_url().unwrap());
         until(cx, "the replaced sign-in's revocation", |_| {
-            logged("revoke r1")
+            logged(&served, "revoke r1")
         });
         browser.join().unwrap();
         assert!(matches!(
@@ -1894,7 +1961,7 @@ mod tests {
             let (state, sign_in, _) = sign_in_state(&connection, cx);
             state == ConnectionState::Ready && matches!(sign_in, SignIn::SignedIn { .. })
         });
-        assert!(!logged("revoke r2"), "kept, so not revoked");
+        assert!(!logged(&served, "revoke r2"), "kept, so not revoked");
         assert_eq!(kept(&connection, cx), Kept::This);
     }
 
@@ -1906,7 +1973,6 @@ mod tests {
     async fn a_sign_in_cancelled_during_its_exchange_revokes_its_token(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let served = Arc::new(Mutex::new(Served {
-            lives: 300,
             hold_token: true,
             ..Served::default()
         }));
@@ -1916,23 +1982,22 @@ mod tests {
         until(cx, "the offer", |cx| {
             matches!(sign_in_state(&connection, cx).1, SignIn::Offered { .. })
         });
-        let logged = |what: &str| {
+        connection.update(cx, |c, cx| c.sign_in(cx));
+        let browser = approve(&served, &cx.opened_url().unwrap());
+        until(cx, "the code exchanged", |_| {
             served
                 .lock()
                 .unwrap()
                 .log
                 .iter()
-                .any(|l| l.starts_with(what))
-        };
-        connection.update(cx, |c, cx| c.sign_in(cx));
-        let browser = approve(&served, &cx.opened_url().unwrap());
-        until(cx, "the code exchanged", |_| {
-            logged("token authorization_code")
+                .any(|l| l.starts_with("token authorization_code"))
         });
         browser.join().unwrap();
         connection.update(cx, |c, cx| c.cancel_sign_in(cx));
         served.lock().unwrap().hold_token = false;
-        until(cx, "the token nobody took revoked", |_| logged("revoke r1"));
+        until(cx, "the token nobody took revoked", |_| {
+            logged(&served, "revoke r1")
+        });
         assert!(keychain.items.lock().unwrap().is_empty());
         assert!(matches!(
             sign_in_state(&connection, cx).1,
@@ -1977,7 +2042,7 @@ mod tests {
                 .contains("lasts 3600 seconds")
         );
         until(cx, "its refresh token revoked", |_| {
-            served.lock().unwrap().log.iter().any(|l| l == "revoke r1")
+            logged(&served, "revoke r1")
         });
         assert!(keychain.items.lock().unwrap().is_empty());
 
@@ -1986,17 +2051,11 @@ mod tests {
             lives: 3600,
             ..Served::default()
         }));
-        served.lock().unwrap().refresh.insert("kept".into());
-        let keychain = Arc::new(MemoryKeychain::default());
-        keychain
-            .items
-            .lock()
-            .unwrap()
-            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
+        let keychain = kept_at_launch(&served);
         let kept_one = connection_in(&served, context(&served, keychain.clone()), cx);
         kept_one.update(cx, |c, cx| c.connect(cx));
         until(cx, "the rotated token revoked", |_| {
-            served.lock().unwrap().log.iter().any(|l| l == "revoke r1")
+            logged(&served, "revoke r1")
         });
         until(cx, "the sign-in refused", |cx| {
             offered_why(&kept_one, cx).is_some_and(|why| why.contains("lasts 3600 seconds"))
@@ -2022,17 +2081,10 @@ mod tests {
     async fn a_sign_out_deletes_at_once_over_a_refresh_in_flight(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let served = Arc::new(Mutex::new(Served {
-            lives: 300,
             hold_token: true,
             ..Served::default()
         }));
-        served.lock().unwrap().refresh.insert("kept".into());
-        let keychain = Arc::new(MemoryKeychain::default());
-        keychain
-            .items
-            .lock()
-            .unwrap()
-            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
+        let keychain = kept_at_launch(&served);
         let connection = connection(&served, keychain.clone(), cx);
         connection.update(cx, |c, cx| c.connect(cx));
         until(cx, "the launch's refresh in flight", |_| {
@@ -2049,7 +2101,7 @@ mod tests {
         });
         served.lock().unwrap().hold_token = false;
         until(cx, "the rotated token revoked", |_| {
-            served.lock().unwrap().log.iter().any(|l| l == "revoke r1")
+            logged(&served, "revoke r1")
         });
         assert!(keychain.items.lock().unwrap().is_empty());
         assert_eq!(kept(&connection, cx), Kept::Nothing);
@@ -2060,17 +2112,8 @@ mod tests {
     #[gpui::test]
     async fn a_sign_out_during_a_refresh_write_leaves_nothing(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
-        let served = Arc::new(Mutex::new(Served {
-            lives: 300,
-            ..Served::default()
-        }));
-        served.lock().unwrap().refresh.insert("kept".into());
-        let keychain = Arc::new(MemoryKeychain::default());
-        keychain
-            .items
-            .lock()
-            .unwrap()
-            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
+        let served = Arc::new(Mutex::new(Served::default()));
+        let keychain = kept_at_launch(&served);
         let (release, gate) = oneshot::channel::<()>();
         *keychain.write_gate.lock().unwrap() = Some(gate.shared());
         let connection = connection(&served, keychain.clone(), cx);
@@ -2081,7 +2124,7 @@ mod tests {
         connection.update(cx, |c, cx| c.sign_out(cx));
         release.send(()).unwrap();
         until(cx, "the rotated token revoked", |_| {
-            served.lock().unwrap().log.iter().any(|l| l == "revoke r1")
+            logged(&served, "revoke r1")
         });
         never(cx, "an item after the sign-out", |_| {
             !keychain.items.lock().unwrap().is_empty()
@@ -2097,17 +2140,8 @@ mod tests {
     #[gpui::test]
     async fn a_renamed_target_is_signed_in_to_under_its_new_name(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
-        let served = Arc::new(Mutex::new(Served {
-            lives: 300,
-            ..Served::default()
-        }));
-        served.lock().unwrap().refresh.insert("kept".into());
-        let keychain = Arc::new(MemoryKeychain::default());
-        keychain
-            .items
-            .lock()
-            .unwrap()
-            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
+        let served = Arc::new(Mutex::new(Served::default()));
+        let keychain = kept_at_launch(&served);
         let held = |target: &str| {
             keychain
                 .items
@@ -2160,10 +2194,7 @@ mod tests {
         never(cx, "the old name's item said under the new name", |cx| {
             kept(&connection, cx) != Kept::Nothing
         });
-        assert!(
-            !served.lock().unwrap().log.iter().any(|l| l == "revoke r2"),
-            "kept, so not revoked"
-        );
+        assert!(!logged(&served, "revoke r2"), "kept, so not revoked");
 
         connection.update(cx, |c, cx| c.sign_in(cx));
         let browser = approve(&served, &cx.opened_url().unwrap());
@@ -2187,34 +2218,17 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
-        let served = Arc::new(Mutex::new(Served {
-            lives: 300,
-            ..Served::default()
-        }));
-        served.lock().unwrap().refresh.insert("kept".into());
-        let keychain = Arc::new(MemoryKeychain::default());
-        keychain
-            .items
-            .lock()
-            .unwrap()
-            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
+        let served = Arc::new(Mutex::new(Served::default()));
+        let keychain = kept_at_launch(&served);
         let connection = connection(&served, keychain.clone(), cx);
         connection.update(cx, |c, cx| c.connect(cx));
         until(cx, "the kept sign-in", |cx| {
             sign_in_state(&connection, cx).0 == ConnectionState::Ready
         });
-        let (release, gate) = oneshot::channel::<()>();
-        *keychain.write_gate.lock().unwrap() = Some(gate.shared());
-        let writes = keychain.writes.load(Ordering::SeqCst);
-        connection.update(cx, |c, cx| c.sign_in(cx));
-        let browser = approve(&served, &cx.opened_url().unwrap());
-        until(cx, "the new sign-in's write under way", |_| {
-            keychain.writes.load(Ordering::SeqCst) > writes
-        });
-        browser.join().unwrap();
+        let release = sign_in_with_its_write_held(&served, &keychain, &connection, cx);
         connection.update(cx, |c, cx| c.rename("job".into(), cx));
         until(cx, "the held sign-in, replaced, revoked", |_| {
-            served.lock().unwrap().log.iter().any(|l| l == "revoke r1")
+            logged(&served, "revoke r1")
         });
         assert_eq!(
             connection.read_with(cx, |c, _| c.label()),
@@ -2243,7 +2257,7 @@ mod tests {
         );
         assert_eq!(held("job"), None);
         assert_eq!(kept(&connection, cx), Kept::Nothing);
-        assert!(!served.lock().unwrap().log.iter().any(|l| l == "revoke r2"));
+        assert!(!logged(&served, "revoke r2"));
     }
 
     /// While a sign-in as someone else finishes, the one it replaces has ended and answers so;
@@ -2254,32 +2268,15 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
-        let served = Arc::new(Mutex::new(Served {
-            lives: 300,
-            ..Served::default()
-        }));
-        served.lock().unwrap().refresh.insert("kept".into());
-        let keychain = Arc::new(MemoryKeychain::default());
-        keychain
-            .items
-            .lock()
-            .unwrap()
-            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
+        let served = Arc::new(Mutex::new(Served::default()));
+        let keychain = kept_at_launch(&served);
         let connection = connection(&served, keychain.clone(), cx);
         connection.update(cx, |c, cx| c.connect(cx));
         until(cx, "the kept sign-in", |cx| {
             sign_in_state(&connection, cx).0 == ConnectionState::Ready
         });
         // A sign-in as someone else, its keychain write held: it finishes.
-        let (release, gate) = oneshot::channel::<()>();
-        *keychain.write_gate.lock().unwrap() = Some(gate.shared());
-        let writes = keychain.writes.load(Ordering::SeqCst);
-        connection.update(cx, |c, cx| c.sign_in(cx));
-        let browser = approve(&served, &cx.opened_url().unwrap());
-        until(cx, "the new sign-in's write under way", |_| {
-            keychain.writes.load(Ordering::SeqCst) > writes
-        });
-        browser.join().unwrap();
+        let release = sign_in_with_its_write_held(&served, &keychain, &connection, cx);
         // The one replaced is asked again, and answers that it ended.
         connection.update(cx, |c, cx| c.refresh_token(cx));
         never(
@@ -2300,23 +2297,13 @@ mod tests {
     #[gpui::test]
     async fn a_sign_in_over_an_item_left_revokes_its_token(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
-        let served = Arc::new(Mutex::new(Served {
-            lives: 300,
-            ..Served::default()
-        }));
-        served.lock().unwrap().refresh.insert("kept".into());
-        let keychain = Arc::new(MemoryKeychain::default());
-        keychain
-            .items
-            .lock()
-            .unwrap()
-            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
+        let served = Arc::new(Mutex::new(Served::default()));
+        let keychain = kept_at_launch(&served);
         let connection = connection(&served, keychain.clone(), cx);
         connection.update(cx, |c, cx| c.connect(cx));
         until(cx, "the kept sign-in", |cx| {
             sign_in_state(&connection, cx).0 == ConnectionState::Ready
         });
-        let logged = |line: &str| served.lock().unwrap().log.iter().any(|l| l == line);
         // Refused for good: dropped, its item kept, its token not revoked.
         {
             let mut served = served.lock().unwrap();
@@ -2331,7 +2318,7 @@ mod tests {
             ) && kept(&connection, cx) == Kept::This
         });
         never(cx, "the dropped sign-in's token revoked", |_| {
-            logged("revoke r1")
+            logged(&served, "revoke r1")
         });
         {
             let mut served = served.lock().unwrap();
@@ -2340,7 +2327,9 @@ mod tests {
         }
         connection.update(cx, |c, cx| c.sign_in(cx));
         let browser = approve(&served, &cx.opened_url().unwrap());
-        until(cx, "the earlier token revoked", |_| logged("revoke r1"));
+        until(cx, "the earlier token revoked", |_| {
+            logged(&served, "revoke r1")
+        });
         browser.join().unwrap();
         until(cx, "the new sign-in taken, and kept", |cx| {
             let (state, sign_in, _) = sign_in_state(&connection, cx);
@@ -2361,10 +2350,7 @@ mod tests {
     #[gpui::test]
     async fn an_earlier_token_is_revoked_once_the_item_no_longer_holds_it(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
-        let served = Arc::new(Mutex::new(Served {
-            lives: 300,
-            ..Served::default()
-        }));
+        let served = Arc::new(Mutex::new(Served::default()));
         let keychain = Arc::new(MemoryKeychain::default());
         keychain
             .items
@@ -2389,11 +2375,10 @@ mod tests {
                 && matches!(kept(&connection, cx), Kept::Left(_))
         });
         browser.join().unwrap();
-        let logged = |line: &str| served.lock().unwrap().log.iter().any(|l| l == line);
         never(
             cx,
             "the earlier token revoked while the keychain holds it",
-            |_| logged("revoke earlier"),
+            |_| logged(&served, "revoke earlier"),
         );
         // The keychain takes writes again, and a refresh rotates the token into the item.
         keychain.refuses_writes.store(false, Ordering::SeqCst);
@@ -2404,7 +2389,7 @@ mod tests {
             keychain.items.lock().unwrap()[&key("work")].1 == b"r2".to_vec()
         });
         until(cx, "the earlier token revoked", |_| {
-            logged("revoke earlier")
+            logged(&served, "revoke earlier")
         });
         assert_eq!(kept(&connection, cx), Kept::This);
     }
@@ -2422,10 +2407,7 @@ mod tests {
     ) {
         cx.executor().allow_parking();
         for retired in [true, false] {
-            let served = Arc::new(Mutex::new(Served {
-                lives: 300,
-                ..Served::default()
-            }));
+            let served = Arc::new(Mutex::new(Served::default()));
             let keychain = Arc::new(MemoryKeychain::default());
             // An earlier item the keychain will not let go of at launch: said as left.
             keychain
@@ -2444,15 +2426,7 @@ mod tests {
                 )
             });
             keychain.refuses_deletes.store(false, Ordering::SeqCst);
-            let (release, gate) = oneshot::channel::<()>();
-            *keychain.write_gate.lock().unwrap() = Some(gate.shared());
-            let writes = keychain.writes.load(Ordering::SeqCst);
-            connection.update(cx, |c, cx| c.sign_in(cx));
-            let browser = approve(&served, &cx.opened_url().unwrap());
-            until(cx, "the new sign-in's write under way", |_| {
-                keychain.writes.load(Ordering::SeqCst) > writes
-            });
-            browser.join().unwrap();
+            let release = sign_in_with_its_write_held(&served, &keychain, &connection, cx);
             // Retired, then released, as the registry does; or released alone, as at quitting.
             if retired {
                 connection.update(cx, |c, cx| {
@@ -2465,9 +2439,8 @@ mod tests {
             cx.run_until_parked();
             assert!(released.upgrade().is_none(), "the connection released");
             release.send(()).unwrap();
-            let logged = |line: &str| served.lock().unwrap().log.iter().any(|l| l == line);
             until(cx, "the earlier token revoked", |_| {
-                logged("revoke earlier")
+                logged(&served, "revoke earlier")
             });
             assert_eq!(
                 keychain.items.lock().unwrap()[&key("work")].1,
@@ -2481,7 +2454,7 @@ mod tests {
                 state == ConnectionState::Ready && matches!(sign_in, SignIn::SignedIn { .. })
             });
             assert!(
-                !logged("revoke r1"),
+                !logged(&served, "revoke r1"),
                 "kept for the target's return, so not revoked (retired: {retired})"
             );
         }
@@ -2498,17 +2471,8 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
-        let served = Arc::new(Mutex::new(Served {
-            lives: 300,
-            ..Served::default()
-        }));
-        served.lock().unwrap().refresh.insert("kept".into());
-        let keychain = Arc::new(MemoryKeychain::default());
-        keychain
-            .items
-            .lock()
-            .unwrap()
-            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
+        let served = Arc::new(Mutex::new(Served::default()));
+        let keychain = kept_at_launch(&served);
         let context = context(&served, keychain.clone());
         let connection = connection_in(&served, context.clone(), cx);
         connection.update(cx, |c, cx| c.connect(cx));
@@ -2560,9 +2524,8 @@ mod tests {
             )
         });
         assert!(keychain.items.lock().unwrap().is_empty());
-        let logged = |line: &str| served.lock().unwrap().log.iter().any(|l| l == line);
         until(cx, "both tokens revoked", |_| {
-            logged("revoke r1") && logged("revoke r2")
+            logged(&served, "revoke r1") && logged(&served, "revoke r2")
         });
     }
 
@@ -2577,32 +2540,15 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
-        let served = Arc::new(Mutex::new(Served {
-            lives: 300,
-            ..Served::default()
-        }));
-        served.lock().unwrap().refresh.insert("kept".into());
-        let keychain = Arc::new(MemoryKeychain::default());
-        keychain
-            .items
-            .lock()
-            .unwrap()
-            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
+        let served = Arc::new(Mutex::new(Served::default()));
+        let keychain = kept_at_launch(&served);
         let context = context(&served, keychain.clone());
         let connection = connection_in(&served, context.clone(), cx);
         connection.update(cx, |c, cx| c.connect(cx));
         until(cx, "the kept sign-in", |cx| {
             sign_in_state(&connection, cx).0 == ConnectionState::Ready
         });
-        let (release, gate) = oneshot::channel::<()>();
-        *keychain.write_gate.lock().unwrap() = Some(gate.shared());
-        let writes = keychain.writes.load(Ordering::SeqCst);
-        connection.update(cx, |c, cx| c.sign_in(cx));
-        let browser = approve(&served, &cx.opened_url().unwrap());
-        until(cx, "the new sign-in's write under way", |_| {
-            keychain.writes.load(Ordering::SeqCst) > writes
-        });
-        browser.join().unwrap();
+        let release = sign_in_with_its_write_held(&served, &keychain, &connection, cx);
         connection.update(cx, |c, cx| c.sign_out(cx));
         assert_eq!(sign_in_state(&connection, cx).1, SignIn::NotOffered);
         until(cx, "the server's answer without a token", |cx| {
@@ -2639,9 +2585,8 @@ mod tests {
                 },
             );
         }
-        let logged = |line: &str| served.lock().unwrap().log.iter().any(|l| l == line);
         until(cx, "both tokens revoked", |_| {
-            logged("revoke r1") && logged("revoke r2")
+            logged(&served, "revoke r1") && logged(&served, "revoke r2")
         });
         assert!(keychain.items.lock().unwrap().is_empty());
     }
@@ -2654,17 +2599,10 @@ mod tests {
         cx.executor().allow_parking();
         // The service down from launch: the kept sign-in stands, not answering.
         let served = Arc::new(Mutex::new(Served {
-            lives: 300,
             token_down: true,
             ..Served::default()
         }));
-        served.lock().unwrap().refresh.insert("kept".into());
-        let keychain = Arc::new(MemoryKeychain::default());
-        keychain
-            .items
-            .lock()
-            .unwrap()
-            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
+        let keychain = kept_at_launch(&served);
         let connection = connection(&served, keychain.clone(), cx);
         connection.update(cx, |c, cx| c.connect(cx));
         until(cx, "the sign-in not answering", |cx| {
@@ -2683,17 +2621,8 @@ mod tests {
         assert_eq!(sign_in_state(&connection, cx).2, "Sign-in not answering");
 
         // The one held refused for good while another is in the browser, which then fails.
-        let served = Arc::new(Mutex::new(Served {
-            lives: 300,
-            ..Served::default()
-        }));
-        served.lock().unwrap().refresh.insert("kept".into());
-        let keychain = Arc::new(MemoryKeychain::default());
-        keychain
-            .items
-            .lock()
-            .unwrap()
-            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
+        let served = Arc::new(Mutex::new(Served::default()));
+        let keychain = kept_at_launch(&served);
         let connection = connection_in(&served, context(&served, keychain), cx);
         connection.update(cx, |c, cx| c.connect(cx));
         until(cx, "the kept sign-in", |cx| {
@@ -2708,7 +2637,7 @@ mod tests {
         }
         connection.update(cx, |c, cx| c.connect(cx));
         until(cx, "the one held refused and revoked", |_| {
-            served.lock().unwrap().log.iter().any(|l| l == "revoke r1")
+            logged(&served, "revoke r1")
         });
         served.lock().unwrap().token_down = true;
         let browser = approve(&served, &opened);
@@ -2732,17 +2661,8 @@ mod tests {
     #[gpui::test]
     async fn a_connection_reads_the_keychain_after_another_signs_out(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
-        let served = Arc::new(Mutex::new(Served {
-            lives: 300,
-            ..Served::default()
-        }));
-        served.lock().unwrap().refresh.insert("kept".into());
-        let keychain = Arc::new(MemoryKeychain::default());
-        keychain
-            .items
-            .lock()
-            .unwrap()
-            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
+        let served = Arc::new(Mutex::new(Served::default()));
+        let keychain = kept_at_launch(&served);
         let context = context(&served, keychain.clone());
         let first = connection_in(&served, context.clone(), cx);
         first.update(cx, |c, cx| c.connect(cx));
@@ -2778,10 +2698,7 @@ mod tests {
     #[gpui::test]
     async fn a_sign_in_refused_for_good_revokes_a_token_nobody_holds(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
-        let served = Arc::new(Mutex::new(Served {
-            lives: 300,
-            ..Served::default()
-        }));
+        let served = Arc::new(Mutex::new(Served::default()));
         let keychain = Arc::new(MemoryKeychain::default());
         keychain.refuses_writes.store(true, Ordering::SeqCst);
         let connection = connection(&served, keychain, cx);
@@ -2804,7 +2721,7 @@ mod tests {
         }
         connection.update(cx, |c, cx| c.connect(cx));
         until(cx, "the refused sign-in's revocation", |_| {
-            served.lock().unwrap().log.iter().any(|l| l == "revoke r1")
+            logged(&served, "revoke r1")
         });
         assert!(matches!(
             sign_in_state(&connection, cx).1,
@@ -2824,13 +2741,7 @@ mod tests {
             lives: 2,
             ..Served::default()
         }));
-        served.lock().unwrap().refresh.insert("kept".into());
-        let keychain = Arc::new(MemoryKeychain::default());
-        keychain
-            .items
-            .lock()
-            .unwrap()
-            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
+        let keychain = kept_at_launch(&served);
         let connection = connection(&served, keychain, cx);
         let _watch = connection.update(cx, |c, cx| c.watch(cx));
         connection.update(cx, |c, cx| c.connect(cx));
@@ -2865,10 +2776,7 @@ mod tests {
     #[gpui::test]
     async fn a_sign_in_refused_while_another_is_under_way_is_replaced(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
-        let served = Arc::new(Mutex::new(Served {
-            lives: 300,
-            ..Served::default()
-        }));
+        let served = Arc::new(Mutex::new(Served::default()));
         served.lock().unwrap().refresh.insert("kept".into());
         let keychain = Arc::new(MemoryKeychain::default());
         let key = key("work");
@@ -2891,7 +2799,7 @@ mod tests {
         }
         connection.update(cx, |c, cx| c.connect(cx));
         until(cx, "the held sign-in's revocation", |_| {
-            served.lock().unwrap().log.iter().any(|l| l == "revoke r1")
+            logged(&served, "revoke r1")
         });
         assert!(matches!(
             sign_in_state(&connection, cx).1,
@@ -2920,10 +2828,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
-        let served = Arc::new(Mutex::new(Served {
-            lives: 300,
-            ..Served::default()
-        }));
+        let served = Arc::new(Mutex::new(Served::default()));
         let keychain = Arc::new(MemoryKeychain::default());
         let connection = connection(&served, keychain.clone(), cx);
         connection.update(cx, |c, cx| c.connect(cx));
@@ -2958,7 +2863,7 @@ mod tests {
         }
         connection.update(cx, |c, cx| c.connect(cx));
         until(cx, "the held sign-in's revocation", |_| {
-            served.lock().unwrap().log.iter().any(|l| l == "revoke r1")
+            logged(&served, "revoke r1")
         });
         let left = |cx: &mut TestAppContext| connection.read_with(cx, |c, _| c.keychain_left());
         assert!(matches!(
@@ -2982,17 +2887,8 @@ mod tests {
     #[gpui::test]
     async fn a_sign_in_as_someone_else_ends_with_a_cancel_or_a_sign_out(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
-        let served = Arc::new(Mutex::new(Served {
-            lives: 300,
-            ..Served::default()
-        }));
-        served.lock().unwrap().refresh.insert("kept".into());
-        let keychain = Arc::new(MemoryKeychain::default());
-        keychain
-            .items
-            .lock()
-            .unwrap()
-            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
+        let served = Arc::new(Mutex::new(Served::default()));
+        let keychain = kept_at_launch(&served);
         let connection = connection(&served, keychain, cx);
         connection.update(cx, |c, cx| c.connect(cx));
         until(cx, "the kept sign-in", |cx| {
@@ -3044,17 +2940,10 @@ mod tests {
     async fn a_sign_out_while_a_window_waits_says_the_token_is_ready(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let served = Arc::new(Mutex::new(Served {
-            lives: 300,
             hold_token: true,
             ..Served::default()
         }));
-        served.lock().unwrap().refresh.insert("kept".into());
-        let keychain = Arc::new(MemoryKeychain::default());
-        keychain
-            .items
-            .lock()
-            .unwrap()
-            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
+        let keychain = kept_at_launch(&served);
         let connection = connection(&served, keychain, cx);
         let readied = std::rc::Rc::new(std::cell::Cell::new(0));
         let heard = readied.clone();
@@ -3108,13 +2997,7 @@ mod tests {
             lives: 2,
             ..Served::default()
         }));
-        served.lock().unwrap().refresh.insert("kept".into());
-        let keychain = Arc::new(MemoryKeychain::default());
-        keychain
-            .items
-            .lock()
-            .unwrap()
-            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
+        let keychain = kept_at_launch(&served);
         let connection = connection(&served, keychain.clone(), cx);
         connection.update(cx, |c, cx| c.connect(cx));
         until(cx, "the refresh", |cx| {
@@ -3235,10 +3118,7 @@ mod tests {
     #[gpui::test]
     async fn a_new_transport_keeps_the_sign_in_through_it(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
-        let served = Arc::new(Mutex::new(Served {
-            lives: 300,
-            ..Served::default()
-        }));
+        let served = Arc::new(Mutex::new(Served::default()));
         served.lock().unwrap().refresh.insert("kept".into());
         let keychain = Arc::new(MemoryKeychain::default());
         let key = key("work");
@@ -3302,7 +3182,6 @@ mod tests {
     async fn a_sign_in_after_one_failed_reads_the_details_again(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let served = Arc::new(Mutex::new(Served {
-            lives: 300,
             fails_tokens: 1,
             ..Served::default()
         }));
@@ -3356,17 +3235,8 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
-        let served = Arc::new(Mutex::new(Served {
-            lives: 300,
-            ..Served::default()
-        }));
-        served.lock().unwrap().refresh.insert("kept".into());
-        let keychain = Arc::new(MemoryKeychain::default());
-        keychain
-            .items
-            .lock()
-            .unwrap()
-            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
+        let served = Arc::new(Mutex::new(Served::default()));
+        let keychain = kept_at_launch(&served);
         let connection = connection(&served, keychain, cx);
         connection.update(cx, |c, cx| c.connect(cx));
         until(cx, "the kept sign-in", |cx| {
@@ -3415,7 +3285,6 @@ mod tests {
     async fn sign_in_details_that_could_not_be_read_are_read_again(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let served = Arc::new(Mutex::new(Served {
-            lives: 300,
             fails_metadata: 1,
             ..Served::default()
         }));
@@ -3464,7 +3333,6 @@ mod tests {
     ) {
         cx.executor().allow_parking();
         let served = Arc::new(Mutex::new(Served {
-            lives: 300,
             issuer: format!("{SERVER}/oauth"),
             hold_metadata: true,
             ..Served::default()
@@ -3494,9 +3362,7 @@ mod tests {
         });
         browser.join().unwrap();
         connection.update(cx, |c, cx| c.sign_out(cx));
-        until(cx, "the revocation", |_| {
-            served.lock().unwrap().log.iter().any(|l| l == "revoke r1")
-        });
+        until(cx, "the revocation", |_| logged(&served, "revoke r1"));
         let requests = served.lock().unwrap().requests.clone();
         // The exchange went through the client its sign-in started with, the one discovery
         // finished under; what the sign-in kept takes the newest.
@@ -3524,7 +3390,6 @@ mod tests {
     #[test]
     fn a_dropped_ask_leaves_its_refresh_to_finish() {
         let served = Arc::new(Mutex::new(Served {
-            lives: 300,
             hold_token: true,
             ..Served::default()
         }));
@@ -3608,10 +3473,7 @@ mod tests {
     /// delete; an earlier sign-in it holds instead stays said, as the next launch reads that one.
     #[test]
     fn a_rotation_the_keychain_refuses_leaves_what_it_holds_said() {
-        let served = Arc::new(Mutex::new(Served {
-            lives: 300,
-            ..Served::default()
-        }));
+        let served = Arc::new(Mutex::new(Served::default()));
         let service = discovered(&served);
         let keychain = Arc::new(MemoryKeychain::default());
         let key = key("work");
@@ -3696,10 +3558,7 @@ mod tests {
     /// sign-in while its token still held, up to a minute early.
     #[test]
     fn a_grant_without_a_refresh_token_stands_until_its_token_ends() {
-        let served = Arc::new(Mutex::new(Served {
-            lives: 300,
-            ..Served::default()
-        }));
+        let served = Arc::new(Mutex::new(Served::default()));
         let expires_at = SystemTime::now() + Duration::from_secs(3);
         let source = OAuthSource::signed_in(
             discovered(&served),
@@ -3755,10 +3614,7 @@ mod tests {
     /// is said with the sign-out, as the next launch reads it.
     #[test]
     fn a_grant_the_service_ended_says_what_the_keychain_kept() {
-        let served = Arc::new(Mutex::new(Served {
-            lives: 300,
-            ..Served::default()
-        }));
+        let served = Arc::new(Mutex::new(Served::default()));
         let service = discovered(&served);
         let keychain = Arc::new(MemoryKeychain::default());
         let key = key("work");
@@ -3798,7 +3654,6 @@ mod tests {
         // says, and what the keychain and the service's log hold after.
         let dropped_during_refresh = |refuses_writes: bool| {
             let served = Arc::new(Mutex::new(Served {
-                lives: 300,
                 hold_token: true,
                 ..Served::default()
             }));
@@ -3876,7 +3731,6 @@ mod tests {
     #[test]
     fn a_replaced_sign_in_waits_for_no_refresh_and_leaves_the_item_after() {
         let served = Arc::new(Mutex::new(Served {
-            lives: 300,
             hold_token: true,
             ..Served::default()
         }));
@@ -4018,7 +3872,6 @@ mod tests {
             (400, "temporarily_unavailable"),
         ] {
             let served = Arc::new(Mutex::new(Served {
-                lives: 300,
                 fails_tokens: 1,
                 fails_status: status,
                 fails_error: error,
@@ -4057,7 +3910,6 @@ mod tests {
     #[test]
     fn an_ask_joins_the_refresh_under_way() {
         let served = Arc::new(Mutex::new(Served {
-            lives: 300,
             token_down: true,
             hold_token: true,
             ..Served::default()
@@ -4134,7 +3986,6 @@ mod tests {
     #[test]
     fn a_refresh_that_answers_after_its_sign_out_keeps_nothing() {
         let served = Arc::new(Mutex::new(Served {
-            lives: 300,
             hold_token: true,
             ..Served::default()
         }));
@@ -4208,10 +4059,7 @@ mod tests {
     ) {
         cx.executor().allow_parking();
         // A kept refresh token the service no longer honours: signed out, and forgotten.
-        let served = Arc::new(Mutex::new(Served {
-            lives: 300,
-            ..Served::default()
-        }));
+        let served = Arc::new(Mutex::new(Served::default()));
         let keychain = Arc::new(MemoryKeychain::default());
         let key = key("work");
         keychain
@@ -4271,10 +4119,7 @@ mod tests {
 
     #[gpui::test]
     async fn a_server_given_a_token_by_the_cli_is_not_signed_in_to(cx: &mut TestAppContext) {
-        let served = Arc::new(Mutex::new(Served {
-            lives: 300,
-            ..Served::default()
-        }));
+        let served = Arc::new(Mutex::new(Served::default()));
         let connection = connection(&served, Arc::default(), cx);
         connection.update(cx, |c, cx| {
             *c = std::mem::replace(

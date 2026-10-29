@@ -58,15 +58,6 @@ impl Clients {
             self.elsewhere.clone()
         }
     }
-
-    /// The client for a request to `url`.
-    pub fn for_url(&self, url: &Url) -> &dyn HttpClient {
-        if url.origin() == self.endpoint.origin() {
-            self.at_endpoint.as_ref()
-        } else {
-            self.elsewhere.as_ref()
-        }
-    }
 }
 
 /// The resource a server's tokens are issued for, and the one authorization server that issues
@@ -296,7 +287,7 @@ async fn fetch_answer(
     url: &Url,
     what: &str,
 ) -> Result<(StatusCode, Option<Map<String, Value>>), Refusal> {
-    let answer = fetch::get(clients.for_url(url), url, METADATA_TIMEOUT)
+    let answer = fetch::get(clients.client_for(url).as_ref(), url, METADATA_TIMEOUT)
         .await
         .map_err(|why| Refusal(format!("{what} could not be read: {why}.")))?;
     if answer.body.is_none() {

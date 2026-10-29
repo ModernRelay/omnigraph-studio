@@ -231,12 +231,16 @@ async fn request(
     }
     checked(&body, expected, SystemTime::now()).map_err(|why| TokenError::Unusable {
         why,
-        refresh_token: body
-            .get("refresh_token")
-            .and_then(Value::as_str)
-            .filter(|token| !token.is_empty())
-            .map(str::to_owned),
+        refresh_token: refresh_token(&body),
     })
+}
+
+/// The refresh token an answer gives, if any.
+fn refresh_token(body: &Map<String, Value>) -> Option<String> {
+    body.get("refresh_token")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
 }
 
 /// The answer's tokens, if they may be used: a `Bearer` access token that lives at most 300
@@ -314,11 +318,7 @@ fn checked(
     let lives = Duration::from_secs(expires_in);
     Ok(Tokens {
         access_token: access_token.to_owned(),
-        refresh_token: body
-            .get("refresh_token")
-            .and_then(Value::as_str)
-            .filter(|token| !token.is_empty())
-            .map(str::to_owned),
+        refresh_token: refresh_token(body),
         expires_at: now + lives,
         account: Account {
             subject: subject.to_owned(),
