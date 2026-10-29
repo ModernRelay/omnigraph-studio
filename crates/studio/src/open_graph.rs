@@ -226,9 +226,7 @@ impl OpenGraphModal {
             .collect();
         if let Some(selected) = &self.selected {
             let connection = selected.read(cx);
-            if connection.state == ConnectionState::Unauthorized
-                && connection.sign_in == SignIn::NotOffered
-            {
+            if connection.asks_token() {
                 places.push(Place::Token);
             }
             places.extend(connection.graph_ids().into_iter().map(Place::Graph));
@@ -630,9 +628,7 @@ impl OpenGraphModal {
         let holds_sign_in = c.holds_sign_in();
         // A token typed in replaces one the server refused, or one the CLI would not give to a
         // server that asks for one. A server that offers a sign-in is signed in to instead.
-        let asks_token = state == ConnectionState::Unauthorized
-            && sign_in == SignIn::NotOffered
-            && !c.sign_in_under_way();
+        let asks_token = c.asks_token();
         let token_tooltip = token_tooltip(c, self.platform);
         let selected = connection.clone();
         let listing_note = match &c.graphs {
@@ -1340,6 +1336,25 @@ mod tests {
             modal.select(beta.clone(), window, cx)
         });
         assert_eq!(typed(cx), "beta-kept");
+    }
+
+    /// The keyboard reaches the token field only where it is drawn: for a server that refused its
+    /// token and offers no sign-in, with none under way. Before, a sign-in finishing after a drop
+    /// hid the field while the keyboard could still move to it, and what was typed went to a
+    /// field nobody saw.
+    #[gpui::test]
+    fn the_keyboard_reaches_the_token_field_only_where_it_is_drawn(cx: &mut TestAppContext) {
+        let refused = server(&["one"], cx);
+        refused.update(cx, |connection, _| {
+            connection.state = ConnectionState::Unauthorized
+        });
+        let (modal, cx) = dialog(vec![refused.clone()], cx);
+        let reaches_token = |cx: &mut VisualTestContext| {
+            modal.read_with(cx, |modal, cx| modal.places(cx).contains(&Place::Token))
+        };
+        assert!(reaches_token(cx));
+        refused.update(cx, |connection, _| connection.hold_sign_in_for_tests());
+        assert!(!reaches_token(cx), "a sign-in under way hides the field");
     }
 
     /// A server that offers a sign-in says where, while waiting says to finish in the browser,

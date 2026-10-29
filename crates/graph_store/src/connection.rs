@@ -1463,6 +1463,21 @@ impl Connection {
         }
     }
 
+    /// Whether the person is asked for a token: the server refused the one sent, or got none, and
+    /// offers no sign-in, with none under way (one finishing that a drop or a rename ended is kept
+    /// before anything else is asked).
+    pub fn asks_token(&self) -> bool {
+        self.state == ConnectionState::Unauthorized
+            && self.sign_in == SignIn::NotOffered
+            && self.signing_in.is_none()
+    }
+
+    /// Holds a sign-in under way, as a test's state.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold_sign_in_for_tests(&mut self) {
+        self.signing_in = Some(SigningIn::new(Task::ready(())));
+    }
+
     /// Whether a sign-in is under way, whatever the sign-in state says: one finishing that a drop
     /// or a rename ended is kept before anything else is offered.
     pub fn sign_in_under_way(&self) -> bool {
