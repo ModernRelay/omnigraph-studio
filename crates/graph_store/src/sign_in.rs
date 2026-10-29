@@ -3348,6 +3348,65 @@ mod tests {
         browser.join().unwrap();
     }
 
+    /// The sign-in held that the service ends while the details are read again for a sign-in
+    /// as someone else is said, should that sign-in not be taken: here, cancelled. Before, the
+    /// reason was dropped when the details came, and the cancelled sign-in said nothing of it.
+    #[gpui::test]
+    async fn why_the_one_held_ended_while_the_details_are_read_again_is_said(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served {
+            lives: 300,
+            ..Served::default()
+        }));
+        served.lock().unwrap().refresh.insert("kept".into());
+        let keychain = Arc::new(MemoryKeychain::default());
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
+        let connection = connection(&served, keychain, cx);
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the kept sign-in", |cx| {
+            sign_in_state(&connection, cx).0 == ConnectionState::Ready
+        });
+        // A sign-in as someone else fails, the one held standing.
+        served.lock().unwrap().fails_tokens = 1;
+        connection.update(cx, |c, cx| c.sign_in(cx));
+        let browser = approve(&served, &cx.opened_url().unwrap());
+        until(cx, "the sign-in as someone else failed", |cx| {
+            matches!(
+                sign_in_state(&connection, cx).1,
+                SignIn::Offered { why: Some(_), .. }
+            )
+        });
+        browser.join().unwrap();
+        assert!(connection.read_with(cx, |c, _| c.holds_sign_in()));
+
+        // The next reads the details again; meanwhile the service ends the one held.
+        served.lock().unwrap().hold_metadata = true;
+        connection.update(cx, |c, cx| c.sign_in(cx));
+        assert_eq!(sign_in_state(&connection, cx).1, SignIn::Reading);
+        served.lock().unwrap().refresh.clear();
+        connection.update(cx, |c, cx| c.read_refused(cx));
+        until(cx, "the one held ended", |cx| {
+            !connection.read_with(cx, |c, _| c.holds_sign_in())
+        });
+        served.lock().unwrap().hold_metadata = false;
+        until(cx, "waiting for the browser", |cx| {
+            matches!(sign_in_state(&connection, cx).1, SignIn::Waiting { .. })
+        });
+        connection.update(cx, |c, cx| c.cancel_sign_in(cx));
+        match sign_in_state(&connection, cx).1 {
+            SignIn::Offered { why: Some(why), .. } => {
+                assert!(why.contains("Sign in again"), "{why}")
+            }
+            other => panic!("why the one held ended is not said: {other:?}"),
+        }
+    }
+
     /// Sign-in details the server named that could not be read are read again: by Retry, which
     /// connects again, and by the health check that finds the server still asking for a
     /// sign-in. Before, "Sign-in unavailable" stood for the life of the connection, with no

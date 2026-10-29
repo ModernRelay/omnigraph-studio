@@ -830,10 +830,27 @@ enum LineAction {
 /// Retry beside it where connecting again is what helps (the server unreachable, the sign-in's
 /// service not answering).
 fn line_actions(c: &Connection) -> Vec<LineAction> {
-    let holds = c.holds_sign_in();
-    let retry = retries_on_select(c).then_some(LineAction::Retry);
-    match (&c.state, &c.sign_in) {
+    actions_for(
+        &c.state,
+        &c.sign_in,
+        c.holds_sign_in(),
+        retries_on_select(c),
+    )
+}
+
+/// [`line_actions`] for a server in `state` whose sign-in reads `sign_in`, one held (`holds`)
+/// or not, and connecting again helping (`retries`) or not.
+fn actions_for(
+    state: &ConnectionState,
+    sign_in: &SignIn,
+    holds: bool,
+    retries: bool,
+) -> Vec<LineAction> {
+    let retry = retries.then_some(LineAction::Retry);
+    match (state, sign_in) {
         (_, SignIn::Waiting { .. }) => vec![LineAction::CancelSignIn],
+        // Details read again for a sign-in as someone else, the one held standing.
+        (_, SignIn::Reading) if holds => vec![LineAction::SignOut],
         (_, SignIn::Finishing { .. }) => Vec::new(),
         (ConnectionState::Connecting, _) if holds => vec![LineAction::Cancel, LineAction::SignOut],
         // A sign-in as someone else that failed leaves the one held.
@@ -1445,6 +1462,40 @@ mod tests {
         assert_eq!(
             offers(ConnectionState::Ready, signed_in(), None, cx),
             [LineAction::SignOut]
+        );
+    }
+
+    /// A sign-in held offers Sign out wherever it stands: while the details are read again for
+    /// a sign-in as someone else, and while connecting. Before, reading them again offered
+    /// nothing, the one held standing.
+    #[gpui::test]
+    fn a_sign_in_held_offers_sign_out_while_another_is_read(_: &mut TestAppContext) {
+        assert_eq!(
+            actions_for(
+                &ConnectionState::Unauthorized,
+                &SignIn::Reading,
+                true,
+                false
+            ),
+            [LineAction::SignOut]
+        );
+        assert_eq!(
+            actions_for(
+                &ConnectionState::Unauthorized,
+                &SignIn::Reading,
+                false,
+                false
+            ),
+            []
+        );
+        assert_eq!(
+            actions_for(
+                &ConnectionState::Connecting,
+                &SignIn::NotOffered,
+                true,
+                false
+            ),
+            [LineAction::Cancel, LineAction::SignOut]
         );
     }
 
