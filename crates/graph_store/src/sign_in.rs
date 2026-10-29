@@ -284,6 +284,15 @@ pub struct Service {
 }
 
 impl Service {
+    /// Revokes `refresh` through `http` where the service publishes a revocation endpoint: once,
+    /// within 10 seconds, and not retried (spec 016, Custody). The sign-in ends whatever the
+    /// service answers.
+    async fn revoke(&self, http: &dyn HttpClient, refresh: &str) {
+        oauth_client::revoke(http, &self.server, &self.client_id, refresh)
+            .await
+            .ok();
+    }
+
     /// The sign-in service's host, as the person reads it.
     pub fn host(&self) -> String {
         oauth_client::host_of(&self.server.issuer)
@@ -576,11 +585,10 @@ impl OAuthSource {
             if kept != Kept::This
                 && let Some(refresh) = refresh
             {
-                let service = &inner.service;
-                let http = inner.token_client();
-                oauth_client::revoke(http.as_ref(), &service.server, &service.client_id, &refresh)
-                    .await
-                    .ok();
+                inner
+                    .service
+                    .revoke(inner.token_client().as_ref(), &refresh)
+                    .await;
             }
             done.send(kept).ok();
         })
@@ -604,16 +612,10 @@ impl OAuthSource {
             };
             let revocation = async move {
                 if let Some(refresh) = refresh {
-                    let service = &inner.service;
-                    let http = inner.token_client();
-                    oauth_client::revoke(
-                        http.as_ref(),
-                        &service.server,
-                        &service.client_id,
-                        &refresh,
-                    )
-                    .await
-                    .ok();
+                    inner
+                        .service
+                        .revoke(inner.token_client().as_ref(), &refresh)
+                        .await;
                 }
             }
             .boxed();
@@ -659,9 +661,7 @@ impl Drop for Unclaimed {
         let service = self.service.clone();
         smol::spawn(async move {
             let http = service.clients.for_url(&service.server.token_endpoint);
-            oauth_client::revoke(http, &service.server, &service.client_id, &refresh)
-                .await
-                .ok();
+            service.revoke(http, &refresh).await;
         })
         .detach();
     }
