@@ -70,10 +70,10 @@ jobs:
           git config --global core.longpaths true
           echo "CARGO_NET_GIT_FETCH_WITH_CLI=true" >> "$GITHUB_ENV"
         shell: bash
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The scripts read TOML with Python's tomllib (3.11+); Ubuntu 22.04 has 3.10.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -160,7 +160,7 @@ jobs:
           cp target/bundle/*.dmg target/bundle/*.tar.gz target/bundle/*.zip dist/ 2>/dev/null || true
           ls -la dist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: dist/*
@@ -178,7 +178,7 @@ jobs:
     runs-on: ubuntu-24.04
     environment: update-signing
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Whether the update key is published
         id: key
@@ -187,7 +187,7 @@ jobs:
             echo "published=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         if: steps.key.outputs.published == 'true'
         with:
           name: macos-arm64
@@ -229,7 +229,7 @@ jobs:
             minisign -V -p "$RUNNER_TEMP/update.pub" -m "$update" -x "$RUNNER_TEMP/update.minisig"
           done
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: steps.key.outputs.published == 'true'
         with:
           name: update-signature
@@ -244,9 +244,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
