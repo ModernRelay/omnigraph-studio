@@ -1192,109 +1192,111 @@ impl Connection {
                 Err(why) => (Err(why), None),
             };
             // Finishing from here, not to be cancelled: the sign-in this one replaces (another
-            // account, after Not admitted) ends in its turn.
-            let mut turn = None;
-            let mut earlier = None;
-            if signed_in.is_ok() {
-                let Ok(taken) = this.update(cx, |this, cx| {
-                    this.sign_in = SignIn::Finishing {
-                        service: service.host(),
-                    };
-                    // The one it replaces: held, or ended by the service meanwhile.
-                    let previous = match &mut this.signing_in {
-                        Some(under_way) => {
-                            under_way.finish = Some(Finish::Take);
-                            this.oauth
-                                .clone()
-                                .or_else(|| under_way.replaced.take().map(|(previous, _)| previous))
-                        }
-                        None => this.oauth.clone(),
-                    };
-                    cx.emit(ConnectionEvent::StateChanged);
-                    cx.notify();
-                    (context.turns.next(&service.key(&target)), previous)
-                }) else {
-                    return;
-                };
-                let ((before, done), previous) = taken;
-                turn = Some(done);
-                if let Some(before) = before {
-                    before.await;
-                }
-                // One account per target: the one replaced ends, its refresh token revoked, and
-                // the keychain keeps only the new one's, or none, never the old account's.
-                let previous_holds_item = previous
-                    .as_ref()
-                    .is_some_and(|previous| previous.kept_in_keychain() == Kept::This);
-                if let Some(previous) = previous {
-                    previous.end(End::Replaced, None).await;
-                }
-                // An earlier item that one does not answer for (left by a sign-in that ended,
-                // for the next launch) is written over or forgotten below.
-                if !previous_holds_item {
-                    earlier = context
-                        .keychain
-                        .read(service.key(&target))
-                        .await
-                        .ok()
-                        .flatten();
-                }
-            }
-            let kept = match &signed_in {
+            // account, after Not admitted) ends in its turn, and the keychain work runs on its own
+            // to its end, the connection released meanwhile or not.
+            let signed_in = match signed_in {
                 Ok(tokens) => {
-                    let written = match &tokens.refresh_token {
-                        Some(refresh) => context
-                            .keychain
-                            .write(
-                                service.key(&target),
-                                tokens.account.subject.clone(),
-                                refresh.as_bytes().to_vec(),
-                            )
-                            .await
-                            .is_ok(),
-                        None => false,
+                    let Ok(taken) = this.update(cx, |this, cx| {
+                        this.sign_in = SignIn::Finishing {
+                            service: service.host(),
+                        };
+                        // The one it replaces: held, or ended by the service meanwhile.
+                        let previous = match &mut this.signing_in {
+                            Some(under_way) => {
+                                under_way.finish = Some(Finish::Take);
+                                this.oauth.clone().or_else(|| {
+                                    under_way.replaced.take().map(|(previous, _)| previous)
+                                })
+                            }
+                            None => this.oauth.clone(),
+                        };
+                        cx.emit(ConnectionEvent::StateChanged);
+                        cx.notify();
+                        (
+                            context.turns.next(&service.key(&target)),
+                            previous,
+                            this.current(service.clone()),
+                        )
+                    }) else {
+                        return;
                     };
-                    if written {
-                        Kept::This
-                    } else {
-                        // Kept or not, this sign-in leaves the keychain no earlier one: one it
-                        // will not delete is said, as the next launch would read it.
-                        sign_in::forgotten(context.keychain.as_ref(), service.key(&target)).await
+                    let ((before, done), previous, current) = taken;
+                    let keychain = context.keychain.clone();
+                    let key = service.key(&target);
+                    let refresh = tokens.refresh_token.clone();
+                    let subject = tokens.account.subject.clone();
+                    let (answer, answered) = oneshot::channel();
+                    cx.background_executor()
+                        .spawn(async move {
+                            if let Some(before) = before {
+                                before.await;
+                            }
+                            // One account per target: the one replaced ends, its refresh token
+                            // revoked, and the keychain keeps only the new one's, or none, never
+                            // the old account's.
+                            let previous_holds_item = previous
+                                .as_ref()
+                                .is_some_and(|previous| previous.kept_in_keychain() == Kept::This);
+                            if let Some(previous) = previous {
+                                previous.end(End::Replaced, None).await;
+                            }
+                            // An earlier item that one does not answer for (left by a sign-in that
+                            // ended, for the next launch) is written over or forgotten below.
+                            let earlier = if previous_holds_item {
+                                None
+                            } else {
+                                keychain
+                                    .read(key.clone())
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|(_, secret)| String::from_utf8(secret).ok())
+                                    .filter(|earlier| refresh.as_ref() != Some(earlier))
+                            };
+                            let written = match &refresh {
+                                Some(refresh) => keychain
+                                    .write(key.clone(), subject, refresh.as_bytes().to_vec())
+                                    .await
+                                    .is_ok(),
+                                None => false,
+                            };
+                            let kept = if written {
+                                Kept::This
+                            } else {
+                                // Kept or not, this sign-in leaves the keychain no earlier one:
+                                // one it will not delete is said, as the next launch would read it.
+                                sign_in::forgotten(keychain.as_ref(), key).await
+                            };
+                            // The earlier item's token: gone from the keychain, it is held by
+                            // nothing and revoked, through the client in use; still there (the
+                            // keychain would not let go), the sign-in keeps it, to revoke once the
+                            // item no longer holds it.
+                            let left = match (&kept, earlier) {
+                                (Kept::Left(_), earlier) => earlier,
+                                (_, Some(earlier)) => {
+                                    current.revoke(current.token_client(), earlier);
+                                    None
+                                }
+                                (_, None) => None,
+                            };
+                            done.send(()).ok();
+                            answer.send((kept, left)).ok();
+                        })
+                        .detach();
+                    match answered.await {
+                        Ok((kept, left)) => Ok((tokens, kept, left)),
+                        Err(_) => Err("Studio stopped before it kept the sign-in.".to_owned()),
                     }
                 }
-                Err(_) => Kept::Nothing,
+                Err(why) => Err(why),
             };
-            // The earlier item's token: gone from the keychain, it is held by nothing and revoked;
-            // still there (the keychain would not let go), the sign-in keeps it, to revoke once
-            // the item no longer holds it.
-            let earlier = earlier
-                .and_then(|(_, secret)| String::from_utf8(secret).ok())
-                .filter(|token| {
-                    signed_in
-                        .as_ref()
-                        .ok()
-                        .and_then(|t| t.refresh_token.as_ref())
-                        != Some(token)
-                });
-            let (mut let_go, left) = match (&kept, earlier) {
-                (Kept::Left(_), earlier) => (None, earlier),
-                (_, earlier) => (earlier, None),
-            };
-            let fallback = service.clone();
-            if let Some(done) = turn {
-                done.send(()).ok();
-            }
             let taken = this.update(cx, |this, cx| {
                 let (finish, replaced) = this.signing_in.take().map_or((None, None), |under_way| {
                     (under_way.finish, under_way.replaced)
                 });
                 let service = this.current(service);
-                // Through the client in use now.
-                if let Some(token) = let_go.take() {
-                    service.revoke(service.token_client(), token);
-                }
                 match signed_in {
-                    Ok(tokens) => {
+                    Ok((tokens, kept, left)) => {
                         let source = OAuthSource::signed_in(
                             service,
                             &target,
@@ -1339,10 +1341,6 @@ impl Connection {
                 && let Some(unclaimed) = unclaimed
             {
                 unclaimed.claim();
-            }
-            // The connection gone: the earlier token is revoked all the same.
-            if let Some(token) = let_go {
-                fallback.revoke(fallback.token_client(), token);
             }
         })));
     }

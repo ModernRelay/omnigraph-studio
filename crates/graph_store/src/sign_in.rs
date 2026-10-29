@@ -2357,8 +2357,12 @@ mod tests {
         keychain.refuses_deletes.store(true, Ordering::SeqCst);
         let connection = connection(&served, keychain.clone(), cx);
         connection.update(cx, |c, cx| c.connect(cx));
-        until(cx, "the offer", |cx| {
-            matches!(sign_in_state(&connection, cx).1, SignIn::Offered { .. })
+        // The earlier item is read at launch, refreshed, and refused: the offer that follows.
+        until(cx, "the earlier sign-in refused", |cx| {
+            matches!(
+                sign_in_state(&connection, cx).1,
+                SignIn::Offered { why: Some(_), .. }
+            )
         });
         connection.update(cx, |c, cx| c.sign_in(cx));
         let browser = approve(&served, &cx.opened_url().unwrap());
@@ -2385,6 +2389,63 @@ mod tests {
             logged("revoke earlier")
         });
         assert_eq!(kept(&connection, cx), Kept::This);
+    }
+
+    /// A connection released while a sign-in finishes (its target gone from the CLI) lets the
+    /// sign-in's keychain work finish, which runs on its own: the write over an earlier item
+    /// lands, and that item's token, held by nothing then, is revoked; the new token, which
+    /// nobody takes, is revoked too. Before, the release cut the work off mid-write, and the
+    /// earlier token, overwritten, was left with nobody.
+    #[gpui::test]
+    async fn a_connection_released_while_a_sign_in_finishes_lets_it_finish(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served {
+            lives: 300,
+            ..Served::default()
+        }));
+        let keychain = Arc::new(MemoryKeychain::default());
+        // An earlier item the keychain will not let go of at launch: said as left.
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key("work"), ("user_9".into(), b"earlier".to_vec()));
+        keychain.refuses_deletes.store(true, Ordering::SeqCst);
+        let connection = connection(&served, keychain.clone(), cx);
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the earlier sign-in refused", |cx| {
+            matches!(
+                sign_in_state(&connection, cx).1,
+                SignIn::Offered { why: Some(_), .. }
+            )
+        });
+        keychain.refuses_deletes.store(false, Ordering::SeqCst);
+        let (release, gate) = oneshot::channel::<()>();
+        *keychain.write_gate.lock().unwrap() = Some(gate.shared());
+        let writes = keychain.writes.load(Ordering::SeqCst);
+        connection.update(cx, |c, cx| c.sign_in(cx));
+        let browser = approve(&served, &cx.opened_url().unwrap());
+        until(cx, "the new sign-in's write under way", |_| {
+            keychain.writes.load(Ordering::SeqCst) > writes
+        });
+        browser.join().unwrap();
+        let released = connection.downgrade();
+        drop(connection);
+        cx.update(|_| {});
+        cx.run_until_parked();
+        assert!(released.upgrade().is_none(), "the connection released");
+        release.send(()).unwrap();
+        let logged = |line: &str| served.lock().unwrap().log.iter().any(|l| l == line);
+        until(cx, "the earlier token revoked", |_| {
+            logged("revoke earlier")
+        });
+        until(cx, "the token nobody took revoked", |_| logged("revoke r1"));
+        assert_eq!(
+            keychain.items.lock().unwrap()[&key("work")].1,
+            b"r1".to_vec()
+        );
     }
 
     /// A sign-out while a sign-in as someone else finishes: nothing is offered until that one is
@@ -2645,7 +2706,9 @@ mod tests {
             served.lock().unwrap().issued > issued
         });
         until(cx, "the renewal taken", |cx| {
-            connection.read_with(cx, |c, _| c.lease_ends()) != lease
+            connection
+                .read_with(cx, |c, _| c.lease_ends())
+                .is_some_and(|ends| Some(ends) != lease)
         });
         assert!(
             matches!(sign_in_state(&connection, cx).1, SignIn::Waiting { .. }),
@@ -3626,8 +3689,9 @@ mod tests {
     }
 
     /// An ask made while a refresh is under way joins it, and gets its answer: a refresh that
-    /// fails is not begun again by every ask that waited for it. Before, a waiting ask could
-    /// join only in the moment the refresh began, and after a failure began its own.
+    /// fails is not begun again by every ask that waited for it, and one the server's refusal
+    /// asked for meanwhile takes the new token the refresh under way gives. Before, a waiting
+    /// ask could join only in the moment the refresh began; after it, it refreshed again.
     #[test]
     fn an_ask_joins_the_refresh_under_way() {
         let served = Arc::new(Mutex::new(Served {
@@ -3660,8 +3724,8 @@ mod tests {
         while refreshes() == 0 {
             std::thread::sleep(Duration::from_millis(5));
         }
-        // The second ask, polled once while the first's answer is held: under way before the
-        // first's refresh ends. Waiting either way; the count below tells joining from not.
+        // The second ask, polled once while the first's answer is held, so it is under way
+        // before that refresh ends.
         let mut second = source.token(Arc::default());
         smol::block_on(async {
             assert!(futures::poll!(&mut second).is_pending());
@@ -3670,6 +3734,34 @@ mod tests {
         assert!(smol::block_on(first).is_err());
         assert!(smol::block_on(second).is_err());
         assert_eq!(refreshes(), 2, "one refresh and its retry, for both asks");
+
+        // The server refuses the token held while a refresh is under way: an ask after that
+        // takes the refresh's new token, and no second refresh begins.
+        {
+            let mut served = served.lock().unwrap();
+            served.token_down = false;
+            served.hold_token = true;
+        }
+        let first = {
+            let source = source.clone();
+            smol::spawn(async move { source.token(Arc::default()).await })
+        };
+        while refreshes() == 2 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        source.note_refused();
+        let mut second = source.token(Arc::default());
+        smol::block_on(async {
+            assert!(futures::poll!(&mut second).is_pending());
+        });
+        served.lock().unwrap().hold_token = false;
+        assert!(smol::block_on(first).is_ok());
+        assert!(smol::block_on(second).is_ok());
+        assert_eq!(
+            refreshes(),
+            3,
+            "the second ask joined the refresh under way"
+        );
     }
 
     /// A refresh the service answers after its sign-in was signed out keeps nothing in the

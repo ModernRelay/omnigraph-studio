@@ -684,6 +684,10 @@ impl OpenGraphModal {
                         ),
                         // Its tokens given, the sign-in is being kept: not to be cancelled.
                         (_, SignIn::Finishing { .. }) => row,
+                        // Connecting with a sign-in held: either.
+                        (ConnectionState::Connecting, _) if holds_sign_in => row
+                            .child(cancel_button(&selected, cx))
+                            .child(sign_out_button(&selected, cx)),
                         (ConnectionState::Unauthorized, SignIn::Offered { service, .. }) => row
                             .child(
                                 studio_ui::ds::button("sign-in", "Sign in")
@@ -702,14 +706,11 @@ impl OpenGraphModal {
                             .when(holds_sign_in, |row| {
                                 row.child(sign_out_button(&selected, cx))
                             }),
-                        // The same in any other state but connecting, the one held admitted
-                        // meanwhile or the server unreachable.
-                        (state, SignIn::Offered { .. })
-                            if holds_sign_in && *state != ConnectionState::Connecting =>
-                        {
-                            row.child(sign_out_button(&selected, cx))
-                                .when(offers_retry, |row| row.child(retry_button(&selected, cx)))
-                        }
+                        // The same in any other state, the one held admitted meanwhile or the
+                        // server unreachable.
+                        (_, SignIn::Offered { .. }) if holds_sign_in => row
+                            .child(sign_out_button(&selected, cx))
+                            .when(offers_retry, |row| row.child(retry_button(&selected, cx))),
                         (ConnectionState::Unauthorized, SignIn::SignedIn { .. }) => row
                             .child(
                                 studio_ui::ds::button("sign-in-again", "Sign in as someone else")
@@ -723,13 +724,7 @@ impl OpenGraphModal {
                             )
                             .child(sign_out_button(&selected, cx)),
                         (_, SignIn::SignedIn { .. }) => row.child(sign_out_button(&selected, cx)),
-                        (ConnectionState::Connecting, _) => row.child(
-                            studio_ui::ds::button("cancel-connect", "Cancel")
-                                .style(ButtonStyle::Subtle)
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    selected.update(cx, |c, cx| c.cancel(cx));
-                                })),
-                        ),
+                        (ConnectionState::Connecting, _) => row.child(cancel_button(&selected, cx)),
                         _ if offers_retry => row.child(retry_button(&selected, cx)),
                         _ => row,
                     }),
@@ -879,6 +874,13 @@ fn sign_out_button(selected: &Entity<Connection>, cx: &mut Context<OpenGraphModa
             "Forgets this sign-in, and asks the sign-in service to end it where it can.",
         ))
         .on_click(cx.listener(move |_, _, _, cx| selected.update(cx, |c, cx| c.sign_out(cx))))
+}
+
+fn cancel_button(selected: &Entity<Connection>, cx: &mut Context<OpenGraphModal>) -> ds::Button {
+    let selected = selected.clone();
+    studio_ui::ds::button("cancel-connect", "Cancel")
+        .style(ButtonStyle::Subtle)
+        .on_click(cx.listener(move |_, _, _, cx| selected.update(cx, |c, cx| c.cancel(cx))))
 }
 
 fn retry_button(selected: &Entity<Connection>, cx: &mut Context<OpenGraphModal>) -> ds::Button {
