@@ -375,11 +375,16 @@ impl Connection {
         if source.is_none() && self.oauth.is_some() {
             return;
         }
+        let was_ready = self.token_ready();
         if source.is_some() {
             self.drop_sign_in(cx);
         }
         let had = self.token_source.is_some();
         self.token_source = source;
+        // A window waiting for the old source's answer reads without a token now.
+        if !was_ready && self.token_ready() {
+            cx.emit(ConnectionEvent::TokenReady);
+        }
         // The token held is the old source's: the new one's failure does not keep it.
         self.token_from_source = false;
         if self.token_source.is_some() {
@@ -1188,7 +1193,11 @@ impl Connection {
         let Some(source) = self.oauth.take() else {
             return;
         };
+        let was_ready = self.token_ready();
         self.token_source = None;
+        if !was_ready {
+            cx.emit(ConnectionEvent::TokenReady);
+        }
         self.lease = None;
         self._renewal = None;
         self.custody += 1;
@@ -1696,6 +1705,32 @@ mod tests {
             assert!(c.token_ready(), "the waiting window gets its token");
             assert_eq!(c.state, ConnectionState::Idle);
         });
+
+        // The same, the target made anonymous instead: the window hears the token is ready.
+        let waited = Arc::new(Gated::default());
+        let connection = gated_server(waited.clone(), cx);
+        let readied = Rc::new(std::cell::Cell::new(0));
+        let heard = readied.clone();
+        let _heard = cx.update(|cx| {
+            cx.subscribe(&connection, move |_, event: &ConnectionEvent, _| {
+                if matches!(event, ConnectionEvent::TokenReady) {
+                    heard.set(heard.get() + 1);
+                }
+            })
+        });
+        let (_answer, gate) = oneshot::channel::<Token>();
+        *waited.0.lock().unwrap() = Some(gate);
+        connection.update(cx, |c, cx| c.wait_for_token(cx));
+        cx.run_until_parked();
+        connection.update(cx, |c, cx| c.cancel(cx));
+        connection.update(cx, |c, cx| c.take_token_from(None, cx));
+        cx.run_until_parked();
+        connection.read_with(cx, |c, _| assert!(c.token_ready()));
+        assert_eq!(
+            readied.get(),
+            1,
+            "the waiting window heard the token is ready"
+        );
     }
 
     /// A token source that answers "first" at once, or, once given a gate, what comes through it.

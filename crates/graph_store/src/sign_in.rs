@@ -768,8 +768,14 @@ impl Inner {
                 // sign-out's delete is the last it hears of this sign-in; the rotated token is
                 // held for the sign-out to revoke, as the one it replaced no longer counts.
                 Ok(tokens) if self.ended.load(Ordering::SeqCst) => {
-                    if let Some(rotated) = tokens.refresh_token {
+                    if let Some(rotated) = tokens.refresh_token.filter(|new| *new != refresh) {
                         held.refresh = Some(rotated);
+                        // What the keychain holds of this sign-in no longer refreshes: whatever
+                        // ends it revokes the rotated token rather than leave it to the keychain.
+                        let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+                        if *kept == Kept::This {
+                            *kept = Kept::Nothing;
+                        }
                     }
                     return Err(NoToken::lasting("Signed out."));
                 }
@@ -2127,6 +2133,9 @@ mod tests {
         smol::block_on(revocation);
         let log = served.lock().unwrap().log.clone();
         assert!(log.contains(&"revoke r1".to_owned()), "{log:?}");
+        // What the keychain holds of it no longer refreshes, so whatever else ends it (the CLI's
+        // credential, deciding by this) revokes the rotated token too.
+        assert_eq!(source.kept_in_keychain(), Kept::Nothing);
     }
 
     #[gpui::test]
