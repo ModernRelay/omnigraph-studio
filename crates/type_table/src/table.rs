@@ -225,9 +225,13 @@ impl BulkDraft {
 /// The hover group of a grid row, for the actions its cells show under the pointer.
 const ROW_GROUP: &str = "table-row";
 
-/// Where the key column's content starts: the page's gutter, as the toolbar's title does,
+/// Where the key column's checkbox sits: the page's gutter, as the toolbar's title does,
 /// since the grid runs to the document's edges. The other cells keep a cell's inset.
 const KEY_INSET: f32 = space::EDGE;
+
+/// Where the key column's text starts: after its checkbox and a gap, so the text does not
+/// move when a row's checkbox shows.
+const KEY_TEXT_INSET: f32 = KEY_INSET + studio_ui::ds::size::CHECK + space::MD;
 
 use crate::peek::property_icon;
 
@@ -1575,10 +1579,10 @@ impl TypeTable {
         cx.notify();
     }
 
-    /// The bar over the table while rows are picked: how many, and setting one property on
-    /// all of them.
+    /// The bar over the table while rows are picked: how many, setting one property on all of
+    /// them, and deleting them.
     fn render_bulk_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.selection.len() < 2 {
+        if self.selection.is_empty() {
             return None;
         }
         let border = studio_ui::ds::surface::rule(cx);
@@ -1679,6 +1683,17 @@ impl TypeTable {
                     )
                 });
         }
+        // Deleting asks first, naming the rows, in its own dialog.
+        let delete_refused = self.write_refusal(cx);
+        bar = bar.child(
+            studio_ui::ds::button("bulk-delete", "Delete…")
+                .style(ButtonStyle::Outlined)
+                .disabled(delete_refused.is_some())
+                .tooltip(Tooltip::text(delete_refused.unwrap_or_else(|| {
+                    format!("Delete the {} selected", plural(count, "row", "rows"))
+                })))
+                .on_click(cx.listener(|this, _, window, cx| this.on_delete(&DeleteRow, window, cx))),
+        );
         Some(
             bar.children(self.bulk.notice.clone().map(|notice| {
                 studio_ui::ds::text::body(notice.message).color(notice.tone.color())
@@ -7020,7 +7035,7 @@ impl TypeTable {
                 // The key's header starts at the page's gutter, as its cells do.
                 let header = ruled(
                     studio_ui::ds::header_cell(kind, column.title.clone(), sorted.is_some())
-                        .when(index == 0, |header| header.pl(px(KEY_INSET))),
+                        .when(index == 0, |header| header.pl(px(KEY_TEXT_INSET))),
                     index,
                     cx,
                 )
@@ -7029,6 +7044,7 @@ impl TypeTable {
                 .relative()
                 .w_full()
                 .child(resize)
+                .when(index == 0, |header| header.child(self.render_all_check(cx)))
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -8221,10 +8237,104 @@ impl TypeTable {
             .clone()
             .iter()
             .map(|place| match *place {
+                // The key cell carries the row's checkbox, over its start.
+                GridPlace::Column(0) => div()
+                    .relative()
+                    .w_full()
+                    .child(self.render_cell(ix, 0, row, window, cx))
+                    .child(self.render_row_check(ix, &row.id, cx))
+                    .into_any_element(),
                 GridPlace::Column(col) => self.render_cell(ix, col, row, window, cx),
                 GridPlace::Gap(_) => div().into_any_element(),
             })
             .collect()
+    }
+
+    /// A row's checkbox, on the page's gutter in its key cell: shown under the pointer, and on
+    /// every row while any is checked, so a list nobody is picking from stays plain. A click
+    /// checks the row or takes it out, ⇧ checks the rows from the last one checked; it moves no
+    /// cursor and opens nothing.
+    fn render_row_check(&self, ix: usize, id: &str, cx: &mut Context<Self>) -> AnyElement {
+        let picked = self.selection.contains(id);
+        let shown = !self.selection.is_empty();
+        studio_ui::ds::check_box(("row-check", ix), ToggleState::from(picked), cx)
+            .debug_selector(move || format!("row-check-{ix}"))
+            .absolute()
+            .left(px(KEY_INSET))
+            .top(px((ROW_HEIGHT - studio_ui::ds::size::CHECK) / 2.))
+            .when(!shown, |check| {
+                check.invisible().group_hover(ROW_GROUP, |style| style.visible())
+            })
+            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                // The keyboard stays where it was, and the cell under the box hears nothing.
+                window.prevent_default();
+                cx.stop_propagation();
+            })
+            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                this.pick_rows(ix, event.modifiers().shift, cx);
+            }))
+            .into_any_element()
+    }
+
+    /// The key column's select-all: checks every loaded row, or, when every one is, takes them
+    /// all out; a dash while some are checked.
+    fn render_all_check(&self, cx: &mut Context<Self>) -> AnyElement {
+        let state = self.all_check_state();
+        let loaded = self.distinct_rows();
+        let tooltip = match state {
+            ToggleState::Selected => "Clear the selection (Esc)".to_owned(),
+            _ => format!("Select the {} loaded", plural(loaded, "row", "rows")),
+        };
+        studio_ui::ds::check_box("all-rows-check", state, cx)
+            .debug_selector(|| "all-rows-check".into())
+            .absolute()
+            .left(px(KEY_INSET))
+            .top(px((studio_ui::HEADER_HEIGHT - studio_ui::ds::size::CHECK) / 2.))
+            .tooltip(Tooltip::text(tooltip))
+            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                window.prevent_default();
+                cx.stop_propagation();
+            })
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.toggle_all_rows(cx);
+            }))
+            .into_any_element()
+    }
+
+    /// The select-all's state: none checked, every loaded row checked, or some.
+    fn all_check_state(&self) -> ToggleState {
+        if self.selection.is_empty() {
+            ToggleState::Unselected
+        } else if self.rows.iter().all(|row| self.selection.contains(&row.id)) {
+            ToggleState::Selected
+        } else {
+            ToggleState::Indeterminate
+        }
+    }
+
+    /// How many rows are loaded: grouped by a relationship, a row shows under each of its
+    /// neighbours, and counts once.
+    fn distinct_rows(&self) -> usize {
+        self.rows
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    /// Checks every loaded row, or takes them all out when every one is checked.
+    fn toggle_all_rows(&mut self, cx: &mut Context<Self>) {
+        if self.all_check_state() == ToggleState::Selected {
+            self.clear_selection(cx);
+            return;
+        }
+        self.selection
+            .extend(self.rows.iter().map(|row| row.id.clone()));
+        self.selection_anchor = None;
+        self.bulk.notice = None;
+        cx.notify();
     }
 
     /// The columns rows draw this frame: the pinned first, those in the horizontal view with
@@ -8335,7 +8445,7 @@ impl TypeTable {
             .h(px(ROW_HEIGHT))
             .w_full()
             .px(px(space::LG))
-            .when(col == 0, |d| d.pl(px(KEY_INSET)))
+            .when(col == 0, |d| d.pl(px(KEY_TEXT_INSET)))
             .flex()
             .items_center()
             .gap(px(space::XS))
@@ -12897,6 +13007,47 @@ mod tests {
             assert!(table.bulk.notice.is_none());
             assert_eq!(table.rows[0].value("name"), "Same");
         });
+    }
+
+    /// A row's checkbox checks it, or takes it out, without moving the cursor or opening
+    /// anything; the key column's select-all checks every loaded row, shows a dash while some
+    /// are, and takes them all out once all are; one checked row is enough for the bulk bar.
+    #[gpui::test]
+    async fn checkboxes_pick_rows_and_the_header_selects_all(cx: &mut TestAppContext) {
+        let session = session(PEOPLE, cx);
+        let (table, cx) = people_table(&session, cx);
+        cx.run_until_parked();
+        let click = |cx: &mut VisualTestContext, selector: &'static str| {
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} was not drawn"));
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        let picked = |cx: &mut VisualTestContext| {
+            table.read_with(cx, |table, _| {
+                table.selection.iter().cloned().collect::<Vec<String>>()
+            })
+        };
+        let state = |cx: &mut VisualTestContext| table.read_with(cx, |t, _| t.all_check_state());
+        let cursor = table.read_with(cx, |table, _| table.cursor);
+        assert_eq!(state(cx), ToggleState::Unselected);
+        click(cx, "all-rows-check");
+        assert_eq!(picked(cx), ["p1", "p2"]);
+        assert_eq!(state(cx), ToggleState::Selected);
+        // With a row checked every row's box shows, so the first row's takes it out.
+        click(cx, "row-check-0");
+        assert_eq!(picked(cx), ["p2"]);
+        assert_eq!(state(cx), ToggleState::Indeterminate);
+        table.update(cx, |table, cx| {
+            assert_eq!(table.cursor, cursor, "a checkbox moves no cursor");
+            assert!(table.render_bulk_bar(cx).is_some(), "one checked row has the bar");
+        });
+        click(cx, "all-rows-check");
+        assert_eq!(picked(cx), ["p2", "p1"]);
+        click(cx, "all-rows-check");
+        assert!(picked(cx).is_empty(), "all checked, the select-all takes them out");
+        table.update(cx, |table, cx| assert!(table.render_bulk_bar(cx).is_none()));
     }
 
     /// A grouped frame reads the Blob and relationship cells of the rows its lines show: a

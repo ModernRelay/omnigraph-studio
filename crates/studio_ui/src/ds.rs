@@ -2082,9 +2082,8 @@ pub fn menu_at(menu: impl IntoElement, position: gpui::Point<Pixels>) -> gpui::D
     .with_priority(1)
 }
 
-/// A checkbox and its label: a box of the scale's extra-small corner, filled with the ink
-/// and a check when on. Zed's `Checkbox` keeps a 2 px corner of its own. The caller handles
-/// the click and keeps the state; a disabled one recedes and takes no pointer.
+/// A checkbox and its label: a [`check_box`] and the label beside it. The caller handles the
+/// click and keeps the state; a disabled one recedes and takes no pointer.
 pub fn checkbox(
     id: impl Into<ElementId>,
     checked: bool,
@@ -2092,6 +2091,25 @@ pub fn checkbox(
     disabled: bool,
     cx: &App,
 ) -> Stateful<Div> {
+    h_flex()
+        .id(id.into())
+        .gap(px(space::SM))
+        .items_center()
+        .when(disabled, |row| row.opacity(opacity::DIMMED))
+        .when(!disabled, |row| row.cursor_pointer())
+        .child(check_mark(ui::ToggleState::from(checked), cx))
+        .child(text::body(label))
+}
+
+/// A checkbox without a label (a table row's, a column's select-all): a box of the scale's
+/// extra-small corner, filled with the ink and a check when on, a dash when some of what it
+/// stands for is (`ToggleState::Indeterminate`). Zed's `Checkbox` keeps a 2 px corner of its
+/// own. The caller handles the click and keeps the state.
+pub fn check_box(id: impl Into<ElementId>, state: ui::ToggleState, cx: &App) -> Stateful<Div> {
+    check_mark(state, cx).id(id.into()).cursor_pointer()
+}
+
+fn check_mark(state: ui::ToggleState, cx: &App) -> Div {
     let ink = cx.theme().colors().text;
     let mark = div()
         .size(px(size::CHECK))
@@ -2101,23 +2119,19 @@ pub fn checkbox(
         .justify_center()
         .rounded(px(radii(cx).xs))
         .border_1();
-    let mark = if checked {
-        mark.bg(ink).border_color(ink).child(
-            Icon::new(IconName::Check)
+    let icon = match state {
+        ui::ToggleState::Selected => Some(IconName::Check),
+        ui::ToggleState::Indeterminate => Some(IconName::Dash),
+        ui::ToggleState::Unselected => None,
+    };
+    match icon {
+        Some(icon) => mark.bg(ink).border_color(ink).child(
+            Icon::new(icon)
                 .size(IconSize::XSmall)
                 .color(Color::Custom(surface::document(cx))),
-        )
-    } else {
-        lifted(mark.bg(surface::document(cx)), cx)
-    };
-    h_flex()
-        .id(id.into())
-        .gap(px(space::SM))
-        .items_center()
-        .when(disabled, |row| row.opacity(opacity::DIMMED))
-        .when(!disabled, |row| row.cursor_pointer())
-        .child(mark)
-        .child(text::body(label))
+        ),
+        None => lifted(mark.bg(surface::document(cx)), cx),
+    }
 }
 
 /// A severity's icon and its colour, shared by [`Banner`] and [`Callout`].
