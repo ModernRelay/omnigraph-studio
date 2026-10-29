@@ -2438,7 +2438,17 @@ mod tests {
         assert_eq!(std::fs::read(first.join("p1-photo.png")).unwrap(), b"one");
         let two_days_ago =
             std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 60 * 60);
-        std::fs::File::open(&first)
+        let mut folder = std::fs::OpenOptions::new();
+        folder.read(true);
+        // Windows opens a folder only with FILE_FLAG_BACKUP_SEMANTICS, and sets its times only
+        // through a handle with FILE_WRITE_ATTRIBUTES.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            folder.access_mode(0x0100).custom_flags(0x0200_0000);
+        }
+        folder
+            .open(&first)
             .unwrap()
             .set_modified(two_days_ago)
             .unwrap();
