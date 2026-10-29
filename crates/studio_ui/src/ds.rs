@@ -1004,12 +1004,7 @@ pub enum Status {
 /// either line up: for rows whose context already names the type, where a lettered mark would
 /// repeat it.
 pub fn type_dot(type_name: &str) -> Div {
-    icon_slot(
-        div()
-            .size(px(size::DOT))
-            .rounded_full()
-            .bg(studio_theme::type_color(type_name)),
-    )
+    icon_slot(dot(Color::Custom(studio_theme::type_color(type_name))))
 }
 
 /// A dot that beats while given its `beat` (a server that answers): each beat sends one ring
@@ -1067,15 +1062,6 @@ impl RenderOnce for Dot {
             .rounded_full()
             .bg(self.0.color(cx))
     }
-}
-
-/// A status dot.
-pub fn status_dot(status: Status) -> Div {
-    div()
-        .size(px(size::DOT))
-        .flex_none()
-        .rounded_full()
-        .bg(surface::status(status))
 }
 
 /// The glass window's wash, painted once behind everything: three soft fields of colour (warm
@@ -3113,7 +3099,7 @@ impl RenderOnce for ActivityRow {
             .px(px(space::EDGE))
             .gap(px(space::SM))
             .items_center()
-            .child(status_dot(self.status))
+            .child(dot(Color::Custom(surface::status(self.status))))
             .child(
                 Icon::new(self.actor_icon)
                     .size(IconSize::Small)
