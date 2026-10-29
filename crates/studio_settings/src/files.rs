@@ -79,12 +79,19 @@ pub fn run_in_turn(job: impl FnOnce() + Send + 'static) {
     writer().send(Job::Run(Box::new(job))).ok();
 }
 
-/// Waits, a few seconds at most, until every write asked for so far is done: at quit, so the
-/// last state is on disk.
+/// Waits until every write asked for so far is done: at quit, a few seconds at most, so the last
+/// state is on disk without holding the quit up. In a test build, as long as a loaded machine
+/// takes: every test in the process shares the one write thread, and a test that reads a file
+/// back after a capped wait could read it before its own write lands.
 pub fn writes_done() {
+    const WAIT: std::time::Duration = if cfg!(any(test, feature = "test-support")) {
+        std::time::Duration::from_secs(120)
+    } else {
+        std::time::Duration::from_secs(5)
+    };
     let (done, wait) = std::sync::mpsc::channel();
     if writer().send(Job::Done(done)).is_ok() {
-        wait.recv_timeout(std::time::Duration::from_secs(5)).ok();
+        wait.recv_timeout(WAIT).ok();
     }
 }
 
