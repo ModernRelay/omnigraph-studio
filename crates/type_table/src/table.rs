@@ -7240,6 +7240,9 @@ impl TypeTable {
                     .relative()
                     .flex_1()
                     .min_h_0()
+                    // The rows' fills and rules under their text: one layer of the scene, so a
+                    // frame orders them without a search per cell (the edit callout floats,
+                    // deferred, over them).
                     .child(table)
                     .child(wheel),
             )
@@ -13048,6 +13051,63 @@ mod tests {
         click(cx, "all-rows-check");
         assert!(picked(cx).is_empty(), "all checked, the select-all takes them out");
         table.update(cx, |table, cx| assert!(table.render_bulk_bar(cx).is_none()));
+    }
+
+    /// The time of a frame of a full table while its grid replays from its cache, as in every
+    /// frame an animation, a hover or a keystroke elsewhere in the window draws: GPUI builds the
+    /// whole scene each frame, and a cached view's quads and lines go back into its draw order.
+    #[gpui::test]
+    #[ignore = "instrument: prints the time of a frame of a 200-row, 20-column table, its grid cached"]
+    async fn instrument_a_frame_of_a_full_table(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        const COLUMNS: usize = 20;
+        let properties: String = (0..COLUMNS)
+            .map(|c| format!("  p{c:02}: String\n"))
+            .collect();
+        let schema = format!("node Wide {{\n  slug: String @key\n{properties}}}\n");
+        let rows: Vec<Value> = (0..200)
+            .map(|i| {
+                let mut node = serde_json::Map::new();
+                node.insert("@id".into(), format!("w{i}").into());
+                node.insert("slug".into(), format!("wide-{i:06}").into());
+                for c in 0..COLUMNS {
+                    node.insert(format!("p{c:02}"), format!("value {i}·{c}").into());
+                }
+                serde_json::json!({ "n": node })
+            })
+            .collect();
+        let session = crate::test_support::session_reading(&schema, Value::Array(rows), cx);
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Wide".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let frame = |cx: &mut VisualTestContext| {
+            table.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+        };
+        for _ in 0..30 {
+            frame(cx);
+        }
+        let frames = 600;
+        let started = std::time::Instant::now();
+        for _ in 0..frames {
+            frame(cx);
+        }
+        let drawn = table.read_with(cx, |table, _| table.rows.len());
+        eprintln!(
+            "{drawn} rows loaded: {:?} a frame over {frames}",
+            started.elapsed() / frames
+        );
     }
 
     /// A grouped frame reads the Blob and relationship cells of the rows its lines show: a
