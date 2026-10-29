@@ -2327,15 +2327,29 @@ exit 64
     fn a_probe_is_remembered_across_launches() {
         let _cache = probe_cache();
         let cli = StandIn::new("remembered");
+        // A probe's file is written on the write thread that every test in the process shares,
+        // and `writes_done` gives up after a few seconds, so the test waits for the file to show
+        // the write: one landing late would replace what the test writes after.
+        let program = serde_json::to_string(&cli.program).unwrap();
+        let settled = |what: &str, done: &dyn Fn(&str) -> bool| -> String {
+            for _ in 0..2000 {
+                if let Ok(text) = std::fs::read_to_string(probes_path())
+                    && done(&text)
+                {
+                    return text;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("timed out waiting for {what}");
+        };
         assert!(found(&cli.programs()).is_ok());
         assert_eq!(cli.calls(), ["version --json"]);
         // The next launch: nothing in memory, the data directory's file read again.
-        studio_settings::writes_done();
+        let kept = settled("the probe kept", &|text| text.contains(&program));
+        assert!(kept.contains(r#""0.14.0""#), "{kept}");
         forget_probes();
         assert!(found(&cli.programs()).is_ok());
         assert!(cli.calls().is_empty(), "asked nothing");
-        let kept = std::fs::read_to_string(probes_path()).unwrap();
-        assert!(kept.contains(r#""0.14.0""#), "{kept}");
 
         // Upgraded in place: its stamp changed, so it is asked again.
         let script = std::fs::read_to_string(&cli.program).unwrap();
@@ -2344,20 +2358,16 @@ exit 64
         assert_eq!(cli.calls(), ["version --json"]);
 
         // Kept by a Studio that asked something else of a CLI: probed again, under these.
-        studio_settings::writes_done();
-        let earlier = std::fs::read_to_string(probes_path())
-            .unwrap()
-            .replace(&requirements(), "HTTP contract 0.14, target protocol 1");
-        std::fs::write(probes_path(), earlier).unwrap();
+        let upgraded = settled("the upgrade kept", &|text| text != kept);
+        let earlier = upgraded.replace(&requirements(), "HTTP contract 0.14, target protocol 1");
+        assert_ne!(earlier, upgraded, "the requirements are in the file");
+        std::fs::write(probes_path(), &earlier).unwrap();
         forget_probes();
         assert!(found(&cli.programs()).is_ok());
         assert_eq!(cli.calls(), ["version --json"], "judged again");
-        studio_settings::writes_done();
-        assert!(
-            std::fs::read_to_string(probes_path())
-                .unwrap()
-                .contains(&requirements())
-        );
+        settled("the new judgment kept", &|text| {
+            text.contains(&requirements())
+        });
     }
 
     /// The sequences waiting for the CLI take it in the order they asked, but one a window
