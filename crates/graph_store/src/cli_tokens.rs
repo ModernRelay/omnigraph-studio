@@ -2288,8 +2288,10 @@ exit 64
             Duration::from_secs(10),
             1024,
         ));
-        let Ok(ran) = ran else {
-            panic!("the command's own answer, not the broken pipe");
+        let ran = match ran {
+            Ok(ran) => ran,
+            Err(Unrun::Timeout) => panic!("the command's own answer, not a timeout"),
+            Err(Unrun::Failed(error)) => panic!("the command's own answer, not: {error}"),
         };
         assert!(!ran.status.success());
         assert!(String::from_utf8_lossy(&ran.stderr).contains("lock refused"));
