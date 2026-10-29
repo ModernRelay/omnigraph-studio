@@ -1545,6 +1545,66 @@ mod tests {
         assert_eq!(kept(&keychain).as_deref(), Some("r4"));
     }
 
+    /// A window waiting for a kept sign-in's first token hears the token is ready when the person
+    /// signs out meanwhile: the connection reads without one from then on. Before, the window
+    /// waited until it was shown again.
+    #[gpui::test]
+    async fn a_sign_out_while_a_window_waits_says_the_token_is_ready(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served {
+            lives: 300,
+            hold_token: true,
+            ..Served::default()
+        }));
+        served.lock().unwrap().refresh.insert("kept".into());
+        let keychain = Arc::new(MemoryKeychain::default());
+        keychain.items.lock().unwrap().insert(
+            format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}"),
+            ("user_1".into(), b"kept".to_vec()),
+        );
+        let connection = connection(&served, keychain, cx);
+        let readied = std::rc::Rc::new(std::cell::Cell::new(0));
+        let heard = readied.clone();
+        let _heard = cx.update(|cx| {
+            cx.subscribe(
+                &connection,
+                move |_, event: &crate::connection::ConnectionEvent, _| {
+                    if matches!(event, crate::connection::ConnectionEvent::TokenReady) {
+                        heard.set(heard.get() + 1);
+                    }
+                },
+            )
+        });
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the kept sign-in's refresh", |_| {
+            served
+                .lock()
+                .unwrap()
+                .log
+                .iter()
+                .any(|line| line.starts_with("token refresh_token"))
+        });
+        connection.update(cx, |c, cx| c.wait_for_token(cx));
+        assert!(!connection.read_with(cx, |c, _| c.token_ready()));
+        connection.update(cx, |c, cx| c.sign_out(cx));
+        cx.run_until_parked();
+        assert!(connection.read_with(cx, |c, _| c.token_ready()));
+        assert_eq!(
+            readied.get(),
+            1,
+            "the waiting window heard the token is ready"
+        );
+        served.lock().unwrap().hold_token = false;
+        until(cx, "the sign-out's revocation", |_| {
+            served
+                .lock()
+                .unwrap()
+                .log
+                .iter()
+                .any(|line| line.starts_with("revoke"))
+        });
+    }
+
     #[gpui::test]
     async fn a_kept_sign_in_is_refreshed_without_a_browser_and_renewed_quietly(
         cx: &mut TestAppContext,
