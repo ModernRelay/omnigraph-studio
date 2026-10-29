@@ -702,11 +702,14 @@ impl OpenGraphModal {
                             .when(holds_sign_in, |row| {
                                 row.child(sign_out_button(&selected, cx))
                             }),
-                        // The same in any other state, the one held admitted meanwhile or the
-                        // server unreachable.
-                        (_, SignIn::Offered { .. }) if holds_sign_in => row
-                            .child(sign_out_button(&selected, cx))
-                            .when(offers_retry, |row| row.child(retry_button(&selected, cx))),
+                        // The same in any other state but connecting, the one held admitted
+                        // meanwhile or the server unreachable.
+                        (state, SignIn::Offered { .. })
+                            if holds_sign_in && *state != ConnectionState::Connecting =>
+                        {
+                            row.child(sign_out_button(&selected, cx))
+                                .when(offers_retry, |row| row.child(retry_button(&selected, cx)))
+                        }
                         (ConnectionState::Unauthorized, SignIn::SignedIn { .. }) => row
                             .child(
                                 studio_ui::ds::button("sign-in-again", "Sign in as someone else")

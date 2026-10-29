@@ -1264,14 +1264,23 @@ impl Connection {
                 }
                 Err(_) => Kept::Nothing,
             };
-            // The earlier item's token, gone from the keychain now, is held by nothing: revoked.
-            if let (Some((_, secret)), Ok(tokens)) = (earlier, &signed_in)
-                && !matches!(kept, Kept::Left(_))
-                && let Ok(token) = String::from_utf8(secret)
-                && tokens.refresh_token.as_ref() != Some(&token)
-            {
-                service.revoke(service.token_client(), token);
-            }
+            // The earlier item's token: gone from the keychain, it is held by nothing and revoked;
+            // still there (the keychain would not let go), the sign-in keeps it, to revoke once
+            // the item no longer holds it.
+            let earlier = earlier
+                .and_then(|(_, secret)| String::from_utf8(secret).ok())
+                .filter(|token| {
+                    signed_in
+                        .as_ref()
+                        .ok()
+                        .and_then(|t| t.refresh_token.as_ref())
+                        != Some(token)
+                });
+            let (mut let_go, left) = match (&kept, earlier) {
+                (Kept::Left(_), earlier) => (None, earlier),
+                (_, earlier) => (earlier, None),
+            };
+            let fallback = service.clone();
             if let Some(done) = turn {
                 done.send(()).ok();
             }
@@ -1279,14 +1288,20 @@ impl Connection {
                 let (finish, replaced) = this.signing_in.take().map_or((None, None), |under_way| {
                     (under_way.finish, under_way.replaced)
                 });
+                let service = this.current(service);
+                // Through the client in use now.
+                if let Some(token) = let_go.take() {
+                    service.revoke(service.token_client(), token);
+                }
                 match signed_in {
                     Ok(tokens) => {
                         let source = OAuthSource::signed_in(
-                            this.current(service),
+                            service,
                             &target,
                             context.keychain.clone(),
                             tokens,
                             kept,
+                            left,
                         );
                         match finish {
                             Some(Finish::End(how)) => {
@@ -1324,6 +1339,10 @@ impl Connection {
                 && let Some(unclaimed) = unclaimed
             {
                 unclaimed.claim();
+            }
+            // The connection gone: the earlier token is revoked all the same.
+            if let Some(token) = let_go {
+                fallback.revoke(fallback.token_client(), token);
             }
         })));
     }
@@ -1418,6 +1437,12 @@ impl Connection {
             Kept::Left(refused) => Some(refused),
             Kept::This | Kept::Nothing => None,
         }
+    }
+
+    /// When the token held ends, as a test's view of a renewal taken.
+    #[cfg(test)]
+    pub(crate) fn lease_ends(&self) -> Option<SystemTime> {
+        self.lease.as_ref().map(|lease| lease.expires_at)
     }
 
     /// Says what a sign-in that ended left in the keychain, as a test's state.
