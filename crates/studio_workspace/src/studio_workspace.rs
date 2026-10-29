@@ -2960,7 +2960,7 @@ impl Workspace {
     /// dot, the server and the graph. It opens the graph switcher: the graphs open in this
     /// window, another graph, closing this one. The connection's state shows beside it only
     /// when it is not ready, and always in its tooltip, with the round trip and the actor.
-    fn render_graph_switcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_graph_switcher(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (color, server, url, state, ready, actor, graph, unavailable) = match &self.session {
             Some(session) => {
                 let s = session.read(cx);
@@ -3028,7 +3028,13 @@ impl Workspace {
                     .px(px(studio_ui::ds::space::XS))
                     .gap(px(studio_ui::ds::space::SM))
                     .items_center()
-                    .child(Indicator::dot().color(color))
+                    // A ready server's dot beats while the window is in front.
+                    .child(studio_ui::ds::live_dot(
+                        "connection-dot",
+                        color.color(cx),
+                        ready && window.is_window_active(),
+                        cx,
+                    ))
                     .child(studio_ui::ds::text::muted(server).single_line())
                     .when_some(graph, |row, graph| {
                         row.child(studio_ui::ds::text::body("/").color(Color::Disabled))
@@ -3665,6 +3671,7 @@ impl Workspace {
     fn render_status_bar(
         &self,
         status: Option<ItemStatus>,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let status_background = studio_ui::ds::surface::status_bar(cx);
@@ -3696,7 +3703,7 @@ impl Workspace {
                     .child(self.render_panel_buttons(PanelPosition::Left, cx))
                     .child(studio_ui::ds::divider_v(cx))
             })
-            .child(self.render_graph_switcher(cx))
+            .child(self.render_graph_switcher(window, cx))
             .children(self.render_branch(cx))
             .when(has_start, |bar| bar.child(studio_ui::ds::divider_v(cx)))
             .children(status.start);
@@ -4724,7 +4731,7 @@ impl Render for Workspace {
                 .child(docks)
                 .children(self.render_zoomed(cx)),
         )
-        .child(self.render_status_bar(status, cx))
+        .child(self.render_status_bar(status, window, cx))
         .child(self.render_toasts(cx))
         .children(modal)
     }

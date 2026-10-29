@@ -16,6 +16,26 @@ use gpui::{App, Window};
 /// How long a change of place takes: long enough to follow, short enough not to wait for.
 pub const GLIDE: Duration = Duration::from_millis(220);
 
+/// A live dot's beat ([`crate::ds::live_dot`]): a ring goes out from the dot and fades in the
+/// first [`PULSE_RING`] of it, and the rest is still.
+pub const PULSE: Duration = Duration::from_millis(2000);
+
+/// The part of a [`PULSE`] the ring takes to go out and fade.
+pub const PULSE_RING: f32 = 0.6;
+
+/// How often ambient motion (a live dot's ring, a spinner) redraws its view at most. It runs
+/// for as long as a server is ready or work is under way, and each redraw renders the window's
+/// chrome again, so it takes 24 steps a second, which read as smooth for a dot's ring or a
+/// small icon turning once in two seconds, rather than every frame (60 to 120 a second).
+pub const AMBIENT_FPS: f32 = 24.;
+
+/// A ring's place in its beat: how far out it is (`0..=1`, eased as things arriving) and how
+/// visible (`1` to `0`), from the beat's linear progress `t`; still after [`PULSE_RING`].
+pub fn pulse(t: f32) -> (f32, f32) {
+    let out = (t / PULSE_RING).clamp(0., 1.);
+    (Ease::OutCubic.apply(out), 1. - out)
+}
+
 /// An easing curve over linear progress `0..=1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ease {
@@ -125,6 +145,20 @@ mod tests {
         }
         // Out-cubic is past halfway at a quarter of the time: arriving things slow down.
         assert!(Ease::OutCubic.apply(0.25) > 0.5);
+    }
+
+    #[test]
+    fn a_pulse_goes_out_fades_and_rests() {
+        // Starts on the dot, fully visible; reaches its full size as it fades out.
+        assert_eq!(pulse(0.), (0., 1.));
+        let (reach, seen) = pulse(PULSE_RING);
+        assert!((reach - 1.).abs() < 1e-6);
+        assert_eq!(seen, 0.);
+        // Still for the rest of the beat.
+        assert_eq!(pulse(0.9), pulse(1.));
+        // Out faster than it fades: most of the way out while still half visible.
+        let (reach, seen) = pulse(PULSE_RING / 2.);
+        assert!(reach > 0.8 && (seen - 0.5).abs() < 1e-6);
     }
 
     #[test]

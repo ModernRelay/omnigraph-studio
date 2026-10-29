@@ -7,13 +7,17 @@
 //! layout and polish rules: group with space, not lines; concentric radii; shadows for
 //! elevation.
 
+use std::time::Duration;
+
 use gpui::{
-    AnyElement, App, Bounds, BoxShadow, ClickEvent, Corners, Div, ElementId, Hsla, MouseButton,
-    Pixels, SharedString, Stateful, Window, point,
+    AnyElement, Animation, AnimationExt as _, App, Bounds, BoxShadow, ClickEvent, Corners, Div,
+    ElementId, Hsla, MouseButton, Pixels, SharedString, Stateful, Transformation, Window,
+    percentage, point,
 };
+use crate::motion;
 use studio_settings::{StudioSettings, WindowStyle};
 use ui::prelude::*;
-use ui::{CommonAnimationExt as _, Tooltip, rems_from_px};
+use ui::{Tooltip, rems_from_px};
 
 pub use crate::button::{Button, IconButton, Shape, Variant};
 pub use crate::menu::{MenuRow, menu_header, menu_separator, menu_surface};
@@ -1008,6 +1012,42 @@ pub fn type_dot(type_name: &str) -> Div {
     )
 }
 
+/// A dot that, while `live` (a server that answers), beats: every [`motion::PULSE`] a ring
+/// goes out from it and fades ([`motion::pulse`]). The ring draws outside the dot's box, so it
+/// takes no room. It redraws its view at most [`motion::AMBIENT_FPS`] times a second, and a
+/// caller makes it live only while someone can see it (its window in front); with reduced
+/// motion it is still.
+pub fn live_dot(id: impl Into<ElementId>, color: Hsla, live: bool, cx: &App) -> Div {
+    /// How far the ring goes past the dot's edge.
+    const REACH: f32 = 4.;
+    let dot = div().size(px(size::DOT)).flex_none().rounded_full().bg(color);
+    if !live || !motion::enabled(cx) {
+        return dot;
+    }
+    let ring = div().absolute().rounded_full().with_animation(
+        id,
+        Animation::new(motion::PULSE)
+            .repeat()
+            .with_max_fps(motion::AMBIENT_FPS),
+        move |ring, t| {
+            let (reach, seen) = motion::pulse(t);
+            let side = size::DOT + 2. * REACH * reach;
+            let at = px((size::DOT - side) / 2.);
+            ring.size(px(side))
+                .left(at)
+                .top(at)
+                .bg(color.opacity(0.45 * seen))
+        },
+    );
+    // The ring first, so the dot paints over it.
+    div()
+        .relative()
+        .size(px(size::DOT))
+        .flex_none()
+        .child(ring)
+        .child(dot.absolute())
+}
+
 /// A status dot.
 pub fn status_dot(status: Status) -> Div {
     div()
@@ -1624,12 +1664,33 @@ pub fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Butto
 }
 
 /// Work under way that the person waits on (a search, a run, rows being read): a small turning
-/// circle, muted, beside or in place of what it will fill.
+/// circle, muted, beside or in place of what it will fill. It turns once in two seconds, every
+/// spinner in step, redrawing its view at most [`motion::AMBIENT_FPS`] times a second (Zed's
+/// `with_rotate_animation` redraws at every frame for as long as the work runs).
 pub fn spinner() -> impl IntoElement {
-    Icon::new(IconName::ArrowCircle)
-        .size(IconSize::XSmall)
-        .color(Color::Muted)
-        .with_rotate_animation(2)
+    Spinner
+}
+
+/// See [`spinner`]. Drawn as Zed's `Icon` draws an icon, an SVG of its path, as Zed keeps the
+/// trait that turns an `Icon` to its own crate.
+#[derive(IntoElement)]
+struct Spinner;
+
+impl RenderOnce for Spinner {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        gpui::svg()
+            .path(SharedString::from(IconName::ArrowCircle.path()))
+            .size(IconSize::XSmall.rems())
+            .flex_none()
+            .text_color(Color::Muted.color(cx))
+            .with_animation(
+                "spinner",
+                Animation::new(Duration::from_secs(2))
+                    .repeat_synced()
+                    .with_max_fps(motion::AMBIENT_FPS),
+                |svg, t| svg.with_transformation(Transformation::rotate(percentage(t))),
+            )
+    }
 }
 
 /// [`button`] inside a [`float_bar`]: the same size, with the scale's corner (spec 002, "Round
