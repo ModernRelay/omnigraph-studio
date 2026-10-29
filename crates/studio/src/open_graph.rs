@@ -630,7 +630,9 @@ impl OpenGraphModal {
         let holds_sign_in = c.holds_sign_in();
         // A token typed in replaces one the server refused, or one the CLI would not give to a
         // server that asks for one. A server that offers a sign-in is signed in to instead.
-        let asks_token = state == ConnectionState::Unauthorized && sign_in == SignIn::NotOffered;
+        let asks_token = state == ConnectionState::Unauthorized
+            && sign_in == SignIn::NotOffered
+            && !c.sign_in_under_way();
         let token_tooltip = token_tooltip(c, self.platform);
         let selected = connection.clone();
         let listing_note = match &c.graphs {
@@ -914,6 +916,10 @@ fn state_status(c: &Connection) -> String {
         }
         (SignIn::Finishing { service }, _) => {
             return format!("Finishing the sign-in at {service}.");
+        }
+        // One finishing that a drop or a rename ended is kept before a sign-in is offered.
+        (SignIn::NotOffered, ConnectionState::Unauthorized) if c.sign_in_under_way() => {
+            return "Studio is finishing a sign-in.".into();
         }
         (SignIn::Reading, ConnectionState::Unauthorized) => {
             return "This server asks you to sign in. Studio is reading how.".into();

@@ -293,6 +293,7 @@ impl Connection {
                 return "Sign-in not answering".into();
             }
             match &self.sign_in {
+                SignIn::NotOffered if self.signing_in.is_some() => return "Signing in…".into(),
                 SignIn::NotOffered => {}
                 SignIn::Reading => return "Reading how to sign in".into(),
                 // A sign-in as someone else that failed, the one held not admitted.
@@ -406,7 +407,12 @@ impl Connection {
         }
         let had = self.token_source.is_some();
         self.token_source = source;
-        // A window waiting for the old source's answer reads without a token now.
+        // A window reads with the new source's token, waiting for its answer, not with what the
+        // old one gave; one waiting for the old one's answer reads without a token now if there
+        // is no new one.
+        if self.token_source.is_some() {
+            self.token_answered = false;
+        }
         if !was_ready && self.token_ready() {
             cx.emit(ConnectionEvent::TokenReady);
         }
@@ -1341,6 +1347,12 @@ impl Connection {
         }
     }
 
+    /// Whether a sign-in is under way, whatever the sign-in state says: one finishing that a drop
+    /// or a rename ended is kept before anything else is offered.
+    pub fn sign_in_under_way(&self) -> bool {
+        self.signing_in.is_some()
+    }
+
     /// Whether a sign-in is held, whatever the sign-in state says: one a sign-in as someone else
     /// would replace stays held until that one is taken.
     pub fn holds_sign_in(&self) -> bool {
@@ -1417,9 +1429,9 @@ impl Connection {
         source.key() == source.service().key(&self.server.name)
     }
 
-    /// Ends `source` for `how` in the target's keychain turn ([`OAuthSource::end`]), and keeps
-    /// what the keychain then holds that no sign-in answers for. Detached, so the ending
-    /// finishes when the connection is gone first.
+    /// Ends `source` for `how` in its item's keychain turn ([`OAuthSource::end`]), and says what
+    /// the keychain then holds there, while no sign-in is held and the item is the target's under
+    /// its name now. Detached, so the ending finishes when the connection is gone first.
     fn end_sign_in(&mut self, source: OAuthSource, how: End, cx: &mut Context<Self>) {
         let (before, done) = match &self.sign_in_context {
             Some(context) => context.turns.next(&source.key()),
@@ -1490,10 +1502,12 @@ impl Connection {
         self.connect(cx);
     }
 
-    /// Forgets the sign-in, which the CLI's credential for the target replaces. The keychain
-    /// keeps what it holds, for the target made anonymous again, and an item it kept but would
-    /// not delete stays said; a sign-in whose token the keychain does not hold is revoked, since
-    /// nothing else would hold it ([`End::Dropped`]). One finishing is kept, then dropped so.
+    /// Forgets the sign-in: the CLI's credential for the target replaces it, the connection is
+    /// retired, or the target renamed ([`Self::rename`]). The keychain keeps what it holds, for
+    /// the target under that name made anonymous again, and an item it kept but would not delete
+    /// stays said while the name stands; a sign-in whose token the keychain does not hold is
+    /// revoked, since nothing else would hold it ([`End::Dropped`]). One finishing is kept, then
+    /// dropped so.
     fn drop_sign_in(&mut self, cx: &mut Context<Self>) {
         let held = self.oauth.take();
         self.end_sign_ins(held, End::Dropped, cx);

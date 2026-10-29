@@ -458,7 +458,7 @@ pub(crate) enum End {
     /// refresh token revoked.
     Replaced,
     /// The connection no longer takes its token from it (the CLI's credential, a retired
-    /// connection, the service ending it): the item stays, given a token a refresh rotated
+    /// connection, a renamed target, the service ending it): the item stays, given a token a refresh rotated
     /// meanwhile (forgotten if the keychain will not take it, or if the refresh found it spent),
     /// and the refresh token is revoked unless the keychain keeps it for the next launch.
     Dropped,
@@ -657,8 +657,9 @@ impl OAuthSource {
     /// keychain no more but holds what it is given. Once `before` (the keychain work ahead of
     /// this at its item) has settled, and a keychain write a refresh has in progress, the item is
     /// dealt with as `how` says; a drop, which gives the keychain a token rotated meanwhile or
-    /// forgets one the refresh found spent, waits for that refresh too. The refresh token is revoked after, once any refresh has settled, in
-    /// the background, so no one waits on the network (spec 016, Custody). It runs on its own
+    /// forgets one the refresh found spent, waits for that refresh too. The refresh token is
+    /// revoked after, once any refresh has settled, in the background, so no one waits on the
+    /// network (spec 016, Custody). It runs on its own
     /// once begun, resolves to what the keychain holds for the target then, and ends the sign-in
     /// once: a second ending answers with the first's.
     pub(crate) fn end(&self, how: End, before: Option<KeychainTurn>) -> BoxFuture<'static, Kept> {
@@ -1697,6 +1698,12 @@ mod tests {
         let release = sign_out_held_then_sign_in(cx);
         connection.update(cx, |c, cx| c.take_token_from(Some(Arc::new(Cli)), cx));
         assert_eq!(sign_in_state(&connection, cx).1, SignIn::NotOffered);
+        // A window reads with the CLI's token, waiting for its answer, not with what the
+        // sign-in's answers left.
+        assert!(!connection.read_with(cx, |c, _| c.token_ready()));
+        until(cx, "the CLI's answer", |cx| {
+            connection.read_with(cx, |c, _| c.token_ready())
+        });
         release.send(()).unwrap();
         until(cx, "the dropped sign-in kept", |_| {
             held(&keychain).as_deref() == Some("r3")
@@ -2002,6 +2009,26 @@ mod tests {
             sign_in_state(&connection, cx).0 == ConnectionState::Ready
         });
         assert_eq!(held("work").as_deref(), Some("r1"), "rotated at launch");
+        // A refresh in flight across the rename, so the old sign-in's ending, a drop that waits
+        // for it, reports only after the new name's offer.
+        {
+            let mut served = served.lock().unwrap();
+            served.hold_token = true;
+            served.admits_nobody = true;
+        }
+        let refreshes = || {
+            served
+                .lock()
+                .unwrap()
+                .log
+                .iter()
+                .filter(|l| l.starts_with("token refresh_token"))
+                .count()
+        };
+        let before = refreshes();
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "a refresh in flight", |_| refreshes() > before);
+        served.lock().unwrap().admits_nobody = false;
 
         connection.update(cx, |c, cx| c.rename("job".into(), cx));
         until(cx, "a sign-in offered under the new name", |cx| {
@@ -2011,14 +2038,18 @@ mod tests {
             )
         });
         assert!(!connection.read_with(cx, |c, _| c.holds_sign_in()));
-        assert_eq!(kept(&connection, cx), Kept::Nothing);
-        never(cx, "the old name's token revoked", |_| {
-            served.lock().unwrap().log.iter().any(|l| l == "revoke r1")
+        served.lock().unwrap().hold_token = false;
+        until(
+            cx,
+            "the old sign-in's rotation kept under the old name",
+            |_| held("work").as_deref() == Some("r2"),
+        );
+        never(cx, "the old name's item said under the new name", |cx| {
+            kept(&connection, cx) != Kept::Nothing
         });
-        assert_eq!(
-            held("work").as_deref(),
-            Some("r1"),
-            "kept under the old name"
+        assert!(
+            !served.lock().unwrap().log.iter().any(|l| l == "revoke r2"),
+            "kept, so not revoked"
         );
 
         connection.update(cx, |c, cx| c.sign_in(cx));
@@ -2028,9 +2059,78 @@ mod tests {
             state == ConnectionState::Ready && matches!(sign_in, SignIn::SignedIn { .. })
         });
         browser.join().unwrap();
-        assert_eq!(held("job").as_deref(), Some("r2"));
+        assert_eq!(held("job").as_deref(), Some("r3"));
         assert_eq!(kept(&connection, cx), Kept::This);
-        assert_eq!(held("work").as_deref(), Some("r1"));
+        assert_eq!(held("work").as_deref(), Some("r2"));
+    }
+
+    /// A rename while a sign-in as someone else finishes: the one held ends as replaced, its
+    /// token revoked; the finishing one is kept, under the name it began with, then dropped as
+    /// that name's; meanwhile the connection reads as signing in, not as asking for a token; and
+    /// once it is kept, a sign-in is offered under the new name.
+    #[gpui::test]
+    async fn a_rename_while_a_sign_in_finishes_offers_one_under_the_new_name(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served {
+            lives: 300,
+            ..Served::default()
+        }));
+        served.lock().unwrap().refresh.insert("kept".into());
+        let key = |target: &str| format!("omnigraph-studio-oauth:{target}#{ISSUER}#{RESOURCE}");
+        let keychain = Arc::new(MemoryKeychain::default());
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
+        let connection = connection(&served, keychain.clone(), cx);
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the kept sign-in", |cx| {
+            sign_in_state(&connection, cx).0 == ConnectionState::Ready
+        });
+        let (release, gate) = oneshot::channel::<()>();
+        *keychain.write_gate.lock().unwrap() = Some(gate.shared());
+        let writes = keychain.writes.load(Ordering::SeqCst);
+        connection.update(cx, |c, cx| c.sign_in(cx));
+        let browser = approve(&served, &cx.opened_url().unwrap());
+        until(cx, "the new sign-in's write under way", |_| {
+            keychain.writes.load(Ordering::SeqCst) > writes
+        });
+        browser.join().unwrap();
+        connection.update(cx, |c, cx| c.rename("job".into(), cx));
+        until(cx, "the held sign-in revoked", |_| {
+            served.lock().unwrap().log.iter().any(|l| l == "revoke r1")
+        });
+        assert_eq!(
+            connection.read_with(cx, |c, _| c.label()),
+            "Signing in…",
+            "kept before anything is offered"
+        );
+        release.send(()).unwrap();
+        until(cx, "a sign-in offered under the new name", |cx| {
+            matches!(
+                sign_in_state(&connection, cx).1,
+                SignIn::Offered { why: None, .. }
+            )
+        });
+        let held = |target: &str| {
+            keychain
+                .items
+                .lock()
+                .unwrap()
+                .get(&key(target))
+                .map(|(_, secret)| String::from_utf8(secret.clone()).unwrap())
+        };
+        assert_eq!(
+            held("work").as_deref(),
+            Some("r2"),
+            "kept under the name it began with"
+        );
+        assert_eq!(held("job"), None);
+        assert_eq!(kept(&connection, cx), Kept::Nothing);
+        assert!(!served.lock().unwrap().log.iter().any(|l| l == "revoke r2"));
     }
 
     /// While a sign-in as someone else finishes, the one it replaces has ended and answers so;

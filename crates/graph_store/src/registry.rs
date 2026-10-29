@@ -599,17 +599,6 @@ impl ConnectionRegistry {
         }
     }
 
-    /// Brings the CLI's servers in line with the targets the CLI lists, and says whether
-    /// anything changed. An address is one server (spec 003), so a CLI server is its address: a
-    /// target renamed on the same endpoint renames the connection in place, which the windows
-    /// open on it keep, each graph's saved state staying under the name it was opened with until
-    /// it is opened again ([`crate::GraphSession::overrides_key`]). A new address is a new
-    /// connection, with the graphs Studio remembered for its target's name, or for the name at
-    /// the address it left; an address no longer listed leaves the list (a window open on it
-    /// keeps its connection); a target whose entry or token file changed asks the CLI for its
-    /// token again; a target's graph is added. Targets that could not be listed change no server. What could not be
-    /// listed or used, a server that cannot be added included, is a change only when it differs
-    /// from what was kept.
     /// The transports the CLI connections hold, and what makes a client for another, for a
     /// listing to prepare off the main thread ([`prepare_transports`]).
     fn transport_maker(&self) -> (Vec<CliTransport>, TransportHttp) {
@@ -637,6 +626,18 @@ impl ConnectionRegistry {
         }
     }
 
+    /// Brings the CLI's servers in line with the targets the CLI lists, and says whether
+    /// anything changed. An address is one server (spec 003), so a CLI server is its address: a
+    /// target renamed on the same endpoint renames the connection in place, which the windows
+    /// open on it keep, each graph's saved state staying under the name it was opened with until
+    /// it is opened again ([`crate::GraphSession::overrides_key`]); its sign-in, the old name's,
+    /// is dropped ([`Connection::rename`]). A new address is a new connection, with the graphs
+    /// Studio remembered for its target's name, or for the name at the address it left; an
+    /// address no longer listed leaves the list (a window open on it keeps its connection); a
+    /// target whose entry or token file changed asks the CLI for its token again; a target's
+    /// graph is added. Targets that could not be listed change no server. What could not be
+    /// listed or used, a server that cannot be added included, is a change only when it differs
+    /// from what was kept.
     fn apply_cli_targets(
         &mut self,
         targets: CliTargets,
