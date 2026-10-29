@@ -29,8 +29,8 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyWindowHandle, Focusable as _, HeadlessAppContext, Modifiers, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase, point,
-    px, size,
+    MouseMoveEvent, MouseUpEvent, PlatformInput, ScrollDelta, ScrollEvent, ScrollSource,
+    TouchPhase, point, px, size,
 };
 
 /// The calling thread's CPU time so far.
@@ -280,11 +280,12 @@ fn main() {
                         );
                     } else if let Some((dx, dy)) = scroll {
                         window.dispatch_event(
-                            PlatformInput::ScrollWheel(ScrollWheelEvent {
+                            PlatformInput::Scroll(ScrollEvent {
                                 position: center,
                                 delta: ScrollDelta::Pixels(point(px(dx * sign), px(dy * sign))),
                                 modifiers: Modifiers::default(),
                                 touch_phase: TouchPhase::Moved,
+                                source: ScrollSource::Pointer,
                             }),
                             cx,
                         );

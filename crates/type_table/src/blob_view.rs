@@ -12,7 +12,7 @@ use editor::Editor;
 use gpui::{
     App, AppContext as _, Bounds, Context, Entity, EventEmitter, ExternalPaths, FocusHandle,
     Focusable, ImageFormat, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled,
+    ParentElement, Pixels, Point, Render, ScrollDelta, ScrollEvent, SharedString, Styled,
     Subscription, SvgRenderer, Task, Window, canvas, checkerboard, div, img, point,
 };
 use gq_language::{BuiltQuery, builder};
@@ -472,7 +472,7 @@ impl BlobView {
         cx.notify();
     }
 
-    fn scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn scroll(&mut self, event: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
         let delta = match event.delta {
             ScrollDelta::Pixels(pixels) => pixels,
             ScrollDelta::Lines(lines) => point(px(lines.x * 20.), px(lines.y * 20.)),
@@ -967,7 +967,7 @@ impl BlobView {
             .cursor_grab()
             .child(measure)
             .child(frame)
-            .on_scroll_wheel(cx.listener(Self::scroll))
+            .on_scroll(cx.listener(Self::scroll))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, _, cx| {

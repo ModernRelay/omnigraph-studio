@@ -26,8 +26,7 @@ use std::time::Instant;
 use gpui::{
     App, AppContext as _, Bounds, ContentMask, Context, Entity, EventEmitter, FocusHandle,
     Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Pixels,
-    Point, Render, ScrollWheelEvent, SharedString, Size, Subscription, Task, Window, canvas, point,
-    px,
+    Point, Render, ScrollEvent, SharedString, Size, Subscription, Task, Window, canvas, point, px,
 };
 use graph_store::{
     EntryKind, Exploration, ExplorationEvent, ExplorePath, GraphSession, GroupKey, Loadable,
@@ -2009,7 +2008,7 @@ impl GraphCanvas {
         cx.notify();
     }
 
-    fn scroll(&mut self, event: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn scroll(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.settle_camera();
         self.camera_touched = true;
         let delta = event.delta.pixel_delta(window.line_height());
@@ -2733,7 +2732,7 @@ impl Render for GraphCanvas {
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up_out))
-            .on_scroll_wheel(cx.listener(Self::scroll))
+            .on_scroll(cx.listener(Self::scroll))
             .on_pinch(cx.listener(Self::pinch))
             .child(canvas)
             .children(area)

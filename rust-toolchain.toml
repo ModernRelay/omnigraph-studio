@@ -1,5 +1,5 @@
 [toolchain]
-# Zed's toolchain at the pinned tag (v1.23.2). Bump together with the Zed pin.
+# Zed's toolchain at the pinned tag (v1.26.2). Bump together with the Zed pin.
 channel = "1.98.1"
 profile = "minimal"
 components = ["rustfmt", "clippy", "rust-src"]

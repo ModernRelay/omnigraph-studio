@@ -1,5 +1,5 @@
 //! Panes and the split tree of the document area (spec 002, "Frame"), after Zed's `Pane` and
-//! `PaneGroup` at `v1.23.2`: a pane is a row of tabs with one active; pinned tabs come first and
+//! `PaneGroup` at `v1.26.2`: a pane is a row of tabs with one active; pinned tabs come first and
 //! are kept by "close others"; one tab may be a preview, which the next preview replaces in
 //! place until it is kept. Each pane keeps its own back and forward trail, as Zed's
 //! `NavHistory` does. Panes sit in a tree of horizontal and vertical splits.
