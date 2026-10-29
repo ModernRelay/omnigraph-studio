@@ -167,6 +167,8 @@ pub struct MemoryKeychain {
     pub items: Mutex<HashMap<String, KeychainItem>>,
     /// Writes are refused, as a keychain that will not keep the sign-in.
     pub refuses_writes: AtomicBool,
+    /// Deletes are refused, as a keychain that will not let go of it.
+    pub refuses_deletes: AtomicBool,
     /// How many times it was read.
     pub reads: std::sync::atomic::AtomicUsize,
 }
@@ -201,6 +203,9 @@ impl Keychain for MemoryKeychain {
     }
 
     fn delete(&self, key: String) -> BoxFuture<'static, Result<(), String>> {
+        if self.refuses_deletes.load(Ordering::SeqCst) {
+            return futures::future::ready(Err("the keychain refused".to_owned())).boxed();
+        }
         self.items
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -458,18 +463,19 @@ impl OAuthSource {
 
     /// Ends the sign-in: drops its tokens, deletes the keychain item and, when the service
     /// publishes a revocation endpoint, revokes the refresh token there, once, within 10
-    /// seconds (spec 016, Custody).
-    pub(crate) fn sign_out(&self) -> BoxFuture<'static, ()> {
+    /// seconds (spec 016, Custody). Fails with the keychain's refusal when it kept the item,
+    /// which the next launch would read.
+    pub(crate) fn sign_out(&self) -> BoxFuture<'static, Result<(), String>> {
         self.end(true)
     }
 
     /// Ends the sign-in another replaces, for the same target: drops its tokens and revokes its
     /// refresh token, leaving the keychain item to the sign-in that replaces it.
     pub(crate) fn replaced(&self) -> BoxFuture<'static, ()> {
-        self.end(false)
+        self.end(false).map(drop).boxed()
     }
 
-    fn end(&self, forget: bool) -> BoxFuture<'static, ()> {
+    fn end(&self, forget: bool) -> BoxFuture<'static, Result<(), String>> {
         let inner = self.inner.clone();
         inner.ended.store(true, Ordering::SeqCst);
         async move {
@@ -478,9 +484,11 @@ impl OAuthSource {
                 held.access = None;
                 held.refresh.take()
             };
-            if forget {
-                inner.keychain.delete(inner.key.clone()).await.ok();
-            }
+            let forgotten = if forget {
+                inner.keychain.delete(inner.key.clone()).await
+            } else {
+                Ok(())
+            };
             if let Some(refresh) = refresh {
                 let service = &inner.service;
                 let http = inner.token_client();
@@ -488,6 +496,7 @@ impl OAuthSource {
                     .await
                     .ok();
             }
+            forgotten
         }
         .boxed()
     }
@@ -1075,6 +1084,59 @@ mod tests {
             served.lock().unwrap().log.iter().any(|l| l == "revoke r2")
         });
         assert!(keychain.items.lock().unwrap().is_empty());
+        connection.update(cx, |c, cx| c.sign_out(cx));
+        until(cx, "the sign-out", |cx| {
+            sign_in_state(&connection, cx).0 == ConnectionState::Unauthorized
+        });
+
+        // A keychain that will not keep the sign-in leaves it good for this run, and says so.
+        served.lock().unwrap().no_refresh = false;
+        keychain.refuses_writes.store(true, Ordering::SeqCst);
+        connection.update(cx, |c, cx| c.sign_in(cx));
+        let browser = approve(&served, &cx.opened_url().unwrap());
+        until(cx, "the sign-in not kept", |cx| {
+            matches!(
+                sign_in_state(&connection, cx).1,
+                SignIn::SignedIn { kept: false, .. }
+            ) && sign_in_state(&connection, cx).0 == ConnectionState::Ready
+        });
+        browser.join().unwrap();
+        assert!(keychain.items.lock().unwrap().is_empty());
+
+        // One that will not delete it leaves the person signed out for this run, and says so:
+        // the next launch would read the sign-in back.
+        keychain.refuses_writes.store(false, Ordering::SeqCst);
+        connection.update(cx, |c, cx| c.sign_in(cx));
+        let browser = approve(&served, &cx.opened_url().unwrap());
+        until(cx, "the sign-in kept", |cx| {
+            matches!(
+                sign_in_state(&connection, cx).1,
+                SignIn::SignedIn { kept: true, .. }
+            )
+        });
+        browser.join().unwrap();
+        keychain.refuses_deletes.store(true, Ordering::SeqCst);
+        connection.update(cx, |c, cx| c.sign_out(cx));
+        until(cx, "the keychain's refusal", |cx| {
+            matches!(
+                sign_in_state(&connection, cx).1,
+                SignIn::Offered { why: Some(_), .. }
+            )
+        });
+        let (state, offer, _) = sign_in_state(&connection, cx);
+        assert_eq!(state, ConnectionState::Unauthorized);
+        assert_eq!(
+            offer,
+            SignIn::Offered {
+                service: "id.test".into(),
+                why: Some(
+                    "Signed out for this session; the keychain did not delete the sign-in (the \
+                     keychain refused), so the next launch reads it back."
+                        .into()
+                )
+            }
+        );
+        assert_eq!(keychain.items.lock().unwrap().len(), 1);
     }
 
     #[gpui::test]

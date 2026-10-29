@@ -1089,7 +1089,8 @@ impl Connection {
     }
 
     /// Signs out: the tokens are dropped, the keychain item deleted and, where the service
-    /// takes it, the refresh token revoked; the connection checks again without a token.
+    /// takes it, the refresh token revoked; the connection checks again without a token. A
+    /// keychain that keeps the item is said, as the next launch would read it back.
     pub fn sign_out(&mut self, cx: &mut Context<Self>) {
         let Some(source) = self.oauth.take() else {
             return;
@@ -1097,11 +1098,34 @@ impl Connection {
         self.token_source = None;
         self.lease = None;
         self._renewal = None;
-        cx.background_executor().spawn(source.sign_out()).detach();
-        self.sign_in = SignIn::Offered {
-            service: source.service().host(),
-            why: None,
-        };
+        let service = source.service().host();
+        let ended = cx.background_executor().spawn(source.sign_out());
+        let signed_out = service.clone();
+        // Detached, so the revocation finishes when the connection is gone first.
+        cx.spawn(async move |this, cx| {
+            let Err(refused) = ended.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                // Only while the person is still signed out of that service, with nothing said.
+                if let SignIn::Offered {
+                    service: offered,
+                    why: why @ None,
+                } = &mut this.sign_in
+                    && *offered == signed_out
+                {
+                    *why = Some(format!(
+                        "Signed out for this session; the keychain did not delete the sign-in \
+                         ({refused}), so the next launch reads it back."
+                    ));
+                    cx.emit(ConnectionEvent::StateChanged);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+        self.sign_in = SignIn::Offered { service, why: None };
         self.replace_token(None, None, cx);
         cx.emit(ConnectionEvent::StateChanged);
         cx.notify();

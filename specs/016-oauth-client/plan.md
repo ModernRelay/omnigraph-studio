@@ -197,7 +197,9 @@ Studio restarts; they hold no secrets.
   in for this session; the keychain did not keep it"); there is no file fallback.
 - **Sign out** drops the access token, deletes the keychain item and, when the authorization
   server publishes a `revocation_endpoint`, revokes the refresh token there (RFC 7009),
-  bounded to 10 seconds and not retried.
+  bounded to 10 seconds and not retried. A keychain that refuses the delete leaves the person
+  signed out for this run and says so ("Signed out for this session; the keychain did not
+  delete the sign-in"), since the next launch would read the item back.
 
 ### Refresh
 
@@ -351,6 +353,7 @@ Studio restarts; they hold no secrets.
 
 | 2026-10-26 | A second review of #12 (the session sharing the checkout, read-only) | `graph_store` `a_dropped_ask_leaves_its_refresh_to_finish` (the service holds its answer after rotating the refresh token; the ask is dropped there; the next ask is answered without asking again), `a_new_transport_keeps_the_sign_in_through_it` (extended: the server is checked again through the new client unasked); `oauth_client` token test (a clock ten minutes ahead keeps `expires_in`) | Fixed: refreshes run on their own task and asks join them; a renewal is quiet by its flag and holder, not only when the server is ready; the lifetime is `expires_in` alone, renewed no sooner than a second; a transport change checks a server in use again. Not taken here, as older than this PR: a token source's temporary failure dropping a working token, one failed health check showing Unreachable for two minutes, the CLI's stdin write without a timeout |
 | 2026-10-28 | A sign-in whose service does not answer stands | `graph_store` `sign_in::tests::a_sign_in_whose_service_does_not_answer_stands` (a kept sign-in whose service answers 503 at launch, then again at a renewal), `connection::tests::a_renewal_that_cannot_be_answered_keeps_the_token_held` (asked again halfway to the token's end, then renewed quietly); `studio` `a_server_that_offers_a_sign_in_says_where_and_as_whom` (extended: the status line and chip) | All pass. At launch the server read Sign-in not answering, signed in as the keychain's account, with no browser opened and the keychain item kept; the next health check signed in. At the renewal the token stayed in use with the same credential. Before, both ended the sign-in and offered a browser sign-in. This takes the first of the three items the 2026-10-26 review left; the other two (a single failed health check, the CLI's stdin write) were fixed on main in #13 |
+| 2026-10-29 | A keychain that refuses the keep or the delete is said | `graph_store` `sign_in::tests::a_server_that_offers_sign_in_is_signed_in_through_the_browser` (extended: a keychain that refuses the write, then one that refuses the delete at sign-out) | Pass. The refused keep reads Signed in, not kept, with the keychain empty; the refused delete reads signed out for this session, with the item still in the keychain. Before, a refused delete was dropped without a word: the next launch read the item back, and signed in with it where the service had not revoked it. The test keychain's refused write had no test until now. Not taken: a sign-in as another account whose grant gives no refresh token still drops a refused delete of the previous account's item, whose token was revoked where the service takes revocation, so the next launch signs in with it only where the service does not and the keychain refused |
 
 ## Corrections
 
