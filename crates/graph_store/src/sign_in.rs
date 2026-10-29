@@ -1167,7 +1167,11 @@ mod tests {
         let _watch = connection.update(cx, |c, cx| c.watch(cx));
         connection.update(cx, |c, cx| c.connect(cx));
         until(cx, "the refresh and its retry", |_| refreshes() == 2);
-        cx.run_until_parked();
+        // The service logs the retry as it reads it; the connection takes its answer after,
+        // over the socket, so the test waits for that answer and not for the log alone.
+        until(cx, "the retry's answer", |cx| {
+            connection.read_with(cx, |c, _| c.token_unanswered)
+        });
         let (state, sign_in, label) = sign_in_state(&connection, cx);
         assert_eq!(state, ConnectionState::Unauthorized);
         assert_eq!(sign_in, signed_in);
