@@ -788,20 +788,23 @@ mod tests {
                             ),
                     ),
                 )
+                // In a row, so the chip's box is its own width, not the column's.
                 .child(
-                    div().debug_selector(|| "control-chip".into()).child(
-                        ds::control_chip(
-                            "chip",
-                            div()
-                                .debug_selector(|| "chip-button".into())
-                                .child(ds::chip_button(
-                                    "chip-button",
-                                    ui::IconName::Filter,
-                                    "Filters",
-                                    Some("2".into()),
-                                )),
-                        )
-                        .on_clear("Clear the filters", |_, _, _| {}),
+                    h_flex().child(
+                        div().debug_selector(|| "control-chip".into()).child(
+                            ds::control_chip(
+                                "chip",
+                                div()
+                                    .debug_selector(|| "chip-button".into())
+                                    .child(ds::chip_button(
+                                        "chip-button",
+                                        ui::IconName::Filter,
+                                        "Filters",
+                                        Some("2".into()),
+                                    )),
+                            )
+                            .on_clear("Clear the filters", |_, _, _| {}),
+                        ),
                     ),
                 )
                 // A relationship's header over its neighbours' rows.
@@ -862,8 +865,8 @@ mod tests {
     }
 
     /// A property row holds its boxed value with room above and below; a control chip is a
-    /// filter pill's height with its button centred in it, and the "+" after a list of values
-    /// is a value's height.
+    /// button's height with its button filling it from its start, so its label is as far in as
+    /// a button's, and the "+" after a list of values is a value's height.
     #[gpui::test]
     fn property_and_control_parts_draw_at_their_sizes(cx: &mut TestAppContext) {
         cx.update(studio_theme::init_test);
@@ -883,12 +886,15 @@ mod tests {
         );
         let chip = bounds(cx, "control-chip");
         let chip_button = bounds(cx, "chip-button");
-        assert_eq!(f32::from(chip.size.height), ds::size::PILL);
-        assert_eq!(f32::from(chip_button.size.height), ds::size::BAR_BUTTON);
+        assert_eq!(f32::from(chip.size.height), ds::size::BAR_BUTTON);
+        assert_eq!(chip_button.size.height, chip.size.height, "the button fills its chip");
+        assert_eq!(chip_button.origin, chip.origin, "from the chip's start");
+        let clear = bounds(cx, "chip-clear");
+        assert_eq!(f32::from(clear.size.height), ds::size::ROW_BUTTON);
         assert_eq!(
-            f32::from(chip_button.top() - chip.top()),
-            f32::from(chip.bottom() - chip_button.bottom()),
-            "the button centred in its chip"
+            f32::from(chip.right() - clear.right()),
+            ds::PILL_BUTTON_GAP,
+            "the clear button inside the chip's round end"
         );
         // A group's header and its neighbours are rows of one height, on one edge.
         let fold = bounds(cx, "fold-row");

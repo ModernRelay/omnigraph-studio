@@ -199,8 +199,10 @@ pub mod size {
     pub const ROW_BUTTON: f32 = TAG;
     /// The large button, one step above a control.
     pub const LARGE_BUTTON: f32 = 32.;
-    /// A pill: a filter, a composer's picker, a dock's title tab.
-    pub const PILL: f32 = 26.;
+    /// A pill of segments (a filter, a toolbar's control chip) and a shared type's pill: a
+    /// button's height, so a chip and the buttons beside it are one size and its label sits as
+    /// far in as theirs.
+    pub const PILL: f32 = BAR_BUTTON;
     /// A thread's or feed's gutter, where each entry's icon sits.
     pub const GUTTER: f32 = 24.;
     /// A row of the command palette: a pick list is read once, so a little taller than a menu's.
@@ -1796,8 +1798,9 @@ pub fn filter_pill(
         ))
 }
 
-/// A raised pill of segments ([`filter_pill`], [`control_chip`]): the document's fill, a clear
-/// border and `shadow-custom`, [`size::PILL`] tall, its segments clipped to its round ends.
+/// A raised pill of segments ([`filter_pill`], [`control_chip`]): the document's fill and
+/// `shadow-custom`, whose ring is its edge, [`size::PILL`] tall, its segments clipped to its
+/// round ends. No border, so a segment's content starts where a button's does.
 fn pill_frame(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
     h_flex()
         .id(id.into())
@@ -1806,8 +1809,6 @@ fn pill_frame(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
         .items_center()
         .rounded_full()
         .bg(surface::document(cx))
-        .border_1()
-        .border_color(gpui::transparent_black())
         .shadow(elevation::custom(cx))
         .overflow_hidden()
 }
@@ -1822,12 +1823,12 @@ fn pill_rule(cx: &App) -> Div {
 }
 
 /// A pill's last segment: its round button ([`pill_button`]), [`PILL_BUTTON_GAP`] inside the
-/// pill's end, the pill's border the rest of the gap.
+/// pill's end.
 fn pill_end(button: impl IntoElement) -> Div {
     div()
         .h_full()
         .pl(px(space::XS))
-        .pr(px(PILL_BUTTON_GAP - size::HAIRLINE))
+        .pr(px(PILL_BUTTON_GAP))
         .flex()
         .items_center()
         .child(button)
@@ -1882,20 +1883,14 @@ impl ControlChip {
 
 impl RenderOnce for ControlChip {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        // The button's quiet pill a hairline in from the chip's round end, the chip's border
-        // the rest; without a clear button, the same at its other end.
-        let inset = PILL_BUTTON_GAP / 2. - size::HAIRLINE;
-        let cleared = self.clear.is_some();
+        // The button fills the chip, so its label is as far in as a button's and its hover
+        // fill is the chip's own shape.
         pill_frame(self.id, cx)
-            .child(
-                div()
-                    .pl(px(inset))
-                    .when(!cleared, |button| button.pr(px(inset)))
-                    .child(self.button),
-            )
+            .child(self.button)
             .when_some(self.clear, |chip, (tooltip, on_clear)| {
                 chip.child(pill_rule(cx)).child(pill_end(
                     pill_button("clear", IconName::Close, Color::Muted, cx)
+                        .debug_selector(|| "chip-clear".into())
                         .tooltip(Tooltip::text(tooltip))
                         .on_click(move |event, window, cx| on_clear(event, window, cx)),
                 ))
@@ -1903,9 +1898,9 @@ impl RenderOnce for ControlChip {
     }
 }
 
-/// How far a [`pill_button`] sits inside its pill's edge, its border included: the pill's end
-/// pads by this less the border.
-pub const PILL_BUTTON_GAP: f32 = space::XS;
+/// How far a [`pill_button`] sits inside its pill's edge: a row button's circle
+/// ([`size::ROW_BUTTON`]) in a [`size::PILL`].
+pub const PILL_BUTTON_GAP: f32 = space::XXS;
 
 /// An icon button at a pill's end, [`PILL_BUTTON_GAP`] inside it: round, so its fill follows
 /// the pill's round end (`radius::within(size::PILL / 2, gap)` is its own half height) where

@@ -6687,17 +6687,23 @@ impl TypeTable {
                     .bg(rule)
             };
             let chevron = || studio_ui::ds::icon::meta(IconName::ChevronDown);
-            // The filter being written is the pill it will become, outlined while it is open.
+            // The filter being written is the pill it will become, outlined while it is open:
+            // a ring outside it as the pill's own edge is, so its buttons keep a button's height.
             let pill = h_flex()
                 .h(px(studio_ui::ds::size::PILL))
                 .flex_none()
                 .rounded_full()
-                .border_1()
-                .border_color(if draft.error.is_some() {
-                    studio_ui::ds::surface::error_border(cx)
-                } else {
-                    studio_ui::ds::surface::focus(cx)
-                })
+                .shadow(vec![gpui::BoxShadow {
+                    color: if draft.error.is_some() {
+                        studio_ui::ds::surface::error_border(cx)
+                    } else {
+                        studio_ui::ds::surface::focus(cx)
+                    },
+                    offset: gpui::point(px(0.), px(0.)),
+                    blur_radius: px(0.),
+                    spread_radius: px(studio_ui::ds::size::HAIRLINE),
+                    inset: false,
+                }])
                 .bg(editor_bg)
                 .overflow_hidden()
                 .child(
@@ -6799,8 +6805,7 @@ impl TypeTable {
                     h_flex()
                         .h_full()
                         .pl(px(space::XS))
-                        // The pill's border is the rest of the gap.
-                        .pr(px(studio_ui::ds::PILL_BUTTON_GAP - 1.))
+                        .pr(px(studio_ui::ds::PILL_BUTTON_GAP))
                         .gap(px(space::XXS))
                         .items_center()
                         .child(

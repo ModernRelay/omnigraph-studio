@@ -676,7 +676,7 @@ impl OntologyPage {
             h_flex()
                 .id(SharedString::from(format!("shared-{name}")))
                 .h(px(size::PILL))
-                .px(px(space::CONTROL_INSET))
+                .px(px(space::MD))
                 .gap(px(space::SM))
                 .rounded(px(ds::radii(cx).sm))
                 .bg(ds::surface::document(cx))

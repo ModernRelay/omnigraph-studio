@@ -751,14 +751,17 @@ than styling one-off elements.
   property icons' edge. A neighbour's `ds::value_remove` (a quiet ×) is the row's action,
   over its end under the pointer; the group's "+" sits in its header.
 - **Control chips** (since 2026-10-21, after the reference toolbar). A toolbar's controls are
-  `ds::control_chip`s, the filter pill's family: one raised pill (`shadow-custom`, 26 px) holding
-  a quiet `ds::chip_button` (its icon, its label and, while set, what it is set to in the
+  `ds::control_chip`s, the filter pill's family: one raised pill (`shadow-custom`, whose ring
+  is its edge, a button's 22 px) filled by a quiet `ds::chip_button`, its label 8 px in as
+  every button's (since 2026-10-29; the chip was 26 px with its button 2 px inside, its label
+  10 px in, a size apart from the buttons beside it) (its icon, its label and, while set, what it is set to in the
   accent, `Button::value`: "Sort name", "Filters 2") and, while set and clearable, a hairline
   and a round clear button (`ControlChip::on_clear`). The pill is the same set or not, so
   setting a control adds to its chip rather than changing what it is. `ds::filter_pill` and
   the chip share their frame, hairline and clear end.
 - **Control sizes, in code.** `size::CONTROL` (28 px: a field, a floating bar, a tile),
-  `size::PILL` (26 px: a filter, a composer's picker, a dock's title tab),
+  `size::PILL` (`BAR_BUTTON`'s 22 px: a filter's pill, a toolbar's chips, a shared type's
+  pill; the round button at a pill's end is a row button's 18 px, 2 px inside it),
   `size::BAR_BUTTON` (22 px: every button, a segment, the status bar's items), `size::TAG`
   (18 px: tags, count badges, a write target), `size::DOT` and `size::DISCLOSURE`. Every
   single-line field is `ds::field_frame` (the scale's `sm` corner at a control's height, a
