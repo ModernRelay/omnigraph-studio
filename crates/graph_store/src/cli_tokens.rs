@@ -1361,7 +1361,7 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
-    use std::sync::Arc;
+    use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
     use gpui::{AppContext as _, TestAppContext};
     use http_client::{AsyncBody, FakeHttpClient, Response};
@@ -1382,7 +1382,9 @@ mod tests {
     }
 
     impl StandIn {
-        fn new(name: &str) -> Self {
+        /// A stand-in named `name`, made under the test's hold on the probe cache: its probes
+        /// write the cache's file.
+        fn new(_held: &CacheHold, name: &str) -> Self {
             let dir = std::env::temp_dir()
                 .join(format!("studio-cli-stand-in-{name}-{}", std::process::id()));
             std::fs::remove_dir_all(&dir).ok();
@@ -1519,14 +1521,26 @@ exit 64
         }
     }
 
-    /// Held by the test that starts the probe cache over ([`forget_probes`], rewriting its file)
-    /// and by each test whose assertions need a program it probed to stay remembered: the cache
-    /// is the process's, and the tests run at once. Without it, a launch simulated in one test
-    /// made another's remembered program be probed again.
-    static PROBE_CACHE: Mutex<()> = Mutex::new(());
+    /// The probe cache is the process's, and the tests run at once. Every probe rewrites the
+    /// cache's one file with each program the process remembers, so a probe in one test could
+    /// replace what another wrote there, or bring back what it forgot ([`forget_probes`]). A
+    /// stand-in is therefore made under its test's hold on the cache: shared ([`probing`]), or
+    /// whole ([`probe_cache`]) for a test whose assertions need the cache to itself.
+    static PROBE_CACHE: RwLock<()> = RwLock::new(());
 
-    fn probe_cache() -> MutexGuard<'static, ()> {
-        PROBE_CACHE.lock().unwrap_or_else(PoisonError::into_inner)
+    /// A test's hold on the probe cache, taken once at its start: a thread that asked for a
+    /// second share would wait behind a test waiting for the whole, which waits on the first.
+    enum CacheHold {
+        Shared(#[expect(dead_code)] RwLockReadGuard<'static, ()>),
+        Whole(#[expect(dead_code)] RwLockWriteGuard<'static, ()>),
+    }
+
+    fn probing() -> CacheHold {
+        CacheHold::Shared(PROBE_CACHE.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    fn probe_cache() -> CacheHold {
+        CacheHold::Whole(PROBE_CACHE.write().unwrap_or_else(PoisonError::into_inner))
     }
 
     /// The CLI Studio would run of `programs`, found in a turn at the CLI of its own.
@@ -1547,35 +1561,35 @@ exit 64
     /// over, and each one passed over is named with why.
     #[test]
     fn a_cli_is_chosen_by_its_contract_and_protocols() {
-        let _cache = probe_cache();
-        let old = StandIn::new("old");
+        let cache = probe_cache();
+        let old = StandIn::new(&cache, "old");
         old.write("version.json", "not json");
-        let other_contract = StandIn::new("other-contract");
+        let other_contract = StandIn::new(&cache, "other-contract");
         other_contract.write(
             "version.json",
             r#"{"version":"0.15.0","http_contract":"0.15","protocols":{"target":2,"credential":2,"access":1}}"#,
         );
-        let no_contract = StandIn::new("no-contract");
+        let no_contract = StandIn::new(&cache, "no-contract");
         no_contract.write(
             "version.json",
             r#"{"version":"0.14.0-dev","protocols":{"target":1,"credential":1,"access":1}}"#,
         );
-        let pre_access = StandIn::new("pre-access");
+        let pre_access = StandIn::new(&cache, "pre-access");
         pre_access.write(
             "version.json",
             r#"{"version":"0.14.0-edge+50283ce","http_contract":"0.14","protocols":{"target":2,"credential":2}}"#,
         );
-        let unknown = StandIn::new("unknown");
+        let unknown = StandIn::new(&cache, "unknown");
         unknown.write(
             "version.json",
             r#"{"version":"0.15.0","http_contract":"0.14","protocols":{"target":3,"credential":2,"access":1}}"#,
         );
-        let edge = StandIn::new("edge");
+        let edge = StandIn::new(&cache, "edge");
         edge.write(
             "version.json",
             r#"{"version":"0.14.0-edge+7fff9df","channel":"edge","http_contract":"0.14","protocols":{"target":1,"credential":1,"access":1}}"#,
         );
-        let current = StandIn::new("current");
+        let current = StandIn::new(&cache, "current");
         let missing = old.dir.join("not-there");
         let not_executable = old.dir.join("plain");
         std::fs::write(&not_executable, "#!/bin/sh\n").unwrap();
@@ -1617,7 +1631,7 @@ exit 64
         assert_eq!(chosen.path, current.program);
         assert_eq!(chosen.version, "0.14.0");
         // Found again with no probe while the program is unchanged.
-        let again = StandIn::new("again");
+        let again = StandIn::new(&cache, "again");
         assert_eq!(found(&again.programs()).unwrap().version, "0.14.0");
         again.calls();
         found(&again.programs()).unwrap();
@@ -1639,7 +1653,8 @@ exit 64
     /// configuration the CLI refuses lists nothing, with the CLI's own words.
     #[test]
     fn the_targets_are_listed_as_the_cli_describes_them() {
-        let cli = StandIn::new("targets");
+        let cache = probing();
+        let cli = StandIn::new(&cache, "targets");
         let token_file = cli.dir.join("tokens").join("filed");
         let authority = crate::test_tls::Authority::new("strategy");
         let ca_file = cli.dir.join("ca.pem");
@@ -2008,7 +2023,8 @@ exit 64
     /// names, and the token reaches no file, error or debug output.
     #[test]
     fn a_token_is_exported_through_a_pipe() {
-        let cli = StandIn::new("export");
+        let cache = probing();
+        let cli = StandIn::new(&cache, "export");
         cli.server("stored", "https://store.example.com/");
         cli.write("token-stored", "secret-stored-token");
         let source = cli.source("stored", "https://store.example.com/", CliCredential::Store);
@@ -2055,7 +2071,8 @@ exit 64
     /// The source says whose login it carries; a server target's says none.
     #[test]
     fn a_managed_targets_token_is_exchanged_from_the_clis_login() {
-        let cli = StandIn::new("managed");
+        let cache = probing();
+        let cli = StandIn::new(&cache, "managed");
         let endpoint = "https://c1-i1.graphs.example.com/";
         cli.write(
             "inspect-cloud.json",
@@ -2109,7 +2126,8 @@ exit 64
     /// without an export; an export that never answers is stopped past its time.
     #[test]
     fn a_refused_export_says_why_and_never_the_token() {
-        let cli = StandIn::new("refused");
+        let cache = probing();
+        let cli = StandIn::new(&cache, "refused");
         cli.server("stored", "https://store.example.com/");
         cli.write("fail-stored", "secret-half-printed");
         let why =
@@ -2181,7 +2199,8 @@ exit 64
     /// said.
     #[test]
     fn tokens_asked_together_take_turns_at_the_cli() {
-        let cli = StandIn::new("turns");
+        let cache = probing();
+        let cli = StandIn::new(&cache, "turns");
         cli.write("locking", "");
         let names = ["a", "b", "c", "d"];
         for name in names {
@@ -2302,7 +2321,8 @@ exit 64
     /// look; only its own answer is kept while its file does not change.
     #[test]
     fn a_program_that_did_not_answer_is_asked_again() {
-        let cli = StandIn::new("transient");
+        let cache = probing();
+        let cli = StandIn::new(&cache, "transient");
         // Runs through an interpreter that is not there yet, so it cannot start.
         let shell = cli.dir.join("shell");
         let program = cli.dir.join("late");
@@ -2325,27 +2345,13 @@ exit 64
     /// asked again.
     #[test]
     fn a_probe_is_remembered_across_launches() {
-        let _cache = probe_cache();
-        let cli = StandIn::new("remembered");
-        // A probe's file is written on the write thread that every test in the process shares,
-        // and `writes_done` gives up after a few seconds, so the test waits for the file to show
-        // the write: one landing late would replace what the test writes after.
-        let program = serde_json::to_string(&cli.program).unwrap();
-        let settled = |what: &str, done: &dyn Fn(&str) -> bool| -> String {
-            for _ in 0..2000 {
-                if let Ok(text) = std::fs::read_to_string(probes_path())
-                    && done(&text)
-                {
-                    return text;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            panic!("timed out waiting for {what}");
-        };
+        let cache = probe_cache();
+        let cli = StandIn::new(&cache, "remembered");
         assert!(found(&cli.programs()).is_ok());
         assert_eq!(cli.calls(), ["version --json"]);
         // The next launch: nothing in memory, the data directory's file read again.
-        let kept = settled("the probe kept", &|text| text.contains(&program));
+        studio_settings::writes_done();
+        let kept = std::fs::read_to_string(probes_path()).unwrap();
         assert!(kept.contains(r#""0.14.0""#), "{kept}");
         forget_probes();
         assert!(found(&cli.programs()).is_ok());
@@ -2358,24 +2364,28 @@ exit 64
         assert_eq!(cli.calls(), ["version --json"]);
 
         // Kept by a Studio that asked something else of a CLI: probed again, under these.
-        let upgraded = settled("the upgrade kept", &|text| text != kept);
+        studio_settings::writes_done();
+        let upgraded = std::fs::read_to_string(probes_path()).unwrap();
         let earlier = upgraded.replace(&requirements(), "HTTP contract 0.14, target protocol 1");
         assert_ne!(earlier, upgraded, "the requirements are in the file");
         std::fs::write(probes_path(), &earlier).unwrap();
         forget_probes();
         assert!(found(&cli.programs()).is_ok());
         assert_eq!(cli.calls(), ["version --json"], "judged again");
-        settled("the new judgment kept", &|text| {
-            text.contains(&requirements())
-        });
+        studio_settings::writes_done();
+        assert!(
+            std::fs::read_to_string(probes_path())
+                .unwrap()
+                .contains(&requirements())
+        );
     }
 
     /// The sequences waiting for the CLI take it in the order they asked, but one a window
     /// waits on (`hurry` raised) goes before them, even raised after it started waiting.
     #[test]
     fn the_token_a_window_waits_on_goes_first() {
-        let _cache = probe_cache();
-        let cli = StandIn::new("hurry");
+        let cache = probe_cache();
+        let cli = StandIn::new(&cache, "hurry");
         for name in ["early", "late", "shown"] {
             cli.server(name, &format!("https://{name}.example.com/"));
             cli.write(&format!("token-{name}"), &format!("secret-{name}"));
@@ -2429,7 +2439,8 @@ exit 64
     /// of Studio's holds back past it is not run, and says so.
     #[test]
     fn a_command_held_back_past_its_timeout_is_not_run() {
-        let cli = StandIn::new("busy");
+        let cache = probing();
+        let cli = StandIn::new(&cache, "busy");
         cli.server("stored", "https://store.example.com/");
         let held = smol::block_on(TURN.take(&Arc::default(), READ_TIMEOUT)).unwrap();
         let mut source = cli.source("stored", "https://store.example.com/", CliCredential::Store);
@@ -2476,7 +2487,8 @@ exit 64
         if std::env::var_os("OMNIGRAPH_STUDIO_TEST_SECRET").is_none() {
             return;
         }
-        let cli = StandIn::new("environment");
+        let cache = probing();
+        let cli = StandIn::new(&cache, "environment");
         cli.server("stored", "https://store.example.com/");
         cli.write("token-stored", "secret-stored-token");
         let source = cli.source(
@@ -2500,7 +2512,8 @@ exit 64
     /// target again.
     #[test]
     fn a_server_is_added_through_the_cli() {
-        let cli = StandIn::new("add");
+        let cache = probing();
+        let cli = StandIn::new(&cache, "add");
         let added = |name: &str| -> serde_json::Value {
             serde_json::from_str(
                 &std::fs::read_to_string(cli.dir.join(format!("added-{name}.json"))).unwrap(),
