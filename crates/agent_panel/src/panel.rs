@@ -2642,17 +2642,24 @@ impl AgentMenu {
                 .unwrap_or_else(|| vec![("Default model".to_owned(), None)]);
             for (label, model) in models {
                 let (panel, command) = (panel.clone(), command.clone());
-                menu = menu.entry(label, None, move |window, cx| {
-                    panel
-                        .update(cx, |panel, cx| {
-                            panel.choose_model(command.clone(), model.clone(), window, cx)
-                        })
-                        .ok();
-                });
+                // Unchecked, in the checked column, so every section's models line up.
+                menu = menu.toggleable_entry(
+                    label,
+                    false,
+                    IconPosition::Start,
+                    None,
+                    move |window, cx| {
+                        panel
+                            .update(cx, |panel, cx| {
+                                panel.choose_model(command.clone(), model.clone(), window, cx)
+                            })
+                            .ok();
+                    },
+                );
             }
         }
         menu.separator()
-            .entry("Other agent…", None, |window, cx| {
+            .entry("Custom agent…", None, |window, cx| {
                 window.dispatch_action(Box::new(studio_actions::workspace::OpenSettings), cx)
             })
             .separator()
@@ -3988,6 +3995,7 @@ impl AgentPanel {
             None => {
                 let agent_name = match self.state {
                     State::Ready { .. } | State::Prompting { .. } => agent_name,
+                    State::Starting => format!("Starting {}…", self.agent_label(cx)),
                     _ => self.agent_label(cx),
                 };
                 let command = self.agent.join(" ");

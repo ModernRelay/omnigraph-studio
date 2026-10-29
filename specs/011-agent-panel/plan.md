@@ -83,7 +83,7 @@ model option, the current one checked; another agent's as it offered them when i
 runs that agent with it: the model is remembered as the agent's preference, which its new
 session takes as it opens. Choosing another agent makes it the default. A conversation nothing was sent in
 yet changes agent in place; one that holds messages keeps its agent, and the choice opens a new
-conversation. **Other agent…** opens Settings for a custom command.
+conversation. **Custom agent…** opens Settings for a custom command.
 
 ### Lifecycle
 
