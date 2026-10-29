@@ -31,7 +31,7 @@ use studio_ui::ds::{Dotted as _, Prose as _};
 use studio_ui::menu::ContextMenu;
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
 use ui::prelude::*;
-use ui::{CircularProgress, Indicator, KeyBinding, PopoverMenu, Severity, Tooltip};
+use ui::{CircularProgress, KeyBinding, PopoverMenu, Severity, Tooltip};
 
 use crate::cli_home::{self, CliHome};
 use crate::gateway::{Gateway, GatewayEvent, OnOutcome, Seen};
@@ -4736,7 +4736,7 @@ impl AgentPanel {
                         .cursor_pointer()
                         .hover(|style| style.bg(ds::surface::highlight(cx)))
                         .tooltip(Tooltip::text(about))
-                        .child(Indicator::dot().color(dot))
+                        .child(studio_ui::ds::dot(dot))
                         .child(studio_ui::ds::text::muted(agent_name))
                         .on_click(|_, window, cx| {
                             window.dispatch_action(
@@ -4846,7 +4846,7 @@ impl AgentPanel {
                     .border_t_1()
                     .dotted(cx)
                     .tooltip(Tooltip::text(entry.text.clone()))
-                    .child(Indicator::dot().color(if next { Color::Accent } else { Color::Muted }))
+                    .child(studio_ui::ds::dot(if next { Color::Accent } else { Color::Muted }))
                     .child(
                         div().flex_1().min_w_0().child(
                             studio_ui::ds::text::body(line)

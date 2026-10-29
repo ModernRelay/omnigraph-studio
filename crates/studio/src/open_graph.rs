@@ -17,7 +17,6 @@ use graph_store::{
 use studio_ui::ds::{self, MenuRow, size, space};
 use studio_workspace::ModalView;
 use studio_workspace::{Workspace, connection_color};
-use ui::Indicator;
 use ui::prelude::*;
 
 /// Where the keyboard is in the dialog: a server, one of the chosen server's graphs, or a field.
@@ -592,7 +591,7 @@ impl OpenGraphModal {
                                 MenuRow::new(("server", index))
                                     .height(size::FEED_ROW)
                                     .toggle_state(selected)
-                                    .start_slot(Indicator::dot().color(color))
+                                    .start_slot(studio_ui::ds::dot(color))
                                     .child(
                                         v_flex()
                                             .min_w_0()
@@ -661,7 +660,7 @@ impl OpenGraphModal {
                     .min_h(px(size::CONTROL))
                     .px(px(space::MD))
                     .gap(px(space::MD))
-                    .child(Indicator::dot().color(connection_color(&state)))
+                    .child(studio_ui::ds::dot(connection_color(&state)))
                     // Wraps, so the CLI's whole reason shows within the pane.
                     .child(
                         div()

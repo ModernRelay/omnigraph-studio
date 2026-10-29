@@ -765,8 +765,9 @@ than styling one-off elements.
   `size::PILL` (`BAR_BUTTON`'s 22 px: a filter's pill, a toolbar's chips, a shared type's
   pill; the round button at a pill's end is a row button's 18 px, 2 px inside it),
   `size::BAR_BUTTON` (22 px: every button, a segment, the status bar's items), `size::TAG`
-  (18 px: tags, count badges, a write target), `size::DOT` and `size::DISCLOSURE`. Every
-  single-line field is `ds::field_frame` (the scale's `sm` corner at a control's height, a
+  (18 px: tags, count badges, a write target), `size::DOT` (7 px: every status dot,
+  `ds::dot`, a type's and a live one; Zed's 6 px `Indicator` is not used) and
+  `size::DISCLOSURE`. Every single-line field is `ds::field_frame` (the scale's `sm` corner at a control's height, a
   `shadow-custom` (below; its border clear), the error border with the drops alone when
   invalid)
   around `ds::field_input`, and every search box is `ds::search_field`, so fields line up

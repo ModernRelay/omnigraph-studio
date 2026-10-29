@@ -40,7 +40,7 @@ use studio_settings::{BottomDockLayout, StudioSettings};
 use studio_ui::ds::IconButton;
 use studio_ui::menu::{ContextMenu, ContextMenuEntry, ContextMenuItem};
 use ui::prelude::*;
-use ui::{ButtonLike, Indicator, PopoverMenu, Tooltip, right_click_menu};
+use ui::{ButtonLike, PopoverMenu, Tooltip, right_click_menu};
 
 use item::ItemHandle;
 pub use item::{Item, ItemEvent, ItemStatus, KeyHint};
@@ -3080,7 +3080,7 @@ impl Workspace {
                             .child(studio_ui::ds::text::body(graph).single_line())
                     })
                     .when(unavailable.is_some(), |row| {
-                        row.child(Indicator::dot().color(Color::Warning))
+                        row.child(studio_ui::ds::dot(Color::Warning))
                     })
                     // Ready, the dot says so; anything else is spelled out.
                     .when(!ready, |row| {
@@ -3190,9 +3190,9 @@ impl Workspace {
                 // newer data) and one after it for its close or pin button, both kept when
                 // empty so the tabs' contents line up.
                 let indicator = if dirty {
-                    Some(Indicator::dot().color(Color::Warning))
+                    Some(studio_ui::ds::dot(Color::Warning))
                 } else if stale {
-                    Some(Indicator::dot().color(Color::Muted))
+                    Some(studio_ui::ds::dot(Color::Muted))
                 } else {
                     None
                 };
@@ -4299,7 +4299,7 @@ impl Workspace {
                     .max_w(px(studio_ui::ds::size::POPOVER_MAX))
                     .rounded(px(studio_ui::ds::radii(cx).md))
                     .map(|toast| studio_ui::ds::toast_surface(toast, cx))
-                    .child(Indicator::dot().color(color))
+                    .child(studio_ui::ds::dot(color))
                     // `min_w_0` lets the text wrap inside the toast instead of widening it.
                     .child(
                         div()

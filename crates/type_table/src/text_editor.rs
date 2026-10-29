@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use studio_actions::node::SaveText;
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
-use ui::{Indicator, Tooltip};
+use ui::{Tooltip};
 
 use crate::model::{Notice, SaveResult, Tone, edited, node_label, node_rows};
 
@@ -482,7 +482,7 @@ impl TextEditor {
             State::Conflict => Some(
                 h_flex()
                     .gap(px(studio_ui::ds::space::SM))
-                    .child(Indicator::dot().color(Color::Warning))
+                    .child(studio_ui::ds::dot(Color::Warning))
                     .child(
                         studio_ui::ds::text::body("Changed elsewhere while you edited")
                             .color(Color::Warning),
@@ -512,7 +512,7 @@ impl TextEditor {
             State::Failed(notice) => Some(
                 h_flex()
                     .gap(px(studio_ui::ds::space::SM))
-                    .child(Indicator::dot().color(notice.tone.color()))
+                    .child(studio_ui::ds::dot(notice.tone.color()))
                     .child(studio_ui::ds::text::muted(notice.message.clone()))
                     .into_any_element(),
             ),

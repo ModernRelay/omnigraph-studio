@@ -233,7 +233,7 @@ impl Render for DesignGallery {
                     .gap(px(space::SM))
                     .border_t_1()
                     .border_color(surface::rule(cx))
-                    .child(ui::Indicator::dot().color(Color::Success))
+                    .child(studio_ui::ds::dot(Color::Success))
                     .child(text::body("environment"))
                     .child(text::muted("Ready"))
                     .child(div().flex_1())

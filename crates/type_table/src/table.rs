@@ -44,7 +44,7 @@ use studio_ui::{ColumnDrag, ColumnResize, GridPlace, ROW_HEIGHT, columns_in_view
 use studio_workspace::{Item, ItemEvent, ItemStatus, KeyHint, SavedItem, ToastKind, Workspace};
 use ui::prelude::*;
 use ui::{
-    ColumnWidthConfig, Indicator, PopoverMenu, PopoverMenuHandle, Table, TableInteractionState,
+    ColumnWidthConfig, PopoverMenu, PopoverMenuHandle, Table, TableInteractionState,
     TintColor, Tooltip,
 };
 
@@ -5709,7 +5709,7 @@ impl TypeTable {
             .max_w(px(studio_ui::ds::size::READING_WIDTH))
             .pl(px(space::CONTROL_INSET))
             .gap(px(space::MD))
-            .child(Indicator::dot().color(Color::Accent))
+            .child(studio_ui::ds::dot(Color::Accent))
             .child(
                 studio_ui::ds::text::body(if saving {
                     "Saving drafts…".to_owned()
@@ -8641,7 +8641,7 @@ impl TypeTable {
                     .on_click(cx.listener(move |this, _, window, cx| this.peek_at(ix, window, cx))),
             )
         });
-        cell.children(dot.map(|color| Indicator::dot().color(color)))
+        cell.children(dot.map(studio_ui::ds::dot))
             .child(content)
             .children(peek)
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
@@ -8675,7 +8675,7 @@ impl TypeTable {
                     let unknown = notice.tone == Tone::Unknown;
                     h_flex()
                         .gap(px(space::SM))
-                        .child(Indicator::dot().color(notice.tone.color()))
+                        .child(studio_ui::ds::dot(notice.tone.color()))
                         .child(studio_ui::ds::text::body(notice.message).color(notice.tone.color()))
                         // Whether the save landed is in the branch's history.
                         .when(unknown, |row| {

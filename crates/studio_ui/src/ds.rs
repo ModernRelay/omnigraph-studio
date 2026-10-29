@@ -1049,6 +1049,26 @@ pub fn live_dot(id: impl Into<SharedString>, color: Hsla, beat: Option<u64>, cx:
         .child(dot.absolute())
 }
 
+/// A dot in a [`Color`] (a connection's state, a change not yet saved, a notice's tone):
+/// [`size::DOT`], as a type's dot and a status dot are.
+pub fn dot(color: Color) -> Dot {
+    Dot(color)
+}
+
+/// See [`dot`].
+#[derive(IntoElement)]
+pub struct Dot(Color);
+
+impl RenderOnce for Dot {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        div()
+            .size(px(size::DOT))
+            .flex_none()
+            .rounded_full()
+            .bg(self.0.color(cx))
+    }
+}
+
 /// A status dot.
 pub fn status_dot(status: Status) -> Div {
     div()

@@ -30,7 +30,7 @@ use studio_actions::table::{SelectNextSuggestion, SelectPreviousSuggestion};
 use studio_ui::ds::space;
 use studio_ui::menu::ContextMenu;
 use ui::prelude::*;
-use ui::{Indicator, PopoverMenu, ToggleState, Tooltip};
+use ui::{PopoverMenu, ToggleState, Tooltip};
 
 use crate::blob::{
     IMAGE_MAX, KIND_PREFIX, PREVIEW_PREFIX, Preview, bytes_wanted, preview, read_range,
@@ -1900,7 +1900,7 @@ impl NodePeek {
                             .child(studio_ui::ds::icon::meta(IconName::File))
                             .child(studio_ui::ds::text::body(slot.property.clone()))
                             .when(saving, |line| {
-                                line.child(Indicator::dot().color(Color::Warning))
+                                line.child(studio_ui::ds::dot(Color::Warning))
                             })
                             .child(studio_ui::ds::text::meta(facts))
                             .child(div().flex_1())
@@ -3796,7 +3796,7 @@ impl NodePeek {
             h_flex()
                 .gap(px(space::SM))
                 .items_center()
-                .child(Indicator::dot().color(Color::Accent))
+                .child(studio_ui::ds::dot(Color::Accent))
                 .child(studio_ui::ds::text::body(label))
                 .children(self.drafts_notice.as_ref().map(|notice| {
                     studio_ui::ds::text::meta(notice.message.clone()).color(notice.tone.color())
@@ -4082,7 +4082,7 @@ impl NodePeek {
                         },
                         cx,
                     ))
-                    .child(Indicator::dot().color(Color::Accent))
+                    .child(studio_ui::ds::dot(Color::Accent))
                     .into_any_element()
             }
             None => match state.picker.take() {
@@ -4144,7 +4144,7 @@ impl NodePeek {
                 .gap(px(space::SM))
                 .items_start()
                 .child(studio_ui::ds::text::body(draft.text.clone()))
-                .child(Indicator::dot().color(Color::Accent))
+                .child(studio_ui::ds::dot(Color::Accent))
                 .into_any_element(),
             None => match self.markdown.get(name) {
                 // GPUI's text takes its size from the element around it, so the labels' size
@@ -4184,7 +4184,7 @@ impl NodePeek {
                 head.child(
                     div()
                         .debug_selector(move || draft_selector.clone())
-                        .child(Indicator::dot().color(Color::Accent)),
+                        .child(studio_ui::ds::dot(Color::Accent)),
                 )
             })
             .child(div().flex_1())
@@ -4281,7 +4281,7 @@ impl NodePeek {
                         div()
                             .id(("peek-saving", index))
                             .tooltip(Tooltip::text("Saving…"))
-                            .child(Indicator::dot().color(Color::Warning)),
+                            .child(studio_ui::ds::dot(Color::Warning)),
                     )
                     .into_any_element(),
             );
@@ -4510,7 +4510,7 @@ impl NodePeek {
                 let unknown = notice.tone == Tone::Unknown;
                 h_flex()
                     .gap(px(space::SM))
-                    .child(Indicator::dot().color(notice.tone.color()))
+                    .child(studio_ui::ds::dot(notice.tone.color()))
                     .child(studio_ui::ds::text::meta(notice.message).color(notice.tone.color()))
                     // Whether the save landed is in the branch's history.
                     .when(unknown, |row| {
@@ -4609,7 +4609,7 @@ impl NodePeek {
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(index, cx)))
             .when_some(failed, |d, error| d.tooltip(Tooltip::text(error)))
             .when(self.edge_writes.contains(&index), |header| {
-                header.child(Indicator::dot().color(Color::Warning))
+                header.child(studio_ui::ds::dot(Color::Warning))
             })
             .children(add)
             .child(studio_ui::ds::text::meta(count));

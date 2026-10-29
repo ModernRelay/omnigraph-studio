@@ -795,7 +795,7 @@ impl BlobView {
             Some(BlobEdit::Saving(_)) => parts.push(
                 h_flex()
                     .gap(px(ds::space::SM))
-                    .child(ui::Indicator::dot().color(Color::Warning))
+                    .child(studio_ui::ds::dot(Color::Warning))
                     .child(ds::text::meta(format!("Saving to {}…", self.branch)))
                     .into_any_element(),
             ),
