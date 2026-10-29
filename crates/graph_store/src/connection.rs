@@ -12,7 +12,7 @@ use http_client::HttpClient;
 use studio_settings::StudioSettings;
 
 use crate::cli_tokens::{Lease, NoToken, Token, TokenSource};
-use crate::sign_in::{self, OAuthSource, Service, SignIn, SignInContext};
+use crate::sign_in::{self, Kept, OAuthSource, Service, SignIn, SignInContext};
 
 /// Where Studio learned about a server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1031,22 +1031,32 @@ impl Connection {
                 previous.replaced().await;
             }
             let kept = match &signed_in {
-                Ok(tokens) => match &tokens.refresh_token {
-                    Some(refresh) => context
-                        .keychain
-                        .write(
-                            service.key(&target),
-                            tokens.account.subject.clone(),
-                            refresh.as_bytes().to_vec(),
-                        )
-                        .await
-                        .is_ok(),
-                    None => {
-                        context.keychain.delete(service.key(&target)).await.ok();
-                        false
+                Ok(tokens) => {
+                    let written = match &tokens.refresh_token {
+                        Some(refresh) => context
+                            .keychain
+                            .write(
+                                service.key(&target),
+                                tokens.account.subject.clone(),
+                                refresh.as_bytes().to_vec(),
+                            )
+                            .await
+                            .is_ok(),
+                        None => false,
+                    };
+                    if written {
+                        Kept::This
+                    } else {
+                        // Kept or not, this sign-in leaves the keychain no earlier one: one it
+                        // will not delete is said, as the next launch would read it.
+                        match sign_in::forget(context.keychain.as_ref(), service.key(&target)).await
+                        {
+                            Ok(()) => Kept::Nothing,
+                            Err(refused) => Kept::Earlier(refused),
+                        }
                     }
-                },
-                Err(_) => false,
+                }
+                Err(_) => Kept::Nothing,
             };
             this.update(cx, |this, cx| {
                 this._signing_in = None;

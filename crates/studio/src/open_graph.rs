@@ -9,7 +9,7 @@ use gpui::{
     ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window,
 };
 use graph_store::cli_config::{self, Platform};
-use graph_store::sign_in::SignIn;
+use graph_store::sign_in::{Kept, SignIn};
 use graph_store::{
     Connection, ConnectionEvent, ConnectionRegistry, ConnectionState, ConnectionWatch,
     GraphListing, ServerSource,
@@ -916,10 +916,15 @@ fn server_status(c: &Connection) -> String {
             },
             ConnectionState::Ready,
         ) => {
-            let lasts = if *kept {
-                ""
-            } else {
-                " The keychain did not keep the sign-in, so it lasts until Studio quits."
+            let lasts = match kept {
+                Kept::This => String::new(),
+                Kept::Nothing => {
+                    " The keychain did not keep the sign-in, so it lasts until Studio quits.".into()
+                }
+                Kept::Earlier(why) => format!(
+                    " The keychain did not keep the sign-in, and did not delete an earlier one \
+                     ({why}), which the next launch reads."
+                ),
             };
             return format!("Signed in as {account} at {service}.{lasts}");
         }
@@ -1326,16 +1331,25 @@ mod tests {
             kept,
         };
         assert_eq!(
-            said(ConnectionState::Ready, signed_in(true), cx).0,
+            said(ConnectionState::Ready, signed_in(Kept::This), cx).0,
             "Signed in as user_1 at id.example."
         );
         assert!(
-            said(ConnectionState::Ready, signed_in(false), cx)
+            said(ConnectionState::Ready, signed_in(Kept::Nothing), cx)
                 .0
                 .ends_with("lasts until Studio quits.")
         );
+        assert!(
+            said(
+                ConnectionState::Ready,
+                signed_in(Kept::Earlier("locked".into())),
+                cx
+            )
+            .0
+            .ends_with("did not delete an earlier one (locked), which the next launch reads.")
+        );
         assert_eq!(
-            said(ConnectionState::Unauthorized, signed_in(true), cx),
+            said(ConnectionState::Unauthorized, signed_in(Kept::This), cx),
             (
                 "The server refused user_1, signed in at id.example: it may not admit this \
                  account."
@@ -1350,7 +1364,7 @@ mod tests {
                 Some("The sign-in service could not be reached: offline.".into());
         });
         assert_eq!(
-            said(ConnectionState::Unauthorized, signed_in(true), cx),
+            said(ConnectionState::Unauthorized, signed_in(Kept::This), cx),
             (
                 "The sign-in service could not be reached: offline. You stay signed in at \
                  id.example; Studio asks again."

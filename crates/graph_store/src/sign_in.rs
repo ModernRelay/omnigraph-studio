@@ -77,7 +77,21 @@ pub trait Keychain: Send + Sync + 'static {
         user: String,
         secret: Vec<u8>,
     ) -> BoxFuture<'static, Result<(), String>>;
+    /// Deletes the item at `key`. macOS and Windows refuse to delete an item that is not
+    /// there; [`forget`] takes that as done.
     fn delete(&self, key: String) -> BoxFuture<'static, Result<(), String>>;
+}
+
+/// Deletes `key`'s item: done when the key holds none afterwards, so a key that held nothing is
+/// no refusal. Otherwise the keychain's refusal, the item still there for the next launch.
+pub(crate) async fn forget(keychain: &dyn Keychain, key: String) -> Result<(), String> {
+    let Err(refused) = keychain.delete(key.clone()).await else {
+        return Ok(());
+    };
+    match keychain.read(key).await {
+        Ok(None) => Ok(()),
+        _ => Err(refused),
+    }
 }
 
 enum KeychainRequest {
@@ -202,15 +216,21 @@ impl Keychain for MemoryKeychain {
         futures::future::ready(Ok(())).boxed()
     }
 
+    /// As macOS and Windows do, an item that is not there is not deleted.
     fn delete(&self, key: String) -> BoxFuture<'static, Result<(), String>> {
         if self.refuses_deletes.load(Ordering::SeqCst) {
             return futures::future::ready(Err("the keychain refused".to_owned())).boxed();
         }
-        self.items
+        let removed = self
+            .items
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&key);
-        futures::future::ready(Ok(())).boxed()
+        let done = match removed {
+            Some(_) => Ok(()),
+            None => Err("no such item".to_owned()),
+        };
+        futures::future::ready(done).boxed()
     }
 }
 
@@ -301,12 +321,24 @@ pub enum SignIn {
     Unavailable(String),
     /// The browser is open at `service`.
     Waiting { service: String },
-    /// Signed in at `service` as `account`; `kept` says the keychain kept the sign-in.
+    /// Signed in at `service` as `account`; `kept` is what the keychain holds for the target.
     SignedIn {
         service: String,
         account: String,
-        kept: bool,
+        kept: Kept,
     },
+}
+
+/// What the keychain holds for a signed-in target, which the next launch reads (spec 016,
+/// Custody).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Kept {
+    /// This sign-in.
+    This,
+    /// Nothing: the sign-in lasts until Studio quits.
+    Nothing,
+    /// An earlier sign-in, which the keychain did not delete: its refusal.
+    Earlier(String),
 }
 
 /// The tokens of one sign-in: the access token, refreshed from the refresh token the keychain
@@ -325,8 +357,8 @@ struct Inner {
     keychain: Arc<dyn Keychain>,
     held: smol::lock::Mutex<Held>,
     account: Mutex<Account>,
-    /// The keychain kept the refresh token held.
-    kept: AtomicBool,
+    /// What the keychain holds for the target.
+    kept: Mutex<Kept>,
     /// The server refused the access token held: the next ask refreshes.
     refused: AtomicBool,
     /// The sign-in ended (`invalid_grant`, or signed out): no refresh is tried.
@@ -362,13 +394,13 @@ impl Access {
 }
 
 impl OAuthSource {
-    /// A sign-in just made, its tokens and whether the keychain kept them.
+    /// A sign-in just made, its tokens and what the keychain holds for its target.
     pub(crate) fn signed_in(
         service: Service,
         target: &str,
         keychain: Arc<dyn Keychain>,
         tokens: Tokens,
-        kept: bool,
+        kept: Kept,
     ) -> Self {
         Self::new(
             service,
@@ -405,7 +437,7 @@ impl OAuthSource {
                 subject,
                 organization: None,
             },
-            true,
+            Kept::This,
         )
     }
 
@@ -415,7 +447,7 @@ impl OAuthSource {
         keychain: Arc<dyn Keychain>,
         held: Held,
         account: Account,
-        kept: bool,
+        kept: Kept,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -425,7 +457,7 @@ impl OAuthSource {
                 keychain,
                 held: smol::lock::Mutex::new(held),
                 account: Mutex::new(account),
-                kept: AtomicBool::new(kept),
+                kept: Mutex::new(kept),
                 refused: AtomicBool::new(false),
                 ended: AtomicBool::new(false),
             }),
@@ -445,8 +477,12 @@ impl OAuthSource {
             .clone()
     }
 
-    pub(crate) fn kept_in_keychain(&self) -> bool {
-        self.inner.kept.load(Ordering::SeqCst)
+    pub(crate) fn kept_in_keychain(&self) -> Kept {
+        self.inner
+            .kept
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Sends the sign-in's requests to the server's address through `http` from now on: the
@@ -485,7 +521,7 @@ impl OAuthSource {
                 held.refresh.take()
             };
             let forgotten = if forget {
-                inner.keychain.delete(inner.key.clone()).await
+                self::forget(inner.keychain.as_ref(), inner.key.clone()).await
             } else {
                 Ok(())
             };
@@ -606,7 +642,7 @@ impl Inner {
                     {
                         // The rotated token replaces the kept one before the new access token
                         // is used: the old one no longer refreshes.
-                        let kept = self
+                        let written = self
                             .keychain
                             .write(
                                 self.key.clone(),
@@ -615,7 +651,14 @@ impl Inner {
                             )
                             .await
                             .is_ok();
-                        self.kept.store(kept, Ordering::SeqCst);
+                        let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+                        if written {
+                            *kept = Kept::This;
+                        } else if *kept == Kept::This {
+                            // What it holds is this account's token from before, which no longer
+                            // refreshes; an earlier sign-in it holds instead stays said.
+                            *kept = Kept::Nothing;
+                        }
                         held.refresh = Some(rotated.clone());
                     }
                     held.access = Some(Access::new(tokens.access_token, tokens.expires_at));
@@ -1034,7 +1077,7 @@ mod tests {
             SignIn::SignedIn {
                 service: "id.test".into(),
                 account: "user_1".into(),
-                kept: true
+                kept: Kept::This
             }
         );
         let key = format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}");
@@ -1076,7 +1119,10 @@ mod tests {
         until(cx, "the sign-in as another account", |cx| {
             matches!(
                 sign_in_state(&connection, cx).1,
-                SignIn::SignedIn { kept: false, .. }
+                SignIn::SignedIn {
+                    kept: Kept::Nothing,
+                    ..
+                }
             ) && sign_in_state(&connection, cx).0 == ConnectionState::Ready
         });
         browser.join().unwrap();
@@ -1097,11 +1143,37 @@ mod tests {
         until(cx, "the sign-in not kept", |cx| {
             matches!(
                 sign_in_state(&connection, cx).1,
-                SignIn::SignedIn { kept: false, .. }
+                SignIn::SignedIn {
+                    kept: Kept::Nothing,
+                    ..
+                }
             ) && sign_in_state(&connection, cx).0 == ConnectionState::Ready
         });
         browser.join().unwrap();
         assert!(keychain.items.lock().unwrap().is_empty());
+        // Its sign-out finds nothing to delete, which is no refusal.
+        let revoked = |served: &Arc<Mutex<Served>>| {
+            served
+                .lock()
+                .unwrap()
+                .log
+                .iter()
+                .filter(|l| l.starts_with("revoke"))
+                .count()
+        };
+        let before = revoked(&served);
+        connection.update(cx, |c, cx| c.sign_out(cx));
+        until(cx, "the unkept sign-in's revocation", |_| {
+            revoked(&served) > before
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            sign_in_state(&connection, cx).1,
+            SignIn::Offered {
+                service: "id.test".into(),
+                why: None
+            }
+        );
 
         // One that will not delete it leaves the person signed out for this run, and says so:
         // the next launch would read the sign-in back.
@@ -1111,7 +1183,10 @@ mod tests {
         until(cx, "the sign-in kept", |cx| {
             matches!(
                 sign_in_state(&connection, cx).1,
-                SignIn::SignedIn { kept: true, .. }
+                SignIn::SignedIn {
+                    kept: Kept::This,
+                    ..
+                }
             )
         });
         browser.join().unwrap();
@@ -1137,6 +1212,41 @@ mod tests {
             }
         );
         assert_eq!(keychain.items.lock().unwrap().len(), 1);
+
+        // A sign-in the keychain keeps nothing of, over an earlier one it will not delete, says
+        // the earlier one is what the next launch reads.
+        served.lock().unwrap().no_refresh = true;
+        connection.update(cx, |c, cx| c.sign_in(cx));
+        let browser = approve(&served, &cx.opened_url().unwrap());
+        until(cx, "the sign-in over an earlier one", |cx| {
+            matches!(sign_in_state(&connection, cx).1, SignIn::SignedIn { .. })
+        });
+        browser.join().unwrap();
+        assert!(matches!(
+            sign_in_state(&connection, cx).1,
+            SignIn::SignedIn {
+                kept: Kept::Earlier(ref why),
+                ..
+            } if why == "the keychain refused"
+        ));
+        assert_eq!(keychain.items.lock().unwrap().len(), 1);
+        // And one whose write the keychain refuses deletes the earlier one rather than leave it.
+        served.lock().unwrap().no_refresh = false;
+        keychain.refuses_deletes.store(false, Ordering::SeqCst);
+        keychain.refuses_writes.store(true, Ordering::SeqCst);
+        connection.update(cx, |c, cx| c.sign_in(cx));
+        let browser = approve(&served, &cx.opened_url().unwrap());
+        until(cx, "the earlier sign-in deleted", |cx| {
+            matches!(
+                sign_in_state(&connection, cx).1,
+                SignIn::SignedIn {
+                    kept: Kept::Nothing,
+                    ..
+                }
+            )
+        });
+        browser.join().unwrap();
+        assert!(keychain.items.lock().unwrap().is_empty());
     }
 
     #[gpui::test]
@@ -1223,7 +1333,7 @@ mod tests {
         let signed_in = SignIn::SignedIn {
             service: "id.test".into(),
             account: "user_1".into(),
-            kept: true,
+            kept: Kept::This,
         };
         let connection = connection(&served, keychain.clone(), cx);
         let _watch = connection.update(cx, |c, cx| c.watch(cx));
@@ -1456,6 +1566,62 @@ mod tests {
         assert_eq!(keychain.items.lock().unwrap()[&key].1, b"r1".to_vec());
     }
 
+    /// A rotated refresh token the keychain will not keep: a sign-in it kept reads not kept, as
+    /// it holds this account's token from before, which no longer refreshes; an earlier sign-in
+    /// it holds instead stays said, as the next launch reads that one.
+    #[test]
+    fn a_rotation_the_keychain_refuses_leaves_what_it_holds_said() {
+        let served = Arc::new(Mutex::new(Served {
+            lives: 300,
+            ..Served::default()
+        }));
+        let http = fake(served.clone());
+        let clients = Clients::new(url::Url::parse(SERVER).unwrap(), http.clone(), http);
+        let identities = ClientIdentities {
+            metadata_document: Some(CLIENT.into()),
+            registered: Vec::new(),
+            development: None,
+        };
+        let metadata = format!("{SERVER}/.well-known/oauth-protected-resource/mcp");
+        let service = smol::block_on(discover(clients, metadata, identities)).unwrap();
+        let keychain = Arc::new(MemoryKeychain::default());
+        keychain.refuses_writes.store(true, Ordering::SeqCst);
+        let rotated_from = |source: OAuthSource, refresh: &str| {
+            served.lock().unwrap().refresh.insert(refresh.to_owned());
+            let token = smol::block_on(source.token(Arc::default()));
+            assert!(token.is_ok(), "{token:?}");
+            source.kept_in_keychain()
+        };
+
+        let kept = OAuthSource::kept(
+            service.clone(),
+            "work",
+            keychain.clone(),
+            "user_1".into(),
+            "kept".into(),
+        );
+        assert_eq!(rotated_from(kept, "kept"), Kept::Nothing);
+
+        // A sign-in whose access token has ended, so its first ask refreshes.
+        let earlier = Kept::Earlier("the keychain refused".into());
+        let over_earlier = OAuthSource::signed_in(
+            service,
+            "work",
+            keychain,
+            Tokens {
+                access_token: "ended".into(),
+                refresh_token: Some("over-earlier".into()),
+                expires_at: SystemTime::now() - Duration::from_secs(60),
+                account: Account {
+                    subject: "user_2".into(),
+                    organization: None,
+                },
+            },
+            earlier.clone(),
+        );
+        assert_eq!(rotated_from(over_earlier, "over-earlier"), earlier);
+    }
+
     #[gpui::test]
     async fn a_sign_in_the_service_ended_or_the_server_does_not_admit_is_said(
         cx: &mut TestAppContext,
@@ -1652,7 +1818,7 @@ mod tests {
         assert!(page.join().unwrap().contains("Signed in to 127.0.0.1:"));
         let (_, signed_in, _) = sign_in_state(&connection, cx);
         assert!(
-            matches!(&signed_in, SignIn::SignedIn { account, kept: true, .. } if account == "user_alice"),
+            matches!(&signed_in, SignIn::SignedIn { account, kept: Kept::This, .. } if account == "user_alice"),
             "{signed_in:?}"
         );
         let graphs = connection.read_with(cx, |c, _| c.graph_ids());
