@@ -628,6 +628,13 @@ fn preferences_path() -> PathBuf {
         .join("preferences.json")
 }
 
+/// Where an agent's preferences keep the models it offered when it last ran; no option has
+/// this id, so it is never set on a session.
+const MODELS: &str = "@models";
+
+/// An agent's model option's id, and each of its values with its name.
+pub type Models = (String, Vec<(String, String)>);
+
 /// The preferences, read from their file once and then kept; each change is written in turn,
 /// off the main thread, unless the file could not be read and stays where it was.
 struct Preferences {
@@ -648,6 +655,29 @@ impl Preferences {
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// The option values to set on the agent's next session.
+    fn options(&mut self, command: &[String]) -> Map<String, Value> {
+        let mut options = self.of(command);
+        options.remove(MODELS);
+        options
+    }
+
+    /// The models the agent offered when it last ran, for the model menu to list while another
+    /// agent runs.
+    fn models(&mut self, command: &[String]) -> Option<Models> {
+        serde_json::from_value(self.of(command).remove(MODELS)?).ok()
+    }
+
+    /// Keeps the models the agent offers, written only when they changed.
+    fn remember_models(&mut self, command: &[String], option: &str, values: Vec<(String, String)>) {
+        let offered = (option.to_owned(), values);
+        if self.models(command).as_ref() != Some(&offered)
+            && let Ok(value) = serde_json::to_value(&offered)
+        {
+            self.prefer(command, MODELS, value);
+        }
     }
 
     fn prefer(&mut self, command: &[String], option: &str, value: Value) {
@@ -686,7 +716,16 @@ fn with_preferences<T>(f: impl FnOnce(&mut Preferences) -> T) -> T {
 }
 
 pub fn preferences(command: &[String]) -> Map<String, Value> {
-    with_preferences(|preferences| preferences.of(command))
+    with_preferences(|preferences| preferences.options(command))
+}
+
+/// The models an agent offered when it last ran ([`Preferences::models`]).
+pub fn models(command: &[String]) -> Option<Models> {
+    with_preferences(|preferences| preferences.models(command))
+}
+
+pub fn remember_models(command: &[String], option: &str, values: Vec<(String, String)>) {
+    with_preferences(|preferences| preferences.remember_models(command, option, values));
 }
 
 pub fn prefer(command: &[String], option: &str, value: Value) {
@@ -1253,6 +1292,36 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An agent's models are kept for the menu to list while another agent runs, and are never
+    /// among the options set on its next session.
+    #[test]
+    fn an_agents_models_are_kept_apart_from_its_options() {
+        let dir = std::env::temp_dir().join(format!("studio-agent-models-{}", std::process::id()));
+        let path = dir.join("preferences.json");
+        let codex = vec!["codex-acp".to_owned()];
+        let kept = |path: &Path| Preferences {
+            path: path.to_owned(),
+            records: None,
+        };
+        let models = vec![
+            ("gpt-5.5".to_owned(), "GPT-5.5".to_owned()),
+            ("gpt-5.5-mini".to_owned(), "GPT-5.5 mini".to_owned()),
+        ];
+        let mut preferences = kept(&path);
+        assert_eq!(preferences.models(&codex), None);
+        preferences.prefer(&codex, "model", json!("gpt-5.5"));
+        preferences.remember_models(&codex, "model", models.clone());
+        studio_settings::writes_done();
+        let mut preferences = kept(&path);
+        assert_eq!(
+            preferences.models(&codex),
+            Some(("model".to_owned(), models))
+        );
+        let options = preferences.options(&codex);
+        assert_eq!(options.keys().collect::<Vec<_>>(), ["model"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

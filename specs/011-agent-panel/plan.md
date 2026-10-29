@@ -76,9 +76,12 @@ person picks one.
 
 Each conversation runs its own agent, as each of Zed's threads does: the one it was held with
 (`SessionRecord::agent`), else the default when it opened. The composer's model menu, or the
-agent's name in its place before the agent offers a model, lists the agents (the presets, then
-a configured command that is none of them) with the conversation's checked, as Zed's
-new-thread menu does. Choosing one makes it the default. A conversation nothing was sent in
+agent's name in its place before the agent offers a model, has a section of models per agent
+(the presets, then a configured command that is none of them): the running agent's from its
+model option, the current one checked; another agent's as it offered them when it last ran
+(kept with its preferences), or "Default model" before it ever has. A model of another agent
+runs that agent with it: the model is remembered as the agent's preference, which its new
+session takes as it opens. Choosing another agent makes it the default. A conversation nothing was sent in
 yet changes agent in place; one that holds messages keeps its agent, and the choice opens a new
 conversation. **Other agent…** opens Settings for a custom command.
 
@@ -379,6 +382,7 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-29 | The model menu lists each agent's models, and a model of another agent runs that agent | `agent_panel` `sessions::tests::an_agents_models_are_kept_apart_from_its_options`; `cargo test -p agent_panel`, clippy `-D warnings` | Pass. The menu is not drawn by a test |
 | 2026-10-29 | A conversation runs the agent it was held with, starts it when shown, and joins the list on its first message | `agent_panel` `panel::tests::a_conversation_runs_the_agent_it_was_held_with` (held agent, default, a custom command offered beside the presets), `a_restored_conversation_starts_its_agent_when_shown`; `cargo test -p agent_panel`, clippy `-D warnings` | Pass. The menu and the in-place switch are not drawn by a test; checked by hand in the running app |
 | 2026-10-28 | The panel serves no MCP server, and each conversation has a folder of its own | `agent_panel` `sessions::tests::each_conversation_has_a_folder_of_its_own`, `cli_home::tests::agents_md_names_the_cli_the_branch_and_the_rules`, `a_conversation_home_holds_its_config_token_and_wrapper`, `panel::tests::a_run_of_steps_reads_as_one_sentence`, `streaming_into_the_last_turn_keeps_the_earlier_turns_blocks`; `cargo test -p agent_panel -p studio`, clippy `-D warnings` | See spec 013's log of the same date. `socket.rs`, `mcp.rs`, `tools.rs` and the `mcp-proxy` command are gone; every permission request is the person's; the thread shows each tool call by its title |
 | 2026-10-29 | A conversation restored behind another tab starts no agent until it is shown | `agent_panel::panel::open_session` and `AgentPanel::start_when_shown` by reading: the start is owed to the tab's next draw, as the other views' reads are (`type_table` `a_page_not_drawn_reads_nothing` and siblings test that mechanism); `cargo test -p agent_panel`, clippy `-D warnings` | Pass. Before, every conversation tab the workspace restored started its agent at launch, a process and a replay each, shown or not; one opened from the list starts as its tab draws |

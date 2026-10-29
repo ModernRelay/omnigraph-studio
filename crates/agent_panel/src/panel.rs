@@ -1436,6 +1436,26 @@ impl AgentPanel {
         cx.notify();
     }
 
+    /// Runs `command` with `model` (its model option and value): remembered for the agent's next
+    /// session, which takes it as it opens. Another agent is chosen ([`Self::choose_agent`]);
+    /// this conversation's agent switches model when it is running.
+    fn choose_model(
+        &mut self,
+        command: Vec<String>,
+        model: Option<(String, String)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((option, value)) = &model {
+            crate::sessions::prefer(&command, option, Value::String(value.clone()));
+        }
+        if command != self.agent {
+            self.choose_agent(command, window, cx);
+        } else if let Some((option, value)) = model {
+            self.set_option(option, SessionConfigOptionValue::value_id(value), cx);
+        }
+    }
+
     /// The name the agent menu gives this conversation's agent.
     fn agent_label(&self, cx: &App) -> String {
         agents(cx)
@@ -1769,6 +1789,13 @@ impl AgentPanel {
             .filter_map(|option| OptionView::new(option, self.setting_option.as_ref()))
             .map(Rc::new)
             .collect();
+        // Kept, so the model menu lists this agent's models while another one runs.
+        if let Some(model) = self.option_views.iter().find(|option| option.is_model())
+            && let Choice::Select { sections, .. } = &model.choice
+        {
+            let values = sections.iter().flat_map(|(_, values)| values.clone());
+            crate::sessions::remember_models(&self.agent, &model.id, values.collect());
+        }
     }
 
     /// Sets the options chosen last for this agent where the new session differs and still
@@ -2427,6 +2454,41 @@ impl OptionView {
 
     /// The option's entries in a menu: its values with the current one checked, or one entry
     /// that switches it.
+    /// A select option's values in the menu, the current one checked; another is set when chosen.
+    fn add_values(
+        &self,
+        mut menu: ContextMenu,
+        values: &[(String, String)],
+        current: &str,
+        panel: &WeakEntity<AgentPanel>,
+    ) -> ContextMenu {
+        for (value, name) in values {
+            let checked = value == current;
+            let (panel, id, value) = (panel.clone(), self.id.clone(), value.clone());
+            menu = menu.toggleable_entry(
+                name.clone(),
+                checked,
+                IconPosition::Start,
+                None,
+                move |_, cx| {
+                    if checked {
+                        return;
+                    }
+                    panel
+                        .update(cx, |panel, cx| {
+                            panel.set_option(
+                                id.clone(),
+                                SessionConfigOptionValue::value_id(value.clone()),
+                                cx,
+                            )
+                        })
+                        .ok();
+                },
+            );
+        }
+        menu
+    }
+
     fn add_to(&self, mut menu: ContextMenu, panel: &WeakEntity<AgentPanel>) -> ContextMenu {
         match &self.choice {
             Choice::Select {
@@ -2436,31 +2498,7 @@ impl OptionView {
                     if index > 0 {
                         menu = menu.separator();
                     }
-                    menu = menu.header(header.clone());
-                    for (value, name) in values {
-                        let checked = value == current;
-                        let (panel, id, value) = (panel.clone(), self.id.clone(), value.clone());
-                        menu = menu.toggleable_entry(
-                            name.clone(),
-                            checked,
-                            IconPosition::Start,
-                            None,
-                            move |_, cx| {
-                                if checked {
-                                    return;
-                                }
-                                panel
-                                    .update(cx, |panel, cx| {
-                                        panel.set_option(
-                                            id.clone(),
-                                            SessionConfigOptionValue::value_id(value.clone()),
-                                            cx,
-                                        )
-                                    })
-                                    .ok();
-                            },
-                        );
-                    }
+                    menu = self.add_values(menu.header(header.clone()), values, current, panel);
                 }
                 menu
             }
@@ -2519,13 +2557,14 @@ fn option_picker(
             let option = option.clone();
             let panel = panel.clone();
             let agents = agents.clone();
-            Some(ContextMenu::build(window, cx, move |menu, _, _| {
-                let mut menu = option.add_to(menu, &panel);
-                if let Some(agents) = &agents {
-                    menu = agents.add_to(menu.separator(), &panel);
-                }
-                menu
-            }))
+            Some(ContextMenu::build(
+                window,
+                cx,
+                move |menu, _, _| match &agents {
+                    Some(agents) => agents.add_to(menu, &panel),
+                    None => option.add_to(menu, &panel),
+                },
+            ))
         })
         .anchor(gpui::Anchor::BottomRight)
         .into_any_element()
@@ -2562,43 +2601,64 @@ fn agent_for(session_id: Option<&str>, sessions: &Entity<AgentSessions>, cx: &Ap
         .unwrap_or_else(|| held.split_whitespace().map(str::to_owned).collect())
 }
 
-/// The agent menu, in the model picker or in its place: the agents, this conversation's
-/// checked ([`AgentPanel::choose_agent`]), and a new conversation.
+/// The model menu, or the menu in its place before the agent offers a model: a section of
+/// models per agent. The running agent's are its model option's, the current one checked; another
+/// agent's are the ones it offered when it last ran, or its default before it ever has. A model
+/// of another agent runs that agent with it ([`AgentPanel::choose_model`]).
 #[derive(Clone)]
 struct AgentMenu {
     agents: Vec<(String, Vec<String>)>,
     current: Vec<String>,
+    /// The running agent's model option.
+    model: Option<Rc<OptionView>>,
 }
 
 impl AgentMenu {
     fn add_to(&self, mut menu: ContextMenu, panel: &WeakEntity<AgentPanel>) -> ContextMenu {
-        menu = menu.header("Agent");
-        for (name, command) in &self.agents {
-            let checked = *command == self.current;
-            let (panel, command) = (panel.clone(), command.clone());
-            menu = menu.toggleable_entry(
-                name.clone(),
-                checked,
-                IconPosition::Start,
-                None,
-                move |window, cx| {
-                    if !checked {
-                        panel
-                            .update(cx, |panel, cx| {
-                                panel.choose_agent(command.clone(), window, cx)
-                            })
-                            .ok();
-                    }
-                },
-            );
+        for (index, (name, command)) in self.agents.iter().enumerate() {
+            if index > 0 {
+                menu = menu.separator();
+            }
+            menu = menu.header(name.clone());
+            let live = self.model.as_ref().filter(|_| *command == self.current);
+            if let Some(model) = live
+                && let Choice::Select {
+                    current, sections, ..
+                } = &model.choice
+            {
+                for (_, values) in sections {
+                    menu = model.add_values(menu, values, current, panel);
+                }
+                continue;
+            }
+            let models = crate::sessions::models(command)
+                .map(|(option, values)| {
+                    values
+                        .into_iter()
+                        .map(|(value, name)| (name, Some((option.clone(), value))))
+                        .collect()
+                })
+                .filter(|models: &Vec<_>| !models.is_empty())
+                .unwrap_or_else(|| vec![("Default model".to_owned(), None)]);
+            for (label, model) in models {
+                let (panel, command) = (panel.clone(), command.clone());
+                menu = menu.entry(label, None, move |window, cx| {
+                    panel
+                        .update(cx, |panel, cx| {
+                            panel.choose_model(command.clone(), model.clone(), window, cx)
+                        })
+                        .ok();
+                });
+            }
         }
-        menu.entry("Other agent…", None, |window, cx| {
-            window.dispatch_action(Box::new(studio_actions::workspace::OpenSettings), cx)
-        })
-        .separator()
-        .entry("New conversation", None, |window, cx| {
-            window.dispatch_action(Box::new(studio_actions::agent::NewConversation), cx)
-        })
+        menu.separator()
+            .entry("Other agent…", None, |window, cx| {
+                window.dispatch_action(Box::new(studio_actions::workspace::OpenSettings), cx)
+            })
+            .separator()
+            .entry("New conversation", None, |window, cx| {
+                window.dispatch_action(Box::new(studio_actions::agent::NewConversation), cx)
+            })
     }
 }
 
@@ -3874,6 +3934,7 @@ impl AgentPanel {
         let agent_menu = AgentMenu {
             agents: agents(cx),
             current: self.agent.clone(),
+            model: models.first().cloned(),
         };
 
         let mut pickers: Vec<AnyElement> = shown
