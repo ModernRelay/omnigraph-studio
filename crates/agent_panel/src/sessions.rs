@@ -431,11 +431,17 @@ impl AgentSessions {
 }
 
 /// Where a conversation runs: where it ran before (`saved`), so a resumed one finds the agent's
-/// own record of it whatever key its graph had then; a new one in its graph's directory.
-pub fn working_dir(saved: Option<&SessionRecord>, graph: &str) -> PathBuf {
+/// own record of it whatever key its graph had then; a new one in a folder of its own in its
+/// graph's directory, named for its `branch`, which holds its CLI and `AGENTS.md`
+/// ([`crate::cli_home`]).
+pub fn working_dir(saved: Option<&SessionRecord>, graph: &str, branch: &str) -> PathBuf {
     match saved {
         Some(saved) => saved.cwd.clone(),
-        None => graph_cwd(graph),
+        None => {
+            // A tab that starts again on the same branch gets another folder.
+            let random = crate::confined::random_hex(4).unwrap_or_default();
+            graph_cwd(graph).join(format!("{}-{random}", branch.replace('/', "-")))
+        }
     }
 }
 
@@ -456,8 +462,8 @@ pub fn graph_cwd(graph: &str) -> PathBuf {
         .join(format!("{slug}-{hash:08x}"))
 }
 
-/// The folder of what agents keep on this machine, their working directories and their
-/// conversations' private CLI homes: `agent` in Studio's data folder, or on Windows in its
+/// The folder of what agents keep on this machine, their working directories with their
+/// conversations' CLI homes: `agent` in Studio's data folder, or on Windows in its
 /// local counterpart ([`local_counterpart`]).
 fn agent_dir() -> PathBuf {
     let data = studio_settings::data_dir();
@@ -487,12 +493,6 @@ fn agent_dir() -> PathBuf {
 fn local_counterpart(data: &Path, roaming: Option<&Path>, local: Option<&Path>) -> Option<PathBuf> {
     let (roaming, local, name) = (roaming?, local?, data.file_name()?);
     (data.parent() == Some(roaming)).then(|| local.join(name))
-}
-
-/// Where each conversation's private CLI home is made: outside every working directory, so
-/// an agent cannot change what `omnigraph_run` runs, and beside them on this machine.
-pub fn private_homes() -> PathBuf {
-    agent_dir().join("homes")
 }
 
 /// A title as Studio keeps one: the first line with text, cut to a title's length on a
@@ -745,17 +745,26 @@ mod tests {
         assert!(a.to_string_lossy().contains("server-crm-"));
     }
 
-    /// On Windows agents work, and their conversations' CLI homes with a session token and a
-    /// certificate are kept, in the local application folder, never the roaming one, which
+    /// A new conversation works in a folder of its own in its graph's directory, named for its
+    /// branch, another each time; a saved one where it ran before.
+    #[test]
+    fn each_conversation_has_a_folder_of_its_own() {
+        let first = working_dir(None, "server/crm", "agent/20261028-101500");
+        let again = working_dir(None, "server/crm", "agent/20261028-101500");
+        assert_eq!(first.parent(), Some(graph_cwd("server/crm").as_path()));
+        assert_ne!(first, again);
+        let name = first.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("agent-20261028-101500-"), "{name}");
+        let saved = record("s1", "server/crm", "agent", 1);
+        assert_eq!(working_dir(Some(&saved), "other", "agent/x"), saved.cwd);
+    }
+
+    /// On Windows agents work, with their conversations' CLI homes holding a session token and
+    /// a certificate, in the local application folder, never the roaming one, which
     /// folder redirection can put on a network share where cmd cannot work. A data folder set
     /// elsewhere keeps its agents.
     #[test]
     fn agents_work_in_the_local_folder_of_studios_roaming_data() {
-        // The homes and the working directories are found in one folder.
-        assert_eq!(
-            private_homes().parent(),
-            graph_cwd("g").parent().and_then(Path::parent)
-        );
         let profile = std::env::temp_dir().join("profile");
         let (roaming, local) = (
             profile.join("AppData").join("Roaming"),

@@ -201,10 +201,8 @@ impl SessionsPanel {
     /// The agent the settings name, as this panel runs it to import or delete conversations.
     fn agent(cx: &App) -> Option<AgentLaunch> {
         let settings = &StudioSettings::get(cx).agent;
-        Self::has_agent(cx).then(|| AgentLaunch {
-            command: settings.command.clone(),
-            env: settings.env.clone(),
-        })
+        Self::has_agent(cx)
+            .then(|| AgentLaunch::new(settings.command.clone(), settings.env.clone()))
     }
 
     // ---- rename ----

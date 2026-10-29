@@ -7,7 +7,7 @@
 //! directory's handle (`openat`); Windows holds each directory's handle so that its path keeps
 //! naming it (`pinned`).
 //!
-//! The working directory itself is Studio's own (`sessions::graph_cwd`) and is opened as it is.
+//! The working directory itself is Studio's own (`sessions::working_dir`) and is opened as it is.
 
 use std::ffi::OsString;
 use std::io;

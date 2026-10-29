@@ -99,7 +99,7 @@ schema, the agent skill's `upstream/`).
   and the script refuses a binary that needs a newer glibc. AppImage later.
 - Windows: `script/bundle-windows`, run in Git Bash, builds a zip (`omnigraph-studio.exe`,
   `LICENSE`, `THIRD-PARTY-NOTICES.md`) for Windows 10 1809 and later, the first Windows with Unix
-  sockets, which the agent's tool socket uses (`uds_windows`). A release build opens no console
+  sockets, which the agent's tool socket used (`uds_windows`) until 2026-10-28. A release build opens no console
   window. The executable is not signed, has no icon yet, and there is no installer. Settings live
   in `%APPDATA%\Omnigraph Studio`. `.gitattributes` checks text out with LF everywhere, so the
   files Studio embeds are the same bytes on every system. The agent panel says it is not

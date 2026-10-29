@@ -17,20 +17,17 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     BooleanConfigOptionCapabilities, CancelNotification, ClientCapabilities,
     ClientSessionCapabilities, CloseSessionRequest, ContentBlock, DeleteSessionRequest,
-    Implementation, InitializeRequest, ListSessionsRequest, LoadSessionRequest, McpServer,
-    McpServerStdio, NewSessionRequest, PermissionOptionKind, PromptRequest,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
-    SessionConfigOptionValue, SessionConfigOptionsCapabilities, SessionId, SessionInfo,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason, TextContent,
+    Implementation, InitializeRequest, ListSessionsRequest, LoadSessionRequest, NewSessionRequest,
+    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    ResumeSessionRequest, SessionConfigId, SessionConfigOption, SessionConfigOptionValue,
+    SessionConfigOptionsCapabilities, SessionId, SessionInfo, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, StopReason, TextContent,
 };
 use agent_client_protocol::{
     AcpAgent, AcpAgentConfig, Agent, ConnectionTo, LineDirection, SentRequest,
 };
 use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
-
-use crate::tools;
 
 /// Lines of the agent's stderr kept for the "stopped" state.
 const STDERR_LINES: usize = 20;
@@ -66,15 +63,19 @@ pub struct AgentLaunch {
     pub env: BTreeMap<String, String>,
 }
 
+impl AgentLaunch {
+    /// The agent the settings name, with codex-acp starting unsandboxed ([`crate::codex`]).
+    pub fn new(command: Vec<String>, mut env: BTreeMap<String, String>) -> Self {
+        crate::codex::unsandbox(&command, &mut env);
+        Self { command, env }
+    }
+}
+
 /// One conversation on the agent.
 #[derive(Debug, Clone)]
 pub struct SessionLaunch {
     /// The session's working directory.
     pub cwd: PathBuf,
-    /// The stdio MCP server the agent starts for it: Studio's own executable as `mcp-proxy`,
-    /// with the conversation's own socket.
-    pub mcp_command: PathBuf,
-    pub mcp_args: Vec<String>,
     /// A session to come back to, when the agent can load or resume one.
     pub resume: Option<String>,
 }
@@ -99,9 +100,6 @@ pub enum Opened {
 }
 
 pub enum HostEvent {
-    /// The adapter the agent runs as, before anything of the session: a loaded session replays
-    /// its tool calls before `Ready`, and each is told apart by its adapter.
-    Adapter(tools::Adapter),
     /// The session is open.
     Ready {
         agent: String,
@@ -174,9 +172,6 @@ struct Routes {
     /// The sessions in `early` in the order they began keeping updates, the oldest first (and
     /// ids since let go, skipped): a new one takes the oldest's place when they are full.
     early_order: VecDeque<SessionId>,
-    /// The tool calls that are Studio's own, by id, as their first update said: Codex asks
-    /// permission for an MCP call with its id alone.
-    studio_calls: HashMap<String, tools::StudioTool>,
     /// Sessions their conversation closed: an update that comes after is not kept as early,
     /// where it would take the place of a session about to open.
     closed: HashSet<SessionId>,
@@ -214,31 +209,8 @@ fn compact(order: &mut VecDeque<SessionId>, bound: usize, kept: impl Fn(&Session
         order.retain(|id| kept(id));
     }
 }
-/// The most of Studio's tool calls remembered for their permission requests.
-const STUDIO_CALLS: usize = 256;
 
 impl Routes {
-    /// Remembers a tool call that is one of Studio's tools, by what the adapter said of it.
-    fn note_tool_call(&mut self, adapter: tools::Adapter, update: &SessionUpdate) {
-        let (id, studio) = match update {
-            SessionUpdate::ToolCall(call) => (
-                &call.tool_call_id,
-                tools::StudioTool::of(adapter, call.meta.as_ref(), call.raw_input.as_ref()),
-            ),
-            SessionUpdate::ToolCallUpdate(call) => (
-                &call.tool_call_id,
-                tools::StudioTool::of(adapter, call.meta.as_ref(), call.fields.raw_input.as_ref()),
-            ),
-            _ => return,
-        };
-        if let Some(studio) = studio {
-            if self.studio_calls.len() >= STUDIO_CALLS {
-                self.studio_calls.clear();
-            }
-            self.studio_calls.insert(id.to_string(), studio);
-        }
-    }
-
     fn update(&mut self, session: SessionId, update: SessionUpdate) {
         match self.sessions.get(&session) {
             Some(events) => {
@@ -486,18 +458,12 @@ async fn connect(
 
     let updates = routes.clone();
     let permissions = routes.clone();
-    // Known once the agent answers `initialize`, before any session or permission request.
-    let adapter: Arc<Mutex<tools::Adapter>> = Arc::default();
-    let asked_by = adapter.clone();
-    let noted_by = adapter.clone();
     agent_client_protocol::Client
         .builder()
         .name("omnigraph-studio")
         .on_receive_notification(
             async move |notification: SessionNotification, _connection| {
-                let adapter = noted_by.lock().map(|adapter| *adapter).unwrap_or_default();
                 if let Ok(mut routes) = updates.lock() {
-                    routes.note_tool_call(adapter, &notification.update);
                     routes.update(notification.session_id, notification.update);
                 }
                 Ok(())
@@ -506,35 +472,6 @@ async fn connect(
         )
         .on_receive_request(
             async move |request: RequestPermissionRequest, responder, connection| {
-                let adapter = asked_by.lock().map(|adapter| *adapter).unwrap_or_default();
-                let call = &request.tool_call;
-                let studio = tools::StudioTool::of(
-                    adapter,
-                    call.meta.as_ref(),
-                    call.fields.raw_input.as_ref(),
-                )
-                .or_else(|| {
-                    let routes = permissions.lock().ok()?;
-                    routes
-                        .studio_calls
-                        .get(&call.tool_call_id.to_string())
-                        .copied()
-                });
-                // Studio's reads are read-only and its writes go through Studio's own approval
-                // setting, so the agent's prompt for them is allowed at once, for this call
-                // alone. Offered no allow-once (a lasting allow, or a refusal, first), the
-                // person is asked, as for any other tool.
-                if studio.is_some()
-                    && let Some(allow) = request
-                        .options
-                        .iter()
-                        .find(|option| option.kind == PermissionOptionKind::AllowOnce)
-                {
-                    let outcome = RequestPermissionOutcome::Selected(
-                        SelectedPermissionOutcome::new(allow.option_id.clone()),
-                    );
-                    return responder.respond(RequestPermissionResponse::new(outcome));
-                }
                 let events = permissions
                     .lock()
                     .ok()
@@ -577,18 +514,6 @@ async fn connect(
                 .await?;
             let capabilities = &initialized.agent_capabilities;
             let sessions = &capabilities.session_capabilities;
-            let adapter = {
-                let named = initialized
-                    .agent_info
-                    .as_ref()
-                    .map_or(tools::Adapter::Other, |info| {
-                        tools::Adapter::named(&info.name)
-                    });
-                if let Ok(mut shared) = adapter.lock() {
-                    *shared = named;
-                }
-                named
-            };
             let agent = AgentInfo {
                 name: initialized
                     .agent_info
@@ -621,7 +546,6 @@ async fn connect(
                         commands,
                     } => {
                         // Already in `opening`, from `AgentConnection::open`.
-                        events.unbounded_send(HostEvent::Adapter(adapter)).ok();
                         let session = open_session(
                             connection.clone(),
                             launch,
@@ -707,9 +631,6 @@ async fn open_session(
             opening.retain(|waiting| !waiting.same_receiver(&events));
         }
     };
-    let mcp =
-        McpServerStdio::new("omnigraph", launch.mcp_command.clone()).args(launch.mcp_args.clone());
-    let mcp_servers = vec![McpServer::Stdio(mcp)];
     // What the panel sends while the session opens, for the session once it is open.
     let mut held = Vec::new();
     // Come back to the earlier conversation when the agent can load it (with its messages) or
@@ -739,20 +660,16 @@ async fn open_session(
             return Ok(());
         }
         if can.load {
-            let request = connection.send_request(
-                LoadSessionRequest::new(id.clone(), launch.cwd.clone())
-                    .mcp_servers(mcp_servers.clone()),
-            );
+            let request =
+                connection.send_request(LoadSessionRequest::new(id.clone(), launch.cwd.clone()));
             let loaded = open_request(&connection, request, &events, &mut commands, &mut held);
             if let Ok(loaded) = loaded.await {
                 opened = Some((id.clone(), Opened::Loaded));
                 config_options = loaded.config_options.unwrap_or_default();
             }
         } else {
-            let request = connection.send_request(
-                ResumeSessionRequest::new(id.clone(), launch.cwd.clone())
-                    .mcp_servers(mcp_servers.clone()),
-            );
+            let request =
+                connection.send_request(ResumeSessionRequest::new(id.clone(), launch.cwd.clone()));
             let resumed = open_request(&connection, request, &events, &mut commands, &mut held);
             if let Ok(resumed) = resumed.await {
                 opened = Some((id.clone(), Opened::Resumed));
@@ -774,8 +691,7 @@ async fn open_session(
     let (session_id, opened) = match opened {
         Some(opened) => opened,
         None => {
-            let request = connection
-                .send_request(NewSessionRequest::new(launch.cwd.clone()).mcp_servers(mcp_servers));
+            let request = connection.send_request(NewSessionRequest::new(launch.cwd.clone()));
             let created = open_request(&connection, request, &events, &mut commands, &mut held);
             match created.await {
                 Ok(created) => {
@@ -1188,28 +1104,6 @@ mod tests {
         assert_eq!(error_words(&bare), "Internal error");
     }
 
-    /// Codex asks permission for an MCP call by its id alone: the call is Studio's tool by what
-    /// its first update said.
-    #[test]
-    fn a_tool_call_is_remembered_as_studios_by_its_first_update() {
-        use agent_client_protocol::schema::v1::ToolCall;
-        let mut routes = Routes::default();
-        let call = |id: &str, server: &str| {
-            SessionUpdate::ToolCall(ToolCall::new(id.to_owned(), "Call").raw_input(
-                serde_json::json!({ "server": server, "tool": "omnigraph_run", "arguments": {} }),
-            ))
-        };
-        routes.note_tool_call(tools::Adapter::Codex, &call("t1", "omnigraph"));
-        routes.note_tool_call(tools::Adapter::Codex, &call("t2", "elsewhere"));
-        routes.note_tool_call(tools::Adapter::Other, &call("t3", "omnigraph"));
-        assert_eq!(routes.studio_calls.get("t1"), Some(&tools::StudioTool::Run));
-        assert!(!routes.studio_calls.contains_key("t2"));
-        assert!(
-            !routes.studio_calls.contains_key("t3"),
-            "only by its adapter's word"
-        );
-    }
-
     fn chunk(text: &str) -> SessionUpdate {
         SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
             text,
@@ -1230,8 +1124,6 @@ mod tests {
             .unbounded_send(ConnectionCommand::Open {
                 launch: SessionLaunch {
                     cwd: std::env::temp_dir(),
-                    mcp_command: "studio".into(),
-                    mcp_args: Vec::new(),
                     resume: None,
                 },
                 events,

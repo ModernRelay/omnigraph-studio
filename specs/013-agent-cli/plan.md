@@ -130,9 +130,8 @@ Studio at `3df9307`:
 - The agent process inherits Studio's whole environment. `agent.env` can add or override
   variables but cannot remove any, and the ACP crate's `spawn_process` has no `env_clear`
   (`crates/agent_panel/src/host.rs:228-230`; `agent-client-protocol-2.2.0/src/acp_agent.rs:265-291`).
-- The MCP proxy is Studio's own executable re-run as `omnigraph-studio mcp-proxy <socket>`,
-  once per conversation (`crates/studio/src/main.rs:8-21`, `panel.rs:651-687`). The debug
-  executable is 490 MB.
+- The MCP proxy was Studio's own executable re-run as `omnigraph-studio mcp-proxy <socket>`,
+  once per conversation, until 2026-10-28. The debug executable is 490 MB.
 - The bundle registers `omnigraph-studio://` and handles `graph`, `node` and `query` links;
   `connect` is refused (`script/bundle-mac:75-85`, `crates/studio/src/deep_link.rs:1-9`).
 - New conversations get `cwd` = `<data dir>/agent/graphs/<slug>-<hash>`, and nothing is written
@@ -150,6 +149,11 @@ Agents (claude-agent-acp 0.89.1 with Claude Agent SDK 0.3.293; codex-acp 2.2.2 w
   (`ignore_default_excludes = true`), so shell commands get the agent's whole environment. Its
   stdio MCP servers run outside the sandbox with only a fixed set of variables plus the ACP
   `env` entries. Its shell snapshot may rewrite PATH.
+- codex-acp (2.3.0) ignores the sandbox in Codex's `config.toml`: every session, new, loaded or
+  resumed, starts in its `agent` mode unless `INITIAL_AGENT_MODE` names another
+  (`AgentMode.getInitialAgentMode`), and each turn sends that mode's sandbox policy, which
+  overrides Codex's permission profiles. Its modes are `read-only`, `workspace-write` and `agent`
+  (both without network) and `agent-full-access`.
 - Both read `AGENTS.md` in the working directory. Claude reads it when there is no `CLAUDE.md`.
 
 ## Design
@@ -162,18 +166,29 @@ Agents (claude-agent-acp 0.89.1 with Claude Agent SDK 0.3.293; codex-acp 2.2.2 w
 | Rules | `crates/agent_panel/src/gateway_rules.rs` | `classify(request, sandbox) -> Verdict`: read, read with a rewritten body, a write for the agent's branch, or a refusal. The health probe never reaches them: the gateway answers it |
 | Gateway | `crates/agent_panel/src/gateway.rs`, `gateway_tls.rs`, `requester.rs` | A loopback HTTPS (HTTP/1.1 over TLS) server per conversation (`127.0.0.1:0`, one request per connection), with a certificate it makes when it starts. Checks the session token and contract header, applies the rules, forwards, and reports writes to the panel. On Windows it holds the processes a write's CLI was started under while the write waits |
 | CLI finder | `graph_store::cli` (`crates/graph_store/src/cli_tokens.rs`) | Shared with Studio's own servers (spec 003): where Studio looks for the CLI (`cli::candidates`, the `omnigraph_cli` setting first), the probe and what it remembers (`cli::probe`, `cli_probes.json`), Studio's one turn at the CLI (`cli::take_turn`, `cli::run`), and the Omnigraph variables no process Studio starts inherits (`cli::omnigraph_variables`) |
-| CLI home | `crates/agent_panel/src/cli_home.rs` | The conversation's directory, config, token, certificate and wrapper; the shared `AGENTS.md`; choosing, of the CLIs the finder takes, the first whose `config validate` passes the home |
+| CLI home | `crates/agent_panel/src/cli_home.rs` | In the conversation's folder: the wrapper, the config, token and certificate, and `AGENTS.md`; choosing, of the CLIs the finder takes, the first that reads the home |
 | Panel | `crates/agent_panel/src/panel.rs` | Starts the gateway and home with the conversation, shows each write as a card, and records outcomes in the session's write log (`GraphSession::note_write`) |
 | Agent launch | `crates/agent_panel/src/host.rs`, `launch.rs`; `omnigraph-studio launch-agent` in `crates/studio/src/main.rs` | Starts the agent without Omnigraph credentials in its environment: through `env -u` on Unix, always through Studio's own launcher on Windows |
 
-### One directory per conversation
+### One folder per conversation
 
-A graph's conversations share one agent process and one working directory
-(`<data dir>/agent/graphs/<graph>/`; on Windows under `%LOCALAPPDATA%`, below), so nothing per
-conversation can travel in the agent's environment or in one instructions file. Each
-conversation gets `<cwd>/.studio/<agent branch with / as ->-<8 random hex>/` (mode `0700`), its own
-even when two panels write to one branch (a conversation open in two windows); ended, it removes
-what Studio wrote there and the folder once empty:
+A graph's conversations share one agent process, so nothing per conversation can travel in the
+agent's environment. Each conversation works in a folder of its own instead (since 2026-10-28),
+`<agent dir>/graphs/<graph>/<agent branch with / as ->-<8 random hex>/`
+(`sessions::working_dir`; `<agent dir>` is `<data dir>/agent`, on Windows under
+`%LOCALAPPDATA%`, below), which ACP gives the session as its `cwd`. Everything the conversation's
+agent needs is there at the same names in every conversation, so `AGENTS.md` is all it reads:
+
+- `omnigraph` (`omnigraph.cmd` on Windows, `0700`), the wrapper the agent runs as `./omnigraph`;
+- `.studio/` (`0700`), the CLI's home: `config.yaml`, `token` and `ca.pem`;
+- `AGENTS.md`: the graph, the agent's branch and base, the command and the rules;
+- the `omnigraph-studio` skill (below).
+
+Ended, the conversation removes the wrapper, the token, the certificate and the config, and
+`.studio` once empty. A conversation saved before 2026-10-28 keeps the folder it ran in, the
+graph's shared directory, since the agent finds its session by it; two such conversations open
+at once there write over each other's `AGENTS.md` and wrapper, which is accepted for the few
+that exist.
 
 ```yaml
 # config.yaml (0600): Omnigraph's version-1 operator configuration
@@ -202,14 +217,12 @@ defaults:
   CLI reads it at each command, so the token never passes through a process or an environment.
 - `ca.pem` (`0600`): the certificate the gateway serves, the only one the CLI trusts for the
   target (`mode: replace`, so neither the system's roots nor any other certificate apply).
-- Both files are removed when the conversation ends, unless a later conversation on the branch
-  wrote its own.
+- Both files are removed when the conversation ends.
 - `auth-state/` is the CLI's own: at its first command with the token it records the target's
   credential binding there (identifiers, no secret), in a folder it makes `0700` and refuses
   when anyone else could enter it.
 
-Each path is the folder's own, absolute; the private home `omnigraph_run` uses (below) holds the
-same config naming its own `token` and `ca.pem`. The config is written by hand in the plain YAML
+Each path is the home's own, absolute. The config is written by hand in the plain YAML
 the CLI reads strictly: no null, tag, anchor or key it does not know. The proxy is named
 `direct` though that is the default, so a later default cannot route loopback through a proxy.
 Studio writes only this form: a CLI that cannot read it is not chosen (below). On Windows the
@@ -217,10 +230,11 @@ files are private as the home's other files are: the folder is under the person'
 (`%LOCALAPPDATA%`, below), and Windows has no mode bits.
 
 `omnigraph` (`0700`) is a wrapper: it unsets every `OMNIGRAPH_*` variable, the prefix
-(`graph_store::cli::VARIABLE_PREFIX`) matched in any ASCII case, as `omnigraph_run` removes
-them, then sets `OMNIGRAPH_HOME` to the directory, puts `127.0.0.1,localhost` in `NO_PROXY`, and
-runs the chosen CLI. The agent runs it by absolute path, so neither an environment filter nor a
-shell snapshot that reorders PATH can change what the CLI reads.
+(`graph_store::cli::VARIABLE_PREFIX`) matched in any ASCII case, then sets `OMNIGRAPH_HOME` to
+`.studio`, puts `127.0.0.1,localhost` in `NO_PROXY`, and runs the chosen CLI. The agent runs it
+by its path in the folder, so neither an environment filter nor a shell snapshot that reorders
+PATH can change what the CLI reads. Until Studio has chosen the CLI it runs nothing and says
+Studio is still choosing; when no CLI fits, it says why.
 
 Known first-run cost on macOS: the wrapper is a newly written executable, so its first run
 waits for Gatekeeper's scan of it before the shell starts it. `syspolicyd` logs
@@ -236,21 +250,20 @@ now.
 On Windows the wrapper is the batch file `omnigraph.cmd`, written from the same account of what
 it does as the shell script (`cli_home::Wrapper`), so only the syntax differs. It removes the
 same variables (`set OMNIGRAPH_` lists each of that prefix, in any case), sets
-`OMNIGRAPH_HOME` to its own folder (`%~dp0`), prefixes `NO_PROXY` (one variable with `no_proxy`
+`OMNIGRAPH_HOME` to `.studio` in its own folder (`%~dp0.studio`), prefixes `NO_PROXY` (one variable with `no_proxy`
 there) and runs the CLI with `%*`. Windows starts a batch file through `cmd /c`, which reads the
 caller's command line first: it expands `%NAME%` and, outside double quotes, acts on `&`, `|`,
 `<`, `>` and `^`. A caller that escapes for cmd, as Rust's standard library does, gets every
 argument through as given; a shell that quotes only for programs (Git Bash, PowerShell) leaves
 the text between two quotes inside one argument outside cmd's quotes. That holds for every
-`.cmd`, npm's shims included, so on Windows the instructions and `AGENTS.md` tell the agent to
-put such a query or its parameters in a file, or to use `omnigraph_run`. The batch file reads
+`.cmd`, npm's shims included, so on Windows `AGENTS.md` tells the agent to put such a query or
+its parameters in a file. The batch file reads
 nothing more itself: `%*` is expanded once, delayed expansion is off, each path it names is in
 double quotes with `%` doubled, and its lines end with CRLF. cmd reads a batch file in the
-console's code page, so the file is ASCII only: its home is `%~dp0`; the CLI is named by its
+console's code page, so the file is ASCII only: its folder is `%~dp0`; the CLI is named by its
 path when that is ASCII, else from `%~dp0` when that way is (both under a profile whose name is
-not); otherwise the wrapper says so and points at `omnigraph_run`. The agent is then told that
-its shell cannot run the CLI and to use `omnigraph_run`, which starts the CLI by its path and
-still runs it, and the thread says why; it is not told the wrapper is ready. A refusal turns
+not); otherwise the wrapper runs nothing and says to set `omnigraph_cli` to a CLI at a plain
+ASCII path, and the thread says so too. A refusal turns
 delayed expansion off too, so a `!` in its text stays even where a person's registry turns it
 on for every batch file.
 
@@ -264,19 +277,14 @@ working directory in the wrapper was rejected: cmd has lost the caller's folder 
 file runs, so it could only guess the working directory's root, and a drive letter it maps can
 be left mapped when the command is stopped before its `popd`. Known limit: a working directory that is
 still a network path (a profile on a share, or `OMNIGRAPH_STUDIO_DATA` set to one) keeps cmd's
-behaviour, and the conversation's instructions then tell the agent to give the CLI every file by
-its absolute path, or use `omnigraph_run`, which reads relative paths itself.
+behaviour, and `AGENTS.md` then tells the agent to give the CLI every file by its absolute path.
 
-The agent learns the path two ways: the conversation's MCP server adds it to its `initialize`
-instructions, and a new `omnigraph_cli` tool returns it with the branch, its base and the rules.
-Both say what Studio chose, so both wait for the choice (since 2026-10-21): the instructions are
-made when `initialize` arrives, from the CLI chosen by then, which the panel sends the socket
-(`socket::Instructions`); past 5 s still choosing, they say so and to call `omnigraph_cli`, and
-name no CLI. An `omnigraph_cli` call made before the choice is answered once it is made.
-The config makes the gateway and the graph the default, so they tell the agent to give no
-`--target` or `--graph`.
-`<cwd>/AGENTS.md`, shared by the graph's conversations, gives the rules and says where to find
-the command. Codex reads `AGENTS.md`; Claude reads it when there is no `CLAUDE.md`.
+`AGENTS.md` names the command, the branch and its base, and says to give no `--target` or
+`--graph`, since the config makes the gateway and the graph the default. Codex reads
+`AGENTS.md`; Claude reads it when there is no `CLAUDE.md`. Until 2026-10-28 the graph's
+conversations shared one directory, each with its home in `.studio/<branch>-<random>/`, and the
+agent learned the wrapper's path from Studio's MCP server (its instructions and an
+`omnigraph_cli` tool).
 
 ### The gateway's TLS
 
@@ -313,7 +321,7 @@ tokens and addressing, and tokens kept for other servers (`OMNIGRAPH_MR_BEARER_T
 server's token list alike, the prefix matched in any ASCII case on every system. The prefix is
 matched in one place, `graph_store::cli` (`omnigraph_variables`, since 2026-10-22; before,
 `agent_panel::scrub`, which matched any case on Windows alone), which the agent's launch,
-`omnigraph_run`, the wrapper and Studio's own CLI (spec 003) use; a variable Omnigraph adds later
+the wrapper and Studio's own CLI (spec 003) use; a variable Omnigraph adds later
 is removed without a list to keep. Cloud variables (`AWS_*`, `AZURE_*`, Google's) stay: the agent
 may need them for its model, as Claude Code on Bedrock does. This closes the gap where the
 agent inherited the person's graph tokens. With none of these variables set, the agent starts as
@@ -322,8 +330,8 @@ it is.
 - On Unix the command is `/usr/bin/env -u NAME … PROGRAM ARGS…`. `env` reads a word holding `=`
   as an assignment, so a program path holding one runs through `/bin/sh -c 'exec "$0" "$@"'`.
 - Windows has no `env`. There Studio starts its own executable as
-  `omnigraph-studio launch-agent NAME… -- PROGRAM ARGS…` (`launch.rs`), as it does for
-  `mcp-proxy`, with no names to remove as well. The launcher removes the names, starts the
+  `omnigraph-studio launch-agent NAME… -- PROGRAM ARGS…` (`launch.rs`), with no names to
+  remove as well. The launcher removes the names, starts the
   program as the ACP crate would (with no window), and exits with its code. Its arguments travel
   on the command line the standard library writes and reads back, so a path or argument arrives
   as given. Studio stops an agent by ending the process it started, which is the launcher, so
@@ -372,8 +380,8 @@ look in the same places, probe alike, and share one turn at the CLI.
    that (a token's export waiting on its credential helper), no CLI is asked: the wrapper runs
    nothing and says the CLI was busy with another of Studio's commands, and to start a new
    conversation to try again.
-4. If none fits, the wrapper runs nothing and prints why, so `omnigraph_run` and the agent's
-   shell refuse rather than run a CLI that cannot reach the gateway. A notice in the thread names
+4. If none fits, the wrapper runs nothing and prints why, so the agent's shell refuses rather
+   than run a CLI that cannot reach the gateway. A notice in the thread names
    what the graph and the home need, and each CLI found with why it does not fit, naming its
    release where it reported one: it answers no `version --json`, speaks another contract,
    reports no target, credential or access protocol, or one other than 2, or could not be run or
@@ -381,8 +389,7 @@ look in the same places, probe alike, and share one turn at the CLI.
    Omnigraph's installer (`curl -fsSL
    https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | bash`;
    `install.ps1` through PowerShell on Windows), or `omnigraph_cli` set to such a CLI. The
-   `omnigraph_cli` tool and the conversation's instructions say the CLI is unavailable and name
-   the same release. A configured `omnigraph_cli` that does not fit is passed over with a notice
+   wrapper's refusal names the same release. A configured `omnigraph_cli` that does not fit is passed over with a notice
    naming the one used.
 
 The edge builds are refused: `0.14.0-edge+50283ce` reports no access protocol, and
@@ -476,78 +483,33 @@ CLI Studio started itself has none). When one of them ends while the write waits
 given up as if the CLI had gone, and the CLI, still listening, hears a 403 that nothing was
 sent (`requester`).
 
-### An agent whose shell has no network
+### Both agents run unsandboxed
 
-Codex's default sandbox blocks loopback, so its CLI calls fail with "server discovery connection
-failed". For that agent Studio runs the CLI itself: `omnigraph_run` takes the arguments after
-`omnigraph` as a list, runs the conversation's chosen CLI with them (no shell, killed with the
-call), and returns the exit code, standard output and standard error. The same gateway, rules
-and cards apply, because the CLI still speaks to the gateway.
+The agent's shell runs `./omnigraph`, so it must reach the gateway on loopback. Claude's Bash
+sandbox is off by default. Codex runs unsandboxed too (`agent_panel::codex`): codex-acp starts
+every session, new or loaded, in a mode whose sandbox has no network and ignores Codex's own
+configuration, so when the agent command runs codex-acp Studio starts it with
+`INITIAL_AGENT_MODE=agent-full-access`. An `INITIAL_AGENT_MODE` in the agent's settings is kept,
+and a mode chosen in the panel still applies to its conversation; in a sandboxed mode Codex's
+shell cannot reach the gateway, and the CLI says so ("server discovery connection failed").
+Without a sandbox the agent's shell runs as the person and could read their own CLI
+configuration, as Claude's can by default: the gateway's rules hold for the CLI Studio gives it,
+and are not a boundary against an agent that leaves it.
 
-- The run is outside the agent's sandbox, and the agent can rewrite anything in its working
-  directory, its wrapper and `.studio/<branch>/config.yaml` included. So Studio never runs the
-  wrapper or reads that home: it starts the chosen CLI itself, with `OMNIGRAPH_HOME` set to a
-  copy of the conversation's config and credentials in a private folder outside every working
-  directory (`<data dir>/agent/homes/`, `0700`; on Windows under `%LOCALAPPDATA%`, beside the
-  working directories, since a roaming `%APPDATA%` would carry its token and certificate to a
-  network share), with every `OMNIGRAPH_*` variable of Studio's
-  own removed, and with that folder as its current directory. Run files are staged there too,
-  not in the temporary directory, which a sandboxed agent may write. The folder goes with the
-  conversation.
+Until 2026-10-28 Studio ran the CLI for a sandboxed agent itself, as the MCP tool
+`omnigraph_run`: an argument list checked against a table of each command's flags, files
+copied through a private folder outside the working directory, and a run number for calls past
+four minutes. It went with the MCP server, about 2,000 lines, once neither agent needed it.
 
-- Studio passes each command only the flags it lists for it (`cli_home::RUN_TABLE`): those that
-  choose what the command reads or writes, and `--yes` where the CLI asks before a destructive
-  write, which it refuses with no terminal. Every other argument is refused before running,
-  wherever it stands: before the command's words, between them, after them, with its value
-  after `=`, as another flag's value, or after `--`. Arguments are read as the CLI's parser
-  reads them: a value that starts with `-` goes after `=`, and text joined to `-e` is its value.
-  An operator file can name a credential command that the CLI runs before any request
-  (`auth: {provider: exec, …}`, Omnigraph main since #1115), so `--operator-config`, `--profile`,
-  `--config`, `--target` (even naming `studio`) and `--as` would let the agent run a program
-  outside its sandbox with Studio's environment, or leave the gateway; a list of refused flags
-  would also pass every flag a later CLI adds. `--page-token` passes to `commit list`,
-  `branch diff` and `commit changes`, the commands that take it (`commands/history/args.rs`;
-  `changes poll` follows every page itself and has none): it is the server's opaque cursor for a
-  next page, which the CLI sends to the gateway as a query parameter, not a credential (since
-  2026-10-21; before, it was left out with every flag named for a token).
-- Studio adds `--target studio` to every command but `lint` and `version`, which the CLI
-  refuses it on, and `--graph <graph>` unless the arguments name a graph, except to
-  `graphs list`, which takes none.
-- Commands: `query`, `mutate`, `load`, `branch create|list|delete|merge|diff|merge-base`,
-  `snapshot`, `export`, `blob get|stat|put|clear`, `commit list|show|changes|publish|drop`
-  (the gateway refuses the last two), `changes poll|baseline`, `schema show`, `graphs list`,
-  `version` and `lint`. Anything else is refused before running. `lint` checks queries against a
-  schema file offline (`--query`, `--schema`, `--json` only, no target added): a positional
-  storage URI would make Studio open storage itself.
-- Files given to `--query`, `--data`, `--params-file`, `--file`, `--out` and `--schema`, and
-  `save_to`, must be inside the working directory (relative, or absolute under it, never
-  through `..`, and never under `.studio`, which holds Studio's files for the conversation, by
-  any name that opens it: another case, trailing dots and spaces, or an NTFS stream's name), so
-  the agent can process them in its own sandbox. Studio opens only regular files there, without
-  waiting on a pipe. The CLI runs outside that
-  sandbox, so it never opens them there: Studio copies each input into a private folder before
-  the run and writes each output back after it, opening every folder on the way by handle and
-  never through a link (`agent_panel::confined`). A link the agent makes between the check and
-  the run is refused on the way in and replaced, not followed, on the way out. The skill,
-  `AGENTS.md` and the conversation's CLI home are written the same way.
-- Output over 100 KB is cut with a note to use `save_to`; standard output is bounded at 64 MiB,
-  and a run at 30 minutes.
-- A call made before Studio has chosen a CLI waits for that choice instead of failing.
-- A call answers within four minutes. A command still running then (a large load, or a write
-  waiting for the person) answers with its run number and keeps going; `omnigraph_run` with
-  `wait` set to that number waits for its outcome, again for up to four minutes. A run's
-  outcome is returned once; a new session, or the agent stopping, kills runs still going.
-
-Giving Codex network access (a codex-acp mode with network) lets its shell reach the gateway
-too, and opens all network, so it stays the person's choice. E24 has landed (a `unix:///…`
-server, Omnigraph #988), so a sandbox can allow one socket instead. To adopt: the gateway also
-listens on a Unix socket in the conversation's folder, and a target-capable CLI's home points at
-it, so Codex reaches the gateway without network.
+E24 has landed (a `unix:///…` server, Omnigraph #988), but a Unix socket does not help Codex
+yet: Codex can allow one only through a permission profile's network table, which also opens
+the rest of the network under `codex sandbox`, and codex-acp's per-turn sandbox policy
+overrides profiles in any case (Validation log).
 
 ### The skill
 
-Studio writes an `omnigraph-studio` skill into the graph's agent working directory at every
-conversation start, beside `AGENTS.md`: `.claude/skills/omnigraph-studio/` for Claude Code and
+Studio writes an `omnigraph-studio` skill into the conversation's folder at every start, beside
+`AGENTS.md`: `.claude/skills/omnigraph-studio/` for Claude Code and
 `.agents/skills/omnigraph-studio/` for Codex, since neither agent reads the other's folder.
 
 - Its `SKILL.md` is Studio's own (`crates/agent_panel/skill/SKILL.md`): what differs in Studio
@@ -566,27 +528,14 @@ When the CLI can export its own skill (being added as `omnigraph skill export`),
 take the guide from the CLI it chose, so the guide always matches that binary, and keep the
 embedded copy for CLIs without the command.
 
-### The MCP tools
+### No MCP server
 
-The CLI is the agent's one way to the graph. Studio's MCP server offers two tools:
-`omnigraph_cli` (the command path, flags, branch and rules) and `omnigraph_run`. The graph tools
-of spec 011 (`omnigraph_schema`, `omnigraph_branches`, `omnigraph_query`,
-`omnigraph_propose_change`) are gone: every one of them is a CLI command, and two ways to the
-same write would split the cards and the rules.
-
-- The server's instructions reach the model; Claude Code keeps the first 2,048 characters, so the
-  server's and the conversation's instructions together stay under that (tested with a long
-  data directory).
-- Agents give up on a slow tool call without telling the server. Claude Code aborts a call that
-  sends nothing for 30 minutes, and progress resets that; Studio sends `notifications/progress`
-  every 60 seconds while a call runs, when the client gave a progress token. Codex abandons any
-  call after 300 seconds, ignores progress and sends no cancellation. An agent told its write
-  failed while Studio still holds it might write again, so `omnigraph_run` answers before
-  Codex's limit with a run number to wait on.
-- The thread shows an `omnigraph_run` call with an inline query as a query card titled by its
-  subcommand ("Query", "Mutate"), and other calls as tool rows ("Run omnigraph"). A write whose
-  card shows its text is the title line alone ("Mutate retitle"), so the query shows once, on
-  the card with its branch and outcome (since 2026-10-21).
+The CLI is the agent's one way to the graph, and Studio serves no MCP server (since
+2026-10-28; before, `omnigraph_cli` and `omnigraph_run`, above). The graph tools of spec 011
+(`omnigraph_schema`, `omnigraph_branches`, `omnigraph_query`, `omnigraph_propose_change`) went
+earlier: every one of them is a CLI command, and two ways to the same write would split the
+cards and the rules. Every permission request the agent sends is the person's to answer, and
+the thread shows each tool call by its title; a write's query and outcome show on its card.
 
 ## Decisions
 
@@ -596,10 +545,10 @@ same write would split the cards and the rules.
 | Studio holds the person's token; the agent gets a session token for the gateway only | Give the agent the person's token; mint a server token for the agent | The person's token could write `main` and every branch. 0.13 cannot mint a narrower credential: credentials carry no grants, and branch scopes cannot name a branch (E20) |
 | The gateway classifies writes by structured fields and refuses what it cannot classify | Parse statement mutations with `gq_language` | Statement targets live in query text, `commit publish/drop` names no branch, and stored-query mutability is the server's. A second parser of the write language could drift from the engine's. Refusing keeps the gateway closed by default; the agent uses the structured commands instead |
 | Session token in a 0600 file | An environment variable | The agent process is shared by the graph's conversations, so one variable cannot hold each conversation's token, and both agents pass their whole environment to every shell command |
-| A wrapper per conversation, run by absolute path | Environment variables and a PATH entry on the agent process; one `AGENTS.md` naming the command | The agent process and working directory are shared by the graph's conversations, so per-conversation values cannot live there. Codex's shell snapshot may reorder PATH |
+| A folder per conversation holding `./omnigraph` and `AGENTS.md` (since 2026-10-28; before, a wrapper per conversation in a shared directory, its path told by Studio's MCP server) | Environment variables and a PATH entry on the agent process; keep the shared directory and the MCP server; put the path in the first message | The agent process is shared by the graph's conversations, so per-conversation values cannot live in its environment, and Codex's shell snapshot may reorder PATH. A folder of its own gives each conversation the same names, so `AGENTS.md` alone says what to run, with no server and nothing in the conversation's history to lose to compaction |
 | Remove only Omnigraph's variables from the agent's environment | Also remove `AWS_*`, `AZURE_*`, Google credentials | The agent may need them for its model provider |
 | On Windows the agent starts through Studio's own executable as `launch-agent` | `cmd /c set NAME= & PROGRAM ARGS…`; starting the agent's process without the ACP crate | `cmd` expands `%` even inside quotes and does not read the quotes the standard library writes, and the ACP crate passes arguments only through the standard library, so a path or argument could change. Starting the process without the crate would repeat its stderr capture, exit and shutdown handling. Studio already re-runs its executable as `mcp-proxy` |
-| On Windows the agent's wrapper is a batch file, `omnigraph.cmd`, written from the same account as the shell script | A native launcher in each home; a PowerShell script | A launcher means a second executable to build and ship, or Studio's own: that opens its window when run as `omnigraph`, is large to copy into each home, and a hard link to it would let the agent write Studio's executable. PowerShell's default execution policy on Windows 10 and 11 refuses scripts, and Git Bash cannot run one. A batch file's cost is cmd's reading of the caller's line, which no batch file can undo; the agent is told, and `omnigraph_run` takes a list |
+| On Windows the agent's wrapper is a batch file, `omnigraph.cmd`, written from the same account as the shell script | A native launcher in each home; a PowerShell script | A launcher means a second executable to build and ship, or Studio's own: that opens its window when run as `omnigraph`, is large to copy into each home, and a hard link to it would let the agent write Studio's executable. PowerShell's default execution policy on Windows 10 and 11 refuses scripts, and Git Bash cannot run one. A batch file's cost is cmd's reading of the caller's line, which no batch file can undo; `AGENTS.md` tells the agent |
 | Request bodies read whole, at most 64 MiB; answers to reads stream | Stream request bodies too | The rules need small JSON bodies whole; a load larger than 64 MiB is refused before sending, which bounds memory (IX) |
 | The gateway passes the upstream contract through and refuses a CLI that speaks another | Translate between contracts | The contract is an exact-match safety property. A translation layer would be a second API that drifts |
 | Studio tests each CLI once against the gateway | Map package versions to contracts | The package version does not determine the contract; a real request does, until E23. Superseded by `version --json` (see "Choosing the CLI") |
@@ -610,11 +559,8 @@ same write would split the cards and the rules.
 | One certificate per gateway, made when it starts and valid for a year, its key in memory only; never renewed (Ragnor, 2026-10-21) | A short validity, renewed at half-life with both certificates in `ca.pem` | The key never leaves the process and dies with it, and a gateway started again makes a new one, so a shorter validity protects nothing, and renewal is machinery carried forever (a bundle rewritten under a running CLI, and a CLI that read the old one). A gateway that outlived its certificate, which a conversation does not in practice, would let the CLI's TLS error reach the agent |
 | Token and certificate in files named by absolute paths in each home | Relative paths beside the config; the certificate inline | The CLI resolves either; absolute paths read the same in both homes' files and in an error. The version-1 configuration takes a CA only as a file |
 | The agent keeps Studio's gateway, not the server's MCP | Point the agent at the server's MCP, which has read and opt-in write tools since #994 | Its writes would go wherever the agent's token may write; until E20 only the gateway keeps them on the agent's branch, and only the gateway shows each write as a card |
-| Codex gets network only when the person allows it | Always enable it; always refuse the CLI to Codex | Enabling it opens all network; refusing it gives up the CLI where the person accepts the risk |
-| The CLI is the only graph tool; `omnigraph_run` runs it for agents without network | Keep spec 011's schema, query and propose tools beside the CLI | The CLI covers every served route and composes; the old tools were a subset with their own write path. One path keeps one set of rules and cards |
-| `omnigraph_run` takes an argument list and runs the chosen CLI without a shell, from a private home | A command string run by a shell; running the agent's wrapper | A list cannot smuggle a second command or a redirect, and the allowlist and file checks read the same arguments the CLI gets |
-| `omnigraph_run` passes each command only the flags Studio lists for it, read as the CLI's parser reads them | Refuse a list of flags that leave the gateway (`--target`, `--as`) and pass the rest | The CLI runs outside the agent's sandbox with Studio's environment. A list of refusals passes every flag a later CLI adds: `--operator-config` (#1115) names a file whose credential command the CLI runs, which made `omnigraph_run` run the agent's program |
-| Long calls report MCP progress and answer within four minutes with a run number | Raise the agent's timeout | A timeout is the agent's setting and differs by agent. codex-acp drops a per-server `tool_timeout_sec`; setting it means declaring the server in `CODEX_CONFIG` instead of ACP `mcpServers`. A run number works for every agent |
+| Codex runs unsandboxed, as Claude does | Network only when the person allows it; mirror the sandbox in the person's Codex `config.toml`; always refuse the CLI to Codex | One way for both agents to reach the graph, their shell, and no code to read Codex's configuration. Claude's sandbox is off by default already, so a sandboxed Codex protected nothing Claude did not already expose |
+| The CLI is the only graph tool, run in the agent's shell | Keep spec 011's schema, query and propose tools beside the CLI; keep `omnigraph_run` for a sandboxed agent (until 2026-10-28) | The CLI covers every served route and composes; the old tools were a subset with their own write path. With both agents unsandboxed, `omnigraph_run` (an argument allowlist, staged files, run numbers past a tool timeout) served no agent Studio starts by default, and was the most code in the crate |
 
 ## Deferred
 
@@ -657,6 +603,8 @@ CLI is the one they trust).
 | 2026-10-13 | Proxy variables capture loopback | `HTTP_PROXY=http://127.0.0.1:9`, with and without `NO_PROXY` | Without: "server discovery connection failed … not sent". With `NO_PROXY=127.0.0.1,localhost`: rows |
 | 2026-10-13 | Destructive commands need `--yes` with no terminal, even on loopback | `branch delete gw-probe < /dev/null` | Refused, `not_started`; `--yes` deleted it |
 | 2026-10-13 | Codex's sandbox blocks loopback | `codex sandbox` (0.160.1, a throwaway `CODEX_HOME`) running `curl http://127.0.0.1:8790/healthz` | Default: no connection, `CODEX_SANDBOX_NETWORK_DISABLED=1`. Workspace-write without network: none. With `sandbox_workspace_write.network_access=true`: 200. Danger-full-access: 200 |
+| 2026-10-28 | A folder per conversation replaces the MCP server and `omnigraph_run` | `agent_panel` `sessions::tests::each_conversation_has_a_folder_of_its_own`, `cli_home::tests::agents_md_names_the_cli_the_branch_and_the_rules`, `a_conversation_home_holds_its_config_token_and_wrapper` (the wrapper refuses while Studio chooses, then runs the CLI with `.studio` as its home; the token, certificate, wrapper and `.studio` go with the conversation), `both_wrappers_are_written_from_one_account` (`%~dp0.studio`), `a_cli_the_batch_file_cannot_name_is_not_offered_to_the_shell`, `codex::tests::codex_starts_unsandboxed_unless_its_settings_say_otherwise`; `cargo test -p agent_panel -p studio`, clippy `-D warnings`, `cargo deny check` | See the result columns of the run in the session that made the change. Not yet run with a live agent: the test agent now runs `./omnigraph` in its session's folder, as Claude and Codex would |
+| 2026-10-28 | Codex cannot allow one Unix socket to an ACP session | `codex sandbox` (0.164.0, a throwaway `CODEX_HOME`, profile `-P`) running `nc -U` to a listening socket, `nc -z 1.1.1.1 443`; codex-acp 2.3.0's `dist/index.js` | Default and workspace-write: socket refused. A profile with `[permissions.p.network] unix_sockets = { "<dir>" = "allow" }`: refused. With `enabled = true` too (any `mode`, any `domains`): the allowed socket, another socket and the internet all open. codex-acp sends each turn a legacy sandbox policy (`runTurn`, `sandboxPolicy`) that has no socket field and overrides profiles |
 | 2026-10-13 | A `unix://` server is not a server address today | `omnigraph query --server unix:///tmp/x.sock …` | `storage_root_invalid … unsupported storage URI scheme 'unix'` (E24) |
 | 2026-10-13 | Forwarding keeps Studio's credentials and stays under the root | `graph_client` `a_forward_carries_studios_credentials_and_stays_under_the_root` | Token and contract added, the caller's content type and body kept, the answer streamed; `/…`, `../`, `graphs/../..`, a full URL and a backslash refused before sending |
 | 2026-10-13 | The rules classify every route the CLI uses | `agent_panel` `gateway_rules` tests (5) | Reads anywhere; mutate, load, Blob, branch, merge and stored-query writes only on the agent branch; statements, other branches, other graphs, commit publish/drop and cluster changes refused; a stored query elsewhere gets `expect_mutation: false` |

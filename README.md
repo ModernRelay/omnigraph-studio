@@ -120,8 +120,9 @@ seconds, to run day to day); `script/bundle-linux` builds a tarball with a `.des
   server refuses.
 - **History.** Commit lane graph; open any table, query or node at an older commit, read-only.
 - **Agent panel.** Claude or Codex over the Agent Client Protocol, each started as its own
-  `npx` process. The agent gets an MCP server proxied by Studio, writes only to a branch Studio
-  creates for it, and never receives the token.
+  `npx` process. Each conversation has a folder of its own with an `omnigraph` CLI that reaches
+  the graph through Studio; the agent writes only to a branch Studio creates for it, and never
+  receives the token.
 - **Shell.** Command palette (⌘K), go to type or node (⌘P), split panes, several windows
   restored on launch, the schema's `.pg` source, a storage inspector, and `omnigraph-studio://`
   links that open a graph, node or query without running anything. `?` lists every binding.

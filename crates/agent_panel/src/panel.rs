@@ -10,12 +10,11 @@ use agent_client_protocol::schema::v1::{
     ContentBlock, PermissionOption, PermissionOptionKind, PlanEntryStatus,
     RequestPermissionOutcome, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOptions,
-    SessionUpdate, StopReason, ToolCallContent, ToolCallStatus,
+    SessionUpdate, StopReason, ToolCallStatus,
 };
 use editor::{Editor, EditorEvent};
+use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
-use futures::future::Shared;
-use futures::{FutureExt as _, StreamExt as _};
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, FollowMode,
     ListAlignment, ListState, Render, SharedString, Subscription, Task, WeakEntity, Window, list,
@@ -38,8 +37,6 @@ use crate::gateway::{Gateway, GatewayEvent, OnOutcome, Seen};
 use crate::gateway_rules::{Creates, Sandbox, WriteKind, WriteSummary};
 use crate::host::{AgentLaunch, HostCommand, HostEvent, Opened, SessionLaunch};
 use crate::sessions::{AgentSessions, Live, SessionRecord};
-use crate::socket::{ToolRequest, ToolSocket};
-use crate::tools::{Adapter, StudioTool, ToolCall};
 
 /// Presets offered when no agent is set: the ACP crate's own preset commands.
 pub const PRESETS: &[(&str, &[&str])] = &[
@@ -334,12 +331,6 @@ struct WriteCard {
     state: WriteState,
 }
 
-/// An `omnigraph_run` under way or done, and the stop that kills its command.
-struct CliRun {
-    task: Shared<Task<(String, bool)>>,
-    stop: Option<oneshot::Sender<()>>,
-}
-
 struct PermissionCard {
     title: String,
     options: Vec<PermissionOption>,
@@ -367,16 +358,6 @@ enum Entry {
         id: String,
         title: String,
         status: ToolCallStatus,
-        /// The arguments the agent called it with, as it reported them, for Studio's own tools
-        /// (an `omnigraph_run` query shows from them); another tool's only while small
-        /// ([`kept_input`]).
-        input: Option<Value>,
-        /// Which of Studio's tools it is, by what the agent's adapter said when it was called.
-        studio: Option<StudioTool>,
-        /// What one of Studio's tools returned, as the agent reported it (its content's text,
-        /// else its raw output): a query's rows show from it as a record card. Another tool's is
-        /// not kept: its row shows only its title and how it went.
-        output: Option<String>,
     },
     Plan(Vec<(String, PlanEntryStatus)>),
     Permission(PermissionCard),
@@ -398,8 +379,7 @@ impl Entry {
     }
 }
 
-/// One item of the thread's list: an entry, a query the agent ran, a run of steps folded to
-/// one line, the message sent before the agent was ready with how its start goes, or the
+/// One item of the thread's list: an entry, a run of steps folded to one line, the message sent before the agent was ready with how its start goes, or the
 /// callout of an agent that stopped. `lead` carries the agent's mark; `ends`
 /// marks the last reply of a finished turn, which carries the turn's actions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -408,13 +388,6 @@ enum Block {
         index: usize,
         lead: bool,
         ends: bool,
-    },
-    /// `on_card`: a write card of its turn shows its text ([`query_on_card`]), so the call is
-    /// its line alone.
-    Query {
-        index: usize,
-        lead: bool,
-        on_card: bool,
     },
     Activity {
         start: usize,
@@ -433,7 +406,7 @@ enum Block {
 type ThreadKey = (u64, u64, Option<u64>, bool, Option<u64>);
 
 /// The thread's entries, and what each shows folded to a number, kept as they change: a
-/// streamed token rehashes the entry it lands in, not the whole conversation (a tool's input
+/// streamed token rehashes the entry it lands in, not the whole conversation (a reply can be
 /// can hold a whole file). Every way to change an entry marks it, so none goes stale.
 #[derive(Default)]
 struct Entries {
@@ -596,17 +569,9 @@ fn hash_entry(entry: &Entry, hasher: &mut impl std::hash::Hasher) {
     std::mem::discriminant(entry).hash(hasher);
     match entry {
         Entry::User(text) | Entry::Agent(text) | Entry::Thought(text) => text.hash(hasher),
-        Entry::Tool {
-            title,
-            status,
-            input,
-            output,
-            ..
-        } => {
+        Entry::Tool { title, status, .. } => {
             title.hash(hasher);
             format!("{status:?}").hash(hasher);
-            input.as_ref().map(Value::to_string).hash(hasher);
-            output.hash(hasher);
         }
         Entry::Plan(items) => {
             for (content, status) in items {
@@ -767,12 +732,8 @@ struct Host {
     events: mpsc::UnboundedSender<HostEvent>,
     /// Keeps the agent's process running while this conversation is open.
     _connection: std::sync::Arc<crate::connection::AgentConnection>,
-    _socket: ToolSocket,
     /// The conversation's CLI home (spec 013); its session token goes with it.
-    cli_home: Option<std::sync::Arc<CliHome>>,
-    /// Sends the conversation's MCP instructions once Studio has chosen its CLI, which they
-    /// describe ([`AgentPanel::cli_chosen`]).
-    instructions: Option<oneshot::Sender<String>>,
+    _cli_home: Option<std::sync::Arc<CliHome>>,
     _tasks: Vec<Task<()>>,
 }
 
@@ -783,48 +744,28 @@ impl Drop for Host {
 }
 
 /// What a conversation's agent needs before it is launched, made off the main thread: its
-/// working directory, the tool socket, and the omnigraph CLI's gateway and home with the shared
-/// rules and skill, which it can start without.
+/// working directory, and the omnigraph CLI's gateway and home with `AGENTS.md` and the skill,
+/// which it can start without.
 struct Prepared {
-    socket: ToolSocket,
-    /// Studio's own executable, which the agent runs as its tool proxy.
-    executable: PathBuf,
     gateway: std::io::Result<(Gateway, CliHome)>,
-    /// Why the shared rules and the skill could not be written.
+    /// Why `AGENTS.md` and the skill could not be written.
     rules: Option<std::io::Error>,
 }
 
 impl Prepared {
     /// Makes them for a conversation in `cwd` on `graph`, writing to `branch` off `base`; a
-    /// start fails, with its message, when the directory, the socket or the executable cannot
-    /// be had.
+    /// start fails, with its message, when the directory cannot be made.
     fn make(cwd: &Path, graph: &str, branch: &str, base: &str) -> Result<Self, String> {
         std::fs::create_dir_all(cwd)
             .map_err(|error| format!("Studio could not create {}: {error}", cwd.display()))?;
-        let socket = ToolSocket::bind(&crate::socket::socket_dir())
-            .map_err(|error| format!("Studio could not open the tool socket: {error}"))?;
-        let executable = std::env::current_exe()
-            .map_err(|error| format!("Studio could not find its own executable: {error}"))?;
         let gateway = Gateway::bind().and_then(|gateway| {
-            let home = CliHome::write(
-                cwd,
-                &crate::sessions::private_homes(),
-                gateway.access(),
-                graph,
-                branch,
-                base,
-            )?;
+            let home = CliHome::write(cwd, gateway.access(), graph)?;
             Ok((gateway, home))
         });
-        let rules = cli_home::write_agents_md(cwd, graph)
+        let rules = cli_home::write_agents_md(cwd, graph, branch, base)
             .and_then(|()| crate::skill::write(cwd))
             .err();
-        Ok(Self {
-            socket,
-            executable,
-            gateway,
-            rules,
-        })
+        Ok(Self { gateway, rules })
     }
 }
 
@@ -867,8 +808,6 @@ pub struct AgentPanel {
     _slow_start: Option<Task<()>>,
     branch: Option<AgentBranch>,
     always_allow: bool,
-    /// The adapter the agent runs as, which says which of its tool calls are Studio's.
-    adapter: Adapter,
     host: Option<Host>,
     /// Making what a start needs on disk, off the main thread; dropped, the start is not made.
     preparing: Option<Task<()>>,
@@ -899,27 +838,12 @@ pub struct AgentPanel {
     /// The options as the composer shows them, made when they or the value being set change,
     /// not at every frame the composer is drawn: a model picker holds every model's name.
     option_views: Vec<Rc<OptionView>>,
-    /// Each query card's text and highlights, by entry, kept while the entry's hash holds: a
-    /// running query's card is drawn at every frame of its spinner.
-    query_cards: std::cell::RefCell<std::collections::HashMap<usize, (u64, Rc<QueryCard>)>>,
     usage: Option<Usage>,
     /// Runs of tool calls and thoughts opened to their steps, by the run's first entry.
     expanded_activity: std::collections::HashSet<usize>,
-    /// Query calls whose card is folded away, by entry.
-    folded_queries: std::collections::HashSet<usize>,
-    /// Counts the changes to which runs are open and which queries folded.
+    /// Counts the changes to which runs are open.
     folds: u64,
     queue: MessageQueue,
-    /// Whether a CLI that speaks the graph's API was found for this conversation (spec 013);
-    /// `None` while Studio looks.
-    cli_ready: Option<bool>,
-    /// `omnigraph_run` calls made while Studio looks, answered once it knows.
-    cli_waiting: Vec<oneshot::Sender<()>>,
-    /// CLI runs whose outcome has not reached the agent yet, by run number. A run outlives the
-    /// call that started it when it takes longer than `RUN_ANSWER_WITHIN`. A run stops (its
-    /// command killed) when its call is cancelled, at Stop and with a new session.
-    runs: std::collections::HashMap<u64, CliRun>,
-    next_run: u64,
     /// The card of each write the gateway holds, by the gateway's id: the card's own id, for a
     /// write the CLI gave up before the person decided.
     gateway_cards: std::collections::HashMap<u64, u64>,
@@ -1093,7 +1017,6 @@ impl AgentPanel {
             markdown: std::collections::HashMap::new(),
             branch: None,
             always_allow: false,
-            adapter: Adapter::Other,
             host: None,
             preparing: None,
             replace_on_replay: None,
@@ -1106,16 +1029,10 @@ impl AgentPanel {
             config_options: Vec::new(),
             setting_option: None,
             option_views: Vec::new(),
-            query_cards: Default::default(),
             usage: None,
             expanded_activity: std::collections::HashSet::new(),
-            folded_queries: std::collections::HashSet::new(),
             folds: 0,
             queue: MessageQueue::default(),
-            cli_ready: None,
-            cli_waiting: Vec::new(),
-            runs: std::collections::HashMap::new(),
-            next_run: 1,
             gateway_cards: std::collections::HashMap::new(),
             next_card: 0,
             synced_folds: None,
@@ -1182,7 +1099,6 @@ impl AgentPanel {
             saved => saved,
         };
         let graph_key = self.session.read(cx).overrides_key();
-        let cwd = crate::sessions::working_dir(saved.as_ref(), &graph_key);
         let base = self.session.read(cx).branch.clone();
         // A resumed conversation keeps writing to its branch.
         let branch = match &saved {
@@ -1199,8 +1115,9 @@ impl AgentPanel {
                 changes: 0,
             },
         };
+        let cwd = crate::sessions::working_dir(saved.as_ref(), &graph_key, &branch.name);
         let graph = self.session.read(cx).graph_id.clone();
-        // The directory, the sockets and the files the agent needs are made off the main thread
+        // The directory, the gateway and the files the agent needs are made off the main thread
         // (constitution IX); the agent is launched once they are there.
         let prepare = {
             let (cwd, graph) = (cwd.clone(), graph.clone());
@@ -1229,12 +1146,7 @@ impl AgentPanel {
         graph: String,
         cx: &mut Context<Self>,
     ) {
-        let Prepared {
-            mut socket,
-            executable,
-            gateway,
-            rules,
-        } = prepared;
+        let Prepared { gateway, rules } = prepared;
         self.failed = false;
         let (agent_branch, agent_base) = (branch.name.clone(), branch.base.clone());
         self.branch = Some(branch);
@@ -1243,10 +1155,6 @@ impl AgentPanel {
         // The agent's omnigraph CLI (spec 013): a gateway for this conversation, and a home that
         // points the CLI at it. Without them the agent still has the tools.
         let (gateway_tx, mut gateway_rx) = mpsc::unbounded::<GatewayEvent>();
-        self.cli_ready = None;
-        self.cli_waiting.clear();
-        self.stop_runs();
-        self.runs.clear();
         self.gateway_cards.clear();
         let (cli_home, gateway_serve) = match gateway {
             Ok((mut gateway, home)) => {
@@ -1262,7 +1170,6 @@ impl AgentPanel {
                 (Some(std::sync::Arc::new(home)), Some(serve))
             }
             Err(error) => {
-                self.cli_ready = Some(false);
                 self.say(
                     format!(
                         "Studio could not set up the omnigraph CLI for this conversation \
@@ -1273,7 +1180,8 @@ impl AgentPanel {
                 (None, None)
             }
         };
-        // The shared rules and the skill help the agent; without them it still has the CLI.
+        // `AGENTS.md` and the skill tell the agent how to use the CLI; without them it can still
+        // run it.
         if let Some(error) = rules {
             self.say(
                 format!(
@@ -1283,40 +1191,21 @@ impl AgentPanel {
                 true,
             );
         }
-        // The conversation's MCP instructions say what its CLI is and whether the agent's shell
-        // can run it, which Studio knows once it has chosen one (`cli_chosen`); `initialize`
-        // waits for them. Without a CLI home there are none.
-        let (instructions_tx, instructions) = oneshot::channel::<String>();
-        let instructions_tx = cli_home.is_some().then_some(instructions_tx);
-
         self.cwd = Some(cwd.clone());
         let launch = SessionLaunch {
             cwd,
-            // The proxy is Studio's own executable.
-            mcp_command: executable,
-            mcp_args: vec![
-                crate::PROXY_COMMAND.to_owned(),
-                socket.path.to_string_lossy().into_owned(),
-            ],
             resume: self.session_id.clone(),
         };
         let (events_tx, mut events_rx) = mpsc::unbounded();
         let (commands_tx, commands_rx) = mpsc::unbounded();
-        let (tools_tx, mut tools_rx) = mpsc::unbounded::<ToolRequest>();
         // One process per agent, shared with the graph's other conversations.
-        let connection = crate::connection::connection(
-            AgentLaunch {
-                command: settings.command,
-                env: settings.env,
-            },
-            cx,
-        );
+        let connection =
+            crate::connection::connection(AgentLaunch::new(settings.command, settings.env), cx);
         if !connection.open(launch, events_tx.clone(), commands_rx) {
             self.fail_start("The agent is not running.".into(), cx);
             return;
         }
 
-        let serve = cx.background_spawn(socket.serve(tools_tx, instructions.shared()));
         let mut tasks = Vec::new();
         if let Some(gateway_serve) = gateway_serve {
             tasks.push(cx.background_spawn(gateway_serve));
@@ -1355,24 +1244,12 @@ impl AgentPanel {
                 }
             }
         });
-        let tool_pump = cx.spawn(async move |this, cx| {
-            while let Some(request) = tools_rx.next().await {
-                if this
-                    .update(cx, |this, cx| this.run_tool(request, cx))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-        tasks.extend([serve, event_pump, tool_pump]);
+        tasks.push(event_pump);
         self.host = Some(Host {
             commands: commands_tx,
             events: events_tx,
             _connection: connection,
-            _socket: socket,
-            cli_home,
-            instructions: instructions_tx,
+            _cli_home: cli_home,
             _tasks: tasks,
         });
         self.enter_starting(cx);
@@ -1431,8 +1308,6 @@ impl AgentPanel {
     fn stop_host(&mut self) {
         self.host = None;
         self.preparing = None;
-        // No agent is left to take a run's outcome.
-        self.stop_runs();
         // Options can only be set on a running session.
         self.config_options.clear();
         self.setting_option = None;
@@ -1456,10 +1331,8 @@ impl AgentPanel {
     /// Forgets the thread on screen, before the agent shows it again.
     fn clear_thread(&mut self) {
         self.entries.clear();
-        self.query_cards.borrow_mut().clear();
         self.markdown.clear();
         self.expanded_activity.clear();
-        self.folded_queries.clear();
         self.folds += 1;
         self.usage = None;
     }
@@ -1521,7 +1394,6 @@ impl AgentPanel {
 
     fn apply_event(&mut self, event: HostEvent, cx: &mut Context<Self>) {
         match event {
-            HostEvent::Adapter(adapter) => self.adapter = adapter,
             HostEvent::Ready {
                 agent,
                 session,
@@ -1727,58 +1599,25 @@ impl AgentPanel {
                 }
             }
             SessionUpdate::ToolCall(call) => {
-                let studio =
-                    StudioTool::of(self.adapter, call.meta.as_ref(), call.raw_input.as_ref());
-                let output =
-                    studio.and_then(|_| tool_output(&call.content, call.raw_output.as_ref()));
                 self.entries.push(Entry::Tool {
                     id: call.tool_call_id.to_string(),
                     title: call.title,
                     status: call.status,
-                    input: kept_input(studio, call.raw_input),
-                    studio,
-                    output,
                 });
             }
             SessionUpdate::ToolCallUpdate(update) => {
                 let id = update.tool_call_id.to_string();
-                let adapter = self.adapter;
                 let at = self.entries.iter().rposition(
                     |entry| matches!(entry, Entry::Tool { id: existing, .. } if *existing == id),
                 );
-                if let Some(Entry::Tool {
-                    title,
-                    status,
-                    input,
-                    studio,
-                    output,
-                    ..
-                }) = at.and_then(|at| self.entries.get_mut(at))
+                if let Some(Entry::Tool { title, status, .. }) =
+                    at.and_then(|at| self.entries.get_mut(at))
                 {
-                    if let Some(new_title) = update.fields.title.clone() {
+                    if let Some(new_title) = update.fields.title {
                         *title = new_title;
                     }
                     if let Some(new_status) = update.fields.status {
                         *status = new_status;
-                    }
-                    if studio.is_none() {
-                        *studio = StudioTool::of(
-                            adapter,
-                            update.meta.as_ref(),
-                            update.fields.raw_input.as_ref(),
-                        );
-                    }
-                    if let Some(new_input) = update.fields.raw_input {
-                        *input = kept_input(*studio, Some(new_input));
-                    }
-                    if studio.is_some() {
-                        let reported = tool_output(
-                            update.fields.content.as_deref().unwrap_or_default(),
-                            update.fields.raw_output.as_ref(),
-                        );
-                        if reported.is_some() {
-                            *output = reported;
-                        }
                     }
                 }
             }
@@ -2003,9 +1842,6 @@ impl AgentPanel {
         {
             self.queue.send_after_cancel(text);
             host.commands.unbounded_send(HostCommand::Cancel).ok();
-            // As Stop does: a run the cancelled turn started (a load waiting on its card) must
-            // not land after the new message, which no turn would hear of.
-            self.stop_runs();
             self.entries.cancel_permissions();
             cx.notify();
         } else {
@@ -2057,10 +1893,9 @@ impl AgentPanel {
         cx.notify();
     }
 
-    /// Stops the turn and the CLI runs it started, and answers the turn's waiting permission
-    /// requests; the queue waits until the person sends again.
+    /// Stops the turn and answers its waiting permission requests; the queue waits until the
+    /// person sends again.
     fn stop(&mut self, _: &Stop, _window: &mut Window, cx: &mut Context<Self>) {
-        self.stop_runs();
         if let Some(host) = &self.host {
             host.commands.unbounded_send(HostCommand::Cancel).ok();
             self.entries.cancel_permissions();
@@ -2128,29 +1963,6 @@ impl AgentPanel {
     fn reject(&mut self, _: &Reject, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(index) = self.entries.keyed_write() {
             self.decide(index, Decision::Reject, cx);
-        }
-    }
-
-    // ---- tools ----
-
-    fn run_tool(&mut self, request: ToolRequest, cx: &mut Context<Self>) {
-        let ToolRequest {
-            name,
-            arguments,
-            reply,
-            cancelled,
-        } = request;
-        match ToolCall::parse(&name, &arguments) {
-            Ok(ToolCall::Cli) => self.answer_cli(reply, cx),
-            Ok(ToolCall::Run { args, save_to }) => {
-                self.run_cli(&args, save_to.as_deref(), reply, cancelled, cx);
-            }
-            Ok(ToolCall::Wait { run }) => {
-                self.answer_run(run, reply, cx);
-            }
-            Err(error) => {
-                reply.send((error, true)).ok();
-            }
         }
     }
 
@@ -2339,18 +2151,6 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         let contract = graph_client::CONTRACT;
-        let chosen = matches!(choice, cli_home::CliChoice::Chosen { .. });
-        self.cli_ready = Some(chosen);
-        for waiting in self.cli_waiting.drain(..) {
-            waiting.send(()).ok();
-        }
-        // The MCP instructions say what was chosen, as the `omnigraph_cli` tool does: no CLI,
-        // one the agent's shell cannot run, or the wrapper's path.
-        if let Some(host) = self.host.as_mut()
-            && let (Some(instructions), Some(home)) = (host.instructions.take(), &host.cli_home)
-        {
-            instructions.send(home.instructions(Some(chosen))).ok();
-        }
         match choice {
             cli_home::CliChoice::Chosen {
                 cli,
@@ -2374,10 +2174,9 @@ impl AgentPanel {
                 if !wrapper {
                     self.say(
                         format!(
-                            "The agent's shell cannot run {}: its path is not plain ASCII, \
-                             which a batch file cannot hold. The agent runs it with \
-                             omnigraph_run instead; set `omnigraph_cli` in Studio's settings \
-                             to a CLI at a plain ASCII path to give its shell the CLI too.",
+                            "The agent cannot run {}: its path is not plain ASCII, which a \
+                             batch file cannot hold. Set `omnigraph_cli` in Studio's settings to \
+                             a CLI at a plain ASCII path.",
                             cli.display()
                         ),
                         false,
@@ -2395,209 +2194,6 @@ impl AgentPanel {
         cx.notify();
     }
 
-    /// Runs the conversation's CLI for the agent from Studio (`omnigraph_run`, spec 013), for an
-    /// agent whose sandbox cannot reach the gateway. The arguments are checked first, since the
-    /// CLI then runs outside the agent's sandbox.
-    fn run_cli(
-        &mut self,
-        args: &[String],
-        save_to: Option<&str>,
-        reply: oneshot::Sender<(String, bool)>,
-        cancelled: oneshot::Receiver<()>,
-        cx: &mut Context<Self>,
-    ) {
-        let (Some(home), Some(cwd)) = (
-            self.host.as_ref().and_then(|host| host.cli_home.clone()),
-            self.cwd.clone(),
-        ) else {
-            reply.send(self.cli_instructions()).ok();
-            return;
-        };
-        match self.cli_ready {
-            Some(true) => {}
-            None => {
-                // The call waits until Studio has found (or not found) the CLI.
-                let (ready, known) = oneshot::channel();
-                self.cli_waiting.push(ready);
-                let (args, save_to) = (args.to_vec(), save_to.map(str::to_owned));
-                cx.spawn(async move |this, cx| {
-                    if known.await.is_err() {
-                        reply
-                            .send((
-                                "The conversation ended before the command ran.".into(),
-                                true,
-                            ))
-                            .ok();
-                        return;
-                    }
-                    this.update(cx, |this, cx| {
-                        this.run_cli(&args, save_to.as_deref(), reply, cancelled, cx)
-                    })
-                    .ok();
-                })
-                .detach();
-                return;
-            }
-            Some(false) => {
-                reply.send(self.cli_instructions()).ok();
-                return;
-            }
-        }
-        let checked = cli_home::check_run_args(args, &cwd, &home.graph).and_then(|mut plan| {
-            plan.save_to = save_to
-                .map(|path| {
-                    cli_home::inside(&cwd, path).map(|parts| cli_home::RunFile {
-                        parts,
-                        output: true,
-                    })
-                })
-                .transpose()?;
-            Ok(plan)
-        });
-        let plan = match checked {
-            Ok(plan) => plan,
-            Err(message) => {
-                reply.send((message, true)).ok();
-                return;
-            }
-        };
-        let run = self.next_run;
-        self.next_run += 1;
-        let (stop, stopped) = oneshot::channel::<()>();
-        let task = cx
-            .background_spawn(async move {
-                let ran = cli_home::run(&home, &cwd, plan).fuse();
-                // Only a stop sent stops it, never one dropped with its entry.
-                let stopped = async {
-                    if stopped.await.is_err() {
-                        futures::future::pending::<()>().await;
-                    }
-                }
-                .fuse();
-                futures::pin_mut!(ran, stopped);
-                // Dropping the run kills its command.
-                futures::select! {
-                    done = ran => done,
-                    () = stopped => (
-                        "The run was stopped before it finished; what it had already written \
-                         stays."
-                            .into(),
-                        true,
-                    ),
-                }
-            })
-            .shared();
-        self.runs.insert(
-            run,
-            CliRun {
-                task,
-                stop: Some(stop),
-            },
-        );
-        // The agent cancelling the call while it waits for the run stops the run.
-        cx.spawn(async move |this, cx| {
-            if cancelled.await.is_ok() {
-                this.update(cx, |this, _| this.stop_run(run)).ok();
-            }
-        })
-        .detach();
-        self.answer_run(run, reply, cx);
-    }
-
-    fn stop_run(&mut self, run: u64) {
-        if let Some(stop) = self.runs.get_mut(&run).and_then(|run| run.stop.take()) {
-            stop.send(()).ok();
-        }
-    }
-
-    /// Stops every run still going: at Stop, when the agent stops and when a new session
-    /// starts.
-    fn stop_runs(&mut self) {
-        for run in self.runs.values_mut() {
-            if let Some(stop) = run.stop.take() {
-                stop.send(()).ok();
-            }
-        }
-    }
-
-    /// Answers with run `run`'s outcome once it finishes, or with its number if it is still
-    /// going after `RUN_ANSWER_WITHIN`, so the agent can wait for it again.
-    fn answer_run(
-        &mut self,
-        run: u64,
-        reply: oneshot::Sender<(String, bool)>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(task) = self.runs.get(&run).map(|run| run.task.clone()) else {
-            reply
-                .send((
-                    format!(
-                        "There is no run {run} waiting in this conversation: its outcome was \
-                         already returned, or the conversation restarted."
-                    ),
-                    true,
-                ))
-                .ok();
-            return;
-        };
-        cx.spawn(async move |this, cx| {
-            match cli_home::answer_within(task, cli_home::RUN_ANSWER_WITHIN).await {
-                Some(answer) => {
-                    this.update(cx, |this, _| this.runs.remove(&run)).ok();
-                    reply.send(answer).ok();
-                }
-                None => {
-                    reply.send(cli_home::still_running(run)).ok();
-                }
-            }
-        })
-        .detach();
-    }
-
-    /// Answers `omnigraph_cli` once Studio has chosen the conversation's CLI, since what it
-    /// says depends on the choice; a call made before waits for it.
-    fn answer_cli(&mut self, reply: oneshot::Sender<(String, bool)>, cx: &mut Context<Self>) {
-        let has_home = self
-            .host
-            .as_ref()
-            .is_some_and(|host| host.cli_home.is_some());
-        if self.cli_ready.is_some() || !has_home {
-            reply.send(self.cli_instructions()).ok();
-            return;
-        }
-        let (ready, known) = oneshot::channel();
-        self.cli_waiting.push(ready);
-        cx.spawn(async move |this, cx| {
-            if known.await.is_err() {
-                reply
-                    .send((
-                        "The conversation ended before Studio chose its omnigraph CLI.".into(),
-                        true,
-                    ))
-                    .ok();
-                return;
-            }
-            this.update(cx, |this, _| reply.send(this.cli_instructions()).ok())
-                .ok();
-        })
-        .detach();
-    }
-
-    /// What the `omnigraph_cli` tool answers: this conversation's CLI, or why it has none.
-    fn cli_instructions(&self) -> (String, bool) {
-        match self.host.as_ref().and_then(|host| host.cli_home.as_ref()) {
-            Some(home) => match self.cli_ready {
-                Some(false) => (home.instructions(Some(false)), true),
-                ready => (home.instructions(ready), false),
-            },
-            None => (
-                "The omnigraph CLI is not available in this conversation; tell the person.".into(),
-                true,
-            ),
-        }
-    }
-
-    /// Sets the state of write card `card`, while the thread holds it.
     fn set_write_state(&mut self, card: u64, state: WriteState, cx: &mut Context<Self>) {
         if let Some(card) = self.entries.write_card(card) {
             card.state = state;
@@ -2624,164 +2220,6 @@ impl AgentPanel {
         }
         cx.notify();
     }
-}
-
-/// What a query card shows: the CLI's subcommand, the query's name, its text with its
-/// highlights, and the rest of its arguments.
-struct QueryCard {
-    command: String,
-    name: Option<String>,
-    text: SharedString,
-    highlights: Vec<(std::ops::Range<usize>, &'static str)>,
-    params: String,
-    /// The rows it returned, when its result holds the CLI's rows.
-    rows: Option<QueryRows>,
-}
-
-/// The rows a query returned, as the CLI prints them with `--json` (`columns`, `rows`,
-/// `row_count`, `target`), for its record card: the first columns, each with the icon of what
-/// its first value holds, the first rows' values as text, how many rows and columns came back,
-/// and where they were read.
-#[derive(Debug, Clone, PartialEq)]
-struct QueryRows {
-    columns: Vec<(String, IconName)>,
-    rows: Vec<Vec<String>>,
-    total_rows: usize,
-    total_columns: usize,
-    read_at: Option<String>,
-}
-
-/// The most rows and columns a record card shows; its title says how many came back.
-const RECORD_ROWS: usize = 5;
-const RECORD_COLUMNS: usize = 4;
-
-/// A query's rows from what its tool call returned: `omnigraph_run`'s answer ("exit 0", the
-/// output, then `[stderr]` and what the CLI wrote there) or the CLI's output alone, when it is
-/// the CLI's JSON result with rows. `None` for a failed run, other output or no rows.
-fn query_rows(output: &str) -> Option<QueryRows> {
-    let body = match output.split_once('\n') {
-        Some((first, rest)) if first.starts_with("exit ") => {
-            if first.trim_end() != "exit 0" {
-                return None;
-            }
-            rest
-        }
-        _ => output,
-    };
-    let body = body.split("\n[stderr]\n").next().unwrap_or(body).trim();
-    let value: Value = serde_json::from_str(body).ok()?;
-    let rows = value.get("rows")?.as_array()?;
-    let first = rows.first()?.as_object()?;
-    let columns: Vec<String> = value
-        .get("columns")
-        .and_then(Value::as_array)
-        .map(|columns| {
-            columns
-                .iter()
-                .filter_map(|column| column.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_else(|| first.keys().cloned().collect());
-    if columns.is_empty() {
-        return None;
-    }
-    let total_columns = columns.len();
-    let shown: Vec<String> = columns.into_iter().take(RECORD_COLUMNS).collect();
-    let icon = |column: &str| {
-        rows.iter()
-            .filter_map(|row| row.get(column))
-            .find(|value| !value.is_null())
-            .map_or(IconName::CaseSensitive, studio_ui::value_icon)
-    };
-    let target = value.get("target");
-    let read_at = target
-        .and_then(|target| target.get("snapshot"))
-        .and_then(Value::as_str)
-        .map(|commit| studio_ui::short_commit_id(commit).to_string())
-        .or_else(|| {
-            target
-                .and_then(|target| target.get("branch"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        });
-    Some(QueryRows {
-        columns: shown
-            .iter()
-            .map(|column| (column.clone(), icon(column)))
-            .collect(),
-        rows: rows
-            .iter()
-            .take(RECORD_ROWS)
-            .map(|row| {
-                shown
-                    .iter()
-                    .map(|column| studio_ui::format_value(row.get(column).unwrap_or(&Value::Null)))
-                    .collect()
-            })
-            .collect(),
-        total_rows: value
-            .get("row_count")
-            .and_then(Value::as_u64)
-            .map_or(rows.len(), |count| count as usize),
-        total_columns,
-        read_at,
-    })
-}
-
-/// A record card, after the reference chat's: a title line (a tile, how many rows, where they
-/// were read), then the rows in the type table's cells, a header cell per column (the kind's
-/// icon and the column's name) over the values.
-fn record_card(rows: &QueryRows, cx: &App) -> Div {
-    let shown = rows.rows.len();
-    let noun = |count: usize| if count == 1 { "row" } else { "rows" };
-    let title = if shown < rows.total_rows {
-        format!("{shown} of {} {}", rows.total_rows, noun(rows.total_rows))
-    } else {
-        format!("{shown} {}", noun(shown))
-    };
-    let mut meta: Vec<String> = rows.read_at.iter().cloned().collect();
-    if rows.columns.len() < rows.total_columns {
-        meta.push(format!(
-            "{} of {} columns",
-            rows.columns.len(),
-            rows.total_columns
-        ));
-    }
-    let last = rows.columns.len().saturating_sub(1);
-    let ruled = |cell: Div, at: usize| {
-        let cell = cell.flex_1().min_w_0();
-        if at < last {
-            ds::cell_rule(cell, cx)
-        } else {
-            cell
-        }
-    };
-    // A reading column wide at most: a few columns stretched across a wide thread scan
-    // badly.
-    ds::card(cx)
-        .max_w(px(ds::size::READING_WIDTH))
-        .child(ds::card_title(
-            ds::icon_tile(IconName::Table, cx),
-            title,
-            (!meta.is_empty()).then(|| meta.join(" · ").into()),
-        ))
-        .child(
-            ds::header_row(cx).children(rows.columns.iter().enumerate().map(
-                |(at, (name, icon))| ruled(ds::header_cell(Some(*icon), name.clone(), false), at),
-            )),
-        )
-        .children(rows.rows.iter().map(|values| {
-            ds::grid_row(cx).children(values.iter().enumerate().map(|(at, value)| {
-                ruled(
-                    ds::data_cell().child(
-                        div()
-                            .min_w_0()
-                            .child(ds::text::body(value.clone()).single_line().truncate()),
-                    ),
-                    at,
-                )
-            }))
-        }))
 }
 
 /// One of the agent's session options as the composer shows it, with a value chosen but not yet
@@ -3120,57 +2558,6 @@ fn turn_ends(entries: &[Entry], working: bool) -> Vec<usize> {
     ends
 }
 
-/// The most of another tool's input, as JSON, the thread keeps: its row shows only its title and
-/// how it went, and Claude's Read and Write tools carry whole files.
-const FOREIGN_INPUT_BYTES: usize = 4 * 1024;
-
-/// What the thread keeps of a tool call's input: all of it for Studio's own tools, and of
-/// another tool only an input within [`FOREIGN_INPUT_BYTES`], so a call an update names
-/// Studio's later still has its arguments.
-fn kept_input(studio: Option<StudioTool>, input: Option<Value>) -> Option<Value> {
-    /// Takes bytes up to a limit, then refuses, so measuring a large input stops there.
-    struct Within(usize);
-    impl std::io::Write for Within {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self
-                .0
-                .checked_sub(bytes.len())
-                .ok_or_else(|| std::io::Error::other("past the limit"))?;
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let input = input?;
-    let small = || serde_json::to_writer(Within(FOREIGN_INPUT_BYTES), &input).is_ok();
-    (studio.is_some() || small()).then_some(input)
-}
-
-/// What a tool call returned, as its agent reports it: the text of its content blocks (Claude's
-/// adapter sends an MCP tool's result so), else its raw output, a string as it is and other JSON
-/// as its text. `None` when it reported neither.
-fn tool_output(content: &[ToolCallContent], raw: Option<&Value>) -> Option<String> {
-    let text: Vec<&str> = content
-        .iter()
-        .filter_map(|content| match content {
-            ToolCallContent::Content(content) => match &content.content {
-                ContentBlock::Text(text) => Some(text.text.as_str()),
-                _ => None,
-            },
-            _ => None,
-        })
-        .collect();
-    if !text.is_empty() {
-        return Some(text.join("\n"));
-    }
-    match raw? {
-        Value::Null => None,
-        Value::String(text) => Some(text.clone()),
-        other => Some(other.to_string()),
-    }
-}
-
 fn content_text(content: &ContentBlock) -> String {
     match content {
         ContentBlock::Text(text) => text.text.clone(),
@@ -3207,85 +2594,13 @@ fn gutter_row(icon: Option<Icon>, content: impl IntoElement) -> Div {
         .child(div().flex_1().min_w_0().child(content))
 }
 
-/// An `omnigraph_run` call's subcommand and the query text it gives
-/// ([`cli_home::query_string`]), read without copying them. Arguments that are not text, which
-/// `omnigraph_run` refuses, are passed over.
-fn query_text(entry: &Entry) -> Option<(&str, &str)> {
-    let args = run_args(entry)?;
-    let command = args.first()?.as_str()?;
-    let (_, text) = cli_home::query_string(args.iter().filter_map(Value::as_str))?;
-    Some((command, text))
-}
-
-/// An `omnigraph_run` call shown with its query: the subcommand ("query", "mutate"), the
-/// query text ([`query_text`]), and the other arguments on one line.
-fn shown_query(entry: &Entry) -> Option<(String, String, String)> {
-    let args: Vec<&str> = run_args(entry)?.iter().filter_map(Value::as_str).collect();
-    let (at, text) = cli_home::query_string(args.iter().copied())?;
-    let rest = args
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| *index != 0 && !at.contains(index))
-        .map(|(_, arg)| *arg)
-        .collect::<Vec<_>>()
-        .join(" ");
-    Some(((*args.first()?).to_owned(), text.to_owned(), rest))
-}
-
-/// An `omnigraph_run` call's arguments.
-fn run_args(entry: &Entry) -> Option<&Vec<Value>> {
-    let Entry::Tool { input, studio, .. } = entry else {
-        return None;
-    };
-    if *studio != Some(StudioTool::Run) {
-        return None;
-    }
-    input.as_ref()?.get("args")?.as_array()
-}
-
-/// Whether [`shown_query`] shows the entry, read without copying its text: on every render,
-/// for every tool call in the thread.
-fn shows_query(entry: &Entry) -> bool {
-    query_text(entry).is_some()
-}
-
-/// Whether the query call at `index` has its text on the write card the gateway made for it,
-/// which holds the query, its parameters, its branch and its outcome; the call's line alone then
-/// says what ran, so the text shows once. It has when a write card after it in its turn carries
-/// the same text, before a later call of that text, which owns the cards after it; and while a
-/// `mutate` call runs, since its card is on its way or waits for the person's answer. A call
-/// that ended with no such card (its CLI failed before sending it) shows its own text.
-fn query_on_card(entries: &[Entry], index: usize) -> bool {
-    let Some(entry @ Entry::Tool { status, .. }) = entries.get(index) else {
-        return false;
-    };
-    let Some((command, text)) = query_text(entry) else {
-        return false;
-    };
-    let text = text.trim();
-    let running = matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress);
-    for later in entries.get(index + 1..).unwrap_or_default() {
-        match later {
-            Entry::User(_) => break,
-            Entry::Write(card) if card.query.trim() == text => return true,
-            Entry::Tool { .. }
-                if query_text(later).is_some_and(|(_, again)| again.trim() == text) =>
-            {
-                break;
-            }
-            _ => {}
-        }
-    }
-    running && command == "mutate"
-}
-
 /// The thread's blocks for `entries`, made again from the turn the first new or changed entry,
 /// `changed`, falls in; the turns before keep their blocks from `shown`, which was made from
 /// the entries as they still are there. Returns the blocks and how many were kept.
 ///
 /// That holds because a turn's blocks read only its own entries and whether a message of the
-/// person's follows it: no block spans a message of the person's, a query's card is looked for
-/// only up to the next one, and only the last turn can still be under way. The person's last
+/// person's follows it: no block spans a message of the person's, and only the last turn can
+/// still be under way. The person's last
 /// message before `changed` is unchanged and was there before, so every turn before it was
 /// followed by it then and now.
 fn thread_blocks(
@@ -3303,7 +2618,7 @@ fn thread_blocks(
     let kept = shown
         .iter()
         .take_while(|block| match block {
-            Block::Entry { index, .. } | Block::Query { index, .. } => *index < cut,
+            Block::Entry { index, .. } => *index < cut,
             Block::Activity { start, .. } => *start < cut,
             Block::Waiting | Block::Exited => false,
         })
@@ -3333,19 +2648,11 @@ fn blocks_from(entries: &[Entry], start: usize, working: bool) -> Vec<Block> {
     while index < entries.len() {
         let entry = &entries[index];
         match entry {
-            Entry::Tool { .. } if shows_query(entry) => {
-                blocks.push(Block::Query {
-                    index,
-                    lead: !marked,
-                    on_card: query_on_card(entries, index),
-                });
-                marked = true;
-                index += 1;
-                continue;
-            }
             Entry::Tool { .. } | Entry::Thought(_) => {
                 let start = index;
-                while index < entries.len() && is_folded_step(&entries[index]) {
+                while index < entries.len()
+                    && matches!(entries[index], Entry::Tool { .. } | Entry::Thought(_))
+                {
                     index += 1;
                 }
                 blocks.push(Block::Activity {
@@ -3373,51 +2680,8 @@ fn blocks_from(entries: &[Entry], start: usize, working: bool) -> Vec<Block> {
     blocks
 }
 
-/// Whether an entry folds into a run's summary line: thoughts, and tool calls other than the
-/// queries shown with their text.
-fn is_folded_step(entry: &Entry) -> bool {
-    match entry {
-        Entry::Thought(_) => true,
-        Entry::Tool { .. } => !shows_query(entry),
-        _ => false,
-    }
-}
-
-/// What a tool call did, for a run's summary line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolKind {
-    Cli,
-    Run,
-    Other,
-}
-
-impl ToolKind {
-    fn of(studio: Option<StudioTool>) -> Self {
-        match studio {
-            Some(StudioTool::Cli) => Self::Cli,
-            Some(StudioTool::Run) => Self::Run,
-            None => Self::Other,
-        }
-    }
-
-    /// What `count` calls of this kind did. Beside Studio's own tools in the same run, the
-    /// agent's others are its "other" tools, so the parts add up to the turn's tool calls.
-    fn phrase(self, count: usize, beside_studios: bool) -> String {
-        let plural = |one: &str, many: &str| if count == 1 { one } else { many }.to_owned();
-        match self {
-            Self::Cli => "looked up the CLI".into(),
-            Self::Run => format!("ran {count} omnigraph {}", plural("command", "commands")),
-            Self::Other if beside_studios => {
-                format!("used {count} other {}", plural("tool", "tools"))
-            }
-            Self::Other => format!("used {count} {}", plural("tool", "tools")),
-        }
-    }
-}
-
-/// A run's summary, as Delta writes it: "Thought 1 time, read the schema, ran 2 queries", kinds
-/// in the order they first ran.
-fn activity_summary(thoughts: usize, tools: &[ToolKind]) -> String {
+/// A run's summary, as Delta writes it: "Thought 1 time, used 2 tools".
+fn activity_summary(thoughts: usize, tools: usize) -> String {
     let mut parts = Vec::new();
     if thoughts > 0 {
         parts.push(format!(
@@ -3425,30 +2689,17 @@ fn activity_summary(thoughts: usize, tools: &[ToolKind]) -> String {
             if thoughts == 1 { "time" } else { "times" }
         ));
     }
-    let mut seen: Vec<ToolKind> = Vec::new();
-    for kind in tools {
-        if !seen.contains(kind) {
-            seen.push(*kind);
-        }
-    }
-    let beside_studios = seen.iter().any(|kind| *kind != ToolKind::Other);
-    for kind in seen {
-        let count = tools.iter().filter(|other| **other == kind).count();
-        parts.push(kind.phrase(count, beside_studios));
+    if tools > 0 {
+        parts.push(format!(
+            "used {tools} {}",
+            if tools == 1 { "tool" } else { "tools" }
+        ));
     }
     let text = parts.join(", ");
     let mut chars = text.chars();
     match chars.next() {
         Some(first) => first.to_uppercase().chain(chars).collect(),
         None => text,
-    }
-}
-
-fn tool_verb(title: &str, studio: Option<StudioTool>) -> String {
-    match ToolKind::of(studio) {
-        ToolKind::Cli => "Look up the CLI".into(),
-        ToolKind::Run => "Run omnigraph".into(),
-        ToolKind::Other => title.to_owned(),
     }
 }
 
@@ -3827,10 +3078,6 @@ impl AgentPanel {
         first.hash(&mut hasher);
         let entries = match *block {
             Block::Entry { index, .. } => index..index + 1,
-            Block::Query { index, .. } => {
-                self.folded_queries.contains(&index).hash(&mut hasher);
-                index..index + 1
-            }
             Block::Activity { start, end, .. } => {
                 self.expanded_activity.contains(&start).hash(&mut hasher);
                 start..end
@@ -3948,14 +3195,6 @@ impl AgentPanel {
                     .child(gutter_row(None, self.render_turn_actions(index, cx)))
                     .into_any_element(),
                 Some(entry) => self.render_entry(index, entry, lead, window, cx),
-                None => div().into_any_element(),
-            },
-            Block::Query {
-                index,
-                lead,
-                on_card,
-            } => match self.entries.get(index) {
-                Some(entry) => self.render_query_call(index, entry, lead, on_card, cx),
                 None => div().into_any_element(),
             },
             Block::Activity { start, end, lead } => {
@@ -4131,139 +3370,6 @@ impl AgentPanel {
         }
     }
 
-    /// A query the agent ran, as Delta shows an edit: "Query people" over the query in a code
-    /// card with the editor's colours, and its parameters under it. The line folds the card. A
-    /// write whose text its write card shows ([`query_on_card`]) is the line alone: "Mutate
-    /// retitle", with no code or arguments to fold.
-    fn render_query_call(
-        &self,
-        index: usize,
-        entry: &Entry,
-        lead: bool,
-        on_card: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let Entry::Tool { status, .. } = entry else {
-            return div().into_any_element();
-        };
-        let Some(card) = self.query_card(index, entry) else {
-            return div().into_any_element();
-        };
-        let QueryCard {
-            command,
-            name,
-            text,
-            highlights,
-            params,
-            rows,
-        } = &*card;
-        let running = matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress);
-        let failed = matches!(status, ToolCallStatus::Failed);
-        let folded = on_card || self.folded_queries.contains(&index);
-        let header = h_flex()
-            .id(("query-call", index))
-            .gap(px(ds::space::XS))
-            .items_center()
-            .when(!on_card, |header| header.cursor_pointer())
-            .child(studio_ui::ds::text::muted(if running {
-                "Running".to_owned()
-            } else {
-                // "Query people", "Mutate retitle": the CLI's subcommand, capitalized.
-                let mut chars = command.chars();
-                chars
-                    .next()
-                    .map(|first| first.to_uppercase().chain(chars).collect())
-                    .unwrap_or_default()
-            }))
-            .children(name.clone().map(|name| {
-                studio_ui::ds::text::body(name)
-                    .color(Color::Default)
-                    .buffer_font(cx)
-            }))
-            .when(failed, |row| {
-                row.child(studio_ui::ds::text::error("· failed"))
-            })
-            .map(|row| {
-                if running {
-                    row.child(studio_ui::ds::spinner())
-                } else if on_card {
-                    row
-                } else {
-                    row.child(studio_ui::ds::icon::meta(if folded {
-                        IconName::ChevronRight
-                    } else {
-                        IconName::ChevronDown
-                    }))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if !this.folded_queries.remove(&index) {
-                            this.folded_queries.insert(index);
-                        }
-                        this.folds += 1;
-                        cx.notify();
-                    }))
-                }
-            });
-        let params = params.clone();
-        let card = ds::code_block_highlighted(text.clone(), highlights.iter().cloned(), cx);
-        gutter_row(
-            lead.then(|| studio_ui::ds::icon::lead(IconName::ZedAssistant)),
-            v_flex()
-                .w_full()
-                .gap(px(ds::space::SM))
-                .child(header)
-                .when(!folded, |column| {
-                    column
-                        .child(card)
-                        .when(!params.is_empty(), |column| {
-                            column.child(ds::text::meta(params))
-                        })
-                        .children(rows.as_ref().map(|rows| record_card(rows, cx)))
-                }),
-        )
-        .into_any_element()
-    }
-
-    /// What the query card of entry `index` shows, made once while the entry is unchanged.
-    fn query_card(&self, index: usize, entry: &Entry) -> Option<Rc<QueryCard>> {
-        let hash = self.entries.hash(index);
-        if let Some((held, card)) = self.query_cards.borrow().get(&index)
-            && *held == hash
-        {
-            return Some(card.clone());
-        }
-        let (command, text, params) = shown_query(entry)?;
-        let tokens = gq_language::tokenize(&text);
-        let name = tokens
-            .iter()
-            .find(|token| token.kind == gq_language::TokenKind::QueryName)
-            .map(|token| text[token.range.clone()].to_owned());
-        let shown = text.trim_end();
-        let highlights = tokens
-            .into_iter()
-            .filter(|token| token.range.end <= shown.len())
-            .filter_map(|token| token.kind.syntax_name().map(|name| (token.range, name)))
-            .collect();
-        let rows = match entry {
-            Entry::Tool {
-                output: Some(output),
-                ..
-            } => query_rows(output),
-            _ => None,
-        };
-        let card = Rc::new(QueryCard {
-            command,
-            name,
-            text: shown.to_owned().into(),
-            highlights,
-            params,
-            rows,
-        });
-        self.query_cards
-            .borrow_mut()
-            .insert(index, (hash, card.clone()));
-        Some(card)
-    }
-
     /// A run of tool calls and thoughts as one muted line ("Thought 1 time, ran 2 queries"),
     /// with a turning arrow while a step runs and the failures named; it opens to the steps.
     fn render_activity(
@@ -4278,20 +3384,19 @@ impl AgentPanel {
             .iter()
             .filter(|entry| matches!(entry, Entry::Thought(_)))
             .count();
-        let tools: Vec<(ToolKind, &ToolCallStatus)> = steps
+        let tools: Vec<&ToolCallStatus> = steps
             .iter()
             .filter_map(|entry| match entry {
-                Entry::Tool { studio, status, .. } => Some((ToolKind::of(*studio), status)),
+                Entry::Tool { status, .. } => Some(status),
                 _ => None,
             })
             .collect();
-        let kinds: Vec<ToolKind> = tools.iter().map(|(kind, _)| *kind).collect();
-        let running = tools.iter().any(|(_, status)| {
-            matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress)
-        });
+        let running = tools
+            .iter()
+            .any(|status| matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress));
         let failed = tools
             .iter()
-            .filter(|(_, status)| matches!(status, ToolCallStatus::Failed))
+            .filter(|status| matches!(status, ToolCallStatus::Failed))
             .count();
         let expanded = self.expanded_activity.contains(&start);
         let header = h_flex()
@@ -4300,7 +3405,8 @@ impl AgentPanel {
             .items_center()
             .cursor_pointer()
             .child(studio_ui::ds::text::muted(activity_summary(
-                thoughts, &kinds,
+                thoughts,
+                tools.len(),
             )))
             .when(failed > 0, |row| {
                 row.child(studio_ui::ds::text::error(format!("· {failed} failed")))
@@ -4355,12 +3461,7 @@ impl AgentPanel {
                 .quiet_prose(cx)
                 .child(text.trim().to_owned())
                 .into_any_element(),
-            Entry::Tool {
-                title,
-                status,
-                studio,
-                ..
-            } => {
+            Entry::Tool { title, status, .. } => {
                 let failed = matches!(status, ToolCallStatus::Failed);
                 let running =
                     matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress);
@@ -4370,9 +3471,9 @@ impl AgentPanel {
                     .tooltip(Tooltip::text(title.clone()))
                     .child(
                         studio_ui::ds::text::body(if failed {
-                            format!("{} failed", tool_verb(title, *studio))
+                            format!("{title} failed")
                         } else {
-                            tool_verb(title, *studio)
+                            title.clone()
                         })
                         .color(if failed { Color::Error } else { Color::Muted })
                         .single_line()
@@ -4956,182 +4057,6 @@ impl AgentPanel {
 mod tests {
     use super::*;
 
-    /// Rendering asks [`shows_query`] of every tool call; it agrees with [`shown_query`].
-    #[test]
-    fn a_run_shows_its_query_only_when_it_gives_one() {
-        let tool = |studio, input: Value| Entry::Tool {
-            id: "t".into(),
-            title: String::new(),
-            status: ToolCallStatus::Completed,
-            input: Some(input),
-            studio,
-            output: None,
-        };
-        let run = Some(StudioTool::Run);
-        for (entry, shown) in [
-            (
-                tool(
-                    run,
-                    serde_json::json!({"args": ["query", "-e", "q", "--json"]}),
-                ),
-                true,
-            ),
-            (
-                tool(run, serde_json::json!({"args": ["query", 1, "-e", 2, "q"]})),
-                true,
-            ),
-            (
-                tool(run, serde_json::json!({"args": ["query", "-e"]})),
-                false,
-            ),
-            // A flag after `-e` is a flag of its own, as the CLI reads it.
-            (
-                tool(run, serde_json::json!({"args": ["query", "-e", "--json"]})),
-                false,
-            ),
-            (
-                tool(run, serde_json::json!({"args": ["load", "--data", "x"]})),
-                false,
-            ),
-            (tool(run, serde_json::json!({})), false),
-            (
-                tool(None, serde_json::json!({"args": ["query", "-e", "q"]})),
-                false,
-            ),
-            (Entry::Thought("-e".into()), false),
-        ] {
-            assert_eq!(shows_query(&entry), shown, "{:?}", shown_query(&entry));
-            assert_eq!(shown_query(&entry).is_some(), shown);
-        }
-        // Every way the CLI's parser reads the query text shows it, the rest of the call beside
-        // it.
-        for args in [
-            serde_json::json!(["query", "-e", "q", "--json"]),
-            serde_json::json!(["query", "-eq", "--json"]),
-            serde_json::json!(["query", "-e=q", "--json"]),
-            serde_json::json!(["query", "--query-string", "q", "--json"]),
-            serde_json::json!(["query", "--json", "--query-string=q"]),
-        ] {
-            assert_eq!(
-                shown_query(&tool(run, serde_json::json!({ "args": args }))),
-                Some(("query".into(), "q".into(), "--json".into())),
-                "{args}"
-            );
-        }
-    }
-
-    /// A write's text shows once, on its write card: a `mutate` call whose card carries its text
-    /// is its line alone, as is one still running, whose card is on its way or waits for the
-    /// person to allow it (the card shows the text it asks about). A call that ended with no
-    /// card, a read, and a call whose card is past the person's next message or belongs to a
-    /// later call of the same text show their own text.
-    #[test]
-    fn a_write_shows_its_query_once_on_its_card() {
-        let text = "query retitle() { update Person set { title: \"T\" } }";
-        let call = |command: &str, status| Entry::Tool {
-            id: "t".into(),
-            title: String::new(),
-            status,
-            input: Some(serde_json::json!({
-                "args": [command, "-e", text, "--branch", "agent/x"]
-            })),
-            studio: Some(StudioTool::Run),
-            output: None,
-        };
-        let card = |state| {
-            Entry::Write(WriteCard {
-                id: 0,
-                summary: "Mutation".into(),
-                query: format!("{text}\n"),
-                params: None,
-                branch: "agent/x".into(),
-                creates_from: None,
-                state,
-            })
-        };
-        let waiting = || WriteState::Waiting(oneshot::channel().0);
-        let done = || WriteState::Committed {
-            commit: "c2".into(),
-            nodes: 1,
-            edges: 0,
-        };
-        use ToolCallStatus::{Completed, Failed, InProgress};
-        // Running, before its card arrives and while the card waits for Allow.
-        assert!(query_on_card(&[call("mutate", InProgress)], 0));
-        assert!(query_on_card(
-            &[call("mutate", InProgress), card(waiting())],
-            0
-        ));
-        // Ended, its card showing the outcome; text compared without the trailing line.
-        assert!(query_on_card(&[call("mutate", Completed), card(done())], 0));
-        // Ended with no card: the CLI failed before it sent anything.
-        assert!(!query_on_card(&[call("mutate", Failed)], 0));
-        // A read has no card, running or not.
-        assert!(!query_on_card(&[call("query", InProgress)], 0));
-        // A card past the next message is another turn's.
-        assert!(!query_on_card(
-            &[
-                call("mutate", Failed),
-                Entry::User("again".into()),
-                card(done())
-            ],
-            0
-        ));
-        // A later call of the same text owns the cards after it.
-        let retried = [
-            call("mutate", Failed),
-            call("mutate", Completed),
-            card(done()),
-        ];
-        assert!(!query_on_card(&retried, 0));
-        assert!(query_on_card(&retried, 1));
-    }
-
-    /// A query's rows come from its result as `omnigraph_run` answers it or as the CLI prints
-    /// it: the columns in the CLI's order, the first rows, how many came back and where they
-    /// were read. A failed run, other output and no rows give no card.
-    #[test]
-    fn a_querys_rows_are_read_from_what_its_call_returned() {
-        let json = r#"{"query_name":"people","target":{"branch":"main","snapshot":null},
-            "row_count":3,"columns":["p.name","p.born"],
-            "rows":[{"p.name":"Radia Knuth","p.born":"1978-03-20"},
-                    {"p.name":"Donald Dijkstra","p.born":null},
-                    {"p.name":"Grace Allen","p.born":"1985-01-11"}]}"#;
-        let run = format!("exit 0\n{json}\n[stderr]\nwhat the CLI wrote there");
-        let rows = query_rows(&run).expect("rows from omnigraph_run's answer");
-        assert_eq!(
-            rows.columns,
-            [
-                ("p.name".to_owned(), IconName::CaseSensitive),
-                ("p.born".to_owned(), IconName::Clock)
-            ]
-        );
-        assert_eq!(rows.rows[1], ["Donald Dijkstra", "—"]);
-        assert_eq!((rows.total_rows, rows.total_columns), (3, 2));
-        assert_eq!(rows.read_at.as_deref(), Some("main"));
-        assert_eq!(query_rows(json), Some(rows), "the CLI's output alone");
-
-        let many: Vec<Value> = (0..12)
-            .map(|n| serde_json::json!({"a": n, "b": n, "c": n, "d": n, "e": n}))
-            .collect();
-        let wide = serde_json::json!({"rows": many, "row_count": 12}).to_string();
-        let rows = query_rows(&wide).expect("rows");
-        assert_eq!(
-            (rows.rows.len(), rows.columns.len()),
-            (RECORD_ROWS, RECORD_COLUMNS),
-            "a card shows the first rows and columns"
-        );
-        assert_eq!((rows.total_rows, rows.total_columns), (12, 5));
-
-        assert_eq!(query_rows(&format!("exit 1\n{json}")), None, "a failed run");
-        assert_eq!(query_rows("exit 0\nnode Person {}"), None, "not rows");
-        assert_eq!(
-            query_rows(r#"{"rows":[],"columns":["n"]}"#),
-            None,
-            "no rows"
-        );
-    }
-
     /// A turn's actions go under its last reply once it has finished: not under a turn the
     /// agent still works on, nor in a turn with no reply.
     #[test]
@@ -5156,29 +4081,6 @@ mod tests {
             "the last turn is still going"
         );
         assert!(turn_ends(&[], false).is_empty());
-    }
-
-    /// A tool's result is the text of the content its agent reported, else its raw output.
-    #[test]
-    fn a_tool_call_keeps_the_result_its_agent_reported() {
-        use agent_client_protocol::schema::v1::TextContent;
-        let text =
-            |text: &str| -> ToolCallContent { ContentBlock::Text(TextContent::new(text)).into() };
-        assert_eq!(
-            tool_output(&[text("exit 0"), text("{}")], None).as_deref(),
-            Some("exit 0\n{}")
-        );
-        let raw = serde_json::json!({"rows": []});
-        assert_eq!(
-            tool_output(&[], Some(&raw)).as_deref(),
-            Some(r#"{"rows":[]}"#)
-        );
-        assert_eq!(
-            tool_output(&[], Some(&Value::String("ok".into()))).as_deref(),
-            Some("ok")
-        );
-        assert_eq!(tool_output(&[], Some(&Value::Null)), None);
-        assert_eq!(tool_output(&[], None), None);
     }
 
     #[test]
@@ -5423,21 +4325,6 @@ mod tests {
         assert!(!AgentBranch::resumed(&record(false), "main".into()).offers_review());
     }
 
-    /// Only Studio's own tools keep what they were given whole: another tool's input is kept
-    /// only while small, and a file it carries is not.
-    #[test]
-    fn only_studios_tools_keep_what_they_were_given() {
-        let file = serde_json::json!({"file_path": "/x", "content": "x".repeat(64 * 1024)});
-        let small = serde_json::json!({"command": "ls"});
-        assert_eq!(kept_input(None, Some(file.clone())), None);
-        assert_eq!(kept_input(None, Some(small.clone())), Some(small));
-        assert_eq!(
-            kept_input(Some(StudioTool::Run), Some(file.clone())),
-            Some(file)
-        );
-        assert_eq!(kept_input(Some(StudioTool::Run), None), None);
-    }
-
     /// A streamed token lands in the last turn, and only that turn's blocks are made again:
     /// the earlier turns keep theirs, and the blocks are those a rebuild of the whole thread
     /// makes. A change in an earlier turn makes its turn's blocks and the later ones again. A
@@ -5449,9 +4336,6 @@ mod tests {
             id: "q".into(),
             title: String::new(),
             status: ToolCallStatus::Completed,
-            input: Some(serde_json::json!({"args": ["query", "-e", "query q() {}", "--json"]})),
-            studio: Some(StudioTool::Run),
-            output: None,
         };
         let mut entries = Entries::default();
         for entry in [
@@ -5475,8 +4359,8 @@ mod tests {
             .take_while(|block| !matches!(block, Block::Entry { index: 4, .. }))
             .count();
         assert_eq!(
-            first_turn, 4,
-            "the message, the reply, the query and the thought"
+            first_turn, 3,
+            "the message, the reply, and the query with the thought"
         );
 
         if let Some(Entry::Agent(text)) = entries.last_mut() {
@@ -5647,23 +4531,8 @@ mod tests {
 
     #[test]
     fn a_run_of_steps_reads_as_one_sentence() {
-        use ToolKind::*;
-        assert_eq!(
-            activity_summary(1, &[Run]),
-            "Thought 1 time, ran 1 omnigraph command"
-        );
-        assert_eq!(
-            activity_summary(0, &[Cli, Run, Run, Other]),
-            "Looked up the CLI, ran 2 omnigraph commands, used 1 other tool"
-        );
-        // The agent's own tools first, as Codex reads its skill: "other", so the parts add up
-        // to the turn's tool calls rather than one reading as the total.
-        assert_eq!(
-            activity_summary(0, &[Other, Other, Cli, Run, Run, Other]),
-            "Used 3 other tools, looked up the CLI, ran 2 omnigraph commands"
-        );
-        assert_eq!(activity_summary(0, &[Other, Other]), "Used 2 tools");
-        assert_eq!(activity_summary(2, &[]), "Thought 2 times");
-        assert_eq!(ToolKind::of(Some(StudioTool::Run)), Run);
+        assert_eq!(activity_summary(1, 1), "Thought 1 time, used 1 tool");
+        assert_eq!(activity_summary(0, 2), "Used 2 tools");
+        assert_eq!(activity_summary(2, 0), "Thought 2 times");
     }
 }

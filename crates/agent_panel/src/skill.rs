@@ -1,5 +1,5 @@
 //! The `omnigraph-studio` agent skill (spec 013): the Omnigraph guide that matches the CLI
-//! contract Studio speaks, with Studio's own entry point, written into a graph's agent working
+//! contract Studio speaks, with Studio's own entry point, written into a conversation's working
 //! directory where each agent looks for skills. Claude Code reads `.claude/skills` and Codex
 //! `.agents/skills`; neither reads the other's.
 //!

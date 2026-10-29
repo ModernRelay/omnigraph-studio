@@ -40,7 +40,6 @@ ui = { workspace = true }
 rustix = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-uds_windows = { workspace = true }
 # The agent's launcher holds the agent in a job that ends with it; `confined` holds the agent's
 # folders open while Studio writes in them; `requester` finds the processes a gateway client
 # was started under.

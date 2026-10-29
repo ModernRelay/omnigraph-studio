@@ -148,15 +148,9 @@ fn settle(cx: &mut HeadlessAppContext, wait: Duration) {
 }
 
 fn main() {
-    // The agent panel starts the running executable as its MCP proxy (spec 011), and on
-    // Windows as the agent's launcher (spec 013); answer those here as Studio's own binary does.
+    // On Windows the agent panel starts the running executable as the agent's launcher (spec
+    // 013); answer that here as Studio's own binary does.
     let raw: Vec<_> = std::env::args_os().skip(1).collect();
-    if raw.first().map(|a| a.as_os_str()) == Some(std::ffi::OsStr::new(agent_panel::PROXY_COMMAND))
-    {
-        let socket = raw.get(1).expect("mcp-proxy needs a socket path");
-        agent_panel::proxy(std::path::Path::new(socket)).expect("proxy the MCP socket");
-        return;
-    }
     if raw.first().map(|a| a.as_os_str()) == Some(std::ffi::OsStr::new(agent_panel::LAUNCH_COMMAND))
     {
         std::process::exit(agent_panel::launch_agent(raw.into_iter().skip(1)));
