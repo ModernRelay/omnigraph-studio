@@ -102,7 +102,7 @@ pub struct ConnectionRegistry {
     /// The graph ids remembered for each CLI target, as last read or saved.
     known: KnownGraphs,
     /// What a CLI server's connection signs in with when its server asks (spec 016): `None` in
-    /// a test that does not set it ([`Self::set_sign_in_for_tests`]).
+    /// tests.
     sign_in: Option<SignInContext>,
     /// Whether the remembered graphs are written to the data directory: Studio's, not a
     /// test's.
@@ -345,11 +345,6 @@ impl ConnectionRegistry {
 
     /// Takes `platform` as the system Studio runs on, for the tests of what Studio does where
     /// the CLI gives it no token (Windows).
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn set_sign_in_for_tests(&mut self, context: SignInContext) {
-        self.sign_in = Some(context);
-    }
-
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_platform_for_tests(&mut self, platform: Platform) {
         self.platform = platform;

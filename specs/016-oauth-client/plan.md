@@ -218,8 +218,10 @@ Studio restarts; they hold no secrets.
   nothing to sign in with.
 - A refresh token the service gave that nothing holds is revoked: one given with tokens Studio
   refuses (an access token living past the server's limit, say), the token from before, which
-  that rotation spent, forgotten from the keychain; and one given to a sign-in cancelled while
-  its code exchange was answered, the exchange running to its end on its own.
+  that rotation spent, forgotten from the keychain; one given to a sign-in cancelled while
+  its code exchange was answered, the exchange running to its end on its own; and an earlier
+  item's, which a sign-in writes over or forgets (one a sign-in that ended left for the next
+  launch), unless the sign-in it replaces answers for that item and revokes it itself.
 - A sign-in ends one way, for a sign-out, a replacement by another sign-in, or a drop (the
   CLI's credential for the target, a retired connection, the service refusing it for good),
   and ends once. No refresh begins after, and one under way touches the keychain no more, its
@@ -242,7 +244,9 @@ Studio restarts; they hold no secrets.
   sign-in is held and none is under way. A sign-out or a
   drop cancels a sign-in under way until it is finishing; one finishing is kept, then ends so, as
   one held would, the one it replaces ending as replaced, and no other sign-in starts until it is
-  kept. While a sign-in is under way, the one it replaces answering, a renewal or that it ended,
+  kept, so nothing is offered before. A sign-in as someone else that fails says why, and why the
+  one held ended if it did meanwhile; one held that still stands reads as not admitted, or as not
+  answering when its service did not answer. While a sign-in is under way, the one it replaces answering, a renewal or that it ended,
   does not change the state shown, and one the service ends meanwhile ends as replaced, its token
   revoked, since the sign-in under way answers for the item; should that one not be taken, the
   item is spent, and the next launch, refused once, forgets it. A connection released while a
@@ -269,10 +273,12 @@ Studio restarts; they hold no secrets.
   way finishes and is kept. Reading a second sign-in from the keychain then would race that
   refresh for the refresh token it rotates.
 - One refresh runs at a time per target (its client, issuer, resource and account), for
-  every view and window; others wait for its answer. A refresh runs on a task of its own to its
+  every view and window; an ask while one is under way joins it and takes its answer, so a
+  refresh that fails is not begun again by each ask that waited for it. A busy token endpoint
+  (429, `slow_down`, `temporarily_unavailable`) is a failure that may pass, not a refusal. A refresh runs on a task of its own to its
   end: an ask dropped mid-exchange (a connect replaced, a renewal overtaken) does not take it
-  along, so a refresh token the service has rotated is never lost. These tokens are never mixed with a static token or the
-  CLI's credentials.
+  along, so a refresh token the service has rotated is never lost. These tokens are never mixed
+  with a static token or the CLI's credentials.
 - Every refresh sends `grant_type=refresh_token`, `refresh_token`, `client_id` and `resource`;
   without the resource an authorization server may issue a token for a default audience. The
   new token is checked as a new sign-in's is.
@@ -428,6 +434,7 @@ Studio restarts; they hold no secrets.
 | 2026-10-29 | A narrow review of the fifth's fixes | `graph_store` `sign_in::tests::a_drop_decides_by_what_the_refresh_in_flight_learns` (a third case: a rotation with tokens Studio refuses; the service's first answer held until the drop has begun, so the retry case no longer depends on timing: 40 runs, none failing; still fails without either fix) | Pass. It found no defect in the retry, the `Stale` hand-off or the late ask, and traced what the keychain holds and which token is revoked for every ending against every refresh outcome. Taken: the retry case of the test could fail by timing alone (the fake answered the first request at once, and a stalled test thread let the retry fail too); no test drove an unusable rotation after the ending; two doc comments did not say a drop forgets an item the refresh found spent |
 | 2026-10-29 | The two items the fifth review left open are closed | `graph_store` `sign_in::tests::a_renamed_target_is_signed_in_to_under_its_new_name`, `the_token_of_a_sign_in_being_replaced_stands_while_the_new_one_finishes` (each fails without its fix, checked by removing it) | Pass. The keychain key is the target's name when a sign-in is made, and the registry renamed a target in place, keeping its connection and sign-in: refreshes wrote under the old name while the next launch read the new one. A first fix moved the item on a rename; an independent review of it found the move raced the other actors on the item (a drop's kept item stayed under the old key, unrevoked and then lost to the next move; two movers could delete each other's work; a second rename read a key a pending move had not changed), so the design changed instead: a rename is the old target gone and a new one at the same address, the sign-in dropped as for a target the CLI no longer lists and a sign-in offered under the new name, and an ending says what it left only for the item of the target's name now. That review also asked the finishing arm to keep a token only as the may-pass arm does (a token held, from the source, unexpired, not just refused); it does. While a sign-in finished, the one it replaced answered that it ended, and the connection dropped its token for that moment; the token now stands until the new one is taken |
 | 2026-10-30 | A review of the simplified rename | `graph_store` `sign_in::tests`: `a_renamed_target_is_signed_in_to_under_its_new_name` (a refresh held across the rename, so the old sign-in's ending reports after the new name's offer; fails without `Connection::names`), `a_rename_while_a_sign_in_finishes_offers_one_under_the_new_name`, `a_sign_in_made_during_a_sign_out_reaches_the_keychain_after_it` (extended: a window waits for the CLI's answer), each failing without its fix, checked by removing it; 20 runs of each, none failing | Pass. It found no defect that leaks a token, records an item from another name, or leaves the connection without an offer under the new name. Taken: the rename test's assertion that nothing is said of the old name's item could pass by timing alone; while a sign-in a rename or drop ended was being kept, the connection read as asking for a token and showed the token field; a new token source left windows reading with what the old one's answers left (the rename cleared it to none); doc comments for the drop, `End::Dropped` and the ending, and the CLI targets' doc, which sat above another function, are corrected. By the rule, a rename of a target signed in leaves its item under the old name, as a target the CLI no longer lists does |
+| 2026-10-30 | A final independent review of the whole change, committed | `graph_store` `sign_in::tests`: `a_sign_in_over_an_item_left_revokes_its_token`, `a_sign_out_while_a_sign_in_finishes_offers_one_once_it_is_kept`, `a_failed_sign_in_says_what_became_of_the_one_held` (fails without either of its two fixes), `a_busy_token_endpoint_is_asked_again`, `an_ask_joins_the_refresh_under_way`, each failing without its fix, checked by removing it; 20 runs of each, and of the two timing fixes below, none failing | Pass. It found the custody core sound: no deadlock, no keychain operation overtaking another, no refresh writing after its sign-in ended. Taken, the first two also on main: a sign-in refused for good was dropped with its item kept for the next launch, and a sign-in made after wrote over that item, leaving its token with nobody, unrevoked (an earlier item a sign-in writes over or forgets now has its token revoked); a busy token endpoint (429) was a refusal for good and ended the sign-in; asks could join a refresh under way only in the moment it began, so after a failure each began another, with its own retry (the refresh under way is now joined without waiting for the tokens it holds); a failed sign-in as someone else read Not admitted when the one held was not answering, and lost why the one held ended meanwhile; a sign-out while one finished offered a Sign in that did nothing; Sign out was missing for an offered sign-in with one held while unreachable; a spent token was revoked later for nothing. Also: the item-left sentence, doc comments for `Finishing` and `ended`, a test setter in the registry that nothing called under another setter's doc, the keychain key and Studio's client identity written once in the tests, and four tests whose checks depended on timing |
 
 ## Corrections
 

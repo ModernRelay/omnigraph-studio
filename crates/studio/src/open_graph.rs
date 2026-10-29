@@ -702,10 +702,11 @@ impl OpenGraphModal {
                             .when(holds_sign_in, |row| {
                                 row.child(sign_out_button(&selected, cx))
                             }),
-                        // The same, the one held admitted meanwhile.
-                        (ConnectionState::Ready, SignIn::Offered { .. }) if holds_sign_in => {
-                            row.child(sign_out_button(&selected, cx))
-                        }
+                        // The same in any other state, the one held admitted meanwhile or the
+                        // server unreachable.
+                        (_, SignIn::Offered { .. }) if holds_sign_in => row
+                            .child(sign_out_button(&selected, cx))
+                            .when(offers_retry, |row| row.child(retry_button(&selected, cx))),
                         (ConnectionState::Unauthorized, SignIn::SignedIn { .. }) => row
                             .child(
                                 studio_ui::ds::button("sign-in-again", "Sign in as someone else")
@@ -726,14 +727,7 @@ impl OpenGraphModal {
                                     selected.update(cx, |c, cx| c.cancel(cx));
                                 })),
                         ),
-                        _ if offers_retry => row.child(
-                            studio_ui::ds::button("retry-connect", "Retry")
-                                .style(ButtonStyle::Subtle)
-                                .start_icon(Icon::new(IconName::RotateCw))
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    selected.update(cx, |c, cx| c.connect(cx));
-                                })),
-                        ),
+                        _ if offers_retry => row.child(retry_button(&selected, cx)),
                         _ => row,
                     }),
             )
@@ -884,13 +878,21 @@ fn sign_out_button(selected: &Entity<Connection>, cx: &mut Context<OpenGraphModa
         .on_click(cx.listener(move |_, _, _, cx| selected.update(cx, |c, cx| c.sign_out(cx))))
 }
 
+fn retry_button(selected: &Entity<Connection>, cx: &mut Context<OpenGraphModal>) -> ds::Button {
+    let selected = selected.clone();
+    studio_ui::ds::button("retry-connect", "Retry")
+        .style(ButtonStyle::Subtle)
+        .start_icon(Icon::new(IconName::RotateCw))
+        .on_click(cx.listener(move |_, _, _, cx| selected.update(cx, |c, cx| c.connect(cx))))
+}
+
 /// What the chosen server's line says of its state. A 401 says what it was an answer to: no
 /// token at all (a server Studio has none configured for asks for one), or the token sent. A
 /// CLI server the CLI gave no token is asked nothing, and says why. A server that offers a
 /// sign-in says where, and who is signed in (spec 016).
 fn server_status(c: &Connection) -> String {
     let status = state_status(c);
-    // An item the keychain would not delete, which Studio may sign in with later, is said
+    // An item the keychain would not delete, which Studio may read again later, is said
     // whatever the state.
     match c.keychain_left() {
         Some(refused) => format!("{status} {}", left_in_keychain(&refused)),
@@ -924,7 +926,8 @@ fn state_status(c: &Connection) -> String {
         (SignIn::Reading, ConnectionState::Unauthorized) => {
             return "This server asks you to sign in. Studio is reading how.".into();
         }
-        // A sign-in as someone else that failed, the one held not admitted.
+        // A sign-in as someone else that failed, the one held standing: the server does not admit
+        // it, or its service did not answer.
         (
             SignIn::Offered {
                 service,
@@ -932,9 +935,14 @@ fn state_status(c: &Connection) -> String {
             },
             ConnectionState::Unauthorized,
         ) if c.holds_sign_in() => {
-            return format!(
-                "{why} You stay signed in at {service}, as an account this server may not admit."
-            );
+            return if c.token_unanswered {
+                format!("{why} You stay signed in at {service}; Studio asks again.")
+            } else {
+                format!(
+                    "{why} You stay signed in at {service}, as an account this server may not \
+                     admit."
+                )
+            };
         }
         (SignIn::Offered { service, why }, ConnectionState::Unauthorized) => {
             return match why {
@@ -1405,7 +1413,7 @@ mod tests {
             connection.set_left_for_tests(Kept::Left("locked".into()))
         });
         let left = "The keychain kept a sign-in it would not delete (locked), which Studio may \
-                    sign in with later.";
+                    read again later.";
         assert_eq!(
             said(ConnectionState::Ready, signed_in(), cx).0,
             format!(

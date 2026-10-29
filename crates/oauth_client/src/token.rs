@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use http_client::HttpClient;
+use http_client::http::StatusCode;
 use serde_json::{Map, Value};
 
 use crate::discovery::AuthorizationServer;
@@ -210,6 +211,13 @@ async fn request(
             )),
             _ if answer.status.is_server_error() => {
                 TokenError::Failed(said("The sign-in service failed."))
+            }
+            // Busy, or asking to be asked later: it may pass, so the sign-in stands.
+            "temporarily_unavailable" | "slow_down" => {
+                TokenError::Failed(said("The sign-in service is busy."))
+            }
+            _ if answer.status == StatusCode::TOO_MANY_REQUESTS => {
+                TokenError::Failed(said("The sign-in service is busy."))
             }
             _ => TokenError::Refused(said(&format!(
                 "The sign-in service refused ({}).",

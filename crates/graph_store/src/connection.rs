@@ -296,8 +296,15 @@ impl Connection {
                 SignIn::NotOffered if self.signing_in.is_some() => return "Signing in…".into(),
                 SignIn::NotOffered => {}
                 SignIn::Reading => return "Reading how to sign in".into(),
-                // A sign-in as someone else that failed, the one held not admitted.
-                SignIn::Offered { .. } if self.oauth.is_some() => return "Not admitted".into(),
+                // A sign-in as someone else that failed, the one held standing: the server does
+                // not admit it, or its service did not answer.
+                SignIn::Offered { .. } if self.oauth.is_some() => {
+                    return if self.token_unanswered {
+                        "Sign-in not answering".into()
+                    } else {
+                        "Not admitted".into()
+                    };
+                }
                 SignIn::Offered { .. } => return "Sign in needed".into(),
                 SignIn::Unavailable(_) => return "Sign-in unavailable".into(),
                 SignIn::Waiting { .. } | SignIn::Finishing { .. } => return "Signing in…".into(),
@@ -1187,6 +1194,7 @@ impl Connection {
             // Finishing from here, not to be cancelled: the sign-in this one replaces (another
             // account, after Not admitted) ends in its turn.
             let mut turn = None;
+            let mut earlier = None;
             if signed_in.is_ok() {
                 let Ok(taken) = this.update(cx, |this, cx| {
                     this.sign_in = SignIn::Finishing {
@@ -1215,8 +1223,21 @@ impl Connection {
                 }
                 // One account per target: the one replaced ends, its refresh token revoked, and
                 // the keychain keeps only the new one's, or none, never the old account's.
+                let previous_holds_item = previous
+                    .as_ref()
+                    .is_some_and(|previous| previous.kept_in_keychain() == Kept::This);
                 if let Some(previous) = previous {
                     previous.end(End::Replaced, None).await;
+                }
+                // An earlier item that one does not answer for (left by a sign-in that ended,
+                // for the next launch) is written over or forgotten below.
+                if !previous_holds_item {
+                    earlier = context
+                        .keychain
+                        .read(service.key(&target))
+                        .await
+                        .ok()
+                        .flatten();
                 }
             }
             let kept = match &signed_in {
@@ -1243,14 +1264,21 @@ impl Connection {
                 }
                 Err(_) => Kept::Nothing,
             };
+            // The earlier item's token, gone from the keychain now, is held by nothing: revoked.
+            if let (Some((_, secret)), Ok(tokens)) = (earlier, &signed_in)
+                && !matches!(kept, Kept::Left(_))
+                && let Ok(token) = String::from_utf8(secret)
+                && tokens.refresh_token.as_ref() != Some(&token)
+            {
+                service.revoke(service.token_client(), token);
+            }
             if let Some(done) = turn {
                 done.send(()).ok();
             }
             let taken = this.update(cx, |this, cx| {
-                let finish = this
-                    .signing_in
-                    .take()
-                    .and_then(|under_way| under_way.finish);
+                let (finish, replaced) = this.signing_in.take().map_or((None, None), |under_way| {
+                    (under_way.finish, under_way.replaced)
+                });
                 match signed_in {
                     Ok(tokens) => {
                         let source = OAuthSource::signed_in(
@@ -1277,6 +1305,11 @@ impl Connection {
                         true
                     }
                     Err(why) => {
+                        // And why the one it would have replaced ended meanwhile, if it did.
+                        let why = match replaced {
+                            Some((_, ended)) => format!("{why} {ended}"),
+                            None => why,
+                        };
                         this.sign_in = SignIn::Offered {
                             service: service.host(),
                             why: Some(why),
@@ -1327,10 +1360,20 @@ impl Connection {
         }
         self.lease = None;
         self._renewal = None;
+        let finishing = self
+            .signing_in
+            .as_ref()
+            .is_some_and(|under_way| under_way.finish.is_some());
         self.end_sign_ins(Some(source.clone()), End::SignOut, cx);
-        self.sign_in = SignIn::Offered {
-            service: source.service().host(),
-            why: None,
+        // One finishing is kept, then signed out of, and a sign-in is offered after that, as
+        // none can start before.
+        self.sign_in = if finishing {
+            SignIn::NotOffered
+        } else {
+            SignIn::Offered {
+                service: source.service().host(),
+                why: None,
+            }
         };
         self.replace_token(None, None, cx);
         cx.emit(ConnectionEvent::StateChanged);
@@ -1369,7 +1412,7 @@ impl Connection {
     }
 
     /// The keychain's refusal to delete an item it holds for the target that nobody is signed
-    /// in with, which Studio may sign in with later ([`Self::keychain`]).
+    /// in with, which Studio may read again later ([`Self::keychain`]).
     pub fn keychain_left(&self) -> Option<String> {
         match self.keychain() {
             Kept::Left(refused) => Some(refused),

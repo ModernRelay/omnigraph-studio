@@ -100,11 +100,11 @@ pub(crate) async fn forgotten(keychain: &dyn Keychain, key: String) -> Kept {
 }
 
 /// What is said of a keychain item left at a target, `refused` being the keychain's refusal to
-/// delete it: Studio may sign in with it later, when the server next offers a sign-in.
+/// delete it: Studio reads it again when the server next offers a sign-in.
 pub fn left_in_keychain(refused: &str) -> String {
     format!(
-        "The keychain kept a sign-in it would not delete ({refused}), which Studio may sign in \
-         with later."
+        "The keychain kept a sign-in it would not delete ({refused}), which Studio may read \
+         again later."
     )
 }
 
@@ -428,8 +428,8 @@ pub enum SignIn {
     /// The browser is open at `service`.
     Waiting { service: String },
     /// The service gave the sign-in its tokens, and Studio is keeping them: no longer to be
-    /// cancelled, as the sign-in it replaces is ending. A sign-out or a drop meanwhile ends it
-    /// once kept, as one held.
+    /// cancelled, as the sign-in it replaces is ending. A sign-out or a drop meanwhile shows
+    /// nothing offered, and ends it once kept, as one held.
     Finishing { service: String },
     /// Signed in at `service` as `account`. What the keychain holds for the target is the
     /// connection's to say ([`crate::connection::Connection::keychain`]).
@@ -445,7 +445,7 @@ pub enum Kept {
     /// Nothing: a sign-in held lasts until Studio quits.
     Nothing,
     /// An item the keychain would not delete (an earlier sign-in's, or this account's token from
-    /// before), which Studio may sign in with later: the keychain's refusal.
+    /// before), which Studio may read again later: the keychain's refusal.
     Left(String),
 }
 
@@ -467,6 +467,9 @@ pub(crate) enum End {
 /// One turn's wait at a keychain item ([`KeychainTurns`]): the work before it, done.
 pub(crate) type KeychainTurn = Shared<BoxFuture<'static, ()>>;
 
+/// A refresh's answer, which every ask waiting for it shares.
+type Refreshing = Shared<oneshot::Receiver<Result<(), NoToken>>>;
+
 /// The tokens of one sign-in: the access token, refreshed from the refresh token the keychain
 /// keeps (spec 016, Refresh). One refresh runs at a time; others wait for its answer.
 #[derive(Clone)]
@@ -487,11 +490,17 @@ struct Inner {
     kept: Mutex<Kept>,
     /// The server refused the access token held: the next ask refreshes.
     refused: AtomicBool,
-    /// The sign-in ended ([`OAuthSource::end`], or the service ended its grant): no refresh is
-    /// tried.
+    /// The sign-in ended ([`OAuthSource::end`], or the service ended its grant): no refresh
+    /// begins, and one under way runs to its end, its retry included, touching the keychain no
+    /// more.
     ended: AtomicBool,
     /// Its ending, once begun: a second ending answers with the first's.
     ending: Mutex<Option<Shared<BoxFuture<'static, Kept>>>>,
+    /// The refresh under way, which every ask joins without waiting for the tokens it holds.
+    /// It runs on a task of its own to its end, so an ask dropped mid-exchange (a connect
+    /// replaced, a renewal overtaken) cannot lose the refresh token the service has rotated by
+    /// then.
+    running: Mutex<Option<Refreshing>>,
     /// Held across each keychain operation a refresh makes, which it begins only while the
     /// sign-in stands: an ending, with `ended` set, waits on it for one in progress, never for
     /// the refresh's request, and none follows.
@@ -501,11 +510,6 @@ struct Inner {
 struct Held {
     access: Option<Access>,
     refresh: Option<String>,
-    /// The refresh under way, which an ask joins; one that waited for the held tokens while a
-    /// refresh failed starts the next. It runs on a task of its own to its end, so an ask dropped
-    /// mid-exchange (a connect replaced, a renewal overtaken) cannot lose the refresh token the
-    /// service has rotated by then.
-    running: Option<Shared<oneshot::Receiver<Result<(), NoToken>>>>,
     /// What a refresh answered after the sign-in ended learned of the keychain's item, which it
     /// leaves to the ending ([`OAuthSource::end`]).
     stale: Option<Stale>,
@@ -556,7 +560,6 @@ impl OAuthSource {
             Held {
                 access: Some(Access::new(tokens.access_token, tokens.expires_at)),
                 refresh: tokens.refresh_token,
-                running: None,
                 stale: None,
             },
             tokens.account,
@@ -579,7 +582,6 @@ impl OAuthSource {
             Held {
                 access: None,
                 refresh: Some(refresh),
-                running: None,
                 stale: None,
             },
             Account {
@@ -610,6 +612,7 @@ impl OAuthSource {
                 refused: AtomicBool::new(false),
                 ended: AtomicBool::new(false),
                 ending: Mutex::new(None),
+                running: Mutex::new(None),
                 writing: smol::lock::Mutex::new(()),
             }),
         }
@@ -803,35 +806,49 @@ impl Inner {
     /// starting it when none is. The refresh is not this ask's: dropped, the ask leaves it running.
     /// A refresh that did not end may pass; a sign-in that ended does not.
     async fn token(self: Arc<Self>) -> Result<Token, NoToken> {
-        let running = {
-            let mut held = self.held.lock().await;
-            if self.ended.load(Ordering::SeqCst) {
-                return Err(NoToken::lasting("Signed out."));
+        let under_way = self
+            .running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let running = match under_way {
+            // Its answer is a new token, whatever the server refused.
+            Some(running) => {
+                self.refused.store(false, Ordering::SeqCst);
+                running
             }
-            let refused = self.refused.swap(false, Ordering::SeqCst);
-            if !refused
-                && let Some(access) = &held.access
-                && SystemTime::now() < access.renew_at
-            {
-                return Ok(self.leased(access));
-            }
-            if held.refresh.is_none() {
-                held.access = None;
-                return Err(NoToken::lasting("The sign-in has ended. Sign in again."));
-            }
-            match &held.running {
-                Some(running) => running.clone(),
-                None => {
-                    let (done, running) = oneshot::channel();
-                    let running = running.shared();
-                    held.running = Some(running.clone());
-                    let inner = self.clone();
-                    smol::spawn(async move {
-                        let refreshed = inner.refresh().await;
-                        done.send(refreshed).ok();
-                    })
-                    .detach();
-                    running
+            None => {
+                let mut held = self.held.lock().await;
+                if self.ended.load(Ordering::SeqCst) {
+                    return Err(NoToken::lasting("Signed out."));
+                }
+                let refused = self.refused.swap(false, Ordering::SeqCst);
+                if !refused
+                    && let Some(access) = &held.access
+                    && SystemTime::now() < access.renew_at
+                {
+                    return Ok(self.leased(access));
+                }
+                if held.refresh.is_none() {
+                    held.access = None;
+                    return Err(NoToken::lasting("The sign-in has ended. Sign in again."));
+                }
+                let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+                match running.as_ref() {
+                    // Begun while this waited for the tokens.
+                    Some(under_way) => under_way.clone(),
+                    None => {
+                        let (done, answer) = oneshot::channel();
+                        let answer = answer.shared();
+                        *running = Some(answer.clone());
+                        let inner = self.clone();
+                        smol::spawn(async move {
+                            let refreshed = inner.refresh().await;
+                            done.send(refreshed).ok();
+                        })
+                        .detach();
+                        answer
+                    }
                 }
             }
         };
@@ -858,7 +875,8 @@ impl Inner {
     async fn refresh(&self) -> Result<(), NoToken> {
         let mut held = self.held.lock().await;
         let refreshed = self.refresh_held(&mut held).await;
-        held.running = None;
+        // Over while the tokens are still held, so an ask after it finds what it left.
+        *self.running.lock().unwrap_or_else(PoisonError::into_inner) = None;
         refreshed
     }
 
@@ -957,6 +975,8 @@ impl Inner {
                     held.access = None;
                     if let Some(rotated) = refresh_token.filter(|new| *new != refresh) {
                         self.service.revoke(self.token_client(), rotated);
+                        // The token held is spent by that rotation: nothing to revoke later.
+                        held.refresh = None;
                         let was = self
                             .kept
                             .lock()
@@ -1025,6 +1045,20 @@ mod tests {
     const ISSUER: &str = "https://id.test";
     const CLIENT: &str = "https://studio.test/client.json";
 
+    /// The keychain key of a sign-in to the fake service for the target `target`.
+    fn key(target: &str) -> String {
+        format!("omnigraph-studio-oauth:{target}#{ISSUER}#{RESOURCE}")
+    }
+
+    /// Studio's client identity at the fake service.
+    fn identities() -> ClientIdentities {
+        ClientIdentities {
+            metadata_document: Some(CLIENT.into()),
+            registered: Vec::new(),
+            development: None,
+        }
+    }
+
     /// The CLI's credential for the target: a token typed for it.
     struct Cli;
 
@@ -1058,8 +1092,10 @@ mod tests {
         hold_token: bool,
         /// The sign-in service fails every token request (503) and keeps its grants.
         token_down: bool,
-        /// The sign-in service fails this many more token requests (503), keeping its grants.
+        /// The sign-in service fails this many more token requests, keeping its grants: 503,
+        /// or `fails_status` when set.
         fails_tokens: u32,
+        fails_status: u16,
         /// The sign-in service refuses every refresh for good (`invalid_target`) and keeps its
         /// grants.
         refuses_target: bool,
@@ -1207,7 +1243,10 @@ mod tests {
                 }
                 if served.fails_tokens > 0 {
                     served.fails_tokens -= 1;
-                    return (503, vec![], json!({}));
+                    return match served.fails_status {
+                        0 => (503, vec![], json!({})),
+                        status => (status, vec![], json!({"error": "rate_limited"})),
+                    };
                 }
                 if served.refuses_target && form["grant_type"] == "refresh_token" {
                     return (400, vec![], json!({"error": "invalid_target"}));
@@ -1298,11 +1337,7 @@ mod tests {
             elsewhere: fake(served.clone()),
             keychain,
             turns: KeychainTurns::default(),
-            identities: ClientIdentities {
-                metadata_document: Some(CLIENT.into()),
-                registered: Vec::new(),
-                development: None,
-            },
+            identities: identities(),
         }
     }
 
@@ -1438,7 +1473,7 @@ mod tests {
             }
         );
         assert_eq!(kept(&connection, cx), Kept::This);
-        let key = format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}");
+        let key = key("work");
         assert_eq!(
             keychain.items.lock().unwrap()[&key],
             ("user_1".to_owned(), b"r1".to_vec())
@@ -1627,7 +1662,7 @@ mod tests {
         }));
         served.lock().unwrap().refresh.insert("kept".into());
         let keychain = Arc::new(MemoryKeychain::default());
-        let key = format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}");
+        let key = key("work");
         keychain
             .items
             .lock()
@@ -1708,10 +1743,12 @@ mod tests {
         until(cx, "the dropped sign-in kept", |_| {
             held(&keychain).as_deref() == Some("r3")
         });
+        until(cx, "the dropped sign-in said as kept", |cx| {
+            kept(&connection, cx) == Kept::This
+        });
         never(cx, "the dropped sign-in kept, so not revoked", |_| {
             served.lock().unwrap().log.iter().any(|l| l == "revoke r3")
         });
-        assert_eq!(kept(&connection, cx), Kept::This);
     }
 
     /// A sign-in as someone else dropped while it finishes (the CLI's credential taking the
@@ -1731,7 +1768,7 @@ mod tests {
         }));
         served.lock().unwrap().refresh.insert("kept".into());
         let keychain = Arc::new(MemoryKeychain::default());
-        let key = format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}");
+        let key = key("work");
         keychain
             .items
             .lock()
@@ -1885,10 +1922,11 @@ mod tests {
         }));
         served.lock().unwrap().refresh.insert("kept".into());
         let keychain = Arc::new(MemoryKeychain::default());
-        keychain.items.lock().unwrap().insert(
-            format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}"),
-            ("user_1".into(), b"kept".to_vec()),
-        );
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
         let kept_one = connection_in(&served, context(&served, keychain.clone()), cx);
         kept_one.update(cx, |c, cx| c.connect(cx));
         until(cx, "the rotated token revoked", |_| {
@@ -1916,10 +1954,11 @@ mod tests {
         }));
         served.lock().unwrap().refresh.insert("kept".into());
         let keychain = Arc::new(MemoryKeychain::default());
-        keychain.items.lock().unwrap().insert(
-            format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}"),
-            ("user_1".into(), b"kept".to_vec()),
-        );
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
         let connection = connection(&served, keychain.clone(), cx);
         connection.update(cx, |c, cx| c.connect(cx));
         until(cx, "the launch's refresh in flight", |_| {
@@ -1953,10 +1992,11 @@ mod tests {
         }));
         served.lock().unwrap().refresh.insert("kept".into());
         let keychain = Arc::new(MemoryKeychain::default());
-        keychain.items.lock().unwrap().insert(
-            format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}"),
-            ("user_1".into(), b"kept".to_vec()),
-        );
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
         let (release, gate) = oneshot::channel::<()>();
         *keychain.write_gate.lock().unwrap() = Some(gate.shared());
         let connection = connection(&served, keychain.clone(), cx);
@@ -1988,7 +2028,6 @@ mod tests {
             ..Served::default()
         }));
         served.lock().unwrap().refresh.insert("kept".into());
-        let key = |target: &str| format!("omnigraph-studio-oauth:{target}#{ISSUER}#{RESOURCE}");
         let keychain = Arc::new(MemoryKeychain::default());
         keychain
             .items
@@ -2064,10 +2103,11 @@ mod tests {
         assert_eq!(held("work").as_deref(), Some("r2"));
     }
 
-    /// A rename while a sign-in as someone else finishes: the one held ends as replaced, its
-    /// token revoked; the finishing one is kept, under the name it began with, then dropped as
-    /// that name's; meanwhile the connection reads as signing in, not as asking for a token; and
-    /// once it is kept, a sign-in is offered under the new name.
+    /// A rename while a sign-in as someone else finishes, the one held ended as replaced (its
+    /// token revoked) when the finishing one took its turn: the finishing one is kept, under the
+    /// name it began with, then dropped as that name's; meanwhile the connection reads as signing
+    /// in, not as asking for a token; and once it is kept, a sign-in is offered under the new
+    /// name.
     #[gpui::test]
     async fn a_rename_while_a_sign_in_finishes_offers_one_under_the_new_name(
         cx: &mut TestAppContext,
@@ -2078,7 +2118,6 @@ mod tests {
             ..Served::default()
         }));
         served.lock().unwrap().refresh.insert("kept".into());
-        let key = |target: &str| format!("omnigraph-studio-oauth:{target}#{ISSUER}#{RESOURCE}");
         let keychain = Arc::new(MemoryKeychain::default());
         keychain
             .items
@@ -2100,7 +2139,7 @@ mod tests {
         });
         browser.join().unwrap();
         connection.update(cx, |c, cx| c.rename("job".into(), cx));
-        until(cx, "the held sign-in revoked", |_| {
+        until(cx, "the held sign-in, replaced, revoked", |_| {
             served.lock().unwrap().log.iter().any(|l| l == "revoke r1")
         });
         assert_eq!(
@@ -2147,10 +2186,11 @@ mod tests {
         }));
         served.lock().unwrap().refresh.insert("kept".into());
         let keychain = Arc::new(MemoryKeychain::default());
-        keychain.items.lock().unwrap().insert(
-            format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}"),
-            ("user_1".into(), b"kept".to_vec()),
-        );
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
         let connection = connection(&served, keychain.clone(), cx);
         connection.update(cx, |c, cx| c.connect(cx));
         until(cx, "the kept sign-in", |cx| {
@@ -2180,6 +2220,198 @@ mod tests {
         });
     }
 
+    /// A sign-in the service refused for good is dropped, its item kept for the next launch; a
+    /// sign-in made after writes over that item, and revokes its token, which nothing holds once
+    /// overwritten. Before, the earlier token was left with nobody, unrevoked.
+    #[gpui::test]
+    async fn a_sign_in_over_an_item_left_revokes_its_token(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served {
+            lives: 300,
+            ..Served::default()
+        }));
+        served.lock().unwrap().refresh.insert("kept".into());
+        let keychain = Arc::new(MemoryKeychain::default());
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
+        let connection = connection(&served, keychain.clone(), cx);
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the kept sign-in", |cx| {
+            sign_in_state(&connection, cx).0 == ConnectionState::Ready
+        });
+        let logged = |line: &str| served.lock().unwrap().log.iter().any(|l| l == line);
+        // Refused for good: dropped, its item kept, its token not revoked.
+        {
+            let mut served = served.lock().unwrap();
+            served.refuses_target = true;
+            served.admits_nobody = true;
+        }
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the sign-in refused", |cx| {
+            matches!(
+                sign_in_state(&connection, cx).1,
+                SignIn::Offered { why: Some(_), .. }
+            ) && kept(&connection, cx) == Kept::This
+        });
+        assert!(!logged("revoke r1"));
+        {
+            let mut served = served.lock().unwrap();
+            served.refuses_target = false;
+            served.admits_nobody = false;
+        }
+        connection.update(cx, |c, cx| c.sign_in(cx));
+        let browser = approve(&served, &cx.opened_url().unwrap());
+        until(cx, "the earlier token revoked", |_| logged("revoke r1"));
+        browser.join().unwrap();
+        until(cx, "the new sign-in kept", |cx| {
+            kept(&connection, cx) == Kept::This
+        });
+        assert_eq!(
+            keychain.items.lock().unwrap()[&key("work")].1,
+            b"r2".to_vec()
+        );
+    }
+
+    /// A sign-out while a sign-in as someone else finishes: nothing is offered until that one is
+    /// kept, as no sign-in can start before, then signed out of; then a sign-in is offered, and
+    /// the keychain keeps neither. Before, Sign in was offered at once and did nothing.
+    #[gpui::test]
+    async fn a_sign_out_while_a_sign_in_finishes_offers_one_once_it_is_kept(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served {
+            lives: 300,
+            ..Served::default()
+        }));
+        served.lock().unwrap().refresh.insert("kept".into());
+        let keychain = Arc::new(MemoryKeychain::default());
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
+        let connection = connection(&served, keychain.clone(), cx);
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the kept sign-in", |cx| {
+            sign_in_state(&connection, cx).0 == ConnectionState::Ready
+        });
+        let (release, gate) = oneshot::channel::<()>();
+        *keychain.write_gate.lock().unwrap() = Some(gate.shared());
+        let writes = keychain.writes.load(Ordering::SeqCst);
+        connection.update(cx, |c, cx| c.sign_in(cx));
+        let browser = approve(&served, &cx.opened_url().unwrap());
+        until(cx, "the new sign-in's write under way", |_| {
+            keychain.writes.load(Ordering::SeqCst) > writes
+        });
+        browser.join().unwrap();
+        connection.update(cx, |c, cx| c.sign_out(cx));
+        assert_eq!(sign_in_state(&connection, cx).1, SignIn::NotOffered);
+        until(cx, "the server's answer without a token", |cx| {
+            sign_in_state(&connection, cx).0 == ConnectionState::Unauthorized
+        });
+        assert_eq!(sign_in_state(&connection, cx).1, SignIn::NotOffered);
+        assert_eq!(connection.read_with(cx, |c, _| c.label()), "Signing in…");
+        release.send(()).unwrap();
+        until(
+            cx,
+            "a sign-in offered once that one is signed out of",
+            |cx| {
+                matches!(
+                    sign_in_state(&connection, cx).1,
+                    SignIn::Offered { why: None, .. }
+                )
+            },
+        );
+        let logged = |line: &str| served.lock().unwrap().log.iter().any(|l| l == line);
+        until(cx, "both tokens revoked", |_| {
+            logged("revoke r1") && logged("revoke r2")
+        });
+        assert!(keychain.items.lock().unwrap().is_empty());
+    }
+
+    /// A sign-in as someone else that fails while the one held still stands says why, and what
+    /// the one held is: not answering, when its service does not answer, not "Not admitted".
+    /// And one that fails after the one held was refused says why that one ended too.
+    #[gpui::test]
+    async fn a_failed_sign_in_says_what_became_of_the_one_held(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        // The service down from launch: the kept sign-in stands, not answering.
+        let served = Arc::new(Mutex::new(Served {
+            lives: 300,
+            token_down: true,
+            ..Served::default()
+        }));
+        served.lock().unwrap().refresh.insert("kept".into());
+        let keychain = Arc::new(MemoryKeychain::default());
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
+        let connection = connection(&served, keychain.clone(), cx);
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the sign-in not answering", |cx| {
+            sign_in_state(&connection, cx).2 == "Sign-in not answering"
+        });
+        connection.update(cx, |c, cx| c.sign_in(cx));
+        let browser = approve(&served, &cx.opened_url().unwrap());
+        until(cx, "the sign-in as someone else failed", |cx| {
+            matches!(
+                sign_in_state(&connection, cx).1,
+                SignIn::Offered { why: Some(_), .. }
+            )
+        });
+        browser.join().unwrap();
+        assert!(connection.read_with(cx, |c, _| c.holds_sign_in()));
+        assert_eq!(sign_in_state(&connection, cx).2, "Sign-in not answering");
+
+        // The one held refused for good while another is in the browser, which then fails.
+        let served = Arc::new(Mutex::new(Served {
+            lives: 300,
+            ..Served::default()
+        }));
+        served.lock().unwrap().refresh.insert("kept".into());
+        let keychain = Arc::new(MemoryKeychain::default());
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
+        let connection = connection_in(&served, context(&served, keychain), cx);
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the kept sign-in", |cx| {
+            sign_in_state(&connection, cx).0 == ConnectionState::Ready
+        });
+        connection.update(cx, |c, cx| c.sign_in(cx));
+        let opened = cx.opened_url().unwrap();
+        {
+            let mut served = served.lock().unwrap();
+            served.refuses_target = true;
+            served.admits_nobody = true;
+        }
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the one held refused and revoked", |_| {
+            served.lock().unwrap().log.iter().any(|l| l == "revoke r1")
+        });
+        served.lock().unwrap().token_down = true;
+        let browser = approve(&served, &opened);
+        until(cx, "the sign-in under way failed", |cx| {
+            matches!(
+                sign_in_state(&connection, cx).1,
+                SignIn::Offered { why: Some(_), .. }
+            )
+        });
+        browser.join().unwrap();
+        let SignIn::Offered { why: Some(why), .. } = sign_in_state(&connection, cx).1 else {
+            unreachable!()
+        };
+        assert!(why.contains("does not issue tokens"), "{why}");
+    }
+
     /// The keychain's turns are its item's, whichever connection takes them: a connection made
     /// for a target while another's sign-out is still deleting its item (the target listed
     /// again) reads the keychain after that delete, and is offered a sign-in. Before, each
@@ -2193,10 +2425,11 @@ mod tests {
         }));
         served.lock().unwrap().refresh.insert("kept".into());
         let keychain = Arc::new(MemoryKeychain::default());
-        keychain.items.lock().unwrap().insert(
-            format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}"),
-            ("user_1".into(), b"kept".to_vec()),
-        );
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
         let context = context(&served, keychain.clone());
         let first = connection_in(&served, context.clone(), cx);
         first.update(cx, |c, cx| c.connect(cx));
@@ -2280,10 +2513,11 @@ mod tests {
         }));
         served.lock().unwrap().refresh.insert("kept".into());
         let keychain = Arc::new(MemoryKeychain::default());
-        keychain.items.lock().unwrap().insert(
-            format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}"),
-            ("user_1".into(), b"kept".to_vec()),
-        );
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
         let connection = connection(&served, keychain, cx);
         let _watch = connection.update(cx, |c, cx| c.watch(cx));
         connection.update(cx, |c, cx| c.connect(cx));
@@ -2297,12 +2531,10 @@ mod tests {
         until(cx, "the renewal", |_| {
             served.lock().unwrap().issued > issued
         });
-        cx.run_until_parked();
-        assert!(
-            matches!(sign_in_state(&connection, cx).1, SignIn::Waiting { .. }),
-            "{:?}",
-            sign_in_state(&connection, cx).1
-        );
+        // Its answer reaches the connection a moment after the service gives it.
+        never(cx, "the state shown changed by the renewal", |cx| {
+            !matches!(sign_in_state(&connection, cx).1, SignIn::Waiting { .. })
+        });
     }
 
     /// A sign-in held that the service refuses for good while another is under way ends as the
@@ -2319,7 +2551,7 @@ mod tests {
         }));
         served.lock().unwrap().refresh.insert("kept".into());
         let keychain = Arc::new(MemoryKeychain::default());
-        let key = format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}");
+        let key = key("work");
         keychain
             .items
             .lock()
@@ -2379,10 +2611,11 @@ mod tests {
             matches!(sign_in_state(&connection, cx).1, SignIn::Offered { .. })
         });
         // A sign-in the keychain keeps nothing of, over an earlier item it will not delete.
-        keychain.items.lock().unwrap().insert(
-            format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}"),
-            ("user_9".into(), b"earlier".to_vec()),
-        );
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key("work"), ("user_9".into(), b"earlier".to_vec()));
         keychain.refuses_writes.store(true, Ordering::SeqCst);
         keychain.refuses_deletes.store(true, Ordering::SeqCst);
         connection.update(cx, |c, cx| c.sign_in(cx));
@@ -2435,10 +2668,11 @@ mod tests {
         }));
         served.lock().unwrap().refresh.insert("kept".into());
         let keychain = Arc::new(MemoryKeychain::default());
-        keychain.items.lock().unwrap().insert(
-            format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}"),
-            ("user_1".into(), b"kept".to_vec()),
-        );
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
         let connection = connection(&served, keychain, cx);
         connection.update(cx, |c, cx| c.connect(cx));
         until(cx, "the kept sign-in", |cx| {
@@ -2496,10 +2730,11 @@ mod tests {
         }));
         served.lock().unwrap().refresh.insert("kept".into());
         let keychain = Arc::new(MemoryKeychain::default());
-        keychain.items.lock().unwrap().insert(
-            format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}"),
-            ("user_1".into(), b"kept".to_vec()),
-        );
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
         let connection = connection(&served, keychain, cx);
         let readied = std::rc::Rc::new(std::cell::Cell::new(0));
         let heard = readied.clone();
@@ -2555,17 +2790,18 @@ mod tests {
         }));
         served.lock().unwrap().refresh.insert("kept".into());
         let keychain = Arc::new(MemoryKeychain::default());
-        keychain.items.lock().unwrap().insert(
-            format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}"),
-            ("user_1".into(), b"kept".to_vec()),
-        );
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key("work"), ("user_1".into(), b"kept".to_vec()));
         let connection = connection(&served, keychain.clone(), cx);
         connection.update(cx, |c, cx| c.connect(cx));
         until(cx, "the refresh", |cx| {
             sign_in_state(&connection, cx).0 == ConnectionState::Ready
         });
         assert_eq!(cx.opened_url(), None);
-        let key = format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}");
+        let key = key("work");
         assert_eq!(
             keychain.items.lock().unwrap()[&key].1,
             b"r1".to_vec(),
@@ -2609,7 +2845,7 @@ mod tests {
         }));
         served.lock().unwrap().refresh.insert("kept".into());
         let keychain = Arc::new(MemoryKeychain::default());
-        let key = format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}");
+        let key = key("work");
         keychain
             .items
             .lock()
@@ -2685,7 +2921,7 @@ mod tests {
         }));
         served.lock().unwrap().refresh.insert("kept".into());
         let keychain = Arc::new(MemoryKeychain::default());
-        let key = format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}");
+        let key = key("work");
         keychain
             .items
             .lock()
@@ -2847,7 +3083,7 @@ mod tests {
             1,
             "the service was asked once"
         );
-        let key = format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}");
+        let key = key("work");
         assert_eq!(keychain.items.lock().unwrap()[&key].1, b"r1".to_vec());
     }
 
@@ -2855,11 +3091,7 @@ mod tests {
     fn discovered(served: &Arc<Mutex<Served>>) -> Service {
         let http = fake(served.clone());
         let clients = Clients::new(url::Url::parse(SERVER).unwrap(), http.clone(), http);
-        let identities = ClientIdentities {
-            metadata_document: Some(CLIENT.into()),
-            registered: Vec::new(),
-            development: None,
-        };
+        let identities = identities();
         let metadata = format!("{SERVER}/.well-known/oauth-protected-resource/mcp");
         smol::block_on(discover(clients, metadata, identities)).unwrap()
     }
@@ -2901,7 +3133,7 @@ mod tests {
         }));
         let service = discovered(&served);
         let keychain = Arc::new(MemoryKeychain::default());
-        let key = format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}");
+        let key = key("work");
         keychain
             .items
             .lock()
@@ -2986,7 +3218,7 @@ mod tests {
         }));
         let service = discovered(&served);
         let keychain = Arc::new(MemoryKeychain::default());
-        let key = format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}");
+        let key = key("work");
         keychain
             .items
             .lock()
@@ -3030,7 +3262,7 @@ mod tests {
             served.lock().unwrap().refresh.insert("kept".into());
             let service = discovered(&served);
             let keychain = Arc::new(MemoryKeychain::default());
-            let key = format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}");
+            let key = key("work");
             keychain
                 .items
                 .lock()
@@ -3067,8 +3299,14 @@ mod tests {
             let dropped = source.end(End::Dropped, None);
             served.lock().unwrap().hold_token = false;
             let kept = smol::block_on(dropped);
-            // A revocation, if any, follows in the background.
-            std::thread::sleep(Duration::from_millis(300));
+            // A revocation, if any, follows in the background: waited for when one is due.
+            let revoke_due = refuses_writes;
+            for _ in 0..if revoke_due { 500 } else { 50 } {
+                if served.lock().unwrap().log.contains(&"revoke r1".to_owned()) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
             let held = keychain
                 .items
                 .lock()
@@ -3158,7 +3396,7 @@ mod tests {
     /// before.
     #[test]
     fn a_drop_decides_by_what_the_refresh_in_flight_learns() {
-        let key = format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}");
+        let key = key("work");
         // The service's first answer is held until the drop has begun; `fails` fails it (503),
         // and the retry is answered at once.
         let dropped_during_refresh = |token: &str, granted: bool, fails: u32, lives: u64| {
@@ -3227,6 +3465,81 @@ mod tests {
         );
     }
 
+    /// A busy token endpoint (429) is a failure that may pass: the refresh is tried again, and
+    /// the sign-in stands. Before, it was taken as a refusal for good and ended the sign-in.
+    #[test]
+    fn a_busy_token_endpoint_is_asked_again() {
+        let served = Arc::new(Mutex::new(Served {
+            lives: 300,
+            fails_tokens: 1,
+            fails_status: 429,
+            ..Served::default()
+        }));
+        served.lock().unwrap().refresh.insert("kept".into());
+        let source = OAuthSource::kept(
+            discovered(&served),
+            "work",
+            Arc::new(MemoryKeychain::default()),
+            "user_1".into(),
+            "kept".into(),
+        );
+        assert!(smol::block_on(source.token(Arc::default())).is_ok());
+        let refreshes = served
+            .lock()
+            .unwrap()
+            .log
+            .iter()
+            .filter(|l| l.starts_with("token refresh_token"))
+            .count();
+        assert_eq!(refreshes, 2, "the busy answer, then the retry");
+    }
+
+    /// An ask made while a refresh is under way joins it, and gets its answer: a refresh that
+    /// fails is not begun again by every ask that waited for it. Before, a waiting ask could
+    /// join only in the moment the refresh began, and after a failure began its own.
+    #[test]
+    fn an_ask_joins_the_refresh_under_way() {
+        let served = Arc::new(Mutex::new(Served {
+            lives: 300,
+            token_down: true,
+            hold_token: true,
+            ..Served::default()
+        }));
+        served.lock().unwrap().refresh.insert("kept".into());
+        let source = OAuthSource::kept(
+            discovered(&served),
+            "work",
+            Arc::new(MemoryKeychain::default()),
+            "user_1".into(),
+            "kept".into(),
+        );
+        let refreshes = || {
+            served
+                .lock()
+                .unwrap()
+                .log
+                .iter()
+                .filter(|l| l.starts_with("token refresh_token"))
+                .count()
+        };
+        let first = {
+            let source = source.clone();
+            smol::spawn(async move { source.token(Arc::default()).await })
+        };
+        while refreshes() == 0 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The second ask, polled once while the first's answer is held: it is waiting.
+        let mut second = source.token(Arc::default());
+        smol::block_on(async {
+            assert!(futures::poll!(&mut second).is_pending());
+        });
+        served.lock().unwrap().hold_token = false;
+        assert!(smol::block_on(first).is_err());
+        assert!(smol::block_on(second).is_err());
+        assert_eq!(refreshes(), 2, "one refresh and its retry, for both asks");
+    }
+
     /// A refresh the service answers after its sign-in was signed out keeps nothing in the
     /// keychain, so the sign-out's delete is its last word on it, and the sign-out revokes the
     /// rotated token, the one the service still honours. Before, the refresh, running while the
@@ -3242,7 +3555,7 @@ mod tests {
         served.lock().unwrap().refresh.insert("kept".into());
         let service = discovered(&served);
         let keychain = Arc::new(MemoryKeychain::default());
-        let key = format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}");
+        let key = key("work");
         keychain
             .items
             .lock()
@@ -3314,7 +3627,7 @@ mod tests {
             ..Served::default()
         }));
         let keychain = Arc::new(MemoryKeychain::default());
-        let key = format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}");
+        let key = key("work");
         keychain
             .items
             .lock()
@@ -3457,11 +3770,7 @@ mod tests {
             elsewhere,
             keychain: keychain.clone(),
             turns: KeychainTurns::default(),
-            identities: ClientIdentities {
-                metadata_document: Some(CLIENT.into()),
-                registered: Vec::new(),
-                development: None,
-            },
+            identities: identities(),
         };
         let server = ServerEntry {
             name: "oauth-bed".into(),
