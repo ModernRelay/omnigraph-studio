@@ -376,7 +376,7 @@ impl Connection {
             return;
         }
         if source.is_some() {
-            self.drop_sign_in();
+            self.drop_sign_in(cx);
         }
         let had = self.token_source.is_some();
         self.token_source = source;
@@ -418,7 +418,7 @@ impl Connection {
     /// without leaving Studio, and nothing is checked again. A window showing one of its graphs
     /// says so; opening the graph again reaches the target as the CLI lists it now.
     pub(crate) fn retire(&mut self, why: String, cx: &mut Context<Self>) {
-        self.drop_sign_in();
+        self.drop_sign_in(cx);
         self.token_source = None;
         self.token_given = false;
         self.token_answered = true;
@@ -513,10 +513,16 @@ impl Connection {
                     .is_some_and(|current| Arc::ptr_eq(current, &asked))
                 {
                     this.token_answered(answer, ask, cx);
-                } else if ask == Ask::Connect && this.state == ConnectionState::Connecting {
+                } else if ask == Ask::Connect {
                     // A connect that waited on it asks the source now in use, which may give
-                    // the token already held and so start no connect of its own.
-                    this.connect(cx);
+                    // the token already held and so start no connect of its own; after a
+                    // Cancel, a window waiting for the token still gets it, and the connection
+                    // stays as Cancel left it.
+                    if this.state == ConnectionState::Connecting {
+                        this.connect(cx);
+                    } else if !this.token_ready() {
+                        this.ask_for_token(Ask::Connect, cx);
+                    }
                 }
             })
             .ok();
@@ -1288,18 +1294,27 @@ impl Connection {
     }
 
     /// Forgets the sign-in, which the CLI's credential for the target replaces. The keychain
-    /// keeps what it holds, for the target made anonymous again: an item it kept but would not
-    /// delete stays said. A sign-in whose token the keychain does not hold ends, and its refresh
-    /// token is revoked, since nothing else would hold it.
-    fn drop_sign_in(&mut self) {
+    /// keeps what it holds, for the target made anonymous again, and an item it kept but would
+    /// not delete stays said; a sign-in whose token the keychain does not hold is revoked, since
+    /// nothing else would hold it. Both are decided once a refresh under way has settled
+    /// ([`OAuthSource::dropped`]).
+    fn drop_sign_in(&mut self, cx: &mut Context<Self>) {
         if let Some(source) = self.oauth.take() {
-            let kept = source.kept_in_keychain();
-            if let Kept::Earlier(refused) = &kept {
-                self.left_behind = Some(refused.clone());
-            }
-            if kept != Kept::This {
-                smol::spawn(source.replaced()).detach();
-            }
+            let custody = self.custody;
+            let dropped = source.dropped();
+            cx.spawn(async move |this, cx| {
+                if let Kept::Earlier(refused) = dropped.await {
+                    this.update(cx, |this, cx| {
+                        if this.custody == custody {
+                            this.left_behind = Some(refused);
+                            cx.emit(ConnectionEvent::StateChanged);
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                }
+            })
+            .detach();
         }
         self.service = None;
         self.lease = None;
@@ -1610,9 +1625,6 @@ mod tests {
         }
     }
 
-    /// A connection whose token source has not answered waits to connect, sending nothing it
-    /// would be refused; a token typed in connects it. A cancel stops the check scheduled
-    /// after a failure, which would otherwise connect again.
     /// The answer of a token source the connection no longer takes its token from is not taken:
     /// the token dropped when the source was replaced stays dropped. Before, a Refresh or a
     /// renewal under way when the source changed (a sign-out, a sign-in, the CLI's credential)
@@ -1664,6 +1676,26 @@ mod tests {
         answer.send(Token::typed("first".into())).ok();
         cx.run_until_parked();
         connection.read_with(cx, |c, _| assert_eq!(c.state, ConnectionState::Ready));
+
+        // A window waiting for the token, its connect cancelled: the source in use is asked, the
+        // token gets ready, and the connection stays as Cancel left it.
+        let waited = Arc::new(Gated::default());
+        let connection = gated_server(waited.clone(), cx);
+        let (answer, gate) = oneshot::channel();
+        *waited.0.lock().unwrap() = Some(gate);
+        connection.update(cx, |c, cx| c.wait_for_token(cx));
+        cx.run_until_parked();
+        connection.update(cx, |c, cx| c.cancel(cx));
+        connection.update(cx, |c, cx| {
+            c.take_token_from(Some(Arc::new(Gated::default())), cx)
+        });
+        cx.run_until_parked();
+        answer.send(Token::typed("first".into())).ok();
+        cx.run_until_parked();
+        connection.read_with(cx, |c, _| {
+            assert!(c.token_ready(), "the waiting window gets its token");
+            assert_eq!(c.state, ConnectionState::Idle);
+        });
     }
 
     /// A token source that answers "first" at once, or, once given a gate, what comes through it.
@@ -1714,6 +1746,9 @@ mod tests {
         })
     }
 
+    /// A connection whose token source has not answered waits to connect, sending nothing it
+    /// would be refused; a token typed in connects it. A cancel stops the check scheduled
+    /// after a failure, which would otherwise connect again.
     #[gpui::test]
     async fn a_connect_waits_for_its_token_and_a_cancel_stays(cx: &mut TestAppContext) {
         let sent = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));

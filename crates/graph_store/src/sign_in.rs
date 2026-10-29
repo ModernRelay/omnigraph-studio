@@ -537,10 +537,55 @@ impl OAuthSource {
     }
 
     /// Ends the sign-in another replaces, for the same target: drops its tokens and revokes its
-    /// refresh token, leaving the keychain item to the sign-in that replaces it.
+    /// refresh token, leaving the keychain item to the sign-in that replaces it. The ending runs
+    /// on its own, so a sign-in given up while it waits for it does not lose the revocation.
     pub(crate) fn replaced(&self) -> BoxFuture<'static, ()> {
         let ending = self.end(false);
-        async move { ending.await.revocation.await }.boxed()
+        let (done, finished) = oneshot::channel();
+        smol::spawn(async move {
+            ending.await.revocation.await;
+            done.send(()).ok();
+        })
+        .detach();
+        async move {
+            finished.await.ok();
+        }
+        .boxed()
+    }
+
+    /// Ends the sign-in the CLI's credential for the target replaces, once a refresh under way
+    /// has settled, so what it rotated is decided with the rest: one the keychain holds stays
+    /// there, for the target made anonymous again; one it does not hold is revoked, as nothing
+    /// else would hold its token. Resolves to what the keychain holds then. It runs on its own.
+    pub(crate) fn dropped(&self) -> BoxFuture<'static, Kept> {
+        let inner = self.inner.clone();
+        let (done, finished) = oneshot::channel();
+        smol::spawn(async move {
+            let refresh = {
+                let mut held = inner.held.lock().await;
+                // After the refresh under way, before any other: none writes the keychain now.
+                inner.ended.store(true, Ordering::SeqCst);
+                held.access = None;
+                held.refresh.take()
+            };
+            let kept = inner
+                .kept
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if kept != Kept::This
+                && let Some(refresh) = refresh
+            {
+                let service = &inner.service;
+                let http = inner.token_client();
+                oauth_client::revoke(http.as_ref(), &service.server, &service.client_id, &refresh)
+                    .await
+                    .ok();
+            }
+            done.send(kept).ok();
+        })
+        .detach();
+        async move { finished.await.unwrap_or(Kept::Nothing) }.boxed()
     }
 
     fn end(&self, forget: bool) -> BoxFuture<'static, Ending> {
@@ -1390,6 +1435,7 @@ mod tests {
         until(cx, "the dropped sign-in's revocation", |_| {
             revoked(&served) > before
         });
+        until(cx, "the item left said", |cx| left(cx).is_some());
         assert_eq!(left(cx).as_deref(), Some("the keychain refused"));
         assert_eq!(keychain.items.lock().unwrap()[&key].1, b"earlier".to_vec());
     }
@@ -1958,6 +2004,63 @@ mod tests {
             Kept::Earlier("the keychain refused".into())
         );
         assert_eq!(keychain.items.lock().unwrap()[&key].1, b"stale".to_vec());
+    }
+
+    /// A sign-in dropped for the CLI's credential while a refresh is under way is decided once
+    /// the refresh has settled: the keychain refusing the rotated token, the token, which nothing
+    /// else holds, is revoked. Before, the drop judged by what the keychain held before the
+    /// refresh, and the rotated token was left with nobody.
+    #[test]
+    fn a_sign_in_dropped_during_a_refresh_is_decided_after_it() {
+        let served = Arc::new(Mutex::new(Served {
+            lives: 300,
+            hold_token: true,
+            ..Served::default()
+        }));
+        served.lock().unwrap().refresh.insert("kept".into());
+        let service = discovered(&served);
+        let keychain = Arc::new(MemoryKeychain::default());
+        let key = format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}");
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key.clone(), ("user_1".into(), b"kept".to_vec()));
+        keychain.refuses_writes.store(true, Ordering::SeqCst);
+        let source = OAuthSource::kept(
+            service,
+            "work",
+            keychain.clone(),
+            "user_1".into(),
+            "kept".into(),
+        );
+        let rotated = || {
+            served
+                .lock()
+                .unwrap()
+                .log
+                .iter()
+                .any(|line| line.starts_with("token refresh_token"))
+        };
+        let asked = smol::block_on(smol::future::or(
+            async { Some(source.token(Arc::default()).await) },
+            async {
+                while !rotated() {
+                    smol::Timer::after(Duration::from_millis(10)).await;
+                }
+                None
+            },
+        ));
+        assert!(asked.is_none(), "the ask was dropped mid-exchange");
+        let dropped = source.dropped();
+        served.lock().unwrap().hold_token = false;
+        assert_eq!(smol::block_on(dropped), Kept::Nothing);
+        assert!(
+            keychain.items.lock().unwrap().is_empty(),
+            "the token from before is forgotten"
+        );
+        let log = served.lock().unwrap().log.clone();
+        assert!(log.contains(&"revoke r1".to_owned()), "{log:?}");
     }
 
     /// A refresh the service answers after its sign-in was signed out keeps nothing in the
