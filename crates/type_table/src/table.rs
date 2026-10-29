@@ -1,7 +1,7 @@
 //! One type's table (spec 004): keyset pages pinned to one commit, engine-side filters and
 //! counts, a cell cursor, value-bound cell edits with their three outcomes, and a peek.
 //!
-//! The grid is Zed's `ui::Table` (`crates/ui/src/components/data_table.rs` at v1.23.2) in the
+//! The grid is Zed's `ui::Table` (`crates/ui/src/components/data_table.rs` at v1.26.2) in the
 //! configuration Zed's `tabular_data_preview` uses: resizable columns, the first column pinned,
 //! rows virtualized by `uniform_list`.
 
@@ -9016,7 +9016,7 @@ fn sideways_scroll(
         |bounds, window, _| window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
         move |_, hitbox, window, _| {
             let view = window.current_view();
-            window.on_mouse_event(move |event: &gpui::ScrollWheelEvent, phase, window, cx| {
+            window.on_mouse_event(move |event: &gpui::ScrollEvent, phase, window, cx| {
                 if phase != gpui::DispatchPhase::Capture
                     || !hitbox.should_handle_scroll(window)
                     || editor.contains(event.position)
@@ -10523,11 +10523,12 @@ mod tests {
         };
         assert_eq!(offsets(cx), (px(0.), px(0.)));
         let wheel = |at: gpui::Point<Pixels>, (x, y): (f32, f32), touch_phase| {
-            gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+            gpui::PlatformInput::Scroll(gpui::ScrollEvent {
                 position: at,
                 delta: gpui::ScrollDelta::Pixels(point(px(x), px(y))),
                 modifiers: gpui::Modifiers::default(),
                 touch_phase,
+                source: gpui::ScrollSource::Pointer,
             })
         };
         let over_rows = point(px(400.), px(300.));

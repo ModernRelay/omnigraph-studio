@@ -1,9 +1,9 @@
 //! Lane assignment for the history graph (spec 009).
 //!
 //! The idea follows Zed's `crates/git_ui/src/git_graph.rs` (`GraphData::add_commits`) at
-//! v1.23.2: commits arrive newest first; a commit takes the lowest lane that expects it, or the
-//! first free lane; its first parent continues in that lane and each merged parent opens a new
-//! lane. This is a fresh implementation with a simpler output: per row, the lanes that pass
+//! v1.26.2, whose lane assignment is as at v1.23.2: commits arrive newest first; a commit takes
+//! the lowest lane that expects it, or the first free lane; its first parent continues in that
+//! lane and each merged parent opens a new lane. This is a fresh implementation with a simpler output: per row, the lanes that pass
 //! through, the lanes that end at the commit and the lanes that leave it, so each row draws
 //! itself and the drawing is virtualized with the rows. The property tests below check it over
 //! random commit graphs.

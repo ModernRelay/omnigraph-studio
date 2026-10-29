@@ -8,7 +8,7 @@
 //!
 //! Layer 5 (`docs/architecture.md`). Plan: `specs/002-app-shell/plan.md`.
 //!
-// Written after zed-industries/zed crates/command_palette/src/command_palette.rs @ v1.23.2: the
+// Written after zed-industries/zed crates/command_palette/src/command_palette.rs @ v1.26.2: the
 // palette lists `window.available_actions` captured from the previously focused element,
 // restores that focus, then dispatches. Studio does not depend on Zed's `picker`, which needs
 // `project` and `workspace`; the list, matching and persistence are Studio's own.

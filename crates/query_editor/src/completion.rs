@@ -2,7 +2,7 @@
 //! server: candidates come from `gq_language::completions` on the session's schema.
 //!
 // Modelled on zed-industries/zed crates/keymap_editor/src/action_completion_provider.rs
-// @ v1.23.2, a provider that also runs without a project.
+// @ v1.26.2 (unchanged since v1.23.2), a provider that also runs without a project.
 
 use anyhow::Result;
 use editor::{CompletionProvider, Editor};
