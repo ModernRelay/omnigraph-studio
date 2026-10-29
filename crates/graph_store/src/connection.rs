@@ -513,6 +513,10 @@ impl Connection {
                     .is_some_and(|current| Arc::ptr_eq(current, &asked))
                 {
                     this.token_answered(answer, ask, cx);
+                } else if ask == Ask::Connect && this.state == ConnectionState::Connecting {
+                    // A connect that waited on it asks the source now in use, which may give
+                    // the token already held and so start no connect of its own.
+                    this.connect(cx);
                 }
             })
             .ok();
@@ -1520,7 +1524,7 @@ async fn list_graphs(client: &GraphClient) -> Result<GraphListing, Failed> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{AppContext as _, TestAppContext};
+    use gpui::{AppContext as _, Entity, TestAppContext};
     use http_client::{AsyncBody, FakeHttpClient, Response};
 
     /// A server answering `/healthz` with `version`, and every other read with no graphs.
@@ -1615,21 +1619,72 @@ mod tests {
     /// answered afterwards and put its token back.
     #[gpui::test]
     async fn a_token_answered_after_its_source_was_replaced_is_not_taken(cx: &mut TestAppContext) {
-        /// Answers "first" at once, or, once given a gate, what comes through it.
-        #[derive(Default)]
-        struct Gated(std::sync::Mutex<Option<oneshot::Receiver<Token>>>);
-        impl TokenSource for Gated {
-            fn token(&self, _: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, NoToken>> {
-                let gate = self.0.lock().unwrap().take();
-                async move {
-                    match gate {
-                        Some(gate) => gate.await.map_err(|_| NoToken::passing("no answer")),
-                        None => Ok(Token::typed("first".into())),
-                    }
+        let gated = Arc::new(Gated::default());
+        let connection = gated_server(gated.clone(), cx);
+        connection.update(cx, |c, cx| c.connect(cx));
+        cx.run_until_parked();
+        connection.read_with(cx, |c, _| {
+            assert_eq!(c.state, ConnectionState::Ready);
+            assert!(c.has_token);
+        });
+        // A Refresh waits for its answer while the target is made anonymous.
+        let (answer, gate) = oneshot::channel();
+        *gated.0.lock().unwrap() = Some(gate);
+        connection.update(cx, |c, cx| c.refresh_token(cx));
+        cx.run_until_parked();
+        connection.update(cx, |c, cx| c.take_token_from(None, cx));
+        cx.run_until_parked();
+        connection.read_with(cx, |c, _| assert!(!c.has_token));
+        answer.send(Token::typed("stale".into())).ok();
+        cx.run_until_parked();
+        connection.read_with(cx, |c, _| {
+            assert!(!c.has_token, "the replaced source's answer was taken")
+        });
+    }
+
+    /// A connect that waited on a token source replaced meanwhile asks the source now in use:
+    /// one that gives the token already held starts no connect of its own, and without this
+    /// the connection stayed connecting.
+    #[gpui::test]
+    async fn a_connect_whose_source_was_replaced_asks_the_new_one(cx: &mut TestAppContext) {
+        let first = Arc::new(Gated::default());
+        let connection = gated_server(first.clone(), cx);
+        connection.update(cx, |c, cx| c.connect(cx));
+        cx.run_until_parked();
+        let (answer, gate) = oneshot::channel();
+        *first.0.lock().unwrap() = Some(gate);
+        connection.update(cx, |c, cx| c.connect(cx));
+        cx.run_until_parked();
+        connection.read_with(cx, |c, _| assert_eq!(c.state, ConnectionState::Connecting));
+        // The CLI's credential changes to a source that gives the same token.
+        connection.update(cx, |c, cx| {
+            c.take_token_from(Some(Arc::new(Gated::default())), cx)
+        });
+        cx.run_until_parked();
+        answer.send(Token::typed("first".into())).ok();
+        cx.run_until_parked();
+        connection.read_with(cx, |c, _| assert_eq!(c.state, ConnectionState::Ready));
+    }
+
+    /// A token source that answers "first" at once, or, once given a gate, what comes through it.
+    #[derive(Default)]
+    struct Gated(std::sync::Mutex<Option<oneshot::Receiver<Token>>>);
+
+    impl TokenSource for Gated {
+        fn token(&self, _: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, NoToken>> {
+            let gate = self.0.lock().unwrap().take();
+            async move {
+                match gate {
+                    Some(gate) => gate.await.map_err(|_| NoToken::passing("no answer")),
+                    None => Ok(Token::typed("first".into())),
                 }
-                .boxed()
             }
+            .boxed()
         }
+    }
+
+    /// A healthy server with no graphs, whose token comes from `source`.
+    fn gated_server(source: Arc<Gated>, cx: &mut TestAppContext) -> Entity<Connection> {
         let http = FakeHttpClient::create(move |request| {
             let path = request.uri().path().to_owned();
             async move {
@@ -1651,32 +1706,12 @@ mod tests {
             source: ServerSource::Cli,
             known_graphs: Vec::new(),
         };
-        let gated = Arc::new(Gated::default());
-        let source: Arc<dyn TokenSource> = gated.clone();
-        let connection = cx.new(|_| {
+        let source: Arc<dyn TokenSource> = source;
+        cx.new(|_| {
             Connection::new(server, None, http)
                 .unwrap()
                 .with_token_source(Some(source))
-        });
-        connection.update(cx, |c, cx| c.connect(cx));
-        cx.run_until_parked();
-        connection.read_with(cx, |c, _| {
-            assert_eq!(c.state, ConnectionState::Ready);
-            assert!(c.has_token);
-        });
-        // A Refresh waits for its answer while the target is made anonymous.
-        let (answer, gate) = oneshot::channel();
-        *gated.0.lock().unwrap() = Some(gate);
-        connection.update(cx, |c, cx| c.refresh_token(cx));
-        cx.run_until_parked();
-        connection.update(cx, |c, cx| c.take_token_from(None, cx));
-        cx.run_until_parked();
-        connection.read_with(cx, |c, _| assert!(!c.has_token));
-        answer.send(Token::typed("stale".into())).ok();
-        cx.run_until_parked();
-        connection.read_with(cx, |c, _| {
-            assert!(!c.has_token, "the replaced source's answer was taken")
-        });
+        })
     }
 
     #[gpui::test]
