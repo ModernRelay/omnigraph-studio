@@ -744,14 +744,27 @@ impl Inner {
                             )
                             .await
                             .is_ok();
-                        let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
-                        if written {
-                            *kept = Kept::This;
-                        } else if *kept == Kept::This {
+                        let was = self
+                            .kept
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .clone();
+                        let kept = match (written, was) {
+                            (true, _) => Kept::This,
                             // What it holds is this account's token from before, which no longer
-                            // refreshes; an earlier sign-in it holds instead stays said.
-                            *kept = Kept::Nothing;
-                        }
+                            // refreshes, or which a service that keeps old tokens honoured would
+                            // sign the next launch in with: forgotten, as a sign-in that keeps
+                            // nothing forgets, and said when the keychain will not let go.
+                            (false, Kept::This) => {
+                                match forget(self.keychain.as_ref(), self.key.clone()).await {
+                                    Ok(()) => Kept::Nothing,
+                                    Err(refused) => Kept::Earlier(refused),
+                                }
+                            }
+                            // An earlier sign-in it holds instead stays said.
+                            (false, was) => was,
+                        };
+                        *self.kept.lock().unwrap_or_else(PoisonError::into_inner) = kept;
                         held.refresh = Some(rotated.clone());
                     }
                     held.access = Some(Access::new(tokens.access_token, tokens.expires_at));
@@ -1825,9 +1838,9 @@ mod tests {
         assert!(keychain.items.lock().unwrap().is_empty());
     }
 
-    /// A rotated refresh token the keychain will not keep: a sign-in it kept reads not kept, as
-    /// it holds this account's token from before, which no longer refreshes; an earlier sign-in
-    /// it holds instead stays said, as the next launch reads that one.
+    /// A rotated refresh token the keychain will not keep: a sign-in it kept forgets this
+    /// account's token from before and reads not kept, or says the token the keychain will not
+    /// delete; an earlier sign-in it holds instead stays said, as the next launch reads that one.
     #[test]
     fn a_rotation_the_keychain_refuses_leaves_what_it_holds_said() {
         let served = Arc::new(Mutex::new(Served {
@@ -1865,6 +1878,28 @@ mod tests {
             "kept".into(),
         );
         assert_eq!(rotated_from(kept, "kept"), Kept::Nothing);
+        assert!(
+            keychain.items.lock().unwrap().is_empty(),
+            "the token from before is forgotten"
+        );
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key.clone(), ("user_1".into(), b"kept-again".to_vec()));
+        keychain.refuses_deletes.store(true, Ordering::SeqCst);
+        let kept = OAuthSource::kept(
+            service.clone(),
+            "work",
+            keychain.clone(),
+            "user_1".into(),
+            "kept-again".into(),
+        );
+        assert_eq!(
+            rotated_from(kept, "kept-again"),
+            Kept::Earlier("the keychain refused".into())
+        );
+        keychain.refuses_deletes.store(false, Ordering::SeqCst);
 
         let earlier = Kept::Earlier("the keychain refused".into());
         let over_earlier = OAuthSource::signed_in(
@@ -1883,7 +1918,10 @@ mod tests {
             earlier.clone(),
         );
         assert_eq!(rotated_from(over_earlier, "over-earlier"), earlier);
-        assert_eq!(keychain.items.lock().unwrap()[&key].1, b"kept".to_vec());
+        assert_eq!(
+            keychain.items.lock().unwrap()[&key].1,
+            b"kept-again".to_vec()
+        );
     }
 
     /// A grant the service ended forgets the keychain item, and one the keychain will not delete

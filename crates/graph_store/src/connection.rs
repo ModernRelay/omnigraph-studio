@@ -500,10 +500,22 @@ impl Connection {
             return;
         };
         let hurry = self.hurry.clone();
+        let asked = source.clone();
         let asking = cx.spawn(async move |this, cx| {
             let answer = cx.background_executor().spawn(source.token(hurry)).await;
-            this.update(cx, |this, cx| this.token_answered(answer, ask, cx))
-                .ok();
+            this.update(cx, |this, cx| {
+                // Taken only while the token still comes from the source asked: one a sign-out,
+                // a sign-in or the CLI's credential replaced meanwhile could put back a token
+                // that was dropped, the person's signed-out one among them.
+                if this
+                    .token_source
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &asked))
+                {
+                    this.token_answered(answer, ask, cx);
+                }
+            })
+            .ok();
         });
         if ask == Ask::Connect {
             self._task = Some(asking);
@@ -1597,6 +1609,76 @@ mod tests {
     /// A connection whose token source has not answered waits to connect, sending nothing it
     /// would be refused; a token typed in connects it. A cancel stops the check scheduled
     /// after a failure, which would otherwise connect again.
+    /// The answer of a token source the connection no longer takes its token from is not taken:
+    /// the token dropped when the source was replaced stays dropped. Before, a Refresh or a
+    /// renewal under way when the source changed (a sign-out, a sign-in, the CLI's credential)
+    /// answered afterwards and put its token back.
+    #[gpui::test]
+    async fn a_token_answered_after_its_source_was_replaced_is_not_taken(cx: &mut TestAppContext) {
+        /// Answers "first" at once, or, once given a gate, what comes through it.
+        #[derive(Default)]
+        struct Gated(std::sync::Mutex<Option<oneshot::Receiver<Token>>>);
+        impl TokenSource for Gated {
+            fn token(&self, _: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, NoToken>> {
+                let gate = self.0.lock().unwrap().take();
+                async move {
+                    match gate {
+                        Some(gate) => gate.await.map_err(|_| NoToken::passing("no answer")),
+                        None => Ok(Token::typed("first".into())),
+                    }
+                }
+                .boxed()
+            }
+        }
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            async move {
+                let body = if path.ends_with("/healthz") {
+                    r#"{"status":"ok","version":"0.14.0","internal_schema_version":16}"#
+                } else {
+                    r#"{"graphs":[]}"#
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Cli,
+            known_graphs: Vec::new(),
+        };
+        let gated = Arc::new(Gated::default());
+        let source: Arc<dyn TokenSource> = gated.clone();
+        let connection = cx.new(|_| {
+            Connection::new(server, None, http)
+                .unwrap()
+                .with_token_source(Some(source))
+        });
+        connection.update(cx, |c, cx| c.connect(cx));
+        cx.run_until_parked();
+        connection.read_with(cx, |c, _| {
+            assert_eq!(c.state, ConnectionState::Ready);
+            assert!(c.has_token);
+        });
+        // A Refresh waits for its answer while the target is made anonymous.
+        let (answer, gate) = oneshot::channel();
+        *gated.0.lock().unwrap() = Some(gate);
+        connection.update(cx, |c, cx| c.refresh_token(cx));
+        cx.run_until_parked();
+        connection.update(cx, |c, cx| c.take_token_from(None, cx));
+        cx.run_until_parked();
+        connection.read_with(cx, |c, _| assert!(!c.has_token));
+        answer.send(Token::typed("stale".into())).ok();
+        cx.run_until_parked();
+        connection.read_with(cx, |c, _| {
+            assert!(!c.has_token, "the replaced source's answer was taken")
+        });
+    }
+
     #[gpui::test]
     async fn a_connect_waits_for_its_token_and_a_cancel_stays(cx: &mut TestAppContext) {
         let sent = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
