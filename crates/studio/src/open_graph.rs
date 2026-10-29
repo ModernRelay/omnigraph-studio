@@ -876,6 +876,17 @@ fn sign_out_button(selected: &Entity<Connection>, cx: &mut Context<OpenGraphModa
 /// CLI server the CLI gave no token is asked nothing, and says why. A server that offers a
 /// sign-in says where, and who is signed in (spec 016).
 fn server_status(c: &Connection) -> String {
+    let status = state_status(c);
+    // An item the keychain kept for the target, which the next launch reads, is said whatever
+    // the state.
+    match c.kept_behind() {
+        Some(refused) => format!("{status} {}", kept_behind(&refused)),
+        None => status,
+    }
+}
+
+/// [`server_status`] but for what the keychain kept.
+fn state_status(c: &Connection) -> String {
     match (&c.sign_in, &c.state) {
         (SignIn::Waiting { service }, _) => {
             return format!("Finish signing in at {service} in your browser.");
@@ -899,19 +910,13 @@ fn server_status(c: &Connection) -> String {
         }
         (
             SignIn::SignedIn {
-                service,
-                account,
-                kept,
+                service, account, ..
             },
             ConnectionState::Unauthorized,
         ) => {
-            let left = match kept {
-                Kept::Earlier(why) => format!(" {}", kept_behind(why)),
-                Kept::This | Kept::Nothing => String::new(),
-            };
             return format!(
                 "The server refused {account}, signed in at {service}: it may not admit this \
-                 account.{left}"
+                 account."
             );
         }
         (
@@ -923,16 +928,11 @@ fn server_status(c: &Connection) -> String {
             ConnectionState::Ready,
         ) => {
             let lasts = match kept {
-                Kept::This => String::new(),
+                Kept::This => "",
                 Kept::Nothing => {
-                    " The keychain did not keep the sign-in, so it lasts until Studio quits.".into()
+                    " The keychain did not keep the sign-in, so it lasts until Studio quits."
                 }
-                Kept::Earlier(why) => {
-                    format!(
-                        " The keychain did not keep the sign-in. {}",
-                        kept_behind(why)
-                    )
-                }
+                Kept::Earlier(_) => " The keychain did not keep the sign-in.",
             };
             return format!("Signed in as {account} at {service}.{lasts}");
         }
@@ -1347,16 +1347,23 @@ mod tests {
                 .0
                 .ends_with("lasts until Studio quits.")
         );
-        assert!(
+        // What the keychain kept is said whatever the state: the earlier item a sign-in kept
+        // nothing over, or one a sign-out left (this connection holds no sign-in, so both read
+        // what was left).
+        connection.update(cx, |connection, _| {
+            connection.left_behind = Some("locked".into())
+        });
+        let left = "The keychain kept a sign-in it would not delete (locked), which the next \
+                    launch reads.";
+        assert_eq!(
             said(
                 ConnectionState::Ready,
                 signed_in(Kept::Earlier("locked".into())),
                 cx
             )
-            .0
-            .ends_with(
-                "did not keep the sign-in. The keychain kept an earlier sign-in it would not \
-                 delete (locked), which the next launch reads."
+            .0,
+            format!(
+                "Signed in as user_1 at id.example. The keychain did not keep the sign-in. {left}"
             )
         );
         assert!(
@@ -1366,8 +1373,24 @@ mod tests {
                 cx
             )
             .0
-            .ends_with("may not admit this account. The keychain kept an earlier sign-in it would not delete (locked), which the next launch reads.")
+            .ends_with(&format!("may not admit this account. {left}"))
         );
+        let offered = || SignIn::Offered {
+            service: "id.example".into(),
+            why: None,
+        };
+        assert_eq!(
+            said(ConnectionState::Unauthorized, offered(), cx).0,
+            format!("This server asks you to sign in at id.example. {left}")
+        );
+        let unreachable = said(
+            ConnectionState::Unreachable("offline".into()),
+            offered(),
+            cx,
+        )
+        .0;
+        assert!(unreachable.ends_with(left), "{unreachable}");
+        connection.update(cx, |connection, _| connection.left_behind = None);
         assert_eq!(
             said(ConnectionState::Unauthorized, signed_in(Kept::This), cx),
             (

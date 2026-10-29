@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use futures::FutureExt as _;
 use futures::channel::oneshot;
-use futures::future::Shared;
+use futures::future::{BoxFuture, Shared};
 use gpui::{Context, EventEmitter, Task};
 use graph_client::api::{GraphInfo, HealthOutput};
 use graph_client::{GraphClient, ReadError};
@@ -192,11 +192,14 @@ pub struct Connection {
     /// The sign-in under way: reading its service, or waiting for the browser.
     _signing_in: Option<Task<()>>,
     /// Counts what decides the keychain's item for the target (a sign-in taken, a sign-out):
-    /// a sign-out's answer, which comes later, is said only while that sign-out is the last.
+    /// a sign-out's answer, which comes later, is taken only while that sign-out is the last.
     custody: u64,
-    /// The last sign-out's keychain work, which a sign-in's own waits for, so the two reach the
-    /// keychain in order.
-    keychain_turn: Option<Shared<oneshot::Receiver<()>>>,
+    /// The keychain's refusal to delete the target's item, which a sign-out or a sign-in that
+    /// ended left there and the next launch reads. A sign-in taken answers for the item itself.
+    pub left_behind: Option<String>,
+    /// The target's keychain work in turn: the end of the queue, which the next sign-in,
+    /// sign-out or launch read waits for before it reaches the keychain ([`Self::next_keychain_turn`]).
+    keychain_turn: Option<Shared<BoxFuture<'static, ()>>>,
     /// The ask for the next short-lived token, before the one held ends.
     _renewal: Option<Task<()>>,
     /// The renewal came while nothing watched the server: the next watch asks.
@@ -322,6 +325,7 @@ impl Connection {
             lease: None,
             _signing_in: None,
             custody: 0,
+            left_behind: None,
             keychain_turn: None,
             _renewal: None,
             renewal_missed: false,
@@ -632,6 +636,9 @@ impl Connection {
         } else if let Some(source) = self.oauth.take() {
             self.token_source = None;
             self.token_unread = None;
+            if let Kept::Earlier(refused) = source.kept_in_keychain() {
+                self.left_behind = Some(refused);
+            }
             self.sign_in = SignIn::Offered {
                 service: source.service().host(),
                 why: Some(no.why),
@@ -918,12 +925,23 @@ impl Connection {
                 ))
                 .await;
             let kept = match &found {
-                Ok(service) => context
-                    .keychain
-                    .read(service.key(&target))
-                    .await
-                    .ok()
-                    .flatten(),
+                Ok(service) => {
+                    let Ok((before, done)) = this.update(cx, |this, _| this.next_keychain_turn())
+                    else {
+                        return;
+                    };
+                    if let Some(before) = before {
+                        before.await;
+                    }
+                    let kept = context
+                        .keychain
+                        .read(service.key(&target))
+                        .await
+                        .ok()
+                        .flatten();
+                    done.send(()).ok();
+                    kept
+                }
                 Err(_) => None,
             };
             this.update(cx, |this, cx| {
@@ -1004,7 +1022,6 @@ impl Connection {
         let host = oauth_client::host_of(&self.server.url);
         // The sign-in this one replaces, as another account after Not admitted.
         let previous = self.oauth.clone();
-        let turn = self.keychain_turn.clone();
         self._signing_in = Some(cx.spawn(async move |this, cx| {
             let redirect = callback.redirect_uri().to_owned();
             let issuer = service.server.issuer.clone();
@@ -1035,8 +1052,21 @@ impl Connection {
                     .map_err(|error| error.to_string())
                 })
                 .await;
-            if let Some(turn) = turn {
-                turn.await.ok();
+            // Revoked if the connection does not take it: the sign-in cancelled while it waits,
+            // or the connection gone.
+            let unclaimed = signed_in.as_ref().ok().map(|tokens| {
+                sign_in::Unclaimed::new(service.clone(), tokens.refresh_token.clone())
+            });
+            let mut turn_done = None;
+            if signed_in.is_ok() {
+                let Ok((before, done)) = this.update(cx, |this, _| this.next_keychain_turn())
+                else {
+                    return;
+                };
+                turn_done = Some(done);
+                if let Some(before) = before {
+                    before.await;
+                }
             }
             // One account per target: the one replaced ends, its refresh token revoked, and the
             // keychain keeps only the new one's, or none, never the old account's.
@@ -1073,7 +1103,10 @@ impl Connection {
                 }
                 Err(_) => Kept::Nothing,
             };
-            this.update(cx, |this, cx| {
+            if let Some(done) = turn_done {
+                done.send(()).ok();
+            }
+            let taken = this.update(cx, |this, cx| {
                 this._signing_in = None;
                 match signed_in {
                     Ok(tokens) => {
@@ -1085,6 +1118,7 @@ impl Connection {
                             kept,
                         );
                         this.use_sign_in(source, cx);
+                        true
                     }
                     Err(why) => {
                         this.sign_in = SignIn::Offered {
@@ -1093,10 +1127,15 @@ impl Connection {
                         };
                         cx.emit(ConnectionEvent::StateChanged);
                         cx.notify();
+                        false
                     }
                 }
-            })
-            .ok();
+            });
+            if matches!(taken, Ok(true))
+                && let Some(unclaimed) = unclaimed
+            {
+                unclaimed.claim();
+            }
         }));
     }
 
@@ -1125,9 +1164,15 @@ impl Connection {
         self._renewal = None;
         self.custody += 1;
         let custody = self.custody;
-        let ending = cx.background_executor().spawn(source.sign_out());
-        let (done, turn) = oneshot::channel();
-        self.keychain_turn = Some(turn.shared());
+        // Ends the sign-in now, so no refresh writes the keychain after this.
+        let sign_out = source.sign_out();
+        let (before, done) = self.next_keychain_turn();
+        let ending = cx.background_executor().spawn(async move {
+            if let Some(before) = before {
+                before.await;
+            }
+            sign_out.await
+        });
         // Detached, so the revocation finishes when the connection is gone first. The keychain's
         // answer is taken before it, and before a sign-in made meanwhile reaches the keychain.
         cx.spawn(async move |this, cx| {
@@ -1138,15 +1183,8 @@ impl Connection {
             cx.background_executor().spawn(revocation).detach();
             if let Err(refused) = forgotten {
                 this.update(cx, |this, cx| {
-                    if this.custody != custody {
-                        return;
-                    }
-                    if let SignIn::Offered { why, .. } = &mut this.sign_in {
-                        let left = sign_in::kept_behind(&refused);
-                        *why = Some(match why.take() {
-                            Some(said) => format!("{said} {left}"),
-                            None => format!("Signed out for this session. {left}"),
-                        });
+                    if this.custody == custody {
+                        this.left_behind = Some(refused);
                         cx.emit(ConnectionEvent::StateChanged);
                         cx.notify();
                     }
@@ -1175,9 +1213,45 @@ impl Connection {
         }
     }
 
+    /// The keychain's refusal to delete an item it holds for the target, which the next launch
+    /// reads: the earlier one the sign-in held kept nothing over, whatever the sign-in's state,
+    /// or one left when no sign-in is held.
+    pub fn kept_behind(&self) -> Option<String> {
+        match &self.oauth {
+            Some(source) => match source.kept_in_keychain() {
+                Kept::Earlier(refused) => Some(refused),
+                Kept::This | Kept::Nothing => None,
+            },
+            None => self.left_behind.clone(),
+        }
+    }
+
+    /// The next turn at the target's keychain: the work to wait for first (the end of the queue
+    /// until now), and what to send once this turn's keychain work is done. The queue's new end
+    /// waits for both, so a turn given up still holds the next behind the one before it.
+    fn next_keychain_turn(
+        &mut self,
+    ) -> (Option<Shared<BoxFuture<'static, ()>>>, oneshot::Sender<()>) {
+        let (done, own) = oneshot::channel::<()>();
+        let before = self.keychain_turn.take();
+        let after = before.clone();
+        self.keychain_turn = Some(
+            async move {
+                if let Some(after) = after {
+                    after.await;
+                }
+                own.await.ok();
+            }
+            .boxed()
+            .shared(),
+        );
+        (before, done)
+    }
+
     /// Takes the token from `source`, a sign-in just made or kept, and connects with it.
     fn use_sign_in(&mut self, source: OAuthSource, cx: &mut Context<Self>) {
         self.custody += 1;
+        self.left_behind = None;
         self.oauth = Some(source.clone());
         self.token_source = Some(Arc::new(source));
         self.token_given = false;

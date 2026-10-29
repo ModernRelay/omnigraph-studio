@@ -83,8 +83,10 @@ pub trait Keychain: Send + Sync + 'static {
 }
 
 /// Deletes `key`'s item: done when the next launch would read none there, so a key that held
-/// nothing is no refusal, and neither is one the keychain cannot read (a launch takes such a
-/// read as nothing kept). Otherwise the keychain's refusal, the item still there.
+/// nothing is no refusal, and neither is one the keychain cannot read: a launch takes such a
+/// read as nothing kept, as where no keychain is reachable at all (Linux with no Secret
+/// Service). A keychain unreadable only for now (macOS, locked) can then keep an item unsaid,
+/// which the next launch reads. Otherwise the keychain's refusal, the item still there.
 pub(crate) async fn forget(keychain: &dyn Keychain, key: String) -> Result<(), String> {
     let Err(refused) = keychain.delete(key.clone()).await else {
         return Ok(());
@@ -99,8 +101,8 @@ pub(crate) async fn forget(keychain: &dyn Keychain, key: String) -> Result<(), S
 /// delete it: the next launch signs in with it.
 pub fn kept_behind(refused: &str) -> String {
     format!(
-        "The keychain kept an earlier sign-in it would not delete ({refused}), which the next \
-         launch reads."
+        "The keychain kept a sign-in it would not delete ({refused}), which the next launch \
+         reads."
     )
 }
 
@@ -188,13 +190,15 @@ impl Keychain for PlatformKeychain {
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 pub struct MemoryKeychain {
-    pub items: Mutex<HashMap<String, KeychainItem>>,
+    pub items: Arc<Mutex<HashMap<String, KeychainItem>>>,
     /// Writes are refused, as a keychain that will not keep the sign-in.
     pub refuses_writes: AtomicBool,
     /// Deletes are refused, as a keychain that will not let go of it.
     pub refuses_deletes: AtomicBool,
     /// Reads fail, as a keychain that cannot be reached.
     pub fails_reads: AtomicBool,
+    /// Deletes asked for wait for this, as a keychain slow to answer.
+    pub delete_gate: Mutex<Option<Shared<oneshot::Receiver<()>>>>,
     /// How many times it was read.
     pub reads: std::sync::atomic::AtomicUsize,
 }
@@ -234,19 +238,30 @@ impl Keychain for MemoryKeychain {
 
     /// As macOS and Windows do, an item that is not there is not deleted.
     fn delete(&self, key: String) -> BoxFuture<'static, Result<(), String>> {
-        if self.refuses_deletes.load(Ordering::SeqCst) {
-            return futures::future::ready(Err("the keychain refused".to_owned())).boxed();
-        }
-        let removed = self
-            .items
+        let refused = self.refuses_deletes.load(Ordering::SeqCst);
+        let gate = self
+            .delete_gate
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(&key);
-        let done = match removed {
-            Some(_) => Ok(()),
-            None => Err("no such item".to_owned()),
-        };
-        futures::future::ready(done).boxed()
+            .clone();
+        let items = self.items.clone();
+        async move {
+            if let Some(gate) = gate {
+                gate.await.ok();
+            }
+            if refused {
+                return Err("the keychain refused".to_owned());
+            }
+            match items
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&key)
+            {
+                Some(_) => Ok(()),
+                None => Err("no such item".to_owned()),
+            }
+        }
+        .boxed()
     }
 }
 
@@ -572,6 +587,41 @@ pub(crate) struct Ending {
     pub revocation: BoxFuture<'static, ()>,
 }
 
+/// A refresh token the service gave a sign-in that the connection has not taken yet: dropped
+/// unclaimed (the sign-in cancelled while its keychain work waited, or the connection gone),
+/// it is revoked, so no token the service honours is left with nobody holding it.
+pub(crate) struct Unclaimed {
+    service: Service,
+    refresh: Option<String>,
+}
+
+impl Unclaimed {
+    pub(crate) fn new(service: Service, refresh: Option<String>) -> Self {
+        Self { service, refresh }
+    }
+
+    /// The connection took the sign-in, and the token with it.
+    pub(crate) fn claim(mut self) {
+        self.refresh = None;
+    }
+}
+
+impl Drop for Unclaimed {
+    fn drop(&mut self) {
+        let Some(refresh) = self.refresh.take() else {
+            return;
+        };
+        let service = self.service.clone();
+        smol::spawn(async move {
+            let http = service.clients.for_url(&service.server.token_endpoint);
+            oauth_client::revoke(http, &service.server, &service.client_id, &refresh)
+                .await
+                .ok();
+        })
+        .detach();
+    }
+}
+
 impl TokenSource for OAuthSource {
     fn token(&self, _hurry: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, NoToken>> {
         Inner::token(self.inner.clone()).boxed()
@@ -669,9 +719,13 @@ impl Inner {
             )
             .await
             {
-                // Signed out while the service answered: what it gave is not kept, so the
-                // sign-out's delete is the last the keychain hears of this sign-in.
-                Ok(_) if self.ended.load(Ordering::SeqCst) => {
+                // Signed out while the service answered: the keychain is not written, so the
+                // sign-out's delete is the last it hears of this sign-in; the rotated token is
+                // held for the sign-out to revoke, as the one it replaced no longer counts.
+                Ok(tokens) if self.ended.load(Ordering::SeqCst) => {
+                    if let Some(rotated) = tokens.refresh_token {
+                        held.refresh = Some(rotated);
+                    }
                     return Err(NoToken::lasting("Signed out."));
                 }
                 Ok(tokens) => {
@@ -708,12 +762,13 @@ impl Inner {
                     held.access = None;
                     held.refresh = None;
                     self.ended.store(true, Ordering::SeqCst);
-                    let left = match forget(self.keychain.as_ref(), self.key.clone()).await {
-                        Ok(()) => String::new(),
-                        Err(refused) => format!(" {}", kept_behind(&refused)),
+                    let kept = match forget(self.keychain.as_ref(), self.key.clone()).await {
+                        Ok(()) => Kept::Nothing,
+                        Err(refused) => Kept::Earlier(refused),
                     };
+                    *self.kept.lock().unwrap_or_else(PoisonError::into_inner) = kept;
                     return Err(NoToken::lasting(format!(
-                        "Signed out: {why} Sign in again.{left}"
+                        "Signed out: {why} Sign in again."
                     )));
                 }
                 Err(TokenError::Refused(why)) => {
@@ -1203,6 +1258,7 @@ mod tests {
                 .filter(|l| l.starts_with("revoke"))
                 .count()
         };
+        let left = |cx: &mut TestAppContext| connection.read_with(cx, |c, _| c.kept_behind());
         let before = revoked(&served);
         connection.update(cx, |c, cx| c.sign_out(cx));
         until(cx, "the unkept sign-in's revocation", |_| {
@@ -1216,6 +1272,7 @@ mod tests {
                 why: None
             }
         );
+        assert_eq!(left(cx), None);
 
         // One that will not delete it leaves the person signed out for this run, and says so:
         // the next launch would read the sign-in back.
@@ -1234,25 +1291,22 @@ mod tests {
         browser.join().unwrap();
         keychain.refuses_deletes.store(true, Ordering::SeqCst);
         connection.update(cx, |c, cx| c.sign_out(cx));
-        until(cx, "the keychain's refusal", |cx| {
-            matches!(
-                sign_in_state(&connection, cx).1,
-                SignIn::Offered { why: Some(_), .. }
-            )
-        });
+        until(cx, "the keychain's refusal", |cx| left(cx).is_some());
         let (state, offer, _) = sign_in_state(&connection, cx);
         assert_eq!(state, ConnectionState::Unauthorized);
         assert_eq!(
             offer,
             SignIn::Offered {
                 service: "id.test".into(),
-                why: Some(format!(
-                    "Signed out for this session. {}",
-                    kept_behind("the keychain refused")
-                ))
+                why: None
             }
         );
+        assert_eq!(left(cx).as_deref(), Some("the keychain refused"));
         assert_eq!(keychain.items.lock().unwrap().len(), 1);
+        // It is the connection's to say, not a message's: a sign-in begun and given up leaves it.
+        connection.update(cx, |c, cx| c.sign_in(cx));
+        connection.update(cx, |c, cx| c.cancel_sign_in(cx));
+        assert_eq!(left(cx).as_deref(), Some("the keychain refused"));
 
         // A sign-in the keychain keeps nothing of, over an earlier one it will not delete, says
         // the earlier one is what the next launch reads.
@@ -1270,6 +1324,7 @@ mod tests {
                 ..
             } if why == "the keychain refused"
         ));
+        assert_eq!(left(cx).as_deref(), Some("the keychain refused"));
         assert_eq!(keychain.items.lock().unwrap().len(), 1);
         // And one whose write the keychain refuses deletes the earlier one rather than leave it.
         served.lock().unwrap().no_refresh = false;
@@ -1288,6 +1343,106 @@ mod tests {
         });
         browser.join().unwrap();
         assert!(keychain.items.lock().unwrap().is_empty());
+        assert_eq!(left(cx), None);
+    }
+
+    /// The target's keychain work takes its turns in order. A sign-in made while a sign-out's
+    /// delete is under way reaches the keychain after it, so the delete cannot take the item the
+    /// new sign-in kept; and one cancelled while it waits its turn revokes the token it was
+    /// given, which nothing else would hold.
+    #[gpui::test]
+    async fn a_sign_in_made_during_a_sign_out_reaches_the_keychain_after_it(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served {
+            lives: 300,
+            ..Served::default()
+        }));
+        served.lock().unwrap().refresh.insert("kept".into());
+        let keychain = Arc::new(MemoryKeychain::default());
+        let key = format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}");
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key.clone(), ("user_1".into(), b"kept".to_vec()));
+        let connection = connection(&served, keychain.clone(), cx);
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the kept sign-in", |cx| {
+            sign_in_state(&connection, cx).0 == ConnectionState::Ready
+        });
+        let kept = |keychain: &MemoryKeychain| {
+            keychain
+                .items
+                .lock()
+                .unwrap()
+                .get(&key)
+                .map(|(_, secret)| String::from_utf8(secret.clone()).unwrap())
+        };
+        assert_eq!(kept(&keychain).as_deref(), Some("r1"), "rotated at launch");
+        let exchanged = |served: &Arc<Mutex<Served>>| {
+            served
+                .lock()
+                .unwrap()
+                .log
+                .iter()
+                .filter(|line| line.starts_with("token authorization_code"))
+                .count()
+        };
+        // Signs out with its delete held, then signs in: the sign-in is exchanged and waits.
+        let sign_out_held_then_sign_in = |cx: &mut TestAppContext| {
+            let (release, gate) = oneshot::channel::<()>();
+            *keychain.delete_gate.lock().unwrap() = Some(gate.shared());
+            connection.update(cx, |c, cx| c.sign_out(cx));
+            until(cx, "the sign-out", |cx| {
+                sign_in_state(&connection, cx).0 == ConnectionState::Unauthorized
+            });
+            let before = exchanged(&served);
+            connection.update(cx, |c, cx| c.sign_in(cx));
+            let browser = approve(&served, &cx.opened_url().unwrap());
+            until(cx, "the code exchanged", |_| exchanged(&served) > before);
+            browser.join().unwrap();
+            cx.run_until_parked();
+            assert!(
+                matches!(sign_in_state(&connection, cx).1, SignIn::Waiting { .. }),
+                "the sign-in waits for the sign-out's delete"
+            );
+            release
+        };
+
+        // Cancelled while it waits: its token, r2, is revoked, and the keychain has nothing.
+        let release = sign_out_held_then_sign_in(cx);
+        connection.update(cx, |c, cx| c.cancel_sign_in(cx));
+        release.send(()).unwrap();
+        until(cx, "the cancelled sign-in's revocation", |_| {
+            served.lock().unwrap().log.iter().any(|l| l == "revoke r2")
+        });
+        cx.run_until_parked();
+        assert_eq!(kept(&keychain), None);
+
+        // Signed in again (r3), then the same with the sign-in let through: its own token, r4,
+        // is what the keychain holds once the delete before it is done.
+        connection.update(cx, |c, cx| c.sign_in(cx));
+        let browser = approve(&served, &cx.opened_url().unwrap());
+        until(cx, "the sign-in", |cx| {
+            sign_in_state(&connection, cx).0 == ConnectionState::Ready
+        });
+        browser.join().unwrap();
+        assert_eq!(kept(&keychain).as_deref(), Some("r3"));
+        let release = sign_out_held_then_sign_in(cx);
+        assert_eq!(kept(&keychain).as_deref(), Some("r3"), "nothing yet");
+        release.send(()).unwrap();
+        until(cx, "the new sign-in", |cx| {
+            matches!(
+                sign_in_state(&connection, cx).1,
+                SignIn::SignedIn {
+                    kept: Kept::This,
+                    ..
+                }
+            )
+        });
+        assert_eq!(kept(&keychain).as_deref(), Some("r4"));
     }
 
     #[gpui::test]
@@ -1724,19 +1879,19 @@ mod tests {
         let Err(ended) = smol::block_on(source.token(Arc::default())) else {
             panic!("the grant ended");
         };
-        assert!(
-            ended.why.starts_with("Signed out: ")
-                && ended.why.ends_with(&kept_behind("the keychain refused")),
-            "{}",
-            ended.why
+        assert!(ended.why.starts_with("Signed out: "), "{}", ended.why);
+        assert_eq!(
+            source.kept_in_keychain(),
+            Kept::Earlier("the keychain refused".into())
         );
         assert_eq!(keychain.items.lock().unwrap()[&key].1, b"stale".to_vec());
     }
 
-    /// A refresh the service answers after its sign-in was signed out keeps nothing: the
-    /// sign-out's delete is the keychain's last word on it. Before, the refresh, running while
-    /// the sign-out waited for it, wrote its rotated token after the sign-out began, so a
-    /// sign-in made meanwhile could find its own item replaced, then deleted.
+    /// A refresh the service answers after its sign-in was signed out keeps nothing in the
+    /// keychain, so the sign-out's delete is its last word on it, and the sign-out revokes the
+    /// rotated token, the one the service still honours. Before, the refresh, running while the
+    /// sign-out waited for it, wrote its rotated token after the sign-out began, so a sign-in
+    /// made meanwhile could find its own item replaced, then deleted.
     #[test]
     fn a_refresh_that_answers_after_its_sign_out_keeps_nothing() {
         let served = Arc::new(Mutex::new(Served {
@@ -1783,13 +1938,19 @@ mod tests {
         assert!(asked.is_none(), "the ask was dropped mid-exchange");
         let ending = source.sign_out();
         served.lock().unwrap().hold_token = false;
-        let Ending { forgotten, .. } = smol::block_on(ending);
+        let Ending {
+            forgotten,
+            revocation,
+        } = smol::block_on(ending);
         assert_eq!(forgotten, Err("the keychain refused".to_owned()));
         assert_eq!(
             keychain.items.lock().unwrap()[&key].1,
             b"kept".to_vec(),
             "the rotated token was not written after the sign-out"
         );
+        smol::block_on(revocation);
+        let log = served.lock().unwrap().log.clone();
+        assert!(log.contains(&"revoke r1".to_owned()), "{log:?}");
     }
 
     #[gpui::test]
