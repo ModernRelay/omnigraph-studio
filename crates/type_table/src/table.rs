@@ -4714,8 +4714,13 @@ impl TypeTable {
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
         // The footer's key hints read the bindings of the frame drawn before, which still had
-        // the editor focused; draw once more so they show the table's keys again.
-        cx.on_next_frame(window, |_, window, _| window.refresh());
+        // the editor focused: the workspace, which draws the footer, draws once more so they
+        // show the table's keys again. Not a refresh, which would draw every view in the
+        // window again, skipping every cache (this table's grid, every pane).
+        let workspace = self.workspace.clone();
+        cx.on_next_frame(window, move |_, _, cx| {
+            workspace.update(cx, |_, cx| cx.notify()).ok();
+        });
     }
 
     /// Whether rows without a value of the sort's property can follow those with one: not when
@@ -8284,10 +8289,9 @@ impl TypeTable {
     /// all out; a dash while some are checked.
     fn render_all_check(&self, cx: &mut Context<Self>) -> AnyElement {
         let state = self.all_check_state();
-        let loaded = self.distinct_rows();
         let tooltip = match state {
-            ToggleState::Selected => "Clear the selection (Esc)".to_owned(),
-            _ => format!("Select the {} loaded", plural(loaded, "row", "rows")),
+            ToggleState::Selected => "Clear the selection (Esc)",
+            _ => "Select every loaded row",
         };
         studio_ui::ds::check_box("all-rows-check", state, cx)
             .debug_selector(|| "all-rows-check".into())
@@ -8315,16 +8319,6 @@ impl TypeTable {
         } else {
             ToggleState::Indeterminate
         }
-    }
-
-    /// How many rows are loaded: grouped by a relationship, a row shows under each of its
-    /// neighbours, and counts once.
-    fn distinct_rows(&self) -> usize {
-        self.rows
-            .iter()
-            .map(|row| row.id.as_str())
-            .collect::<HashSet<_>>()
-            .len()
     }
 
     /// Checks every loaded row, or takes them all out when every one is checked.
