@@ -44,8 +44,8 @@ use studio_ui::{ColumnDrag, ColumnResize, GridPlace, ROW_HEIGHT, columns_in_view
 use studio_workspace::{Item, ItemEvent, ItemStatus, KeyHint, SavedItem, ToastKind, Workspace};
 use ui::prelude::*;
 use ui::{
-    ColumnWidthConfig, PopoverMenu, PopoverMenuHandle, Table, TableInteractionState,
-    TintColor, Tooltip,
+    ColumnWidthConfig, PopoverMenu, PopoverMenuHandle, Table, TableInteractionState, TintColor,
+    Tooltip,
 };
 
 use crate::blob_write::{self, Binding, BlobChange, BlobEdit, BlobWritten};
@@ -1692,7 +1692,9 @@ impl TypeTable {
                 .tooltip(Tooltip::text(delete_refused.unwrap_or_else(|| {
                     format!("Delete the {} selected", plural(count, "row", "rows"))
                 })))
-                .on_click(cx.listener(|this, _, window, cx| this.on_delete(&DeleteRow, window, cx))),
+                .on_click(
+                    cx.listener(|this, _, window, cx| this.on_delete(&DeleteRow, window, cx)),
+                ),
         );
         Some(
             bar.children(self.bulk.notice.clone().map(|notice| {
@@ -6698,14 +6700,6 @@ impl TypeTable {
             let ops = self.ops_for(&draft.property);
             let property_table = table.clone();
             let chosen_icon = self.key_icon(&draft.property);
-            let rule = studio_ui::ds::surface::rule(cx);
-            let divider = move || {
-                div()
-                    .w(px(studio_ui::ds::size::HAIRLINE))
-                    .h_full()
-                    .flex_none()
-                    .bg(rule)
-            };
             let chevron = || studio_ui::ds::icon::meta(IconName::ChevronDown);
             // The filter being written is the pill it will become, outlined while it is open:
             // a ring outside it as the pill's own edge is, so its buttons keep a button's height.
@@ -6770,7 +6764,7 @@ impl TypeTable {
                             }))
                         }),
                 )
-                .child(divider())
+                .child(studio_ui::ds::pill_rule(cx))
                 .child(
                     PopoverMenu::new("filter-op")
                         .with_handle(self.filter_menus[1].clone())
@@ -6804,7 +6798,7 @@ impl TypeTable {
                         && !menu_open
                         && !draft.offers.is_empty())
                     .then(|| self.render_suggestions(draft, cx));
-                    pill.child(divider()).child(
+                    pill.child(studio_ui::ds::pill_rule(cx)).child(
                         div()
                             .key_context("FilterValue")
                             .on_action(cx.listener(|this, _: &SelectNextSuggestion, _, cx| {
@@ -6820,7 +6814,7 @@ impl TypeTable {
                             .children(offers),
                     )
                 })
-                .child(divider())
+                .child(studio_ui::ds::pill_rule(cx))
                 .child(
                     h_flex()
                         .h_full()
@@ -8271,7 +8265,9 @@ impl TypeTable {
             .left(px(KEY_INSET))
             .top(px((ROW_HEIGHT - studio_ui::ds::size::CHECK) / 2.))
             .when(!shown, |check| {
-                check.invisible().group_hover(ROW_GROUP, |style| style.visible())
+                check
+                    .invisible()
+                    .group_hover(ROW_GROUP, |style| style.visible())
             })
             .on_mouse_down(MouseButton::Left, |_, window, cx| {
                 // The keyboard stays where it was, and the cell under the box hears nothing.
@@ -8297,7 +8293,9 @@ impl TypeTable {
             .debug_selector(|| "all-rows-check".into())
             .absolute()
             .left(px(KEY_INSET))
-            .top(px((studio_ui::HEADER_HEIGHT - studio_ui::ds::size::CHECK) / 2.))
+            .top(px(
+                (studio_ui::HEADER_HEIGHT - studio_ui::ds::size::CHECK) / 2.
+            ))
             .tooltip(Tooltip::text(tooltip))
             .on_mouse_down(MouseButton::Left, |_, window, cx| {
                 window.prevent_default();
@@ -13038,12 +13036,18 @@ mod tests {
         assert_eq!(state(cx), ToggleState::Indeterminate);
         table.update(cx, |table, cx| {
             assert_eq!(table.cursor, cursor, "a checkbox moves no cursor");
-            assert!(table.render_bulk_bar(cx).is_some(), "one checked row has the bar");
+            assert!(
+                table.render_bulk_bar(cx).is_some(),
+                "one checked row has the bar"
+            );
         });
         click(cx, "all-rows-check");
         assert_eq!(picked(cx), ["p2", "p1"]);
         click(cx, "all-rows-check");
-        assert!(picked(cx).is_empty(), "all checked, the select-all takes them out");
+        assert!(
+            picked(cx).is_empty(),
+            "all checked, the select-all takes them out"
+        );
         table.update(cx, |table, cx| assert!(table.render_bulk_bar(cx).is_none()));
     }
 

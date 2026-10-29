@@ -4438,9 +4438,8 @@ impl Render for Workspace {
         // hover), so the state is compared at most every `SAVE_CHECK`, not on every frame.
         // The connection dot beats while its server is ready and someone can see it; render
         // runs when either changes (a connection's state, the window's activation).
-        let live = self.server_ready(cx)
-            && window.is_window_active()
-            && studio_ui::motion::enabled(cx);
+        let live =
+            self.server_ready(cx) && window.is_window_active() && studio_ui::motion::enabled(cx);
         self.count_beats(live, cx);
         if self._save_check.is_none() {
             self._save_check = Some(cx.spawn(async move |this, cx| {

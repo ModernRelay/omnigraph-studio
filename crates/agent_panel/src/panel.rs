@@ -4846,7 +4846,11 @@ impl AgentPanel {
                     .border_t_1()
                     .dotted(cx)
                     .tooltip(Tooltip::text(entry.text.clone()))
-                    .child(studio_ui::ds::dot(if next { Color::Accent } else { Color::Muted }))
+                    .child(studio_ui::ds::dot(if next {
+                        Color::Accent
+                    } else {
+                        Color::Muted
+                    }))
                     .child(
                         div().flex_1().min_w_0().child(
                             studio_ui::ds::text::body(line)

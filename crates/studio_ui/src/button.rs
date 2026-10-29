@@ -794,14 +794,14 @@ mod tests {
                         div().debug_selector(|| "control-chip".into()).child(
                             ds::control_chip(
                                 "chip",
-                                div()
-                                    .debug_selector(|| "chip-button".into())
-                                    .child(ds::chip_button(
+                                div().debug_selector(|| "chip-button".into()).child(
+                                    ds::chip_button(
                                         "chip-button",
                                         ui::IconName::Filter,
                                         "Filters",
                                         Some("2".into()),
-                                    )),
+                                    ),
+                                ),
                             )
                             .on_clear("Clear the filters", |_, _, _| {}),
                         ),
@@ -887,7 +887,10 @@ mod tests {
         let chip = bounds(cx, "control-chip");
         let chip_button = bounds(cx, "chip-button");
         assert_eq!(f32::from(chip.size.height), ds::size::BAR_BUTTON);
-        assert_eq!(chip_button.size.height, chip.size.height, "the button fills its chip");
+        assert_eq!(
+            chip_button.size.height, chip.size.height,
+            "the button fills its chip"
+        );
         assert_eq!(chip_button.origin, chip.origin, "from the chip's start");
         let clear = bounds(cx, "chip-clear");
         assert_eq!(f32::from(clear.size.height), ds::size::ROW_BUTTON);
