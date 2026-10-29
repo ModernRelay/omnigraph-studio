@@ -203,9 +203,9 @@ pub struct Connection {
 /// A sign-in under way.
 struct SigningIn {
     _task: Task<()>,
-    /// What becomes of it once kept, from when it is finishing: it is not cancelled then
-    /// ([`Connection::end_sign_ins`]). Shared with the sign-in finished, which ends as it says
-    /// should the connection be gone before it takes it.
+    /// Set once it is finishing, when it is not cancelled ([`Connection::end_sign_ins`]): how it
+    /// is to end once kept, if told meanwhile. Shared with the sign-in finished, which ends so
+    /// should the connection be released before it takes it.
     finish: Option<Told>,
     /// The sign-in it would replace, when the service ended that one meanwhile, and why: ended
     /// as replaced, which this one waits for before it reaches the keychain, and said should
@@ -223,19 +223,15 @@ impl SigningIn {
     }
 }
 
-/// What a finishing sign-in was last told ([`Finish`]), which the connection and the sign-in
-/// finished share.
-type Told = Arc<Mutex<Finish>>;
-
-/// A keychain turn at an item ([`sign_in::KeychainTurns::next`]): the work to wait for first, and
-/// what to send once this turn's is done.
-type Turn = (Option<KeychainTurn>, oneshot::Sender<()>);
+/// How a finishing sign-in is to end once kept, when a sign-out or a drop ended it meanwhile, as
+/// one held would; untold, it is taken. The connection and the sign-in finished share it.
+type Told = Arc<Mutex<Option<End>>>;
 
 /// A sign-in whose keychain work is done, until the connection takes it: the sign-in, the token
 /// of an earlier item the keychain let go of (held by nothing, so revoked), what it was told, and
-/// its item's keychain turn. Dropped untaken (the connection released, or gone before it took
-/// it), it ends as told, a release as for a retired connection ([`End::Dropped`]), and its turn
-/// passes on only once that ending has dealt with the item.
+/// its item's keychain turn. Dropped untaken (its connection released before it took it), it ends
+/// as told, or untold as for a retired connection ([`End::Dropped`]), and its turn passes on only
+/// once that ending has dealt with the item.
 struct Finished {
     source: Option<OAuthSource>,
     let_go: Option<String>,
@@ -245,7 +241,14 @@ struct Finished {
 
 impl Finished {
     /// The connection takes it, and answers for all of it from here.
-    fn take(mut self) -> (OAuthSource, Option<String>, Finish, oneshot::Sender<()>) {
+    fn take(
+        mut self,
+    ) -> (
+        OAuthSource,
+        Option<String>,
+        Option<End>,
+        oneshot::Sender<()>,
+    ) {
         (
             self.source.take().expect("a finished sign-in, taken once"),
             self.let_go.take(),
@@ -267,11 +270,7 @@ impl Drop for Finished {
                 .service()
                 .revoke(source.service().token_client(), token);
         }
-        let how = match told(&self.told) {
-            Finish::Take => End::Dropped,
-            Finish::End(how) => how,
-        };
-        let ending = source.end(how, None);
+        let ending = source.end(told(&self.told).unwrap_or(End::Dropped), None);
         smol::spawn(async move {
             ending.await;
             done.send(()).ok();
@@ -281,18 +280,8 @@ impl Drop for Finished {
 }
 
 /// What `told` says now.
-fn told(told: &Told) -> Finish {
+fn told(told: &Told) -> Option<End> {
     *told.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// What becomes of a sign-in finishing (given its tokens, its keychain work under way) once its
-/// keychain work is done.
-#[derive(Clone, Copy)]
-enum Finish {
-    /// It is taken.
-    Take,
-    /// A sign-out or a drop ended it meanwhile: it ends so, as one held would.
-    End(End),
 }
 
 /// What an ask for a token is for, which decides what its answer does.
@@ -1256,28 +1245,27 @@ impl Connection {
             // to its end, the connection released meanwhile or not.
             let signed_in = match signed_in {
                 Ok((tokens, unclaimed)) => {
-                    let told = Arc::new(Mutex::new(Finish::Take));
-                    let Ok(taken) = this.update(cx, |this, cx| {
+                    let told = Arc::new(Mutex::new(None));
+                    // The sign-in under way owns this task, so it is there; were it not, nothing
+                    // would take the tokens, and their guard would revoke them.
+                    let Ok(Some(taken)) = this.update(cx, |this, cx| {
+                        let under_way = this.signing_in.as_mut()?;
+                        under_way.finish = Some(told.clone());
+                        // The one it replaces: held, or ended by the service meanwhile.
+                        let previous = this
+                            .oauth
+                            .clone()
+                            .or_else(|| under_way.replaced.take().map(|(previous, _)| previous));
                         this.sign_in = SignIn::Finishing {
                             service: service.host(),
                         };
-                        // The one it replaces: held, or ended by the service meanwhile.
-                        let previous = match &mut this.signing_in {
-                            Some(under_way) => {
-                                under_way.finish = Some(told.clone());
-                                this.oauth.clone().or_else(|| {
-                                    under_way.replaced.take().map(|(previous, _)| previous)
-                                })
-                            }
-                            None => this.oauth.clone(),
-                        };
                         cx.emit(ConnectionEvent::StateChanged);
                         cx.notify();
-                        (
+                        Some((
                             context.turns.next(&service.key(&target)),
                             previous,
                             this.current(service.clone()),
-                        )
+                        ))
                     }) else {
                         return;
                     };
@@ -1390,14 +1378,14 @@ impl Connection {
     /// other work reads the item between its write and that ending; the target made anonymous
     /// again then, the server's answer offers a sign-in, which reads the item after.
     fn take_sign_in(&mut self, finished: Finished, cx: &mut Context<Self>) {
-        let (source, let_go, finish, done) = finished.take();
+        let (source, let_go, told, done) = finished.take();
         source.reach_through(self.http.clone());
         if let Some(token) = let_go {
             let service = self.current(source.service().clone());
             service.revoke(service.token_client(), token);
         }
-        match finish {
-            Finish::End(how) => {
+        match told {
+            Some(how) => {
                 self.end_in_turn(source, how, (None, done), cx);
                 if self.token_source.is_none()
                     && self.state == ConnectionState::Unauthorized
@@ -1406,7 +1394,7 @@ impl Connection {
                     self.connect(cx);
                 }
             }
-            Finish::Take => {
+            None => {
                 done.send(()).ok();
                 self.use_sign_in(source, cx);
             }
@@ -1528,9 +1516,9 @@ impl Connection {
             .and_then(|under_way| under_way.finish.as_ref())
         {
             Some(told) => {
-                let mut finish = told.lock().unwrap_or_else(PoisonError::into_inner);
-                if !matches!(*finish, Finish::End(End::SignOut)) {
-                    *finish = Finish::End(how);
+                let mut told = told.lock().unwrap_or_else(PoisonError::into_inner);
+                if *told != Some(End::SignOut) {
+                    *told = Some(how);
                 }
                 true
             }
@@ -1582,7 +1570,7 @@ impl Connection {
         &mut self,
         source: OAuthSource,
         how: End,
-        (before, done): Turn,
+        (before, done): (Option<KeychainTurn>, oneshot::Sender<()>),
         cx: &mut Context<Self>,
     ) {
         let ending = source.end(how, before);

@@ -2391,77 +2391,82 @@ mod tests {
         assert_eq!(kept(&connection, cx), Kept::This);
     }
 
-    /// A connection retired and released while a sign-in finishes (its target gone from the
-    /// CLI) lets the sign-in's keychain work finish, which runs on its own: the write over an
-    /// earlier item lands, and that item's token, held by nothing then, is revoked. The new
-    /// sign-in is dropped as the retirement told it, kept for the target's return, and a
-    /// connection to it later takes its turn at the item and signs in with it. Before, the
-    /// release cut the work off mid-write, leaving the overwritten token with nobody.
+    /// A connection released while a sign-in finishes, retired first as when its target is gone
+    /// from the CLI or not as when Studio quits, lets the sign-in's keychain work finish, which
+    /// runs on its own: the write over an earlier item lands, and that item's token, held by
+    /// nothing then, is revoked. The new sign-in is dropped as for a retired connection, kept for
+    /// the target's return, and a connection to it later takes its turn at the item and signs in
+    /// with it. Before, the release cut the work off mid-write, leaving the overwritten token with
+    /// nobody.
     #[gpui::test]
     async fn a_connection_released_while_a_sign_in_finishes_lets_it_finish(
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
-        let served = Arc::new(Mutex::new(Served {
-            lives: 300,
-            ..Served::default()
-        }));
-        let keychain = Arc::new(MemoryKeychain::default());
-        // An earlier item the keychain will not let go of at launch: said as left.
-        keychain
-            .items
-            .lock()
-            .unwrap()
-            .insert(key("work"), ("user_9".into(), b"earlier".to_vec()));
-        keychain.refuses_deletes.store(true, Ordering::SeqCst);
-        let context = context(&served, keychain.clone());
-        let connection = connection_in(&served, context.clone(), cx);
-        connection.update(cx, |c, cx| c.connect(cx));
-        until(cx, "the earlier sign-in refused", |cx| {
-            matches!(
-                sign_in_state(&connection, cx).1,
-                SignIn::Offered { why: Some(_), .. }
-            )
-        });
-        keychain.refuses_deletes.store(false, Ordering::SeqCst);
-        let (release, gate) = oneshot::channel::<()>();
-        *keychain.write_gate.lock().unwrap() = Some(gate.shared());
-        let writes = keychain.writes.load(Ordering::SeqCst);
-        connection.update(cx, |c, cx| c.sign_in(cx));
-        let browser = approve(&served, &cx.opened_url().unwrap());
-        until(cx, "the new sign-in's write under way", |_| {
-            keychain.writes.load(Ordering::SeqCst) > writes
-        });
-        browser.join().unwrap();
-        // As the registry does: retired, then released.
-        connection.update(cx, |c, cx| {
-            c.retire("The CLI no longer lists it".into(), cx)
-        });
-        let released = connection.downgrade();
-        drop(connection);
-        cx.update(|_| {});
-        cx.run_until_parked();
-        assert!(released.upgrade().is_none(), "the connection released");
-        release.send(()).unwrap();
-        let logged = |line: &str| served.lock().unwrap().log.iter().any(|l| l == line);
-        until(cx, "the earlier token revoked", |_| {
-            logged("revoke earlier")
-        });
-        assert_eq!(
-            keychain.items.lock().unwrap()[&key("work")].1,
-            b"r1".to_vec()
-        );
-        // A connection to the target later reads the item in its turn, and signs in with it.
-        let again = connection_in(&served, context, cx);
-        again.update(cx, |c, cx| c.connect(cx));
-        until(cx, "signed in with the sign-in kept", |cx| {
-            let (state, sign_in, _) = sign_in_state(&again, cx);
-            state == ConnectionState::Ready && matches!(sign_in, SignIn::SignedIn { .. })
-        });
-        assert!(
-            !logged("revoke r1"),
-            "kept for the target's return, so not revoked"
-        );
+        for retired in [true, false] {
+            let served = Arc::new(Mutex::new(Served {
+                lives: 300,
+                ..Served::default()
+            }));
+            let keychain = Arc::new(MemoryKeychain::default());
+            // An earlier item the keychain will not let go of at launch: said as left.
+            keychain
+                .items
+                .lock()
+                .unwrap()
+                .insert(key("work"), ("user_9".into(), b"earlier".to_vec()));
+            keychain.refuses_deletes.store(true, Ordering::SeqCst);
+            let context = context(&served, keychain.clone());
+            let connection = connection_in(&served, context.clone(), cx);
+            connection.update(cx, |c, cx| c.connect(cx));
+            until(cx, "the earlier sign-in refused", |cx| {
+                matches!(
+                    sign_in_state(&connection, cx).1,
+                    SignIn::Offered { why: Some(_), .. }
+                )
+            });
+            keychain.refuses_deletes.store(false, Ordering::SeqCst);
+            let (release, gate) = oneshot::channel::<()>();
+            *keychain.write_gate.lock().unwrap() = Some(gate.shared());
+            let writes = keychain.writes.load(Ordering::SeqCst);
+            connection.update(cx, |c, cx| c.sign_in(cx));
+            let browser = approve(&served, &cx.opened_url().unwrap());
+            until(cx, "the new sign-in's write under way", |_| {
+                keychain.writes.load(Ordering::SeqCst) > writes
+            });
+            browser.join().unwrap();
+            // Retired, then released, as the registry does; or released alone, as at quitting.
+            if retired {
+                connection.update(cx, |c, cx| {
+                    c.retire("The CLI no longer lists it".into(), cx)
+                });
+            }
+            let released = connection.downgrade();
+            drop(connection);
+            cx.update(|_| {});
+            cx.run_until_parked();
+            assert!(released.upgrade().is_none(), "the connection released");
+            release.send(()).unwrap();
+            let logged = |line: &str| served.lock().unwrap().log.iter().any(|l| l == line);
+            until(cx, "the earlier token revoked", |_| {
+                logged("revoke earlier")
+            });
+            assert_eq!(
+                keychain.items.lock().unwrap()[&key("work")].1,
+                b"r1".to_vec()
+            );
+            // A connection to the target later reads the item in its turn, and signs in with it.
+            let again = connection_in(&served, context, cx);
+            again.update(cx, |c, cx| c.connect(cx));
+            until(cx, "signed in with the sign-in kept", |cx| {
+                let (state, sign_in, _) = sign_in_state(&again, cx);
+                state == ConnectionState::Ready && matches!(sign_in, SignIn::SignedIn { .. })
+            });
+            assert!(
+                !logged("revoke r1"),
+                "kept for the target's return, so not revoked (retired: {retired})"
+            );
+        }
     }
 
     /// A sign-out while a sign-in as someone else finishes stands through the connection's
@@ -2623,6 +2628,9 @@ mod tests {
         assert!(keychain.items.lock().unwrap().is_empty());
     }
 
+    /// A sign-in as someone else that fails while the one held still stands says why, and what
+    /// the one held is: not answering, when its service does not answer, not "Not admitted".
+    /// And one that fails after the one held was refused says why that one ended too.
     #[gpui::test]
     async fn a_failed_sign_in_says_what_became_of_the_one_held(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
