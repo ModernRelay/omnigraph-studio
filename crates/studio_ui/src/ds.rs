@@ -1012,23 +1012,24 @@ pub fn type_dot(type_name: &str) -> Div {
     )
 }
 
-/// A dot that, while `live` (a server that answers), beats: every [`motion::PULSE`] a ring
-/// goes out from it and fades ([`motion::pulse`]). The ring draws outside the dot's box, so it
-/// takes no room. It redraws its view at most [`motion::AMBIENT_FPS`] times a second, and a
-/// caller makes it live only while someone can see it (its window in front); with reduced
-/// motion it is still.
-pub fn live_dot(id: impl Into<ElementId>, color: Hsla, live: bool, cx: &App) -> Div {
+/// A dot that beats while given its `beat` (a server that answers): each beat sends one ring
+/// out from it, which fades in [`motion::PULSE_RING`] ([`motion::pulse`]), redrawing at most
+/// [`motion::AMBIENT_FPS`] times a second; then nothing is drawn until the next beat. The
+/// caller counts the beats, [`motion::PULSE`] apart, and only while someone can see the dot
+/// (its window in front), since every frame builds the whole window's scene. The ring draws
+/// outside the dot's box, so it takes no room; with reduced motion the dot is still.
+pub fn live_dot(id: impl Into<SharedString>, color: Hsla, beat: Option<u64>, cx: &App) -> Div {
     /// How far the ring goes past the dot's edge.
     const REACH: f32 = 4.;
     let dot = div().size(px(size::DOT)).flex_none().rounded_full().bg(color);
-    if !live || !motion::enabled(cx) {
+    let Some(beat) = beat.filter(|_| motion::enabled(cx)) else {
         return dot;
-    }
+    };
+    // A new id for each beat: GPUI keeps a finished animation's state under its id, so a ring
+    // runs once, and the next beat's is a new animation.
     let ring = div().absolute().rounded_full().with_animation(
-        id,
-        Animation::new(motion::PULSE)
-            .repeat()
-            .with_max_fps(motion::AMBIENT_FPS),
+        ElementId::NamedInteger(id.into(), beat),
+        Animation::new(motion::PULSE_RING).with_max_fps(motion::AMBIENT_FPS),
         move |ring, t| {
             let (reach, seen) = motion::pulse(t);
             let side = size::DOT + 2. * REACH * reach;

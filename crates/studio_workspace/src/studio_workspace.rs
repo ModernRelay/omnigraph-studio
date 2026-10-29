@@ -362,6 +362,10 @@ pub struct Workspace {
     _save: Option<Task<()>>,
     /// The next comparison of the state with what was last written.
     _save_check: Option<Task<()>>,
+    /// The status bar's connection dot's beats, counted every `motion::PULSE` by `_beats` while
+    /// its server is ready and the window in front ([`Workspace::count_beats`]).
+    beat: u64,
+    _beats: Option<Task<()>>,
     _save_bounds: Option<Task<()>>,
     /// The window's place and size the debounced save above has still to write.
     pending_bounds: Option<Bounds<Pixels>>,
@@ -573,6 +577,8 @@ impl Workspace {
             saved: None,
             _save: None,
             _save_check: None,
+            beat: 0,
+            _beats: None,
             _save_bounds: None,
             pending_bounds: None,
             _bounds_subscription: bounds_subscription,
@@ -2960,7 +2966,40 @@ impl Workspace {
     /// dot, the server and the graph. It opens the graph switcher: the graphs open in this
     /// window, another graph, closing this one. The connection's state shows beside it only
     /// when it is not ready, and always in its tooltip, with the round trip and the actor.
-    fn render_graph_switcher(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Whether the window's server answers: its connection is ready.
+    fn server_ready(&self, cx: &App) -> bool {
+        self.session.as_ref().is_some_and(|session| {
+            session.read(cx).connection.read(cx).state == ConnectionState::Ready
+        })
+    }
+
+    /// Counts the connection dot's beats, one every `motion::PULSE`, while it is `live`.
+    /// Not live, the count stops (its task dropped), so a dot nobody sees asks for no frames.
+    fn count_beats(&mut self, live: bool, cx: &mut Context<Self>) {
+        if !live {
+            self._beats = None;
+            return;
+        }
+        if self._beats.is_some() {
+            return;
+        }
+        self._beats = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(studio_ui::motion::PULSE)
+                    .await;
+                let counted = this.update(cx, |this, cx| {
+                    this.beat += 1;
+                    cx.notify();
+                });
+                if counted.is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn render_graph_switcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (color, server, url, state, ready, actor, graph, unavailable) = match &self.session {
             Some(session) => {
                 let s = session.read(cx);
@@ -3032,7 +3071,7 @@ impl Workspace {
                     .child(studio_ui::ds::live_dot(
                         "connection-dot",
                         color.color(cx),
-                        ready && window.is_window_active(),
+                        self._beats.is_some().then_some(self.beat),
                         cx,
                     ))
                     .child(studio_ui::ds::text::muted(server).single_line())
@@ -3671,7 +3710,6 @@ impl Workspace {
     fn render_status_bar(
         &self,
         status: Option<ItemStatus>,
-        window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let status_background = studio_ui::ds::surface::status_bar(cx);
@@ -3703,7 +3741,7 @@ impl Workspace {
                     .child(self.render_panel_buttons(PanelPosition::Left, cx))
                     .child(studio_ui::ds::divider_v(cx))
             })
-            .child(self.render_graph_switcher(window, cx))
+            .child(self.render_graph_switcher(cx))
             .children(self.render_branch(cx))
             .when(has_start, |bar| bar.child(studio_ui::ds::divider_v(cx)))
             .children(status.start);
@@ -4398,6 +4436,12 @@ impl Render for Workspace {
         // Every change to tabs or panels re-renders the workspace, so this sees all of them. The
         // workspace also renders whenever anything inside it notifies (a streamed reply, a
         // hover), so the state is compared at most every `SAVE_CHECK`, not on every frame.
+        // The connection dot beats while its server is ready and someone can see it; render
+        // runs when either changes (a connection's state, the window's activation).
+        let live = self.server_ready(cx)
+            && window.is_window_active()
+            && studio_ui::motion::enabled(cx);
+        self.count_beats(live, cx);
         if self._save_check.is_none() {
             self._save_check = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(SAVE_CHECK).await;
@@ -4731,7 +4775,7 @@ impl Render for Workspace {
                 .child(docks)
                 .children(self.render_zoomed(cx)),
         )
-        .child(self.render_status_bar(status, window, cx))
+        .child(self.render_status_bar(status, cx))
         .child(self.render_toasts(cx))
         .children(modal)
     }
@@ -6161,6 +6205,58 @@ mod tests {
                 "the dock's button takes it from the tab under it"
             );
         });
+    }
+
+    /// The connection dot beats, one beat a pulse, only while its server is ready and the
+    /// window in front, so a dot nobody sees asks for no frames; a server that stops answering
+    /// stops it at once (the workspace reads the connection as it draws, so GPUI draws it again
+    /// when the connection changes).
+    #[gpui::test]
+    fn the_connection_dot_beats_only_while_ready_and_seen(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            cx.set_global(StudioSettings::default());
+        });
+        let session = idle_session("http://localhost:1", "g", cx);
+        let connection = session.read_with(cx, |session, _| session.connection.clone());
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.set_session(session.clone(), window, cx)
+        });
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let beating =
+            |cx: &mut gpui::VisualTestContext| workspace.read_with(cx, |w, _| w._beats.is_some());
+        let beat = |cx: &mut gpui::VisualTestContext| workspace.read_with(cx, |w, _| w.beat);
+        let set_state = |state: ConnectionState, cx: &mut gpui::VisualTestContext| {
+            connection.update(cx, |connection, cx| {
+                connection.state = state;
+                cx.notify();
+            });
+            cx.run_until_parked();
+        };
+        let pulses = |count: u32, cx: &mut gpui::VisualTestContext| {
+            cx.executor()
+                .advance_clock(studio_ui::motion::PULSE * count);
+            cx.run_until_parked();
+        };
+        set_state(ConnectionState::Connecting, cx);
+        assert!(!beating(cx), "not ready");
+        set_state(ConnectionState::Ready, cx);
+        assert!(beating(cx), "ready and in front");
+        let before = beat(cx);
+        pulses(2, cx);
+        assert_eq!(beat(cx), before + 2, "one beat a pulse");
+        cx.deactivate_window();
+        assert!(!beating(cx), "not in front");
+        let before = beat(cx);
+        pulses(3, cx);
+        assert_eq!(beat(cx), before, "no beats behind other windows");
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        assert!(beating(cx), "in front again");
+        set_state(ConnectionState::Unreachable("refused".into()), cx);
+        assert!(!beating(cx), "stopped answering");
     }
 
     /// A session for `graph` on the server at `url`, which answers every request with a 404.
