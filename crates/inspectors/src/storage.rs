@@ -721,7 +721,7 @@ impl Render for StorageInspector {
                     .when(loading, |d| d.child(studio_ui::ds::text::meta("Reading…")))
                     .when(self.newer, |d| {
                         d.child(
-                            studio_ui::ds::toolbar_button(
+                            studio_ui::ds::button(
                                 "newer-storage",
                                 "Newer snapshot · Refresh",
                             )
@@ -736,7 +736,7 @@ impl Render for StorageInspector {
                     })
                     .child(div().flex_1())
                     .child(
-                        studio_ui::ds::toolbar_icon_button("refresh-storage", IconName::RotateCw)
+                        studio_ui::ds::icon_button("refresh-storage", IconName::RotateCw)
                             .tooltip(|_, cx| {
                                 Tooltip::for_action("Read the server's state again", &Refresh, cx)
                             })

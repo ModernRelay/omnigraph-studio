@@ -676,7 +676,7 @@ impl OntologyPage {
             h_flex()
                 .id(SharedString::from(format!("shared-{name}")))
                 .h(px(size::PILL))
-                .px(px(space::CONTROL_INSET))
+                .px(px(space::MD))
                 .gap(px(space::SM))
                 .rounded(px(ds::radii(cx).sm))
                 .bg(ds::surface::document(cx))
@@ -727,8 +727,8 @@ impl OntologyPage {
                     .selected(self.pointed == Some(Pointed::Type(ty)))
                     .muted(self.dimmed(ty, lit))
                     .tooltip(format!(
-                        "{name} · related to {related} {}",
-                        if related == 1 { "type" } else { "types" }
+                        "{name} · related to {}",
+                        studio_ui::plural(related, "type", "types")
                     ))
                     .on_click(cx.listener(move |this, _, _, cx| this.focus_on(&target, cx))),
             )
@@ -908,15 +908,13 @@ impl OntologyPage {
                 .h(px(LABEL_HEIGHT))
                 .justify_center()
                 .child(
-                    div()
+                    ds::lifted(div(), cx)
                         .h(px(LABEL_HEIGHT))
                         .px(px(space::SM))
                         .flex()
                         .items_center()
                         .rounded(px(ds::radii(cx).xs))
                         .bg(ds::surface::canvas_label(cx))
-                        .border_1()
-                        .border_color(ds::surface::divider(cx))
                         .child(if strong {
                             ds::text::meta(name).color(Color::Default)
                         } else {
@@ -1274,10 +1272,7 @@ impl OntologyPage {
                 view.schema.edges.len()
             );
             if view.map.is_none() {
-                summary += &format!(
-                    " · {groups} {}",
-                    if groups == 1 { "domain" } else { "domains" }
-                );
+                summary += &format!(" · {}", studio_ui::plural(groups, "domain", "domains"));
             }
             summary
         });

@@ -26,8 +26,8 @@ use std::time::Instant;
 use gpui::{
     App, AppContext as _, Bounds, ContentMask, Context, Entity, EventEmitter, FocusHandle,
     Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Pixels,
-    Point, Render, ScrollWheelEvent, SharedString, Size, Subscription, Task, Window, anchored,
-    canvas, deferred, point, px,
+    Point, Render, ScrollWheelEvent, SharedString, Size, Subscription, Task, Window, canvas, point,
+    px,
 };
 use graph_store::{
     EntryKind, Exploration, ExplorationEvent, ExplorePath, GraphSession, GroupKey, Loadable,
@@ -1794,11 +1794,11 @@ impl GraphCanvas {
                             }
                         }),
                     );
-                    let choices = schema
+                    let sections = schema
                         .as_ref()
-                        .map(|schema| gq_language::builder::GroupBy::choices(schema, &group))
+                        .map(|schema| gq_language::builder::GroupBy::sections(schema, &group))
                         .unwrap_or_default();
-                    if exploring && !choices.is_empty() {
+                    if exploring && !sections.is_empty() {
                         let (this, path, current) =
                             (this.clone(), node.path.clone(), grouping.clone());
                         let group = group.clone();
@@ -1821,14 +1821,18 @@ impl GraphCanvas {
                                 None,
                                 set(None),
                             );
-                            for by in &choices {
-                                menu = menu.toggleable_entry(
-                                    by.label(),
-                                    current.as_ref() == Some(by),
-                                    IconPosition::Start,
-                                    None,
-                                    set(Some(by.clone())),
-                                );
+                            // As the tree's menu shows them (spec 005).
+                            for (heading, section) in &sections {
+                                menu = menu.separator().header(heading.clone());
+                                for by in section {
+                                    menu = menu.toggleable_entry(
+                                        by.label(),
+                                        current.as_ref() == Some(by),
+                                        IconPosition::Start,
+                                        None,
+                                        set(Some(by.clone())),
+                                    );
+                                }
                             }
                             menu
                         });
@@ -2297,13 +2301,12 @@ impl GraphCanvas {
         let summary = match self.mode() {
             Mode::Results => {
                 let count = self.scene.nodes.len();
-                let noun = if count == 1 { "node" } else { "nodes" };
                 let title = self
                     .results
                     .as_ref()
                     .map(|(_, r)| r.title.clone())
                     .unwrap_or_default();
-                format!("{title} · {count} {noun}")
+                format!("{title} · {}", studio_ui::plural(count, "node", "nodes"))
             }
             Mode::Explore => {
                 let root = exploration
@@ -2315,9 +2318,8 @@ impl GraphCanvas {
                             .unwrap_or_else(|| root.id.clone())
                     })
                     .unwrap_or_default();
-                let nodes = self.node_count;
-                let noun = if nodes == 1 { "node" } else { "nodes" };
-                format!("From {root} · {nodes} {noun}")
+                let nodes = studio_ui::plural(self.node_count, "node", "nodes");
+                format!("From {root} · {nodes}")
             }
         };
         let root_error = match (&state.root_status, self.mode()) {
@@ -2390,26 +2392,21 @@ impl GraphCanvas {
                         panel("canvas-zoom")
                             .when(!self.pinned.is_empty(), |panel| {
                                 panel.child(
-                                    studio_ui::ds::bar_icon_button(
-                                        "reset-layout",
-                                        IconName::RotateCcw,
-                                    )
-                                    .tooltip(|_window, cx| {
-                                        Tooltip::for_action(
-                                            "Reset the layout: forget the nodes you placed",
-                                            &ResetLayout,
-                                            cx,
-                                        )
-                                    })
-                                    .on_click(cx.listener(
-                                        |this, _, window, cx| {
+                                    studio_ui::ds::icon_button("reset-layout", IconName::RotateCcw)
+                                        .tooltip(|_window, cx| {
+                                            Tooltip::for_action(
+                                                "Reset the layout: forget the nodes you placed",
+                                                &ResetLayout,
+                                                cx,
+                                            )
+                                        })
+                                        .on_click(cx.listener(|this, _, window, cx| {
                                             this.reset_layout(&ResetLayout, window, cx)
-                                        },
-                                    )),
+                                        })),
                                 )
                             })
                             .child(
-                                studio_ui::ds::bar_icon_button("zoom-out", IconName::Dash)
+                                studio_ui::ds::icon_button("zoom-out", IconName::Dash)
                                     .tooltip(|_window, cx| {
                                         Tooltip::for_action("Zoom out", &ZoomOut, cx)
                                     })
@@ -2427,7 +2424,7 @@ impl GraphCanvas {
                                     })),
                             )
                             .child(
-                                studio_ui::ds::bar_icon_button("zoom-in", IconName::Plus)
+                                studio_ui::ds::icon_button("zoom-in", IconName::Plus)
                                     .tooltip(|_window, cx| {
                                         Tooltip::for_action("Zoom in", &ZoomIn, cx)
                                     })
@@ -2742,16 +2739,11 @@ impl Render for GraphCanvas {
             .children(area)
             .children(body.map(|body| div().absolute().size_full().top_0().left_0().child(body)))
             .child(overlay)
-            .children(self.context_menu.as_ref().map(|(menu, position, _)| {
-                deferred(
-                    anchored()
-                        .position(*position)
-                        .anchor(gpui::Anchor::TopLeft)
-                        .snap_to_window_with_margin(px(space::MD))
-                        .child(menu.clone()),
-                )
-                .with_priority(1)
-            }))
+            .children(
+                self.context_menu
+                    .as_ref()
+                    .map(|(menu, position, _)| studio_ui::ds::menu_at(menu.clone(), *position)),
+            )
             // Nothing drawn yet: the start state says it all.
             .when(!self.scene.nodes.is_empty(), |canvas| {
                 canvas.child(self.render_caption(cx))

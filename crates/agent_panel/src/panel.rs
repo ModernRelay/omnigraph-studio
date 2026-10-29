@@ -17,7 +17,7 @@ use futures::channel::{mpsc, oneshot};
 use futures::future::Shared;
 use futures::{FutureExt as _, StreamExt as _};
 use gpui::{
-    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, FollowMode,
+    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, FollowMode, Hsla,
     ListAlignment, ListState, Render, SharedString, Subscription, Task, WeakEntity, Window, list,
 };
 use graph_client::api::CommitKind;
@@ -31,7 +31,7 @@ use studio_ui::ds::{Dotted as _, Prose as _};
 use studio_ui::menu::ContextMenu;
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
 use ui::prelude::*;
-use ui::{CircularProgress, Indicator, KeyBinding, PopoverMenu, Severity, Tooltip};
+use ui::{CircularProgress, KeyBinding, PopoverMenu, Severity, Tooltip};
 
 use crate::cli_home::{self, CliHome};
 use crate::gateway::{Gateway, GatewayEvent, OnOutcome, Seen};
@@ -198,7 +198,7 @@ pub fn open(
 }
 
 /// Opens one of the graph's conversations in its own tab, or shows the tab it is in; the agent
-/// starts and replays it.
+/// starts and replays it once the tab is shown ([`AgentPanel::start_when_shown`]).
 ///
 /// A conversation has one tab, in whichever pane it is, also while a split or a restore fills
 /// a pane with copies: a second tab would load the session again and take the first one's
@@ -222,7 +222,7 @@ pub fn open_session(
     let panel = workspace.open_item(format!("agent:{id}"), window, cx, move |window, cx| {
         AgentPanel::new(session, handle, Some(id), window, cx)
     })?;
-    panel.update(cx, |panel, cx| panel.start_if_idle(cx));
+    panel.update(cx, |panel, cx| panel.start_when_shown(cx));
     Some(panel)
 }
 
@@ -676,6 +676,31 @@ struct Usage {
     cost: Option<(f64, String)>,
 }
 
+impl Usage {
+    /// How much of the window is used, from 0 to 1, of a window whose size is known.
+    fn ratio(&self) -> f32 {
+        (self.used as f32 / self.size as f32).clamp(0., 1.)
+    }
+
+    /// The tokens used of the window's, as "12k of 200k tokens".
+    fn tokens(&self) -> String {
+        format!(
+            "{} of {} tokens",
+            humanize_tokens(self.used),
+            humanize_tokens(self.size)
+        )
+    }
+
+    /// The window as a ring filled to how much is used, in `color`, over a visible track, so it
+    /// reads as a gauge, not a spinner.
+    fn gauge(&self, color: Hsla, cx: &App) -> CircularProgress {
+        CircularProgress::new(self.used as f32, self.size as f32, px(ds::size::GAUGE), cx)
+            .stroke_width(px(ds::size::GAUGE_STROKE))
+            .bg_color(ds::surface::control_border(cx))
+            .progress_color(color)
+    }
+}
+
 /// A message sent while the agent was working, waiting for its turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Queued {
@@ -882,6 +907,10 @@ pub struct AgentPanel {
     /// The conversation this tab holds: the one it loads before the agent answers, then the one
     /// the agent opened. `None` starts a new one.
     session_id: Option<String>,
+    /// The agent starts when the tab is next drawn ([`AgentPanel::start_when_shown`]): a
+    /// conversation restored with the workspace behind another tab starts no agent until it is
+    /// shown.
+    start_owed: bool,
     /// The agent stopped with an error.
     failed: bool,
     /// The directory the agent works in for this conversation.
@@ -1095,6 +1124,7 @@ impl AgentPanel {
             replace_on_replay: None,
             said_while_starting: Vec::new(),
             session_id,
+            start_owed: false,
             failed: false,
             cwd: None,
             _focus: Some(focus),
@@ -1134,9 +1164,15 @@ impl AgentPanel {
 
     // ---- lifecycle ----
 
-    /// Starts the agent at once for a conversation to come back to, so it is on screen
-    /// without sending anything first.
-    pub fn start_if_idle(&mut self, cx: &mut Context<Self>) {
+    /// Starts the agent for a conversation to come back to when the tab is next drawn, so it is
+    /// on screen without sending anything first, and a tab not shown runs no agent.
+    pub fn start_when_shown(&mut self, cx: &mut Context<Self>) {
+        self.start_owed = true;
+        cx.notify();
+    }
+
+    /// Starts the agent at once for a conversation to come back to.
+    fn start_if_idle(&mut self, cx: &mut Context<Self>) {
         if matches!(self.state, State::Idle) && self.session_id.is_some() {
             self.start(cx);
         }
@@ -1325,12 +1361,21 @@ impl AgentPanel {
             // (`omnigraph_cli`), so the agent and Studio take the same CLI.
             let configured = graph_store::cli::configured();
             tasks.push(cx.spawn(async move |this, cx| {
-                let chosen = cx
+                let (chosen, passed_over) = cx
                     .background_spawn(async move {
-                        cli_home::choose_cli(&home, graph_store::cli::candidates()).await
+                        let chosen =
+                            cli_home::choose_cli(&home, graph_store::cli::candidates()).await;
+                        let passed_over = configured.filter(|configured| match &chosen {
+                            cli_home::CliChoice::Chosen { cli, .. } => {
+                                std::fs::canonicalize(configured).ok()
+                                    != std::fs::canonicalize(cli).ok()
+                            }
+                            _ => false,
+                        });
+                        (chosen, passed_over)
                     })
                     .await;
-                this.update(cx, |this, cx| this.cli_chosen(chosen, configured, cx))
+                this.update(cx, |this, cx| this.cli_chosen(chosen, passed_over, cx))
                     .ok();
             }));
         }
@@ -2319,12 +2364,12 @@ impl AgentPanel {
     }
 
     /// Studio found (or did not find) a CLI that speaks the graph's API for this conversation.
-    /// A configured CLI it passed over, every CLI it found when none fits, and one the agent's
-    /// shell cannot run through the wrapper, are named.
+    /// The configured CLI it passed over for another (`passed_over`), every CLI it found when
+    /// none fits, and one the agent's shell cannot run through the wrapper, are named.
     fn cli_chosen(
         &mut self,
         choice: cli_home::CliChoice,
-        configured: Option<PathBuf>,
+        passed_over: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) {
         let contract = graph_client::CONTRACT;
@@ -2346,9 +2391,7 @@ impl AgentPanel {
                 version,
                 wrapper,
             } => {
-                if let Some(configured) = configured
-                    && std::fs::canonicalize(&configured).ok() != std::fs::canonicalize(&cli).ok()
-                {
+                if let Some(configured) = passed_over {
                     self.say(
                         format!(
                             "`omnigraph_cli` ({}) does not speak this graph's HTTP API \
@@ -2722,11 +2765,14 @@ fn query_rows(output: &str) -> Option<QueryRows> {
 /// icon and the column's name) over the values.
 fn record_card(rows: &QueryRows, cx: &App) -> Div {
     let shown = rows.rows.len();
-    let noun = |count: usize| if count == 1 { "row" } else { "rows" };
     let title = if shown < rows.total_rows {
-        format!("{shown} of {} {}", rows.total_rows, noun(rows.total_rows))
+        format!(
+            "{} of {}",
+            studio_ui::group_digits(shown),
+            studio_ui::plural(rows.total_rows, "row", "rows")
+        )
     } else {
-        format!("{shown} {}", noun(shown))
+        studio_ui::plural(shown, "row", "rows")
     };
     let mut meta: Vec<String> = rows.read_at.iter().cloned().collect();
     if rows.columns.len() < rows.total_columns {
@@ -3392,14 +3438,17 @@ impl ToolKind {
     /// What `count` calls of this kind did. Beside Studio's own tools in the same run, the
     /// agent's others are its "other" tools, so the parts add up to the turn's tool calls.
     fn phrase(self, count: usize, beside_studios: bool) -> String {
-        let plural = |one: &str, many: &str| if count == 1 { one } else { many }.to_owned();
+        let plural = studio_ui::plural;
         match self {
             Self::Cli => "looked up the CLI".into(),
-            Self::Run => format!("ran {count} omnigraph {}", plural("command", "commands")),
+            Self::Run => format!(
+                "ran {}",
+                plural(count, "omnigraph command", "omnigraph commands")
+            ),
             Self::Other if beside_studios => {
-                format!("used {count} other {}", plural("tool", "tools"))
+                format!("used {}", plural(count, "other tool", "other tools"))
             }
-            Self::Other => format!("used {count} {}", plural("tool", "tools")),
+            Self::Other => format!("used {}", plural(count, "tool", "tools")),
         }
     }
 }
@@ -3410,8 +3459,8 @@ fn activity_summary(thoughts: usize, tools: &[ToolKind]) -> String {
     let mut parts = Vec::new();
     if thoughts > 0 {
         parts.push(format!(
-            "thought {thoughts} {}",
-            if thoughts == 1 { "time" } else { "times" }
+            "thought {}",
+            studio_ui::plural(thoughts, "time", "times")
         ));
     }
     let mut seen: Vec<ToolKind> = Vec::new();
@@ -3443,6 +3492,9 @@ fn tool_verb(title: &str, studio: Option<StudioTool>) -> String {
 
 impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.start_owed) {
+            cx.defer_in(window, |this, _, cx| this.start_if_idle(cx));
+        }
         let editor_bg = ds::surface::document(cx);
         let body = match &self.state {
             State::Setup => self.render_setup(cx).into_any_element(),
@@ -4684,7 +4736,7 @@ impl AgentPanel {
                         .cursor_pointer()
                         .hover(|style| style.bg(ds::surface::highlight(cx)))
                         .tooltip(Tooltip::text(about))
-                        .child(Indicator::dot().color(dot))
+                        .child(studio_ui::ds::dot(dot))
                         .child(studio_ui::ds::text::muted(agent_name))
                         .on_click(|_, window, cx| {
                             window.dispatch_action(
@@ -4703,7 +4755,7 @@ impl AgentPanel {
     /// with the percentage then; the share, token counts and cost so far on hover.
     fn render_usage(&self, cx: &App) -> Option<AnyElement> {
         let usage = self.usage.as_ref().filter(|usage| usage.size > 0)?;
-        let ratio = (usage.used as f32 / usage.size as f32).clamp(0., 1.);
+        let ratio = usage.ratio();
         let nearly_full = ratio >= CONTEXT_NEARLY_FULL;
         let color = if nearly_full {
             Color::Warning.color(cx)
@@ -4711,11 +4763,7 @@ impl AgentPanel {
             Color::Muted.color(cx)
         };
         let title = format!("{}% of the context window", (ratio * 100.).round() as u32);
-        let mut meta = format!(
-            "{} of {} tokens",
-            humanize_tokens(usage.used),
-            humanize_tokens(usage.size)
-        );
+        let mut meta = usage.tokens();
         if let Some((amount, currency)) = &usage.cost {
             meta.push_str(&format!(" · {} so far", format_cost(*amount, currency)));
         }
@@ -4725,18 +4773,7 @@ impl AgentPanel {
                 .flex_none()
                 .gap(px(ds::space::XS))
                 .items_center()
-                .child(
-                    CircularProgress::new(
-                        usage.used as f32,
-                        usage.size as f32,
-                        px(ds::size::GAUGE),
-                        cx,
-                    )
-                    .stroke_width(px(ds::size::GAUGE_STROKE))
-                    // A visible track, so the ring reads as a gauge, not a spinner.
-                    .bg_color(ds::surface::control_border(cx))
-                    .progress_color(color),
-                )
+                .child(usage.gauge(color, cx))
                 // Nearly empty, a ring still reads as a spinner; its number says it is a gauge.
                 .child(
                     ds::text::meta(format!("{}%", (ratio * 100.).round() as u32)).color(
@@ -4809,7 +4846,11 @@ impl AgentPanel {
                     .border_t_1()
                     .dotted(cx)
                     .tooltip(Tooltip::text(entry.text.clone()))
-                    .child(Indicator::dot().color(if next { Color::Accent } else { Color::Muted }))
+                    .child(studio_ui::ds::dot(if next {
+                        Color::Accent
+                    } else {
+                        Color::Muted
+                    }))
                     .child(
                         div().flex_1().min_w_0().child(
                             studio_ui::ds::text::body(line)
@@ -4884,30 +4925,16 @@ impl AgentPanel {
     fn render_notices(&self, cx: &mut Context<Self>) -> Option<Div> {
         let mut lines = Vec::new();
         if let Some(usage) = self.usage.as_ref().filter(|usage| usage.size > 0) {
-            let ratio = (usage.used as f32 / usage.size as f32).clamp(0., 1.);
+            let ratio = usage.ratio();
             if ratio >= CONTEXT_NEARLY_FULL {
                 lines.push(
                     ds::notice_line()
-                        .child(
-                            CircularProgress::new(
-                                usage.used as f32,
-                                usage.size as f32,
-                                px(ds::size::GAUGE),
-                                cx,
-                            )
-                            .stroke_width(px(ds::size::GAUGE_STROKE))
-                            .bg_color(ds::surface::control_border(cx))
-                            .progress_color(Color::Warning.color(cx)),
-                        )
+                        .child(usage.gauge(Color::Warning.color(cx), cx))
                         .child(ds::text::body(format!(
                             "{}% of the context window used",
                             (ratio * 100.).round() as u32
                         )))
-                        .child(ds::text::muted(format!(
-                            "{} of {} tokens",
-                            humanize_tokens(usage.used),
-                            humanize_tokens(usage.size)
-                        ))),
+                        .child(ds::text::muted(usage.tokens())),
                 );
             }
         }
@@ -4928,7 +4955,7 @@ impl AgentPanel {
                     })
                     .child(div().flex_1())
                     .child(
-                        ds::toolbar_button("review", "Review")
+                        ds::button("review", "Review")
                             .start_icon(Icon::new(IconName::Eye))
                             .on_click(cx.listener(|this, _, window, cx| this.review(window, cx))),
                     ),
@@ -4941,6 +4968,70 @@ impl AgentPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A conversation restored with the workspace behind another tab starts no agent: its start
+    /// waits for the tab's first draw, which takes it. Before, every restored conversation
+    /// started its agent at launch, a process and a replay each. (A drawn tab here has no agent
+    /// to start, so the test starts no process.)
+    #[gpui::test]
+    async fn a_restored_conversation_starts_its_agent_when_shown(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+            editor::init(cx);
+        });
+        let agent = |command: &[&str], cx: &mut gpui::TestAppContext| {
+            cx.update(|cx| {
+                let mut settings = StudioSettings::get(cx).clone();
+                settings.agent.command = command.iter().map(|part| (*part).to_owned()).collect();
+                cx.set_global(settings);
+            })
+        };
+        agent(&["an-agent"], cx);
+        let (session, _) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n}\n",
+            |_| serde_json::json!([]),
+            cx,
+        );
+        cx.run_until_parked();
+        let (_root, cx) = cx.add_window_view(|_, _| gpui::EmptyView);
+        let hidden = cx.update(|window, cx| {
+            let session = session.clone();
+            cx.new(|cx| {
+                let mut panel = AgentPanel::new(
+                    session,
+                    WeakEntity::new_invalid(),
+                    Some("s1".into()),
+                    window,
+                    cx,
+                );
+                panel.start_when_shown(cx);
+                panel
+            })
+        });
+        cx.run_until_parked();
+        hidden.read_with(cx, |panel, _| {
+            assert!(matches!(panel.state, State::Idle), "no agent started");
+            assert!(panel.start_owed, "it starts when drawn");
+        });
+
+        agent(&[], &mut cx.cx);
+        let (shown, cx) = cx.add_window_view(|window, cx| {
+            let mut panel = AgentPanel::new(
+                session,
+                WeakEntity::new_invalid(),
+                Some("s2".into()),
+                window,
+                cx,
+            );
+            panel.start_when_shown(cx);
+            panel
+        });
+        cx.run_until_parked();
+        shown.read_with(cx, |panel, _| {
+            assert!(!panel.start_owed, "the draw took it")
+        });
+    }
 
     /// Rendering asks [`shows_query`] of every tool call; it agrees with [`shown_query`].
     #[test]

@@ -25,8 +25,8 @@ use gpui::{
     WindowControlArea, WindowHandle, deferred, div, point,
 };
 use graph_store::{
-    AccessAction, AccessScope, ConnectionRegistry, ConnectionState, GraphSession, OutcomeKind,
-    SessionEvent,
+    AccessAction, AccessScope, ConnectionRegistry, ConnectionState, GraphSession, Loadable,
+    OutcomeKind, SessionEvent,
 };
 use studio_actions::graph::{OpenCommit, OpenHistory};
 use studio_actions::workspace::{
@@ -40,7 +40,7 @@ use studio_settings::{BottomDockLayout, StudioSettings};
 use studio_ui::ds::IconButton;
 use studio_ui::menu::{ContextMenu, ContextMenuEntry, ContextMenuItem};
 use ui::prelude::*;
-use ui::{ButtonLike, Indicator, PopoverMenu, Tooltip, right_click_menu};
+use ui::{ButtonLike, PopoverMenu, Tooltip, right_click_menu};
 
 use item::ItemHandle;
 pub use item::{Item, ItemEvent, ItemStatus, KeyHint};
@@ -362,6 +362,10 @@ pub struct Workspace {
     _save: Option<Task<()>>,
     /// The next comparison of the state with what was last written.
     _save_check: Option<Task<()>>,
+    /// The status bar's connection dot's beats, counted every `motion::PULSE` by `_beats` while
+    /// its server is ready and the window in front ([`Workspace::count_beats`]).
+    beat: u64,
+    _beats: Option<Task<()>>,
     _save_bounds: Option<Task<()>>,
     /// The window's place and size the debounced save above has still to write.
     pending_bounds: Option<Bounds<Pixels>>,
@@ -573,6 +577,8 @@ impl Workspace {
             saved: None,
             _save: None,
             _save_check: None,
+            beat: 0,
+            _beats: None,
             _save_bounds: None,
             pending_bounds: None,
             _bounds_subscription: bounds_subscription,
@@ -2956,28 +2962,70 @@ impl Workspace {
         self.activate_in(self.active_pane, index, false, window, cx);
     }
 
-    /// The server this window is connected to: a status dot, the server and its state, as
-    /// Delta's sidebar shows the account. It opens the graph switcher: the graphs open in this
-    /// window, another graph, closing this one.
-    fn render_server_switcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (color, server, url, state, actor) = match &self.session {
+    /// Where the window reads, the first part of the bar's breadcrumb: the connection's status
+    /// dot, the server and the graph. It opens the graph switcher: the graphs open in this
+    /// window, another graph, closing this one. The connection's state shows beside it only
+    /// when it is not ready, and always in its tooltip, with the round trip and the actor.
+    /// Whether the window's server answers: its connection is ready.
+    fn server_ready(&self, cx: &App) -> bool {
+        self.session.as_ref().is_some_and(|session| {
+            session.read(cx).connection.read(cx).state == ConnectionState::Ready
+        })
+    }
+
+    /// Counts the connection dot's beats, one every `motion::PULSE`, while it is `live`.
+    /// Not live, the count stops (its task dropped), so a dot nobody sees asks for no frames.
+    fn count_beats(&mut self, live: bool, cx: &mut Context<Self>) {
+        if !live {
+            self._beats = None;
+            return;
+        }
+        if self._beats.is_some() {
+            return;
+        }
+        self._beats = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(studio_ui::motion::PULSE)
+                    .await;
+                let counted = this.update(cx, |this, cx| {
+                    this.beat += 1;
+                    cx.notify();
+                });
+                if counted.is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn render_graph_switcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (color, server, url, state, ready, actor, graph, unavailable) = match &self.session {
             Some(session) => {
-                let actor = session.read(cx).actor().map(str::to_owned);
-                let connection = session.read(cx).connection.read(cx);
-                let color = connection_color(&connection.state);
+                let s = session.read(cx);
+                let actor = s.actor().map(str::to_owned);
+                let connection = s.connection.read(cx);
+                let ready = connection.state == ConnectionState::Ready;
                 // The server's round trip from the last health check, beside its state.
                 let state = match (&connection.state, connection.latency) {
                     (ConnectionState::Ready, Some(latency)) => {
-                        format!("{} · {} ms", connection.label(), latency.as_millis())
+                        format!(
+                            "{} · {}",
+                            connection.label(),
+                            studio_ui::format_elapsed(latency)
+                        )
                     }
                     _ => connection.label(),
                 };
                 (
-                    color,
+                    connection_color(&connection.state),
                     connection.server.name.clone(),
                     connection.server.url.clone(),
                     state,
+                    ready,
                     actor,
+                    Some(s.graph_id.clone()),
+                    s.unavailable.clone(),
                 )
             }
             None => (
@@ -2985,6 +3033,9 @@ impl Workspace {
                 "No server".to_owned(),
                 String::new(),
                 "Not connected".to_owned(),
+                false,
+                None,
+                None,
                 None,
             ),
         };
@@ -3003,7 +3054,12 @@ impl Workspace {
                 )
             })
             .collect();
-        let tooltip = connection_tooltip(&url, &state, actor.as_deref());
+        let mut tooltip = connection_tooltip(&url, &state, actor.as_deref());
+        if let Some(reason) = &unavailable {
+            tooltip = format!(
+                "This graph is unavailable: {reason}. Reads resume when it is ready. · {tooltip}"
+            );
+        }
         let trigger = ButtonLike::new("graph-switcher")
             .tooltip(Tooltip::text(tooltip))
             .child(
@@ -3011,13 +3067,29 @@ impl Workspace {
                     .px(px(studio_ui::ds::space::XS))
                     .gap(px(studio_ui::ds::space::SM))
                     .items_center()
-                    .child(Indicator::dot().color(color))
-                    .child(studio_ui::ds::text::body(server).single_line())
-                    .child(studio_ui::ds::text::muted(state).single_line())
+                    // A ready server's dot beats while the window is in front.
+                    .child(studio_ui::ds::live_dot(
+                        "connection-dot",
+                        color.color(cx),
+                        self._beats.is_some().then_some(self.beat),
+                        cx,
+                    ))
+                    .child(studio_ui::ds::text::muted(server).single_line())
+                    .when_some(graph, |row, graph| {
+                        row.child(studio_ui::ds::text::body("/").color(Color::Disabled))
+                            .child(studio_ui::ds::text::body(graph).single_line())
+                    })
+                    .when(unavailable.is_some(), |row| {
+                        row.child(studio_ui::ds::dot(Color::Warning))
+                    })
+                    // Ready, the dot says so; anything else is spelled out.
+                    .when(!ready, |row| {
+                        row.child(studio_ui::ds::text::muted(state).single_line())
+                    })
                     .when(others > 0, |row| {
                         row.child(studio_ui::ds::sidebar_count(format!(
-                            "+{others} graph{}",
-                            if others == 1 { "" } else { "s" }
+                            "+{}",
+                            studio_ui::plural(others, "graph", "graphs")
                         )))
                     })
                     .child(studio_ui::ds::icon::meta(IconName::ChevronUpDown)),
@@ -3118,9 +3190,9 @@ impl Workspace {
                 // newer data) and one after it for its close or pin button, both kept when
                 // empty so the tabs' contents line up.
                 let indicator = if dirty {
-                    Some(Indicator::dot().color(Color::Warning))
+                    Some(studio_ui::ds::dot(Color::Warning))
                 } else if stale {
-                    Some(Indicator::dot().color(Color::Muted))
+                    Some(studio_ui::ds::dot(Color::Muted))
                 } else {
                     None
                 };
@@ -3546,22 +3618,20 @@ impl Workspace {
         floor: SheetFloor,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Member::Split {
-            axis,
-            members,
-            flexes,
-        } = member
-        else {
-            let Member::Pane(id) = member else {
-                unreachable!()
-            };
-            // A zoomed pane is drawn over the document area instead (`render_zoomed`).
-            if self.zoomed == Some(Zoomed::Pane(*id)) {
-                return div().size_full().into_any_element();
+        let (axis, members, flexes) = match member {
+            Member::Pane(id) => {
+                // A zoomed pane is drawn over the document area instead (`render_zoomed`).
+                if self.zoomed == Some(Zoomed::Pane(*id)) {
+                    return div().size_full().into_any_element();
+                }
+                return self.render_pane(*id, floor, cx);
             }
-            return self.render_pane(*id, floor, cx);
+            Member::Split {
+                axis,
+                members,
+                flexes,
+            } => (*axis, members, flexes),
         };
-        let axis = *axis;
         let hairline = studio_ui::ds::surface::rule(cx);
         let horizontal = axis == SplitAxis::Horizontal;
         let split_id = SharedString::from(format!(
@@ -3654,8 +3724,8 @@ impl Workspace {
             match (s.reads_in_flight, s.writes_in_flight) {
                 (0, 0) => None,
                 (reads, 0) => Some(format!(
-                    "{reads} quer{} running",
-                    if reads == 1 { "y" } else { "ies" }
+                    "{} running",
+                    studio_ui::plural(reads, "query", "queries")
                 )),
                 (_, writes) => Some(format!("Writing ({writes})…")),
             }
@@ -3671,8 +3741,8 @@ impl Workspace {
                     .child(self.render_panel_buttons(PanelPosition::Left, cx))
                     .child(studio_ui::ds::divider_v(cx))
             })
-            .child(self.render_server_switcher(cx))
-            .children(self.render_graph_and_branch(cx))
+            .child(self.render_graph_switcher(cx))
+            .children(self.render_branch(cx))
             .when(has_start, |bar| bar.child(studio_ui::ds::divider_v(cx)))
             .children(status.start);
         let docks_right = shown && !(self.bottom.panels.is_empty() && self.right.panels.is_empty());
@@ -3761,14 +3831,12 @@ impl Workspace {
             .child(right)
     }
 
-    /// The graph the open tab reads, and its branch: a chip that opens another graph, then the
-    /// branch menu.
-    fn render_graph_and_branch(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    /// The breadcrumb's last part, after the graph switcher: the branch the window reads and
+    /// edits, its menu switching it, and "read only" when the credential may not change it.
+    fn render_branch(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let session = self.session.as_ref()?;
         let s = session.read(cx);
-        let graph = s.graph_id.clone();
         let branch = s.branch.clone();
-        let unavailable = s.unavailable.clone();
         // The access route refused changes on the window's branch: its edits are disabled, so
         // the bar says so beside the name (spec 002).
         let read_only = s.refusal(AccessAction::Change, &AccessScope::branch(&branch));
@@ -3786,44 +3854,6 @@ impl Workspace {
                 .gap(px(studio_ui::ds::space::XS))
                 .items_center()
                 .flex_none()
-                .child(
-                    h_flex()
-                        .id("status-graph")
-                        .h(px(studio_ui::ds::size::BAR_BUTTON))
-                        // A 22 px button's inset, so it reads as the branch button beside it.
-                        .px(px(studio_ui::ds::space::MD))
-                        .gap(px(studio_ui::ds::space::XS))
-                        .items_center()
-                        .rounded(px(studio_ui::ds::radii(cx).sm))
-                        .cursor_pointer()
-                        .hover(|style| style.bg(studio_ui::ds::surface::highlight(cx)))
-                        .map(|button| match unavailable.clone() {
-                            Some(reason) => button.tooltip(Tooltip::text(format!(
-                                "This graph is unavailable: {reason}. Reads resume when it is \
-                                 ready."
-                            ))),
-                            None => button.tooltip(|_, cx| {
-                                Tooltip::for_action(
-                                    "Open another graph",
-                                    &studio_actions::workspace::OpenGraph,
-                                    cx,
-                                )
-                            }),
-                        })
-                        .child(
-                            // As a button's icon: 80 % of the label's ink.
-                            studio_ui::ds::icon::meta(IconName::DatabaseZap)
-                                .color(studio_ui::ds::text::icon_ink(cx)),
-                        )
-                        .when(unavailable.is_some(), |button| {
-                            button.child(Indicator::dot().color(Color::Warning))
-                        })
-                        .child(studio_ui::ds::text::body(graph).single_line())
-                        .on_click(|_, window, cx| {
-                            window
-                                .dispatch_action(Box::new(studio_actions::workspace::OpenGraph), cx)
-                        }),
-                )
                 .child(studio_ui::ds::text::body("/").color(Color::Disabled))
                 .child(
                     PopoverMenu::new("branch-menu")
@@ -3838,20 +3868,44 @@ impl Workspace {
                         .menu(move |window, cx| {
                             let session = session_for_menu.clone();
                             // Read when the menu opens, not copied at every frame drawn.
-                            let branches = session
-                                .read(cx)
-                                .branches
-                                .loaded()
-                                .cloned()
-                                .unwrap_or_default();
+                            let (current, branches) = {
+                                let s = session.read(cx);
+                                (s.branch.clone(), s.branches.clone())
+                            };
+                            // A list not read, or that could not be, is read for the next look.
+                            if matches!(branches, Loadable::NotLoaded | Loadable::Failed(_)) {
+                                session.update(cx, |s, cx| s.reload_branches(cx));
+                            }
                             Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                                 menu = menu.header("Branches");
-                                for branch in branches {
-                                    let session = session.clone();
-                                    let name = branch.clone();
-                                    menu = menu.entry(branch, None, move |_, cx| {
-                                        session.update(cx, |s, cx| s.set_branch(name.clone(), cx));
-                                    });
+                                let note =
+                                    |text: String| ContextMenuEntry::new(text).disabled(true);
+                                match &branches {
+                                    Loadable::Loaded(list) => {
+                                        for branch in list {
+                                            let session = session.clone();
+                                            let name = branch.clone();
+                                            menu = menu.toggleable_entry(
+                                                branch.clone(),
+                                                *branch == current,
+                                                IconPosition::Start,
+                                                None,
+                                                move |_, cx| {
+                                                    session.update(cx, |s, cx| {
+                                                        s.set_branch(name.clone(), cx)
+                                                    });
+                                                },
+                                            );
+                                        }
+                                    }
+                                    Loadable::Failed(why) => {
+                                        menu = menu.item(note(format!(
+                                            "The branches could not be read: {why}"
+                                        )));
+                                    }
+                                    Loadable::NotLoaded | Loadable::Loading => {
+                                        menu = menu.item(note("Reading the branches…".into()));
+                                    }
                                 }
                                 menu
                             }))
@@ -4245,7 +4299,7 @@ impl Workspace {
                     .max_w(px(studio_ui::ds::size::POPOVER_MAX))
                     .rounded(px(studio_ui::ds::radii(cx).md))
                     .map(|toast| studio_ui::ds::toast_surface(toast, cx))
-                    .child(Indicator::dot().color(color))
+                    .child(studio_ui::ds::dot(color))
                     // `min_w_0` lets the text wrap inside the toast instead of widening it.
                     .child(
                         div()
@@ -4382,6 +4436,11 @@ impl Render for Workspace {
         // Every change to tabs or panels re-renders the workspace, so this sees all of them. The
         // workspace also renders whenever anything inside it notifies (a streamed reply, a
         // hover), so the state is compared at most every `SAVE_CHECK`, not on every frame.
+        // The connection dot beats while its server is ready and someone can see it; render
+        // runs when either changes (a connection's state, the window's activation).
+        let live =
+            self.server_ready(cx) && window.is_window_active() && studio_ui::motion::enabled(cx);
+        self.count_beats(live, cx);
         if self._save_check.is_none() {
             self._save_check = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(SAVE_CHECK).await;
@@ -6145,6 +6204,58 @@ mod tests {
                 "the dock's button takes it from the tab under it"
             );
         });
+    }
+
+    /// The connection dot beats, one beat a pulse, only while its server is ready and the
+    /// window in front, so a dot nobody sees asks for no frames; a server that stops answering
+    /// stops it at once (the workspace reads the connection as it draws, so GPUI draws it again
+    /// when the connection changes).
+    #[gpui::test]
+    fn the_connection_dot_beats_only_while_ready_and_seen(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            cx.set_global(StudioSettings::default());
+        });
+        let session = idle_session("http://localhost:1", "g", cx);
+        let connection = session.read_with(cx, |session, _| session.connection.clone());
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.set_session(session.clone(), window, cx)
+        });
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let beating =
+            |cx: &mut gpui::VisualTestContext| workspace.read_with(cx, |w, _| w._beats.is_some());
+        let beat = |cx: &mut gpui::VisualTestContext| workspace.read_with(cx, |w, _| w.beat);
+        let set_state = |state: ConnectionState, cx: &mut gpui::VisualTestContext| {
+            connection.update(cx, |connection, cx| {
+                connection.state = state;
+                cx.notify();
+            });
+            cx.run_until_parked();
+        };
+        let pulses = |count: u32, cx: &mut gpui::VisualTestContext| {
+            cx.executor()
+                .advance_clock(studio_ui::motion::PULSE * count);
+            cx.run_until_parked();
+        };
+        set_state(ConnectionState::Connecting, cx);
+        assert!(!beating(cx), "not ready");
+        set_state(ConnectionState::Ready, cx);
+        assert!(beating(cx), "ready and in front");
+        let before = beat(cx);
+        pulses(2, cx);
+        assert_eq!(beat(cx), before + 2, "one beat a pulse");
+        cx.deactivate_window();
+        assert!(!beating(cx), "not in front");
+        let before = beat(cx);
+        pulses(3, cx);
+        assert_eq!(beat(cx), before, "no beats behind other windows");
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        assert!(beating(cx), "in front again");
+        set_state(ConnectionState::Unreachable("refused".into()), cx);
+        assert!(!beating(cx), "stopped answering");
     }
 
     /// A session for `graph` on the server at `url`, which answers every request with a 404.

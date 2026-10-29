@@ -7,13 +7,17 @@
 //! layout and polish rules: group with space, not lines; concentric radii; shadows for
 //! elevation.
 
+use std::time::Duration;
+
+use crate::motion;
 use gpui::{
-    AnyElement, App, Bounds, BoxShadow, ClickEvent, Corners, Div, ElementId, Hsla, MouseButton,
-    Pixels, SharedString, Stateful, Window, point,
+    Animation, AnimationExt as _, AnyElement, App, Bounds, BoxShadow, ClickEvent, Corners, Div,
+    ElementId, Hsla, MouseButton, Pixels, SharedString, Stateful, Transformation, Window,
+    percentage, point,
 };
 use studio_settings::{StudioSettings, WindowStyle};
 use ui::prelude::*;
-use ui::{CommonAnimationExt as _, Tooltip, rems_from_px};
+use ui::{Tooltip, rems_from_px};
 
 pub use crate::button::{Button, IconButton, Shape, Variant};
 pub use crate::menu::{MenuRow, menu_header, menu_separator, menu_surface};
@@ -189,18 +193,20 @@ pub mod size {
     /// The slot a sidebar row's icon or type mark sits in, so every label of a list starts on
     /// one edge whatever leads it.
     pub const ROW_ICON: f32 = 16.;
-    /// A control: a medium button, a field, a segmented track, a floating bar, a tile.
+    /// A control: a field, a segmented track, a floating bar, a tile.
     pub const CONTROL: f32 = 28.;
-    /// A button inside a floating bar ([`super::bar_button`]): Zed's default size, 3 px inside
-    /// the bar's edge.
+    /// A button, a pill or not, and an icon button's square ([`super::button`]): Zed's default
+    /// size, 3 px inside a floating bar's edge.
     pub const BAR_BUTTON: f32 = 22.;
     /// A button inside a row, a card or beside a value: a tag's height, so a row action sits
     /// in the row as its chips do.
     pub const ROW_BUTTON: f32 = TAG;
     /// The large button, one step above a control.
     pub const LARGE_BUTTON: f32 = 32.;
-    /// A pill: a filter, a composer's picker, a dock's title tab.
-    pub const PILL: f32 = 26.;
+    /// A pill of segments (a filter, a toolbar's control chip) and a shared type's pill: a
+    /// button's height, so a chip and the buttons beside it are one size and its label sits as
+    /// far in as theirs.
+    pub const PILL: f32 = BAR_BUTTON;
     /// A thread's or feed's gutter, where each entry's icon sits.
     pub const GUTTER: f32 = 24.;
     /// A row of the command palette: a pick list is read once, so a little taller than a menu's.
@@ -625,6 +631,17 @@ pub mod surface {
         }
     }
 
+    /// The line around an image on its edge (interfaces.dev's image outline): black at 10 % in
+    /// a light theme, white at 10 % in a dark one, so an image's edge shows on a fill of its
+    /// own colour whatever the background.
+    pub fn image_outline(cx: &App) -> Hsla {
+        if cx.theme().appearance.is_light() {
+            gpui::black().opacity(0.1)
+        } else {
+            gpui::white().opacity(0.1)
+        }
+    }
+
     /// The canvas's marquee while it is dragged: the accent, faint inside, firmer at its edge.
     pub fn marquee(cx: &App) -> Hsla {
         accent(cx).opacity(0.08)
@@ -987,21 +1004,68 @@ pub enum Status {
 /// either line up: for rows whose context already names the type, where a lettered mark would
 /// repeat it.
 pub fn type_dot(type_name: &str) -> Div {
-    icon_slot(
-        div()
-            .size(px(size::DOT))
-            .rounded_full()
-            .bg(studio_theme::type_color(type_name)),
-    )
+    icon_slot(dot(Color::Custom(studio_theme::type_color(type_name))))
 }
 
-/// A status dot.
-pub fn status_dot(status: Status) -> Div {
-    div()
+/// A dot that beats while given its `beat` (a server that answers): each beat sends one ring
+/// out from it, which fades in [`motion::PULSE_RING`] ([`motion::pulse`]), redrawing at most
+/// [`motion::AMBIENT_FPS`] times a second; then nothing is drawn until the next beat. The
+/// caller counts the beats, [`motion::PULSE`] apart, and only while someone can see the dot
+/// (its window in front), since every frame builds the whole window's scene. The ring draws
+/// outside the dot's box, so it takes no room; with reduced motion the dot is still.
+pub fn live_dot(id: impl Into<SharedString>, color: Hsla, beat: Option<u64>, cx: &App) -> Div {
+    /// How far the ring goes past the dot's edge.
+    const REACH: f32 = 4.;
+    let dot = div()
         .size(px(size::DOT))
         .flex_none()
         .rounded_full()
-        .bg(surface::status(status))
+        .bg(color);
+    let Some(beat) = beat.filter(|_| motion::enabled(cx)) else {
+        return dot;
+    };
+    // A new id for each beat: GPUI keeps a finished animation's state under its id, so a ring
+    // runs once, and the next beat's is a new animation.
+    let ring = div().absolute().rounded_full().with_animation(
+        ElementId::NamedInteger(id.into(), beat),
+        Animation::new(motion::PULSE_RING).with_max_fps(motion::AMBIENT_FPS),
+        move |ring, t| {
+            let (reach, seen) = motion::pulse(t);
+            let side = size::DOT + 2. * REACH * reach;
+            let at = px((size::DOT - side) / 2.);
+            ring.size(px(side))
+                .left(at)
+                .top(at)
+                .bg(color.opacity(0.45 * seen))
+        },
+    );
+    // The ring first, so the dot paints over it.
+    div()
+        .relative()
+        .size(px(size::DOT))
+        .flex_none()
+        .child(ring)
+        .child(dot.absolute())
+}
+
+/// A dot in a [`Color`] (a connection's state, a change not yet saved, a notice's tone):
+/// [`size::DOT`], as a type's dot and a status dot are.
+pub fn dot(color: Color) -> Dot {
+    Dot(color)
+}
+
+/// See [`dot`].
+#[derive(IntoElement)]
+pub struct Dot(Color);
+
+impl RenderOnce for Dot {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        div()
+            .size(px(size::DOT))
+            .flex_none()
+            .rounded_full()
+            .bg(self.0.color(cx))
+    }
 }
 
 /// The glass window's wash, painted once behind everything: three soft fields of colour (warm
@@ -1449,17 +1513,6 @@ pub fn toolbar(cx: &App) -> Div {
         .border_color(surface::rule(cx))
 }
 
-/// A button in a document's toolbar: Zed's 22 px size (Tower's `xs`), small type and icons, so
-/// the toolbar reads as the document's chrome rather than as its content.
-pub fn toolbar_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
-    button(id, label).size(ButtonSize::Default)
-}
-
-/// An icon button in a document's toolbar, beside [`toolbar_button`]s.
-pub fn toolbar_icon_button(id: impl Into<ElementId>, icon: IconName) -> IconButton {
-    icon_button(id, icon).size(ButtonSize::Default)
-}
-
 /// A switch: a pill track and a round knob. On, the track is the primary button's ink; off,
 /// the [`surface::divider`]'s grey; the knob is the solid surface with interfaces.dev's shadow
 /// in both, so it reads on either. Studio draws it rather than Zed's `Switch`, whose knob takes
@@ -1613,37 +1666,53 @@ pub fn meta_code(icon: IconName, value: impl Into<SharedString>, cx: &App) -> Di
         .child(text::code(value, cx).color(Color::Muted).single_line())
 }
 
-/// A button in a toolbar, strip, panel or dialog: 28 px tall with a 6 px inset and a small
-/// label, so its hover and pressed fills have room around the label without padding it out
-/// (`crate::button`). A button inside a row or a card is a [`row_button`].
+/// A button with a label, in a toolbar, strip, panel or dialog: a pill of Zed's 22 px size
+/// (Tower's `xs`), its label small and 8 px in, the size of a [`bar_button`] and an
+/// [`icon_button`] beside it (`crate::button`). A button inside a row or a card is a
+/// [`row_button`].
 pub fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
     Button::new(id, label)
 }
 
 /// Work under way that the person waits on (a search, a run, rows being read): a small turning
-/// circle, muted, beside or in place of what it will fill.
+/// circle, muted, beside or in place of what it will fill. It turns once in two seconds, every
+/// spinner in step, redrawing its view at most [`motion::AMBIENT_FPS`] times a second (Zed's
+/// `with_rotate_animation` redraws at every frame for as long as the work runs).
 pub fn spinner() -> impl IntoElement {
-    Icon::new(IconName::ArrowCircle)
-        .size(IconSize::XSmall)
-        .color(Color::Muted)
-        .with_rotate_animation(2)
+    Spinner
 }
 
-/// [`button`] inside a [`float_bar`]: Zed's default size, `size::BAR_BUTTON` tall.
+/// See [`spinner`]. Drawn as Zed's `Icon` draws an icon, an SVG of its path, as Zed keeps the
+/// trait that turns an `Icon` to its own crate.
+#[derive(IntoElement)]
+struct Spinner;
+
+impl RenderOnce for Spinner {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        gpui::svg()
+            .path(SharedString::from(IconName::ArrowCircle.path()))
+            .size(IconSize::XSmall.rems())
+            .flex_none()
+            .text_color(Color::Muted.color(cx))
+            .with_animation(
+                "spinner",
+                Animation::new(Duration::from_secs(2))
+                    .repeat_synced()
+                    .with_max_fps(motion::AMBIENT_FPS),
+                |svg, t| svg.with_transformation(Transformation::rotate(percentage(t))),
+            )
+    }
+}
+
+/// [`button`] inside a [`float_bar`]: the same size, with the scale's corner (spec 002, "Round
+/// ends only for buttons with a label").
 pub fn bar_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
-    button(id, label)
-        .size(ButtonSize::Default)
-        .shape(Shape::Rounded)
+    button(id, label).shape(Shape::Rounded)
 }
 
-/// [`icon_button`] inside a [`float_bar`].
-pub fn bar_icon_button(id: impl Into<ElementId>, icon: IconName) -> IconButton {
-    icon_button(id, icon).size(ButtonSize::Default)
-}
-
-/// [`button`] for an icon alone: a 28 px square.
+/// [`button`] for an icon alone: a square as tall as a button, wherever it sits.
 pub fn icon_button(id: impl Into<ElementId>, icon: IconName) -> IconButton {
-    IconButton::new(id, icon).size(ButtonSize::Medium)
+    IconButton::new(id, icon)
 }
 
 /// A labelled action inside a row or a card ("Show all", "Load more", "Discard"):
@@ -1669,7 +1738,6 @@ pub fn inline_icon_button(id: impl Into<ElementId>, icon: IconName) -> IconButto
 pub fn sheet_close_button(id: impl Into<ElementId>) -> IconButton {
     IconButton::new(id, IconName::Close)
         .variant(Variant::Outline)
-        .size(ButtonSize::Default)
         .icon_size(IconSize::XSmall)
 }
 
@@ -1732,6 +1800,22 @@ pub fn sidebar_search(editor: impl IntoElement, cx: &App) -> Div {
         .child(field_input(editor))
 }
 
+/// A view's key context: `name`, and `searching` while its search field (`search`) has the
+/// keyboard. The keymaps bind the keys that move the view's selection only outside a search
+/// (`History && !searching`), so typing in the field does not move it.
+pub fn search_key_context(
+    name: &'static str,
+    search: &gpui::FocusHandle,
+    window: &Window,
+) -> gpui::KeyContext {
+    let mut context = gpui::KeyContext::new_with_defaults();
+    context.add(name);
+    if search.is_focused(window) {
+        context.add("searching");
+    }
+    context
+}
+
 /// The text of a single-line field that sits among `Small` labels (a filter value, a search
 /// box): an editor's text at the label's size rather than the body size.
 pub fn field_text(cx: &App) -> gpui::TextStyleRefinement {
@@ -1786,8 +1870,9 @@ pub fn filter_pill(
         ))
 }
 
-/// A raised pill of segments ([`filter_pill`], [`control_chip`]): the document's fill, a clear
-/// border and `shadow-custom`, [`size::PILL`] tall, its segments clipped to its round ends.
+/// A raised pill of segments ([`filter_pill`], [`control_chip`]): the document's fill and
+/// `shadow-custom`, whose ring is its edge, [`size::PILL`] tall, its segments clipped to its
+/// round ends. No border, so a segment's content starts where a button's does.
 fn pill_frame(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
     h_flex()
         .id(id.into())
@@ -1796,14 +1881,13 @@ fn pill_frame(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
         .items_center()
         .rounded_full()
         .bg(surface::document(cx))
-        .border_1()
-        .border_color(gpui::transparent_black())
         .shadow(elevation::custom(cx))
         .overflow_hidden()
 }
 
-/// The hairline between a pill's segments, the pill's full height.
-fn pill_rule(cx: &App) -> Div {
+/// The hairline between a pill's segments, the pill's full height: a filter's, a toolbar
+/// chip's, and the filter being written.
+pub fn pill_rule(cx: &App) -> Div {
     div()
         .w(px(size::HAIRLINE))
         .h_full()
@@ -1812,12 +1896,12 @@ fn pill_rule(cx: &App) -> Div {
 }
 
 /// A pill's last segment: its round button ([`pill_button`]), [`PILL_BUTTON_GAP`] inside the
-/// pill's end, the pill's border the rest of the gap.
+/// pill's end.
 fn pill_end(button: impl IntoElement) -> Div {
     div()
         .h_full()
         .pl(px(space::XS))
-        .pr(px(PILL_BUTTON_GAP - size::HAIRLINE))
+        .pr(px(PILL_BUTTON_GAP))
         .flex()
         .items_center()
         .child(button)
@@ -1832,7 +1916,7 @@ pub fn chip_button(
     label: impl Into<SharedString>,
     value: Option<SharedString>,
 ) -> Button {
-    toolbar_button(id, label)
+    button(id, label)
         .start_icon(Icon::new(icon))
         .value(value)
         .shape(crate::button::Shape::Pill)
@@ -1872,30 +1956,25 @@ impl ControlChip {
 
 impl RenderOnce for ControlChip {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        // The button's quiet pill a hairline in from the chip's round end, the chip's border
-        // the rest; without a clear button, the same at its other end.
-        let inset = PILL_BUTTON_GAP / 2. - size::HAIRLINE;
-        let cleared = self.clear.is_some();
-        pill_frame(self.id, cx)
-            .child(
-                div()
-                    .pl(px(inset))
-                    .when(!cleared, |button| button.pr(px(inset)))
-                    .child(self.button),
-            )
-            .when_some(self.clear, |chip, (tooltip, on_clear)| {
+        // The button fills the chip, so its label is as far in as a button's and its hover
+        // fill is the chip's own shape.
+        pill_frame(self.id, cx).child(self.button).when_some(
+            self.clear,
+            |chip, (tooltip, on_clear)| {
                 chip.child(pill_rule(cx)).child(pill_end(
                     pill_button("clear", IconName::Close, Color::Muted, cx)
+                        .debug_selector(|| "chip-clear".into())
                         .tooltip(Tooltip::text(tooltip))
                         .on_click(move |event, window, cx| on_clear(event, window, cx)),
                 ))
-            })
+            },
+        )
     }
 }
 
-/// How far a [`pill_button`] sits inside its pill's edge, its border included: the pill's end
-/// pads by this less the border.
-pub const PILL_BUTTON_GAP: f32 = space::XS;
+/// How far a [`pill_button`] sits inside its pill's edge: a row button's circle
+/// ([`size::ROW_BUTTON`]) in a [`size::PILL`].
+pub const PILL_BUTTON_GAP: f32 = space::XXS;
 
 /// An icon button at a pill's end, [`PILL_BUTTON_GAP`] inside it: round, so its fill follows
 /// the pill's round end (`radius::within(size::PILL / 2, gap)` is its own half height) where
@@ -1927,29 +2006,30 @@ pub fn pill_button(
 }
 
 /// A padded list of rounded rows in a form or a dialog (a field's offers, what a delete takes
-/// with it): rows of radius `Radii::xs` on the document's fill inside a floating surface's
-/// hairline, the list concentric around them.
+/// with it): rows of radius `Radii::xs` on the document's fill, raised as a field is
+/// ([`lifted`]), the list concentric around them.
 pub fn row_list(cx: &App) -> Div {
-    v_flex()
-        .p(px(space::XS))
-        .border_1()
-        .rounded(px(radii(cx).row_list()))
-        .bg(surface::document(cx))
-        .border_color(surface::floating_border(cx))
+    lifted(
+        v_flex()
+            .p(px(space::XS))
+            .rounded(px(radii(cx).row_list()))
+            .bg(surface::document(cx)),
+        cx,
+    )
 }
 
-/// A [`row_list`] floating over the page under a field (a filter's values): a menu's fill
-/// and shadow.
+/// A [`row_list`] floating over the page under a field (a filter's values): a menu's fill,
+/// hairline and shadow.
 pub fn popover_list(cx: &App) -> Div {
     row_list(cx)
         .bg(surface::floating(cx))
+        .border_color(surface::floating_border(cx))
         .shadow(elevation::floating(cx))
 }
 
 /// A floating group of controls over a canvas: a glass bar 28 px tall holding
-/// [`bar_button`]s, [`bar_icon_button`]s (22 px) and [`segment`]s, 3 px inside its edge and
-/// rounded concentrically around them (`Radii::bar`). A medium button would not fit inside its
-/// border. The caller occludes it (`.occlude()`) unless what is drawn under it must keep the
+/// [`bar_button`]s, [`icon_button`]s (22 px) and [`segment`]s, 3 px inside its edge and
+/// rounded concentrically around them (`Radii::bar`). The caller occludes it (`.occlude()`) unless what is drawn under it must keep the
 /// pointer, as a drag across a canvas does.
 pub fn float_bar(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
     let gap = (size::CONTROL - size::BAR_BUTTON) / 2.;
@@ -1974,21 +2054,22 @@ pub const TAG_MAX_WIDTH: f32 = 160.;
 /// A tag: a name in a quiet pill, as a table shows a row's neighbours. The UI font, unlike
 /// `ui::Chip`, which is for code-like values such as enum members.
 pub fn tag(label: impl Into<SharedString>, cx: &App) -> Div {
-    div()
-        .flex_none()
-        .max_w(px(TAG_MAX_WIDTH))
-        .h(px(size::TAG))
-        .px(px(space::SM))
-        .flex()
-        .items_center()
-        .rounded(px(radii(cx).xs))
-        .bg(surface::tag(cx))
-        .child(crate::cell_text(label, cx).meta(cx).hug())
+    tag_box(crate::cell_text(label, cx).meta(cx).hug(), cx)
 }
 
 /// A code-like value in a quiet box, as a table shows an enum member: [`tag`] with the value
 /// in the buffer font. Zed's `Chip` keeps its own corner and hairline.
 pub fn chip(label: impl Into<SharedString>, cx: &App) -> Div {
+    tag_box(
+        crate::cell_text(label, cx).meta(cx).buffer_font(cx).hug(),
+        cx,
+    )
+}
+
+/// The quiet box of a [`tag`] and a [`chip`], around their text: a cell text, not a truncating
+/// label, since every cell of a column of them draws one, and a truncating label is shaped
+/// again on every pass of every frame.
+fn tag_box(text: impl IntoElement, cx: &App) -> Div {
     div()
         .flex_none()
         .max_w(px(TAG_MAX_WIDTH))
@@ -1998,14 +2079,24 @@ pub fn chip(label: impl Into<SharedString>, cx: &App) -> Div {
         .items_center()
         .rounded(px(radii(cx).xs))
         .bg(surface::tag(cx))
-        // A cell text, not a truncating label: every enum cell draws one, and a truncating
-        // label is shaped again on every pass of every frame.
-        .child(crate::cell_text(label, cx).meta(cx).buffer_font(cx).hug())
+        .child(text)
 }
 
-/// A checkbox and its label: a box of the scale's extra-small corner, filled with the ink
-/// and a check when on. Zed's `Checkbox` keeps a 2 px corner of its own. The caller handles
-/// the click and keeps the state; a disabled one recedes and takes no pointer.
+/// A menu opened at `position`, where the right click was: drawn over everything else, and
+/// kept inside the window by a margin.
+pub fn menu_at(menu: impl IntoElement, position: gpui::Point<Pixels>) -> gpui::Deferred {
+    gpui::deferred(
+        gpui::anchored()
+            .position(position)
+            .anchor(gpui::Anchor::TopLeft)
+            .snap_to_window_with_margin(px(space::MD))
+            .child(menu),
+    )
+    .with_priority(1)
+}
+
+/// A checkbox and its label: a [`check_box`] and the label beside it. The caller handles the
+/// click and keeps the state; a disabled one recedes and takes no pointer.
 pub fn checkbox(
     id: impl Into<ElementId>,
     checked: bool,
@@ -2013,6 +2104,25 @@ pub fn checkbox(
     disabled: bool,
     cx: &App,
 ) -> Stateful<Div> {
+    h_flex()
+        .id(id.into())
+        .gap(px(space::SM))
+        .items_center()
+        .when(disabled, |row| row.opacity(opacity::DIMMED))
+        .when(!disabled, |row| row.cursor_pointer())
+        .child(check_mark(ui::ToggleState::from(checked), cx))
+        .child(text::body(label))
+}
+
+/// A checkbox without a label (a table row's, a column's select-all): a box of the scale's
+/// extra-small corner, filled with the ink and a check when on, a dash when some of what it
+/// stands for is (`ToggleState::Indeterminate`). Zed's `Checkbox` keeps a 2 px corner of its
+/// own. The caller handles the click and keeps the state.
+pub fn check_box(id: impl Into<ElementId>, state: ui::ToggleState, cx: &App) -> Stateful<Div> {
+    check_mark(state, cx).id(id.into()).cursor_pointer()
+}
+
+fn check_mark(state: ui::ToggleState, cx: &App) -> Div {
     let ink = cx.theme().colors().text;
     let mark = div()
         .size(px(size::CHECK))
@@ -2022,24 +2132,19 @@ pub fn checkbox(
         .justify_center()
         .rounded(px(radii(cx).xs))
         .border_1();
-    let mark = if checked {
-        mark.bg(ink).border_color(ink).child(
-            Icon::new(IconName::Check)
+    let icon = match state {
+        ui::ToggleState::Selected => Some(IconName::Check),
+        ui::ToggleState::Indeterminate => Some(IconName::Dash),
+        ui::ToggleState::Unselected => None,
+    };
+    match icon {
+        Some(icon) => mark.bg(ink).border_color(ink).child(
+            Icon::new(icon)
                 .size(IconSize::XSmall)
                 .color(Color::Custom(surface::document(cx))),
-        )
-    } else {
-        mark.bg(surface::document(cx))
-            .border_color(surface::control_border(cx))
-    };
-    h_flex()
-        .id(id.into())
-        .gap(px(space::SM))
-        .items_center()
-        .when(disabled, |row| row.opacity(opacity::DIMMED))
-        .when(!disabled, |row| row.cursor_pointer())
-        .child(mark)
-        .child(text::body(label))
+        ),
+        None => lifted(mark.bg(surface::document(cx)), cx),
+    }
 }
 
 /// A severity's icon and its colour, shared by [`Banner`] and [`Callout`].
@@ -2684,7 +2789,6 @@ pub fn value_list() -> Div {
 /// its end.
 pub fn value_select(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
     button(id, label)
-        .size(ButtonSize::Default)
         .variant(crate::button::Variant::Outline)
         .end_icon(Icon::new(IconName::ChevronDown))
 }
@@ -3001,7 +3105,7 @@ impl RenderOnce for ActivityRow {
             .px(px(space::EDGE))
             .gap(px(space::SM))
             .items_center()
-            .child(status_dot(self.status))
+            .child(dot(Color::Custom(surface::status(self.status))))
             .child(
                 Icon::new(self.actor_icon)
                     .size(IconSize::Small)
@@ -3080,9 +3184,7 @@ pub fn composer_button(
                         .color(Color::Custom(surface::document(cx))),
                 )
             } else {
-                button
-                    .border_1()
-                    .border_color(surface::control_border(cx))
+                lifted(button, cx)
                     .hover(move |style| style.bg(hover))
                     .child(icon::lead(icon))
             }

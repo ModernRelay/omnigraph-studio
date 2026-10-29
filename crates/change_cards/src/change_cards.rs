@@ -98,8 +98,20 @@ impl CardRows {
     }
 }
 
+/// The button below card `ix`'s lines, with `left_out` of them not shown; its click, the
+/// view's, asks [`CardLines::show_more`].
+pub fn more_lines_button(
+    ix: usize,
+    left_out: usize,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> studio_ui::ds::Button {
+    studio_ui::ds::button(("more-relationships", ix), more_lines_label(left_out))
+        .style(ButtonStyle::Subtle)
+        .on_click(on_click)
+}
+
 /// What the button below a card's lines says, with `left_out` of them not shown.
-pub fn more_lines_label(left_out: usize) -> String {
+fn more_lines_label(left_out: usize) -> String {
     match left_out {
         1 => "Show 1 more relationship".to_owned(),
         n if n <= MORE_LINES => format!("Show {} more relationships", group_digits(n)),

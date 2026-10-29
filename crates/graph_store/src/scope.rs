@@ -49,7 +49,7 @@ struct Entry {
 }
 
 /// Held by a read a scope counts as out, until it finishes or is dropped.
-pub(crate) struct ReadToken(#[allow(dead_code)] Rc<()>);
+pub(crate) struct ReadToken(#[expect(dead_code)] Rc<()>);
 
 impl Entry {
     /// Whether the view shows anything of this dependence: an answer came in (or failed), a

@@ -27,6 +27,30 @@ pub use unix::Confined;
 #[cfg(windows)]
 pub use pinned::Confined;
 
+/// What a confined directory offers on both platforms, over each one's `open_dir`.
+#[cfg(any(unix, windows))]
+impl Confined {
+    /// The directories along `path` (`a/b/c`), each opened as [`Confined::dir`] opens it.
+    pub fn dirs(&self, path: &str) -> io::Result<Self> {
+        self.walk(path, true)
+    }
+
+    /// The directories along `path`, which must exist.
+    pub fn existing_dirs(&self, path: &str) -> io::Result<Self> {
+        self.walk(path, false)
+    }
+
+    fn walk(&self, path: &str, create: bool) -> io::Result<Self> {
+        let mut parts = path.split('/').filter(|part| !part.is_empty());
+        let first = parts
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "an empty path"))?;
+        parts.try_fold(self.open_dir(first, create)?, |dir, part| {
+            dir.open_dir(part, create)
+        })
+    }
+}
+
 /// `len` random bytes as hex: a name no one else picks, or a token no one guesses.
 pub(crate) fn random_hex(len: usize) -> io::Result<String> {
     let mut bytes = vec![0u8; len];
@@ -87,7 +111,7 @@ mod unix {
             self.open_dir(name, true)
         }
 
-        fn open_dir(&self, name: &str, create: bool) -> io::Result<Self> {
+        pub(super) fn open_dir(&self, name: &str, create: bool) -> io::Result<Self> {
             check_name(name)?;
             match rustix::fs::openat(&self.fd, name, DIR, Mode::empty()) {
                 Ok(fd) => Ok(Self { fd }),
@@ -102,26 +126,6 @@ mod unix {
                 Err(Errno::LOOP | Errno::NOTDIR) => Err(refused(name)),
                 Err(error) => Err(error.into()),
             }
-        }
-
-        /// The directories along `path` (`a/b/c`), each opened as [`Confined::dir`] opens it.
-        pub fn dirs(&self, path: &str) -> io::Result<Self> {
-            self.walk(path, true)
-        }
-
-        /// The directories along `path`, which must exist.
-        pub fn existing_dirs(&self, path: &str) -> io::Result<Self> {
-            self.walk(path, false)
-        }
-
-        fn walk(&self, path: &str, create: bool) -> io::Result<Self> {
-            let mut parts = path.split('/').filter(|part| !part.is_empty());
-            let first = parts
-                .next()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "an empty path"))?;
-            parts.try_fold(self.open_dir(first, create)?, |dir, part| {
-                dir.open_dir(part, create)
-            })
         }
 
         /// The regular file `name`, opened for reading; a link, a pipe or anything else is
@@ -291,7 +295,7 @@ mod pinned {
             self.open_dir(name, true)
         }
 
-        fn open_dir(&self, name: &str, create: bool) -> io::Result<Self> {
+        pub(super) fn open_dir(&self, name: &str, create: bool) -> io::Result<Self> {
             check_name(name)?;
             let path = self.path.join(name);
             let held = match hold(&path, false) {
@@ -312,26 +316,6 @@ mod pinned {
             let mut chain = self.held.clone();
             chain.push(Arc::new(held));
             Ok(Self { path, held: chain })
-        }
-
-        /// The directories along `path` (`a/b/c`), each opened as [`Confined::dir`] opens it.
-        pub fn dirs(&self, path: &str) -> io::Result<Self> {
-            self.walk(path, true)
-        }
-
-        /// The directories along `path`, which must exist.
-        pub fn existing_dirs(&self, path: &str) -> io::Result<Self> {
-            self.walk(path, false)
-        }
-
-        fn walk(&self, path: &str, create: bool) -> io::Result<Self> {
-            let mut parts = path.split('/').filter(|part| !part.is_empty());
-            let first = parts
-                .next()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "an empty path"))?;
-            parts.try_fold(self.open_dir(first, create)?, |dir, part| {
-                dir.open_dir(part, create)
-            })
         }
 
         /// The regular file `name`, opened for reading; a link or anything else is refused.

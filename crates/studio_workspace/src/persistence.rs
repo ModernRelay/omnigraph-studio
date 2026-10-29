@@ -608,17 +608,11 @@ mod tests {
 
     #[gpui::test]
     fn a_closed_window_leaves_the_session_and_the_others_stay(cx: &mut gpui::TestAppContext) {
-        struct Blank;
-        impl gpui::Render for Blank {
-            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
-                gpui::Empty
-            }
-        }
         let open = |name: &'static str, cx: &mut gpui::TestAppContext| {
             cx.add_window(|window, cx| {
                 let slot = window_opened(window, cx);
                 window_graphs_changed(slot, &showing(&[name]), cx);
-                Blank
+                gpui::EmptyView
             })
         };
         let saved = |cx: &mut gpui::TestAppContext| -> Vec<String> {

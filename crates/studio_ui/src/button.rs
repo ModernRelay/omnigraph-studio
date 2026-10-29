@@ -6,6 +6,9 @@
 //! traits, so `.style(ButtonStyle::…)` picks the variant (`Variant::from`) and a button is a
 //! `PopoverMenu` trigger as Zed's is.
 //!
+//! Every button is Zed's 22 px size (`size::BAR_BUTTON`), its label 8 px in and small, a pill
+//! or not, so a pill and a rounded button side by side match; a row's is smaller.
+//!
 //! A disabled button fades to 64 %; a toggled one sits on the pressed fill. Clicks stop at the
 //! button and a press leaves the focus where it was, as Zed's buttons do.
 
@@ -304,7 +307,7 @@ pub struct Button {
 impl Button {
     pub fn new(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Self {
         let label = label.into();
-        let mut base = Base::new(id.into(), Variant::Ghost, ButtonSize::Medium, Shape::Pill);
+        let mut base = Base::new(id.into(), Variant::Ghost, ButtonSize::Default, Shape::Pill);
         base.aria_label = Some(label.clone());
         Self {
             base,
@@ -512,10 +515,9 @@ impl RenderOnce for Button {
     }
 }
 
-/// An icon button: one icon in a square of the radius scale's small corner. By default Zed's
-/// 22 px size (`size::BAR_BUTTON`), which every strip, toolbar and floating bar holds with
-/// room around its fill; `ds::icon_button` is the 28 px one, beside a field or a medium
-/// button.
+/// An icon button: one icon in a square of the radius scale's small corner, Zed's 22 px size
+/// (`size::BAR_BUTTON`) as a text button is, which every strip, toolbar and floating bar holds
+/// with room around its fill; a row's is smaller (`ds::row_icon_button`).
 #[derive(IntoElement)]
 pub struct IconButton {
     base: Base,
@@ -694,14 +696,14 @@ mod tests {
                         .child(
                             div()
                                 .debug_selector(|| "bar-icon-button".into())
-                                .child(ds::bar_icon_button("zoom", ui::IconName::Plus)),
+                                .child(ds::icon_button("zoom", ui::IconName::Plus)),
                         ),
                 )
                 // Each size by its role. Before `button`, whose label the test measures.
                 .child(
                     div()
-                        .debug_selector(|| "toolbar-icon-button".into())
-                        .child(ds::toolbar_icon_button("t", ui::IconName::Plus)),
+                        .debug_selector(|| "rounded-button".into())
+                        .child(ds::bar_button("bt", "Views")),
                 )
                 .child(
                     div()
@@ -786,20 +788,23 @@ mod tests {
                             ),
                     ),
                 )
+                // In a row, so the chip's box is its own width, not the column's.
                 .child(
-                    div().debug_selector(|| "control-chip".into()).child(
-                        ds::control_chip(
-                            "chip",
-                            div()
-                                .debug_selector(|| "chip-button".into())
-                                .child(ds::chip_button(
-                                    "chip-button",
-                                    ui::IconName::Filter,
-                                    "Filters",
-                                    Some("2".into()),
-                                )),
-                        )
-                        .on_clear("Clear the filters", |_, _, _| {}),
+                    h_flex().child(
+                        div().debug_selector(|| "control-chip".into()).child(
+                            ds::control_chip(
+                                "chip",
+                                div().debug_selector(|| "chip-button".into()).child(
+                                    ds::chip_button(
+                                        "chip-button",
+                                        ui::IconName::Filter,
+                                        "Filters",
+                                        Some("2".into()),
+                                    ),
+                                ),
+                            )
+                            .on_clear("Clear the filters", |_, _, _| {}),
+                        ),
                     ),
                 )
                 // A relationship's header over its neighbours' rows.
@@ -860,8 +865,8 @@ mod tests {
     }
 
     /// A property row holds its boxed value with room above and below; a control chip is a
-    /// filter pill's height with its button centred in it, and the "+" after a list of values
-    /// is a value's height.
+    /// button's height with its button filling it from its start, so its label is as far in as
+    /// a button's, and the "+" after a list of values is a value's height.
     #[gpui::test]
     fn property_and_control_parts_draw_at_their_sizes(cx: &mut TestAppContext) {
         cx.update(studio_theme::init_test);
@@ -881,12 +886,18 @@ mod tests {
         );
         let chip = bounds(cx, "control-chip");
         let chip_button = bounds(cx, "chip-button");
-        assert_eq!(f32::from(chip.size.height), ds::size::PILL);
-        assert_eq!(f32::from(chip_button.size.height), ds::size::BAR_BUTTON);
+        assert_eq!(f32::from(chip.size.height), ds::size::BAR_BUTTON);
         assert_eq!(
-            f32::from(chip_button.top() - chip.top()),
-            f32::from(chip.bottom() - chip_button.bottom()),
-            "the button centred in its chip"
+            chip_button.size.height, chip.size.height,
+            "the button fills its chip"
+        );
+        assert_eq!(chip_button.origin, chip.origin, "from the chip's start");
+        let clear = bounds(cx, "chip-clear");
+        assert_eq!(f32::from(clear.size.height), ds::size::ROW_BUTTON);
+        assert_eq!(
+            f32::from(chip.right() - clear.right()),
+            ds::PILL_BUTTON_GAP,
+            "the clear button inside the chip's round end"
         );
         // A group's header and its neighbours are rows of one height, on one edge.
         let fold = bounds(cx, "fold-row");
@@ -983,10 +994,11 @@ mod tests {
         cx.update(|window, _| assert!(field.is_focused(window), "the field kept the focus"));
     }
 
-    /// The design system's controls draw at their tokens: a button as tall as a control with its
-    /// content 10 px in, an icon button a circle, a field as tall as a button, a pill button
-    /// round in a pill, a floating bar's buttons inside its border, and each button role at its
-    /// size, an icon button's icon following that size.
+    /// The design system's controls draw at their tokens: a button at a bar button's height
+    /// with its content 8 px in, a pill and a rounded button alike, an icon button a square of
+    /// that height, a field a control's height, a pill button round in a pill, a floating bar's
+    /// buttons inside its border, and each button role at its size, an icon button's icon
+    /// following that size.
     #[gpui::test]
     fn controls_draw_at_their_sizes(cx: &mut TestAppContext) {
         cx.update(studio_theme::init_test);
@@ -999,16 +1011,22 @@ mod tests {
         let button = bounds(cx, "button");
         // A label alone: what the inset is measured to.
         let content = bounds(cx, "button-label");
-        assert_eq!(f32::from(button.size.height), ds::size::CONTROL);
-        assert_eq!(f32::from(content.origin.x - button.origin.x), 10.);
+        assert_eq!(f32::from(button.size.height), ds::size::BAR_BUTTON);
+        assert_eq!(f32::from(content.origin.x - button.origin.x), ds::space::MD);
         assert_eq!(
             f32::from(button.right() - content.right()),
-            10.,
+            ds::space::MD,
             "the inset is even"
         );
+        // The same label with the scale's corner: the same box, only its corner differs.
+        assert_eq!(
+            bounds(cx, "rounded-button").size,
+            button.size,
+            "a pill and a rounded button match"
+        );
         let icon = bounds(cx, "icon-button");
-        assert_eq!(f32::from(icon.size.height), ds::size::CONTROL);
-        assert_eq!(icon.size.width, icon.size.height, "a circle");
+        assert_eq!(f32::from(icon.size.height), ds::size::BAR_BUTTON);
+        assert_eq!(icon.size.width, icon.size.height, "a square");
         assert_eq!(
             f32::from(bounds(cx, "field").size.height),
             ds::size::CONTROL
@@ -1036,7 +1054,6 @@ mod tests {
             assert!(button.top() >= bar.top() + gpui::px(1.), "{selector}");
         }
         for (selector, side) in [
-            ("toolbar-icon-button", ds::size::BAR_BUTTON),
             ("row-button", ds::size::ROW_BUTTON),
             ("row-icon-button", ds::size::ROW_BUTTON),
         ] {

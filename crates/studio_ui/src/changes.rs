@@ -531,11 +531,7 @@ fn value_label(value: &Option<SharedString>, color: Color, strike: bool) -> Labe
 impl RenderOnce for ChangeCard {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let accent = self.kind.color().color(cx);
-        let border = if self.selected {
-            crate::ds::surface::focus(cx)
-        } else {
-            crate::ds::surface::rule(cx)
-        };
+        let selected = self.selected;
         let kind = self.kind;
         let header = h_flex()
             .id("change-kind")
@@ -590,12 +586,12 @@ impl RenderOnce for ChangeCard {
                 .children(self.relationships)
                 .children(footer)
         });
-        let card = h_flex()
-            .id(self.id)
+        let card = crate::ds::lifted(h_flex().id(self.id), cx)
+            .when(selected, |card| {
+                card.border_color(crate::ds::surface::focus(cx))
+            })
             .w_full()
             .rounded(px(radii(cx).md))
-            .border_1()
-            .border_color(border)
             .overflow_hidden()
             .child(
                 // The change's mark: a line of its colour down the card's leading edge.

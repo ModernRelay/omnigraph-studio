@@ -500,6 +500,9 @@ pub struct ReviewView {
     /// The target moved since the dry run: it is read again at the next frame the review is
     /// drawn in ([`ReviewView::preview_moved`]), and a hidden review reads nothing.
     preview_owed: bool,
+    /// The review is read when it is next drawn ([`Self::owe_read`]): a review restored behind
+    /// another tab reads no diff, nor after a new token, until it is shown.
+    read_owed: bool,
     /// The target's head as the session knew it when the dry run was asked for.
     preview_target: Option<String>,
     _load_task: Option<Task<()>>,
@@ -645,6 +648,7 @@ impl ReviewView {
             _target_watch: target_watch,
             preview_again: false,
             preview_owed: false,
+            read_owed: false,
             preview_target: None,
             _load_task: None,
             _names_task: None,
@@ -655,12 +659,20 @@ impl ReviewView {
             _fix_task: None,
             _subscriptions: vec![subscription, search_subscription],
         };
-        // Read as any Refresh is: a merge of these branches whose response was lost and may
-        // still land, sent from a review closed since or open elsewhere, is where this one
-        // starts, from the session's log.
-        view.reload(cx);
+        // Read as any Refresh is, once shown: a merge of these branches whose response was lost
+        // and may still land, sent from a review closed since or open elsewhere, is where this
+        // one starts, from the session's log.
+        view.owe_read(cx);
         view.logged_merge_held = view.logged_merge_may_land(cx);
         view
+    }
+
+    /// Reads the review again from the branch head when it is next drawn ([`Self::read_owed`]),
+    /// as [`Self::reload`] does at once.
+    fn owe_read(&mut self, cx: &mut Context<Self>) {
+        self.load = LoadState::Loading { folded: 0 };
+        self.read_owed = true;
+        cx.notify();
     }
 
     /// The session logged an outcome, recorded what a target's history showed of a lost merge,
@@ -754,7 +766,7 @@ impl ReviewView {
         self._names_task = None;
         self.preview = Preview::Unread;
         self._preview_task = None;
-        self.reload(cx);
+        self.owe_read(cx);
     }
 
     /// Another writer's schema: the cards were made under the one before, as are those of a
@@ -2160,7 +2172,7 @@ impl ReviewView {
         let mergeable = self.mergeable(cx);
         let merge_refused = self.merge_refusal(cx);
         let delete_refused = self.delete_refusal(cx);
-        let merge_button = studio_ui::ds::toolbar_button(
+        let merge_button = studio_ui::ds::button(
             "merge",
             format!("Merge {} into {}", self.branch, self.target),
         )
@@ -2190,7 +2202,7 @@ impl ReviewView {
             move |_, cx| Tooltip::with_meta(title.clone(), None, cli.clone(), cx)
         })
         .on_click(cx.listener(|this, _, _, cx| this.merge(cx)));
-        let refresh = studio_ui::ds::toolbar_icon_button("refresh", IconName::RotateCw)
+        let refresh = studio_ui::ds::icon_button("refresh", IconName::RotateCw)
             .tooltip(refresh_tooltip(
                 "Read the branch and its target again",
                 &self.focus_handle,
@@ -2349,7 +2361,7 @@ impl ReviewView {
         let view = cx.entity().downgrade();
         let scope_menu = PopoverMenu::new("review-scope")
             .trigger(
-                studio_ui::ds::toolbar_button("review-scope-button", scope_label)
+                studio_ui::ds::button("review-scope-button", scope_label)
                     .style(ButtonStyle::Outlined)
                     .end_icon(Icon::new(IconName::ChevronDown)),
             )
@@ -2421,9 +2433,8 @@ impl ReviewView {
                 Preview::Conflicts(conflicts) => (
                     Severity::Warning,
                     format!(
-                        "{} conflict{} would stop a merge into {} now. {}",
-                        conflicts.len(),
-                        if conflicts.len() == 1 { "" } else { "s" },
+                        "{} would stop a merge into {} now. {}",
+                        studio_ui::plural(conflicts.len(), "conflict", "conflicts"),
                         self.target,
                         resolution_hint(&self.branch, &self.target)
                     ),
@@ -2532,9 +2543,8 @@ impl ReviewView {
             MergeState::Conflicts(conflicts) => (
                 Severity::Error,
                 format!(
-                    "{} conflict{} stopped the merge, and nothing was merged. {}",
-                    conflicts.len(),
-                    if conflicts.len() == 1 { "" } else { "s" },
+                    "{} stopped the merge, and nothing was merged. {}",
+                    studio_ui::plural(conflicts.len(), "conflict", "conflicts"),
                     resolution_hint(&self.branch, &self.target)
                 ),
                 Some(
@@ -2618,15 +2628,12 @@ impl ReviewView {
             .px(px(space::XL))
             .pb(px(space::MD))
             .child(
-                h_flex()
-                    .id(("conflict", ix))
+                studio_ui::ds::lifted(h_flex().id(("conflict", ix)), cx)
                     .w_full()
                     .gap(px(space::LG))
                     .px(px(space::LG))
                     .py(px(space::MD))
                     .rounded(px(radii(cx).md))
-                    .border_1()
-                    .border_color(studio_ui::ds::surface::rule(cx))
                     .bg(studio_ui::ds::surface::document(cx))
                     .child(Icon::new(IconName::GitMergeConflict).color(Color::Conflict))
                     .child(
@@ -2889,17 +2896,14 @@ impl ReviewView {
             .collect();
         card = card.relationships(counts, lines);
         if left_out > 0 {
-            card = card.relationships_footer(
-                studio_ui::ds::button(
-                    ("more-relationships", ix),
-                    change_cards::more_lines_label(left_out),
-                )
-                .style(ButtonStyle::Subtle)
-                .on_click(cx.listener(move |this, _, _, cx| {
+            card = card.relationships_footer(change_cards::more_lines_button(
+                ix,
+                left_out,
+                cx.listener(move |this, _, _, cx| {
                     this.card_lines.show_more(card_key.clone(), shown);
                     cx.notify();
-                })),
-            );
+                }),
+            ));
         }
         card.on_click(cx.listener(move |this, _, _, cx| {
             let primary = this
@@ -2960,13 +2964,7 @@ fn unknown_merge_words(reason: &str, landed: Check, target: &str) -> String {
 /// lists. Counts are of commits at or below the reviewed head, never of the commits the branch
 /// made after it, which the pages read too.
 fn capped_commits_note(data: &ReviewData, branch: &str, target: &str) -> Option<String> {
-    let commits = |n: usize| {
-        format!(
-            "{} commit{}",
-            group_digits(n),
-            if n == 1 { "" } else { "s" }
-        )
-    };
+    let commits = |n: usize| studio_ui::plural(n, "commit", "commits");
     Some(match data.commits_capped.as_ref()? {
         Capped::Own { read: 0 } => format!(
             "{branch} has more than {} commits since this review was read: Studio read no \
@@ -3786,6 +3784,9 @@ impl Render for ReviewView {
         if std::mem::take(&mut self.preview_owed) {
             cx.defer_in(window, |this, _, cx| this.preview_moved(cx));
         }
+        if std::mem::take(&mut self.read_owed) {
+            cx.defer_in(window, |this, _, cx| this.reload(cx));
+        }
         let header = self.render_header(cx);
         let body = match (&self.load, &self.data) {
             (LoadState::Ready, Some(_)) if self.show_conflicts => self.render_conflicts(cx),
@@ -3816,11 +3817,8 @@ impl Render for ReviewView {
             _ => studio_ui::ds::loading_state("Reading changes…").into_any_element(),
         };
         // Typing in the search box must not move between cards.
-        let mut context = gpui::KeyContext::new_with_defaults();
-        context.add("Review");
-        if self.search.focus_handle(cx).is_focused(window) {
-            context.add("searching");
-        }
+        let context =
+            studio_ui::ds::search_key_context("Review", &self.search.focus_handle(cx), window);
         v_flex()
             .key_context(context)
             .track_focus(&self.focus_handle)
@@ -4027,6 +4025,35 @@ pub(crate) mod tests {
             mark_of(&change("p2", json!({"name": "Ada"}))),
             "another entity"
         );
+    }
+
+    /// A review not drawn (restored with the workspace behind another tab) reads no diff until
+    /// it is shown; drawn, it reads. Before, every restored review read its whole diff at start.
+    #[gpui::test]
+    async fn a_review_not_drawn_reads_no_diff(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _) = reviewed_server_writing(false, cx);
+        let (_blank, cx) = cx.add_window_view(|_, _| gpui::EmptyView);
+        let hidden = cx.update(|window, cx| {
+            let session = session.clone();
+            cx.new(|cx| ReviewView::new(session, "feature".into(), "main".into(), window, cx))
+        });
+        cx.run_until_parked();
+        hidden.read_with(cx, |view, _| {
+            assert!(
+                view._load_task.is_none() && view.data.is_none(),
+                "no diff read"
+            );
+            assert!(view.read_owed, "it reads when drawn");
+        });
+        let (shown, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        shown.read_with(cx, |view, _| assert!(matches!(view.load, LoadState::Ready)));
     }
 
     /// Fixes asked for one after the other go one at a time, each bound to the commit the one

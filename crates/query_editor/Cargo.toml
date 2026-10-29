@@ -39,6 +39,7 @@ serde_json = { workspace = true }
 gpui = { workspace = true, features = ["test-support"] }
 http_client = { workspace = true }
 studio_theme = { workspace = true, features = ["test-support"] }
+studio_workspace = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

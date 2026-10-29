@@ -5,6 +5,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
+use futures::FutureExt as _;
+use futures::channel::oneshot;
+use futures::future::{BoxFuture, Shared};
 use gpui::{Context, EventEmitter, Task};
 use graph_client::api::{GraphInfo, HealthOutput};
 use graph_client::{GraphClient, ReadError};
@@ -12,7 +15,7 @@ use http_client::HttpClient;
 use studio_settings::StudioSettings;
 
 use crate::cli_tokens::{Lease, NoToken, Token, TokenSource};
-use crate::sign_in::{self, OAuthSource, Service, SignIn, SignInContext};
+use crate::sign_in::{self, Kept, OAuthSource, Service, SignIn, SignInContext};
 
 /// Where Studio learned about a server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +191,15 @@ pub struct Connection {
     lease: Option<Lease>,
     /// The sign-in under way: reading its service, or waiting for the browser.
     _signing_in: Option<Task<()>>,
+    /// Counts what decides the keychain's item for the target (a sign-in taken, a sign-out):
+    /// a sign-out's answer, which comes later, is taken only while that sign-out is the last.
+    custody: u64,
+    /// The keychain's refusal to delete the target's item, which a sign-out or a sign-in that
+    /// ended left there and the next launch reads. A sign-in taken answers for the item itself.
+    pub left_behind: Option<String>,
+    /// The target's keychain work in turn: the end of the queue, which the next sign-in,
+    /// sign-out or launch read waits for before it reaches the keychain ([`Self::next_keychain_turn`]).
+    keychain_turn: Option<Shared<BoxFuture<'static, ()>>>,
     /// The ask for the next short-lived token, before the one held ends.
     _renewal: Option<Task<()>>,
     /// The renewal came while nothing watched the server: the next watch asks.
@@ -312,6 +324,9 @@ impl Connection {
             oauth: None,
             lease: None,
             _signing_in: None,
+            custody: 0,
+            left_behind: None,
+            keychain_turn: None,
             _renewal: None,
             renewal_missed: false,
         })
@@ -360,11 +375,16 @@ impl Connection {
         if source.is_none() && self.oauth.is_some() {
             return;
         }
+        let was_ready = self.token_ready();
         if source.is_some() {
-            self.drop_sign_in();
+            self.drop_sign_in(cx);
         }
         let had = self.token_source.is_some();
         self.token_source = source;
+        // A window waiting for the old source's answer reads without a token now.
+        if !was_ready && self.token_ready() {
+            cx.emit(ConnectionEvent::TokenReady);
+        }
         // The token held is the old source's: the new one's failure does not keep it.
         self.token_from_source = false;
         if self.token_source.is_some() {
@@ -403,7 +423,7 @@ impl Connection {
     /// without leaving Studio, and nothing is checked again. A window showing one of its graphs
     /// says so; opening the graph again reaches the target as the CLI lists it now.
     pub(crate) fn retire(&mut self, why: String, cx: &mut Context<Self>) {
-        self.drop_sign_in();
+        self.drop_sign_in(cx);
         self.token_source = None;
         self.token_given = false;
         self.token_answered = true;
@@ -485,10 +505,32 @@ impl Connection {
             return;
         };
         let hurry = self.hurry.clone();
+        let asked = source.clone();
         let asking = cx.spawn(async move |this, cx| {
             let answer = cx.background_executor().spawn(source.token(hurry)).await;
-            this.update(cx, |this, cx| this.token_answered(answer, ask, cx))
-                .ok();
+            this.update(cx, |this, cx| {
+                // Taken only while the token still comes from the source asked: one a sign-out,
+                // a sign-in or the CLI's credential replaced meanwhile could put back a token
+                // that was dropped, the person's signed-out one among them.
+                if this
+                    .token_source
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &asked))
+                {
+                    this.token_answered(answer, ask, cx);
+                } else if ask == Ask::Connect {
+                    // A connect that waited on it asks the source now in use, which may give
+                    // the token already held and so start no connect of its own; after a
+                    // Cancel, a window waiting for the token still gets it, and the connection
+                    // stays as Cancel left it.
+                    if this.state == ConnectionState::Connecting {
+                        this.connect(cx);
+                    } else if !this.token_ready() {
+                        this.ask_for_token(Ask::Connect, cx);
+                    }
+                }
+            })
+            .ok();
         });
         if ask == Ask::Connect {
             self._task = Some(asking);
@@ -621,6 +663,9 @@ impl Connection {
         } else if let Some(source) = self.oauth.take() {
             self.token_source = None;
             self.token_unread = None;
+            if let Kept::Earlier(refused) = source.kept_in_keychain() {
+                self.left_behind = Some(refused);
+            }
             self.sign_in = SignIn::Offered {
                 service: source.service().host(),
                 why: Some(no.why),
@@ -907,12 +952,23 @@ impl Connection {
                 ))
                 .await;
             let kept = match &found {
-                Ok(service) => context
-                    .keychain
-                    .read(service.key(&target))
-                    .await
-                    .ok()
-                    .flatten(),
+                Ok(service) => {
+                    let Ok((before, done)) = this.update(cx, |this, _| this.next_keychain_turn())
+                    else {
+                        return;
+                    };
+                    if let Some(before) = before {
+                        before.await;
+                    }
+                    let kept = context
+                        .keychain
+                        .read(service.key(&target))
+                        .await
+                        .ok()
+                        .flatten();
+                    done.send(()).ok();
+                    kept
+                }
                 Err(_) => None,
             };
             this.update(cx, |this, cx| {
@@ -923,6 +979,9 @@ impl Connection {
                         let service = this.current(service);
                         let host = service.host();
                         this.service = Some(service.clone());
+                        // What the keychain holds now is what was read: nothing left there to say
+                        // when the read found none, and a sign-in taken when it found one.
+                        this.left_behind = None;
                         this.sign_in = SignIn::Offered {
                             service: host,
                             why: None,
@@ -1011,7 +1070,7 @@ impl Connection {
                     .ok_or("The sign-in was not finished within five minutes.".to_owned())?
                     .map_err(|error| error.to_string())?;
                     let service = exchanged;
-                    oauth_client::exchange(
+                    let tokens = oauth_client::exchange(
                         service.clients.for_url(&service.server.token_endpoint),
                         &service.server,
                         &code,
@@ -1020,9 +1079,29 @@ impl Connection {
                         service.expected(),
                     )
                     .await
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| error.to_string())?;
+                    // Revoked if the connection does not take it (the sign-in cancelled, or the
+                    // connection gone), made here so no moment holds the token unguarded.
+                    let unclaimed =
+                        sign_in::Unclaimed::new(service.clone(), tokens.refresh_token.clone());
+                    Ok((tokens, unclaimed))
                 })
                 .await;
+            let (signed_in, unclaimed) = match signed_in {
+                Ok((tokens, unclaimed)) => (Ok(tokens), Some(unclaimed)),
+                Err(why) => (Err(why), None),
+            };
+            let mut turn_done = None;
+            if signed_in.is_ok() {
+                let Ok((before, done)) = this.update(cx, |this, _| this.next_keychain_turn())
+                else {
+                    return;
+                };
+                turn_done = Some(done);
+                if let Some(before) = before {
+                    before.await;
+                }
+            }
             // One account per target: the one replaced ends, its refresh token revoked, and the
             // keychain keeps only the new one's, or none, never the old account's.
             if signed_in.is_ok()
@@ -1031,24 +1110,37 @@ impl Connection {
                 previous.replaced().await;
             }
             let kept = match &signed_in {
-                Ok(tokens) => match &tokens.refresh_token {
-                    Some(refresh) => context
-                        .keychain
-                        .write(
-                            service.key(&target),
-                            tokens.account.subject.clone(),
-                            refresh.as_bytes().to_vec(),
-                        )
-                        .await
-                        .is_ok(),
-                    None => {
-                        context.keychain.delete(service.key(&target)).await.ok();
-                        false
+                Ok(tokens) => {
+                    let written = match &tokens.refresh_token {
+                        Some(refresh) => context
+                            .keychain
+                            .write(
+                                service.key(&target),
+                                tokens.account.subject.clone(),
+                                refresh.as_bytes().to_vec(),
+                            )
+                            .await
+                            .is_ok(),
+                        None => false,
+                    };
+                    if written {
+                        Kept::This
+                    } else {
+                        // Kept or not, this sign-in leaves the keychain no earlier one: one it
+                        // will not delete is said, as the next launch would read it.
+                        match sign_in::forget(context.keychain.as_ref(), service.key(&target)).await
+                        {
+                            Ok(()) => Kept::Nothing,
+                            Err(refused) => Kept::Earlier(refused),
+                        }
                     }
-                },
-                Err(_) => false,
+                }
+                Err(_) => Kept::Nothing,
             };
-            this.update(cx, |this, cx| {
+            if let Some(done) = turn_done {
+                done.send(()).ok();
+            }
+            let taken = this.update(cx, |this, cx| {
                 this._signing_in = None;
                 match signed_in {
                     Ok(tokens) => {
@@ -1060,6 +1152,7 @@ impl Connection {
                             kept,
                         );
                         this.use_sign_in(source, cx);
+                        true
                     }
                     Err(why) => {
                         this.sign_in = SignIn::Offered {
@@ -1068,10 +1161,15 @@ impl Connection {
                         };
                         cx.emit(ConnectionEvent::StateChanged);
                         cx.notify();
+                        false
                     }
                 }
-            })
-            .ok();
+            });
+            if matches!(taken, Ok(true))
+                && let Some(unclaimed) = unclaimed
+            {
+                unclaimed.claim();
+            }
         }));
     }
 
@@ -1089,15 +1187,51 @@ impl Connection {
     }
 
     /// Signs out: the tokens are dropped, the keychain item deleted and, where the service
-    /// takes it, the refresh token revoked; the connection checks again without a token.
+    /// takes it, the refresh token revoked; the connection checks again without a token. A
+    /// keychain that keeps the item is said, as the next launch would read it back.
     pub fn sign_out(&mut self, cx: &mut Context<Self>) {
         let Some(source) = self.oauth.take() else {
             return;
         };
+        let was_ready = self.token_ready();
         self.token_source = None;
+        if !was_ready {
+            cx.emit(ConnectionEvent::TokenReady);
+        }
         self.lease = None;
         self._renewal = None;
-        cx.background_executor().spawn(source.sign_out()).detach();
+        self.custody += 1;
+        let custody = self.custody;
+        // Ends the sign-in now, so no refresh writes the keychain after this.
+        let sign_out = source.sign_out();
+        let (before, done) = self.next_keychain_turn();
+        let ending = cx.background_executor().spawn(async move {
+            if let Some(before) = before {
+                before.await;
+            }
+            sign_out.await
+        });
+        // Detached, so the revocation finishes when the connection is gone first. The keychain's
+        // answer is taken before it, and before a sign-in made meanwhile reaches the keychain.
+        cx.spawn(async move |this, cx| {
+            let sign_in::Ending {
+                forgotten,
+                revocation,
+            } = ending.await;
+            cx.background_executor().spawn(revocation).detach();
+            if let Err(refused) = forgotten {
+                this.update(cx, |this, cx| {
+                    if this.custody == custody {
+                        this.left_behind = Some(refused);
+                        cx.emit(ConnectionEvent::StateChanged);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+            done.send(()).ok();
+        })
+        .detach();
         self.sign_in = SignIn::Offered {
             service: source.service().host(),
             why: None,
@@ -1117,8 +1251,45 @@ impl Connection {
         }
     }
 
+    /// The keychain's refusal to delete an item it holds for the target, which the next launch
+    /// reads: the earlier one the sign-in held kept nothing over, whatever the sign-in's state,
+    /// or one left when no sign-in is held.
+    pub fn kept_behind(&self) -> Option<String> {
+        match &self.oauth {
+            Some(source) => match source.kept_in_keychain() {
+                Kept::Earlier(refused) => Some(refused),
+                Kept::This | Kept::Nothing => None,
+            },
+            None => self.left_behind.clone(),
+        }
+    }
+
+    /// The next turn at the target's keychain: the work to wait for first (the end of the queue
+    /// until now), and what to send once this turn's keychain work is done. The queue's new end
+    /// waits for both, so a turn given up still holds the next behind the one before it.
+    fn next_keychain_turn(
+        &mut self,
+    ) -> (Option<Shared<BoxFuture<'static, ()>>>, oneshot::Sender<()>) {
+        let (done, own) = oneshot::channel::<()>();
+        let before = self.keychain_turn.take();
+        let after = before.clone();
+        self.keychain_turn = Some(
+            async move {
+                if let Some(after) = after {
+                    after.await;
+                }
+                own.await.ok();
+            }
+            .boxed()
+            .shared(),
+        );
+        (before, done)
+    }
+
     /// Takes the token from `source`, a sign-in just made or kept, and connects with it.
     fn use_sign_in(&mut self, source: OAuthSource, cx: &mut Context<Self>) {
+        self.custody += 1;
+        self.left_behind = None;
         self.oauth = Some(source.clone());
         self.token_source = Some(Arc::new(source));
         self.token_given = false;
@@ -1132,9 +1303,28 @@ impl Connection {
     }
 
     /// Forgets the sign-in, which the CLI's credential for the target replaces. The keychain
-    /// keeps it, for the target made anonymous again.
-    fn drop_sign_in(&mut self) {
-        self.oauth = None;
+    /// keeps what it holds, for the target made anonymous again, and an item it kept but would
+    /// not delete stays said; a sign-in whose token the keychain does not hold is revoked, since
+    /// nothing else would hold it. Both are decided once a refresh under way has settled
+    /// ([`OAuthSource::dropped`]).
+    fn drop_sign_in(&mut self, cx: &mut Context<Self>) {
+        if let Some(source) = self.oauth.take() {
+            let custody = self.custody;
+            let dropped = source.dropped();
+            cx.spawn(async move |this, cx| {
+                if let Kept::Earlier(refused) = dropped.await {
+                    this.update(cx, |this, cx| {
+                        if this.custody == custody {
+                            this.left_behind = Some(refused);
+                            cx.emit(ConnectionEvent::StateChanged);
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                }
+            })
+            .detach();
+        }
         self.service = None;
         self.lease = None;
         self._renewal = None;
@@ -1358,7 +1548,7 @@ async fn list_graphs(client: &GraphClient) -> Result<GraphListing, Failed> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{AppContext as _, TestAppContext};
+    use gpui::{AppContext as _, Entity, TestAppContext};
     use http_client::{AsyncBody, FakeHttpClient, Response};
 
     /// A server answering `/healthz` with `version`, and every other read with no graphs.
@@ -1442,6 +1632,153 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// The answer of a token source the connection no longer takes its token from is not taken:
+    /// the token dropped when the source was replaced stays dropped. Before, a Refresh or a
+    /// renewal under way when the source changed (a sign-out, a sign-in, the CLI's credential)
+    /// answered afterwards and put its token back.
+    #[gpui::test]
+    async fn a_token_answered_after_its_source_was_replaced_is_not_taken(cx: &mut TestAppContext) {
+        let gated = Arc::new(Gated::default());
+        let connection = gated_server(gated.clone(), cx);
+        connection.update(cx, |c, cx| c.connect(cx));
+        cx.run_until_parked();
+        connection.read_with(cx, |c, _| {
+            assert_eq!(c.state, ConnectionState::Ready);
+            assert!(c.has_token);
+        });
+        // A Refresh waits for its answer while the target is made anonymous.
+        let (answer, gate) = oneshot::channel();
+        *gated.0.lock().unwrap() = Some(gate);
+        connection.update(cx, |c, cx| c.refresh_token(cx));
+        cx.run_until_parked();
+        connection.update(cx, |c, cx| c.take_token_from(None, cx));
+        cx.run_until_parked();
+        connection.read_with(cx, |c, _| assert!(!c.has_token));
+        answer.send(Token::typed("stale".into())).ok();
+        cx.run_until_parked();
+        connection.read_with(cx, |c, _| {
+            assert!(!c.has_token, "the replaced source's answer was taken")
+        });
+    }
+
+    /// A connect that waited on a token source replaced meanwhile asks the source now in use:
+    /// one that gives the token already held starts no connect of its own, and without this
+    /// the connection stayed connecting.
+    #[gpui::test]
+    async fn a_connect_whose_source_was_replaced_asks_the_new_one(cx: &mut TestAppContext) {
+        let first = Arc::new(Gated::default());
+        let connection = gated_server(first.clone(), cx);
+        connection.update(cx, |c, cx| c.connect(cx));
+        cx.run_until_parked();
+        let (answer, gate) = oneshot::channel();
+        *first.0.lock().unwrap() = Some(gate);
+        connection.update(cx, |c, cx| c.connect(cx));
+        cx.run_until_parked();
+        connection.read_with(cx, |c, _| assert_eq!(c.state, ConnectionState::Connecting));
+        // The CLI's credential changes to a source that gives the same token.
+        connection.update(cx, |c, cx| {
+            c.take_token_from(Some(Arc::new(Gated::default())), cx)
+        });
+        cx.run_until_parked();
+        answer.send(Token::typed("first".into())).ok();
+        cx.run_until_parked();
+        connection.read_with(cx, |c, _| assert_eq!(c.state, ConnectionState::Ready));
+
+        // A window waiting for the token, its connect cancelled: the source in use is asked, the
+        // token gets ready, and the connection stays as Cancel left it.
+        let waited = Arc::new(Gated::default());
+        let connection = gated_server(waited.clone(), cx);
+        let (answer, gate) = oneshot::channel();
+        *waited.0.lock().unwrap() = Some(gate);
+        connection.update(cx, |c, cx| c.wait_for_token(cx));
+        cx.run_until_parked();
+        connection.update(cx, |c, cx| c.cancel(cx));
+        connection.update(cx, |c, cx| {
+            c.take_token_from(Some(Arc::new(Gated::default())), cx)
+        });
+        cx.run_until_parked();
+        answer.send(Token::typed("first".into())).ok();
+        cx.run_until_parked();
+        connection.read_with(cx, |c, _| {
+            assert!(c.token_ready(), "the waiting window gets its token");
+            assert_eq!(c.state, ConnectionState::Idle);
+        });
+
+        // The same, the target made anonymous instead: the window hears the token is ready.
+        let waited = Arc::new(Gated::default());
+        let connection = gated_server(waited.clone(), cx);
+        let readied = Rc::new(std::cell::Cell::new(0));
+        let heard = readied.clone();
+        let _heard = cx.update(|cx| {
+            cx.subscribe(&connection, move |_, event: &ConnectionEvent, _| {
+                if matches!(event, ConnectionEvent::TokenReady) {
+                    heard.set(heard.get() + 1);
+                }
+            })
+        });
+        let (_answer, gate) = oneshot::channel::<Token>();
+        *waited.0.lock().unwrap() = Some(gate);
+        connection.update(cx, |c, cx| c.wait_for_token(cx));
+        cx.run_until_parked();
+        connection.update(cx, |c, cx| c.cancel(cx));
+        connection.update(cx, |c, cx| c.take_token_from(None, cx));
+        cx.run_until_parked();
+        connection.read_with(cx, |c, _| assert!(c.token_ready()));
+        assert_eq!(
+            readied.get(),
+            1,
+            "the waiting window heard the token is ready"
+        );
+    }
+
+    /// A token source that answers "first" at once, or, once given a gate, what comes through it.
+    #[derive(Default)]
+    struct Gated(std::sync::Mutex<Option<oneshot::Receiver<Token>>>);
+
+    impl TokenSource for Gated {
+        fn token(&self, _: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, NoToken>> {
+            let gate = self.0.lock().unwrap().take();
+            async move {
+                match gate {
+                    Some(gate) => gate.await.map_err(|_| NoToken::passing("no answer")),
+                    None => Ok(Token::typed("first".into())),
+                }
+            }
+            .boxed()
+        }
+    }
+
+    /// A healthy server with no graphs, whose token comes from `source`.
+    fn gated_server(source: Arc<Gated>, cx: &mut TestAppContext) -> Entity<Connection> {
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            async move {
+                let body = if path.ends_with("/healthz") {
+                    r#"{"status":"ok","version":"0.14.0","internal_schema_version":16}"#
+                } else {
+                    r#"{"graphs":[]}"#
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Cli,
+            known_graphs: Vec::new(),
+        };
+        let source: Arc<dyn TokenSource> = source;
+        cx.new(|_| {
+            Connection::new(server, None, http)
+                .unwrap()
+                .with_token_source(Some(source))
+        })
     }
 
     /// A connection whose token source has not answered waits to connect, sending nothing it

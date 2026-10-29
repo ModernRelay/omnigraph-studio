@@ -36,7 +36,14 @@ pub fn init(cx: &mut App) {
         ) else {
             return;
         };
-        commit_view::open_in(workspace, session, id.to_owned(), None, window, cx);
+        // Read once shown: a tab behind another reads nothing at start.
+        let id = id.to_owned();
+        workspace.open_item::<commit_view::CommitView>(
+            commit_view::commit_key(&id),
+            window,
+            cx,
+            |_, cx| commit_view::CommitView::when_shown(session, id, cx),
+        );
     });
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         if let Some(window) = window {
