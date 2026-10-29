@@ -1858,6 +1858,18 @@ impl Connection {
             cx.emit(ConnectionEvent::StateChanged);
             cx.notify();
         }
+        // A renewal the wall clock has passed is asked now. The executor's timers stand still
+        // while the machine sleeps, so after a sleep the renewal's own timer fires that much late,
+        // the token held ended meanwhile; this check comes within its interval of waking.
+        if self.state == ConnectionState::Ready
+            && self._asking.is_none()
+            && self
+                .lease
+                .as_ref()
+                .is_some_and(|lease| SystemTime::now() >= lease.renew_at)
+        {
+            self.ask_for_token(Ask::Renewal, cx);
+        }
         self.schedule_health_check(cx);
     }
 }
@@ -2769,6 +2781,84 @@ mod tests {
             (2, refused_under + 1),
             "the ask after the refusal answered, its token a new credential"
         );
+    }
+
+    /// A renewal the wall clock has passed is asked at the next health check, though its own
+    /// timer has not fired: the executor's timers stand still while the machine sleeps, so after
+    /// a sleep that timer fires late. Before, the token held, ended meanwhile, was sent until it.
+    #[gpui::test]
+    async fn a_renewal_the_clock_passed_in_a_sleep_is_asked_at_the_next_check(
+        cx: &mut TestAppContext,
+    ) {
+        use std::sync::atomic::AtomicUsize;
+        #[derive(Default)]
+        struct Leasing {
+            asked: AtomicUsize,
+        }
+        impl TokenSource for Leasing {
+            fn token(
+                &self,
+                _: Arc<AtomicBool>,
+            ) -> futures::future::BoxFuture<'static, Result<Token, NoToken>> {
+                let asked = self.asked.fetch_add(1, Ordering::SeqCst) + 1;
+                let now = SystemTime::now();
+                Box::pin(async move {
+                    Ok(Token::leased(
+                        format!("token {asked}"),
+                        Lease {
+                            expires_at: now + Duration::from_secs(7200),
+                            renew_at: now + Duration::from_secs(3600),
+                            holder: "user_1".into(),
+                        },
+                    ))
+                })
+            }
+        }
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            async move {
+                let body = if path.ends_with("/healthz") {
+                    r#"{"status":"ok","version":"0.14.0","internal_schema_version":16}"#
+                } else {
+                    r#"{"graphs":[]}"#
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let source = Arc::new(Leasing::default());
+        let server = ServerEntry {
+            name: "signed".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Cli,
+            known_graphs: Vec::new(),
+        };
+        let held: Arc<dyn TokenSource> = source.clone();
+        let connection = cx.new(|_| {
+            Connection::new(server, None, http)
+                .unwrap()
+                .with_token_source(Some(held))
+        });
+        let _watch = connection.update(cx, |connection, cx| {
+            connection.connect(cx);
+            connection.watch(cx)
+        });
+        cx.run_until_parked();
+        let asked = || source.asked.load(Ordering::SeqCst);
+        assert_eq!(asked(), 1);
+        // The machine slept past the renewal: the wall clock moved, the executor's did not.
+        connection.update(cx, |connection, _| {
+            connection.lease.as_mut().unwrap().renew_at = SystemTime::now() - Duration::from_secs(1)
+        });
+        cx.executor().advance_clock(DEFAULT_CHECK_INTERVAL);
+        cx.run_until_parked();
+        assert_eq!(asked(), 2, "renewed at the check after waking");
+        cx.executor().advance_clock(DEFAULT_CHECK_INTERVAL);
+        cx.run_until_parked();
+        assert_eq!(asked(), 2, "the renewed token is not asked about again");
     }
 
     /// A renewal the source cannot answer now leaves the token held in use, unsaid: the
