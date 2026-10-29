@@ -40,6 +40,29 @@ trait InsertForm: EventEmitter<DismissEvent> + Sized + 'static {
     fn fields_mut(&mut self) -> &mut Vec<Field>;
     /// Whether its write is under way, and why the last one did not land.
     fn outcome_mut(&mut self) -> (&mut bool, &mut Option<Notice>);
+    /// The dialog's title: "New" and the type.
+    fn title(&self) -> String;
+    /// The branch the insert writes to.
+    fn branch(&self) -> &str;
+    /// Why nothing can be inserted here (the credential may not write), if so.
+    fn blocked(&self) -> Option<&str>;
+    /// Inserts what the form holds.
+    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>);
+    /// Tab and shift-tab move between the form's fields.
+    fn focus_step(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>);
+
+    /// ↵: inserts, unless the form takes it first.
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.submit(window, cx);
+    }
+
+    /// Closes the dialog, unless its write is under way: its outcome shows here.
+    fn cancel(&mut self, cx: &mut Context<Self>) {
+        let (saving, _) = self.outcome_mut();
+        if !*saving {
+            cx.emit(DismissEvent);
+        }
+    }
 
     /// Whether the last write's outcome is unknown and the form has not changed since: sent
     /// again as it is, an insert may land twice, so Insert waits and the dialog offers History.
@@ -232,6 +255,75 @@ impl InsertForm for InsertRowModal {
     fn outcome_mut(&mut self) -> (&mut bool, &mut Option<Notice>) {
         (&mut self.saving, &mut self.notice)
     }
+
+    fn title(&self) -> String {
+        format!("New {}", self.type_name)
+    }
+
+    fn branch(&self) -> &str {
+        &self.branch
+    }
+
+    fn blocked(&self) -> Option<&str> {
+        self.blocked.as_deref()
+    }
+
+    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.saving || self.blocked.is_some() || self.held_back() {
+            return;
+        }
+        let Some(values) = field_values(&mut self.fields, cx) else {
+            cx.notify();
+            return;
+        };
+        let query = match builder::insert_node(&self.schema, &self.type_name, &values) {
+            Ok(query) => query,
+            Err(error) => {
+                self.notice = Some(Notice::new(Tone::Invalid, error.to_string()));
+                cx.notify();
+                return;
+            }
+        };
+        let key = self
+            .schema
+            .node(&self.type_name)
+            .and_then(|node| node.key.clone())
+            .and_then(|key| values.iter().find(|(name, _)| *name == key))
+            .and_then(|(_, value)| value.as_str().map(str::to_owned));
+        let description = match &key {
+            Some(key) => format!("Insert {} {key}", self.type_name),
+            None => format!("Insert {}", self.type_name),
+        };
+        self.saving = true;
+        self.notice = None;
+        cx.notify();
+        let values: Map<String, Value> = values.into_iter().collect();
+        send_insert(
+            &self.session,
+            self.table.clone(),
+            self.branch.clone(),
+            &query,
+            description,
+            (key, values),
+            "Nothing was inserted.",
+            window,
+            cx,
+        );
+    }
+
+    /// Tab and shift-tab move between fields.
+    fn focus_step(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.fields.is_empty() {
+            return;
+        }
+        let current = self
+            .fields
+            .iter()
+            .position(|field| field.editor.focus_handle(cx).is_focused(window))
+            .unwrap_or(0) as isize;
+        let next = (current + step).rem_euclid(self.fields.len() as isize) as usize;
+        window.focus(&self.fields[next].editor.focus_handle(cx), cx);
+    }
 }
 
 impl ModalView for InsertRowModal {
@@ -281,69 +373,6 @@ impl InsertRowModal {
             _subscriptions: subscriptions,
         }
     }
-
-    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.saving || self.blocked.is_some() || self.held_back() {
-            return;
-        }
-        let Some(values) = field_values(&mut self.fields, cx) else {
-            cx.notify();
-            return;
-        };
-        let query = match builder::insert_node(&self.schema, &self.type_name, &values) {
-            Ok(query) => query,
-            Err(error) => {
-                self.notice = Some(Notice::new(Tone::Invalid, error.to_string()));
-                cx.notify();
-                return;
-            }
-        };
-        let key = self
-            .schema
-            .node(&self.type_name)
-            .and_then(|node| node.key.clone())
-            .and_then(|key| values.iter().find(|(name, _)| *name == key))
-            .and_then(|(_, value)| value.as_str().map(str::to_owned));
-        let description = match &key {
-            Some(key) => format!("Insert {} {key}", self.type_name),
-            None => format!("Insert {}", self.type_name),
-        };
-        self.saving = true;
-        self.notice = None;
-        cx.notify();
-        let values: Map<String, Value> = values.into_iter().collect();
-        send_insert(
-            &self.session,
-            self.table.clone(),
-            self.branch.clone(),
-            &query,
-            description,
-            (key, values),
-            "Nothing was inserted.",
-            window,
-            cx,
-        );
-    }
-
-    fn cancel(&mut self, cx: &mut Context<Self>) {
-        if !self.saving {
-            cx.emit(DismissEvent);
-        }
-    }
-
-    /// Tab and shift-tab move between fields.
-    fn focus_step(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.fields.is_empty() {
-            return;
-        }
-        let current = self
-            .fields
-            .iter()
-            .position(|field| field.editor.focus_handle(cx).is_focused(window))
-            .unwrap_or(0) as isize;
-        let next = (current + step).rem_euclid(self.fields.len() as isize) as usize;
-        window.focus(&self.fields[next].editor.focus_handle(cx), cx);
-    }
 }
 
 fn placeholder(property: &Property) -> String {
@@ -390,58 +419,74 @@ fn render_field(field: &Field, cx: &App) -> AnyElement {
 
 impl Render for InsertRowModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let fields: Vec<AnyElement> = self
-            .fields
-            .iter()
-            .map(|field| render_field(field, cx))
-            .collect();
-        let saving = self.saving;
-        let unknown = self.held_back();
-        let blocked = self.blocked.clone();
-        modal(cx)
-            .key_context("InsertRowModal")
-            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.submit(window, cx)))
-            .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| this.cancel(cx)))
-            .on_action(
-                cx.listener(|this, _: &menu::SelectNext, window, cx| {
-                    this.focus_step(1, window, cx)
-                }),
-            )
-            .on_action(cx.listener(|this, _: &menu::SelectPrevious, window, cx| {
-                this.focus_step(-1, window, cx)
-            }))
-            .child(
-                ModalHeader::new(format!("New {}", self.type_name))
-                    .meta(write_target(self.branch.clone(), cx))
-                    .close_disabled(saving)
-                    .on_close(cx.listener(|this, _, _, cx| this.cancel(cx))),
-            )
-            .child(
-                modal_body()
-                    .children(fields)
-                    .children(blocked.map(studio_ui::ds::text::error))
-                    .children(self.notice.clone().map(|notice| {
-                        studio_ui::ds::text::body(notice.message).color(notice.tone.color())
-                    })),
-            )
-            .child(
-                modal_footer(cx)
-                    .child(
-                        cancel_button("cancel-insert")
-                            .disabled(saving)
-                            .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
-                    )
-                    .when(unknown, |footer| {
-                        footer.child(open_history_button("insert-history"))
-                    })
-                    .child(
-                        action_button("insert", if saving { "Inserting…" } else { "Insert" })
-                            .disabled(saving || self.blocked.is_some() || unknown)
-                            .key_binding(ui::KeyBinding::for_action(&menu::Confirm, cx))
-                            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
-                    ),
-            )
+        insert_dialog(self, "InsertRowModal", Vec::new(), cx)
     }
+}
+
+/// An insert dialog: its title over the branch it writes to; `leading` (an edge's endpoints),
+/// then the property fields; why it cannot insert, and the last write's outcome; and Cancel,
+/// History while that outcome is unknown, and Insert. `context` is its key context.
+fn insert_dialog<V: InsertForm>(
+    this: &mut V,
+    context: &'static str,
+    leading: Vec<AnyElement>,
+    cx: &mut Context<V>,
+) -> Div {
+    let fields: Vec<AnyElement> = this
+        .fields_mut()
+        .iter()
+        .map(|field| render_field(field, cx))
+        .collect();
+    let unknown = this.held_back();
+    let (saving, notice) = {
+        let (saving, notice) = this.outcome_mut();
+        (*saving, notice.clone())
+    };
+    let blocked = this.blocked().map(str::to_owned);
+    modal(cx)
+        .key_context(context)
+        .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.confirm(window, cx)))
+        .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| this.cancel(cx)))
+        .on_action(
+            cx.listener(|this, _: &menu::SelectNext, window, cx| this.focus_step(1, window, cx)),
+        )
+        .on_action(
+            cx.listener(|this, _: &menu::SelectPrevious, window, cx| {
+                this.focus_step(-1, window, cx)
+            }),
+        )
+        .child(
+            ModalHeader::new(this.title())
+                .meta(write_target(this.branch().to_owned(), cx))
+                .close_disabled(saving)
+                .on_close(cx.listener(|this, _, _, cx| this.cancel(cx))),
+        )
+        .child(
+            modal_body()
+                .children(leading)
+                .children(fields)
+                .children(blocked.clone().map(studio_ui::ds::text::error))
+                .children(notice.map(|notice| {
+                    studio_ui::ds::text::body(notice.message).color(notice.tone.color())
+                })),
+        )
+        .child(
+            modal_footer(cx)
+                .child(
+                    cancel_button("cancel-insert")
+                        .disabled(saving)
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+                )
+                .when(unknown, |footer| {
+                    footer.child(open_history_button("insert-history"))
+                })
+                .child(
+                    action_button("insert", if saving { "Inserting…" } else { "Insert" })
+                        .disabled(saving || blocked.is_some() || unknown)
+                        .key_binding(ui::KeyBinding::for_action(&menu::Confirm, cx))
+                        .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+                ),
+        )
 }
 
 /// One end of a new edge: a node of `type_name`, searched by id or label while it is typed, at
@@ -494,6 +539,96 @@ impl InsertForm for InsertEdgeModal {
 
     fn outcome_mut(&mut self) -> (&mut bool, &mut Option<Notice>) {
         (&mut self.saving, &mut self.notice)
+    }
+
+    fn title(&self) -> String {
+        format!("New {}", self.edge_name)
+    }
+
+    fn branch(&self) -> &str {
+        &self.branch
+    }
+
+    fn blocked(&self) -> Option<&str> {
+        self.blocked.as_deref()
+    }
+
+    /// ↵ picks the highlighted node in an endpoint field, and inserts otherwise. While the
+    /// field's search is out it waits: the nodes offered were found for earlier text.
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(end) = self.focused_end(window, cx) {
+            let endpoint = self.endpoint_mut(end);
+            let typed = endpoint.editor.read(cx).text(cx);
+            if endpoint.answers.as_deref() != Some(typed.trim()) {
+                return;
+            }
+            if let Some(index) = endpoint.offers.highlighted() {
+                self.pick(end, index, window, cx);
+                return;
+            }
+        }
+        self.submit(window, cx);
+    }
+
+    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.saving || self.blocked.is_some() || self.held_back() {
+            return;
+        }
+        let mut valid = true;
+        let mut ends = Vec::new();
+        for end in [End::From, End::To] {
+            let endpoint = self.endpoint_mut(end);
+            let id = endpoint.editor.read(cx).text(cx).trim().to_owned();
+            if id.is_empty() {
+                endpoint.error = Some(format!("Pick a {}.", endpoint.type_name));
+                valid = false;
+            }
+            ends.push(id);
+        }
+        let values = field_values(&mut self.fields, cx);
+        let Some(values) = values.filter(|_| valid) else {
+            cx.notify();
+            return;
+        };
+        let (from, to) = (ends[0].clone(), ends[1].clone());
+        let query = match builder::insert_edge(&self.schema, &self.edge_name, &from, &to, &values) {
+            Ok(query) => query,
+            Err(error) => {
+                self.notice = Some(Notice::new(Tone::Invalid, error.to_string()));
+                cx.notify();
+                return;
+            }
+        };
+        self.saving = true;
+        self.notice = None;
+        cx.notify();
+        let description = format!("Insert {} {from} → {to}", self.edge_name);
+        send_insert(
+            &self.session,
+            self.table.clone(),
+            self.branch.clone(),
+            &query,
+            description,
+            (None, Map::new()),
+            "Nothing was inserted: check that both nodes exist on this branch.",
+            window,
+            cx,
+        );
+    }
+
+    /// Tab and shift-tab move through the endpoints, then the properties.
+    fn focus_step(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let mut handles = vec![
+            self.from.editor.focus_handle(cx),
+            self.to.editor.focus_handle(cx),
+        ];
+        handles.extend(self.fields.iter().map(|f| f.editor.focus_handle(cx)));
+        let current = handles
+            .iter()
+            .position(|handle| handle.is_focused(window))
+            .unwrap_or(0) as isize;
+        let next = (current + step).rem_euclid(handles.len() as isize) as usize;
+        window.focus(&handles[next], cx);
     }
 }
 
@@ -671,90 +806,6 @@ impl InsertEdgeModal {
         cx.notify();
     }
 
-    /// ↵ picks the highlighted node in an endpoint field, and inserts otherwise. While the
-    /// field's search is out it waits: the nodes offered were found for earlier text.
-    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(end) = self.focused_end(window, cx) {
-            let endpoint = self.endpoint_mut(end);
-            let typed = endpoint.editor.read(cx).text(cx);
-            if endpoint.answers.as_deref() != Some(typed.trim()) {
-                return;
-            }
-            if let Some(index) = endpoint.offers.highlighted() {
-                self.pick(end, index, window, cx);
-                return;
-            }
-        }
-        self.submit(window, cx);
-    }
-
-    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.saving || self.blocked.is_some() || self.held_back() {
-            return;
-        }
-        let mut valid = true;
-        let mut ends = Vec::new();
-        for end in [End::From, End::To] {
-            let endpoint = self.endpoint_mut(end);
-            let id = endpoint.editor.read(cx).text(cx).trim().to_owned();
-            if id.is_empty() {
-                endpoint.error = Some(format!("Pick a {}.", endpoint.type_name));
-                valid = false;
-            }
-            ends.push(id);
-        }
-        let values = field_values(&mut self.fields, cx);
-        let Some(values) = values.filter(|_| valid) else {
-            cx.notify();
-            return;
-        };
-        let (from, to) = (ends[0].clone(), ends[1].clone());
-        let query = match builder::insert_edge(&self.schema, &self.edge_name, &from, &to, &values) {
-            Ok(query) => query,
-            Err(error) => {
-                self.notice = Some(Notice::new(Tone::Invalid, error.to_string()));
-                cx.notify();
-                return;
-            }
-        };
-        self.saving = true;
-        self.notice = None;
-        cx.notify();
-        let description = format!("Insert {} {from} → {to}", self.edge_name);
-        send_insert(
-            &self.session,
-            self.table.clone(),
-            self.branch.clone(),
-            &query,
-            description,
-            (None, Map::new()),
-            "Nothing was inserted: check that both nodes exist on this branch.",
-            window,
-            cx,
-        );
-    }
-
-    fn cancel(&mut self, cx: &mut Context<Self>) {
-        if !self.saving {
-            cx.emit(DismissEvent);
-        }
-    }
-
-    /// Tab and shift-tab move through the endpoints, then the properties.
-    fn focus_step(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let mut handles = vec![
-            self.from.editor.focus_handle(cx),
-            self.to.editor.focus_handle(cx),
-        ];
-        handles.extend(self.fields.iter().map(|f| f.editor.focus_handle(cx)));
-        let current = handles
-            .iter()
-            .position(|handle| handle.is_focused(window))
-            .unwrap_or(0) as isize;
-        let next = (current + step).rem_euclid(handles.len() as isize) as usize;
-        window.focus(&handles[next], cx);
-    }
-
     fn render_endpoint(
         &self,
         end: End,
@@ -813,59 +864,7 @@ impl Render for InsertEdgeModal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let from = self.render_endpoint(End::From, "From", window, cx);
         let to = self.render_endpoint(End::To, "To", window, cx);
-        let fields: Vec<AnyElement> = self
-            .fields
-            .iter()
-            .map(|field| render_field(field, cx))
-            .collect();
-        let saving = self.saving;
-        let unknown = self.held_back();
-        let blocked = self.blocked.clone();
-        modal(cx)
-            .key_context("InsertEdgeModal")
-            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.confirm(window, cx)))
-            .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| this.cancel(cx)))
-            .on_action(
-                cx.listener(|this, _: &menu::SelectNext, window, cx| {
-                    this.focus_step(1, window, cx)
-                }),
-            )
-            .on_action(cx.listener(|this, _: &menu::SelectPrevious, window, cx| {
-                this.focus_step(-1, window, cx)
-            }))
-            .child(
-                ModalHeader::new(format!("New {}", self.edge_name))
-                    .meta(write_target(self.branch.clone(), cx))
-                    .close_disabled(saving)
-                    .on_close(cx.listener(|this, _, _, cx| this.cancel(cx))),
-            )
-            .child(
-                modal_body()
-                    .child(from)
-                    .child(to)
-                    .children(fields)
-                    .children(blocked.map(studio_ui::ds::text::error))
-                    .children(self.notice.clone().map(|notice| {
-                        studio_ui::ds::text::body(notice.message).color(notice.tone.color())
-                    })),
-            )
-            .child(
-                modal_footer(cx)
-                    .child(
-                        cancel_button("cancel-insert-edge")
-                            .disabled(saving)
-                            .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
-                    )
-                    .when(unknown, |footer| {
-                        footer.child(open_history_button("insert-edge-history"))
-                    })
-                    .child(
-                        action_button("insert-edge", if saving { "Inserting…" } else { "Insert" })
-                            .disabled(saving || self.blocked.is_some() || unknown)
-                            .key_binding(ui::KeyBinding::for_action(&menu::Confirm, cx))
-                            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
-                    ),
-            )
+        insert_dialog(self, "InsertEdgeModal", vec![from, to], cx)
     }
 }
 
