@@ -369,6 +369,7 @@ impl ConnectionRegistry {
         this.sign_in = Some(SignInContext {
             elsewhere: this.http.clone(),
             keychain: PlatformKeychain::start(cx),
+            turns: sign_in::KeychainTurns::default(),
             identities: sign_in::studio_identities(),
         });
 
@@ -729,9 +730,8 @@ impl ConnectionRegistry {
                 }
                 connection.update(cx, |connection, cx| {
                     if connection.server.name != server.name {
-                        connection.server.name = server.name.clone();
+                        connection.rename(server.name.clone(), cx);
                         changed = true;
-                        cx.notify();
                     }
                     for graph in &server.graphs {
                         if !connection.server.known_graphs.contains(graph) {
