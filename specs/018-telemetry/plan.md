@@ -1,6 +1,6 @@
 # 018: Telemetry, with consent
 
-Status: draft · 2026-10-29
+Status: draft · 2026-10-29 · reports go to PostHog (decided 2026-10-29)
 
 ## Problem
 
@@ -168,8 +168,22 @@ summary once it is checked what GPUI exposes about a frame (Open questions).
   hour while anything is pending. A batch is deleted when the endpoint answers 2xx; anything else
   is retried after 1 h, doubling to at most 24 h. A report older than 7 days is deleted unsent.
 - Uploads go through Studio's one HTTP client (the global `graph_store::init` sets), with the
-  user agent it already sends, to one endpoint (Open questions 1 and 2) as a JSON array of
-  reports. The request carries no cookies and no credential of the person's.
+  user agent it already sends, to PostHog's batch endpoint (`/batch/` on the project's host,
+  `https://eu.i.posthog.com` for EU Cloud; Open question 1). The body is PostHog's: the project
+  token as `api_key` and the reports as `batch`. The token is compiled into release builds; a
+  development build has none. The request carries no cookies and no credential of the
+  person's.
+- A usage report is one PostHog event: its tag as `event`, the install ID as `distinct_id`, its
+  fields as `properties` with `$process_person_profile: false` (PostHog's anonymous events: no
+  person profile is made or updated) and `$session_id`, and the time it was recorded as
+  `timestamp`. A daily summary is the event `daily_summary`.
+- A crash report is a `$exception` event, the shape PostHog's error tracking reads: the panic's
+  line (or the signal) as the exception's `value`, `mechanism.handled: false`, and the frames as
+  a raw stack trace (`platform: "custom"`, `lang: "rust"`, `function`, `in_app` for Studio's
+  crates). Its `distinct_id` is a new random UUID for that report alone, with
+  `$process_person_profile: false`, so a crash report is tied to no install.
+- PostHog's project for Studio discards client IP data (its IP data capture setting, which an
+  EU organization's projects start with) and runs no GeoIP transformation.
 - Turning a switch off deletes everything pending for that report at once, and turning usage
   off deletes the install ID.
 - Zed's telemetry queue is never started: Studio does not call `telemetry::init`, and a source
@@ -220,7 +234,8 @@ client; feature crates depend on it only to call `record`. The panic hook in
 | A closed, typed catalog with no free text | Zed's `FlexibleEvent` (a name and any JSON); an analytics SDK's `capture(name, properties)` | Free text is how a branch name or an error message carrying a value leaks; a type that cannot hold one cannot leak one, and a test can prove it |
 | Usage off until chosen; crash reports asked for each time | Usage on unless turned off | Studio shows private graphs to people who never agreed to share anything; asking once costs one status bar item |
 | One status bar item, not a dialog at first start | A first-run dialog | Constitution VII: a start that asks a question before showing anything is loud for a choice that can wait |
-| Studio's own uploader through its one HTTP client | Sentry's or PostHog's Rust SDK | SDKs gather device and environment data by default, bring their own HTTP stack, and would be a second client making requests; the catalog and queue are small |
+| PostHog for usage, summaries and crash reports | A crash tracker beside it (Sentry); a store of Studio's own | Chosen 2026-10-29. One API for all three: events and `$exception` events through the same capture endpoint; anonymous events need no person profile; EU Cloud or self-hosting; client IP data discarded by a project setting |
+| Studio's own uploader through its one HTTP client, speaking PostHog's capture API | PostHog's or Sentry's Rust SDK | SDKs gather device and environment data by default, bring their own HTTP stack, and would be a second client making requests; the catalog and queue are small, and the capture API is a JSON body |
 | A random install ID the person can reset | A hardware or system ID; none | Without an ID retention cannot be counted; a hardware ID follows a person across resets and installs |
 | Bucketed numbers | Exact durations and counts | A bucket says enough to rank and compare; an exact row count can identify a graph |
 | Performance as a daily summary of histograms | One event per query or frame | A summary sends a few hundred bytes a day and nothing about when someone worked |
@@ -240,10 +255,10 @@ client; feature crates depend on it only to call `record`. The panic hook in
 
 ## Open questions
 
-1. Where reports go, and who runs it: one endpoint under `omnigraph.dev` forwarding usage to
-   PostHog (EU cloud or self-hosted) and crash reports to a crash tracker, or one store for both.
-2. What the endpoint keeps: no IP address stored, and how long raw reports are kept (a proposal:
-   90 days raw, aggregates kept).
+1. ~~Where reports go.~~ PostHog, for all three (2026-10-29). Still open: EU Cloud or
+   self-hosted, which organization holds the project, and who can read it.
+2. How long PostHog keeps raw events for this project (a proposal: 90 days, insights kept), with
+   the project's IP data capture set to discard and no GeoIP transformation.
 3. The privacy notice the first popover and `docs/telemetry.md` link to, and its legal review: a
    resettable install ID is still pseudonymous personal data under the GDPR.
 4. Whether an organization signed in to a managed cluster may turn usage off for its people.
@@ -262,6 +277,7 @@ client; feature crates depend on it only to call `record`. The panic hook in
 | 2026-10-29 | Zed's telemetry crate is linked and drops every event | `Cargo.lock` (packages depending on `telemetry`); Zed `v1.23.2` `crates/telemetry/src/telemetry.rs`; a search of Studio's `crates/` for `telemetry` | Depended on by `client`, `dap`, `editor`, `fs`, `remote`, `workspace`; `send_event` sends only once `init` set the queue; no match in Studio |
 | 2026-10-29 | Panics are written as one line with quoted text removed | `crates/studio/src/logging.rs` (`init`, `report_panic`, `panic_line`, `without_quotes`) and its two tests | As described; Rust's report not chained |
 | 2026-10-29 | Release builds unwind and keep symbol names | `Cargo.toml` `[profile.release]` and `[profile.release-fast]`; `nm -U` on the bundle `script/bundle-mac --fast` built from `09e459b` | No `panic` setting (unwind); 328,592 defined symbols, 3,918 from `studio_workspace` |
+| 2026-10-29 | PostHog takes the reports as designed | PostHog's documentation: "Capture and batch API endpoints" (`/docs/api/capture`), "Data collection" (`/docs/privacy/data-collection`), "GeoIP" (`/docs/cdp/geoip-enrichment`), error tracking's manual capture (`/docs/error-tracking/installation/manual`) | `/i/v0/e` and `/batch/` on `us.i.posthog.com`, `eu.i.posthog.com` or a self-hosted domain; every event needs the project token, `distinct_id` and `event`; `$process_person_profile: false` with a random ID makes an anonymous event; IP data capture is set per organization and project, and EU organizations start with it off; GeoIP is a transformation a project adds; `$exception` with `$exception_list` takes raw frames with `platform: "custom"`, `lang` and `function` |
 | 2026-10-29 | An installed build is told from a development build | `studio_settings::is_release_build` and its test `only_an_installed_build_is_a_release_build` | A build directory, a test binary or a bundle under `target/` is not a release build |
 
 ## Corrections
