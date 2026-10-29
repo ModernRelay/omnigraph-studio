@@ -12,7 +12,7 @@ use gpui::{
 use graph_store::{GraphSession, Loadable, SessionEvent};
 use studio_actions::graph::{NewQuery, OpenQueryFile, OpenStoredQuery};
 use studio_actions::queries::{OpenSelected, SelectNext, SelectPrevious};
-use studio_workspace::{Workspace, WorkspaceEvent};
+use studio_workspace::{ToastKind, Workspace, WorkspaceEvent};
 use ui::Tooltip;
 use ui::prelude::*;
 
@@ -507,23 +507,43 @@ impl Render for QueriesActions {
             .children(folder.map(|folder| {
                 button("queries-reveal", IconName::Folder)
                     .tooltip(Tooltip::text("Show this graph's queries folder"))
-                    .on_click(move |_, _, cx| {
-                        // Made off the main thread, then shown.
-                        let folder = folder.clone();
-                        let made = {
-                            let folder = folder.clone();
-                            cx.background_spawn(
-                                async move { std::fs::create_dir_all(&folder).ok() },
-                            )
-                        };
-                        cx.spawn(async move |cx| {
-                            made.await;
-                            cx.update(|cx| cx.reveal_path(&folder));
-                        })
-                        .detach();
+                    .on_click(move |_, window, cx| {
+                        let workspace =
+                            studio_workspace::workspace_for(window).map(|w| w.downgrade());
+                        reveal_folder(folder.clone(), workspace, cx);
                     })
             }))
     }
+}
+
+/// Shows the graph's queries folder, made first off the main thread. One that cannot be made
+/// is said in a toast in `workspace`: shown, nothing would open.
+fn reveal_folder(folder: PathBuf, workspace: Option<WeakEntity<Workspace>>, cx: &mut App) {
+    let made = {
+        let folder = folder.clone();
+        cx.background_spawn(async move { std::fs::create_dir_all(&folder) })
+    };
+    cx.spawn(async move |cx| {
+        let made = made.await;
+        cx.update(|cx| match made {
+            Ok(()) => cx.reveal_path(&folder),
+            Err(error) => {
+                if let Some(workspace) = workspace.and_then(|workspace| workspace.upgrade()) {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.show_toast(
+                            ToastKind::Error,
+                            format!(
+                                "The queries folder could not be made at {}: {error}",
+                                folder.display()
+                            ),
+                            cx,
+                        )
+                    });
+                }
+            }
+        });
+    })
+    .detach();
 }
 
 #[cfg(test)]
@@ -565,6 +585,30 @@ mod tests {
 
     fn session(cx: &mut TestAppContext) -> Entity<GraphSession> {
         session_of("knowledge", cx)
+    }
+
+    /// A queries folder that cannot be made (a file is where it goes) is said in a toast,
+    /// where a reveal would open nothing.
+    #[gpui::test]
+    async fn a_queries_folder_that_cannot_be_made_is_said(cx: &mut TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let dir = std::env::temp_dir().join(format!("queries-reveal-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocked = dir.join("a-file");
+        std::fs::write(&blocked, b"").unwrap();
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let weak = workspace.downgrade();
+        cx.update(|_, cx| reveal_folder(blocked.join("queries"), Some(weak), cx));
+        cx.run_until_parked();
+        let toasts = workspace.read_with(cx, |workspace, _| workspace.toast_messages());
+        assert!(
+            toasts
+                .iter()
+                .any(|toast| toast.contains("The queries folder could not be made")),
+            "{toasts:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The panel takes the keyboard: ↓ and ↑ move among the rows that open a query, passing

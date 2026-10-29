@@ -8,7 +8,7 @@
 use gq_language::builder::{
     RowEdit, delete_edge, delete_node, insert_edge, insert_node, update_rows,
 };
-use gq_language::{BuiltQuery, SchemaModel};
+use gq_language::{BuiltQuery, Property, SchemaModel};
 use serde_json::{Map, Value};
 
 use crate::changes::{FoldedChange, NetChange, endpoints_of};
@@ -60,26 +60,11 @@ pub fn revert_query(
             node.name
         ))),
         Some(NetChange::Removed) => {
-            let before = &change
+            let before = change
                 .before
                 .as_ref()
-                .expect("a removed entity has a before image")
-                .properties;
-            let mut values = Vec::new();
-            for property in &node.properties {
-                match before.get(&property.name) {
-                    Some(Value::Null) | None => {}
-                    Some(value) if property.projectable() => {
-                        values.push((property.name.clone(), value.clone()))
-                    }
-                    Some(_) => {
-                        return Err(RevertUnavailable(format!(
-                            "{} holds a {} value, which the review cannot restore.",
-                            property.name, property.base_type
-                        )));
-                    }
-                }
-            }
+                .expect("a removed entity has a before image");
+            let values = restorable(&node.properties, &before.properties)?;
             insert_node(schema, &node.name, &values).map_err(unavailable)
         }
         Some(NetChange::Changed) => {
@@ -110,6 +95,30 @@ pub fn revert_query(
             update_rows(schema, &node.name, &[row]).map_err(unavailable)
         }
     }
+}
+
+/// The values a removed node or relationship held (`before`), to insert it again: each of
+/// `properties` it held a value of, or why one of them cannot be restored.
+fn restorable(
+    properties: &[Property],
+    before: &Map<String, Value>,
+) -> Result<Vec<(String, Value)>, RevertUnavailable> {
+    let mut values = Vec::new();
+    for property in properties {
+        match before.get(&property.name) {
+            Some(Value::Null) | None => {}
+            Some(value) if property.projectable() => {
+                values.push((property.name.clone(), value.clone()))
+            }
+            Some(_) => {
+                return Err(RevertUnavailable(format!(
+                    "{} holds a {} value, which the review cannot restore.",
+                    property.name, property.base_type
+                )));
+            }
+        }
+    }
+    Ok(values)
 }
 
 /// Whether `change`'s revert deletes the entity: an addition's. The delete is bound to the
@@ -143,21 +152,7 @@ fn revert_edge(
                     "The change feed did not say which nodes this relationship joined.".into(),
                 ));
             };
-            let mut values = Vec::new();
-            for property in &edge.properties {
-                match before.properties.get(&property.name) {
-                    Some(Value::Null) | None => {}
-                    Some(value) if property.projectable() => {
-                        values.push((property.name.clone(), value.clone()))
-                    }
-                    Some(_) => {
-                        return Err(RevertUnavailable(format!(
-                            "{} holds a {} value, which the review cannot restore.",
-                            property.name, property.base_type
-                        )));
-                    }
-                }
-            }
+            let values = restorable(&edge.properties, &before.properties)?;
             insert_edge(schema, &edge.name, &from, &to, &values).map_err(unavailable)
         }
         // Relationships cannot be updated: restoring one means a delete and an insert, which a

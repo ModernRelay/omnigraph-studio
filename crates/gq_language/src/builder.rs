@@ -813,7 +813,7 @@ fn relationship_clause(
 /// block, so a node with several such neighbours stays one row: `exists { $r0: Company
 /// $n worksAt $r0  $r0.city = $f0 }`. "Is empty" is `not { … $r0.city is not null }`: no
 /// neighbour holds a value, including when there is no neighbour.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn neighbour_property_clause(
     schema: &SchemaModel,
     var: &str,
@@ -1027,25 +1027,29 @@ pub fn node_by_id(
     type_name: &str,
     id: &str,
 ) -> Result<BuiltQuery, BuildError> {
-    let node = node(schema, type_name)?;
-    let depends = Depends::Node {
-        type_name: node.name.clone(),
-        id: id.to_owned(),
-    };
+    Ok(one_by_id(node(schema, type_name)?, id, "studio_node", "$n"))
+}
+
+/// Query `name`: the node of `node`'s type whose `@id` is `id`, at most one row, returning
+/// `returns`.
+fn one_by_id(node: &NodeType, id: &str, name: &str, returns: &str) -> BuiltQuery {
     let mut params = Params::new();
-    let id = params.add("id", "String", Value::String(id.to_owned()));
+    let id_param = params.add("id", "String", Value::String(id.to_owned()));
     let text = format!(
-        "query studio_node({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id}\n  }}\n  return {{ $n }}\n  limit 1\n}}\n",
+        "query {name}({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id_param}\n  }}\n  return {{ {returns} }}\n  limit 1\n}}\n",
         sig = params.signature(),
         ty = node.name,
     );
-    Ok(BuiltQuery {
-        name: "studio_node".into(),
+    BuiltQuery {
+        name: name.into(),
         text,
         params: params.values,
-        depends,
+        depends: Depends::Node {
+            type_name: node.name.clone(),
+            id: id.to_owned(),
+        },
         seeds: None,
-    })
+    }
 }
 
 /// Nodes of one type by `@id`, in one read, with only `properties`: a row for each that exists,
@@ -1122,25 +1126,8 @@ pub fn node_fields_by_id(
     without: &[String],
 ) -> Result<BuiltQuery, BuildError> {
     let node = node(schema, type_name)?;
-    let depends = Depends::Node {
-        type_name: node.name.clone(),
-        id: id.to_owned(),
-    };
-    let mut params = Params::new();
-    let id = params.add("id", "String", Value::String(id.to_owned()));
-    let text = format!(
-        "query studio_node_fields({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id}\n  }}\n  return {{ {columns} }}\n  limit 1\n}}\n",
-        sig = params.signature(),
-        ty = node.name,
-        columns = field_columns(node, without),
-    );
-    Ok(BuiltQuery {
-        name: "studio_node_fields".into(),
-        text,
-        params: params.values,
-        depends,
-        seeds: None,
-    })
+    let columns = field_columns(node, without);
+    Ok(one_by_id(node, id, "studio_node_fields", &columns))
 }
 
 /// A read that returns no rows, sent only for the commit its answer names: a branch's head
@@ -1771,6 +1758,31 @@ impl GroupBy {
         choices
     }
 
+    /// [`Self::choices`] in the sections a menu shows them in, each under its heading: the
+    /// other type's properties (its name), the edge's (the edge's name), then the other type's
+    /// relationships. A section with no choice is left out.
+    pub fn sections(
+        schema: &SchemaModel,
+        group: &RelationshipGroup,
+    ) -> Vec<(String, Vec<GroupBy>)> {
+        let choices = Self::choices(schema, group);
+        [
+            (GroupOn::Node, group.other_type.clone()),
+            (GroupOn::Edge, group.edge.clone()),
+            (
+                GroupOn::Relationship,
+                format!("{}'s relationships", group.other_type),
+            ),
+        ]
+        .into_iter()
+        .map(|(on, heading)| {
+            let section = choices.iter().filter(|by| by.on == on).cloned().collect();
+            (heading, section)
+        })
+        .filter(|(_, section): &(String, Vec<GroupBy>)| !section.is_empty())
+        .collect()
+    }
+
     /// For a grouping by the neighbours' relationship: the type at its other end, and the hop
     /// from a neighbour `$m` to a value `$v`.
     fn hop<'a>(
@@ -2241,41 +2253,6 @@ pub fn search_narrows(previous: &str, text: &str) -> bool {
         })
 }
 
-/// Sets one property of one node, bound to the value the cell showed (spec 004). Zero affected
-/// nodes means the value changed elsewhere. List properties cannot be compared, so they are
-/// bound to the row only.
-pub fn update_cell(
-    schema: &SchemaModel,
-    type_name: &str,
-    property_name: &str,
-    id: &str,
-    old: &Value,
-    new: &Value,
-) -> Result<BuiltQuery, BuildError> {
-    let node = node(schema, type_name)?;
-    let property = property(node, property_name)?;
-    if !property.editable_in_cell() {
-        return Err(BuildError::NotEditable(property.name.clone()));
-    }
-    let mut params = Params::new();
-    let id = params.add("id", "String", Value::String(id.to_owned()));
-    let new = params.add("new", &property.param_type(true), new.clone());
-    let predicate = format!("@id = {id}{}", bound_to(property, old, "old", &mut params)?);
-    let text = format!(
-        "query studio_set({sig}) {{\n  update {ty} set {{ {prop}: {new} }} where {predicate}\n}}\n",
-        sig = params.signature(),
-        ty = node.name,
-        prop = property.name,
-    );
-    Ok(BuiltQuery {
-        name: "studio_set".into(),
-        text,
-        params: params.values,
-        depends: Depends::Unknown,
-        seeds: None,
-    })
-}
-
 /// The condition that binds a statement to the value its row showed for `property` (`old`, as
 /// parameter `param`), so a row changed elsewhere matches nothing; a list is not bound. A
 /// property named by a reserved word cannot be named in a mutation's `where`, so no write to it
@@ -2308,9 +2285,10 @@ pub struct RowEdit {
 }
 
 /// Saves edits of different values on several rows in one mutation, so they publish as one
-/// commit (spec 004, drafts). Each row is one statement setting all its edited properties, bound
-/// to every value the row showed: a row changed elsewhere is left alone whole, and
-/// `affected_nodes` comes back short by it.
+/// commit (spec 004, drafts); a cell's edit is one row's of one property. Each row is one
+/// statement setting all its edited properties, bound to every value the row showed: a row
+/// changed elsewhere is left alone whole, and `affected_nodes` comes back short by it, zero for
+/// a single row. List properties cannot be compared, so they are bound to the row only.
 pub fn update_rows(
     schema: &SchemaModel,
     type_name: &str,
@@ -2748,16 +2726,11 @@ mod tests {
             "node Box {\n  slug: String @key\n  in: String?\n  label: String?\n}\n",
         )
         .unwrap();
-        let refused = update_cell(&schema, "Box", "in", "b1", &json!("x"), &json!("y"));
+        let refused = one_cell(&schema, "Box", "in", "b1", json!("x"), json!("y"));
         assert!(matches!(refused, Err(BuildError::Unbindable(ref name)) if name == "in"));
         let rows = [("b1".to_owned(), json!("x"))];
         assert!(update_cells(&schema, "Box", "in", &rows, &json!("y")).is_err());
-        let edit = RowEdit {
-            id: "b1".into(),
-            cells: vec![("in".into(), json!("x"), json!("y"))],
-        };
-        assert!(update_rows(&schema, "Box", &[edit]).is_err());
-        let label = update_cell(&schema, "Box", "label", "b1", &json!("x"), &json!("y")).unwrap();
+        let label = one_cell(&schema, "Box", "label", "b1", json!("x"), json!("y")).unwrap();
         assert_compiles_in(&schema, &label);
     }
 
@@ -3775,6 +3748,30 @@ mod tests {
             ],
             "the key, lists, and vectors are left out"
         );
+        let sections: Vec<(String, usize)> = GroupBy::sections(&schema, works_at)
+            .into_iter()
+            .map(|(heading, section)| (heading, section.len()))
+            .collect();
+        assert_eq!(
+            sections,
+            [
+                ("Person".to_owned(), 4),
+                ("WorksAt".to_owned(), 2),
+                ("Person's relationships".to_owned(), 4),
+            ],
+            "the choices in their sections, in order"
+        );
+        let knows_group = schema
+            .relationships_of("Person")
+            .iter()
+            .find(|group| group.edge == "Knows")
+            .unwrap();
+        assert!(
+            GroupBy::sections(&schema, knows_group)
+                .iter()
+                .all(|(heading, _)| heading != "Knows"),
+            "an edge with no property has no section"
+        );
         let by_company = GroupBy {
             on: GroupOn::Relationship,
             property: "out:WorksAt".into(),
@@ -3970,53 +3967,50 @@ mod tests {
         ));
     }
 
+    /// One property of one node set, as a cell's edit is: one row of one cell.
+    fn one_cell(
+        schema: &SchemaModel,
+        type_name: &str,
+        property: &str,
+        id: &str,
+        old: Value,
+        new: Value,
+    ) -> Result<BuiltQuery, BuildError> {
+        let edit = RowEdit {
+            id: id.into(),
+            cells: vec![(property.into(), old, new)],
+        };
+        update_rows(schema, type_name, &[edit])
+    }
+
     #[test]
     fn writes_compile() {
         let schema = dev();
-        assert_compiles(
-            &update_cell(
-                &schema,
-                "Person",
-                "title",
-                "person-000000",
-                &json!("Founder"),
-                &json!("CEO"),
-            )
-            .unwrap(),
+        let person = "person-000000";
+        for (old, new) in [
+            (json!("Founder"), json!("CEO")),
+            (Value::Null, json!("CEO")),
+        ] {
+            assert_compiles(&one_cell(&schema, "Person", "title", person, old, new).unwrap());
+        }
+        let tags = one_cell(
+            &schema,
+            "Person",
+            "tags",
+            person,
+            json!(["a"]),
+            json!(["b"]),
         );
-        assert_compiles(
-            &update_cell(
-                &schema,
-                "Person",
-                "title",
-                "person-000000",
-                &Value::Null,
-                &json!("CEO"),
-            )
-            .unwrap(),
+        assert_compiles(&tags.unwrap());
+        let status = one_cell(
+            &schema,
+            "Project",
+            "status",
+            "project-00000",
+            json!("active"),
+            json!("done"),
         );
-        assert_compiles(
-            &update_cell(
-                &schema,
-                "Person",
-                "tags",
-                "person-000000",
-                &json!(["a"]),
-                &json!(["b"]),
-            )
-            .unwrap(),
-        );
-        assert_compiles(
-            &update_cell(
-                &schema,
-                "Project",
-                "status",
-                "project-00000",
-                &json!("active"),
-                &json!("done"),
-            )
-            .unwrap(),
-        );
+        assert_compiles(&status.unwrap());
         assert_compiles(
             &insert_node(
                 &schema,
@@ -4051,7 +4045,7 @@ mod tests {
             Err(BuildError::UnknownProperty { .. })
         ));
         assert!(matches!(
-            update_cell(&schema, "Person", "slug", "x", &json!("a"), &json!("b")),
+            one_cell(&schema, "Person", "slug", "x", json!("a"), json!("b")),
             Err(BuildError::NotEditable(_))
         ));
     }

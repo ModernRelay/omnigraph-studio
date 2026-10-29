@@ -28,7 +28,7 @@ use gq_language::{
 use graph_client::api::ReadOutput;
 use graph_client::{BlobCell, BlobMeta, HistoricalGap, PropertyThen, ReadError};
 use graph_store::scope::{ReadScope, ScopeSince};
-use graph_store::{DraftEntry, DraftKey, GraphSession, Loadable, SessionEvent, plural};
+use graph_store::{DraftEntry, DraftKey, GraphSession, Loadable, SessionEvent};
 use serde_json::Value;
 use studio_actions::blob::{ChooseFile, ClearValue};
 use studio_actions::table::{
@@ -39,11 +39,12 @@ use studio_actions::table::{
 use studio_ui::ds::Button;
 use studio_ui::ds::space;
 use studio_ui::menu::{ContextMenu, ContextMenuEntry};
+use studio_ui::plural;
 use studio_ui::{ColumnDrag, ColumnResize, GridPlace, ROW_HEIGHT, columns_in_view, grid_places};
 use studio_workspace::{Item, ItemEvent, ItemStatus, KeyHint, SavedItem, ToastKind, Workspace};
 use ui::prelude::*;
 use ui::{
-    ColumnWidthConfig, Indicator, PopoverMenu, PopoverMenuHandle, Table, TableInteractionState,
+    ColumnWidthConfig, PopoverMenu, PopoverMenuHandle, Table, TableInteractionState,
     TintColor, Tooltip,
 };
 
@@ -224,9 +225,13 @@ impl BulkDraft {
 /// The hover group of a grid row, for the actions its cells show under the pointer.
 const ROW_GROUP: &str = "table-row";
 
-/// Where the key column's content starts: the page's gutter, as the toolbar's title does,
+/// Where the key column's checkbox sits: the page's gutter, as the toolbar's title does,
 /// since the grid runs to the document's edges. The other cells keep a cell's inset.
 const KEY_INSET: f32 = space::EDGE;
+
+/// Where the key column's text starts: after its checkbox and a gap, so the text does not
+/// move when a row's checkbox shows.
+const KEY_TEXT_INSET: f32 = KEY_INSET + studio_ui::ds::size::CHECK + space::MD;
 
 use crate::peek::property_icon;
 
@@ -1466,7 +1471,7 @@ impl TypeTable {
         .detach();
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn finish_bulk(
         &mut self,
         bound: Bound,
@@ -1574,10 +1579,10 @@ impl TypeTable {
         cx.notify();
     }
 
-    /// The bar over the table while rows are picked: how many, and setting one property on
-    /// all of them.
+    /// The bar over the table while rows are picked: how many, setting one property on all of
+    /// them, and deleting them.
     fn render_bulk_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.selection.len() < 2 {
+        if self.selection.is_empty() {
             return None;
         }
         let border = studio_ui::ds::surface::rule(cx);
@@ -1678,6 +1683,17 @@ impl TypeTable {
                     )
                 });
         }
+        // Deleting asks first, naming the rows, in its own dialog.
+        let delete_refused = self.write_refusal(cx);
+        bar = bar.child(
+            studio_ui::ds::button("bulk-delete", "Delete…")
+                .style(ButtonStyle::Outlined)
+                .disabled(delete_refused.is_some())
+                .tooltip(Tooltip::text(delete_refused.unwrap_or_else(|| {
+                    format!("Delete the {} selected", plural(count, "row", "rows"))
+                })))
+                .on_click(cx.listener(|this, _, window, cx| this.on_delete(&DeleteRow, window, cx))),
+        );
         Some(
             bar.children(self.bulk.notice.clone().map(|notice| {
                 studio_ui::ds::text::body(notice.message).color(notice.tone.color())
@@ -4698,8 +4714,13 @@ impl TypeTable {
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
         // The footer's key hints read the bindings of the frame drawn before, which still had
-        // the editor focused; draw once more so they show the table's keys again.
-        cx.on_next_frame(window, |_, window, _| window.refresh());
+        // the editor focused: the workspace, which draws the footer, draws once more so they
+        // show the table's keys again. Not a refresh, which would draw every view in the
+        // window again, skipping every cache (this table's grid, every pane).
+        let workspace = self.workspace.clone();
+        cx.on_next_frame(window, move |_, _, cx| {
+            workspace.update(cx, |_, cx| cx.notify()).ok();
+        });
     }
 
     /// Whether rows without a value of the sort's property can follow those with one: not when
@@ -4797,15 +4818,13 @@ impl TypeTable {
             .pinned
             .clone()
             .filter(|_| same_value(&old, &shown));
-        let write = match write::write_property(
+        let write = match write::write_properties(
             &self.session,
             &self.branch,
             &schema,
             &self.type_name,
             &row_id,
-            &property.name,
-            &old,
-            &new,
+            &[(property.name.clone(), old.clone(), new.clone())],
             read_at,
             cx,
         ) {
@@ -5359,7 +5378,7 @@ impl TypeTable {
         .detach();
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn finish_drafts(
         &mut self,
         bound: Bound,
@@ -5695,7 +5714,7 @@ impl TypeTable {
             .max_w(px(studio_ui::ds::size::READING_WIDTH))
             .pl(px(space::CONTROL_INSET))
             .gap(px(space::MD))
-            .child(Indicator::dot().color(Color::Accent))
+            .child(studio_ui::ds::dot(Color::Accent))
             .child(
                 studio_ui::ds::text::body(if saving {
                     "Saving drafts…".to_owned()
@@ -6572,7 +6591,7 @@ impl TypeTable {
             })
             .when(self.newer, |d| {
                 d.child(
-                    studio_ui::ds::toolbar_button("newer-data", "Newer data · Refresh")
+                    studio_ui::ds::button("newer-data", "Newer data · Refresh")
                         .style(ButtonStyle::Tinted(TintColor::Accent))
                         .tooltip(|_, cx| {
                             Tooltip::for_action("Read the branch head again", &RefreshTable, cx)
@@ -6629,7 +6648,7 @@ impl TypeTable {
                             })),
                     ))
                     .child(
-                        studio_ui::ds::toolbar_icon_button("refresh-table", IconName::RotateCw)
+                        studio_ui::ds::icon_button("refresh-table", IconName::RotateCw)
                             .tooltip(|_, cx| Tooltip::for_action("Refresh", &RefreshTable, cx))
                             .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
                     ),
@@ -6688,17 +6707,23 @@ impl TypeTable {
                     .bg(rule)
             };
             let chevron = || studio_ui::ds::icon::meta(IconName::ChevronDown);
-            // The filter being written is the pill it will become, outlined while it is open.
+            // The filter being written is the pill it will become, outlined while it is open:
+            // a ring outside it as the pill's own edge is, so its buttons keep a button's height.
             let pill = h_flex()
                 .h(px(studio_ui::ds::size::PILL))
                 .flex_none()
                 .rounded_full()
-                .border_1()
-                .border_color(if draft.error.is_some() {
-                    studio_ui::ds::surface::error_border(cx)
-                } else {
-                    studio_ui::ds::surface::focus(cx)
-                })
+                .shadow(vec![gpui::BoxShadow {
+                    color: if draft.error.is_some() {
+                        studio_ui::ds::surface::error_border(cx)
+                    } else {
+                        studio_ui::ds::surface::focus(cx)
+                    },
+                    offset: gpui::point(px(0.), px(0.)),
+                    blur_radius: px(0.),
+                    spread_radius: px(studio_ui::ds::size::HAIRLINE),
+                    inset: false,
+                }])
                 .bg(editor_bg)
                 .overflow_hidden()
                 .child(
@@ -6800,8 +6825,7 @@ impl TypeTable {
                     h_flex()
                         .h_full()
                         .pl(px(space::XS))
-                        // The pill's border is the rest of the gap.
-                        .pr(px(studio_ui::ds::PILL_BUTTON_GAP - 1.))
+                        .pr(px(studio_ui::ds::PILL_BUTTON_GAP))
                         .gap(px(space::XXS))
                         .items_center()
                         .child(
@@ -6857,31 +6881,19 @@ impl TypeTable {
             Rc::new(move |index, window, cx| pick(&index, window, cx)),
             cx,
         );
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .child(
-                deferred(
-                    anchored()
-                        .anchor(Anchor::TopLeft)
-                        // Under the value field, its list's rows on the field's text.
-                        .offset(point(px(-space::XS), px(studio_ui::ds::size::CONTROL)))
-                        .snap_to_window_with_margin(px(space::MD))
-                        .child(
-                            studio_ui::ds::popover_list(cx)
-                                .id("filter-suggestions")
-                                .occlude()
-                                .min_w(px(studio_ui::ds::size::POPOVER_MIN))
-                                .max_w(px(studio_ui::ds::size::POPOVER_MAX))
-                                .max_h(px(studio_ui::ds::size::LIST_MAX_HEIGHT))
-                                .overflow_y_scroll()
-                                .children(items),
-                        ),
-                )
-                .with_priority(1),
-            )
-            .into_any_element()
+        // Under the value field, its list's rows on the field's text.
+        floating_under(
+            point(px(-space::XS), px(studio_ui::ds::size::CONTROL)),
+            1,
+            studio_ui::ds::popover_list(cx)
+                .id("filter-suggestions")
+                .occlude()
+                .min_w(px(studio_ui::ds::size::POPOVER_MIN))
+                .max_w(px(studio_ui::ds::size::POPOVER_MAX))
+                .max_h(px(studio_ui::ds::size::LIST_MAX_HEIGHT))
+                .overflow_y_scroll()
+                .children(items),
+        )
     }
 
     fn render_body(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
@@ -7028,7 +7040,7 @@ impl TypeTable {
                 // The key's header starts at the page's gutter, as its cells do.
                 let header = ruled(
                     studio_ui::ds::header_cell(kind, column.title.clone(), sorted.is_some())
-                        .when(index == 0, |header| header.pl(px(KEY_INSET))),
+                        .when(index == 0, |header| header.pl(px(KEY_TEXT_INSET))),
                     index,
                     cx,
                 )
@@ -7037,6 +7049,7 @@ impl TypeTable {
                 .relative()
                 .w_full()
                 .child(resize)
+                .when(index == 0, |header| header.child(self.render_all_check(cx)))
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -7232,6 +7245,9 @@ impl TypeTable {
                     .relative()
                     .flex_1()
                     .min_h_0()
+                    // The rows' fills and rules under their text: one layer of the scene, so a
+                    // frame orders them without a search per cell (the edit callout floats,
+                    // deferred, over them).
                     .child(table)
                     .child(wheel),
             )
@@ -8229,10 +8245,93 @@ impl TypeTable {
             .clone()
             .iter()
             .map(|place| match *place {
+                // The key cell carries the row's checkbox, over its start.
+                GridPlace::Column(0) => div()
+                    .relative()
+                    .w_full()
+                    .child(self.render_cell(ix, 0, row, window, cx))
+                    .child(self.render_row_check(ix, &row.id, cx))
+                    .into_any_element(),
                 GridPlace::Column(col) => self.render_cell(ix, col, row, window, cx),
                 GridPlace::Gap(_) => div().into_any_element(),
             })
             .collect()
+    }
+
+    /// A row's checkbox, on the page's gutter in its key cell: shown under the pointer, and on
+    /// every row while any is checked, so a list nobody is picking from stays plain. A click
+    /// checks the row or takes it out, ⇧ checks the rows from the last one checked; it moves no
+    /// cursor and opens nothing.
+    fn render_row_check(&self, ix: usize, id: &str, cx: &mut Context<Self>) -> AnyElement {
+        let picked = self.selection.contains(id);
+        let shown = !self.selection.is_empty();
+        studio_ui::ds::check_box(("row-check", ix), ToggleState::from(picked), cx)
+            .debug_selector(move || format!("row-check-{ix}"))
+            .absolute()
+            .left(px(KEY_INSET))
+            .top(px((ROW_HEIGHT - studio_ui::ds::size::CHECK) / 2.))
+            .when(!shown, |check| {
+                check.invisible().group_hover(ROW_GROUP, |style| style.visible())
+            })
+            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                // The keyboard stays where it was, and the cell under the box hears nothing.
+                window.prevent_default();
+                cx.stop_propagation();
+            })
+            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                this.pick_rows(ix, event.modifiers().shift, cx);
+            }))
+            .into_any_element()
+    }
+
+    /// The key column's select-all: checks every loaded row, or, when every one is, takes them
+    /// all out; a dash while some are checked.
+    fn render_all_check(&self, cx: &mut Context<Self>) -> AnyElement {
+        let state = self.all_check_state();
+        let tooltip = match state {
+            ToggleState::Selected => "Clear the selection (Esc)",
+            _ => "Select every loaded row",
+        };
+        studio_ui::ds::check_box("all-rows-check", state, cx)
+            .debug_selector(|| "all-rows-check".into())
+            .absolute()
+            .left(px(KEY_INSET))
+            .top(px((studio_ui::HEADER_HEIGHT - studio_ui::ds::size::CHECK) / 2.))
+            .tooltip(Tooltip::text(tooltip))
+            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                window.prevent_default();
+                cx.stop_propagation();
+            })
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.toggle_all_rows(cx);
+            }))
+            .into_any_element()
+    }
+
+    /// The select-all's state: none checked, every loaded row checked, or some.
+    fn all_check_state(&self) -> ToggleState {
+        if self.selection.is_empty() {
+            ToggleState::Unselected
+        } else if self.rows.iter().all(|row| self.selection.contains(&row.id)) {
+            ToggleState::Selected
+        } else {
+            ToggleState::Indeterminate
+        }
+    }
+
+    /// Checks every loaded row, or takes them all out when every one is checked.
+    fn toggle_all_rows(&mut self, cx: &mut Context<Self>) {
+        if self.all_check_state() == ToggleState::Selected {
+            self.clear_selection(cx);
+            return;
+        }
+        self.selection
+            .extend(self.rows.iter().map(|row| row.id.clone()));
+        self.selection_anchor = None;
+        self.bulk.notice = None;
+        cx.notify();
     }
 
     /// The columns rows draw this frame: the pinned first, those in the horizontal view with
@@ -8343,7 +8442,7 @@ impl TypeTable {
             .h(px(ROW_HEIGHT))
             .w_full()
             .px(px(space::LG))
-            .when(col == 0, |d| d.pl(px(KEY_INSET)))
+            .when(col == 0, |d| d.pl(px(KEY_TEXT_INSET)))
             .flex()
             .items_center()
             .gap(px(space::XS))
@@ -8539,7 +8638,7 @@ impl TypeTable {
                     .on_click(cx.listener(move |this, _, window, cx| this.peek_at(ix, window, cx))),
             )
         });
-        cell.children(dot.map(|color| Indicator::dot().color(color)))
+        cell.children(dot.map(studio_ui::ds::dot))
             .child(content)
             .children(peek)
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
@@ -8555,66 +8654,46 @@ impl TypeTable {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .child(
-                deferred(
-                    anchored()
-                        .anchor(Anchor::TopLeft)
-                        // Under the cell, its edge on the cell's, a hairline's gap below it.
-                        .offset(point(
-                            px(-studio_ui::ds::size::HAIRLINE),
-                            px(ROW_HEIGHT + space::XXS),
-                        ))
-                        .snap_to_window_with_margin(px(space::MD))
-                        .child(
-                            v_flex()
-                                .min_w(px(studio_ui::ds::size::POPOVER_MIN))
-                                .max_w(px(studio_ui::ds::size::POPOVER_MAX))
-                                .px(px(space::MD))
-                                .py(px(space::SM))
-                                .gap(px(space::XS))
-                                .map(|callout| studio_ui::ds::menu_surface(callout, cx))
-                                .children(notice.map(|notice| {
-                                    let unknown = notice.tone == Tone::Unknown;
-                                    h_flex()
-                                        .gap(px(space::SM))
-                                        .child(Indicator::dot().color(notice.tone.color()))
-                                        .child(
-                                            studio_ui::ds::text::body(notice.message)
-                                                .color(notice.tone.color()),
+        // Under the cell, its edge on the cell's, a hairline's gap below it.
+        floating_under(
+            point(
+                px(-studio_ui::ds::size::HAIRLINE),
+                px(ROW_HEIGHT + space::XXS),
+            ),
+            2,
+            v_flex()
+                .min_w(px(studio_ui::ds::size::POPOVER_MIN))
+                .max_w(px(studio_ui::ds::size::POPOVER_MAX))
+                .px(px(space::MD))
+                .py(px(space::SM))
+                .gap(px(space::XS))
+                .map(|callout| studio_ui::ds::menu_surface(callout, cx))
+                .children(notice.map(|notice| {
+                    let unknown = notice.tone == Tone::Unknown;
+                    h_flex()
+                        .gap(px(space::SM))
+                        .child(studio_ui::ds::dot(notice.tone.color()))
+                        .child(studio_ui::ds::text::body(notice.message).color(notice.tone.color()))
+                        // Whether the save landed is in the branch's history.
+                        .when(unknown, |row| {
+                            row.child(
+                                studio_ui::ds::button("open-history", "Open history")
+                                    .style(ButtonStyle::Subtle)
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(
+                                            Box::new(studio_actions::graph::OpenHistory),
+                                            cx,
                                         )
-                                        // Whether the save landed is in the branch's history.
-                                        .when(unknown, |row| {
-                                            row.child(
-                                                studio_ui::ds::button(
-                                                    "open-history",
-                                                    "Open history",
-                                                )
-                                                .style(ButtonStyle::Subtle)
-                                                .on_click(|_, window, cx| {
-                                                    window.dispatch_action(
-                                                        Box::new(
-                                                            studio_actions::graph::OpenHistory,
-                                                        ),
-                                                        cx,
-                                                    )
-                                                }),
-                                            )
-                                        })
-                                }))
-                                .children(hint.map(studio_ui::ds::text::meta))
-                                .child(studio_ui::ds::text::meta(format!(
-                                    "↵ save · esc cancel · write · {}",
-                                    self.branch
-                                ))),
-                        ),
-                )
-                .with_priority(2),
-            )
-            .into_any_element()
+                                    }),
+                            )
+                        })
+                }))
+                .children(hint.map(studio_ui::ds::text::meta))
+                .child(studio_ui::ds::text::meta(format!(
+                    "↵ save · esc cancel · write · {}",
+                    self.branch
+                ))),
+        )
     }
 
     /// The table's part of the status bar ([`Item::status`]): a page being read, or a Retry
@@ -8840,16 +8919,11 @@ impl Render for TypeTable {
                     })
                     .children(drafts_bar),
             )
-            .children(self.header_menu.as_ref().map(|(menu, position, _)| {
-                deferred(
-                    anchored()
-                        .position(*position)
-                        .anchor(Anchor::TopLeft)
-                        .snap_to_window_with_margin(px(space::MD))
-                        .child(menu.clone()),
-                )
-                .with_priority(1)
-            }))
+            .children(
+                self.header_menu
+                    .as_ref()
+                    .map(|(menu, position, _)| studio_ui::ds::menu_at(menu.clone(), *position)),
+            )
     }
 }
 
@@ -8975,6 +9049,31 @@ fn sideways_scroll(
     .size_full()
 }
 
+/// `content` floating under the element this is placed in, `offset` from its top-left corner:
+/// drawn over the rest of the window, `priority` among other overlays, and kept inside it by a
+/// margin.
+fn floating_under(
+    offset: gpui::Point<Pixels>,
+    priority: usize,
+    content: impl IntoElement,
+) -> AnyElement {
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .child(
+            deferred(
+                anchored()
+                    .anchor(Anchor::TopLeft)
+                    .offset(offset)
+                    .snap_to_window_with_margin(px(space::MD))
+                    .child(content),
+            )
+            .with_priority(priority),
+        )
+        .into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8984,15 +9083,6 @@ mod tests {
 
     fn grid_renders(table: &Entity<TypeTable>, cx: &mut VisualTestContext) -> usize {
         table.read_with(cx, |table, cx| table.grid.read(cx).renders)
-    }
-
-    /// A root that draws nothing, for a window whose table is never drawn.
-    struct Blank;
-
-    impl Render for Blank {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div()
-        }
     }
 
     /// A table not drawn (restored with the workspace behind another tab) reads no rows: not
@@ -9006,7 +9096,7 @@ mod tests {
         });
         let session = session(PEOPLE, cx);
         cx.run_until_parked();
-        let (_blank, cx) = cx.add_window_view(|_, _| Blank);
+        let (_blank, cx) = cx.add_window_view(|_, _| gpui::EmptyView);
         let hidden = cx.update(|window, cx| {
             let session = session.clone();
             cx.new(|cx| {
@@ -11426,15 +11516,11 @@ mod tests {
             assert_eq!(session.head("main"), Some("c1"));
             session.schema_model().unwrap()
         });
-        let query = builder::update_cell(
-            &schema,
-            "Person",
-            "name",
-            "p1",
-            &"Ada".into(),
-            &"Ida".into(),
-        )
-        .unwrap();
+        let edit = builder::RowEdit {
+            id: "p1".into(),
+            cells: vec![("name".into(), "Ada".into(), "Ida".into())],
+        };
+        let query = builder::update_rows(&schema, "Person", &[edit]).unwrap();
         // Read again as a schema or a naming change reads it: from the head the session holds.
         table.update(cx, |table, cx| table.reload(false, cx));
         session
@@ -12918,6 +13004,104 @@ mod tests {
             assert!(table.bulk.notice.is_none());
             assert_eq!(table.rows[0].value("name"), "Same");
         });
+    }
+
+    /// A row's checkbox checks it, or takes it out, without moving the cursor or opening
+    /// anything; the key column's select-all checks every loaded row, shows a dash while some
+    /// are, and takes them all out once all are; one checked row is enough for the bulk bar.
+    #[gpui::test]
+    async fn checkboxes_pick_rows_and_the_header_selects_all(cx: &mut TestAppContext) {
+        let session = session(PEOPLE, cx);
+        let (table, cx) = people_table(&session, cx);
+        cx.run_until_parked();
+        let click = |cx: &mut VisualTestContext, selector: &'static str| {
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} was not drawn"));
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        let picked = |cx: &mut VisualTestContext| {
+            table.read_with(cx, |table, _| {
+                table.selection.iter().cloned().collect::<Vec<String>>()
+            })
+        };
+        let state = |cx: &mut VisualTestContext| table.read_with(cx, |t, _| t.all_check_state());
+        let cursor = table.read_with(cx, |table, _| table.cursor);
+        assert_eq!(state(cx), ToggleState::Unselected);
+        click(cx, "all-rows-check");
+        assert_eq!(picked(cx), ["p1", "p2"]);
+        assert_eq!(state(cx), ToggleState::Selected);
+        // With a row checked every row's box shows, so the first row's takes it out.
+        click(cx, "row-check-0");
+        assert_eq!(picked(cx), ["p2"]);
+        assert_eq!(state(cx), ToggleState::Indeterminate);
+        table.update(cx, |table, cx| {
+            assert_eq!(table.cursor, cursor, "a checkbox moves no cursor");
+            assert!(table.render_bulk_bar(cx).is_some(), "one checked row has the bar");
+        });
+        click(cx, "all-rows-check");
+        assert_eq!(picked(cx), ["p2", "p1"]);
+        click(cx, "all-rows-check");
+        assert!(picked(cx).is_empty(), "all checked, the select-all takes them out");
+        table.update(cx, |table, cx| assert!(table.render_bulk_bar(cx).is_none()));
+    }
+
+    /// The time of a frame of a full table while its grid replays from its cache, as in every
+    /// frame an animation, a hover or a keystroke elsewhere in the window draws: GPUI builds the
+    /// whole scene each frame, and a cached view's quads and lines go back into its draw order.
+    #[gpui::test]
+    #[ignore = "instrument: prints the time of a frame of a 200-row, 20-column table, its grid cached"]
+    async fn instrument_a_frame_of_a_full_table(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        const COLUMNS: usize = 20;
+        let properties: String = (0..COLUMNS)
+            .map(|c| format!("  p{c:02}: String\n"))
+            .collect();
+        let schema = format!("node Wide {{\n  slug: String @key\n{properties}}}\n");
+        let rows: Vec<Value> = (0..200)
+            .map(|i| {
+                let mut node = serde_json::Map::new();
+                node.insert("@id".into(), format!("w{i}").into());
+                node.insert("slug".into(), format!("wide-{i:06}").into());
+                for c in 0..COLUMNS {
+                    node.insert(format!("p{c:02}"), format!("value {i}·{c}").into());
+                }
+                serde_json::json!({ "n": node })
+            })
+            .collect();
+        let session = crate::test_support::session_reading(&schema, Value::Array(rows), cx);
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Wide".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let frame = |cx: &mut VisualTestContext| {
+            table.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+        };
+        for _ in 0..30 {
+            frame(cx);
+        }
+        let frames = 600;
+        let started = std::time::Instant::now();
+        for _ in 0..frames {
+            frame(cx);
+        }
+        let drawn = table.read_with(cx, |table, _| table.rows.len());
+        eprintln!(
+            "{drawn} rows loaded: {:?} a frame over {frames}",
+            started.elapsed() / frames
+        );
     }
 
     /// A grouped frame reads the Blob and relationship cells of the rows its lines show: a

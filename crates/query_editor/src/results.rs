@@ -1,8 +1,6 @@
 //! What the editor shows after a run, as plain data: result tables, explain plans, server
 //! diagnostics mapped back into the editor's text, and the small formats they use (spec 007).
 
-use std::time::Duration;
-
 use std::collections::{HashMap, HashSet};
 
 use gq_language::{ResultColumn, SchemaModel, TokenKind};
@@ -359,23 +357,9 @@ pub fn summarize_detail(detail: &str) -> String {
         .join(", ")
 }
 
-/// `34 ms`, `1.2 s`: whole milliseconds first, so 999.6 ms reads `1.0 s`, not `1000 ms`.
-pub fn format_elapsed(elapsed: Duration) -> String {
-    let ms = (elapsed.as_secs_f64() * 1000.).round() as u64;
-    if ms < 1000 {
-        format!("{ms} ms")
-    } else {
-        format!("{:.1} s", ms as f64 / 1000.)
-    }
-}
-
-/// `1 row`, `12,480 rows`: grouped, as Studio writes every count.
+/// `1 row`, `12,480 rows`: a result's row count, as Studio writes every count.
 pub fn rows_label(count: i64) -> String {
-    if count == 1 {
-        "1 row".into()
-    } else {
-        format!("{} rows", studio_ui::group_count(count))
-    }
+    studio_ui::plural(usize::try_from(count).unwrap_or(0), "row", "rows")
 }
 
 /// What a write the server committed did, read from its answer (constitution III): a
@@ -1221,10 +1205,6 @@ mod tests {
 
     #[test]
     fn small_formats() {
-        assert_eq!(format_elapsed(Duration::from_millis(34)), "34 ms");
-        assert_eq!(format_elapsed(Duration::from_millis(1250)), "1.2 s");
-        assert_eq!(format_elapsed(Duration::from_micros(999_600)), "1.0 s");
-        assert_eq!(format_elapsed(Duration::from_micros(999_400)), "999 ms");
         assert_eq!(rows_label(1), "1 row");
         assert_eq!(rows_label(0), "0 rows");
         assert_eq!(rows_label(12_480), "12,480 rows");

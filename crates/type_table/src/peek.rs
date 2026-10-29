@@ -30,7 +30,7 @@ use studio_actions::table::{SelectNextSuggestion, SelectPreviousSuggestion};
 use studio_ui::ds::space;
 use studio_ui::menu::ContextMenu;
 use ui::prelude::*;
-use ui::{Indicator, PopoverMenu, ToggleState, Tooltip};
+use ui::{PopoverMenu, ToggleState, Tooltip};
 
 use crate::blob::{
     IMAGE_MAX, KIND_PREFIX, PREVIEW_PREFIX, Preview, bytes_wanted, preview, read_range,
@@ -512,7 +512,7 @@ impl NodePeek {
     /// [`Self::new`] for a row a table shows: its Blob values are where the table's hold
     /// (`blobs`), which may be past `snapshot` after the table's own Blob write, and each one
     /// the table read is shown as its cell shows it.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn from_table(
         session: Entity<GraphSession>,
         subject: PeekSubject,
@@ -563,7 +563,7 @@ impl NodePeek {
         page
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn build(
         session: Entity<GraphSession>,
         subject: PeekSubject,
@@ -1734,7 +1734,6 @@ impl NodePeek {
     }
 
     fn render_blobs(&self, cx: &mut Context<Self>) -> AnyElement {
-        let border = studio_ui::ds::surface::rule(cx);
         let drop_bg = studio_ui::ds::surface::drop_target(cx);
         v_flex()
             .gap(px(space::MD))
@@ -1797,14 +1796,12 @@ impl NodePeek {
                         Some(studio_ui::ds::text::muted("Empty value").into_any_element())
                     }
                     (_, Loadable::Loaded(Preview::Image(image))) => Some(
-                        div()
+                        studio_ui::ds::lifted(div(), cx)
                             .w_full()
                             .flex()
                             .justify_center()
                             .p(px(space::MD))
                             .rounded(px(studio_ui::ds::radii(cx).md))
-                            .border_1()
-                            .border_color(border)
                             .child(
                                 gpui::img(image.source())
                                     .max_w_full()
@@ -1903,7 +1900,7 @@ impl NodePeek {
                             .child(studio_ui::ds::icon::meta(IconName::File))
                             .child(studio_ui::ds::text::body(slot.property.clone()))
                             .when(saving, |line| {
-                                line.child(Indicator::dot().color(Color::Warning))
+                                line.child(studio_ui::ds::dot(Color::Warning))
                             })
                             .child(studio_ui::ds::text::meta(facts))
                             .child(div().flex_1())
@@ -2232,7 +2229,7 @@ impl NodePeek {
     /// the same commit (`snapshot`), once per property: `read_without` is what this read left
     /// out already. Otherwise a group read whole says why on its count, and one whose count was
     /// shown says why under it.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn group_refused(
         &mut self,
         index: usize,
@@ -2708,15 +2705,13 @@ impl NodePeek {
             cx.notify();
             return;
         }
-        let write = match crate::write::write_property(
+        let write = match crate::write::write_properties(
             &self.session,
             &self.branch,
             &schema,
             &type_name,
             &id,
-            &name,
-            &old,
-            &new,
+            &[(name.clone(), old.clone(), new.clone())],
             None,
             cx,
         ) {
@@ -3692,6 +3687,7 @@ impl NodePeek {
             &type_name,
             &id,
             &cells,
+            None,
             cx,
         ) {
             Ok(write) => write,
@@ -3800,7 +3796,7 @@ impl NodePeek {
             h_flex()
                 .gap(px(space::SM))
                 .items_center()
-                .child(Indicator::dot().color(Color::Accent))
+                .child(studio_ui::ds::dot(Color::Accent))
                 .child(studio_ui::ds::text::body(label))
                 .children(self.drafts_notice.as_ref().map(|notice| {
                     studio_ui::ds::text::meta(notice.message.clone()).color(notice.tone.color())
@@ -4086,7 +4082,7 @@ impl NodePeek {
                         },
                         cx,
                     ))
-                    .child(Indicator::dot().color(Color::Accent))
+                    .child(studio_ui::ds::dot(Color::Accent))
                     .into_any_element()
             }
             None => match state.picker.take() {
@@ -4148,7 +4144,7 @@ impl NodePeek {
                 .gap(px(space::SM))
                 .items_start()
                 .child(studio_ui::ds::text::body(draft.text.clone()))
-                .child(Indicator::dot().color(Color::Accent))
+                .child(studio_ui::ds::dot(Color::Accent))
                 .into_any_element(),
             None => match self.markdown.get(name) {
                 // GPUI's text takes its size from the element around it, so the labels' size
@@ -4188,7 +4184,7 @@ impl NodePeek {
                 head.child(
                     div()
                         .debug_selector(move || draft_selector.clone())
-                        .child(Indicator::dot().color(Color::Accent)),
+                        .child(studio_ui::ds::dot(Color::Accent)),
                 )
             })
             .child(div().flex_1())
@@ -4285,7 +4281,7 @@ impl NodePeek {
                         div()
                             .id(("peek-saving", index))
                             .tooltip(Tooltip::text("Saving…"))
-                            .child(Indicator::dot().color(Color::Warning)),
+                            .child(studio_ui::ds::dot(Color::Warning)),
                     )
                     .into_any_element(),
             );
@@ -4514,7 +4510,7 @@ impl NodePeek {
                 let unknown = notice.tone == Tone::Unknown;
                 h_flex()
                     .gap(px(space::SM))
-                    .child(Indicator::dot().color(notice.tone.color()))
+                    .child(studio_ui::ds::dot(notice.tone.color()))
                     .child(studio_ui::ds::text::meta(notice.message).color(notice.tone.color()))
                     // Whether the save landed is in the branch's history.
                     .when(unknown, |row| {
@@ -4613,7 +4609,7 @@ impl NodePeek {
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(index, cx)))
             .when_some(failed, |d, error| d.tooltip(Tooltip::text(error)))
             .when(self.edge_writes.contains(&index), |header| {
-                header.child(Indicator::dot().color(Color::Warning))
+                header.child(studio_ui::ds::dot(Color::Warning))
             })
             .children(add)
             .child(studio_ui::ds::text::meta(count));
@@ -5362,7 +5358,7 @@ impl NodePeek {
                     )
                     .child(div().flex_1())
                     .children(open_page.map(|open| {
-                        studio_ui::ds::toolbar_icon_button("peek-open-page", IconName::ArrowUpRight)
+                        studio_ui::ds::icon_button("peek-open-page", IconName::ArrowUpRight)
                             .icon_color(Color::Muted)
                             .tooltip(Tooltip::text("Open the node's page"))
                             .on_click(move |_, window, cx| {
@@ -5375,7 +5371,7 @@ impl NodePeek {
                             id: id.clone(),
                         };
                         header.child(
-                            studio_ui::ds::toolbar_button("peek-explore", "Explore")
+                            studio_ui::ds::button("peek-explore", "Explore")
                                 .style(ButtonStyle::Subtle)
                                 .start_icon(
                                     Icon::new(IconName::Crosshair),
@@ -7876,7 +7872,11 @@ mod tests {
             session.schema_model().unwrap()
         });
         let (ada, ida) = (json!("Ada"), json!("Ida"));
-        let query = builder::update_cell(&schema, "Person", "name", "p1", &ada, &ida).unwrap();
+        let edit = builder::RowEdit {
+            id: "p1".into(),
+            cells: vec![("name".into(), ada, ida)],
+        };
+        let query = builder::update_rows(&schema, "Person", &[edit]).unwrap();
         view.update(cx, |view, cx| view.reload(cx));
         session
             .update(cx, |session, cx| {

@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 use editor::{Editor, EditorEvent};
 use gpui::{
     AnyElement, AnyView, App, AsyncApp, Bounds, ClipboardItem, Context, Entity, EventEmitter,
-    FocusHandle, Focusable, Hsla, KeyContext, PathBuilder, Pixels, Render, ScrollStrategy,
-    SharedString, StyleRefinement, Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
-    canvas, point, px, uniform_list,
+    FocusHandle, Focusable, Hsla, PathBuilder, Pixels, Render, ScrollStrategy, SharedString,
+    StyleRefinement, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, canvas,
+    point, px, uniform_list,
 };
 use graph_client::ReadError;
 use graph_client::api::{CommitListOutput, CommitOutput};
@@ -1972,11 +1972,7 @@ fn commit_menu(
 /// below them, and how many of them were merged in, each count grouped as Studio writes every
 /// count.
 fn summary(count: usize, merged: usize, complete: bool) -> String {
-    let mut summary = format!(
-        "{} commit{}",
-        group_digits(count),
-        if count == 1 { "" } else { "s" }
-    );
+    let mut summary = studio_ui::plural(count, "commit", "commits");
     if !complete {
         summary.push_str(" so far");
     }
@@ -2199,7 +2195,7 @@ impl Render for HistoryView {
                             ),
                     )
                     .child(
-                        studio_ui::ds::toolbar_button("retry-history", "Try again")
+                        studio_ui::ds::button("retry-history", "Try again")
                             .style(ButtonStyle::Subtle)
                             .tooltip(Tooltip::text(
                                 "Read the branch's newest commits again; the commits read stay \
@@ -2211,7 +2207,7 @@ impl Render for HistoryView {
             .child(div().flex_1())
             .child(search)
             .child(
-                studio_ui::ds::toolbar_icon_button("refresh-history", IconName::RotateCw)
+                studio_ui::ds::icon_button("refresh-history", IconName::RotateCw)
                     .icon_color(Color::Muted)
                     .tooltip(|_, cx| Tooltip::for_action("Read the history again", &Refresh, cx))
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
@@ -2252,11 +2248,8 @@ impl Render for HistoryView {
             }
         };
         // Typing in the search box must not move the selection.
-        let mut context = KeyContext::new_with_defaults();
-        context.add("History");
-        if self.search.focus_handle(cx).is_focused(window) {
-            context.add("searching");
-        }
+        let context =
+            studio_ui::ds::search_key_context("History", &self.search.focus_handle(cx), window);
         v_flex()
             .key_context(context)
             .track_focus(&self.focus_handle)

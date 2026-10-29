@@ -26,7 +26,7 @@ use studio_ui::ds::Prose as _;
 use studio_ui::menu::ContextMenu;
 use studio_workspace::{ToastKind, Workspace, WorkspaceEvent};
 use ui::prelude::*;
-use ui::{Indicator, PopoverMenu, Tooltip, right_click_menu};
+use ui::{PopoverMenu, Tooltip, right_click_menu};
 
 use crate::connection::{self, AgentConnection};
 use crate::host::AgentLaunch;
@@ -517,7 +517,7 @@ fn conversation_row(
             Some("The agent stopped"),
         ),
         RowState::Unread => (
-            Indicator::dot().color(Color::Accent).into_any_element(),
+            studio_ui::ds::dot(Color::Accent).into_any_element(),
             Some("Finished while you were away"),
         ),
         // No time on the row, as Delta's threads: it is in the tooltip.

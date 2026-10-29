@@ -113,7 +113,8 @@ title bar; Ragnor's choice over a Zed-style title bar) over one status bar acros
   traffic lights' room, the panel's title and search.
 - The status bar (30 px, `ds::size::STATUS_BAR`: Zed's 22 px buttons with 4 px around them)
   reads, after the sidebar toggle and the left dock's buttons: the
-  server chip (state and round trip; the graph switcher), the graph chip and the branch menu,
+  graph switcher (the connection's dot, server / graph; its state beside it only when not
+  ready, and in its tooltip with the round trip) and the branch menu,
   then the few facts the open tab adds (`Item::status`: a query's rows and time, a Blob's size;
   not what the tab shows itself, such as a table's row count or a schema's counts); at the
   right, what is running, a keyboard button whose menu lists the tab's keys (`ItemStatus::keys`,
@@ -183,10 +184,16 @@ what was last saved at most every 250 ms rather than serializing every tab on ev
   header (the sidebar's, else the top-left pane's), and every header strip moves the window.
   As in Zed's title bar, that room is left on macOS only, and not in full screen, where the
   lights hide with the menu bar; there the strip starts at its own edge.
-- Status bar left: the docks' panel buttons, then the connection chip (`ready`,
-  `connecting…`, `contract mismatch`, `unauthorized`, `unreachable`, with the contract and the
-  round trip), the graph and the branch menu, which switches branch for the window. Right: what
-  is running ("2 queries running", "Writing (1)…"), memory and CPU, the other docks' buttons.
+- Status bar left: the docks' panel buttons, then one breadcrumb (since 2026-10-29, when a
+  server chip and a graph chip side by side both switched graphs): the graph switcher, the
+  connection's dot with server / graph (its state, `connecting…`, `contract mismatch`,
+  `unauthorized`, `unreachable`, spelled out beside it only when not ready; the contract and
+  the round trip in its tooltip; a ready server's dot beats, `ds::live_dot`: every 3 s while
+  the window is in front and motion is allowed, one ring goes out from it and fades in 0.9 s,
+  at most 24 redraws a second, and nothing is drawn between rings), then the branch menu, which switches branch for the window, marks the window's
+  branch, and says when the list is being read or could not be (it is read again when the menu
+  opens). Right: what is running ("2 queries running", "Writing (1)…"), memory and CPU, the
+  other docks' buttons.
 - What the credential may do (E15, below): "read only" follows the branch's name when the
   access route refuses `change` there, its tooltip naming what the credential lacks; the actor
   the credential resolves to is in the connection chip's tooltip ("… · as act-ada · Switch
@@ -575,9 +582,9 @@ than styling one-off elements.
   Delta and Zed put a list's search and "new" there rather than as rows in the list; the
   Conversations panel does (spec 011).
 - **Status bar, after Zed's** (until 2026-10-16 two footers, after Delta's). One bar across the
-  window: the left dock's panel buttons, the connection (a status dot, the server and its
-  state, opening the graph switcher), where the open tab reads and writes (graph / branch with
-  the branch menu), then the tab's own facts; at the end what is running, the tab's controls,
+  window: the left dock's panel buttons, where the open tab reads and writes as one breadcrumb
+  (the connection's dot and server / graph, opening the graph switcher; then / branch with the
+  branch menu), then the tab's own facts; at the end what is running, the tab's controls,
   memory and CPU, and the bottom and right docks' panel buttons. A tab supplies its part through
   `Item::status` (`ItemStatus { start, end, keys }`): the table its loaded count, read commit and key
   hints; the agent its restart, agent pill and send. A pane's header holds its Back and Forward
@@ -605,12 +612,21 @@ than styling one-off elements.
   and moves the traffic lights into the sidebar sheet. They sit centered in the first header
   strip (`studio_workspace::traffic_light_position`), where a window also opens with them.
 - **Hairlines.** `ds::surface::rule`, which when flat is `surface::divider`: interfaces.dev's
-  `--color-gray-400`, `#e8e8e8` on a white page (9 % black), 8 % white in a dark theme; a
-  checkbox's, an outlined chip's and a composer control's edge is the same line
-  (`surface::control_border`). A rule between the rows or the sections of a document
+  `--color-gray-400`, `#e8e8e8` on a white page (9 % black), 8 % white in a dark theme; an
+  outlined chip's edge is the same line (`surface::control_border`). A rule between the rows or the sections of a document
   (a table's rows, query results, settings rows, a queue, storage's sections, a feed's date
   rule) is `ds::dotted`: dotted on glass, as Tower's feeds, solid when flat. A region's edge
   (a toolbar's, a strip's, a pane's, the composer's) is solid in both styles.
+- **Shadows, not borders** (since 2026-10-29, after interfaces.dev's "Use shadows instead of
+  borders"). A border that only raised a surface is `shadow-custom` instead (`ds::lifted`: its
+  ring and two drops over a clear border, so the layout keeps the hairline's room, a darker
+  ring under the pointer, the ring alone in a dark theme): cards (a change's, a conflict's,
+  an image preview's), a form's row list, an unchecked checkbox, the composer's outlined
+  control and the ontology's labels, as buttons, fields, pills, chips and floating bars
+  already were. A border stays where it is structure or state: a rule between rows or
+  regions, an inset panel drawn row by row, a banner's severity, a focused, selected or
+  invalid edge, the canvas's marquee, a sheet's rim. A Blob tab's image carries a 1 px
+  outline on its edge at 10 % black, white in a dark theme (`surface::image_outline`).
 - **Ink on glass** (since 2026-10-20). What glass lays over a sheet (the rule, a well, the
   selected and hovered rows, an inactive tab) is black in a light theme and white in a dark
   one, at the same strengths (`surface::ink`): a dark theme's sheet is its own dark surface
@@ -737,17 +753,21 @@ than styling one-off elements.
   property icons' edge. A neighbour's `ds::value_remove` (a quiet ×) is the row's action,
   over its end under the pointer; the group's "+" sits in its header.
 - **Control chips** (since 2026-10-21, after the reference toolbar). A toolbar's controls are
-  `ds::control_chip`s, the filter pill's family: one raised pill (`shadow-custom`, 26 px) holding
-  a quiet `ds::chip_button` (its icon, its label and, while set, what it is set to in the
+  `ds::control_chip`s, the filter pill's family: one raised pill (`shadow-custom`, whose ring
+  is its edge, a button's 22 px) filled by a quiet `ds::chip_button`, its label 8 px in as
+  every button's (since 2026-10-29; the chip was 26 px with its button 2 px inside, its label
+  10 px in, a size apart from the buttons beside it) (its icon, its label and, while set, what it is set to in the
   accent, `Button::value`: "Sort name", "Filters 2") and, while set and clearable, a hairline
   and a round clear button (`ControlChip::on_clear`). The pill is the same set or not, so
   setting a control adds to its chip rather than changing what it is. `ds::filter_pill` and
   the chip share their frame, hairline and clear end.
-- **Control sizes, in code.** `size::CONTROL` (28 px: a medium button, a field, a floating
-  bar, a tile), `size::PILL` (26 px: a filter, a composer's picker, a dock's title tab),
-  `size::BAR_BUTTON` (22 px: a segment, a bar's button, the status bar's items), `size::TAG`
-  (18 px: tags, count badges, a write target), `size::DOT` and `size::DISCLOSURE`. Every
-  single-line field is `ds::field_frame` (the scale's `sm` corner at a control's height, a
+- **Control sizes, in code.** `size::CONTROL` (28 px: a field, a floating bar, a tile),
+  `size::PILL` (`BAR_BUTTON`'s 22 px: a filter's pill, a toolbar's chips, a shared type's
+  pill; the round button at a pill's end is a row button's 18 px, 2 px inside it),
+  `size::BAR_BUTTON` (22 px: every button, a segment, the status bar's items), `size::TAG`
+  (18 px: tags, count badges, a write target), `size::DOT` (7 px: every status dot,
+  `ds::dot`, a type's and a live one; Zed's 6 px `Indicator` is not used) and
+  `size::DISCLOSURE`. Every single-line field is `ds::field_frame` (the scale's `sm` corner at a control's height, a
   `shadow-custom` (below; its border clear), the error border with the drops alone when
   invalid)
   around `ds::field_input`, and every search box is `ds::search_field`, so fields line up
@@ -775,20 +795,21 @@ than styling one-off elements.
   primary, Outlined outline, Subtle ghost, Tinted(Error) destructive. Sizes keep Zed's
   heights, and a view names a button by where it sits, never by its size (since 2026-10-19,
   when the same row action was an 18, 22 or 28 px square from one view to the next): a
-  control's, `ds::button` and `ds::icon_button`, 28 px (`size::CONTROL`, 10 px in), beside a
-  field or among a dialog's actions; a strip's, `ds::toolbar_button`, `ds::bar_button` and
-  their icon forms, 22 px (`size::BAR_BUTTON`: the header strips, floating bars and the
-  status bar); a row's or a card's, `ds::row_button` and `ds::row_icon_button`, 18 px
+  button, `ds::button`, `ds::bar_button` (the scale's corner, in a floating bar) and
+  `ds::icon_button`, 22 px (`size::BAR_BUTTON`, 8 px in) wherever it sits, beside a field,
+  among a dialog's actions, in a strip, a floating bar or the status bar, a pill and a
+  rounded button alike (since 2026-10-29, when a pill was 28 px with 10 px in beside 22 px
+  rounded buttons with 8 px); a row's or a card's, `ds::row_button` and `ds::row_icon_button`, 18 px
   (`size::ROW_BUTTON`, a tag's height: a tree row's toggle, an inline Fix, Show more, a
   setting's reset, a value's copy); and a tab's pin and close, `ds::inline_icon_button`, no
-  square beyond its icon. An icon button's icon follows its size: 14 px at 28 and 22 px,
+  square beyond its icon. An icon button's icon follows its size: 14 px at 22 px,
   12 px in a row and a tab; a sheet's close, `ds::sheet_close_button`, is the one role that
   sets its own, an outlined 22 px square with the 12 px icon. A plain `IconButton::new` is the 22 px one, as Zed's, so its
   hover fill keeps 4 px clear in the 30 px status bar and 5 px in a 32 px strip (until
   2026-10-18 every icon button defaulted to 28 px, which nearly filled the strips it sat
-  in). A label is the body size at 28 px and up (13 px at the default 15 px
-  interface size, Tower's `text-sm`) and the small size below; a leading icon is 16 px at
-  28 px and 12 px below, a trailing one (a chevron) 12 px, both at 80 % of the label's ink.
+  in). A label is the small size, a leading icon 12 px and a trailing one (a chevron)
+  12 px, both at 80 % of the label's ink (Zed's medium and large sizes, which no button takes
+  since 2026-10-29, give the body size and a 16 px leading icon).
   A toggled button sits on the pressed fill; a disabled one fades to 64 %; a key hint on a
   solid button takes its ink. Primary and destructive carry interfaces.dev's primary shadow
   (`elevation::filled`: a 6 % white haze inside, a 10 % drop 1.5 px down, and a 1 px ring
@@ -851,7 +872,7 @@ than styling one-off elements.
   with Zed's fonts); IBM Plex Sans and every installed font stay selectable.
 - **Toolbars.** A document's toolbar and every header or notice strip (a table's, a query's,
   history's and its commit pane's, the review's, storage's, the inspector's header, the text
-  editor's, a newer-data notice) holds `ds::toolbar_button`s and `ds::toolbar_icon_button`s;
+  editor's, a newer-data notice) holds `ds::button`s and `ds::icon_button`s;
   a button inside a dense row (an inline Fix or Run, Show more, a crumb) is a
   `ds::row_button`. Toolbar buttons are Zed's 22 px
   size, Tower's `xs`, with small type and 12 px icons, set with no gap beyond their padding
@@ -963,6 +984,10 @@ opens a link from inside Studio.
 ## Validation log
 
 | Date | Claim | Check | Result |
+| 2026-10-29 | A border that only raises a surface is the shadow; images take the outline | `studio_ui` `controls_draw_at_their_sizes` and the workspace's tests; every all-round border in the crates' code read and sorted (structure or state kept: rules, inset panels, banners, focus, selection, errors, the marquee, sheets' rims) | Change cards, conflict cards, image preview frames, row lists, unchecked checkboxes, the composer's outlined control and the ontology's labels take `ds::lifted`; a Blob tab's image its 10 % outline (`surface::image_outline`) on its edge |
+| 2026-10-29 | A pill and a rounded button are one size | `studio_ui` `controls_draw_at_their_sizes` (extended: `ds::button` and a `ds::bar_button` with the same label draw the same box, 22 px with the label 8 px in; `ds::icon_button` a 22 px square) | Passes. Before: a text pill was 28 px with its label 10 px in and the body size, beside 22 px rounded buttons with 8 px and the small size; `toolbar_button`, `toolbar_icon_button` and `bar_icon_button`, which only named the 22 px size, are gone |
+| 2026-10-29 | A frame costs the whole window, so the dot draws only while its ring moves | `studio_workspace` `the_connection_dot_beats_only_while_ready_and_seen` (one beat a pulse while ready and in front; none behind another window, none once the server stops answering), `motion` `a_ring_goes_out_as_it_fades`; the workspace suite; `sample` of a release build with the ring drawn at every frame over a 126-row table; `top` of the app, the frontmost app read every 2 s, before, at every frame and with the beat | At every frame Studio took a steady 31.5 % CPU in front (about 2.6 ms a frame), against 0.5 % at rest. Of the frame, about 85 % of the samples were GPUI building the scene (`BoundsTree::insert`, 819 of about 1,100 busy samples): a cached view skips its render and layout but `Scene::replay` puts each of its quads and lines back in the draw order, so a frame costs about the window whatever changed, and a dot in a view of its own would have saved only the render. A repeating ring, even capped, asked for frames through its rest. The beat is a one-shot ring keyed by its count, counted every 3 s only while the server is ready, the window in front and motion allowed: in front 10.0 % median while in use (8.2 % before, also in use), behind other windows 0.5 % (0.5 % before). GPUI draws a view again when an entity it read while drawing notifies, so the dot follows the connection without an observer |
+| 2026-10-29 | A toolbar's chips are a button's size; a ready server's dot beats; ambient motion is capped | `studio_ui` `property_and_control_parts_draw_at_their_sizes` (a chip 22 px, its button filling it from its start, its clear button 18 px and 2 px inside its end), `motion` `a_pulse_goes_out_fades_and_rests`; the workspace suite; the relaunched app's table toolbar | The chips were 26 px with their labels 10 px in, a size apart from the 22 px buttons; now Views, Columns, Sort, Group, Filters and Row read as buttons. Every animation frame renders the window's root view again (the panes are cached), and Zed's `with_rotate_animation` asks for every frame, so a spinner redrew the chrome up to 120 times a second for as long as work ran; the spinner and the dot take `motion::AMBIENT_FPS` (24) |
 |---|---|---|---|
 | 2026-10-26 | Update actions are offered only where they apply, from any window, and a notice about no graph stays up while graphs' errors fold | `studio_actions` `an_action_is_offered_unless_it_says_when`; `studio` `update_status::tests::work_in_the_background_shows_its_progress_without_a_spinner`; `studio_workspace` `restarting_to_update_with_unsaved_work_asks_first` (the button says Restart), `errors_of_four_sources_fold_across_graphs_within_the_stack` (the notice stays); CI on PR #11 (run 40281608899), Check on macOS, Linux and Windows: `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` | All pass: 1014 passed on macOS, 1009 on Linux, 979 on Windows; 0 failed |
 | 2026-10-28 | A link picks no credential, is read within a bound, and a window opens with every feature | `studio` `a_link_to_two_servers_at_one_address_picks_no_credential` (two targets at `http://shared.test`: refused naming both, then opened on the one holding the graph, the other left unconnected), `deep_link` `a_link_missing_a_part_or_of_another_kind_is_refused_with_the_reason` (extended: the longest text, every byte encoded, reads; past the bound refused), `a_window_opens_with_every_feature` (every feature's init and a window; fails with the Conversations panel's read of its workspace put back), `keymaps`' `user_keymap_file` on `studio_settings::write_new` (`a_new_file_never_replaces_one`), Reveal Log File's look and folder off the main thread | All pass. Before: a link took the first target listed at its address; a long link was parsed and decoded whole before its text's bound; main at 08e4a91 aborted at launch, before a window showed (fixed in 9913d77); opening the keymap could replace a file made between its look and its write |

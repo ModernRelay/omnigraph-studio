@@ -15,6 +15,7 @@ use graph_client::api::{
     EntityKind,
 };
 use serde_json::Value;
+use studio_ui::plural;
 
 /// The most changes a review folds before it says "Partial" (spec 008).
 pub const REVIEW_CHANGE_CAP: usize = 20_000;
@@ -412,13 +413,6 @@ impl FoldedChanges {
     pub fn relationship_count(&self) -> usize {
         self.changes.iter().filter(|c| c.is_edge()).count()
     }
-}
-
-/// "1 draft", "3 drafts", "1,200 rows": a count, its digits grouped, and the word for it, as
-/// Studio writes every count.
-pub fn plural(count: usize, one: &str, many: &str) -> String {
-    let word = if count == 1 { one } else { many };
-    format!("{} {word}", studio_ui::group_digits(count))
 }
 
 /// The review header's sentence: "17 entities and 22 relationships changed in 3 commits by

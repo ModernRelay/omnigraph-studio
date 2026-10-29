@@ -134,7 +134,7 @@ pub fn modal_footer(cx: &App) -> Div {
         .rounded_b(px(radius::flush(radii(cx).modal)))
 }
 
-/// A modal's Cancel: an outline pill at a control's height.
+/// A modal's Cancel: an outline pill, a button's size.
 pub fn cancel_button(id: impl Into<ElementId>) -> Button {
     Button::new(id, "Cancel").variant(Variant::Outline)
 }

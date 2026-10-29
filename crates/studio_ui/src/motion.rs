@@ -16,6 +16,28 @@ use gpui::{App, Window};
 /// How long a change of place takes: long enough to follow, short enough not to wait for.
 pub const GLIDE: Duration = Duration::from_millis(220);
 
+/// How far apart a live dot's beats are ([`crate::ds::live_dot`]): each sends one ring out
+/// from the dot, and between rings nothing is drawn.
+pub const PULSE: Duration = Duration::from_millis(3000);
+
+/// How long a beat's ring takes to go out from its dot and fade.
+pub const PULSE_RING: Duration = Duration::from_millis(900);
+
+/// How often ambient motion (a beat's ring, a spinner) redraws at most. Every frame builds the
+/// whole window's scene again, whatever changed: a cached view skips its render and layout but
+/// still puts each of its quads and lines back in the scene's draw order (`Scene::replay`), so
+/// a frame of a full table costs about as much as the table. 24 steps a second read as smooth
+/// for a ring a few pixels wide or a small icon turning once in two seconds, where every frame
+/// would be 60 to 120.
+pub const AMBIENT_FPS: f32 = 24.;
+
+/// A ring's place: how far out it is (`0..=1`, eased as things arriving) and how visible (`1`
+/// to `0`), from its linear progress `t`.
+pub fn pulse(t: f32) -> (f32, f32) {
+    let t = t.clamp(0., 1.);
+    (Ease::OutCubic.apply(t), 1. - t)
+}
+
 /// An easing curve over linear progress `0..=1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ease {
@@ -125,6 +147,20 @@ mod tests {
         }
         // Out-cubic is past halfway at a quarter of the time: arriving things slow down.
         assert!(Ease::OutCubic.apply(0.25) > 0.5);
+    }
+
+    #[test]
+    fn a_ring_goes_out_as_it_fades() {
+        // Starts on the dot, fully visible; reaches its full size as it fades out.
+        assert_eq!(pulse(0.), (0., 1.));
+        let (reach, seen) = pulse(1.);
+        assert!((reach - 1.).abs() < 1e-6);
+        assert_eq!(seen, 0.);
+        // Out faster than it fades: most of the way out while still half visible.
+        let (reach, seen) = pulse(0.5);
+        assert!(reach > 0.8 && (seen - 0.5).abs() < 1e-6);
+        // A beat's ring is over well before the next beat.
+        assert!(PULSE_RING * 3 <= PULSE);
     }
 
     #[test]

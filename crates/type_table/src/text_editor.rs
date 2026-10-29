@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use studio_actions::node::SaveText;
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
-use ui::{Indicator, Tooltip};
+use ui::{Tooltip};
 
 use crate::model::{Notice, SaveResult, Tone, edited, node_label, node_rows};
 
@@ -91,7 +91,7 @@ impl TextEditor {
     /// edited at, so saves stay bound to what was read) or the branch head, showing `typed`
     /// when text was typed before it was opened here. Typed text that is the property's draft
     /// on the session's branch is bound, as the draft is, to the value it was typed over.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         session: Entity<GraphSession>,
         type_name: String,
@@ -372,15 +372,13 @@ impl TextEditor {
             }
             None => return,
         };
-        let write = match crate::write::write_property(
+        let write = match crate::write::write_properties(
             &self.session,
             &self.branch,
             &schema,
             &self.type_name,
             &self.id,
-            &self.property,
-            &old,
-            &new,
+            &[(self.property.clone(), old.clone(), new.clone())],
             None,
             cx,
         ) {
@@ -484,7 +482,7 @@ impl TextEditor {
             State::Conflict => Some(
                 h_flex()
                     .gap(px(studio_ui::ds::space::SM))
-                    .child(Indicator::dot().color(Color::Warning))
+                    .child(studio_ui::ds::dot(Color::Warning))
                     .child(
                         studio_ui::ds::text::body("Changed elsewhere while you edited")
                             .color(Color::Warning),
@@ -514,7 +512,7 @@ impl TextEditor {
             State::Failed(notice) => Some(
                 h_flex()
                     .gap(px(studio_ui::ds::space::SM))
-                    .child(Indicator::dot().color(notice.tone.color()))
+                    .child(studio_ui::ds::dot(notice.tone.color()))
                     .child(studio_ui::ds::text::muted(notice.message.clone()))
                     .into_any_element(),
             ),
@@ -536,7 +534,7 @@ impl TextEditor {
                     .child(segment("text-preview", "Preview", Mode::Preview, cx)),
             )
             .child(
-                studio_ui::ds::toolbar_button("text-save", "Save")
+                studio_ui::ds::button("text-save", "Save")
                     .style(if dirty {
                         ButtonStyle::Filled
                     } else {
@@ -776,15 +774,6 @@ mod tests {
         });
     }
 
-    /// A root that draws nothing, for a window whose editor is never drawn.
-    struct Blank;
-
-    impl Render for Blank {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div()
-        }
-    }
-
     /// A tab not drawn (restored with the workspace behind another) reads nothing: not when it
     /// is made, nor when the branch moves; it saves nothing until it has read. Before, every such
     /// tab read its node at start and at each branch move.
@@ -796,7 +785,7 @@ mod tests {
         });
         let session = session_answering(PEOPLE, 200, committed("c2", "c1"), cx);
         cx.run_until_parked();
-        let (_blank, cx) = cx.add_window_view(|_, _| Blank);
+        let (_blank, cx) = cx.add_window_view(|_, _| gpui::EmptyView);
         let hidden = cx.update(|window, cx| {
             let session = session.clone();
             cx.new(|cx| {

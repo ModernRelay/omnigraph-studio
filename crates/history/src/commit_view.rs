@@ -530,11 +530,7 @@ impl CommitView {
         let changes = match &self.state {
             State::Ready => {
                 let total = self.folded.entity_count() + self.folded.relationship_count();
-                let mut text = format!(
-                    "{} change{}",
-                    studio_ui::group_digits(total),
-                    if total == 1 { "" } else { "s" }
-                );
+                let mut text = studio_ui::plural(total, "change", "changes");
                 if self.next_page_token.is_some() {
                     text.push_str(" so far");
                 }
@@ -647,7 +643,7 @@ impl CommitView {
             .child(
                 PopoverMenu::new("open-table-at")
                     .trigger(
-                        studio_ui::ds::toolbar_button("open-table-at-button", "Table")
+                        studio_ui::ds::button("open-table-at-button", "Table")
                             .style(ButtonStyle::Subtle)
                             .start_icon(Icon::new(IconName::Table))
                             .tooltip(Tooltip::text(
@@ -690,7 +686,7 @@ impl CommitView {
                     }),
             )
             .child(
-                studio_ui::ds::toolbar_button("query-at", "Query")
+                studio_ui::ds::button("query-at", "Query")
                     .style(ButtonStyle::Subtle)
                     .start_icon(Icon::new(IconName::FileCode))
                     .tooltip(Tooltip::text("Open a query that reads this commit"))
@@ -706,7 +702,7 @@ impl CommitView {
             .when_some(branch_at, |row, commit| {
                 let cli = branch_here_cli(&commit);
                 row.child(
-                    studio_ui::ds::toolbar_button("branch-here", "Branch")
+                    studio_ui::ds::button("branch-here", "Branch")
                         .style(ButtonStyle::Subtle)
                         .start_icon(Icon::new(IconName::GitBranch))
                         .tooltip(move |_, cx| {
@@ -780,17 +776,14 @@ impl CommitView {
                     .collect();
                 let mut card = card.relationships(counts, lines);
                 if left_out > 0 {
-                    card = card.relationships_footer(
-                        studio_ui::ds::button(
-                            ("more-relationships", ix),
-                            change_cards::more_lines_label(left_out),
-                        )
-                        .style(ButtonStyle::Subtle)
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                    card = card.relationships_footer(change_cards::more_lines_button(
+                        ix,
+                        left_out,
+                        cx.listener(move |this, _, _, cx| {
                             this.card_lines.show_more(card_key.clone(), shown);
                             cx.notify();
-                        })),
-                    );
+                        }),
+                    ));
                 }
                 div()
                     .px(px(studio_ui::ds::space::EDGE))

@@ -1285,11 +1285,7 @@ fn said(stderr: &[u8]) -> String {
     let mut line = causes.join("; ");
     const MAX: usize = 400;
     if line.len() > MAX {
-        let mut end = MAX;
-        while !line.is_char_boundary(end) {
-            end -= 1;
-        }
-        line.truncate(end);
+        line.truncate(line.floor_char_boundary(MAX));
         line.push('…');
     }
     line
