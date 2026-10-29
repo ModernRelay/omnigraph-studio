@@ -952,6 +952,9 @@ impl Connection {
                         let service = this.current(service);
                         let host = service.host();
                         this.service = Some(service.clone());
+                        // What the keychain holds now is what was read: nothing left there to say
+                        // when the read found none, and a sign-in taken when it found one.
+                        this.left_behind = None;
                         this.sign_in = SignIn::Offered {
                             service: host,
                             why: None,
@@ -1040,7 +1043,7 @@ impl Connection {
                     .ok_or("The sign-in was not finished within five minutes.".to_owned())?
                     .map_err(|error| error.to_string())?;
                     let service = exchanged;
-                    oauth_client::exchange(
+                    let tokens = oauth_client::exchange(
                         service.clients.for_url(&service.server.token_endpoint),
                         &service.server,
                         &code,
@@ -1049,14 +1052,18 @@ impl Connection {
                         service.expected(),
                     )
                     .await
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| error.to_string())?;
+                    // Revoked if the connection does not take it (the sign-in cancelled, or the
+                    // connection gone), made here so no moment holds the token unguarded.
+                    let unclaimed =
+                        sign_in::Unclaimed::new(service.clone(), tokens.refresh_token.clone());
+                    Ok((tokens, unclaimed))
                 })
                 .await;
-            // Revoked if the connection does not take it: the sign-in cancelled while it waits,
-            // or the connection gone.
-            let unclaimed = signed_in.as_ref().ok().map(|tokens| {
-                sign_in::Unclaimed::new(service.clone(), tokens.refresh_token.clone())
-            });
+            let (signed_in, unclaimed) = match signed_in {
+                Ok((tokens, unclaimed)) => (Ok(tokens), Some(unclaimed)),
+                Err(why) => (Err(why), None),
+            };
             let mut turn_done = None;
             if signed_in.is_ok() {
                 let Ok((before, done)) = this.update(cx, |this, _| this.next_keychain_turn())
@@ -1265,9 +1272,19 @@ impl Connection {
     }
 
     /// Forgets the sign-in, which the CLI's credential for the target replaces. The keychain
-    /// keeps it, for the target made anonymous again.
+    /// keeps what it holds, for the target made anonymous again: an item it kept but would not
+    /// delete stays said. A sign-in whose token the keychain does not hold ends, and its refresh
+    /// token is revoked, since nothing else would hold it.
     fn drop_sign_in(&mut self) {
-        self.oauth = None;
+        if let Some(source) = self.oauth.take() {
+            let kept = source.kept_in_keychain();
+            if let Kept::Earlier(refused) = &kept {
+                self.left_behind = Some(refused.clone());
+            }
+            if kept != Kept::This {
+                smol::spawn(source.replaced()).detach();
+            }
+        }
         self.service = None;
         self.lease = None;
         self._renewal = None;

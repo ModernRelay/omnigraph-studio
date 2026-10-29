@@ -1344,6 +1344,41 @@ mod tests {
         browser.join().unwrap();
         assert!(keychain.items.lock().unwrap().is_empty());
         assert_eq!(left(cx), None);
+
+        // The CLI's credential for the target replaces a sign-in whose token the keychain does
+        // not hold, over an earlier item it would not delete: the token, which nothing else
+        // holds, is revoked, and the item stays said.
+        struct Cli;
+        impl TokenSource for Cli {
+            fn token(&self, _: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, NoToken>> {
+                futures::future::ready(Ok(Token::typed("from-the-cli".into()))).boxed()
+            }
+        }
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key.clone(), ("user_9".into(), b"earlier".to_vec()));
+        keychain.refuses_deletes.store(true, Ordering::SeqCst);
+        connection.update(cx, |c, cx| c.sign_in(cx));
+        let browser = approve(&served, &cx.opened_url().unwrap());
+        until(cx, "a sign-in over an earlier item", |cx| {
+            matches!(
+                sign_in_state(&connection, cx).1,
+                SignIn::SignedIn {
+                    kept: Kept::Earlier(_),
+                    ..
+                }
+            )
+        });
+        browser.join().unwrap();
+        let before = revoked(&served);
+        connection.update(cx, |c, cx| c.take_token_from(Some(Arc::new(Cli)), cx));
+        until(cx, "the dropped sign-in's revocation", |_| {
+            revoked(&served) > before
+        });
+        assert_eq!(left(cx).as_deref(), Some("the keychain refused"));
+        assert_eq!(keychain.items.lock().unwrap()[&key].1, b"earlier".to_vec());
     }
 
     /// The target's keychain work takes its turns in order. A sign-in made while a sign-out's
