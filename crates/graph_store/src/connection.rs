@@ -5,6 +5,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
+use futures::FutureExt as _;
+use futures::channel::oneshot;
+use futures::future::Shared;
 use gpui::{Context, EventEmitter, Task};
 use graph_client::api::{GraphInfo, HealthOutput};
 use graph_client::{GraphClient, ReadError};
@@ -188,6 +191,12 @@ pub struct Connection {
     lease: Option<Lease>,
     /// The sign-in under way: reading its service, or waiting for the browser.
     _signing_in: Option<Task<()>>,
+    /// Counts what decides the keychain's item for the target (a sign-in taken, a sign-out):
+    /// a sign-out's answer, which comes later, is said only while that sign-out is the last.
+    custody: u64,
+    /// The last sign-out's keychain work, which a sign-in's own waits for, so the two reach the
+    /// keychain in order.
+    keychain_turn: Option<Shared<oneshot::Receiver<()>>>,
     /// The ask for the next short-lived token, before the one held ends.
     _renewal: Option<Task<()>>,
     /// The renewal came while nothing watched the server: the next watch asks.
@@ -312,6 +321,8 @@ impl Connection {
             oauth: None,
             lease: None,
             _signing_in: None,
+            custody: 0,
+            keychain_turn: None,
             _renewal: None,
             renewal_missed: false,
         })
@@ -993,6 +1004,7 @@ impl Connection {
         let host = oauth_client::host_of(&self.server.url);
         // The sign-in this one replaces, as another account after Not admitted.
         let previous = self.oauth.clone();
+        let turn = self.keychain_turn.clone();
         self._signing_in = Some(cx.spawn(async move |this, cx| {
             let redirect = callback.redirect_uri().to_owned();
             let issuer = service.server.issuer.clone();
@@ -1023,6 +1035,9 @@ impl Connection {
                     .map_err(|error| error.to_string())
                 })
                 .await;
+            if let Some(turn) = turn {
+                turn.await.ok();
+            }
             // One account per target: the one replaced ends, its refresh token revoked, and the
             // keychain keeps only the new one's, or none, never the old account's.
             if signed_in.is_ok()
@@ -1108,34 +1123,43 @@ impl Connection {
         self.token_source = None;
         self.lease = None;
         self._renewal = None;
-        let service = source.service().host();
-        let ended = cx.background_executor().spawn(source.sign_out());
-        let signed_out = service.clone();
-        // Detached, so the revocation finishes when the connection is gone first.
+        self.custody += 1;
+        let custody = self.custody;
+        let ending = cx.background_executor().spawn(source.sign_out());
+        let (done, turn) = oneshot::channel();
+        self.keychain_turn = Some(turn.shared());
+        // Detached, so the revocation finishes when the connection is gone first. The keychain's
+        // answer is taken before it, and before a sign-in made meanwhile reaches the keychain.
         cx.spawn(async move |this, cx| {
-            let Err(refused) = ended.await else {
-                return;
-            };
-            this.update(cx, |this, cx| {
-                // Only while the person is still signed out of that service, with nothing said.
-                if let SignIn::Offered {
-                    service: offered,
-                    why: why @ None,
-                } = &mut this.sign_in
-                    && *offered == signed_out
-                {
-                    *why = Some(format!(
-                        "Signed out for this session; the keychain did not delete the sign-in \
-                         ({refused}), so the next launch reads it back."
-                    ));
-                    cx.emit(ConnectionEvent::StateChanged);
-                    cx.notify();
-                }
-            })
-            .ok();
+            let sign_in::Ending {
+                forgotten,
+                revocation,
+            } = ending.await;
+            cx.background_executor().spawn(revocation).detach();
+            if let Err(refused) = forgotten {
+                this.update(cx, |this, cx| {
+                    if this.custody != custody {
+                        return;
+                    }
+                    if let SignIn::Offered { why, .. } = &mut this.sign_in {
+                        let left = sign_in::kept_behind(&refused);
+                        *why = Some(match why.take() {
+                            Some(said) => format!("{said} {left}"),
+                            None => format!("Signed out for this session. {left}"),
+                        });
+                        cx.emit(ConnectionEvent::StateChanged);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+            done.send(()).ok();
         })
         .detach();
-        self.sign_in = SignIn::Offered { service, why: None };
+        self.sign_in = SignIn::Offered {
+            service: source.service().host(),
+            why: None,
+        };
         self.replace_token(None, None, cx);
         cx.emit(ConnectionEvent::StateChanged);
         cx.notify();
@@ -1153,6 +1177,7 @@ impl Connection {
 
     /// Takes the token from `source`, a sign-in just made or kept, and connects with it.
     fn use_sign_in(&mut self, source: OAuthSource, cx: &mut Context<Self>) {
+        self.custody += 1;
         self.oauth = Some(source.clone());
         self.token_source = Some(Arc::new(source));
         self.token_given = false;

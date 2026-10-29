@@ -82,16 +82,26 @@ pub trait Keychain: Send + Sync + 'static {
     fn delete(&self, key: String) -> BoxFuture<'static, Result<(), String>>;
 }
 
-/// Deletes `key`'s item: done when the key holds none afterwards, so a key that held nothing is
-/// no refusal. Otherwise the keychain's refusal, the item still there for the next launch.
+/// Deletes `key`'s item: done when the next launch would read none there, so a key that held
+/// nothing is no refusal, and neither is one the keychain cannot read (a launch takes such a
+/// read as nothing kept). Otherwise the keychain's refusal, the item still there.
 pub(crate) async fn forget(keychain: &dyn Keychain, key: String) -> Result<(), String> {
     let Err(refused) = keychain.delete(key.clone()).await else {
         return Ok(());
     };
     match keychain.read(key).await {
-        Ok(None) => Ok(()),
-        _ => Err(refused),
+        Ok(Some(_)) => Err(refused),
+        _ => Ok(()),
     }
+}
+
+/// What is said of a keychain item left at a target, `refused` being the keychain's refusal to
+/// delete it: the next launch signs in with it.
+pub fn kept_behind(refused: &str) -> String {
+    format!(
+        "The keychain kept an earlier sign-in it would not delete ({refused}), which the next \
+         launch reads."
+    )
 }
 
 enum KeychainRequest {
@@ -183,6 +193,8 @@ pub struct MemoryKeychain {
     pub refuses_writes: AtomicBool,
     /// Deletes are refused, as a keychain that will not let go of it.
     pub refuses_deletes: AtomicBool,
+    /// Reads fail, as a keychain that cannot be reached.
+    pub fails_reads: AtomicBool,
     /// How many times it was read.
     pub reads: std::sync::atomic::AtomicUsize,
 }
@@ -191,6 +203,10 @@ pub struct MemoryKeychain {
 impl Keychain for MemoryKeychain {
     fn read(&self, key: String) -> KeychainRead {
         self.reads.fetch_add(1, Ordering::SeqCst);
+        if self.fails_reads.load(Ordering::SeqCst) {
+            return futures::future::ready(Err("the keychain could not be read".to_owned()))
+                .boxed();
+        }
         let item = self
             .items
             .lock()
@@ -497,21 +513,22 @@ impl OAuthSource {
         *clients = clients.through(http);
     }
 
-    /// Ends the sign-in: drops its tokens, deletes the keychain item and, when the service
+    /// Ends the sign-in: drops its tokens and deletes the keychain item, then, when the service
     /// publishes a revocation endpoint, revokes the refresh token there, once, within 10
-    /// seconds (spec 016, Custody). Fails with the keychain's refusal when it kept the item,
-    /// which the next launch would read.
-    pub(crate) fn sign_out(&self) -> BoxFuture<'static, Result<(), String>> {
+    /// seconds (spec 016, Custody). The keychain's answer comes before the revocation: its
+    /// refusal when it kept the item, which the next launch would read.
+    pub(crate) fn sign_out(&self) -> BoxFuture<'static, Ending> {
         self.end(true)
     }
 
     /// Ends the sign-in another replaces, for the same target: drops its tokens and revokes its
     /// refresh token, leaving the keychain item to the sign-in that replaces it.
     pub(crate) fn replaced(&self) -> BoxFuture<'static, ()> {
-        self.end(false).map(drop).boxed()
+        let ending = self.end(false);
+        async move { ending.await.revocation.await }.boxed()
     }
 
-    fn end(&self, forget: bool) -> BoxFuture<'static, Result<(), String>> {
+    fn end(&self, forget: bool) -> BoxFuture<'static, Ending> {
         let inner = self.inner.clone();
         inner.ended.store(true, Ordering::SeqCst);
         async move {
@@ -525,17 +542,34 @@ impl OAuthSource {
             } else {
                 Ok(())
             };
-            if let Some(refresh) = refresh {
-                let service = &inner.service;
-                let http = inner.token_client();
-                oauth_client::revoke(http.as_ref(), &service.server, &service.client_id, &refresh)
+            let revocation = async move {
+                if let Some(refresh) = refresh {
+                    let service = &inner.service;
+                    let http = inner.token_client();
+                    oauth_client::revoke(
+                        http.as_ref(),
+                        &service.server,
+                        &service.client_id,
+                        &refresh,
+                    )
                     .await
                     .ok();
+                }
             }
-            forgotten
+            .boxed();
+            Ending {
+                forgotten,
+                revocation,
+            }
         }
         .boxed()
     }
+}
+
+/// A sign-in ended: what the keychain did with its item, and the revocation still to send.
+pub(crate) struct Ending {
+    pub forgotten: Result<(), String>,
+    pub revocation: BoxFuture<'static, ()>,
 }
 
 impl TokenSource for OAuthSource {
@@ -635,6 +669,11 @@ impl Inner {
             )
             .await
             {
+                // Signed out while the service answered: what it gave is not kept, so the
+                // sign-out's delete is the last the keychain hears of this sign-in.
+                Ok(_) if self.ended.load(Ordering::SeqCst) => {
+                    return Err(NoToken::lasting("Signed out."));
+                }
                 Ok(tokens) => {
                     let subject = tokens.account.subject.clone();
                     if let Some(rotated) =
@@ -669,9 +708,12 @@ impl Inner {
                     held.access = None;
                     held.refresh = None;
                     self.ended.store(true, Ordering::SeqCst);
-                    self.keychain.delete(self.key.clone()).await.ok();
+                    let left = match forget(self.keychain.as_ref(), self.key.clone()).await {
+                        Ok(()) => String::new(),
+                        Err(refused) => format!(" {}", kept_behind(&refused)),
+                    };
                     return Err(NoToken::lasting(format!(
-                        "Signed out: {why} Sign in again."
+                        "Signed out: {why} Sign in again.{left}"
                     )));
                 }
                 Err(TokenError::Refused(why)) => {
@@ -1204,11 +1246,10 @@ mod tests {
             offer,
             SignIn::Offered {
                 service: "id.test".into(),
-                why: Some(
-                    "Signed out for this session; the keychain did not delete the sign-in (the \
-                     keychain refused), so the next launch reads it back."
-                        .into()
-                )
+                why: Some(format!(
+                    "Signed out for this session. {}",
+                    kept_behind("the keychain refused")
+                ))
             }
         );
         assert_eq!(keychain.items.lock().unwrap().len(), 1);
@@ -1519,15 +1560,7 @@ mod tests {
             ..Served::default()
         }));
         served.lock().unwrap().refresh.insert("kept".into());
-        let http = fake(served.clone());
-        let clients = Clients::new(url::Url::parse(SERVER).unwrap(), http.clone(), http);
-        let identities = ClientIdentities {
-            metadata_document: Some(CLIENT.into()),
-            registered: Vec::new(),
-            development: None,
-        };
-        let metadata = format!("{SERVER}/.well-known/oauth-protected-resource/mcp");
-        let service = smol::block_on(discover(clients, metadata, identities)).unwrap();
+        let service = discovered(&served);
         let keychain = Arc::new(MemoryKeychain::default());
         let source = OAuthSource::kept(
             service,
@@ -1566,6 +1599,42 @@ mod tests {
         assert_eq!(keychain.items.lock().unwrap()[&key].1, b"r1".to_vec());
     }
 
+    /// The sign-in service the fake server names, found as a connection finds it.
+    fn discovered(served: &Arc<Mutex<Served>>) -> Service {
+        let http = fake(served.clone());
+        let clients = Clients::new(url::Url::parse(SERVER).unwrap(), http.clone(), http);
+        let identities = ClientIdentities {
+            metadata_document: Some(CLIENT.into()),
+            registered: Vec::new(),
+            development: None,
+        };
+        let metadata = format!("{SERVER}/.well-known/oauth-protected-resource/mcp");
+        smol::block_on(discover(clients, metadata, identities)).unwrap()
+    }
+
+    /// A delete is done when the next launch would read nothing at the key: macOS and Windows
+    /// refuse to delete an item that is not there, and a launch takes a read that fails as
+    /// nothing kept. Only an item still read back is a refusal.
+    #[test]
+    fn a_delete_is_done_when_the_next_launch_reads_nothing() {
+        let keychain = MemoryKeychain::default();
+        let forgot = |keychain: &MemoryKeychain| smol::block_on(forget(keychain, "key".into()));
+        assert_eq!(forgot(&keychain), Ok(()));
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert("key".into(), ("user_1".into(), b"r1".to_vec()));
+        keychain.refuses_deletes.store(true, Ordering::SeqCst);
+        assert_eq!(forgot(&keychain), Err("the keychain refused".to_owned()));
+        keychain.fails_reads.store(true, Ordering::SeqCst);
+        assert_eq!(forgot(&keychain), Ok(()));
+        keychain.fails_reads.store(false, Ordering::SeqCst);
+        keychain.refuses_deletes.store(false, Ordering::SeqCst);
+        assert_eq!(forgot(&keychain), Ok(()));
+        assert!(keychain.items.lock().unwrap().is_empty());
+    }
+
     /// A rotated refresh token the keychain will not keep: a sign-in it kept reads not kept, as
     /// it holds this account's token from before, which no longer refreshes; an earlier sign-in
     /// it holds instead stays said, as the next launch reads that one.
@@ -1575,21 +1644,26 @@ mod tests {
             lives: 300,
             ..Served::default()
         }));
-        let http = fake(served.clone());
-        let clients = Clients::new(url::Url::parse(SERVER).unwrap(), http.clone(), http);
-        let identities = ClientIdentities {
-            metadata_document: Some(CLIENT.into()),
-            registered: Vec::new(),
-            development: None,
-        };
-        let metadata = format!("{SERVER}/.well-known/oauth-protected-resource/mcp");
-        let service = smol::block_on(discover(clients, metadata, identities)).unwrap();
+        let service = discovered(&served);
         let keychain = Arc::new(MemoryKeychain::default());
+        let key = format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}");
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key.clone(), ("user_1".into(), b"kept".to_vec()));
         keychain.refuses_writes.store(true, Ordering::SeqCst);
         let rotated_from = |source: OAuthSource, refresh: &str| {
             served.lock().unwrap().refresh.insert(refresh.to_owned());
+            // The access token held is set aside, as after the server refused it: the next ask
+            // refreshes.
+            source.note_refused();
             let token = smol::block_on(source.token(Arc::default()));
             assert!(token.is_ok(), "{token:?}");
+            assert!(
+                !served.lock().unwrap().refresh.contains(refresh),
+                "the service took {refresh} and rotated it"
+            );
             source.kept_in_keychain()
         };
 
@@ -1602,16 +1676,15 @@ mod tests {
         );
         assert_eq!(rotated_from(kept, "kept"), Kept::Nothing);
 
-        // A sign-in whose access token has ended, so its first ask refreshes.
         let earlier = Kept::Earlier("the keychain refused".into());
         let over_earlier = OAuthSource::signed_in(
             service,
             "work",
-            keychain,
+            keychain.clone(),
             Tokens {
-                access_token: "ended".into(),
+                access_token: "held".into(),
                 refresh_token: Some("over-earlier".into()),
-                expires_at: SystemTime::now() - Duration::from_secs(60),
+                expires_at: SystemTime::now() + Duration::from_secs(300),
                 account: Account {
                     subject: "user_2".into(),
                     organization: None,
@@ -1620,6 +1693,103 @@ mod tests {
             earlier.clone(),
         );
         assert_eq!(rotated_from(over_earlier, "over-earlier"), earlier);
+        assert_eq!(keychain.items.lock().unwrap()[&key].1, b"kept".to_vec());
+    }
+
+    /// A grant the service ended forgets the keychain item, and one the keychain will not delete
+    /// is said with the sign-out, as the next launch reads it.
+    #[test]
+    fn a_grant_the_service_ended_says_what_the_keychain_kept() {
+        let served = Arc::new(Mutex::new(Served {
+            lives: 300,
+            ..Served::default()
+        }));
+        let service = discovered(&served);
+        let keychain = Arc::new(MemoryKeychain::default());
+        let key = format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}");
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key.clone(), ("user_1".into(), b"stale".to_vec()));
+        keychain.refuses_deletes.store(true, Ordering::SeqCst);
+        // The service no longer knows the kept token: its first ask is refused for good.
+        let source = OAuthSource::kept(
+            service,
+            "work",
+            keychain.clone(),
+            "user_1".into(),
+            "stale".into(),
+        );
+        let Err(ended) = smol::block_on(source.token(Arc::default())) else {
+            panic!("the grant ended");
+        };
+        assert!(
+            ended.why.starts_with("Signed out: ")
+                && ended.why.ends_with(&kept_behind("the keychain refused")),
+            "{}",
+            ended.why
+        );
+        assert_eq!(keychain.items.lock().unwrap()[&key].1, b"stale".to_vec());
+    }
+
+    /// A refresh the service answers after its sign-in was signed out keeps nothing: the
+    /// sign-out's delete is the keychain's last word on it. Before, the refresh, running while
+    /// the sign-out waited for it, wrote its rotated token after the sign-out began, so a
+    /// sign-in made meanwhile could find its own item replaced, then deleted.
+    #[test]
+    fn a_refresh_that_answers_after_its_sign_out_keeps_nothing() {
+        let served = Arc::new(Mutex::new(Served {
+            lives: 300,
+            hold_token: true,
+            ..Served::default()
+        }));
+        served.lock().unwrap().refresh.insert("kept".into());
+        let service = discovered(&served);
+        let keychain = Arc::new(MemoryKeychain::default());
+        let key = format!("omnigraph-studio-oauth:work#{ISSUER}#{RESOURCE}");
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key.clone(), ("user_1".into(), b"kept".to_vec()));
+        // Deletes refused, so what the refresh wrote, if anything, stays to be seen.
+        keychain.refuses_deletes.store(true, Ordering::SeqCst);
+        let source = OAuthSource::kept(
+            service,
+            "work",
+            keychain.clone(),
+            "user_1".into(),
+            "kept".into(),
+        );
+        let rotated = || {
+            served
+                .lock()
+                .unwrap()
+                .log
+                .iter()
+                .any(|line| line.starts_with("token refresh_token"))
+        };
+        // The ask is dropped once the service has rotated the token; its refresh runs on.
+        let asked = smol::block_on(smol::future::or(
+            async { Some(source.token(Arc::default()).await) },
+            async {
+                while !rotated() {
+                    smol::Timer::after(Duration::from_millis(10)).await;
+                }
+                None
+            },
+        ));
+        assert!(asked.is_none(), "the ask was dropped mid-exchange");
+        let ending = source.sign_out();
+        served.lock().unwrap().hold_token = false;
+        let Ending { forgotten, .. } = smol::block_on(ending);
+        assert_eq!(forgotten, Err("the keychain refused".to_owned()));
+        assert_eq!(
+            keychain.items.lock().unwrap()[&key].1,
+            b"kept".to_vec(),
+            "the rotated token was not written after the sign-out"
+        );
     }
 
     #[gpui::test]

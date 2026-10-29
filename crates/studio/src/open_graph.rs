@@ -9,7 +9,7 @@ use gpui::{
     ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window,
 };
 use graph_store::cli_config::{self, Platform};
-use graph_store::sign_in::{Kept, SignIn};
+use graph_store::sign_in::{Kept, SignIn, kept_behind};
 use graph_store::{
     Connection, ConnectionEvent, ConnectionRegistry, ConnectionState, ConnectionWatch,
     GraphListing, ServerSource,
@@ -899,13 +899,19 @@ fn server_status(c: &Connection) -> String {
         }
         (
             SignIn::SignedIn {
-                service, account, ..
+                service,
+                account,
+                kept,
             },
             ConnectionState::Unauthorized,
         ) => {
+            let left = match kept {
+                Kept::Earlier(why) => format!(" {}", kept_behind(why)),
+                Kept::This | Kept::Nothing => String::new(),
+            };
             return format!(
                 "The server refused {account}, signed in at {service}: it may not admit this \
-                 account."
+                 account.{left}"
             );
         }
         (
@@ -921,10 +927,12 @@ fn server_status(c: &Connection) -> String {
                 Kept::Nothing => {
                     " The keychain did not keep the sign-in, so it lasts until Studio quits.".into()
                 }
-                Kept::Earlier(why) => format!(
-                    " The keychain did not keep the sign-in, and did not delete an earlier one \
-                     ({why}), which the next launch reads."
-                ),
+                Kept::Earlier(why) => {
+                    format!(
+                        " The keychain did not keep the sign-in. {}",
+                        kept_behind(why)
+                    )
+                }
             };
             return format!("Signed in as {account} at {service}.{lasts}");
         }
@@ -1346,7 +1354,19 @@ mod tests {
                 cx
             )
             .0
-            .ends_with("did not delete an earlier one (locked), which the next launch reads.")
+            .ends_with(
+                "did not keep the sign-in. The keychain kept an earlier sign-in it would not \
+                 delete (locked), which the next launch reads."
+            )
+        );
+        assert!(
+            said(
+                ConnectionState::Unauthorized,
+                signed_in(Kept::Earlier("locked".into())),
+                cx
+            )
+            .0
+            .ends_with("may not admit this account. The keychain kept an earlier sign-in it would not delete (locked), which the next launch reads.")
         );
         assert_eq!(
             said(ConnectionState::Unauthorized, signed_in(Kept::This), cx),
