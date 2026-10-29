@@ -68,10 +68,19 @@ The agent is never given the server URL or the person's token.
 
 ### Choosing an agent
 
-Setting `agent.command` (a list: program then arguments) and `agent.env` (a map). Empty by
-default: the panel then offers **Claude Agent**, **Codex** and **Custom command…**. A preset
-writes the crate's preset command to settings, and the panel always shows the command it runs.
-Nothing is downloaded until the person picks one and sends a prompt.
+Setting `agent.command` (a list: program then arguments) is the default agent, and `agent.env`
+(a map) the environment of every agent. Empty by default: the panel then offers **Claude
+Agent**, **Codex** and **Custom command…**. A preset writes the crate's preset command to
+settings, and the panel always shows the command it runs. Nothing is downloaded until the
+person picks one.
+
+Each conversation runs its own agent, as each of Zed's threads does: the one it was held with
+(`SessionRecord::agent`), else the default when it opened. The composer's model menu, or the
+agent's name in its place before the agent offers a model, lists the agents (the presets, then
+a configured command that is none of them) with the conversation's checked, as Zed's
+new-thread menu does. Choosing one makes it the default. A conversation nothing was sent in
+yet changes agent in place; one that holds messages keeps its agent, and the choice opens a new
+conversation. **Other agent…** opens Settings for a custom command.
 
 ### Lifecycle
 
@@ -81,8 +90,12 @@ exit status and the last 20 lines (at most 4 KB) of its stderr, and **Restart**.
 graph or closing the window ends the agent (the process group is killed; on Windows, the job
 Studio's launcher holds it in, spec 013).
 
-The agent starts when the first message is sent, so that message waits for the start (a first
-`npx` fetch and the agent's own MCP servers take seconds). It is not queued: it shows in the
+The agent starts when the conversation's tab is first drawn, new or restored, as Zed connects
+when a thread opens: it is usually ready by the time the first message is written. A new
+conversation joins the graph's list when its first message is sent; one closed or switched to
+another agent before that leaves nothing behind, its folder included
+(`AgentPanel::discard_unused_folder`). A message sent before the agent is ready waits for the
+start (a first `npx` fetch takes seconds). It is not queued: it shows in the
 thread at once as the person's, with "Starting the agent…" under it, and is sent as the first
 turn when the agent is ready (`AgentPanel::opening`); messages sent after it wait in the queue
 behind it. A start that has not answered in 20 s says "The agent has not answered yet" with
@@ -213,6 +226,8 @@ Query text, parameters, rows, tokens and prompt text. Agent stderr is shown only
 | No MCP server (since 2026-10-28; before, a stdio proxy to a Unix socket) | Keep the proxy for the CLI's path and `omnigraph_run` | A folder per conversation gives the agent its CLI by a fixed name, and both agents run unsandboxed, so their shells reach the gateway (spec 013) |
 | Depend on `agent-client-protocol` 2.2.0, default features | Fork Zed's `agent_servers` and `agent_ui`; Zed's unstable feature set | Zed's crates need its project and terminal layers. Stable v1 is what released agents speak |
 | No default agent | Default to the Claude preset | Running `npx …@latest` downloads code; the person should choose it |
+| Start the agent when a conversation's tab is shown (since 2026-10-29) | Start it on the first message | Zed's way: the start's seconds pass while the person writes, and a failed start shows before anything is sent. The process is shared and the branch is made on the first write, so an unused tab costs one `session/new` and a folder it removes |
+| The agent is per conversation, chosen in the model menu (since 2026-10-29) | One agent in Settings for every conversation | Zed ties a thread to its agent and picks it from the new-thread menu; a switch in Settings left every conversation held with the other agent unopenable |
 | Approval is Studio's, not the agent's permission prompt | Rely on the agent asking | Agents differ in whether and how they ask; the guarantee has to hold for every agent |
 | One agent branch per agent session | Write to the person's branch; one branch per proposal | Review works per branch (spec 008), and one branch keeps a session's changes together |
 
@@ -364,6 +379,7 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-29 | A conversation runs the agent it was held with, starts it when shown, and joins the list on its first message | `agent_panel` `panel::tests::a_conversation_runs_the_agent_it_was_held_with` (held agent, default, a custom command offered beside the presets), `a_restored_conversation_starts_its_agent_when_shown`; `cargo test -p agent_panel`, clippy `-D warnings` | Pass. The menu and the in-place switch are not drawn by a test; checked by hand in the running app |
 | 2026-10-28 | The panel serves no MCP server, and each conversation has a folder of its own | `agent_panel` `sessions::tests::each_conversation_has_a_folder_of_its_own`, `cli_home::tests::agents_md_names_the_cli_the_branch_and_the_rules`, `a_conversation_home_holds_its_config_token_and_wrapper`, `panel::tests::a_run_of_steps_reads_as_one_sentence`, `streaming_into_the_last_turn_keeps_the_earlier_turns_blocks`; `cargo test -p agent_panel -p studio`, clippy `-D warnings` | See spec 013's log of the same date. `socket.rs`, `mcp.rs`, `tools.rs` and the `mcp-proxy` command are gone; every permission request is the person's; the thread shows each tool call by its title |
 | 2026-10-29 | A conversation restored behind another tab starts no agent until it is shown | `agent_panel::panel::open_session` and `AgentPanel::start_when_shown` by reading: the start is owed to the tab's next draw, as the other views' reads are (`type_table` `a_page_not_drawn_reads_nothing` and siblings test that mechanism); `cargo test -p agent_panel`, clippy `-D warnings` | Pass. Before, every conversation tab the workspace restored started its agent at launch, a process and a replay each, shown or not; one opened from the list starts as its tab draws |
 | 2026-10-28 | A rename or a delete begun before a conversation was rebound finishes on it | `agent_panel` `sessions::tests::a_rebound_conversation_is_found_by_its_old_id` (rebound twice; an unknown id left alone), `SessionsPanel::commit_rename` and `delete` by reading | Pass. Before, a rename typed, or a delete confirmed, while the agent opened a new conversation in place of one it could not load went to the old id: the name was lost, and the agent was asked to delete a conversation it never had |

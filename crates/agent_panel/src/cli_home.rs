@@ -709,7 +709,7 @@ mod tests {
         let cwd = dir.join("conversation");
         std::fs::create_dir_all(&cwd).unwrap();
         let home = CliHome::write(&cwd, access(1, "t"), "knowledge").unwrap();
-        let wrapper = || std::fs::read_to_string(&home.command()).unwrap();
+        let wrapper = || std::fs::read_to_string(home.command()).unwrap();
         let choose = |candidates: Vec<PathBuf>| smol::block_on(choose_cli(&home, candidates));
         let chosen = |candidates: Vec<PathBuf>| match choose(candidates) {
             CliChoice::Chosen { cli, .. } => cli,
@@ -807,7 +807,7 @@ mod tests {
         }
         // It names the CLIs it found but runs none of them.
         assert!(!wrapper().contains("exec "), "{}", wrapper());
-        let run = std::process::Command::new(&home.command())
+        let run = std::process::Command::new(home.command())
             .arg("query")
             .output()
             .unwrap();
@@ -1008,15 +1008,13 @@ mod tests {
             CERTIFICATE
         );
         // Until a CLI is chosen the wrapper runs nothing and says so.
-        let waiting = std::process::Command::new(&home.command())
-            .output()
-            .unwrap();
+        let waiting = std::process::Command::new(home.command()).output().unwrap();
         assert!(!waiting.status.success());
         assert!(String::from_utf8_lossy(&waiting.stderr).contains("still choosing"));
 
         home.use_cli(Path::new("/opt/it's here/omnigraph")).unwrap();
         assert_eq!(mode(&home.command()), 0o700);
-        let script = std::fs::read_to_string(&home.command()).unwrap();
+        let script = std::fs::read_to_string(home.command()).unwrap();
         assert!(
             script.contains("exec '/opt/it'\\''s here/omnigraph' \"$@\""),
             "{script}"
@@ -1026,7 +1024,7 @@ mod tests {
         // The wrapper runs with its own home, loopback outside any proxy, and no other Omnigraph
         // variable, one the CLI does not read today and one in another case included.
         home.use_cli(Path::new("/usr/bin/env")).unwrap();
-        let output = std::process::Command::new(&home.command())
+        let output = std::process::Command::new(home.command())
             .env("OMNIGRAPH_TOKEN_PERSONAL", "secret")
             .env("OMNIGRAPH_BEARER_TOKEN", "secret")
             .env("OMNIGRAPH_FOO", "secret")
@@ -1209,7 +1207,7 @@ mod tests {
         let home = CliHome::write(&cwd, access(1, "t"), "knowledge").unwrap();
         let unnamed = Path::new(r"D:\Jürgen\omnigraph.exe");
         assert!(!home.use_cli_on(unnamed, true).unwrap());
-        let wrapper = std::fs::read_to_string(&home.command()).unwrap();
+        let wrapper = std::fs::read_to_string(home.command()).unwrap();
         assert!(
             wrapper.contains("omnigraph_cli") && !wrapper.contains("%*"),
             "{wrapper}"
@@ -1219,7 +1217,7 @@ mod tests {
                 .unwrap()
         );
         assert!(
-            std::fs::read_to_string(&home.command())
+            std::fs::read_to_string(home.command())
                 .unwrap()
                 .contains("%*")
         );
@@ -1260,7 +1258,7 @@ mod tests {
         home.refuse("No CLI: !y! ^c 100%").unwrap();
         let output = std::process::Command::new("cmd")
             .args(["/D", "/V:ON", "/C"])
-            .arg(&home.command())
+            .arg(home.command())
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(1));
@@ -1325,7 +1323,7 @@ mod tests {
         assert!(home.command().ends_with("omnigraph.cmd"));
         let cli = std::env::current_exe().unwrap();
         assert!(home.use_cli(&cli).unwrap(), "the batch file names {cli:?}");
-        let script = std::fs::read_to_string(&home.command()).unwrap();
+        let script = std::fs::read_to_string(home.command()).unwrap();
         assert!(script.is_ascii(), "{script}");
 
         let given = [
@@ -1344,7 +1342,7 @@ mod tests {
             "trailing\\",
             "naïve 日本",
         ];
-        let output = std::process::Command::new(&home.command())
+        let output = std::process::Command::new(home.command())
             .args(["--exact", STAND_IN_TEST, "--nocapture", "--", CLI])
             .args(given)
             .env(STAND_IN, "1")
@@ -1382,7 +1380,7 @@ mod tests {
         );
 
         home.refuse("No CLI: \"x\" 100% & <a|b> ^c (d)").unwrap();
-        let output = std::process::Command::new(&home.command())
+        let output = std::process::Command::new(home.command())
             .arg("query")
             .output()
             .unwrap();

@@ -1002,7 +1002,7 @@ impl Render for DeleteConversation {
 }
 
 /// The agent's name from its command: the package or program, without a version or path.
-fn agent_name(command: &str) -> String {
+pub(crate) fn agent_name(command: &str) -> String {
     let program = command
         .split_whitespace()
         .rfind(|part| !part.starts_with('-'))

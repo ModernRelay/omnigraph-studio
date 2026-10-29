@@ -2267,7 +2267,7 @@ mod tests {
                 panic!("{why}");
             }
             let args = ["branch", "list", "--json"];
-            let shell = smol::process::Command::new(&home.command())
+            let shell = smol::process::Command::new(home.command())
                 .args(args)
                 .stdin(std::process::Stdio::null())
                 .output()
@@ -2312,7 +2312,7 @@ mod end_to_end {
 
     /// Runs the conversation's wrapper; returns success, stdout and stderr.
     fn run(home: &CliHome, args: &[&str]) -> (bool, String, String) {
-        let output = Command::new(&home.command())
+        let output = Command::new(home.command())
             .args(args)
             .stdin(std::process::Stdio::null())
             .output()

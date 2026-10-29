@@ -223,8 +223,8 @@ pub fn open_session(
     Some(panel)
 }
 
-/// Opens a new conversation in a tab of its own; the agent starts when the first message is
-/// sent.
+/// Opens a new conversation in a tab of its own, with the default agent, which starts when the
+/// tab is shown. It joins the graph's list when the first message is sent.
 pub fn new_conversation(
     workspace: &mut Workspace,
     window: &mut Window,
@@ -232,9 +232,11 @@ pub fn new_conversation(
 ) -> Option<Entity<AgentPanel>> {
     let session = workspace.session()?.clone();
     let handle = cx.entity().downgrade();
-    Some(workspace.add_item(window, cx, move |window, cx| {
+    let panel = workspace.add_item(window, cx, move |window, cx| {
         AgentPanel::new(session, handle, None, window, cx)
-    }))
+    });
+    panel.update(cx, |panel, cx| panel.start_when_shown(cx));
+    Some(panel)
 }
 
 enum State {
@@ -846,6 +848,9 @@ pub struct AgentPanel {
     /// The conversation this tab holds: the one it loads before the agent answers, then the one
     /// the agent opened. `None` starts a new one.
     session_id: Option<String>,
+    /// The agent this conversation runs: the one it was held with, else the default when it
+    /// opened. Empty until an agent is chosen.
+    agent: Vec<String>,
     /// The agent starts when the tab is next drawn ([`AgentPanel::start_when_shown`]): a
     /// conversation restored with the workspace behind another tab starts no agent until it is
     /// shown.
@@ -952,6 +957,9 @@ impl AgentPanel {
         });
         cx.observe_global::<StudioSettings>(|this, cx| {
             let was_setup = matches!(this.state, State::Setup);
+            if this.agent.is_empty() {
+                this.agent = StudioSettings::get(cx).agent.command.clone();
+            }
             this.sync_setup_state(cx);
             // What was sent before an agent was chosen goes to the one chosen.
             if was_setup
@@ -1007,6 +1015,7 @@ impl AgentPanel {
                 this.sessions
                     .update(cx, |sessions, cx| sessions.set_live(&id, None, cx));
             }
+            this.discard_unused_folder(cx);
         })
         .detach();
         let focus_handle = cx.focus_handle();
@@ -1017,6 +1026,7 @@ impl AgentPanel {
                     .update(cx, |sessions, cx| sessions.mark_read(&id, cx));
             }
         });
+        let agent = agent_for(session_id.as_deref(), &sessions, cx);
         let mut panel = Self {
             session,
             workspace,
@@ -1047,6 +1057,7 @@ impl AgentPanel {
             replace_on_replay: None,
             said_while_starting: Vec::new(),
             session_id,
+            agent,
             start_owed: false,
             failed: false,
             cwd: None,
@@ -1066,12 +1077,8 @@ impl AgentPanel {
         panel
     }
 
-    fn command(cx: &App) -> Vec<String> {
-        StudioSettings::get(cx).agent.command.clone()
-    }
-
-    fn sync_setup_state(&mut self, cx: &App) {
-        let has_command = !Self::command(cx).is_empty();
+    fn sync_setup_state(&mut self, _cx: &App) {
+        let has_command = !self.agent.is_empty();
         match self.state {
             State::Setup if has_command => self.state = State::Idle,
             State::Idle if !has_command => self.state = State::Setup,
@@ -1081,48 +1088,32 @@ impl AgentPanel {
 
     // ---- lifecycle ----
 
-    /// Starts the agent for a conversation to come back to when the tab is next drawn, so it is
-    /// on screen without sending anything first, and a tab not shown runs no agent.
+    /// Starts the agent when the tab is next drawn, as Zed does when a thread opens: the agent is
+    /// ready by the time the first message is written, and a tab not shown runs no agent.
     pub fn start_when_shown(&mut self, cx: &mut Context<Self>) {
         self.start_owed = true;
         cx.notify();
     }
 
-    /// Starts the agent at once for a conversation to come back to.
     fn start_if_idle(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.state, State::Idle) && self.session_id.is_some() {
+        if matches!(self.state, State::Idle) {
             self.start(cx);
         }
     }
 
     fn start(&mut self, cx: &mut Context<Self>) {
-        let settings = StudioSettings::get(cx).agent.clone();
-        if settings.command.is_empty() {
+        if self.agent.is_empty() {
             self.state = State::Setup;
             return;
         }
-        // The conversation this tab holds, to load (spec 011: resuming a session).
+        let mut settings = StudioSettings::get(cx).agent.clone();
+        settings.command = self.agent.clone();
+        // The conversation this tab holds, to load with the agent it was held with (spec 011:
+        // resuming a session).
         let saved = self
             .session_id
             .as_ref()
             .and_then(|id| self.sessions.read(cx).get(id).cloned());
-        // One held with another agent is not this one's to load: a new conversation starts,
-        // on a branch of its own, and the old one stays in the list for that agent.
-        let agent = settings.command.join(" ");
-        let saved = match saved {
-            Some(saved) if saved.agent != agent => {
-                self.entries.push(Entry::Notice {
-                    text: format!(
-                        "This conversation was with {}; a new one starts with {agent}.",
-                        saved.agent
-                    ),
-                    error: false,
-                });
-                self.session_id = None;
-                None
-            }
-            saved => saved,
-        };
         let graph_key = self.session.read(cx).overrides_key();
         let base = self.session.read(cx).branch.clone();
         // A resumed conversation keeps writing to its branch.
@@ -1382,7 +1373,7 @@ impl AgentPanel {
         let record = SessionRecord {
             session: session.clone(),
             graph: self.session.read(cx).overrides_key(),
-            agent: Self::command(cx).join(" "),
+            agent: self.agent.join(" "),
             title: None,
             title_override: None,
             created_at: now,
@@ -1395,6 +1386,62 @@ impl AgentPanel {
         };
         self.sessions
             .update(cx, |sessions, cx| sessions.upsert(record, cx));
+    }
+
+    /// Whether the graph's list holds this conversation: something was sent in it.
+    fn is_listed(&self, cx: &App) -> bool {
+        self.session_id
+            .as_ref()
+            .is_some_and(|id| self.sessions.read(cx).get(id).is_some())
+    }
+
+    /// Removes the folder of a conversation the list never held: nothing was sent in it, so
+    /// nothing in it is kept. Only a folder of its own goes, never the graph's shared one.
+    fn discard_unused_folder(&mut self, cx: &mut App) {
+        if self.is_listed(cx) {
+            return;
+        }
+        let Some(cwd) = self.cwd.take() else {
+            return;
+        };
+        let graph = crate::sessions::graph_cwd(&self.session.read(cx).overrides_key());
+        if cwd.parent() == Some(graph.as_path()) {
+            cx.background_executor()
+                .spawn(async move {
+                    std::fs::remove_dir_all(cwd).ok();
+                })
+                .detach();
+        }
+    }
+
+    /// Runs another agent, which becomes the default too, as Zed remembers the agent chosen
+    /// last. A conversation nothing was sent in yet changes agent in place; one that holds
+    /// messages keeps its agent, and the one chosen starts a new conversation.
+    fn choose_agent(&mut self, command: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let default = command.clone();
+        studio_settings::update(cx, move |settings| settings.agent.command = default);
+        if self.is_listed(cx) {
+            window.dispatch_action(Box::new(studio_actions::agent::NewConversation), cx);
+            return;
+        }
+        self.stop_host();
+        self._slow_start = None;
+        self.clear_thread();
+        self.said_while_starting.clear();
+        self.discard_unused_folder(cx);
+        self.session_id = None;
+        self.agent = command;
+        self.state = State::Idle;
+        self.start(cx);
+        cx.notify();
+    }
+
+    /// The name the agent menu gives this conversation's agent.
+    fn agent_label(&self, cx: &App) -> String {
+        agents(cx)
+            .into_iter()
+            .find(|(_, command)| *command == self.agent)
+            .map_or_else(|| "Agent".to_owned(), |(name, _)| name)
     }
 
     /// Whether this tab is the one the workspace shows.
@@ -1446,13 +1493,16 @@ impl AgentPanel {
                     lost = true;
                 }
                 self.session_id = Some(session);
-                self.remember_session(cx);
+                // A new conversation joins the list when something is sent in it.
+                if self.is_listed(cx) {
+                    self.remember_session(cx);
+                }
                 cx.emit(ItemEvent::UpdateTab);
                 // A loaded conversation replays itself and keeps its own options; a new one
                 // starts from the ones chosen last for this agent.
                 match opened {
                     Opened::New => {
-                        self.apply_preferences(cx);
+                        self.apply_preferences();
                         if lost {
                             self.entries.push(Entry::Notice {
                                 text: "The agent could not load this conversation, so a new \
@@ -1696,7 +1746,7 @@ impl AgentPanel {
                 None => return,
             },
         };
-        crate::sessions::prefer(&Self::command(cx), &id, remembered);
+        crate::sessions::prefer(&self.agent, &id, remembered);
         if host
             .commands
             .unbounded_send(HostCommand::SetConfigOption {
@@ -1723,8 +1773,8 @@ impl AgentPanel {
 
     /// Sets the options chosen last for this agent where the new session differs and still
     /// offers the value.
-    fn apply_preferences(&mut self, cx: &mut Context<Self>) {
-        let preferences = crate::sessions::preferences(&Self::command(cx));
+    fn apply_preferences(&mut self) {
+        let preferences = crate::sessions::preferences(&self.agent);
         let Some(host) = &self.host else {
             return;
         };
@@ -1822,6 +1872,9 @@ impl AgentPanel {
             .unbounded_send(HostCommand::Prompt(text.clone()))
             .is_ok();
         if sent {
+            if !self.is_listed(cx) {
+                self.remember_session(cx);
+            }
             if let Some(id) = self.session_id.clone() {
                 self.sessions.update(cx, |sessions, cx| {
                     sessions.suggest_title(&id, &text, cx);
@@ -2244,6 +2297,7 @@ impl AgentPanel {
     }
 
     fn use_command(&mut self, command: Vec<String>, cx: &mut Context<Self>) {
+        self.agent = command.clone();
         studio_settings::update(cx, move |settings| settings.agent.command = command);
         self.sync_setup_state(cx);
         // A question asked before an agent was chosen is sent to it now, as the setup said.
@@ -2440,7 +2494,7 @@ fn option_picker(
     option: Rc<OptionView>,
     icon: Icon,
     panel: &WeakEntity<AgentPanel>,
-    agent: Option<String>,
+    agents: Option<AgentMenu>,
 ) -> AnyElement {
     let id = option.id.clone();
     let title = option.summary();
@@ -2464,31 +2518,88 @@ fn option_picker(
         .menu(move |window, cx| {
             let option = option.clone();
             let panel = panel.clone();
-            let agent = agent.clone();
+            let agents = agents.clone();
             Some(ContextMenu::build(window, cx, move |menu, _, _| {
                 let mut menu = option.add_to(menu, &panel);
-                if let Some(agent) = agent {
-                    menu = menu
-                        .separator()
-                        .header(agent)
-                        .entry("New conversation", None, |window, cx| {
-                            window.dispatch_action(
-                                Box::new(studio_actions::agent::NewConversation),
-                                cx,
-                            )
-                        })
-                        .entry("Choose another agent…", None, |window, cx| {
-                            window.dispatch_action(
-                                Box::new(studio_actions::workspace::OpenSettings),
-                                cx,
-                            )
-                        });
+                if let Some(agents) = &agents {
+                    menu = agents.add_to(menu.separator(), &panel);
                 }
                 menu
             }))
         })
         .anchor(gpui::Anchor::BottomRight)
         .into_any_element()
+}
+
+/// The agents a conversation can run: the presets, then the configured agent when it is none
+/// of them.
+fn agents(cx: &App) -> Vec<(String, Vec<String>)> {
+    let mut agents: Vec<(String, Vec<String>)> = PRESETS
+        .iter()
+        .map(|(name, command)| {
+            let command = command.iter().map(|word| (*word).to_owned()).collect();
+            ((*name).to_owned(), command)
+        })
+        .collect();
+    let configured = &StudioSettings::get(cx).agent.command;
+    if !configured.is_empty() && !agents.iter().any(|(_, command)| command == configured) {
+        let name = crate::sessions_panel::agent_name(&configured.join(" "));
+        agents.push((name, configured.clone()));
+    }
+    agents
+}
+
+/// The command of the agent a conversation was held with, else the default agent's.
+fn agent_for(session_id: Option<&str>, sessions: &Entity<AgentSessions>, cx: &App) -> Vec<String> {
+    let held = session_id.and_then(|id| Some(sessions.read(cx).get(id)?.agent.clone()));
+    let Some(held) = held else {
+        return StudioSettings::get(cx).agent.command.clone();
+    };
+    agents(cx)
+        .into_iter()
+        .map(|(_, command)| command)
+        .find(|command| command.join(" ") == held)
+        .unwrap_or_else(|| held.split_whitespace().map(str::to_owned).collect())
+}
+
+/// The agent menu, in the model picker or in its place: the agents, this conversation's
+/// checked ([`AgentPanel::choose_agent`]), and a new conversation.
+#[derive(Clone)]
+struct AgentMenu {
+    agents: Vec<(String, Vec<String>)>,
+    current: Vec<String>,
+}
+
+impl AgentMenu {
+    fn add_to(&self, mut menu: ContextMenu, panel: &WeakEntity<AgentPanel>) -> ContextMenu {
+        menu = menu.header("Agent");
+        for (name, command) in &self.agents {
+            let checked = *command == self.current;
+            let (panel, command) = (panel.clone(), command.clone());
+            menu = menu.toggleable_entry(
+                name.clone(),
+                checked,
+                IconPosition::Start,
+                None,
+                move |window, cx| {
+                    if !checked {
+                        panel
+                            .update(cx, |panel, cx| {
+                                panel.choose_agent(command.clone(), window, cx)
+                            })
+                            .ok();
+                    }
+                },
+            );
+        }
+        menu.entry("Other agent…", None, |window, cx| {
+            window.dispatch_action(Box::new(studio_actions::workspace::OpenSettings), cx)
+        })
+        .separator()
+        .entry("New conversation", None, |window, cx| {
+            window.dispatch_action(Box::new(studio_actions::agent::NewConversation), cx)
+        })
+    }
 }
 
 /// The model provider's mark, when the agent or model names one.
@@ -2722,7 +2833,10 @@ fn activity_summary(thoughts: usize, tools: usize) -> String {
         ));
     }
     if tools > 0 {
-        parts.push(format!("used {}", studio_ui::plural(tools, "tool", "tools")));
+        parts.push(format!(
+            "used {}",
+            studio_ui::plural(tools, "tool", "tools")
+        ));
     }
     let text = parts.join(", ");
     let mut chars = text.chars();
@@ -2861,11 +2975,7 @@ impl AgentPanel {
     fn status(&self) -> (String, Color, &'static str) {
         match &self.state {
             State::Setup => ("Agent".to_owned(), Color::Muted, "No agent chosen"),
-            State::Idle => (
-                "Agent".to_owned(),
-                Color::Muted,
-                "Starts when you send a message",
-            ),
+            State::Idle => ("Agent".to_owned(), Color::Muted, "Not running"),
             State::Starting => ("Agent".to_owned(), Color::Warning, "Starting"),
             State::Ready { agent } => (agent.clone(), Color::Success, "Ready"),
             State::Prompting { agent } => (agent.clone(), Color::Accent, "Working"),
@@ -3761,6 +3871,10 @@ impl AgentPanel {
         let (models, shown): (Vec<_>, Vec<_>) =
             shown.into_iter().partition(|option| option.is_model());
         let (agent_name, dot, state) = self.status();
+        let agent_menu = AgentMenu {
+            agents: agents(cx),
+            current: self.agent.clone(),
+        };
 
         let mut pickers: Vec<AnyElement> = shown
             .into_iter()
@@ -3808,34 +3922,41 @@ impl AgentPanel {
                     Some(icon) => Icon::new(icon),
                     None => Icon::new(IconName::ZedAssistant),
                 };
-                pickers.push(option_picker(model, icon, &panel, Some(agent_name)));
+                pickers.push(option_picker(model, icon, &panel, Some(agent_menu)));
             }
             None => {
-                let command = Self::command(cx).join(" ");
+                let agent_name = match self.state {
+                    State::Ready { .. } | State::Prompting { .. } => agent_name,
+                    _ => self.agent_label(cx),
+                };
+                let command = self.agent.join(" ");
                 let about = if command.is_empty() {
-                    format!("{state}. Choose the agent in Settings.")
+                    format!("{state}. Choose an agent.")
                 } else {
-                    format!("{state} · {command}. Choose the agent in Settings.")
+                    format!("{state} · {command}")
                 };
                 pickers.push(
-                    h_flex()
-                        .id("agent")
-                        .h(px(ds::size::ROW))
-                        .px(px(ds::space::SM))
-                        .gap(px(ds::space::XS))
-                        .items_center()
-                        .rounded_full()
-                        .cursor_pointer()
-                        .hover(|style| style.bg(ds::surface::highlight(cx)))
-                        .tooltip(Tooltip::text(about))
-                        .child(studio_ui::ds::dot(dot))
-                        .child(studio_ui::ds::text::muted(agent_name))
-                        .on_click(|_, window, cx| {
-                            window.dispatch_action(
-                                Box::new(studio_actions::workspace::OpenSettings),
-                                cx,
-                            )
+                    PopoverMenu::new("agent-menu")
+                        .trigger(
+                            ui::ButtonLike::new("agent")
+                                .style(ButtonStyle::Subtle)
+                                .child(
+                                    h_flex()
+                                        .px(px(ds::space::XS))
+                                        .gap(px(ds::space::XS))
+                                        .items_center()
+                                        .child(studio_ui::ds::dot(dot))
+                                        .child(studio_ui::ds::text::muted(agent_name)),
+                                )
+                                .tooltip(Tooltip::text(about)),
+                        )
+                        .menu(move |window, cx| {
+                            let (agent_menu, panel) = (agent_menu.clone(), panel.clone());
+                            Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                                agent_menu.add_to(menu, &panel)
+                            }))
                         })
+                        .anchor(gpui::Anchor::BottomRight)
                         .into_any_element(),
                 );
             }
@@ -3938,7 +4059,11 @@ impl AgentPanel {
                     .border_t_1()
                     .dotted(cx)
                     .tooltip(Tooltip::text(entry.text.clone()))
-                    .child(studio_ui::ds::dot(if next { Color::Accent } else { Color::Muted }))
+                    .child(studio_ui::ds::dot(if next {
+                        Color::Accent
+                    } else {
+                        Color::Muted
+                    }))
                     .child(
                         div().flex_1().min_w_0().child(
                             studio_ui::ds::text::body(line)
@@ -4056,6 +4181,54 @@ impl AgentPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A conversation runs the agent it was held with, whatever the default is now; a new one
+    /// runs the default. A configured agent that is no preset is offered beside the presets.
+    #[gpui::test]
+    fn a_conversation_runs_the_agent_it_was_held_with(cx: &mut gpui::TestAppContext) {
+        let words = |command: &[&str]| -> Vec<String> {
+            command.iter().map(|word| (*word).to_owned()).collect()
+        };
+        let codex = words(PRESETS[1].1);
+        let custom = words(&["my-agent", "--acp"]);
+        cx.update(|cx| {
+            studio_settings::init_test(cx);
+            let mut settings = StudioSettings::get(cx).clone();
+            settings.agent.command = custom.clone();
+            cx.set_global(settings);
+        });
+        let path =
+            std::env::temp_dir().join(format!("studio-agent-for-{}.json", std::process::id()));
+        let sessions = cx.new(|_| AgentSessions::load(path.clone()));
+        let now = chrono::Utc::now();
+        sessions.update(cx, |sessions, cx| {
+            sessions.upsert(
+                SessionRecord {
+                    session: "held".into(),
+                    graph: "server/crm".into(),
+                    agent: codex.join(" "),
+                    title: None,
+                    title_override: None,
+                    created_at: now,
+                    updated_at: now,
+                    branch: "agent/held".into(),
+                    branch_created: false,
+                    pinned: false,
+                    archived: false,
+                    cwd: std::env::temp_dir(),
+                },
+                cx,
+            )
+        });
+        cx.update(|cx| {
+            assert_eq!(agent_for(Some("held"), &sessions, cx), codex);
+            assert_eq!(agent_for(Some("unknown"), &sessions, cx), custom);
+            assert_eq!(agent_for(None, &sessions, cx), custom);
+            let names: Vec<String> = agents(cx).into_iter().map(|(name, _)| name).collect();
+            assert_eq!(names, ["Claude Agent", "Codex", "my-agent"]);
+        });
+        std::fs::remove_file(&path).ok();
+    }
 
     /// A conversation restored with the workspace behind another tab starts no agent: its start
     /// waits for the tab's first draw, which takes it. Before, every restored conversation

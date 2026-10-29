@@ -116,7 +116,7 @@ impl AgentSessions {
         sessions
     }
 
-    fn load(path: PathBuf) -> Self {
+    pub(crate) fn load(path: PathBuf) -> Self {
         let (Stored { value, saving }, notice) = read_records(&path);
         Self {
             path,
