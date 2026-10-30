@@ -240,7 +240,11 @@ value types, its enums' values, its relationship keys (`relationship_key`), the 
 with one line each on what they take, today's date, and the sentence. The schema is built per
 type: `property` an enum of the type's keys, `op` an enum of the operators, `value` a list of
 strings. The answer's filters go through `builder::build`'s checks; any it refuses is dropped
-and the bar says "Could not use: {property}". The rest become pills as if added by hand, so
+and the bar says "Could not use: {property}". Relationships filter too: `has_any` and
+`has_none` as they are, and `related_to`, which the model answers with the related record's
+name as the sentence says it ("events Aaron attended"), goes through the node search the
+filter's own value field uses (`suggest::search_nodes`, the first match taken), so the pill
+shows the record and the query gets its id; a name no record matches is dropped and named. The rest become pills as if added by hand, so
 they are seen and removable, and the table reads as it does for any filter. A second sentence
 replaces the filters the first made and keeps ones added by hand. Measured: 1.5–2.8 s on
 Haiku with every answer right; Escape leaves the field and clears what it said.

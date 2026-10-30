@@ -6977,10 +6977,22 @@ impl TypeTable {
             .map(|(key, label, _)| words::Choice {
                 ops: self.ops_for(&key),
                 property: self.filterable().find(|p| p.name == key).cloned(),
+                other_type: self.related_type(&key),
                 key,
                 label,
             })
             .collect()
+    }
+
+    /// The type at the other end of a relationship key.
+    fn related_type(&self, key: &str) -> Option<String> {
+        let (direction, edge) = builder::parse_relationship_key(key)?;
+        self.schema
+            .as_ref()?
+            .relationships_of(&self.type_name)
+            .iter()
+            .find(|group| group.direction == direction && group.edge == edge)
+            .map(|group| group.other_type.clone())
     }
 
     /// ↵ in the sentence field: the sentence goes to the model, once the task is allowed.
@@ -7008,23 +7020,81 @@ impl TypeTable {
         };
         let call = models.read(cx).call::<words::Answer>(request, cx);
         let task = cx.spawn(async move |this, cx| {
-            let answer = call.await;
-            this.update(cx, |this, cx| {
-                match answer {
-                    Ok(answer) => {
-                        let (filters, refused) = words::filters(answer.value, &choices);
-                        // The last sentence's filters go; ones added by hand stay.
-                        let made = std::mem::take(&mut this.words_made);
-                        this.filters.retain(|filter| !made.contains(filter));
-                        this.words_made = filters.clone();
-                        this.filters.extend(filters);
-                        let note = (!refused.is_empty())
-                            .then(|| format!("Could not use: {}", refused.join("; ")));
-                        this.words = WordsState::Typing(note);
-                        this.reload(true, cx);
-                    }
-                    Err(error) => this.words = WordsState::Failed(error.to_string()),
+            let answer = match call.await {
+                Ok(answer) => answer,
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        this.words = WordsState::Failed(error.to_string());
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
                 }
+            };
+            let (mut filters, mut refused) = words::filters(answer.value, &choices);
+            // A `related_to` names a record; the name becomes its id through the node search
+            // the filter's own value field uses, the first match taken, and the pill shows it.
+            let mut labels: Vec<(String, String)> = Vec::new();
+            for filter in &mut filters {
+                if filter.op != FilterOp::RelatedTo {
+                    continue;
+                }
+                let Some(name) = filter.value.as_str().map(str::to_owned) else {
+                    continue;
+                };
+                let other = choices
+                    .iter()
+                    .find(|choice| choice.key == filter.property)
+                    .and_then(|choice| choice.other_type.clone());
+                let search = this
+                    .read_with(cx, |this, cx| {
+                        let (other, schema) = (other.as_deref()?, this.schema.clone()?);
+                        Some(suggest::search_nodes(
+                            &this.session,
+                            &schema,
+                            other,
+                            &name,
+                            this.paging.pinned.clone(),
+                            cx,
+                        ))
+                    })
+                    .ok()
+                    .flatten();
+                let found = match search {
+                    Some(search) => search
+                        .await
+                        .ok()
+                        .and_then(|rows| suggest::from_node_rows(&rows).into_iter().next()),
+                    None => None,
+                };
+                match found {
+                    Some(node) => {
+                        if let Some(label) = node.label {
+                            labels.push((node.value.clone(), label));
+                        }
+                        filter.value = Value::String(node.value);
+                    }
+                    None => {
+                        refused.push(format!(
+                            "no {} matching \"{name}\"",
+                            other.unwrap_or_default()
+                        ));
+                        filter.value = Value::Null;
+                    }
+                }
+            }
+            filters.retain(|filter| filter.op != FilterOp::RelatedTo || !filter.value.is_null());
+            this.update(cx, |this, cx| {
+                this.node_labels.extend(labels);
+                // The last sentence's filters go; ones added by hand stay.
+                let made = std::mem::take(&mut this.words_made);
+                this.filters.retain(|filter| !made.contains(filter));
+                this.words_made = filters.clone();
+                this.filters.extend(filters);
+                let note =
+                    (!refused.is_empty()).then(|| format!("Could not use: {}", refused.join("; ")));
+                this.words = WordsState::Typing(note);
+                this.reload(true, cx);
                 cx.notify();
             })
             .ok();

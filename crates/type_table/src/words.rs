@@ -33,6 +33,8 @@ pub struct Choice {
     pub label: String,
     pub ops: Vec<FilterOp>,
     pub property: Option<Property>,
+    /// For a relationship key, the type at its other end, whose records `related_to` names.
+    pub other_type: Option<String>,
 }
 
 /// The answer's shape: filters whose property and operator are each one of the keys offered.
@@ -86,7 +88,12 @@ pub fn input(type_name: &str, choices: &[Choice], today: &str, sentence: &str) -
                     text.push_str(&format!("; one of {}", values.join(", ")));
                 }
             }
-            None => text.push_str(&format!("- {}: relationship, {}", choice.key, choice.label)),
+            None => {
+                text.push_str(&format!("- {}: relationship, {}", choice.key, choice.label));
+                if let Some(other) = &choice.other_type {
+                    text.push_str(&format!("; related_to names the {other}"));
+                }
+            }
         }
         text.push_str(&format!("; operators {}\n", ops.join(", ")));
     }
@@ -94,7 +101,8 @@ pub fn input(type_name: &str, choices: &[Choice], today: &str, sentence: &str) -
         "\nOperators: eq, ne, lt, le, gt, ge compare one value; contains matches text or a \
          list member; in takes several values; is_empty and is_not_empty, today, this_week \
          and last_30_days take no value; has_any and has_none take no value and test a \
-         relationship.\n\nRequest: ",
+         relationship; related_to takes one value, the related record's name as the request \
+         says it.\n\nRequest: ",
     );
     text.push_str(sentence.trim());
     text
@@ -193,6 +201,7 @@ mod tests {
                 label: property.name.clone(),
                 ops: FilterOp::for_property(&property),
                 property: Some(property),
+                other_type: None,
             })
             .collect();
         out.push(Choice {
@@ -200,6 +209,7 @@ mod tests {
             label: "attended Person".into(),
             ops: FilterOp::for_relationship(),
             property: None,
+            other_type: Some("Person".into()),
         });
         out
     }
@@ -259,6 +269,9 @@ mod tests {
         );
         let text = input("Event", &choices, "2026-10-29", " dinners last month ");
         assert!(text.contains("- kind: String, optional; one of dinner, trip; operators eq"));
+        assert!(text.contains(
+            "- out:Attended: relationship, attended Person; related_to names the Person;"
+        ));
         assert!(text.ends_with("Request: dinners last month"));
     }
 }
