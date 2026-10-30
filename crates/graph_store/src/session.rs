@@ -4272,12 +4272,19 @@ fn outcome_kind<T>(
             message: error.body.error.clone(),
         },
         WriteOutcome::NotSent { reason } => OutcomeKind::Refused {
-            message: reason.clone(),
+            message: nothing_sent(reason),
         },
         WriteOutcome::Unknown { reason } => OutcomeKind::Unknown {
             reason: reason.clone(),
         },
     }
+}
+
+/// What a write never sent says of itself where its outcome is logged, a refusal in the
+/// constitution's sense (nothing was written): why, and that nothing was sent. The agent's
+/// gateway says the same of the requests it never sends.
+pub fn nothing_sent(why: &str) -> String {
+    format!("{}, so nothing was sent.", studio_ui::clause(why))
 }
 
 /// The parent of the commit a write's answer names, which `commit` finds: the head below it
@@ -4333,7 +4340,8 @@ mod tests {
     use crate::cli_tokens::{NoToken, Token, TokenSource};
     use crate::connection::{ConnectionState, ServerEntry, ServerSource};
 
-    /// A write never sent is logged as refused, with why: nothing was written.
+    /// A write never sent is logged as refused, with why and that nothing was sent: nothing
+    /// was written.
     #[test]
     fn a_write_never_sent_is_logged_as_refused() {
         let outcome: WriteOutcome<CommitOutput> = WriteOutcome::NotSent {
@@ -4342,7 +4350,7 @@ mod tests {
         assert_eq!(
             outcome_kind(&outcome, |commit: &CommitOutput| Some(commit)),
             OutcomeKind::Refused {
-                message: "the target is gone".into()
+                message: "the target is gone, so nothing was sent.".into()
             }
         );
     }

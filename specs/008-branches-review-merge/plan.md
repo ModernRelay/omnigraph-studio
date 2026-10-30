@@ -166,9 +166,12 @@ place), X (designed on 0.13; the better routes are deferred).
   the merge itself decides.
 - Outcome shown plainly: fast-forwarded, merged (with commit), already up to date. A merge or a
   fix never sent (its connection retired, the server refusing the connection, or the request
-  not made) says so, "The merge was not sent: <why>. Nothing was merged.", and leaves nothing
-  to settle (since 2026-10-30; before, a merge or a fix that failed to send read as an unknown
-  outcome, and a merge's was settled by reading the target's history).
+  not made; a merge whose branch head could not be read; a fix dropped because the one
+  before it did not land or has an unknown outcome) says so ("The merge was not
+  sent: <why>. Nothing was merged."; a fix's "Not sent: <why>. Nothing was written."), and
+  leaves nothing to settle (since 2026-10-30; before, one that failed to send read as an
+  unknown outcome, a merge's settled by reading the target's history, and the others as
+  refused).
 - A 409 opens a conflicts view: one row per conflict with its kind in words ("Changed on both
   branches", "Deleted on main, changed here", "Relationship points to a deleted node"), the
   entity, and the message. Resolution happens on the source branch with ordinary edits; then

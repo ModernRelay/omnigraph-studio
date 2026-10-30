@@ -934,6 +934,17 @@ pub enum SaveResult {
 
 pub const UNKNOWN_MESSAGE: &str = "Check History before trying again; your changes are still here";
 
+/// What a write never sent says: why, and that nothing was written.
+pub(crate) fn not_sent_notice(reason: &str) -> Notice {
+    Notice::new(
+        Tone::Refused,
+        format!(
+            "Not sent: {}. Nothing was written.",
+            studio_ui::clause(reason)
+        ),
+    )
+}
+
 /// Classifies a write's outcome. `branch` names the write target in a denial.
 pub fn save_result(outcome: &WriteOutcome<ChangeOutput>, branch: &str) -> SaveResult {
     match outcome {
@@ -953,10 +964,7 @@ pub fn save_result(outcome: &WriteOutcome<ChangeOutput>, branch: &str) -> SaveRe
             error.body.precondition_failure.is_some(),
             branch,
         )),
-        WriteOutcome::NotSent { reason } => SaveResult::Refused(Notice::new(
-            Tone::Refused,
-            format!("Not sent: {reason}. Nothing was written."),
-        )),
+        WriteOutcome::NotSent { reason } => SaveResult::Refused(not_sent_notice(reason)),
         WriteOutcome::Unknown { .. } => {
             SaveResult::Unknown(Notice::new(Tone::Unknown, UNKNOWN_MESSAGE))
         }

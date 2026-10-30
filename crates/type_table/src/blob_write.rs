@@ -530,10 +530,9 @@ async fn written(
             };
             BlobWritten::Refused(Notice::new(Tone::Refused, message))
         }
-        WriteOutcome::NotSent { reason } => BlobWritten::Refused(Notice::new(
-            Tone::Refused,
-            format!("Not sent: {reason}. Nothing was written."),
-        )),
+        WriteOutcome::NotSent { reason } => {
+            BlobWritten::Refused(crate::model::not_sent_notice(&reason))
+        }
         WriteOutcome::Unknown { .. } => BlobWritten::Unknown(Notice::new(
             Tone::Unknown,
             "The server's answer was lost, so the value may have changed. Check History \

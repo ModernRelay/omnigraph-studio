@@ -866,9 +866,10 @@ impl DeleteBranchModal {
                             this.error = Some(
                                 match &holds {
                                     Holds::Unknown(error) => format!(
-                                        "Studio could not check {} again: {error}. Type its \
-                                         name to delete it.",
-                                        this.branch
+                                        "Studio could not check {} again: {}. Type its name to \
+                                         delete it.",
+                                        this.branch,
+                                        studio_ui::clause(&error.to_string())
                                     ),
                                     _ => format!(
                                         "{} has a commit {TARGET} does not since this opened; \

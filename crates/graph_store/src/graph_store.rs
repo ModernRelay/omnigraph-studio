@@ -63,7 +63,7 @@ pub mod cli {
 pub use session::{
     BranchStart, DraftEntry, DraftKey, ExternalWrite, FollowUp, GraphSession, HeadWatch, HeldAs,
     Loadable, MergeEntry, MergeSent, MergeSettled, OutcomeEntry, OutcomeKind, ServerState,
-    SessionEvent, open_session, open_session_behind,
+    SessionEvent, nothing_sent, open_session, open_session_behind,
 };
 
 /// The user agent of Studio's requests.

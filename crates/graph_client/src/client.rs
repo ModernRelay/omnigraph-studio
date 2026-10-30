@@ -1488,7 +1488,7 @@ impl GraphClient {
         let url = self.blob_url(graph, cell, BlobAt::Branch(branch));
         let mut headers = vec![("content-type", "application/octet-stream")];
         headers.extend(if_match.map(|tag| ("if-match", tag)));
-        self.send_blob_write(Method::PUT, url, Some(bytes), &headers)
+        self.send_write(Method::PUT, url, Some(bytes), &headers)
             .await
     }
 
@@ -1505,21 +1505,7 @@ impl GraphClient {
         let url = self.blob_url(graph, cell, BlobAt::Branch(branch));
         let headers: Vec<(&str, &str)> =
             if_match.map(|tag| ("if-match", tag)).into_iter().collect();
-        self.send_blob_write(Method::DELETE, url, None, &headers)
-            .await
-    }
-
-    async fn send_blob_write(
-        &self,
-        method: Method,
-        url: Url,
-        body: Option<Vec<u8>>,
-        headers: &[(&str, &str)],
-    ) -> WriteOutcome<BlobWriteOutput> {
-        match self.send(method, url, body, headers, WRITE_TIMEOUT).await {
-            Ok(raw) => classify_write(raw),
-            Err(no) => unanswered(no),
-        }
+        self.send_write(Method::DELETE, url, None, &headers).await
     }
 
     async fn write<T: DeserializeOwned>(
@@ -1530,12 +1516,22 @@ impl GraphClient {
         body: Option<Vec<u8>>,
         headers: &[(&str, &str)],
     ) -> WriteOutcome<T> {
-        let url = self.url(segments, query);
-        let raw = match self.send(method, url, body, headers, WRITE_TIMEOUT).await {
-            Ok(raw) => raw,
-            Err(no) => return unanswered(no),
-        };
-        classify_write(raw)
+        self.send_write(method, self.url(segments, query), body, headers)
+            .await
+    }
+
+    /// Sends a write once and judges its answer, or says why it has none.
+    async fn send_write<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        url: Url,
+        body: Option<Vec<u8>>,
+        headers: &[(&str, &str)],
+    ) -> WriteOutcome<T> {
+        match self.send(method, url, body, headers, WRITE_TIMEOUT).await {
+            Ok(raw) => classify_write(raw),
+            Err(no) => unanswered(no),
+        }
     }
 
     // ---- public reads ----
@@ -2147,17 +2143,23 @@ fn classify_write<T: DeserializeOwned>(raw: RawResponse) -> WriteOutcome<T> {
 /// a connection the server refused carried no request ([`NoAnswer::Unreached`]); any other
 /// failure may have come after the request went out ([`NoAnswer::Lost`]).
 fn unanswered_by_transport(error: &anyhow::Error) -> NoAnswer {
-    let refused = error.chain().any(|layer| {
-        layer
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
-    });
     let why = describe_transport(error);
-    if refused {
+    if connection_refused(error) {
         NoAnswer::Unreached(why)
     } else {
         NoAnswer::Lost(why)
     }
+}
+
+/// Whether the server refused the connection, by the error's kind: an io `ConnectionRefused`
+/// anywhere in its chain, whatever its text says (Windows words it "No connection could be made
+/// because the target machine actively refused it").
+fn connection_refused(error: &anyhow::Error) -> bool {
+    error.chain().any(|layer| {
+        layer
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
+    })
 }
 
 /// A write with no answer: never sent, so nothing was written, or lost, so it may have been.
@@ -2251,7 +2253,9 @@ fn describe_transport(error: &anyhow::Error) -> String {
         } else {
             Some(REQUEST_TIMED_OUT)
         }
-    } else if all.contains("connection refused") {
+    } else if connection_refused(error) {
+        // By its kind alone: a failure that only says so in words may come after sending, and
+        // is not said as one that sent nothing.
         Some("the connection was refused")
     } else if all.contains("dns error")
         || all.contains("lookup address")
@@ -3280,11 +3284,28 @@ mod tests {
             write(failing(Some(std::io::ErrorKind::ConnectionRefused))),
             WriteOutcome::NotSent { reason } if reason == "the connection was refused"
         ));
+        // Said the same where the system words it otherwise, as Windows does (error 10061).
+        let windows = client(FakeHttpClient::create(|_| async {
+            Err(anyhow::Error::from(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "No connection could be made because the target machine actively refused it. \
+                 (os error 10061)",
+            ))
+            .context("tcp connect error"))
+        }));
+        assert!(matches!(
+            write(windows),
+            WriteOutcome::NotSent { reason } if reason == "the connection was refused"
+        ));
         assert!(matches!(
             write(failing(Some(std::io::ErrorKind::ConnectionReset))),
             WriteOutcome::Unknown { .. }
         ));
-        assert!(matches!(write(failing(None)), WriteOutcome::Unknown { .. }));
+        // Said in its own words: nothing here says it was not sent.
+        assert!(matches!(
+            write(failing(None)),
+            WriteOutcome::Unknown { reason } if reason == "connection refused, in words alone"
+        ));
     }
 
     /// Stored queries: the catalog decodes (a kind Studio does not know is `Other`), a read

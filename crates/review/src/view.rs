@@ -77,8 +77,9 @@ enum FixState {
     Unchanged,
     Moved,
     Refused(String),
-    /// Never sent (its connection retired, the server refusing the connection, or the request
-    /// not made): nothing was written.
+    /// Never sent (its connection retired, the server refusing the connection, the request not
+    /// made, or dropped because the fix before it did not land or has an unknown outcome):
+    /// nothing was written.
     NotSent(String),
     Unknown,
 }
@@ -159,8 +160,9 @@ enum MergeState {
     },
     Conflicts(Vec<MergeConflictOutput>),
     Refused(String),
-    /// Never sent (its connection retired, the server refusing the connection, or the request
-    /// not made): nothing was merged, and nothing is to be settled.
+    /// Never sent (its connection retired, the server refusing the connection, the request not
+    /// made, or the branch's head not read before it): nothing was merged, and nothing is to be
+    /// settled.
     NotSent(String),
     Unknown {
         reason: String,
@@ -1847,10 +1849,10 @@ impl ReviewView {
     /// perhaps still there.
     fn drop_fixes_after(&mut self, key: &str, unknown: bool) {
         let why = if unknown {
-            "Not sent: whether the relationship that replaced it was removed is not known. \
-             Check History before moving it back."
+            "whether the relationship that replaced it was removed is not known; check History \
+             before moving it back"
         } else {
-            "Not sent: the relationship that replaced it was not removed first."
+            "the relationship that replaced it was not removed first"
         };
         let (dropped, kept): (Vec<Fix>, Vec<Fix>) = std::mem::take(&mut self.fix_queue)
             .into_iter()
@@ -1860,7 +1862,7 @@ impl ReviewView {
             self.fixes_running = self.fixes_running.saturating_sub(1);
             self.fixes_in_flight.remove(&fix.key);
             if let Some(card) = self.card_of(&fix.key).and_then(|ix| self.cards.get_mut(ix)) {
-                card.fix = FixState::Refused(why.into());
+                card.fix = FixState::NotSent(why.into());
             }
         }
     }
@@ -2041,7 +2043,7 @@ impl ReviewView {
                 Ok(base) => (Some(base.source_commit_id), Some(base.target_commit_id)),
                 Err(error) => {
                     this.update(cx, |this, cx| {
-                        this.merge = MergeState::Refused(format!(
+                        this.merge = MergeState::NotSent(format!(
                             "Studio could not read {branch}'s head: {error}"
                         ));
                         this.writes_settled(cx);
@@ -2730,7 +2732,11 @@ impl ReviewView {
                 let deletion = match deleted {
                     None => String::new(),
                     Some(Ok(())) => format!(" Deleted {}.", self.branch),
-                    Some(Err(why)) => format!(" {} was not deleted: {why}.", self.branch),
+                    Some(Err(why)) => format!(
+                        " {} was not deleted: {}.",
+                        self.branch,
+                        studio_ui::clause(why)
+                    ),
                 };
                 let beyond = format!("{beyond}{deletion}");
                 (
@@ -2770,12 +2776,18 @@ impl ReviewView {
             ),
             MergeState::Refused(message) => (
                 Severity::Error,
-                format!("The merge was refused: {message}. Nothing was merged."),
+                format!(
+                    "The merge was refused: {}. Nothing was merged.",
+                    studio_ui::clause(message)
+                ),
                 None,
             ),
             MergeState::NotSent(reason) => (
                 Severity::Error,
-                format!("The merge was not sent: {reason}. Nothing was merged."),
+                format!(
+                    "The merge was not sent: {}. Nothing was merged.",
+                    studio_ui::clause(reason)
+                ),
                 None,
             ),
             MergeState::Unknown { reason, landed, .. } => (
@@ -3152,6 +3164,7 @@ fn merged_check_words(verified: Check, target: &str) -> String {
 /// History that does not show it yet is no proof it will not land: the merge may still be
 /// running on the server.
 fn unknown_merge_words(reason: &str, landed: Check, target: &str) -> String {
+    let reason = studio_ui::clause(reason);
     match landed {
         Check::Reading => format!(
             "The merge outcome is unknown ({reason}). Studio did not retry; reading {target}'s history…"
@@ -3231,7 +3244,10 @@ fn fix_status(fix: &FixState) -> Option<(String, Color)> {
         ),
         FixState::Refused(message) => (format!("Refused: {message}"), Color::Error),
         FixState::NotSent(reason) => (
-            format!("Not sent: {reason}. Nothing was written."),
+            format!(
+                "Not sent: {}. Nothing was written.",
+                studio_ui::clause(reason)
+            ),
             Color::Error,
         ),
         FixState::Unknown => (
@@ -4443,7 +4459,7 @@ pub(crate) mod tests {
             // The first's outcome is unknown, and the second says so: not that it was not
             // removed.
             assert!(
-                matches!(&view.cards[1].fix, FixState::Refused(why) if why.contains("is not known")),
+                matches!(&view.cards[1].fix, FixState::NotSent(why) if why.contains("is not known")),
                 "{:?}",
                 view.cards[1].fix
             );

@@ -629,7 +629,7 @@ async fn read_write_answer(
                 // Never sent (the target retired, the connection refused, or a request Studio
                 // would not make): nothing was written, and the CLI is told so.
                 Some(unsent) => (
-                    Seen::Refused(nothing_sent(&String::from(no))),
+                    Seen::Refused(graph_store::nothing_sent(&String::from(no))),
                     Some(Reply::NotSent(unsent)),
                 ),
                 None => (Seen::Unknown(String::from(no)), None),
@@ -680,13 +680,10 @@ async fn read_write_answer(
 
 /// The CLI's refusal of a request to a retired target ([`NoAnswer::Retired`]).
 fn retired_refusal(why: &str) -> String {
-    format!("Studio: {why}. Tell the person what this says. Nothing was sent.")
-}
-
-/// That a request was never sent, and why ([`NoAnswer::Retired`], [`NoAnswer::Unsendable`],
-/// [`NoAnswer::Unreached`]), as its card says it.
-fn nothing_sent(why: &str) -> String {
-    format!("{why}, so nothing was sent.")
+    format!(
+        "Studio: {}. Tell the person what this says. Nothing was sent.",
+        studio_ui::clause(why)
+    )
 }
 
 /// How the CLI is answered for a request never sent ([`answer`]): its status, code and message.
@@ -711,8 +708,9 @@ fn unsent_refusal(no: &NoAnswer) -> Option<Unsent> {
     match no {
         NoAnswer::Retired(why) => Some(forbidden(retired_refusal(why))),
         NoAnswer::Unsendable(why) => Some(forbidden(format!(
-            "Studio: {why}. Change the request, or tell the person what this says. Nothing was \
-             sent."
+            "Studio: {}. Change the request, or tell the person what this says. Nothing was \
+             sent.",
+            studio_ui::clause(why)
         ))),
         NoAnswer::Unreached(why) => Some(Unsent {
             status: 503,
