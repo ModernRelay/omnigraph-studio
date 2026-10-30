@@ -89,6 +89,30 @@ is for every later one.
   | `claude -p --json-schema`, Haiku | 5–10 s, one 20 s | 8/8 | 28 s, 7¢ |
   | Warm ACP turn, schema in the prompt only | 2.6–5.4 s | 0/5 | — |
 
+  OpenRouter's routers (docs read 2026-10-29): `openrouter/auto` classifies the prompt into one
+  of ~30 task types and picks the model the community spends most on for it; a `cost_tier`
+  plugin setting bounds the price. `typesafe/jev-router` has Jev (below) pick a model and a
+  reasoning effort per request. Both take `response_format`. Measured: `openrouter/auto` sent
+  the eight filter requests to Azure-hosted OpenAI models, 3–5 s each, 8/8 right, about
+  $0.0001 a call: right, but two to three times slower than naming Haiku.
+
+  Jev (`typesafe/jev-1.14`, OpenRouter's "decision model", `POST /api/alpha/decisions`) is not
+  a chat model: it takes a `state` object and typed questions, a Choice over named options, a
+  Noul (yes or no) or a Score on a scale, and answers each with probabilities. $0.042 per
+  million input tokens, output free; about $0.0001 a call. Measured on six sentences with two
+  questions each, a Choice over the personal graph's 100 node types and a Noul "does this ask
+  for a change": 0.4–3 s (one 6 s). The Noul was right every time with ≥ 0.98 for "delete the
+  cancelled trips" and ≤ 0.04 for the reads. The 100-way Choice was right on 4 of 6 and unsure
+  where it was right ("dinners in the last month": Event 0.37, Activity 0.32); "flights this
+  week" went to Reservation over Event.
+
+  BYOK (OpenRouter's "bring your own key"): a provider's key (Anthropic, OpenAI, Google …) is
+  stored in the OpenRouter workspace, on its integrations page or through its management API
+  with a management key, and every request through that provider then uses it, billed to that
+  provider account plus 5% of OpenRouter's list price in credits. A key is prioritized or a
+  fallback, can be kept from falling back to shared capacity, and the workspace's data policies
+  still apply to it. Nothing in the request names a provider key: BYOK is not per request.
+
   Codex answering "ok" takes 4–5 s, the same as a filter, and a larger Codex model is no slower:
   the cost is process start. A custom `--system-prompt` cuts `claude -p` from 17,300 input
   tokens to 1,900 and 2.6¢ to 0.5¢ a call, but not its ~6 s. On a warm ACP session both agents
@@ -171,7 +195,11 @@ A **Models** section:
 | `models.careful` | `anthropic/claude-sonnet-5.5` | model picker |
 | `models.data_leaves_for` | `[]` | read-only list of the tasks allowed so far |
 
-and one row, **OpenRouter key**, that stores to the keychain and shows "Stored" or "None". The
+and one row, **OpenRouter key**, that stores to the keychain and shows "Stored" or "None". A
+second row, **Provider keys**, explains BYOK in one line ("Your own Anthropic, OpenAI or Google
+key, set in your OpenRouter workspace, is used for that provider's models and billed to that
+account") with a button that opens `https://openrouter.ai/settings/integrations`. Studio holds
+no provider key: OpenRouter is the one place they live, and a request never carries one. The
 model picker lists `GET /api/v1/models` filtered to `structured_outputs`, as "name · $in/$out
 per million", read once a day and kept in the data directory; without a key or network it holds
 the two defaults. The section's description: "Studio sends a task's input to OpenRouter and the
@@ -251,6 +279,9 @@ A call is never retried. The model list is read at most once a day.
 | Decision | Rejected alternatives | Why |
 |---|---|---|
 | OpenRouter is the one provider | Anthropic and OpenAI directly; a provider per key; the agent's login | One key, one request shape and one model picker cover every vendor; routing options give the data policy per call. Direct Anthropic was 0.7 s faster for the same model, not enough for two code paths. The agents' logins cannot make API calls |
+| A provider's own key goes through OpenRouter's BYOK, set in its workspace | Provider keys in Studio's settings, sent per request; Studio registering them through the management API | BYOK is not per request, so Studio holding a provider key would gain nothing; registering keys needs a management key and makes Studio a key manager. One link to the integrations page does it, and the provider's own data policies still apply |
+| Named models by tier, not a router | `openrouter/auto`; `typesafe/jev-router` | Auto was right on every filter but 3–5 s against Haiku's 1.5–2.8 s, and neither router says what it will cost or which model will see the data before the call; a named model is what the consent line names |
+| Jev for yes-or-no gates, later, not for the first uses | Jev as the filter or summary engine; Jev picking the table for a sentence | Jev answers typed questions with probabilities, not generated structures: it cannot write a filter or a summary. It was certain and right on read-versus-write, but unsure across 100 types. A gate such as "does this sentence ask for a change" before a filter, or routing a sentence to filter versus query, is its shape, under $0.0001 a call |
 | A schema on every call, parsed in Studio | Prompt for JSON and parse; the agent panel | Without `response_format` both agents misnamed fields every time; with it, every answer parsed. The parse in Studio covers providers that only hint |
 | No headless-CLI fallback | `claude -p --json-schema` or `codex exec --output-schema` without a key | Both are 4–6 s a call and `claude -p` costs 2.6¢ each; a feature that is sometimes five times slower is a worse feature than one that asks for a key |
 | The key lives in the keychain | A `0600` file as the CLI's tokens; settings.json | Spec 016 already keeps its secret there with GPUI's credentials calls; a file would be the first secret file of Studio's own |
@@ -261,6 +292,8 @@ A call is never retried. The model list is read at most once a day.
 
 ## Deferred
 
+- A Jev gate in the filter field: a Noul "asks for a change" that turns "delete the cancelled
+  trips" into a filter plus a note that the table does not delete, before the filter call.
 - Streaming a summary as it arrives (OpenRouter supports `stream: true` with a schema).
 - A model per graph, for graphs whose data may not leave a region: `provider.zdr` and `only`
   per graph.
@@ -274,6 +307,7 @@ A call is never retried. The model list is read at most once a day.
 | Date | Claim | Check | Result |
 |---|---|---|---|
 | 2026-10-29 | Direct schema-bound calls answer filters in 1–3 s and agent routes in 4–6 s; ACP without a schema does not keep the shape | Eight requests on `Event`, graded; `claude -p`, `codex exec`, warm ACP sessions of both agents, OpenRouter with four models, Anthropic direct (scratchpad `nlfilter/`, scripts `run.sh`, `direct.py`, `acp_turns.py`, `grade.py`) | As in the table above. Haiku, Flash Lite and the CLIs 8/8; nano 5/8; ACP 0/5 with the wrong field names |
+| 2026-10-29 | The Auto Router is right but slower than a named model; Jev is certain on read-versus-write and unsure on a 100-way type choice | `direct.py` with `openrouter/auto`; `jev.py` (six sentences, a Choice over the schema's node types and a Noul) | Auto 8/8 at 3–5 s via Azure; Jev 0.4–6 s, Noul right 6/6 (0.98 vs ≤ 0.04), Choice 4/6 |
 | 2026-10-29 | A condensed 294-change branch summarizes well in ~10 s | `direct_summary.py` on Sonnet and Flash Lite; `claude -p` Sonnet; `codex exec` Astra | Sonnet 9.5 s and best; Astra 15 s; `claude -p` 28 s at 7.3¢; Flash Lite 2.5 s but generic |
 
 ## Corrections
