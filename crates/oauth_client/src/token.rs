@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use http_client::HttpClient;
+use http_client::http::StatusCode;
 use serde_json::{Map, Value};
 
 use crate::discovery::AuthorizationServer;
@@ -59,7 +60,7 @@ pub struct Expected<'a> {
     pub organization: Option<&'a str>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum TokenError {
     /// `invalid_grant`: the code or refresh token is not good any more. A refresh that ends so
     /// signs the person out.
@@ -70,14 +71,37 @@ pub enum TokenError {
     /// The request did not complete, or the service failed. A refresh token may have been
     /// rotated anyway, so a refresh is tried once more before the person is asked to sign in.
     Failed(String),
+    /// The service gave tokens Studio may not use, for a reason another try does not change:
+    /// why, and the refresh token they came with, which nothing will hold, so the caller
+    /// revokes it.
+    Unusable {
+        why: String,
+        refresh_token: Option<String>,
+    },
+}
+
+/// Says why, never the refresh token an unusable answer carries.
+impl std::fmt::Debug for TokenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TokenError::InvalidGrant(why) => f.debug_tuple("InvalidGrant").field(why).finish(),
+            TokenError::Refused(why) => f.debug_tuple("Refused").field(why).finish(),
+            TokenError::Failed(why) => f.debug_tuple("Failed").field(why).finish(),
+            TokenError::Unusable { why, .. } => f
+                .debug_struct("Unusable")
+                .field("why", why)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 impl std::fmt::Display for TokenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TokenError::InvalidGrant(why) | TokenError::Refused(why) | TokenError::Failed(why) => {
-                f.write_str(why)
-            }
+            TokenError::InvalidGrant(why)
+            | TokenError::Refused(why)
+            | TokenError::Failed(why)
+            | TokenError::Unusable { why, .. } => f.write_str(why),
         }
     }
 }
@@ -188,6 +212,13 @@ async fn request(
             _ if answer.status.is_server_error() => {
                 TokenError::Failed(said("The sign-in service failed."))
             }
+            // Busy, or asking to be asked later: it may pass, so the sign-in stands.
+            "temporarily_unavailable" | "slow_down" => {
+                TokenError::Failed(said("The sign-in service is busy."))
+            }
+            _ if answer.status == StatusCode::TOO_MANY_REQUESTS => {
+                TokenError::Failed(said("The sign-in service is busy."))
+            }
             _ => TokenError::Refused(said(&format!(
                 "The sign-in service refused ({}).",
                 if error.is_empty() {
@@ -198,7 +229,18 @@ async fn request(
             ))),
         });
     }
-    checked(&body, expected, SystemTime::now()).map_err(TokenError::Refused)
+    checked(&body, expected, SystemTime::now()).map_err(|why| TokenError::Unusable {
+        why,
+        refresh_token: refresh_token(&body),
+    })
+}
+
+/// The refresh token an answer gives, if any.
+fn refresh_token(body: &Map<String, Value>) -> Option<String> {
+    body.get("refresh_token")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
 }
 
 /// The answer's tokens, if they may be used: a `Bearer` access token that lives at most 300
@@ -276,11 +318,7 @@ fn checked(
     let lives = Duration::from_secs(expires_in);
     Ok(Tokens {
         access_token: access_token.to_owned(),
-        refresh_token: body
-            .get("refresh_token")
-            .and_then(Value::as_str)
-            .filter(|token| !token.is_empty())
-            .map(str::to_owned),
+        refresh_token: refresh_token(body),
         expires_at: now + lives,
         account: Account {
             subject: subject.to_owned(),

@@ -95,6 +95,7 @@ pub(crate) const EXPORT_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const HELPER_MARGIN: Duration = Duration::from_secs(15);
 
 /// A token, kept in memory only: its `Debug` never shows it.
+#[derive(Clone)]
 pub struct Token {
     secret: String,
     lease: Option<Lease>,
