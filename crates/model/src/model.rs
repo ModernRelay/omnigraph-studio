@@ -195,6 +195,9 @@ impl Client {
             },
             "max_tokens": task.limits.output_tokens,
             "provider": {"require_parameters": true, "data_collection": "deny"},
+            // A fast task's answer is a few lines: reasoning would spend its token cap before
+            // the answer (Haiku reasons by default, and the thinking counts).
+            "reasoning": {"enabled": matches!(task.tier, Tier::Careful)},
         });
         let http_request = HttpRequest::post(self.endpoint.as_ref())
             .header("Authorization", format!("Bearer {key}"))
@@ -244,21 +247,30 @@ impl Client {
             return Err(Error::Refused(status.as_u16(), refusal(&text)));
         }
         let completion: Completion = serde_json::from_str(&text)
-            .map_err(|_| Error::NotInSchema(cut(&text, 200).to_owned()))?;
+            .map_err(|error| Error::NotInSchema(format!("{error} in {}", cut(&text, 200))))?;
         if let Some(error) = completion.error {
             return Err(Error::Refused(
                 error.code.unwrap_or(status.as_u16()),
                 error.message,
             ));
         }
-        let content = completion
-            .choices
-            .into_iter()
-            .next()
-            .map(|choice| choice.message.content)
+        let choice = completion.choices.into_iter().next();
+        let cut_short = choice
+            .as_ref()
+            .is_some_and(|choice| choice.finish_reason.as_deref() == Some("length"));
+        let content = choice
+            .and_then(|choice| choice.message.content)
             .unwrap_or_default();
-        let value = serde_json::from_str::<T>(&content)
-            .map_err(|_| Error::NotInSchema(cut(&content, 200).to_owned()))?;
+        let value = serde_json::from_str::<T>(&content).map_err(|_| {
+            if cut_short {
+                Error::NotInSchema(format!(
+                    "the answer ran past {} tokens and was cut off",
+                    task.limits.output_tokens
+                ))
+            } else {
+                Error::NotInSchema(cut(&content, 200).to_owned())
+            }
+        })?;
         Ok(Answer {
             value,
             model: completion.model.unwrap_or_else(|| model.to_owned()),
@@ -346,12 +358,14 @@ struct Completion {
 #[derive(Deserialize)]
 struct Choice {
     message: Message,
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct Message {
+    /// `null` when the answer holds no text: cut off before it, or refused.
     #[serde(default)]
-    content: String,
+    content: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -480,6 +494,7 @@ mod tests {
         assert_eq!(body["provider"]["require_parameters"], true);
         assert_eq!(body["provider"]["data_collection"], "deny");
         assert_eq!(body["max_tokens"], 300);
+        assert_eq!(body["reasoning"]["enabled"], false);
         assert_eq!(body["messages"][1]["content"], "dinners last month");
     }
 
@@ -515,6 +530,32 @@ mod tests {
         let answer: Result<Answer<Filters>, Error> = smol::block_on(client.call("m", "k", large));
         assert_eq!(answer.unwrap_err(), Error::TooLarge);
         assert!(seen.lock().unwrap().is_empty(), "nothing sent");
+    }
+
+    /// A real OpenRouter answer (Haiku through Anthropic, BYOK, with reasoning details) parses.
+    #[test]
+    fn a_real_answer_parses() {
+        let body = include_str!("fixtures/openrouter-haiku.json");
+        let completion: Completion = serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            completion.model.as_deref(),
+            Some("anthropic/claude-haiku-5.5")
+        );
+        assert_eq!(completion.usage.and_then(|u| u.cost), Some(0.0));
+        assert!(
+            completion.choices[0]
+                .message
+                .content
+                .as_deref()
+                .is_some_and(|c| c.starts_with("{\"filters\""))
+        );
+        // A choice cut off before its answer parses too, with no content.
+        let cut: Completion = serde_json::from_str(
+            r#"{"choices":[{"finish_reason":"length","message":{"role":"assistant","content":null}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(cut.choices[0].finish_reason.as_deref(), Some("length"));
+        assert!(cut.choices[0].message.content.is_none());
     }
 
     /// The model list keeps the models that take a schema, without batch or free variants,
