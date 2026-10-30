@@ -1222,6 +1222,11 @@ impl GraphSession {
                         self.check_heads(cx);
                     }
                 }
+                // The token was taken: should it lapse later, its refusal asks the source again.
+                if self.connection.read(cx).read_refusal_noted() {
+                    self.connection
+                        .update(cx, |connection, _| connection.read_taken());
+                }
                 // The policy may allow less than was read: the client counted the refusal, and
                 // what the credential may do is read again, as after a refused write.
                 if let Err(ReadError::Refused(error)) = result
@@ -7457,6 +7462,14 @@ mod tests {
     /// A server that answers the token `good` alone, and every read of the graph `knowledge`
     /// sent to it.
     fn answers_good_alone() -> (Arc<dyn http_client::HttpClient>, GraphReads) {
+        answers_alone(Arc::new(std::sync::Mutex::new("good")))
+    }
+
+    /// A server that answers the token `accepted` names alone, which a test changes, as a token
+    /// lapses; and every read of the graph `knowledge` sent to it.
+    fn answers_alone(
+        accepted: Arc<std::sync::Mutex<&'static str>>,
+    ) -> (Arc<dyn http_client::HttpClient>, GraphReads) {
         use futures::AsyncReadExt as _;
         use serde_json::json;
 
@@ -7471,6 +7484,7 @@ mod tests {
                 .unwrap_or_default()
                 .to_owned();
             let log = log.clone();
+            let accepted = format!("Bearer {}", accepted.lock().unwrap());
             async move {
                 let mut bytes = Vec::new();
                 request.into_body().read_to_end(&mut bytes).await.ok();
@@ -7483,7 +7497,7 @@ mod tests {
                         200,
                         json!({ "status": "ok", "version": "0.14.0", "internal_schema_version": 16 }),
                     )
-                } else if token != "Bearer good" {
+                } else if token != accepted {
                     (
                         401,
                         json!({ "error": "unauthorized", "code": "unauthorized" }),
@@ -7537,6 +7551,73 @@ mod tests {
                 .with_token_source(Some(source))
         });
         (connection, give)
+    }
+
+    /// A token the source gave after a refused read is asked about again when a later read is
+    /// refused for it (it lapsed, an hour on), once a read with it was taken; a server that
+    /// refuses every token given is not asked in a loop (`connection::tests::
+    /// a_read_refused_for_its_token_asks_the_source_once`). Before, a token given after a
+    /// refusal was never asked about again, so once it lapsed every read stayed refused until
+    /// Refresh.
+    #[gpui::test]
+    async fn a_token_given_after_a_refusal_is_asked_about_again_once_a_read_took_it(
+        cx: &mut TestAppContext,
+    ) {
+        /// Gives `t1`, `t2`, `t3` in turn, then `t3` again.
+        #[derive(Default)]
+        struct Turns(std::sync::Mutex<usize>);
+        impl TokenSource for Turns {
+            fn token(
+                &self,
+                _: Arc<AtomicBool>,
+            ) -> futures::future::BoxFuture<'static, Result<Token, NoToken>> {
+                let mut asked = self.0.lock().unwrap();
+                *asked += 1;
+                let token = ["t1", "t2", "t3"][(*asked - 1).min(2)];
+                async move { Ok(Token::new(token)) }.boxed()
+            }
+        }
+        let accepted = Arc::new(std::sync::Mutex::new("t1"));
+        let (http, sent) = answers_alone(accepted.clone());
+        let source = Arc::new(Turns::default());
+        let asked = || *source.0.lock().unwrap();
+        let server = ServerEntry {
+            name: "personal".into(),
+            url: "https://graph.test".into(),
+            source: ServerSource::Cli,
+            known_graphs: Vec::new(),
+        };
+        let held: Arc<dyn TokenSource> = source.clone();
+        let connection = cx.new(|_| {
+            Connection::new(server, None, http)
+                .unwrap()
+                .with_token_source(Some(held))
+        });
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        let session =
+            cx.update(|cx| open_session(connection.clone(), "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        assert_eq!(asked(), 1);
+        let carried = |token: &str| {
+            let sent = std::mem::take(&mut *sent.lock().unwrap());
+            sent.iter()
+                .any(|(_, carried)| carried == &format!("Bearer {token}"))
+        };
+        assert!(carried("t1"));
+
+        // `t1` lapses: the read refused asks again, and `t2` reads.
+        *accepted.lock().unwrap() = "t2";
+        session.update(cx, |session, cx| session.reload(cx));
+        cx.run_until_parked();
+        assert_eq!(asked(), 2);
+        assert!(carried("t2"));
+
+        // An hour on, `t2` lapses in turn: asked again, and `t3` reads.
+        *accepted.lock().unwrap() = "t3";
+        session.update(cx, |session, cx| session.reload(cx));
+        cx.run_until_parked();
+        assert_eq!(asked(), 3, "the lapsed token asked about again");
+        assert!(carried("t3"));
     }
 
     /// A graph shown while its connection's token is still on its way from the CLI sends

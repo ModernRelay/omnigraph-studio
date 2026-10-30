@@ -623,9 +623,7 @@ impl OpenGraphModal {
         let c = connection.read(cx);
         let status = server_status(c);
         let state = c.state.clone();
-        let offers_retry = retries_on_select(c);
-        let sign_in = c.sign_in.clone();
-        let holds_sign_in = c.holds_sign_in();
+        let actions = line_actions(c);
         // A token typed in replaces one the server refused, or one the CLI would not give to a
         // server that asks for one. A server that offers a sign-in is signed in to instead.
         let asks_token = c.asks_token();
@@ -667,63 +665,11 @@ impl OpenGraphModal {
                             .min_w_0()
                             .child(studio_ui::ds::text::muted(status)),
                     )
-                    .map(|row| match (&state, &sign_in) {
-                        (_, SignIn::Waiting { .. }) => row.child(
-                            studio_ui::ds::button("cancel-sign-in", "Cancel")
-                                .style(ButtonStyle::Subtle)
-                                .on_click(cx.listener({
-                                    let selected = selected.clone();
-                                    move |_, _, _, cx| {
-                                        selected.update(cx, |c, cx| c.cancel_sign_in(cx));
-                                    }
-                                })),
-                        ),
-                        // Its tokens given, the sign-in is being kept: not to be cancelled.
-                        (_, SignIn::Finishing { .. }) => row,
-                        // Connecting with a sign-in held: either.
-                        (ConnectionState::Connecting, _) if holds_sign_in => row
-                            .child(cancel_button(&selected, cx))
-                            .child(sign_out_button(&selected, cx)),
-                        (ConnectionState::Unauthorized, SignIn::Offered { service, .. }) => row
-                            .child(
-                                studio_ui::ds::button("sign-in", "Sign in")
-                                    .style(ButtonStyle::Filled)
-                                    .tooltip(ui::Tooltip::text(format!(
-                                        "Opens {service} in your browser to sign in to this server."
-                                    )))
-                                    .on_click(cx.listener({
-                                        let selected = selected.clone();
-                                        move |_, _, _, cx| {
-                                            selected.update(cx, |c, cx| c.sign_in(cx))
-                                        }
-                                    })),
-                            )
-                            // A sign-in as someone else that failed leaves the one held.
-                            .when(holds_sign_in, |row| {
-                                row.child(sign_out_button(&selected, cx))
-                            }),
-                        // The same in any other state, the one held admitted meanwhile or the
-                        // server unreachable.
-                        (_, SignIn::Offered { .. }) if holds_sign_in => row
-                            .child(sign_out_button(&selected, cx))
-                            .when(offers_retry, |row| row.child(retry_button(&selected, cx))),
-                        (ConnectionState::Unauthorized, SignIn::SignedIn { .. }) => row
-                            .child(
-                                studio_ui::ds::button("sign-in-again", "Sign in as someone else")
-                                    .style(ButtonStyle::Subtle)
-                                    .on_click(cx.listener({
-                                        let selected = selected.clone();
-                                        move |_, _, _, cx| {
-                                            selected.update(cx, |c, cx| c.sign_in(cx))
-                                        }
-                                    })),
-                            )
-                            .child(sign_out_button(&selected, cx)),
-                        (_, SignIn::SignedIn { .. }) => row.child(sign_out_button(&selected, cx)),
-                        (ConnectionState::Connecting, _) => row.child(cancel_button(&selected, cx)),
-                        _ if offers_retry => row.child(retry_button(&selected, cx)),
-                        _ => row,
-                    }),
+                    .children(
+                        actions
+                            .into_iter()
+                            .map(|action| line_button(action, &selected, cx)),
+                    ),
             )
             .when(asks_token, |pane| {
                 pane.child(
@@ -858,6 +804,106 @@ impl OpenGraphModal {
                         ),
                     ),
             )
+    }
+}
+
+/// What the chosen server's line offers, beside what it says of its state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LineAction {
+    /// Stops waiting for the browser.
+    CancelSignIn,
+    /// Opens the sign-in service, named, in the browser.
+    SignIn {
+        service: String,
+    },
+    /// A sign-in held that the server does not admit, replaced by another.
+    SignInAsSomeoneElse,
+    SignOut,
+    /// Stops the connect under way.
+    Cancel,
+    /// Connects again ([`retries_on_select`]).
+    Retry,
+}
+
+/// The actions the chosen server's line offers, in order (spec 016). A sign-in being kept offers
+/// none, as it is not to be cancelled; a sign-in held offers Sign out wherever it stands, and
+/// Retry beside it where connecting again is what helps (the server unreachable, the sign-in's
+/// service not answering).
+fn line_actions(c: &Connection) -> Vec<LineAction> {
+    actions_for(
+        &c.state,
+        &c.sign_in,
+        c.holds_sign_in(),
+        retries_on_select(c),
+    )
+}
+
+/// [`line_actions`] for a server in `state` whose sign-in reads `sign_in`, one held (`holds`)
+/// or not, and connecting again helping (`retries`) or not.
+fn actions_for(
+    state: &ConnectionState,
+    sign_in: &SignIn,
+    holds: bool,
+    retries: bool,
+) -> Vec<LineAction> {
+    let retry = retries.then_some(LineAction::Retry);
+    match (state, sign_in) {
+        (_, SignIn::Waiting { .. }) => vec![LineAction::CancelSignIn],
+        // Details read again for a sign-in as someone else, the one held standing.
+        (_, SignIn::Reading) if holds => vec![LineAction::SignOut],
+        (_, SignIn::Finishing { .. }) => Vec::new(),
+        (ConnectionState::Connecting, _) if holds => vec![LineAction::Cancel, LineAction::SignOut],
+        // A sign-in as someone else that failed leaves the one held.
+        (ConnectionState::Unauthorized, SignIn::Offered { service, .. }) => {
+            let mut actions = vec![LineAction::SignIn {
+                service: service.clone(),
+            }];
+            actions.extend(holds.then_some(LineAction::SignOut));
+            actions
+        }
+        // The one held admitted meanwhile, or the server unreachable.
+        (_, SignIn::Offered { .. }) if holds => {
+            std::iter::once(LineAction::SignOut).chain(retry).collect()
+        }
+        // Not admitted: another account may be.
+        (ConnectionState::Unauthorized, SignIn::SignedIn { .. }) if retry.is_none() => {
+            vec![LineAction::SignInAsSomeoneElse, LineAction::SignOut]
+        }
+        (_, SignIn::SignedIn { .. }) => std::iter::once(LineAction::SignOut).chain(retry).collect(),
+        (ConnectionState::Connecting, _) => vec![LineAction::Cancel],
+        _ => retry.into_iter().collect(),
+    }
+}
+
+/// The button for `action` on the chosen server's line.
+fn line_button(
+    action: LineAction,
+    selected: &Entity<Connection>,
+    cx: &mut Context<OpenGraphModal>,
+) -> ds::Button {
+    let selected = selected.clone();
+    match action {
+        LineAction::CancelSignIn => studio_ui::ds::button("cancel-sign-in", "Cancel")
+            .style(ButtonStyle::Subtle)
+            .on_click(cx.listener(move |_, _, _, cx| {
+                selected.update(cx, |c, cx| c.cancel_sign_in(cx));
+            })),
+        LineAction::SignIn { service } => studio_ui::ds::button("sign-in", "Sign in")
+            .style(ButtonStyle::Filled)
+            .tooltip(ui::Tooltip::text(format!(
+                "Opens {service} in your browser to sign in to this server."
+            )))
+            .on_click(cx.listener(move |_, _, _, cx| selected.update(cx, |c, cx| c.sign_in(cx)))),
+        LineAction::SignInAsSomeoneElse => {
+            studio_ui::ds::button("sign-in-again", "Sign in as someone else")
+                .style(ButtonStyle::Subtle)
+                .on_click(
+                    cx.listener(move |_, _, _, cx| selected.update(cx, |c, cx| c.sign_in(cx))),
+                )
+        }
+        LineAction::SignOut => sign_out_button(&selected, cx),
+        LineAction::Cancel => cancel_button(&selected, cx),
+        LineAction::Retry => retry_button(&selected, cx),
     }
 }
 
@@ -1007,12 +1053,14 @@ fn gave_no_token(c: &Connection) -> bool {
 }
 
 /// Whether choosing this server, or its Retry, connects it again: one never connected or
-/// unreachable, and one the CLI gave no token.
+/// unreachable, one the CLI gave no token, and one whose sign-in details could not be read,
+/// which the connect reads again.
 fn retries_on_select(c: &Connection) -> bool {
     matches!(
         c.state,
         ConnectionState::Idle | ConnectionState::Unreachable(_)
     ) || gave_no_token(c)
+        || matches!(c.sign_in, SignIn::Unavailable(_))
 }
 
 /// What Update token does with the token typed: it lasts this run
@@ -1355,6 +1403,100 @@ mod tests {
         assert!(reaches_token(cx));
         refused.update(cx, |connection, _| connection.hold_sign_in_for_tests());
         assert!(!reaches_token(cx), "a sign-in under way hides the field");
+    }
+
+    /// The chosen server's line offers Retry beside a sign-in held wherever connecting again is
+    /// what helps: the server unreachable, the sign-in's service not answering, or sign-in
+    /// details that could not be read. One the server does not admit offers another account
+    /// instead. Before, a sign-in held hid Retry, so an unreachable server waited for its next
+    /// check, up to two minutes.
+    #[gpui::test]
+    fn retry_stands_beside_a_sign_in_where_connecting_again_helps(cx: &mut TestAppContext) {
+        let connection = server(&[], cx);
+        let offers = |state: ConnectionState,
+                      sign_in: SignIn,
+                      unread: Option<&str>,
+                      cx: &mut TestAppContext| {
+            connection.update(cx, |connection, _| {
+                connection.state = state;
+                connection.sign_in = sign_in;
+                connection.token_unread = unread.map(str::to_owned);
+                line_actions(connection)
+            })
+        };
+        let signed_in = || SignIn::SignedIn {
+            service: "id.example".into(),
+            account: "user_1".into(),
+        };
+        assert_eq!(
+            offers(
+                ConnectionState::Unreachable("down".into()),
+                signed_in(),
+                None,
+                cx
+            ),
+            [LineAction::SignOut, LineAction::Retry]
+        );
+        assert_eq!(
+            offers(
+                ConnectionState::Unauthorized,
+                signed_in(),
+                Some("the sign-in service did not answer"),
+                cx
+            ),
+            [LineAction::SignOut, LineAction::Retry]
+        );
+        assert_eq!(
+            offers(ConnectionState::Unauthorized, signed_in(), None, cx),
+            [LineAction::SignInAsSomeoneElse, LineAction::SignOut]
+        );
+        assert_eq!(
+            offers(
+                ConnectionState::Unauthorized,
+                SignIn::Unavailable("the details did not answer".into()),
+                None,
+                cx
+            ),
+            [LineAction::Retry]
+        );
+        assert_eq!(
+            offers(ConnectionState::Ready, signed_in(), None, cx),
+            [LineAction::SignOut]
+        );
+    }
+
+    /// A sign-in held offers Sign out wherever it stands: while the details are read again for
+    /// a sign-in as someone else, and while connecting. Before, reading them again offered
+    /// nothing, the one held standing.
+    #[gpui::test]
+    fn a_sign_in_held_offers_sign_out_while_another_is_read(_: &mut TestAppContext) {
+        assert_eq!(
+            actions_for(
+                &ConnectionState::Unauthorized,
+                &SignIn::Reading,
+                true,
+                false
+            ),
+            [LineAction::SignOut]
+        );
+        assert_eq!(
+            actions_for(
+                &ConnectionState::Unauthorized,
+                &SignIn::Reading,
+                false,
+                false
+            ),
+            []
+        );
+        assert_eq!(
+            actions_for(
+                &ConnectionState::Connecting,
+                &SignIn::NotOffered,
+                true,
+                false
+            ),
+            [LineAction::Cancel, LineAction::SignOut]
+        );
     }
 
     /// A server that offers a sign-in says where, while waiting says to finish in the browser,

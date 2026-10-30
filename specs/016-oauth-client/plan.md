@@ -131,8 +131,10 @@ a token, as today.
    client, as the CLI's identity-provider traffic does not inherit a target's transport
    (Omnigraph `docs/user/cli/targets.md`, Transport and capability boundaries).
 
-Discovery answers are kept in memory per endpoint and fetched again after a sign-in fails or
-Studio restarts; they hold no secrets.
+Discovery answers are kept in memory per endpoint and fetched again after a sign-in fails, before
+the next sign-in opens the browser, or Studio restarts; they hold no secrets. Details that could
+not be read are read again on Retry and at each health check while the server still asks for a
+sign-in.
 
 ### Client identity
 
@@ -169,7 +171,9 @@ Studio restarts; they hold no secrets.
   and `scope=offline_access` when the authorization server lists that scope (open question 3).
 - The listener takes `GET /callback` whose `state` matches; a callback with another `state` is
   answered 400 and the listener waits on, and anything else is 404. An `iss` that is not the
-  issuer ends the sign-in (RFC 9207). It takes one callback, answers it with a short page
+  issuer ends the sign-in (RFC 9207). It answers its connections at once, up to eight, so one
+  that sends nothing (a browser's preconnect) does not hold back the callback. It takes one
+  callback, answers it with a short page
   ("Signed in to <host>. You can close this tab." or the error), and closes. It closes after 5
   minutes, on Cancel, or when the server is removed. An `error` in the callback is shown with its
   `error_description`, as plain text, cut at 300 characters. Each request has 10 seconds and 8 KiB
@@ -272,7 +276,14 @@ Studio restarts; they hold no secrets.
 - An access token is refreshed when 60 seconds or less of its life remain (halfway through a
   token that lives two minutes or less) and the server is in use, and before a request that
   would otherwise send an expired one. Nothing refreshes for a server no view reads; the next
-  view to show it asks. A renewal replaces the token without counting as another credential, so
+  view to show it asks. The executor's timers stand still while the machine sleeps, so each
+  health check also asks for a renewal the wall clock has passed: after a sleep, the token is
+  renewed within one health-check interval of waking. A request that would send a token its lease
+  says has ended has the next asked for, while the server is ready or connecting, and waits for
+  it, up to 40 seconds (a refresh, the pause before its one retry, and the retry), before it
+  sends what it holds. Where nothing would ask (the server refused the token or cannot be
+  reached) or nothing listens (its connection is gone), it sends at once; the public health
+  routes never wait. A renewal replaces the token without counting as another credential, so
   nothing read is read again. A token refreshed after a 401 is a new credential and is tried at
   once. A refused token is not renewed: a renewal runs only while the server is ready, and a 401
   cancels the one scheduled. A CLI target whose transport changes keeps its sign-in: its
@@ -298,13 +309,20 @@ Studio restarts; they hold no secrets.
   sign-in: the service may answer later, and the keychain's refresh token is still good. While
   the access token held still lives it stays in use, unsaid, and the renewal is asked again
   halfway to the token's end (no sooner than 5 seconds before it); with none held the server
-  reads **Sign-in not answering** with why, and the next health check asks again. Only
+  reads **Sign-in not answering** with why, and the next health check, which comes as often as
+  a ready server's, asks again. Only
   `invalid_grant`, a refusal, a sign-out or a sign-in with no refresh token ends it, and after a
-  401 no failure keeps the refused token.
+  401 no failure keeps the refused token. A sign-in with no refresh token keeps its access token
+  until it ends, and ends then.
 
 ### 401 and 403
 
-- A 401 to a request sent with an OAuth token refreshes once. A read is then sent again once;
+- A read refused with 401 for a token replaced while it was under way is read again, once,
+  with the token held now: it says nothing of that one.
+- A 401 to a request sent with an OAuth token refreshes once. A renewal due meanwhile leaves
+  that refresh to answer, and a 401 to the token it gives refreshes nothing more until a read
+  with that token is taken: a server that does not admit the account is not refreshed in a loop,
+  and a token that lapses later is refreshed again. A read is then sent again once;
   a write is not sent again: it ran nothing, and Studio says so ("Signed out before the change
   was sent; nothing was written") and keeps what the person typed, as for any refused write.
 - When the refresh fails, or the request is refused again, the connection becomes **Sign in
@@ -449,6 +467,11 @@ Studio restarts; they hold no secrets.
 | 2026-10-30 | A review of the released connection's drop | `graph_store` `sign_in::tests`: `a_sign_out_while_a_sign_in_finishes_stands_when_the_connection_is_released` (new: a sign-out, then the retirement and release; the item deleted, both tokens revoked, and a later connection, its read held while the deletion is, offered a sign-in; fails without either fix, checked by removing each), `a_sign_out_while_a_sign_in_finishes_offers_one_once_it_is_kept` (extended: another connection to the target, waiting while the sign-in finishes, reads the item only after the sign-out's deletion; fails when the sign-out ends in a turn of its own, checked), `a_connection_released_while_a_sign_in_finishes_lets_it_finish` (changed: released once retired, as the registry does, and once without, as at quitting; fails when a sign-in released after the retirement, or untold, ends as signed out of, each checked); each 20 runs, none failing | Pass. Taken: a connection released after a sign-out while a sign-in finished dropped the sign-in, so the keychain kept the token the person signed out of; a sign-in taken after a sign-out, or dropped by a release, passed its item's keychain turn on before it ended, so other work could read the item between its write and the deletion; and a released connection revoked the new token through the client captured when the sign-in began, not the one it was finishing with. The sign-in finished is now a guard (`Finished`) holding the sign-in and its turn: taken, it ends in that turn as told; dropped untaken, by any path, it ends as the connection last told it through a shared cell, and passes the turn on only once that ending has dealt with the item. Both fallbacks of the released connection's drop are removed |
 | 2026-10-30 | A review of the finished sign-in's guard | `graph_store` `sign_in::tests::a_connection_released_while_a_sign_in_finishes_lets_it_finish` (changed: released once retired and once untold; fails when either ends as signed out of, each checked); 20 runs, none failing | Pass. It found no high or medium defect: every path that drops a sign-in finished ends it as told and passes its turn on, no turn is left waiting, and nothing that releases a turn waits for one. Taken: no test released a sign-in untold; what it was told is an `Option<End>`, not an enum of its own; the sign-in under way that owns the task is required rather than given a fallback that would leave it untold; and a test's doc comment the previous commit removed is restored |
 | 2026-10-30 | A review for legacy code and abstractions finds the token field's rule written twice | `studio` `open_graph::tests::the_keyboard_reaches_the_token_field_only_where_it_is_drawn` (new; fails without its fix, checked by restoring the dialog's own copy of the rule); 20 runs, none failing | Taken: the dialog drew the token field only with no sign-in under way, but its keyboard order included the field without that condition, so while a sign-in finished after a drop the keyboard could move to a field nobody saw. The rule is now the connection's (`Connection::asks_token`), which the drawing and the keyboard both read |
+| 2026-10-30 | A whole-feature review of sign-in, beyond the custody change | `graph_store` `connection::tests`: `a_read_refused_for_its_token_asks_the_source_once` (changed: a read refused under the renewed token asks nothing more, though the source gives a new token each time), `a_renewal_leaves_an_ask_after_a_refusal_to_answer` (new); `sign_in::tests`: `a_grant_without_a_refresh_token_stands_until_its_token_ends`, `sign_in_details_that_could_not_be_read_are_read_again`, `a_sign_in_after_one_failed_reads_the_details_again` (new); `studio` `open_graph::tests::retry_stands_beside_a_sign_in_where_connecting_again_helps` (new); `oauth_client` `callback::tests::a_silent_connection_does_not_hold_back_the_answer` (new). Each fails without its fix (checked by removing it) and passes 20 runs | Taken, all present on main before the custody change: a server that did not admit the signed-in account was refreshed in a loop while a graph window was open, each OAuth refresh a new token that read everything again; a renewal due during the refresh after a 401 took its answer as quiet, so the refused read was never read again; "Sign-in unavailable" stood for the connection's life with no button; a failed sign-in's discovery answers were used again; a grant with no refresh token ended a minute before its token; Retry was hidden beside a sign-in held; and a silent loopback connection held the callback back up to 10 seconds. Also taken: a renewal the wall clock passed while the machine slept is asked at the next health check (`connection::tests::a_renewal_the_clock_passed_in_a_sleep_is_asked_at_the_next_check`, new, fails without its fix, 20 runs), as the executor's timers stand still in sleep. Open: a late 401 to a request sent before its token was replaced refreshes once more than needed |
+| 2026-10-30 | A review of that review's fixes | `graph_store` `session::tests::a_token_given_after_a_refusal_is_asked_about_again_once_a_read_took_it`, `connection::tests`: `an_ask_of_a_replaced_source_holds_back_no_renewal`, `a_refresh_that_keeps_the_token_asks_for_its_renewal_again`, `a_server_that_no_longer_offers_a_sign_in_asks_for_a_token`, `sign_in::tests::why_the_one_held_ended_while_the_details_are_read_again_is_said`, `studio` `open_graph::tests::a_sign_in_held_offers_sign_out_while_another_is_read` (all new). Each fails without its fix (checked by removing it) and passes 20 runs | It found the refactor changes no behavior. Taken: a token given after a refusal was never asked about again, so once it lapsed, an hour on, every read stayed refused until Refresh; the bound now lifts when a read with that token is taken. An ask of a source replaced since (a sign-out then a sign-in) held back every renewal of the next. A Refresh the source could not answer lost the renewal that waited for it; it now asks again halfway to the token's end, and a renewal kept for later moves the lease's, so the health check does not ask at every check meanwhile. Sign out was hidden while a held sign-in read the details again, and why it ended meanwhile was dropped. A server that stopped offering a sign-in stayed "Sign-in unavailable" |
+| 2026-10-30 | A request never sends a token its lease says has ended | `graph_client` `client::tests::a_request_waits_for_the_next_token_once_the_one_held_ended`, `graph_store` `connection::tests::a_request_with_an_ended_token_waits_for_the_next` (both new; each fails without its fix, checked by removing it); 20 runs, none failing | Pass. A request sent between waking from a sleep and the next health check carried the token that ended meanwhile, so it was refused, and a write had to be sent again. The connection now tells its client when each token ends; a request that would send an ended one tells the connection, which asks for the next, and waits for it, a bounded while |
+| 2026-10-30 | A review of that change | `graph_client` `client::tests::a_request_waits_for_the_next_token_once_the_one_held_ended` (extended: the token held set again, no holder, a holder gone, the health check), `graph_store` `connection::tests::a_request_with_an_ended_token_waits_for_the_next` (rewritten: the end comes from the lease as given, the connect's own probe waits for the next token, and a server that refused the token sends at once), `a_renewal_that_failed_after_its_token_ended_is_asked_again_at_the_next_check` (new). Each fails without its fix (checked by removing each) and passes 20 runs | It found no high defect. Taken: a request asked for the next token in any state, so a wake before the network dropped the token and the server read "Sign-in not answering" for two minutes after it returned, and a token the server had refused was renewed; now only a server ready or connecting asks, a request elsewhere sends at once, and the check after a source that did not answer comes as often as a ready server's. The tests set the end by hand, so they passed without the wiring; now the end is the lease's. The health routes waited for a token they do not take. The wait (25 s) was shorter than a refresh and its retry (35 s); now 40. A request waited the whole while for a holder that no longer listened, and for a token typed again; now neither. A waiting request told the holder every 50 ms; now each second |
+| 2026-10-30 | A late 401 to a replaced token asks for nothing | `graph_client` `client::tests::a_read_refused_for_a_token_replaced_meanwhile_is_read_again` (new; fails without its fix, checked by removing it); 20 runs, none failing | Pass. The last item the whole-feature review left open: a read sent with a token that a renewal or another read's refresh replaced before its 401 came said that refusal, and its holder asked for yet another token. The client now records the token each request carried, and reads such a read again, once, with the token held now; a write is never sent again |
 
 ## Corrections
 
