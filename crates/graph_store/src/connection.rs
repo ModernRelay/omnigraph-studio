@@ -209,7 +209,8 @@ pub struct Connection {
     left: Kept,
     /// The ask for the next short-lived token, before the one held ends.
     _renewal: Option<Task<()>>,
-    /// The renewal came while nothing watched the server: the next watch asks.
+    /// The renewal came while nothing watched the server: the next watch asks, unless a renewal
+    /// was scheduled since ([`Connection::schedule_renewal`]).
     renewal_missed: bool,
     /// How many checks in a row have come after a sign-in's service did not answer: the next
     /// comes after the ready interval, doubled for each, up to a failed check's. Any answer
@@ -1093,11 +1094,11 @@ impl Connection {
     /// or a connect probing with that token, has its source asked for it, which the request
     /// waits for. A server that could not be reached is checked at once, whether or not
     /// anything shows it: back, it connects again, which asks; still away, the requests waiting
-    /// when the check began are released, and the next request to find it so has it checked
-    /// again, as the network may be back by then. Elsewhere (the server refused the token, a
-    /// connect was cancelled, no source to ask) nothing gives the next now, and the requests
-    /// waiting are released. The end stands throughout, so a request during a later connect's
-    /// ask waits for its token.
+    /// when the check began are released, unless an ask begun meanwhile gives the next, and the
+    /// next request to find it so has it checked again, as the network may be back by then.
+    /// Elsewhere (the server refused the token, a connect was cancelled, no source to ask)
+    /// nothing gives the next now, and the requests waiting are released. The end stands
+    /// throughout, so a request during a later connect's ask waits for its token.
     fn token_ended(&mut self, cx: &mut Context<Self>) {
         if !self.client.holds_ended_token() || self.next_token_coming() {
             return;
@@ -1842,8 +1843,10 @@ impl Connection {
     }
 
     /// Asks for the next short-lived token `at` that time, if a view still shows the server;
-    /// otherwise the next view to show it asks.
+    /// otherwise the next view to show it asks. A renewal scheduled replaces one owed: a token
+    /// given since answered it, or this retry asks in its place.
     fn schedule_renewal(&mut self, at: SystemTime, cx: &mut Context<Self>) {
+        self.renewal_missed = false;
         let wait = at.duration_since(SystemTime::now()).unwrap_or_default();
         self._renewal = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(wait).await;
@@ -3401,11 +3404,23 @@ mod tests {
         // A request while the connect asks waits for its token, and still does after a Cancel
         // leaves the ask to the waiting window, past the second it tells again.
         let before = sent.lock().unwrap().len();
+        let waits_before =
+            connection.read_with(cx, |connection, _| connection.client.waits_begun());
         let request = std::thread::spawn(move || smol::block_on(client.graphs()).is_ok());
-        for _ in 0..30 {
+        for _ in 0..400 {
             cx.run_until_parked();
+            if connection.read_with(cx, |connection, _| connection.client.waits_begun())
+                > waits_before
+            {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
+        assert!(
+            connection.read_with(cx, |connection, _| connection.client.waits_begun())
+                > waits_before,
+            "the request waiting"
+        );
         connection.update(cx, |connection, cx| connection.cancel(cx));
         for _ in 0..150 {
             cx.run_until_parked();
@@ -3430,9 +3445,9 @@ mod tests {
     }
 
     /// A request still waiting when the renewal lands may tell once more, as it does each
-    /// second; that tell finds the renewed token standing and asks nothing, and once that token
-    /// ends a request waits for the next. Before, such a tell took the renewed token for one
-    /// that does not end.
+    /// second; that tell finds the renewed token standing, asks nothing and leaves its end, so
+    /// once that token ends a request waits for the next. Before, such a tell took the renewed
+    /// token for one that does not end.
     #[gpui::test]
     async fn a_late_tell_leaves_the_renewed_tokens_end_standing(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
@@ -3446,12 +3461,21 @@ mod tests {
         );
         assert_eq!(source.asked.load(Ordering::SeqCst), 1);
         // A tell while the token held stands, as one sent before a renewal landed comes.
-        connection.update(cx, |connection, cx| connection.token_ended(cx));
+        let ends = connection.update(cx, |connection, cx| {
+            connection.token_ended(cx);
+            connection.lease_ends()
+        });
         cx.run_until_parked();
         assert_eq!(
             source.asked.load(Ordering::SeqCst),
             1,
             "the tell asks nothing"
+        );
+        assert!(ends.is_some());
+        assert_eq!(
+            connection.read_with(cx, |connection, _| connection.client.token_ends()),
+            ends,
+            "the end stands"
         );
         // The token then ends, as across a sleep: a request waits for the next.
         let client = connection.update(cx, |connection, _| {
@@ -3479,8 +3503,7 @@ mod tests {
 
     /// A renewal that came while nothing showed the server is owed to the token it would have
     /// renewed: a new source's token (the CLI target changed) drops it with that token's lease,
-    /// and the next watch asks nothing. Before, it asked the new source again, running the CLI
-    /// for nothing.
+    /// and the next watch asks nothing. Before, it asked the new source again for nothing.
     #[gpui::test]
     async fn a_new_source_is_not_asked_for_the_renewal_owed_to_the_one_before(
         cx: &mut TestAppContext,
@@ -3503,6 +3526,47 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(next.asked.load(Ordering::SeqCst), 1, "nothing owed to it");
         assert_eq!(source.asked.load(Ordering::SeqCst), 1);
+    }
+
+    /// A renewal owed while nothing showed the server is answered by a renewal a request asked
+    /// for meanwhile, its token having ended: the next watch asks nothing more. Before, it asked
+    /// again for a token renewed moments ago; the sign-in answered from memory, but the answer
+    /// was taken again and the next renewal rescheduled.
+    #[gpui::test]
+    async fn a_renewal_owed_is_settled_by_one_a_request_asked_for(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let source = Arc::new(Scripted::default());
+        let (connection, _, _) = sourced(source.clone(), cx);
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        cx.run_until_parked();
+        // Past the token's renewal, with nothing showing the server: the renewal is owed.
+        cx.executor().advance_clock(Duration::from_secs(3600));
+        cx.run_until_parked();
+        assert!(connection.read_with(cx, |connection, _| connection.renewal_missed));
+        // The token ends, and an agent's request has the next asked for.
+        let client = connection.update(cx, |connection, _| {
+            connection
+                .client
+                .set_token_ends(Some(SystemTime::now() - Duration::from_secs(1)));
+            connection.client.clone()
+        });
+        let request = std::thread::spawn(move || smol::block_on(client.graphs()).is_ok());
+        for _ in 0..400 {
+            cx.run_until_parked();
+            if request.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(request.join().unwrap());
+        assert_eq!(
+            source.asked.load(Ordering::SeqCst),
+            2,
+            "renewed for the request"
+        );
+        let _watch = connection.update(cx, |connection, cx| connection.watch(cx));
+        cx.run_until_parked();
+        assert_eq!(source.asked.load(Ordering::SeqCst), 2, "nothing owed");
     }
 
     /// A token typed in outlives the lease of the one it replaced: no renewal of that one, owed

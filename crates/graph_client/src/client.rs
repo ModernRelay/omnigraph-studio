@@ -532,9 +532,10 @@ pub struct GraphClient {
     /// The number up to which the holder released the requests waiting
     /// ([`Self::release_waits`]). Shared by every clone.
     waits_released: Arc<std::sync::atomic::AtomicU64>,
-    /// Wakes the requests waiting for the next token when what they wait on changes: each
-    /// waits on the channel current when it looked, which a change replaces, closing it
-    /// ([`Self::wake_waits`]). Shared by every clone.
+    /// Wakes the requests waiting (for the next token; for a read slot or out a 429, should the
+    /// client be retired) when what they wait on changes: each waits on the channel current
+    /// when it looked, which a change replaces, closing it ([`Self::wake_waits`]). Shared by
+    /// every clone.
     waits: Arc<std::sync::Mutex<(smol::channel::Sender<()>, smol::channel::Receiver<()>)>>,
     /// The server's transport, one for every clone and for whatever else reaches the server's
     /// address ([`Self::transport`]): a target whose transport changed is reached through the
@@ -728,8 +729,8 @@ impl GraphClient {
 
     /// Stops the client and every clone of it for good, as when its CLI target is gone or names
     /// a transport Studio cannot use: every request after fails with `why`, and nothing is sent,
-    /// a request waiting for the next token included. What was read is read again, and fails
-    /// so. The first reason given stands.
+    /// a request waiting for the next token, a read slot or out a 429 included, at once. What
+    /// was read is read again, and fails so. The first reason given stands.
     pub fn retire(&self, why: String) {
         if self.retired.set(why).is_ok() {
             self.credential_changes
@@ -820,8 +821,19 @@ impl GraphClient {
         self.wake_waits();
     }
 
-    /// Wakes the requests waiting for the next token to look again, once what they wait on
-    /// changed: the channel each waits on closes as this replaces it.
+    /// The channel a wait sleeps on, which [`Self::wake_waits`] closes. Taken before the wait
+    /// looks at what it waits for, so a change made after the look wakes it.
+    fn wake_channel(&self) -> smol::channel::Receiver<()> {
+        self.waits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .1
+            .clone()
+    }
+
+    /// Wakes the requests waiting (for the next token, for a read slot, out a 429) to look
+    /// again, once what they wait on changed: the channel each waits on closes as this replaces
+    /// it.
     fn wake_waits(&self) {
         *self
             .waits
@@ -871,26 +883,14 @@ impl GraphClient {
         };
         let mut told: Option<Instant> = None;
         loop {
-            // Taken before looking, so a change made after the look wakes this wait.
-            let woken = self
-                .waits
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .1
-                .clone();
+            let woken = self.wake_channel();
             if !self.holds_ended_token() {
                 return true;
             }
-            if Instant::now() >= until || released() || self.retired.get().is_some() {
+            if Instant::now() >= until || released() {
                 return false;
             }
-            let holder = self
-                .ended
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone()
-                .filter(|holder| holder.receiver_count() > 0);
-            let Some(holder) = holder else {
+            let Some(holder) = self.listening_holder() else {
                 return false;
             };
             let now = Instant::now();
@@ -913,6 +913,39 @@ impl GraphClient {
             )
             .await;
         }
+    }
+
+    /// Why the client was retired, once it is ([`Self::retire`], which wakes the waits).
+    async fn retired_now(&self) -> String {
+        loop {
+            let woken = self.wake_channel();
+            if let Some(why) = self.retired.get() {
+                return why.clone();
+            }
+            woken.recv().await.ok();
+        }
+    }
+
+    /// The holder told when a request finds the token held ended, while one listens and the
+    /// client is not retired: whom a wait for the next token can be answered by.
+    fn listening_holder(&self) -> Option<smol::channel::Sender<()>> {
+        if self.retired.get().is_some() {
+            return None;
+        }
+        self.ended
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .filter(|holder| holder.receiver_count() > 0)
+    }
+
+    /// When the token held stops being accepted, for a test.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn token_ends(&self) -> Option<SystemTime> {
+        self.token
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .ends
     }
 
     fn token(&self) -> Option<Arc<str>> {
@@ -980,8 +1013,9 @@ impl GraphClient {
     }
 
     /// Sends with the token held now, keeping only what `limit` says of the body: the rest is
-    /// never read. A caller sending a token waits for a fresh one first, once per attempt
-    /// ([`Self::fresh_token`]); the public routes take none.
+    /// never read. A caller sending a token waits for a fresh one first ([`Self::fresh_token`]),
+    /// once per attempt, and a read again should its token end while it queued for a slot and a
+    /// wait can be answered; the public routes take none.
     async fn send_now(
         &self,
         method: Method,
@@ -1045,7 +1079,8 @@ impl GraphClient {
     }
 
     /// Sends a read once one of the connection's read slots is free; one refused with 429
-    /// waits as asked, without its slot, and goes again.
+    /// waits as asked, without its slot, and goes again. A retire ends the wait for a slot or
+    /// out a 429 at once.
     async fn fetch(
         &self,
         method: Method,
@@ -1079,10 +1114,17 @@ impl GraphClient {
             // or check of a server away serves them all, not a slot's worth in turn.
             let live = self.fresh_token().await;
             let raw = {
-                let _slot = self.read_slots.acquire().await;
+                // Refused at once if the client is retired while the read queues, not when a slot
+                // frees behind reads still under way.
+                let slot = smol::future::or(async { Ok(self.read_slots.acquire().await) }, async {
+                    Err(self.retired_now().await)
+                })
+                .await;
+                let _slot = slot.map_err(ReadError::Transport)?;
                 // A token live when the read queued that ended while it did (a sleep across a long
-                // queue) is waited for again, the slot let go meanwhile.
-                if live && self.holds_ended_token() {
+                // queue) is waited for again, the slot let go meanwhile, where a wait can be
+                // answered ([`Self::listening_holder`]).
+                if live && self.holds_ended_token() && self.listening_holder().is_some() {
                     continue;
                 }
                 self.send_now(
@@ -1101,7 +1143,16 @@ impl GraphClient {
                 let wait = raw.retry_after.unwrap_or(DEFAULT_RETRY_AFTER);
                 if wait <= MAX_RETRY_AFTER {
                     retries += 1;
-                    smol::Timer::after(wait).await;
+                    // Cut short by a retire, whose refusal the next attempt meets.
+                    smol::future::or(
+                        async {
+                            smol::Timer::after(wait).await;
+                        },
+                        async {
+                            self.retired_now().await;
+                        },
+                    )
+                    .await;
                     continue;
                 }
             }
@@ -2702,6 +2753,38 @@ mod tests {
     /// the ended one.
     #[test]
     fn a_read_whose_token_ended_while_it_queued_waits_for_the_next() {
+        use std::sync::atomic::AtomicBool;
+        let (held, slots, sent) = slots_taken();
+        let told = held.token_ended();
+        // Polled by hand: queued for a slot with a live token, which then ends.
+        let woken = Arc::new(Woken(AtomicBool::new(false)));
+        let waker = futures::task::waker(woken.clone());
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut queued = Box::pin(held.schema("g"));
+        assert!(queued.as_mut().poll(&mut context).is_pending(), "queued");
+        held.set_token_ends(Some(SystemTime::now()));
+        slots.release();
+        // With a slot, it finds its token ended, and waits for the next, telling the holder.
+        assert!(queued.as_mut().poll(&mut context).is_pending(), "waits");
+        assert!(told.try_recv().is_ok(), "the holder told");
+        woken.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        held.renew_token(
+            "next".into(),
+            Some(SystemTime::now() + Duration::from_secs(300)),
+        );
+        assert!(
+            woken.0.load(std::sync::atomic::Ordering::SeqCst),
+            "woken by the renewal"
+        );
+        assert!(queued.as_mut().poll(&mut context).is_ready(), "sent");
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), READ_CONCURRENCY + 1, "{sent:?}");
+        assert_eq!(sent.last().map(String::as_str), Some("Bearer next"));
+    }
+
+    /// A client whose read slots are all taken by reads its server answers only once the guard
+    /// returned lets go, and the token each request carried, in order.
+    fn slots_taken() -> (GraphClient, SlotsTaken, Arc<std::sync::Mutex<Vec<String>>>) {
         use std::sync::atomic::{AtomicBool, Ordering};
         let hold = Arc::new(AtomicBool::new(true));
         let sent: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
@@ -2716,7 +2799,6 @@ mod tests {
                     .unwrap_or_default()
                     .to_owned();
                 log.lock().unwrap().push(token);
-                // The reads that fill the slots answer once the test lets them.
                 while holding.load(Ordering::SeqCst) {
                     smol::Timer::after(Duration::from_millis(5)).await;
                 }
@@ -2728,12 +2810,14 @@ mod tests {
             }
         });
         let held = client(http);
-        let told = held.token_ended();
-        let read = |held: &GraphClient| {
-            let held = held.clone();
-            std::thread::spawn(move || block_on(held.schema("g")).ok())
-        };
-        let filling: Vec<_> = (0..READ_CONCURRENCY).map(|_| read(&held)).collect();
+        let filling = (0..READ_CONCURRENCY)
+            .map(|_| {
+                let held = held.clone();
+                std::thread::spawn(move || {
+                    block_on(held.schema("g")).ok();
+                })
+            })
+            .collect();
         let started = Instant::now();
         while sent.lock().unwrap().len() < READ_CONCURRENCY {
             assert!(
@@ -2742,23 +2826,105 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
-        // Queued for a slot with a live token, which then ends.
-        let queued = read(&held);
-        std::thread::sleep(Duration::from_millis(300));
-        held.set_token_ends(Some(SystemTime::now()));
-        hold.store(false, Ordering::SeqCst);
-        for done in filling {
-            done.join().unwrap();
+        (held, SlotsTaken { hold, filling }, sent)
+    }
+
+    /// The reads holding a client's read slots ([`slots_taken`]): let go when released, or when
+    /// dropped, so a test that fails does not leave them waiting.
+    struct SlotsTaken {
+        hold: Arc<std::sync::atomic::AtomicBool>,
+        filling: Vec<std::thread::JoinHandle<()>>,
+    }
+
+    impl SlotsTaken {
+        /// Lets the reads be answered, and waits until they are.
+        fn release(mut self) {
+            self.hold.store(false, std::sync::atomic::Ordering::SeqCst);
+            for read in self.filling.drain(..) {
+                read.join().unwrap();
+            }
         }
-        assert!(told_within(&told), "the queued read waits for the next");
-        held.renew_token(
-            "next".into(),
-            Some(SystemTime::now() + Duration::from_secs(300)),
+    }
+
+    impl Drop for SlotsTaken {
+        fn drop(&mut self) {
+            self.hold.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A waker that notes it was woken, for a request polled by hand.
+    struct Woken(std::sync::atomic::AtomicBool);
+
+    impl futures::task::ArcWake for Woken {
+        fn wake_by_ref(this: &Arc<Self>) {
+            this.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A read queued for a slot is refused as soon as its client is retired, not when a slot
+    /// frees behind reads still under way: polled by hand, it is woken by the retire itself.
+    #[test]
+    fn a_read_queued_when_its_client_is_retired_is_refused_at_once() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::Poll;
+        let (held, slots, sent) = slots_taken();
+        let woken = Arc::new(Woken(AtomicBool::new(false)));
+        let waker = futures::task::waker(woken.clone());
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut queued = Box::pin(held.schema("g"));
+        assert!(queued.as_mut().poll(&mut context).is_pending(), "queued");
+        assert!(!woken.0.load(Ordering::SeqCst));
+        held.retire("the target is gone".into());
+        assert!(woken.0.load(Ordering::SeqCst), "woken by the retire");
+        let Poll::Ready(Err(ReadError::Transport(why))) = queued.as_mut().poll(&mut context) else {
+            panic!("refused at once");
+        };
+        assert_eq!(why, "the target is gone");
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            READ_CONCURRENCY,
+            "nothing more sent"
         );
-        queued.join().unwrap();
-        let sent = sent.lock().unwrap();
-        assert_eq!(sent.len(), READ_CONCURRENCY + 1, "{sent:?}");
-        assert_eq!(sent.last().map(String::as_str), Some("Bearer next"));
+        slots.release();
+    }
+
+    /// A read sleeping out a 429's Retry-After is refused as soon as its client is retired, not
+    /// when the sleep ends, and is not sent again.
+    #[test]
+    fn a_read_sleeping_out_a_429_is_refused_when_its_client_is_retired() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::task::Poll;
+        let sent = Arc::new(AtomicUsize::new(0));
+        let count = sent.clone();
+        let http = FakeHttpClient::create(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            async move {
+                Ok(Response::builder()
+                    .status(429)
+                    .header("retry-after", "30")
+                    .header(CONTRACT_HEADER, CONTRACT)
+                    .body(AsyncBody::from("{}"))
+                    .unwrap())
+            }
+        });
+        let held = client(http);
+        let woken = Arc::new(Woken(AtomicBool::new(false)));
+        let waker = futures::task::waker(woken.clone());
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut read = Box::pin(held.schema("g"));
+        assert!(
+            read.as_mut().poll(&mut context).is_pending(),
+            "sleeping out the 429"
+        );
+        assert_eq!(sent.load(Ordering::SeqCst), 1);
+        assert!(!woken.0.load(Ordering::SeqCst));
+        held.retire("the target is gone".into());
+        assert!(woken.0.load(Ordering::SeqCst), "woken by the retire");
+        let Poll::Ready(Err(ReadError::Transport(why))) = read.as_mut().poll(&mut context) else {
+            panic!("refused at once");
+        };
+        assert_eq!(why, "the target is gone");
+        assert_eq!(sent.load(Ordering::SeqCst), 1, "not sent again");
     }
 
     /// An HTTP client replaced on the client, as when the CLI target's certificate authority
