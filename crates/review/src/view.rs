@@ -233,7 +233,6 @@ struct ReviewData {
 /// the task, under way, done, or failed with why.
 enum SummaryState {
     None,
-    Consent,
     Running {
         _call: Task<()>,
     },
@@ -2476,9 +2475,14 @@ impl ReviewView {
             .start_icon(Icon::new(IconName::ZedAssistant))
             .disabled(running)
             .tooltip(|_, cx| {
-                Tooltip::for_action(
+                Tooltip::with_meta(
                     "A model's summary of the branch, for the reviewer",
-                    &Summarize,
+                    Some(&Summarize),
+                    format!(
+                        "{} go to {}",
+                        summary::TASK.sends,
+                        Models::model_for(summary::TASK.tier, cx)
+                    ),
                     cx,
                 )
             })
@@ -2495,31 +2499,6 @@ impl ReviewView {
         };
         Some(match &self.ai_summary {
             SummaryState::None => return None,
-            SummaryState::Consent => {
-                let model = Models::model_for(summary::TASK.tier, cx);
-                card(cx)
-                    .child(studio_ui::ds::text::body(format!(
-                        "{} go to {model}.",
-                        summary::TASK.sends
-                    )))
-                    .child(
-                        h_flex()
-                            .gap(px(space::SM))
-                            .child(
-                                studio_ui::ds::button("summary-send", "Send")
-                                    .on_click(cx.listener(|this, _, _, cx| this.allow_summary(cx))),
-                            )
-                            .child(
-                                studio_ui::ds::button("summary-not-now", "Not now")
-                                    .style(ButtonStyle::Subtle)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.ai_summary = SummaryState::None;
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                    .into_any_element()
-            }
             SummaryState::Running { .. } => card(cx)
                 .child(
                     h_flex()
@@ -2582,21 +2561,7 @@ impl ReviewView {
             cx.notify();
             return;
         };
-        if !Models::allowed(&summary::TASK, cx) {
-            self.ai_summary = SummaryState::Consent;
-            cx.notify();
-            return;
-        }
         self.start_summary(models, cx);
-    }
-
-    fn allow_summary(&mut self, cx: &mut Context<Self>) {
-        Models::allow(&summary::TASK, cx);
-        match Models::try_global(cx) {
-            Some(models) => self.start_summary(models, cx),
-            None => self.ai_summary = SummaryState::None,
-        }
-        cx.notify();
     }
 
     fn start_summary(&mut self, models: Entity<Models>, cx: &mut Context<Self>) {

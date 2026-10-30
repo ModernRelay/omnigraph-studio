@@ -446,7 +446,6 @@ mod tests {
                 "models.fast",
                 "models.careful",
                 "models.key_stored",
-                "models.data_leaves_for",
             ],
             "agent.env, a map, and panels are edited in settings.json or elsewhere"
         );

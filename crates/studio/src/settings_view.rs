@@ -13,7 +13,7 @@ use std::sync::Arc;
 use editor::{Editor, EditorEvent};
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, Global, HighlightStyle, Render,
-    SharedString, StyledText, Subscription, WeakEntity, Window,
+    SharedString, StyledText, Subscription, Task, WeakEntity, Window,
 };
 use gq_language::SchemaModel;
 use graph_store::{GraphSession, SessionEvent};
@@ -42,8 +42,10 @@ pub struct SettingsView {
     /// The OpenRouter key being typed (spec 019): stored in the keychain on Store, never shown
     /// again.
     key_editor: Entity<Editor>,
-    /// What the last Store or Remove said.
+    /// What the last Store, Remove or Test said.
     key_notice: Option<String>,
+    /// The connection test under way (spec 019).
+    key_test: Option<Task<()>>,
     /// The settings as values, read again when they change rather than at every frame.
     values: SettingsValues,
     /// The window's graph changing, which the tab follows.
@@ -194,6 +196,7 @@ impl SettingsView {
             text_inputs,
             key_editor,
             key_notice: None,
+            key_test: None,
             values: StudioSettings::get(cx).values(),
             _workspace_subscription: None,
             _session_subscription: None,
@@ -423,6 +426,14 @@ impl SettingsView {
                     )
                     .when(stored, |row| {
                         row.child(
+                            ds::button("test-key", "Test")
+                                .disabled(self.key_test.is_some())
+                                .tooltip(Tooltip::text(
+                                    "Ask the fast model for one word, with this key",
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| this.test_key(cx))),
+                        )
+                        .child(
                             ds::button("remove-key", "Remove")
                                 .on_click(cx.listener(|this, _, _, cx| this.remove_key(cx))),
                         )
@@ -456,6 +467,33 @@ impl SettingsView {
         self.key_editor
             .update(cx, |editor, cx| editor.clear(window, cx));
         self.put_key(key, cx);
+    }
+
+    /// The smallest call there is, with the stored key and the fast model: says the model and
+    /// the time, or why it failed.
+    fn test_key(&mut self, cx: &mut Context<Self>) {
+        let Some(models) = Models::try_global(cx) else {
+            return;
+        };
+        let call = models.read(cx).test_connection(cx);
+        self.key_notice = Some("Testing…".to_owned());
+        self.key_test = Some(cx.spawn(async move |this, cx| {
+            let answer = call.await;
+            this.update(cx, |this, cx| {
+                this.key_notice = Some(match answer {
+                    Ok(answer) => format!(
+                        "Connected: {} answered in {:.1} s.",
+                        answer.model,
+                        answer.elapsed.as_secs_f32()
+                    ),
+                    Err(error) => format!("Not connected: {error}"),
+                });
+                this.key_test = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     fn remove_key(&mut self, cx: &mut Context<Self>) {
@@ -619,29 +657,6 @@ fn model_control(target: &Target, values: &SettingsValues, cx: &App) -> AnyEleme
         options.insert(0, (SharedString::from(id.to_owned()), current.clone()));
     }
     dropdown(target, current, Rc::from(options))
-}
-
-/// The tasks allowed to send their input (spec 019), and a button that clears them so each
-/// asks again.
-fn task_list_control(target: &Target, values: &SettingsValues) -> AnyElement {
-    let current = values.value_in(&target.scope, target.field).clone();
-    let names: Vec<String> = serde_json::from_value(current).unwrap_or_default();
-    let target = target.clone();
-    h_flex()
-        .gap(px(space::SM))
-        .items_center()
-        .child(ds::text::muted(if names.is_empty() {
-            "None yet".to_owned()
-        } else {
-            names.join(", ")
-        }))
-        .when(!names.is_empty(), |row| {
-            row.child(
-                ds::button("clear-tasks", "Ask again")
-                    .on_click(move |_, _, cx| target.set(Value::Array(Vec::new()), cx)),
-            )
-        })
-        .into_any_element()
 }
 
 /// The choice of the property that names a type's nodes, as the canvas and the table offer it.
@@ -1034,9 +1049,6 @@ impl Render for SettingsView {
                                 }
                                 (None, FieldKind::Custom(kind)) if kind == "model" => {
                                     model_control(&target, values, cx)
-                                }
-                                (None, FieldKind::Custom(kind)) if kind == "task-list" => {
-                                    task_list_control(&target, values)
                                 }
                                 _ => control(&target, values, fonts.as_ref(), cx),
                             };

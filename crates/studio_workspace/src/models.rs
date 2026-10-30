@@ -13,6 +13,12 @@ use studio_settings::StudioSettings;
 
 pub use model::{Answer, Error, Limits, ModelChoice, Request, Task as ModelTask, Tier};
 
+/// The connection test's answer.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct Probe {
+    pub ok: bool,
+}
+
 /// The keychain item the key is kept under (spec 016's mechanism).
 const KEYCHAIN_KEY: &str = "https://openrouter.ai";
 const KEYCHAIN_USER: &str = "studio";
@@ -173,23 +179,33 @@ impl Models {
         })
     }
 
-    /// Whether the person allowed `task` to send its input.
-    pub fn allowed(task: &ModelTask, cx: &App) -> bool {
-        StudioSettings::get(cx)
-            .models
-            .data_leaves_for
-            .iter()
-            .any(|name| name == task.name)
-    }
-
-    pub fn allow(task: &ModelTask, cx: &mut App) {
-        if Self::allowed(task, cx) {
-            return;
-        }
-        let name = task.name.to_owned();
-        studio_settings::update(cx, move |settings| {
-            settings.models.data_leaves_for.push(name)
-        });
+    /// Tries the key and the fast model with the smallest call there is: the answer is the
+    /// model's name and the time it took, or why it failed.
+    pub fn test_connection(&self, cx: &App) -> Task<Result<Answer<Probe>, Error>> {
+        static PROBE: ModelTask = ModelTask {
+            name: "connection-test",
+            sends: "the word ping",
+            tier: Tier::Fast,
+            limits: Limits {
+                input_bytes: 64,
+                output_tokens: 20,
+                time: Duration::from_secs(15),
+            },
+        };
+        self.call::<Probe>(
+            Request {
+                task: &PROBE,
+                instructions: "Answer with the JSON object only.",
+                input: "ping".into(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"ok": {"type": "boolean"}},
+                    "required": ["ok"],
+                    "additionalProperties": false,
+                }),
+            },
+            cx,
+        )
     }
 
     /// The model the settings name for a tier, or the tier's default when they name none.

@@ -171,8 +171,7 @@ impl Client {
 
 The crate holds no key and reads no setting: the caller gives the model and the key with each
 call. `studio_workspace::models::Models`, one per app, is what views call: it reads the key
-from the keychain, names the model for a task's tier from the settings, keeps the consent
-list, caches the model list, and runs each call off the main thread as a `Task` whose drop
+from the keychain, names the model for a task's tier from the settings, caches the model list, and runs each call off the main thread as a `Task` whose drop
 ends the call. A schema is a `serde_json::Value` the feature builds (its enums come from the
 graph's schema, not a Rust type).
 
@@ -202,12 +201,14 @@ A **Models** section:
 |---|---|---|
 | `models.fast` | `anthropic/claude-haiku-5.5` | model picker |
 | `models.careful` | `anthropic/claude-sonnet-5.5` | model picker |
-| `models.data_leaves_for` | `[]` | the tasks allowed so far, with **Ask again** |
-| `models.key_stored` | `false` | **OpenRouter key**: whether the keychain holds one; a masked field, Store, Remove |
+| `models.key_stored` | `false` | **OpenRouter key**: whether the keychain holds one; a masked field, Store, Test, Remove |
 
 The key row writes the key to the keychain and shows "Stored" or "None"; `key_stored` only
-mirrors that, so the row reads right at start, and the key itself is never in the file. The
-row's description explains BYOK in one line ("Your own Anthropic, OpenAI or Google key, set in
+mirrors that, so the row reads right at start, and the key itself is never in the file.
+**Test** makes the smallest call there is with the stored key and the fast model (the word
+"ping", a one-field schema) and says "Connected: {model} answered in {s} s" or why not
+(`Models::test_connection`). The row's description names what each task sends, and explains
+BYOK in one line ("Your own Anthropic, OpenAI or Google key, set in
 your OpenRouter workspace, is used for that provider's models and billed to that account")
 and a **Provider keys…** button opens `https://openrouter.ai/settings/integrations`. Studio
 holds no provider key: OpenRouter is the one place they live, and a request never carries one.
@@ -220,14 +221,13 @@ key."
 The defaults are the measured ones: Haiku was right on every filter at 1.5–2.8 s, Sonnet wrote
 the best summary. Gemini Flash Lite is a cheaper fast choice the picker offers.
 
-### Consent, once per task
+### What is sent is said once, in Settings
 
-The first call of a task in a graph shows, in the control's place, "{sends}. Send to
-{model}? [Send] [Not now]". Send adds the task name to `models.data_leaves_for` and runs the
-call; Not now leaves the control as it was. The list is global: a task allowed once is allowed
-for every graph, since what it sends is the same kind of data. Clearing the list in Settings
-asks again. The agent panel's writes already leave the machine through the agent's own model,
-so this is the same promise made the same way.
+No call asks first. The key row's description names what each task sends, each control's
+tooltip says the same for its task and the model it goes to, and storing a key is the consent:
+nothing is sent without one. (A first draft asked once per task, in the control's place, and
+kept the allowed tasks in a setting; it was dropped on 2026-10-30 as a step in the way of a
+filter box, since the key is the person's own and the settings row already says what leaves.)
 
 ### First uses
 
@@ -242,6 +242,7 @@ and the bar says "Could not use: {property}". The rest become pills as if added 
 they are seen and removable, and the table reads as it does for any filter. A second sentence
 replaces the filters the first made and keeps ones added by hand. Measured: 1.5–2.8 s on
 Haiku with every answer right; the field shows its spinner meanwhile and Escape cancels.
+The Fill button's tooltip and the Summarize button's name what goes out and to which model.
 
 **Branch summary** (`review`). A **Summarize** button beside the review's sentence
 (`studio_review::Summarize`, ⌘⇧M) calls `branch-summary` (Careful; 64 KB in,
@@ -249,7 +250,7 @@ Haiku with every answer right; the field shows its spinner meanwhile and Escape 
 review groups them: per type, the count by operation, then each change as its operation, id,
 title (the `name`, `title` or `subject` property, cut at 80 characters) and, for an update, the
 names of the properties that changed, at most 25 per type with "… and N more". No values go:
-a title is a value, so this is what the consent names. The answer is `{headline, points[],
+a title is a value, so this is what the settings row and the tooltip name. The answer is `{headline, points[],
 needs_attention[]}`, shown as a card under the sentence with the model's name and "Sent {n}
 records' titles", kept with the review until the head moves. Measured: 9.5 s on Sonnet,
 which counted every type, named the three edits to existing records and spotted duplicate
@@ -294,12 +295,12 @@ A call is never retried. The model list is read at most once a day.
 |---|---|---|
 | OpenRouter is the one provider | Anthropic and OpenAI directly; a provider per key; the agent's login | One key, one request shape and one model picker cover every vendor; routing options give the data policy per call. Direct Anthropic was 0.7 s faster for the same model, not enough for two code paths. The agents' logins cannot make API calls |
 | A provider's own key goes through OpenRouter's BYOK, set in its workspace | Provider keys in Studio's settings, sent per request; Studio registering them through the management API | BYOK is not per request, so Studio holding a provider key would gain nothing; registering keys needs a management key and makes Studio a key manager. One link to the integrations page does it, and the provider's own data policies still apply |
-| Named models by tier, not a router | `openrouter/auto`; `typesafe/jev-router` | Auto was right on every filter but 3–5 s against Haiku's 1.5–2.8 s, and neither router says what it will cost or which model will see the data before the call; a named model is what the consent line names |
+| Named models by tier, not a router | `openrouter/auto`; `typesafe/jev-router` | Auto was right on every filter but 3–5 s against Haiku's 1.5–2.8 s, and neither router says what it will cost or which model will see the data before the call; a named model is what the settings row and the tooltips name |
 | Jev for yes-or-no gates, later, not for the first uses | Jev as the filter or summary engine; Jev picking the table for a sentence | Jev answers typed questions with probabilities, not generated structures: it cannot write a filter or a summary. It was certain and right on read-versus-write, but unsure across 100 types. A gate such as "does this sentence ask for a change" before a filter, or routing a sentence to filter versus query, is its shape, under $0.0001 a call |
 | A schema on every call, parsed in Studio | Prompt for JSON and parse; the agent panel | Without `response_format` both agents misnamed fields every time; with it, every answer parsed. The parse in Studio covers providers that only hint |
 | No headless-CLI fallback | `claude -p --json-schema` or `codex exec --output-schema` without a key | Both are 4–6 s a call and `claude -p` costs 2.6¢ each; a feature that is sometimes five times slower is a worse feature than one that asks for a key |
 | The key lives in the keychain | A `0600` file as the CLI's tokens; settings.json | Spec 016 already keeps its secret there with GPUI's credentials calls; a file would be the first secret file of Studio's own |
-| Consent once per task, named by what it sends | A global switch; a dialog per call | A per-call dialog is VII's loudness; a global switch cannot say what each task sends |
+| No confirmation before a call; the settings row and each control's tooltip say what is sent | A confirmation once per task, kept in a setting (the first draft); a dialog per call | A confirmation in a filter box is a step in the way of every first use, and storing the key is already the person's choice; VI is met by saying what each task sends where the key is set and on each control |
 | Models per tier, not per task | A model per task | Two choices are explainable; a task names its tier and the picker names the price |
 | Answers are proposals in the view's own controls | Apply filters silently; write filled cells at once | III: the person's accept is the write; a filter pill can be removed, a suggested cell discarded |
 | Titles but no values in a summary | Whole changes; ids only | Ids alone gave no summary worth reading; titles gave Sonnet enough to name the invoice amounts and the duplicates |

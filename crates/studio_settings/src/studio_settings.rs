@@ -330,15 +330,13 @@ pub struct ModelSettings {
     #[schemars(title = "Careful model", extend("x-control" = "model"))]
     pub careful: String,
     /// Studio sends a task's input to OpenRouter and the model named above, with your key,
-    /// which the system keychain holds. Nothing is sent without a key. Your own Anthropic,
-    /// OpenAI or Google key, set in your OpenRouter workspace, is used for that provider's
-    /// models and billed to that account.
+    /// which the system keychain holds: a table filter sends the type's property names and
+    /// your sentence, a branch summary the changed records' titles and property names, a
+    /// column fill the row's values in the columns you pick. Nothing is sent without a key.
+    /// Your own Anthropic, OpenAI or Google key, set in your OpenRouter workspace, is used for
+    /// that provider's models and billed to that account.
     #[schemars(title = "OpenRouter key", extend("x-control" = "openrouter-key"))]
     pub key_stored: bool,
-    /// Each task says what it sends before its first call; the ones you allowed are listed
-    /// here. Clear the list and each asks again.
-    #[schemars(title = "Allowed tasks", extend("x-control" = "task-list"))]
-    pub data_leaves_for: Vec<String>,
 }
 
 impl Default for ModelSettings {
@@ -347,7 +345,6 @@ impl Default for ModelSettings {
             fast: "anthropic/claude-haiku-5.5".into(),
             careful: "anthropic/claude-sonnet-5.5".into(),
             key_stored: false,
-            data_leaves_for: Vec::new(),
         }
     }
 }

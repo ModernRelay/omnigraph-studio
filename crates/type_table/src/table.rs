@@ -121,7 +121,6 @@ struct FilterDraft {
 /// use; waiting for the person to allow the task; calling; or failed, with why.
 enum WordsState {
     Typing(Option<String>),
-    Consent(String),
     Running { _call: Task<()> },
     Failed(String),
 }
@@ -145,7 +144,6 @@ struct FillState {
 
 enum FillPhase {
     Typing,
-    Consent(String),
     Running {
         _call: Task<()>,
         done: usize,
@@ -1886,25 +1884,7 @@ impl TypeTable {
             cx.notify();
             return;
         };
-        if !Models::allowed(&fill::TASK, cx) {
-            self.set_fill_phase(FillPhase::Consent(instruction));
-            cx.notify();
-            return;
-        }
         self.start_fill(models, instruction, cx);
-    }
-
-    fn allow_fill(&mut self, cx: &mut Context<Self>) {
-        let instruction = match self.fill.as_ref().map(|fill| &fill.phase) {
-            Some(FillPhase::Consent(instruction)) => instruction.clone(),
-            _ => return,
-        };
-        Models::allow(&fill::TASK, cx);
-        match Models::try_global(cx) {
-            Some(models) => self.start_fill(models, instruction, cx),
-            None => self.set_fill_phase(FillPhase::Typing),
-        }
-        cx.notify();
     }
 
     fn set_fill_phase(&mut self, phase: FillPhase) {
@@ -2169,31 +2149,14 @@ impl TypeTable {
                         format!("Fill {}", studio_ui::plural(count, "row", "rows")),
                     )
                     .style(ButtonStyle::Tinted(TintColor::Accent))
-                    .tooltip(Tooltip::text(
-                        "Each answer lands as the cell's draft; save the drafts to write them",
-                    ))
+                    .tooltip(Tooltip::text(format!(
+                        "{} go to {}. Each answer lands as the cell's draft; save the drafts \
+                         to write them",
+                        fill::TASK.sends,
+                        Models::model_for(fill::TASK.tier, cx)
+                    )))
                     .on_click(cx.listener(|this, _, _, cx| this.run_fill(cx))),
                 );
-            }
-            FillPhase::Consent(_) => {
-                let model = Models::model_for(fill::TASK.tier, cx);
-                row = row
-                    .child(studio_ui::ds::text::muted(format!(
-                        "{} go to {model}.",
-                        fill::TASK.sends
-                    )))
-                    .child(
-                        studio_ui::ds::button("fill-send", "Send")
-                            .on_click(cx.listener(|this, _, _, cx| this.allow_fill(cx))),
-                    )
-                    .child(
-                        studio_ui::ds::button("fill-not-now", "Not now")
-                            .style(ButtonStyle::Subtle)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.set_fill_phase(FillPhase::Typing);
-                                cx.notify();
-                            })),
-                    );
             }
             FillPhase::Running {
                 done,
@@ -7035,23 +6998,7 @@ impl TypeTable {
             cx.notify();
             return;
         };
-        if !Models::allowed(&words::TASK, cx) {
-            self.words = Some(WordsState::Consent(sentence));
-            cx.notify();
-            return;
-        }
         self.start_words(models, sentence, cx);
-    }
-
-    fn allow_words(&mut self, cx: &mut Context<Self>) {
-        if let Some(WordsState::Consent(sentence)) = self.words.take() {
-            Models::allow(&words::TASK, cx);
-            match Models::try_global(cx) {
-                Some(models) => self.start_words(models, sentence, cx),
-                None => self.words = Some(WordsState::Typing(None)),
-            }
-        }
-        cx.notify();
     }
 
     fn start_words(&mut self, models: Entity<Models>, sentence: String, cx: &mut Context<Self>) {
@@ -7103,26 +7050,6 @@ impl TypeTable {
                 .when(running, |field| field.child(studio_ui::ds::spinner())),
         );
         match state {
-            WordsState::Consent(_) => {
-                let model = Models::model_for(words::TASK.tier, cx);
-                row = row
-                    .child(studio_ui::ds::text::muted(format!(
-                        "{} go to {model}.",
-                        words::TASK.sends
-                    )))
-                    .child(
-                        studio_ui::ds::button("words-send", "Send")
-                            .on_click(cx.listener(|this, _, _, cx| this.allow_words(cx))),
-                    )
-                    .child(
-                        studio_ui::ds::button("words-not-now", "Not now")
-                            .style(ButtonStyle::Subtle)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.words = Some(WordsState::Typing(None));
-                                cx.notify();
-                            })),
-                    );
-            }
             WordsState::Typing(Some(note)) => {
                 row = row.child(studio_ui::ds::text::muted(note.clone()));
             }

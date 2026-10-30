@@ -29,8 +29,7 @@
   "models": {
     "fast": "anthropic/claude-haiku-5.5",
     "careful": "anthropic/claude-sonnet-5.5",
-    "key_stored": false,
-    "data_leaves_for": []
+    "key_stored": false
   },
   "graphs": {},
   "panels": {}
