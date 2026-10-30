@@ -157,8 +157,9 @@ pub struct Connection {
     asked_after_refusal: bool,
     /// The credential generation ([`GraphClient::credential_changes`]) a graph read was last
     /// refused under ([`Connection::read_refused`]): the source is asked again once for each
-    /// token held. Also the one a token given after a refusal arrived under, which is that one
-    /// more try: a read it carries that is refused asks nothing until a read with it is taken
+    /// token held. Also the one held once the source answered an ask after a refusal, a probe's
+    /// or a read's, the refused token given back included, which is that one more try: a read
+    /// it carries that is refused asks nothing until a read with it is taken
     /// ([`Connection::read_taken`]) or a quiet replacement gives another token, so a server that
     /// does not admit the account is not asked in a loop by a source that gives a new token each
     /// time, and a token that lapses later is.
@@ -811,10 +812,12 @@ impl Connection {
         if after_refusal && ask == Ask::Connect {
             self._asking = None;
         }
+        // A token given after a refusal, a probe's or a read's, is that refusal's one more try,
+        // the refused one given back included: a read refused under it asks nothing more.
+        if after_refusal {
+            self.read_refused_under = Some(self.client.credential_changes());
+        }
         if changed {
-            if after_refusal {
-                self.read_refused_under = Some(self.client.credential_changes());
-            }
             cx.emit(ConnectionEvent::CredentialChanged);
         }
         let unread_changed = self.token_unread.take().is_some();
@@ -2905,6 +2908,44 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(asked(), 2, "a token typed in is not asked about");
+    }
+
+    /// The ask after a probe's 401 is the one more try for the graph reads too: a read refused
+    /// under the token it gave, the refused one given back included, asks nothing until a read
+    /// with it is taken. Before, a source that gave the refused token back was asked again by
+    /// the next read's 401: one more CLI export, or refresh, for a token already asked about.
+    #[gpui::test]
+    async fn the_ask_after_a_probes_refusal_is_the_reads_one_more_try(cx: &mut TestAppContext) {
+        let source = Arc::new(Scripted::default());
+        source.unnumbered.store(true, Ordering::SeqCst);
+        let (connection, _, _) = sourced(source.clone(), cx);
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        cx.run_until_parked();
+        let asked = || source.asked.load(Ordering::SeqCst);
+        assert_eq!(asked(), 1);
+        // The probe's 401 refuses the token: the source is asked once more, and gives it back.
+        connection.update(cx, |connection, cx| {
+            let failed = Failed {
+                state: ConnectionState::Unauthorized,
+                challenge: Some(Box::new(Challenge {
+                    scheme: "Bearer".into(),
+                    params: vec![("error".into(), "invalid_token".into())],
+                })),
+            };
+            connection.refused(failed, true, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(asked(), 2, "asked once after the probe's refusal");
+        connection.update(cx, |connection, cx| connection.read_refused(cx));
+        cx.run_until_parked();
+        assert_eq!(asked(), 2, "a read refused under that token asked again");
+        // A read taken with it lets a later refusal ask.
+        connection.update(cx, |connection, cx| {
+            connection.read_taken();
+            connection.read_refused(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(asked(), 3);
     }
 
     /// A renewal due while the source is asked again after a refused read leaves that ask to

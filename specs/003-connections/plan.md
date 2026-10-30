@@ -205,12 +205,15 @@ dialog by keyboard), X (capabilities from the served document).
      each resolved by Omnigraph's code. It is asked for when the server connects, before
      anything is sent, and a graph's first reads wait until it is in (`Connection::token_ready`,
      since 2026-10-22); once more after a 401 that refused a token from it (one that refused none,
-     the token never arriving, asks nothing), each kind bounded apart: after a probe's 401, not
-     again until a connect is ready; after a graph read's, not again until another token replaces
-     it or a read with it is taken; on the
-     person's Refresh, not when a graph is first shown, whose first reads use the connect's token
-     (since 2026-10-22; before, opening a graph asked twice and dropped a token typed in); when
-     the target's entry or token file changes; and when a CLI is installed, upgraded or removed. The secure store
+     the token never arriving, asks nothing); on the person's Refresh, not when a graph is first
+     shown, whose first reads use the connect's token (since 2026-10-22; before, opening a graph
+     asked twice and dropped a token typed in); when the target's entry or token file changes;
+     and when a CLI is installed, upgraded or removed. After an ask after a refusal, a graph
+     read's 401 asks nothing until a read is taken or the credential changes otherwise (a
+     renewal's or a Refresh's token, a new transport); after a probe's ask, a probe's 401 asks
+     nothing until a connect is ready, the token is asked for anew (Refresh, a change to the CLI)
+     or a new source is taken (since 2026-10-30; before, a read's 401 asked again when the
+     probe's ask gave the refused token back). The secure store
      cannot be watched, so nothing polls it. Each ask runs `credentials status` first: a
      credential it finds missing (`absent`, `unavailable`) is said (`No credential is configured
      for 'personal': its token file … is not there`) and nothing is exported or sent. Then the
