@@ -137,8 +137,6 @@ pub struct Connection {
     /// a server that sends no challenge, the request carried one. Otherwise the server asks for
     /// a token rather than refusing one.
     pub refused_with_token: bool,
-    /// Whether the client holds a token, so the next request sends one.
-    has_token: bool,
     /// The token held is the one the current source last gave: an ask that fails for a reason
     /// that may pass leaves it in use while it lives ([`Self::keeps_token`]).
     token_from_source: bool,
@@ -172,11 +170,15 @@ pub struct Connection {
     /// Asks for the next token when a request finds the one held ended
     /// ([`GraphClient::token_ended`]), from the first connect on.
     _ended: Option<Task<()>>,
-    _task: Option<Task<()>>,
+    /// The connect under way ([`Connection::connect`]) and its step: asking its token source
+    /// for a token (an ask a window waits on outlives a Cancel), or probing the server with what
+    /// it holds.
+    _connect: Option<(ConnectStep, Task<()>)>,
     /// The graph list read again after it could not be read ([`Connection::list_graphs_again`]).
     _listing: Option<Task<()>>,
-    /// The next health re-check (spec 003).
-    _health_check: Option<Task<()>>,
+    /// The next health re-check (spec 003), or one a request started because it found the token
+    /// ended while the server could not be reached ([`Connection::token_ended`]).
+    _health_check: Option<HealthCheck>,
     /// One more holder than the watches held ([`ConnectionWatch`]): health is checked only
     /// while one is.
     watchers: Rc<()>,
@@ -210,6 +212,10 @@ pub struct Connection {
     _renewal: Option<Task<()>>,
     /// The renewal came while nothing watched the server: the next watch asks.
     renewal_missed: bool,
+    /// How many checks in a row have come after a sign-in's service did not answer: the next
+    /// comes after the ready interval, doubled for each, up to a failed check's. Any answer
+    /// starts it again.
+    unanswered_checks: u32,
 }
 
 /// A sign-in under way.
@@ -292,6 +298,25 @@ fn told(told: &Told) -> Option<End> {
     *told.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// A health check under way ([`Connection::check_health_after`]).
+struct HealthCheck {
+    /// For one a request started because it found the token ended: the requests it answers
+    /// for, those waiting when it started ([`GraphClient::waits_begun`]). It is made whether
+    /// or not anything watches, and its answer connects again, which asks for the next token,
+    /// or releases those requests.
+    for_waits: Option<u64>,
+    _task: Task<()>,
+}
+
+/// A connect's step ([`Connection::connect`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectStep {
+    /// Asking the token source for a token, whose answer goes on with the connect.
+    Asking,
+    /// Probing the server with the token held.
+    Probing,
+}
+
 /// What an ask for a token is for, which decides what its answer does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ask {
@@ -339,7 +364,7 @@ impl HttpClient for Unusable {
 /// Health re-check interval after a failure (spec 003).
 pub(crate) const FAILED_CHECK_INTERVAL: Duration = Duration::from_secs(120);
 /// Interval when settings are not loaded, as in tests.
-const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+pub(crate) const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 impl EventEmitter<ConnectionEvent> for Connection {}
 
@@ -386,7 +411,6 @@ impl Connection {
         token: Option<String>,
         http: Arc<dyn HttpClient>,
     ) -> anyhow::Result<Self> {
-        let has_token = token.is_some();
         let client = GraphClient::new(&server.url, token, http.clone())?;
         Ok(Self {
             server,
@@ -398,7 +422,6 @@ impl Connection {
             token_unread: None,
             token_unanswered: false,
             refused_with_token: false,
-            has_token,
             token_from_source: false,
             token_source: None,
             token_given: false,
@@ -409,7 +432,7 @@ impl Connection {
             hurry: Arc::default(),
             _asking: None,
             _ended: None,
-            _task: None,
+            _connect: None,
             _listing: None,
             _health_check: None,
             watchers: Rc::new(()),
@@ -425,6 +448,7 @@ impl Connection {
             left: Kept::Nothing,
             _renewal: None,
             renewal_missed: false,
+            unanswered_checks: 0,
         })
     }
 
@@ -492,6 +516,7 @@ impl Connection {
             self.refresh_token(cx);
         } else if had {
             self.token_given = false;
+            self.forget_lease();
             self.replace_token(None, None, cx);
         }
     }
@@ -529,12 +554,11 @@ impl Connection {
         self.token_given = false;
         self.token_answered = true;
         self.client.set_token(None);
-        self.has_token = false;
         self.token_from_source = false;
         self.token_unanswered = false;
         self.client.set_http(Arc::new(Unusable(why.clone())));
         self._asking = None;
-        self._task = None;
+        self._connect = None;
         self._listing = None;
         self._health_check = None;
         self.state = ConnectionState::Unreachable(why);
@@ -551,7 +575,7 @@ impl Connection {
     /// refused. A token typed in, or a server without a source, is not asked about. A refused
     /// write is never sent again.
     pub fn read_refused(&mut self, cx: &mut Context<Self>) {
-        if !self.has_token || !self.asks_token_source() || !self.token_answered {
+        if !self.has_token() || !self.asks_token_source() || !self.token_answered {
             return;
         }
         let generation = self.client.credential_changes();
@@ -628,6 +652,11 @@ impl Connection {
         let asking = cx.spawn(async move |this, cx| {
             let answer = cx.background_executor().spawn(source.token(hurry)).await;
             this.update(cx, |this, cx| {
+                if ask == Ask::Connect {
+                    this._connect = None;
+                } else {
+                    this._asking = None;
+                }
                 // Taken only while the token still comes from the source asked: one a sign-out,
                 // a sign-in or the CLI's credential replaced meanwhile could put back a token
                 // that was dropped, the person's signed-out one among them.
@@ -652,7 +681,7 @@ impl Connection {
             .ok();
         });
         if ask == Ask::Connect {
-            self._task = Some(asking);
+            self._connect = Some((ConnectStep::Asking, asking));
         } else {
             self._asking = Some((ask, source_asked, asking));
         }
@@ -672,12 +701,17 @@ impl Connection {
     /// Whether a failure that may pass leaves the token held in use: the current source gave
     /// it, and it has not ended.
     fn keeps_token(&self) -> bool {
-        self.has_token
-            && self.token_from_source
-            && self
-                .lease
-                .as_ref()
-                .is_none_or(|lease| SystemTime::now() < lease.expires_at)
+        self.has_token() && self.token_from_source && !self.client.holds_ended_token()
+    }
+
+    /// The step of the connect under way, if one is.
+    fn connect_step(&self) -> Option<ConnectStep> {
+        self._connect.as_ref().map(|(step, _)| *step)
+    }
+
+    /// Whether the client holds a token, so the next request sends one.
+    fn has_token(&self) -> bool {
+        self.client.holds_token()
     }
 
     /// The ask under way of the source in use, if any. One of a source replaced since (a
@@ -696,9 +730,6 @@ impl Connection {
     /// while a window waited for its token ([`Self::cancel`]) is taken, and the connection
     /// stays as Cancel left it.
     fn token_answered(&mut self, answer: Result<Token, NoToken>, ask: Ask, cx: &mut Context<Self>) {
-        if ask != Ask::Connect {
-            self._asking = None;
-        }
         let connecting = ask == Ask::Connect && self.state == ConnectionState::Connecting;
         let was_ready = self.token_ready();
         self.token_answered = true;
@@ -731,26 +762,24 @@ impl Connection {
         // A renewal, the same holder's next short-lived token while the connection stands:
         // nothing read with the last one is read again.
         let renewal = ask == Ask::Renewal
-            && self.has_token
+            && self.has_token()
             && lease.is_some()
             && lease.as_ref().map(|lease| &lease.holder)
                 == self.lease.as_ref().map(|lease| &lease.holder);
         self.lease = lease;
         self.token_from_source = true;
         self.token_unanswered = false;
+        // A request that would send it after its end waits for the next, which this asks for.
+        let ends = self.lease.as_ref().map(|lease| lease.expires_at);
         if renewal {
-            self.client.renew_token(token.into_string());
-            self.client
-                .set_token_ends(self.lease.as_ref().map(|lease| lease.expires_at));
+            self.client.renew_token(token.into_string(), ends);
             cx.emit(ConnectionEvent::StateChanged);
             cx.notify();
             return;
         }
-        self.has_token = true;
-        let changed = self.client.set_token(Some(token.into_string()));
-        // A request that would send it after then waits for the next, which this asks for.
-        self.client
-            .set_token_ends(self.lease.as_ref().map(|lease| lease.expires_at));
+        let changed = self
+            .client
+            .set_token_ending(Some(token.into_string()), ends);
         if changed {
             if ask == Ask::AfterRefusal {
                 self.read_refused_under = Some(self.client.credential_changes());
@@ -775,7 +804,7 @@ impl Connection {
         }
         if let Some(source) = &self.oauth {
             self.sign_in = SignIn::SignedIn {
-                service: source.service().host(),
+                service: source.host(),
                 account: source.account(),
             };
         }
@@ -815,10 +844,8 @@ impl Connection {
     /// one that could not answer leaves a sign-in standing, and is asked again at the next
     /// health check ([`Self::token_unanswered`]).
     fn no_token(&mut self, no: NoToken, connecting: bool, cx: &mut Context<Self>) {
-        self.has_token = false;
         self.token_from_source = false;
-        self.lease = None;
-        self._renewal = None;
+        self.forget_lease();
         if self.client.set_token(None) {
             cx.emit(ConnectionEvent::CredentialChanged);
         }
@@ -832,7 +859,7 @@ impl Connection {
             match &mut self.signing_in {
                 None => {
                     self.sign_in = SignIn::Offered {
-                        service: source.service().host(),
+                        service: source.host(),
                         why: Some(no.why),
                     };
                     // The service ended it: a token it did not end (a refusal other than an
@@ -850,7 +877,7 @@ impl Connection {
             self.token_unread = Some(no.why);
         }
         if connecting || self.state != ConnectionState::Idle {
-            self._task = None;
+            self._connect = None;
             self.refused_with_token = false;
             self.state = ConnectionState::Unauthorized;
             self.schedule_health_check(cx);
@@ -905,6 +932,10 @@ impl Connection {
     pub fn set_token(&mut self, token: Option<String>, cx: &mut Context<Self>) {
         let was_ready = self.token_ready();
         self.token_given = true;
+        // Its lease was the token replaced's: no renewal of that one, under way or owed,
+        // replaces this.
+        self.forget_lease();
+        self._asking = None;
         if !was_ready {
             cx.emit(ConnectionEvent::TokenReady);
         }
@@ -918,7 +949,6 @@ impl Connection {
         unread: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        self.has_token = token.is_some();
         self.token_from_source = false;
         self.token_unanswered = false;
         if self.client.set_token(token) {
@@ -952,7 +982,7 @@ impl Connection {
                 ConnectionState::Idle | ConnectionState::Connecting
             )
         {
-            self.check_health_after(Duration::ZERO, cx);
+            self.check_health_after(Duration::ZERO, None, cx);
         }
         watch
     }
@@ -971,7 +1001,7 @@ impl Connection {
         if self.state == ConnectionState::Connecting {
             let window_waits = !self.token_ready() && self.hurry.load(Ordering::SeqCst);
             if !window_waits {
-                self._task = None;
+                self._connect = None;
             }
             // A check already scheduled would connect again, or mark the server down.
             self._health_check = None;
@@ -995,7 +1025,7 @@ impl Connection {
             return;
         }
         let client = self.client.clone();
-        let token_sent = self.has_token;
+        let token_sent = self.has_token();
         self._listing = Some(cx.spawn(async move |this, cx| {
             let listed = cx
                 .background_executor()
@@ -1020,7 +1050,8 @@ impl Connection {
         self.state = ConnectionState::Connecting;
         // The probe reads the list itself.
         self._listing = None;
-        // The probe schedules the next check when it ends.
+        // The probe schedules the next check when it ends; one started for an ended token is
+        // this connect's to answer.
         self._health_check = None;
         cx.emit(ConnectionEvent::StateChanged);
         cx.notify();
@@ -1032,14 +1063,15 @@ impl Connection {
         let client = self.client.clone();
         // A new token connects again, replacing this probe: the probe's requests carry the
         // token held now.
-        let token_sent = self.has_token;
-        self._task = Some(cx.spawn(async move |this, cx| {
+        let token_sent = self.has_token();
+        let probe = cx.spawn(async move |this, cx| {
             // Off the main thread, so its round trip is not lengthened by a busy frame.
             let outcome = cx
                 .background_executor()
                 .spawn(async move { probe(&client).await })
                 .await;
             this.update(cx, |this, cx| {
+                this._connect = None;
                 match outcome {
                     Probe::Ready {
                         health,
@@ -1059,7 +1091,8 @@ impl Connection {
                 this.schedule_health_check(cx);
             })
             .ok();
-        }));
+        });
+        self._connect = Some((ConnectStep::Probing, probe));
     }
 
     /// From the first connect on, asks for the next token when a request finds the one held
@@ -1078,27 +1111,45 @@ impl Connection {
         }));
     }
 
-    /// A request found the token held ended, as after the machine slept past its renewal. An ask
-    /// under way gives the next; otherwise a server ready or connecting has its source asked for
-    /// it, which the request waits for. Where nothing asks (the server refused the token or
-    /// cannot be reached, the token is not a lease's), the request sends what is held.
+    /// A request found the token held ended, as after the machine slept past its renewal. A
+    /// tell that comes once the token was renewed or replaced (a request waiting tells again
+    /// each second) finds the one held standing, and changes nothing. An ask under way, or a
+    /// connect's ask (one a window waits on outlives a Cancel), gives the next; a ready server,
+    /// or a connect probing with that token, has its source asked for it, which the request
+    /// waits for. A server that could not be reached is checked at once, whether or not
+    /// anything shows it: back, it connects again, which asks; still away, the requests waiting
+    /// when the check began are released, and the next request to find it so has it checked
+    /// again, as the network may be back by then. Elsewhere (the server refused the token, a
+    /// connect was cancelled, no source to ask) nothing gives the next now, and the requests
+    /// waiting are released. The end stands throughout, so a request during a later connect's
+    /// ask waits for its token.
     fn token_ended(&mut self, cx: &mut Context<Self>) {
-        if self.asking().is_some() {
+        if !self.client.holds_ended_token()
+            || self.asking().is_some()
+            || self.connect_step() == Some(ConnectStep::Asking)
+        {
             return;
         }
-        let ended = self
-            .lease
-            .as_ref()
-            .is_some_and(|lease| SystemTime::now() >= lease.expires_at);
-        if ended
-            && matches!(
-                self.state,
-                ConnectionState::Ready | ConnectionState::Connecting
-            )
-        {
-            self.ask_for_token(Ask::Renewal, cx);
-        } else {
-            self.client.set_token_ends(None);
+        let asks = self.asks_token_source();
+        match self.state {
+            ConnectionState::Ready if asks => self.ask_for_token(Ask::Renewal, cx),
+            ConnectionState::Connecting
+                if asks && self.connect_step() == Some(ConnectStep::Probing) =>
+            {
+                self.ask_for_token(Ask::Renewal, cx)
+            }
+            // One check at a time, however many requests found the token ended.
+            ConnectionState::Unreachable(_) => {
+                if !self
+                    ._health_check
+                    .as_ref()
+                    .is_some_and(|check| check.for_waits.is_some())
+                {
+                    let waiting = self.client.waits_begun();
+                    self.check_health_after(Duration::ZERO, Some(waiting), cx);
+                }
+            }
+            _ => self.client.release_waits(self.client.waits_begun()),
         }
     }
 
@@ -1538,7 +1589,7 @@ impl Connection {
                     Err(why) => {
                         this.sign_in = match (&this.oauth, replaced) {
                             (Some(held), _) => SignIn::Offered {
-                                service: held.service().host(),
+                                service: held.host(),
                                 why: Some(why),
                             },
                             (None, Some((_, ended))) => {
@@ -1585,8 +1636,7 @@ impl Connection {
         if !was_ready {
             cx.emit(ConnectionEvent::TokenReady);
         }
-        self.lease = None;
-        self._renewal = None;
+        self.forget_lease();
         let finishing = self.end_sign_ins(Some(source.clone()), End::SignOut, cx);
         // One finishing is kept, then signed out of, and a sign-in is offered after that, as
         // none can start before.
@@ -1594,7 +1644,7 @@ impl Connection {
             SignIn::NotOffered
         } else {
             SignIn::Offered {
-                service: source.service().host(),
+                service: source.host(),
                 why: None,
             }
         };
@@ -1716,7 +1766,7 @@ impl Connection {
     /// Whether `source`'s keychain item is the target's under its name now: one made under a
     /// name the target has since lost is that name's ([`Self::rename`]).
     fn names(&self, source: &OAuthSource) -> bool {
-        source.key() == source.service().key(&self.server.name)
+        source.key() == source.service_key(&self.server.name)
     }
 
     /// Ends `source` for `how` in its item's keychain turn ([`OAuthSource::end`]), and says what
@@ -1798,9 +1848,7 @@ impl Connection {
         self.asked_after_refusal = false;
         // The token held, if any, is another credential's: the sign-in's failure does not keep it.
         self.token_from_source = false;
-        self.lease = None;
-        self._renewal = None;
-        self.renewal_missed = false;
+        self.forget_lease();
         self.connect(cx);
     }
 
@@ -1815,9 +1863,16 @@ impl Connection {
         self.end_sign_ins(held, End::Dropped, cx);
         self.service = None;
         self.sign_in_details = None;
+        self.forget_lease();
+        self.sign_in = SignIn::NotOffered;
+    }
+
+    /// Forgets the lease of the token held, with the renewal of it scheduled or owed: the token
+    /// was replaced or dropped, or the sign-in that gave it ended.
+    fn forget_lease(&mut self) {
         self.lease = None;
         self._renewal = None;
-        self.sign_in = SignIn::NotOffered;
+        self.renewal_missed = false;
     }
 
     /// Asks for the next short-lived token `at` that time, if a view still shows the server;
@@ -1841,32 +1896,55 @@ impl Connection {
         }));
     }
 
-    /// Checks `/healthz` again after the settings' interval while the server is ready, or its
-    /// sign-in's service did not answer, and every two minutes after another failure. A
-    /// recovered server is probed in full again. A timer stands still while the machine sleeps,
-    /// so the first check after a wake comes within one interval of it.
+    /// Checks `/healthz` again after the settings' interval while the server is ready; after a
+    /// sign-in's service did not answer, after that interval doubled for each check in a row it
+    /// has not ([`Self::unanswered_checks`]), up to two minutes; and every two minutes after
+    /// another failure. A recovered server is probed in full again. A timer stands still while
+    /// the machine sleeps, so the first check after a wake comes within one interval of it.
     fn schedule_health_check(&mut self, cx: &mut Context<Self>) {
-        // A source that could not answer (the network back after a wake) is asked again at the
-        // next check, which comes as often as a ready server's.
-        let interval = if self.state == ConnectionState::Ready || self.token_unanswered {
-            cx.try_global::<StudioSettings>()
-                .map(|settings| Duration::from_secs(settings.studio.health_check_seconds.max(5)))
-                .unwrap_or(DEFAULT_CHECK_INTERVAL)
+        let ready = cx
+            .try_global::<StudioSettings>()
+            .map(|settings| Duration::from_secs(settings.studio.health_check_seconds.max(5)))
+            .unwrap_or(DEFAULT_CHECK_INTERVAL);
+        let unanswered = self.token_unanswered && self.oauth.is_some();
+        if !unanswered {
+            self.unanswered_checks = 0;
+        }
+        let interval = if self.state == ConnectionState::Ready {
+            ready
+        } else if unanswered {
+            // A sign-in's service that could not answer (the network back after a wake) is asked
+            // again soon, then less often while it does not answer; a CLI that could not answer
+            // is run again at a failed check's pace.
+            let wait = ready
+                .saturating_mul(1 << self.unanswered_checks.min(8))
+                .min(FAILED_CHECK_INTERVAL);
+            self.unanswered_checks += 1;
+            wait
         } else {
             FAILED_CHECK_INTERVAL
         };
-        self.check_health_after(interval, cx);
+        self.check_health_after(interval, None, cx);
     }
 
     /// Checks `/healthz` after `wait`, unless nothing watches the server by then: that check
-    /// is missed, the checks stop, and the next watch makes it ([`Connection::watch`]).
-    fn check_health_after(&mut self, wait: Duration, cx: &mut Context<Self>) {
+    /// is missed, the checks stop, and the next watch makes it ([`Connection::watch`]). One a
+    /// request started for an ended token ([`HealthCheck::for_waits`], [`Self::token_ended`])
+    /// is made either way.
+    fn check_health_after(
+        &mut self,
+        wait: Duration,
+        for_waits: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        // The checks go on: none is missed for the next watch to make.
+        self.check_missed = false;
         let client = self.client.clone();
-        self._health_check = Some(cx.spawn(async move |this, cx| {
+        let check = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(wait).await;
             let watched = this
                 .update(cx, |this, _| {
-                    this.check_missed = !this.watched();
+                    this.check_missed = !this.watched() && for_waits.is_none();
                     !this.check_missed
                 })
                 .unwrap_or(false);
@@ -1882,15 +1960,24 @@ impl Connection {
                     (health, started.elapsed())
                 })
                 .await;
-            this.update(cx, |this, cx| this.apply_health_check(health, latency, cx))
-                .ok();
-        }));
+            this.update(cx, |this, cx| {
+                // Answered: it is under way no more, whatever comes next.
+                this._health_check = None;
+                this.apply_health_check(health, latency, for_waits, cx)
+            })
+            .ok();
+        });
+        self._health_check = Some(HealthCheck {
+            for_waits,
+            _task: check,
+        });
     }
 
     fn apply_health_check(
         &mut self,
         health: Result<graph_client::ServerHealth, ReadError>,
         latency: Duration,
+        for_waits: Option<u64>,
         cx: &mut Context<Self>,
     ) {
         // How soon a ready server whose check failed once is checked again.
@@ -1907,7 +1994,7 @@ impl Connection {
             cx.notify();
         }
         if first_failure {
-            self.check_health_after(RECHECK, cx);
+            self.check_health_after(RECHECK, None, cx);
             return;
         }
         let next = match served(health) {
@@ -1934,6 +2021,14 @@ impl Connection {
             self.state = next;
             cx.emit(ConnectionEvent::StateChanged);
             cx.notify();
+        }
+        // Not back: the requests that waited for this check send what is held. One that began
+        // waiting during it waits on, and tells again, which checks again: the network may have
+        // come back after this check began.
+        if let Some(through) = for_waits
+            && self.state != ConnectionState::Ready
+        {
+            self.client.release_waits(through);
         }
         // A renewal the wall clock has passed is asked now. The executor's timers stand still
         // while the machine sleeps, so after a sleep the renewal's own timer fires that much late,
@@ -2155,7 +2250,7 @@ mod tests {
         cx.run_until_parked();
         connection.read_with(cx, |c, _| {
             assert_eq!(c.state, ConnectionState::Ready);
-            assert!(c.has_token);
+            assert!(c.has_token());
         });
         // A Refresh waits for its answer while the target is made anonymous.
         let (answer, gate) = oneshot::channel();
@@ -2164,11 +2259,11 @@ mod tests {
         cx.run_until_parked();
         connection.update(cx, |c, cx| c.take_token_from(None, cx));
         cx.run_until_parked();
-        connection.read_with(cx, |c, _| assert!(!c.has_token));
+        connection.read_with(cx, |c, _| assert!(!c.has_token()));
         answer.send(Token::typed("stale".into())).ok();
         cx.run_until_parked();
         connection.read_with(cx, |c, _| {
-            assert!(!c.has_token, "the replaced source's answer was taken")
+            assert!(!c.has_token(), "the replaced source's answer was taken")
         });
     }
 
@@ -3172,15 +3267,16 @@ mod tests {
         });
     }
 
-    /// A token whose lease has ended is not sent: a request has the
-    /// next asked for and goes with it, the connect's own probe included. Before, a request sent
+    /// A token whose lease has ended is not sent: a request has the next asked for and goes
+    /// with it, the connect's own probe included. Before, a request sent
     /// between waking from a sleep and the next health check carried the ended token, and a
     /// write had to be sent again.
     #[gpui::test]
     async fn a_request_with_an_ended_token_waits_for_the_next(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let source = Arc::new(Scripted::default());
-        // The first token has ended by the time it is sent, as one held across a sleep has.
+        // The first token is over when given, as one a clock stepped past is: the connect's
+        // probe has the next asked for and goes with it.
         *source.lives.lock().unwrap() = vec![Duration::ZERO];
         let (connection, sent) = sourced(source.clone(), cx);
         connection.update(cx, |connection, cx| connection.connect(cx));
@@ -3200,11 +3296,38 @@ mod tests {
         assert_eq!(
             source.asked.load(Ordering::SeqCst),
             2,
-            "the next token asked for"
+            "asked again for the probe"
         );
         assert_eq!(
             *sent.lock().unwrap(),
             ["Bearer token 2"],
+            "the over one never sent"
+        );
+
+        // A ready server's token ends, as across a sleep: a request has the next asked for.
+        let client = connection.update(cx, |connection, _| {
+            let ended = SystemTime::now() - Duration::from_secs(1);
+            connection.lease.as_mut().unwrap().expires_at = ended;
+            connection.client.set_token_ends(Some(ended));
+            connection.client.clone()
+        });
+        let request = std::thread::spawn(move || smol::block_on(client.graphs()).is_ok());
+        for _ in 0..400 {
+            cx.run_until_parked();
+            if request.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(request.join().unwrap());
+        assert_eq!(
+            source.asked.load(Ordering::SeqCst),
+            3,
+            "the next token asked for"
+        );
+        assert_eq!(
+            *sent.lock().unwrap(),
+            ["Bearer token 2", "Bearer token 3"],
             "the ended one never sent"
         );
 
@@ -3232,15 +3355,419 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
-        assert_eq!(source.asked.load(Ordering::SeqCst), 2, "nothing asked");
+        assert_eq!(source.asked.load(Ordering::SeqCst), 3, "nothing asked");
+
+        // The server could not be reached, and is back (the network after a wake): a request with
+        // the ended token has it checked at once, which connects again and asks for the next, and
+        // goes with that.
+        let _watch = connection.update(cx, |connection, cx| connection.watch(cx));
+        let client = connection.update(cx, |connection, _| {
+            connection.state = ConnectionState::Unreachable("the network was down".into());
+            let ended = SystemTime::now() - Duration::from_secs(1);
+            connection.lease.as_mut().unwrap().expires_at = ended;
+            connection.client.set_token_ends(Some(ended));
+            connection.client.clone()
+        });
+        let request = std::thread::spawn(move || smol::block_on(client.graphs()).is_ok());
+        for _ in 0..400 {
+            cx.run_until_parked();
+            if request.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(request.join().unwrap());
+        assert_eq!(
+            source.asked.load(Ordering::SeqCst),
+            4,
+            "asked once the server answered"
+        );
+        assert_eq!(sent.lock().unwrap().pop().unwrap(), "Bearer token 4");
+
+        // The person cancels a slow connect, and the CLI target changes: the connection idles
+        // with the old source's token, which ends, until a window opens one of its graphs and
+        // waits for the new source's token.
+        let (stalled, gate) = oneshot::channel::<()>();
+        *source.gate.lock().unwrap() = Some(gate.shared());
+        connection.update(cx, |connection, cx| {
+            let http = connection.http.clone();
+            connection.replace_http(http, cx);
+        });
+        cx.run_until_parked();
+        connection.update(cx, |connection, cx| {
+            connection.cancel(cx);
+            connection.take_token_from(Some(source.clone() as Arc<dyn TokenSource>), cx);
+        });
+        drop(stalled);
+        assert_eq!(source.asked.load(Ordering::SeqCst), 5);
+        // Idle, nothing gives the next: a request goes at once with what is held, and the end
+        // stands for the next connect.
+        let client = connection.update(cx, |connection, _| {
+            connection
+                .client
+                .set_token_ends(Some(SystemTime::now() - Duration::from_secs(1)));
+            connection.client.clone()
+        });
+        let before = sent.lock().unwrap().len();
+        let idle = client.clone();
+        let started = std::time::Instant::now();
+        let request = std::thread::spawn(move || smol::block_on(idle.graphs()).is_ok());
+        for _ in 0..400 {
+            cx.run_until_parked();
+            if request.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(request.join().unwrap());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(sent.lock().unwrap()[before..], ["Bearer token 4"]);
+        let (answer, gate) = oneshot::channel::<()>();
+        *source.gate.lock().unwrap() = Some(gate.shared());
+        connection.update(cx, |connection, cx| connection.wait_for_token(cx));
+        // A request while the connect asks waits for its token, and still does after a Cancel
+        // leaves the ask to the waiting window, past the second it tells again.
+        let before = sent.lock().unwrap().len();
+        let request = std::thread::spawn(move || smol::block_on(client.graphs()).is_ok());
+        for _ in 0..30 {
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        connection.update(cx, |connection, cx| connection.cancel(cx));
+        for _ in 0..150 {
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!request.is_finished(), "waits for the ask's token");
+        assert_eq!(
+            connection.read_with(cx, |connection, _| connection.state.clone()),
+            ConnectionState::Idle
+        );
+        answer.send(()).unwrap();
+        for _ in 0..400 {
+            cx.run_until_parked();
+            if request.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(request.join().unwrap());
+        assert_eq!(source.asked.load(Ordering::SeqCst), 6);
+        assert_eq!(sent.lock().unwrap()[before..], ["Bearer token 6"]);
     }
 
-    /// A renewal the source cannot answer after the token held ended, as when the machine wakes
-    /// before the network, leaves nothing to send and says the sign-in is not answering; the
-    /// next health check, which comes as often as a ready server's, connects again, which asks
-    /// again. Before, that check waited the two minutes of a failed one.
+    /// A request still waiting when the renewal lands may tell once more, as it does each
+    /// second; that tell finds the renewed token standing, asks nothing, and leaves its end, so
+    /// once that one ends a request waits for the next. Before, the tell took the renewed token
+    /// for one that does not end, and a request after its end sent it.
     #[gpui::test]
-    async fn a_renewal_that_failed_after_its_token_ended_is_asked_again_at_the_next_check(
+    async fn a_late_tell_leaves_the_renewed_tokens_end_standing(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let source = Arc::new(Scripted::default());
+        *source.lives.lock().unwrap() = vec![Duration::from_secs(2)];
+        let (connection, sent) = sourced(source.clone(), cx);
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            connection.read_with(cx, |connection, _| connection.state.clone()),
+            ConnectionState::Ready
+        );
+        assert_eq!(source.asked.load(Ordering::SeqCst), 1);
+        // A tell while the token held stands, as one sent before a renewal landed comes.
+        let ends = connection.update(cx, |connection, cx| {
+            connection.token_ended(cx);
+            connection.lease.as_ref().unwrap().expires_at
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            source.asked.load(Ordering::SeqCst),
+            1,
+            "the tell asks nothing"
+        );
+        std::thread::sleep(
+            ends.duration_since(SystemTime::now()).unwrap_or_default() + Duration::from_millis(100),
+        );
+        let client = connection.read_with(cx, |connection, _| connection.client.clone());
+        let request = std::thread::spawn(move || smol::block_on(client.graphs()).is_ok());
+        for _ in 0..400 {
+            cx.run_until_parked();
+            if request.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(request.join().unwrap());
+        assert_eq!(source.asked.load(Ordering::SeqCst), 2, "the next asked for");
+        assert_eq!(
+            *sent.lock().unwrap(),
+            ["Bearer token 1", "Bearer token 2"],
+            "the ended one sent once only, by the connect"
+        );
+    }
+
+    /// A renewal that came while nothing showed the server is owed to the token it would have
+    /// renewed: a new source's token (the CLI target changed) drops it with that token's lease,
+    /// and the next watch asks nothing. Before, it asked the new source again, running the CLI
+    /// for nothing.
+    #[gpui::test]
+    async fn a_new_source_is_not_asked_for_the_renewal_owed_to_the_one_before(
+        cx: &mut TestAppContext,
+    ) {
+        let source = Arc::new(Scripted::default());
+        let (connection, _) = sourced(source.clone(), cx);
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        cx.run_until_parked();
+        // Past the token's renewal, with nothing showing the server: the renewal is owed.
+        cx.executor().advance_clock(Duration::from_secs(3600));
+        cx.run_until_parked();
+        assert!(connection.read_with(cx, |connection, _| connection.renewal_missed));
+        let next = Arc::new(Scripted::default());
+        connection.update(cx, |connection, cx| {
+            connection.take_token_from(Some(next.clone() as Arc<dyn TokenSource>), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(next.asked.load(Ordering::SeqCst), 1, "asked for its token");
+        let _watch = connection.update(cx, |connection, cx| connection.watch(cx));
+        cx.run_until_parked();
+        assert_eq!(next.asked.load(Ordering::SeqCst), 1, "nothing owed to it");
+        assert_eq!(source.asked.load(Ordering::SeqCst), 1);
+    }
+
+    /// A token typed in outlives the lease of the one it replaced: no renewal of that one, owed
+    /// or under way, replaces it. Before, the replaced sign-in's renewal replaced the typed token
+    /// quietly.
+    #[gpui::test]
+    async fn a_token_typed_in_is_not_replaced_by_the_renewal_of_the_one_before(
+        cx: &mut TestAppContext,
+    ) {
+        let source = Arc::new(Scripted::default());
+        let (connection, sent) = sourced(source.clone(), cx);
+        let _watch = connection.update(cx, |connection, cx| {
+            connection.connect(cx);
+            connection.watch(cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(source.asked.load(Ordering::SeqCst), 1);
+        connection.update(cx, |connection, cx| {
+            connection.set_token(Some("typed".into()), cx)
+        });
+        cx.run_until_parked();
+        // Past the replaced token's renewal.
+        cx.executor().advance_clock(Duration::from_secs(3600));
+        cx.run_until_parked();
+        assert_eq!(source.asked.load(Ordering::SeqCst), 1, "no renewal asked");
+        let client = connection.read_with(cx, |connection, _| connection.client.clone());
+        smol::block_on(client.graphs()).ok();
+        assert_eq!(sent.lock().unwrap().pop().unwrap(), "Bearer typed");
+
+        // A renewal already under way when a token is typed answers for nothing.
+        connection.update(cx, |connection, cx| {
+            connection.set_token(Some("given".into()), cx)
+        });
+        cx.run_until_parked();
+        let (release, gate) = oneshot::channel::<()>();
+        *source.gate.lock().unwrap() = Some(gate.shared());
+        connection.update(cx, |connection, cx| {
+            connection.token_given = false;
+            connection.ask_for_token(Ask::Renewal, cx);
+        });
+        cx.run_until_parked();
+        connection.update(cx, |connection, cx| {
+            connection.set_token(Some("typed again".into()), cx)
+        });
+        release.send(()).unwrap();
+        cx.run_until_parked();
+        smol::block_on(client.graphs()).ok();
+        assert_eq!(sent.lock().unwrap().pop().unwrap(), "Bearer typed again");
+    }
+
+    /// A request that finds the token ended while the server cannot be reached has it checked
+    /// at once, whether or not anything shows the server, and one check serves the requests
+    /// waiting, however slow; still away, the request is released and goes with what is held,
+    /// not after the 45 seconds a wait may last. The end stands, so each request after has the
+    /// server checked again. A check answers only for the requests waiting when it began: one
+    /// that began waiting during it, the network back meanwhile, goes with the next token.
+    #[gpui::test]
+    async fn a_server_still_away_releases_the_request_its_check_was_for(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let down = Arc::new(AtomicBool::new(false));
+        let hold = Arc::new(AtomicBool::new(false));
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tokens: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let (away, holding, checked, carried) =
+            (down.clone(), hold.clone(), checks.clone(), tokens.clone());
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let down = away.load(Ordering::SeqCst);
+            let health = path.ends_with("/healthz");
+            if health {
+                checked.fetch_add(1, Ordering::SeqCst);
+            } else if path.ends_with("/graphs") && !down {
+                let token = request
+                    .headers()
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
+                carried.lock().unwrap().push(token);
+            }
+            // A check begun while the test holds checks answers only once it lets go, however
+            // long that is, as the network a check finds down at its start may be back by then.
+            let held = health && holding.load(Ordering::SeqCst);
+            let holding = holding.clone();
+            async move {
+                while held && holding.load(Ordering::SeqCst) {
+                    smol::Timer::after(Duration::from_millis(10)).await;
+                }
+                if down {
+                    anyhow::bail!("the network is down");
+                }
+                let body = if path.ends_with("/healthz") {
+                    r#"{"status":"ok","version":"0.14.0","internal_schema_version":16}"#
+                } else {
+                    r#"{"graphs":[]}"#
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let source = Arc::new(Scripted::default());
+        let server = ServerEntry {
+            name: "signed".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Cli,
+            known_graphs: Vec::new(),
+        };
+        let held: Arc<dyn TokenSource> = source.clone();
+        let connection = cx.new(|_| {
+            Connection::new(server, None, http)
+                .unwrap()
+                .with_token_source(Some(held))
+        });
+        let mut watch = Some(connection.update(cx, |connection, cx| {
+            connection.connect(cx);
+            connection.watch(cx)
+        }));
+        cx.run_until_parked();
+        down.store(true, Ordering::SeqCst);
+        let client = connection.update(cx, |connection, _| {
+            connection.state = ConnectionState::Unreachable("the network is down".into());
+            let ended = SystemTime::now() - Duration::from_secs(1);
+            connection.lease.as_mut().unwrap().expires_at = ended;
+            connection.client.set_token_ends(Some(ended));
+            connection.client.clone()
+        });
+        let checked = || checks.load(Ordering::SeqCst);
+        // Sends a request with the ended token, running the app until it is answered: whether
+        // it was, and how long it took.
+        fn answered(client: &GraphClient, cx: &mut TestAppContext) -> (bool, Duration) {
+            let client = client.clone();
+            let started = std::time::Instant::now();
+            let request = std::thread::spawn(move || smol::block_on(client.graphs()).is_ok());
+            for _ in 0..600 {
+                cx.run_until_parked();
+                if request.is_finished() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(request.is_finished(), "released");
+            (request.join().unwrap(), started.elapsed())
+        }
+        let send = |client: &GraphClient| {
+            let client = client.clone();
+            std::thread::spawn(move || smol::block_on(client.graphs()).is_ok())
+        };
+        let run = |cx: &mut TestAppContext, turns: usize| {
+            for _ in 0..turns {
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let run_until = |cx: &mut TestAppContext, what: &str, done: &dyn Fn() -> bool| {
+            for _ in 0..600 {
+                if done() {
+                    return;
+                }
+                run(cx, 1);
+            }
+            panic!("timed out waiting for {what}");
+        };
+        // A slow check: the request, telling again a second on and more while it is under way,
+        // starts no other, and goes at its answer.
+        hold.store(true, Ordering::SeqCst);
+        let before = checked();
+        let request = send(&client);
+        run_until(cx, "the check", &|| checked() > before);
+        run(cx, 150);
+        assert_eq!(checked() - before, 1, "one check");
+        assert!(!request.is_finished(), "waits for the check");
+        hold.store(false, Ordering::SeqCst);
+        run_until(cx, "the request", &|| request.is_finished());
+        assert!(!request.join().unwrap(), "the network still down");
+        assert_eq!(checked() - before, 1, "one check");
+        // Each request after has the server checked again, the network may be back, and goes at
+        // that check's answer, well within the wait; so does one once nothing shows the server.
+        for unwatched in [false, true] {
+            if unwatched {
+                drop(watch.take());
+            }
+            let before = checked();
+            let (sent, took) = answered(&client, cx);
+            assert!(!sent, "the network still down");
+            assert!(took < Duration::from_secs(5), "{took:?}");
+            assert_eq!(checked() - before, 1, "checked, unwatched: {unwatched}");
+        }
+        assert_eq!(source.asked.load(Ordering::SeqCst), 1, "nothing asked");
+        // The network comes back while a check, begun for one request, is under way, and a
+        // second request begins waiting during it: the check's answer releases the first only,
+        // and the second, telling again, has the server checked again, finds it back, and goes
+        // with the next token.
+        hold.store(true, Ordering::SeqCst);
+        let before = tokens.lock().unwrap().len();
+        let checks_before = checked();
+        let first = send(&client);
+        run_until(cx, "the first's check", &|| checked() > checks_before);
+        let begun = client.waits_begun();
+        let second = send(&client);
+        run_until(cx, "the second waiting", &|| client.waits_begun() > begun);
+        down.store(false, Ordering::SeqCst);
+        hold.store(false, Ordering::SeqCst);
+        run_until(cx, "both requests", &|| {
+            first.is_finished() && second.is_finished()
+        });
+        first.join().unwrap();
+        assert!(
+            second.join().unwrap(),
+            "the second sent once the server answered"
+        );
+        assert_eq!(source.asked.load(Ordering::SeqCst), 2, "the next asked for");
+        // The first goes with what is held, its check having found the server away; the
+        // second, and the connect's probe, with the next.
+        let carried = tokens.lock().unwrap()[before..].to_vec();
+        assert_eq!(
+            carried
+                .iter()
+                .filter(|token| *token == "Bearer token 1")
+                .count(),
+            1,
+            "only the first sent the ended token: {carried:?}"
+        );
+        assert_eq!(carried.last().map(String::as_str), Some("Bearer token 2"));
+    }
+
+    /// A source that is not a sign-in (the CLI) that could not answer is asked again at a failed
+    /// check's pace, not a ready server's: each ask runs the CLI. A sign-in's service is asked
+    /// again sooner (`sign_in::tests::a_sign_in_not_answering_after_a_wake_is_asked_again_soon`).
+    #[gpui::test]
+    async fn a_source_that_could_not_answer_is_asked_again_at_a_failed_checks_pace(
         cx: &mut TestAppContext,
     ) {
         let source = Arc::new(Scripted::default());
@@ -3254,18 +3781,21 @@ mod tests {
         assert_eq!(asked(), 1);
         *source.answers.lock().unwrap() = vec![None];
         connection.update(cx, |connection, cx| {
-            connection.lease.as_mut().unwrap().expires_at =
-                SystemTime::now() - Duration::from_secs(1);
+            connection
+                .client
+                .set_token_ends(Some(SystemTime::now() - Duration::from_secs(1)));
             connection.ask_for_token(Ask::Renewal, cx);
         });
         cx.run_until_parked();
         assert_eq!(asked(), 2);
-        assert!(!connection.read_with(cx, |connection, _| connection.has_token));
         cx.executor().advance_clock(DEFAULT_CHECK_INTERVAL);
         cx.run_until_parked();
-        assert_eq!(asked(), 3, "asked again at the next check");
+        assert_eq!(asked(), 2, "not at a ready server's pace");
+        cx.executor().advance_clock(FAILED_CHECK_INTERVAL);
+        cx.run_until_parked();
+        assert_eq!(asked(), 3, "asked again at a failed check's");
         connection.read_with(cx, |connection, _| {
-            assert!(connection.has_token);
+            assert!(connection.has_token());
             assert_eq!(connection.state, ConnectionState::Ready);
         });
     }

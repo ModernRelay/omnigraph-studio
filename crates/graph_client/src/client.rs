@@ -36,11 +36,9 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// The wait when a 429 names none.
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
 /// How long a request whose token ended waits for the next before it sends what it holds: a
-/// sign-in's refresh (15 seconds), the pause before its one retry (5) and the retry (15), and a
-/// margin.
-const ENDED_TOKEN_WAIT: Duration = Duration::from_secs(40);
-/// How often a request waiting for the next token looks for it.
-const ENDED_TOKEN_LOOK: Duration = Duration::from_millis(50);
+/// check of a server that could not be reached (5 seconds), a sign-in's refresh (15), the pause
+/// before its one retry (5) and the retry (15), and a margin.
+const ENDED_TOKEN_WAIT: Duration = Duration::from_secs(45);
 /// How often a request waiting for the next token tells the holder again.
 const ENDED_TOKEN_TELL: Duration = Duration::from_secs(1);
 /// How many reads one connection has on the wire at once (spec 003). A server admits a bounded
@@ -477,20 +475,35 @@ pub enum FeedAt<'a> {
     Page(&'a str),
 }
 
+/// The token a client holds, and when it stops being accepted, as the lease it came with says
+/// ([`GraphClient::set_token_ending`]): one lock, so no request reads one without the other.
+#[derive(Default)]
+struct HeldToken {
+    value: Option<Arc<str>>,
+    /// `None` for a token that does not end, or not known to.
+    ends: Option<SystemTime>,
+}
+
 /// A client for one server. Cheap to clone.
 #[derive(Clone)]
 pub struct GraphClient {
     base: Url,
     /// Shared by every clone, as the connection's one token: a token replaced after the server
     /// refused the old one reaches every holder, a running agent's gateway among them.
-    token: Arc<std::sync::RwLock<Option<Arc<str>>>>,
-    /// When the token held stops being accepted, as the lease it came with says
-    /// ([`Self::set_token_ends`]); `None` for one that does not end, or not known to. Shared by
-    /// every clone, as the token is.
-    token_ends: Arc<std::sync::RwLock<Option<SystemTime>>>,
+    token: Arc<std::sync::RwLock<HeldToken>>,
     /// The holder told when a request finds the token held ended, once one listens
     /// ([`Self::token_ended`]). Shared by every clone.
     ended: Arc<std::sync::Mutex<Option<smol::channel::Sender<()>>>>,
+    /// How many requests have begun waiting for the next token, each numbered by it
+    /// ([`Self::waits_begun`]). Shared by every clone.
+    waits_begun: Arc<std::sync::atomic::AtomicU64>,
+    /// The number up to which the holder released the requests waiting
+    /// ([`Self::release_waits`]). Shared by every clone.
+    waits_released: Arc<std::sync::atomic::AtomicU64>,
+    /// Wakes the requests waiting for the next token when what they wait on changes: each
+    /// waits on the channel current when it looked, which a change replaces, closing it
+    /// ([`Self::wake_waits`]). Shared by every clone.
+    waits: Arc<std::sync::Mutex<(smol::channel::Sender<()>, smol::channel::Receiver<()>)>>,
     /// Shared by every clone, as the token is: a target whose transport changed is reached
     /// through the new one by every holder ([`Self::set_http`]).
     http: Arc<std::sync::RwLock<Arc<dyn HttpClient>>>,
@@ -543,9 +556,14 @@ impl GraphClient {
         }
         Ok(Self {
             base,
-            token: Arc::new(std::sync::RwLock::new(token.map(Into::into))),
-            token_ends: Arc::default(),
+            token: Arc::new(std::sync::RwLock::new(HeldToken {
+                value: token.map(Into::into),
+                ends: None,
+            })),
             ended: Arc::default(),
+            waits_begun: Arc::default(),
+            waits_released: Arc::default(),
+            waits: Arc::new(std::sync::Mutex::new(smol::channel::bounded(1))),
             http: Arc::new(std::sync::RwLock::new(http)),
             read_slots: Arc::new(smol::lock::Semaphore::new(READ_CONCURRENCY)),
             credential_changes: Arc::default(),
@@ -661,48 +679,60 @@ impl GraphClient {
     /// Replaces the token for this client and every clone of it; requests sent after this use
     /// it. Whether it differs from the token it replaced, which counts as a credential change.
     pub fn set_token(&self, token: Option<String>) -> bool {
+        self.set_token_ending(token, None)
+    }
+
+    /// [`Self::set_token`], with when the token stops being accepted, as the lease it came with
+    /// says (`None` for one not known to end), set with it, so no request reads one without the
+    /// other. A request that would send it after then waits for the next
+    /// ([`Self::token_ended`]).
+    pub fn set_token_ending(&self, token: Option<String>, ends: Option<SystemTime>) -> bool {
         let token: Option<Arc<str>> = token.map(Into::into);
-        // Not known to end until the holder says so, the token held again included.
-        self.set_token_ends(None);
-        let mut held = self
-            .token
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if *held == token {
-            return false;
+        let changed = {
+            let mut held = self.held_mut();
+            let changed = held.value != token;
+            *held = HeldToken { value: token, ends };
+            changed
+        };
+        self.wake_waits();
+        if changed {
+            self.credential_changes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
-        *held = token;
-        self.credential_changes
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        true
+        changed
     }
 
     /// Replaces the token with a renewal of it: the same account's next short-lived token, as
     /// an OAuth refresh gives (spec 016). Nothing read with the old one is read again, so it is
     /// not counted as another token ([`Self::credential_changes`]).
-    pub fn renew_token(&self, token: String) {
-        *self
-            .token
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(token.into());
-        self.set_token_ends(None);
+    pub fn renew_token(&self, token: String, ends: Option<SystemTime>) {
+        *self.held_mut() = HeldToken {
+            value: Some(token.into()),
+            ends,
+        };
+        self.wake_waits();
     }
 
-    /// When the token held stops being accepted, as the lease it came with says; `None` for one
-    /// that does not end, or not known to. A token set or renewed is not known to end until this
-    /// says so. A request that would send it after then waits for the next
-    /// ([`Self::token_ended`]).
-    pub fn set_token_ends(&self, ends: Option<SystemTime>) {
-        *self
-            .token_ends
+    fn held_mut(&self) -> std::sync::RwLockWriteGuard<'_, HeldToken> {
+        self.token
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ends;
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// When the token held stops being accepted, for a test: as a sleep past its renewal would
+    /// leave it, or `None` for one that does not end. A token is given its end with it
+    /// ([`Self::set_token_ending`], [`Self::renew_token`]).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_token_ends(&self, ends: Option<SystemTime>) {
+        self.held_mut().ends = ends;
+        self.wake_waits();
     }
 
     /// Told when a request finds the token held ended, as when the machine slept past its
     /// renewal, and again each second it waits: the holder asks for the next, which the request
-    /// waits for, a while ([`ENDED_TOKEN_WAIT`]), or says the end no longer holds. One holder
-    /// listens; with none listening (never, or no longer), a request sends what it holds.
+    /// waits for, a while ([`ENDED_TOKEN_WAIT`]); or releases the requests waiting
+    /// ([`Self::release_waits`]). One holder listens; with none listening (never, or no
+    /// longer), a request sends what it holds.
     pub fn token_ended(&self) -> smol::channel::Receiver<()> {
         let (tell, told) = smol::channel::bounded(1);
         *self
@@ -712,24 +742,82 @@ impl GraphClient {
         told
     }
 
+    /// The number of the last request to begin waiting for the next token: those up to it are
+    /// the ones waiting when the holder looked.
+    pub fn waits_begun(&self) -> u64 {
+        self.waits_begun.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The holder will give no next token for the requests waiting up to `through`
+    /// ([`Self::waits_begun`] when it decided so, as when its server could not be reached then):
+    /// they send what is held. One that began waiting after waits on, and the end stands, so a
+    /// request after this tells the holder again.
+    pub fn release_waits(&self, through: u64) {
+        self.waits_released
+            .fetch_max(through, std::sync::atomic::Ordering::SeqCst);
+        self.wake_waits();
+    }
+
+    /// Wakes the requests waiting for the next token to look again, once what they wait on
+    /// changed: the channel each waits on closes as this replaces it.
+    fn wake_waits(&self) {
+        *self
+            .waits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = smol::channel::bounded(1);
+    }
+
+    /// Whether a token is held, so the next request sends one.
+    pub fn holds_token(&self) -> bool {
+        self.token
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .value
+            .is_some()
+    }
+
     /// Whether the token held has ended, as its lease says. One in its last moments is sent: its
     /// renewal came before, and a refusal of it asks again.
-    fn holds_ended_token(&self) -> bool {
-        self.token().is_some()
-            && self
-                .token_ends
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .is_some_and(|ends| SystemTime::now() >= ends)
+    pub fn holds_ended_token(&self) -> bool {
+        let held = self
+            .token
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        held.value.is_some() && held.ends.is_some_and(|ends| SystemTime::now() >= ends)
     }
 
     /// Waits, while the token held has ended, a holder listens, and for at most
-    /// [`ENDED_TOKEN_WAIT`], for the next, telling the holder ([`Self::token_ended`]); a request
-    /// then carries whatever it holds, which a server that refuses it says so as before.
+    /// [`ENDED_TOKEN_WAIT`], for the next, telling the holder ([`Self::token_ended`]) at once
+    /// and each second after; a request then carries whatever it holds, which a server that
+    /// refuses it says so as before. A change to the token, its end or a release wakes it
+    /// ([`Self::wake_waits`]); a holder gone is noticed at the next tell.
     async fn fresh_token(&self) {
+        if !self.holds_ended_token() {
+            return;
+        }
         let until = Instant::now() + ENDED_TOKEN_WAIT;
+        // Numbered before it tells, so a release the holder decides on its tell covers it.
+        let number = self
+            .waits_begun
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let released = || {
+            self.waits_released
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= number
+        };
         let mut told: Option<Instant> = None;
-        while self.holds_ended_token() && Instant::now() < until {
+        loop {
+            // Taken before looking, so a change made after the look wakes this wait.
+            let woken = self
+                .waits
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .1
+                .clone();
+            if !self.holds_ended_token() || Instant::now() >= until || released() {
+                return;
+            }
             let holder = self
                 .ended
                 .lock()
@@ -739,11 +827,25 @@ impl GraphClient {
             let Some(holder) = holder else {
                 return;
             };
-            if told.is_none_or(|at| at.elapsed() >= ENDED_TOKEN_TELL) {
-                holder.try_send(()).ok();
-                told = Some(Instant::now());
-            }
-            smol::Timer::after(ENDED_TOKEN_LOOK).await;
+            let now = Instant::now();
+            let told_at = match told {
+                Some(at) if now < at + ENDED_TOKEN_TELL => at,
+                _ => {
+                    holder.try_send(()).ok();
+                    now
+                }
+            };
+            told = Some(told_at);
+            let next = (told_at + ENDED_TOKEN_TELL).min(until);
+            smol::future::or(
+                async {
+                    woken.recv().await.ok();
+                },
+                async {
+                    smol::Timer::at(next).await;
+                },
+            )
+            .await;
         }
     }
 
@@ -751,6 +853,7 @@ impl GraphClient {
         self.token
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .value
             .clone()
     }
 
@@ -2247,10 +2350,11 @@ mod tests {
         assert_eq!(*sent.lock().unwrap(), ["Bearer new", "Bearer new"]);
     }
 
-    /// A request that would send a token its lease says has ended waits for the next, telling the token's holder to ask for it, and carries the next. A
-    /// token set is not known to end, the one held set again included. With no holder listening,
-    /// and for the public routes, which take no token, nothing waits. Before, the ended token
-    /// was sent, and refused, after the machine slept past its renewal.
+    /// A request that would send a token its lease says has ended waits for the next, telling
+    /// the token's holder to ask for it, and carries the next, woken as it comes. A token set is
+    /// not known to end, the one held set again included. With no holder listening, and for the
+    /// public routes, which take no token, nothing waits. Before, the ended token was sent, and
+    /// refused, after the machine slept past its renewal.
     #[test]
     fn a_request_waits_for_the_next_token_once_the_one_held_ended() {
         let sent: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
@@ -2299,13 +2403,21 @@ mod tests {
                 },
             ));
             if told {
-                holder.renew_token("next".into());
-                holder.set_token_ends(Some(SystemTime::now() + Duration::from_secs(300)));
+                holder.renew_token(
+                    "next".into(),
+                    Some(SystemTime::now() + Duration::from_secs(300)),
+                );
             }
             ended
         });
         held.set_token_ends(Some(SystemTime::now()));
+        let started = Instant::now();
         block_on(held.schema("g")).ok();
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "woken by the renewal, not the next tell: {:?}",
+            started.elapsed()
+        );
         let ended = renewed.join().unwrap();
         assert_eq!(sent.lock().unwrap().pop().unwrap(), "Bearer next");
 
@@ -2323,12 +2435,94 @@ mod tests {
         });
         assert_eq!(sent.lock().unwrap().pop().unwrap(), "Bearer next");
 
-        // The holder no longer listens (its connection gone): sent as held.
+        // The holder gives no next token now: the request waiting sends what is held, and the
+        // end stands, so the next request tells the holder again.
         drop(ended);
+        let again = held.token_ended();
+        held.set_token_ends(Some(SystemTime::now()));
+        let holder = held.clone();
+        let first_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let renews = first_sent.clone();
+        // Releases each tell until the first request went, then renews at the next.
+        let answering = std::thread::spawn(move || {
+            loop {
+                assert!(told_within(&again), "told again");
+                if renews.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                holder.release_waits(holder.waits_begun());
+            }
+            holder.renew_token(
+                "third".into(),
+                Some(SystemTime::now() + Duration::from_secs(300)),
+            );
+            again
+        });
+        let started = Instant::now();
+        block_on(held.schema("g")).ok();
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "woken by the release, not the next tell: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            sent.lock().unwrap().pop().unwrap(),
+            "Bearer next",
+            "sent as held"
+        );
+        first_sent.store(true, std::sync::atomic::Ordering::SeqCst);
+        block_on(held.schema("g")).ok();
+        let again = answering.join().unwrap();
+        assert_eq!(
+            sent.lock().unwrap().pop().unwrap(),
+            "Bearer third",
+            "told again"
+        );
+
+        // A release is for the requests waiting when the holder decided it: one that began
+        // waiting after waits on, and goes with the next token.
+        held.set_token_ends(Some(SystemTime::now()));
+        let request = |held: &GraphClient| {
+            let held = held.clone();
+            std::thread::spawn(move || block_on(held.schema("g")).ok())
+        };
+        let first = request(&held);
+        assert!(told_within(&again), "told by the first");
+        let through = held.waits_begun();
+        let second = request(&held);
+        while held.waits_begun() == through {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        held.release_waits(through);
+        first.join().unwrap();
+        assert_eq!(sent.lock().unwrap().pop().unwrap(), "Bearer third");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!second.is_finished(), "the second waits on");
+        held.renew_token(
+            "fourth".into(),
+            Some(SystemTime::now() + Duration::from_secs(300)),
+        );
+        second.join().unwrap();
+        assert_eq!(sent.lock().unwrap().pop().unwrap(), "Bearer fourth");
+
+        // The holder no longer listens (its connection gone): sent as held.
+        drop(again);
         held.set_token_ends(Some(SystemTime::now()));
         quick("a request after the holder stopped listening", &|| {
             block_on(held.schema("g")).ok();
         });
+    }
+
+    /// Whether the holder was told within five seconds, so a test that stops telling fails
+    /// rather than hangs.
+    fn told_within(told: &smol::channel::Receiver<()>) -> bool {
+        block_on(smol::future::or(
+            async { told.recv().await.is_ok() },
+            async {
+                smol::Timer::after(Duration::from_secs(5)).await;
+                false
+            },
+        ))
     }
 
     /// A read refused with 401 for a token replaced while it was under way is read again, once,
@@ -2370,7 +2564,7 @@ mod tests {
         while sent.lock().unwrap().is_empty() {
             std::thread::sleep(Duration::from_millis(5));
         }
-        held.renew_token("next".into());
+        held.renew_token("next".into(), None);
         hold.store(false, Ordering::SeqCst);
         assert!(
             read.join().unwrap().is_ok(),

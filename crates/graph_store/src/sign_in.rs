@@ -345,12 +345,7 @@ impl Service {
     /// seconds, and not retried, in the background, so nobody waits on the network (spec 016,
     /// Custody). The sign-in ends whatever the service answers.
     pub(crate) fn revoke(&self, refresh: String) {
-        self.revoke_through(self.token_client(), refresh);
-    }
-
-    /// [`Self::revoke`], through `http`: a sign-in's client now, which a transport change may
-    /// have replaced since the service was read.
-    fn revoke_through(&self, http: Arc<dyn HttpClient>, refresh: String) {
+        let http = self.token_client();
         let service = self.clone();
         smol::spawn(async move {
             oauth_client::revoke(http.as_ref(), &service.server, &service.client_id, &refresh)
@@ -493,10 +488,9 @@ pub(crate) struct OAuthSource {
 }
 
 struct Inner {
-    service: Service,
-    /// The clients its requests take: the service's at first, then those a new transport for
-    /// the server's address makes ([`OAuthSource::reach_through`]).
-    clients: Mutex<Clients>,
+    /// Its sign-in service, whose clients its requests take: those it was read with at first,
+    /// then those a new transport for the server's address makes ([`OAuthSource::reach_through`]).
+    service: Mutex<Service>,
     key: String,
     keychain: Arc<dyn Keychain>,
     held: smol::lock::Mutex<Held>,
@@ -628,8 +622,7 @@ impl OAuthSource {
         Self {
             inner: Arc::new(Inner {
                 key: service.key(target),
-                clients: Mutex::new(service.clients.clone()),
-                service,
+                service: Mutex::new(service),
                 keychain,
                 held: smol::lock::Mutex::new(held),
                 account: Mutex::new(account),
@@ -644,8 +637,14 @@ impl OAuthSource {
         }
     }
 
-    pub(crate) fn service(&self) -> &Service {
-        &self.inner.service
+    /// Its sign-in service's host, as the person reads it.
+    pub(crate) fn host(&self) -> String {
+        self.inner.service_now(Service::host)
+    }
+
+    /// The key a sign-in to its service at `target` is kept under ([`Service::key`]).
+    pub(crate) fn service_key(&self, target: &str) -> String {
+        self.inner.service_now(|service| service.key(target))
     }
 
     pub(crate) fn account(&self) -> String {
@@ -671,12 +670,12 @@ impl OAuthSource {
     /// CLI target's transport changed. The sign-in stands, and a refresh under way finishes
     /// with its client and keeps what it gives.
     pub(crate) fn reach_through(&self, http: Arc<dyn HttpClient>) {
-        let mut clients = self
+        let mut service = self
             .inner
-            .clients
+            .service
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        *clients = clients.through(http);
+        service.clients = service.clients.through(http);
     }
 
     /// Ends the sign-in for `how`. No refresh begins after this, and one under way touches the
@@ -837,7 +836,17 @@ impl Inner {
 
     /// Revokes `token` through the sign-in's client now.
     fn revoke(&self, token: String) {
-        self.service.revoke_through(self.token_client(), token);
+        self.service().revoke(token);
+    }
+
+    /// Its service as it is now, a transport change included.
+    fn service(&self) -> Service {
+        self.service_now(Service::clone)
+    }
+
+    /// What `read` reads of its service as it is now.
+    fn service_now<T>(&self, read: impl FnOnce(&Service) -> T) -> T {
+        read(&self.service.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     /// The refresh token held once a refresh in flight has settled, taken for the ending, and
@@ -849,10 +858,7 @@ impl Inner {
     }
 
     fn token_client(&self) -> Arc<dyn HttpClient> {
-        self.clients
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .client_for(&self.service.server.token_endpoint)
+        self.service_now(Service::token_client)
     }
 
     /// The access token held while it is fresh; otherwise the one the refresh under way gives,
@@ -976,7 +982,7 @@ impl Inner {
             held.access = None;
             return Err(NoToken::lasting("The sign-in has ended. Sign in again."));
         };
-        let service = &self.service;
+        let service = self.service();
         let mut failed_once = false;
         loop {
             let http = self.token_client();
@@ -3275,6 +3281,68 @@ mod tests {
             }
             other => panic!("why the one held ended is not said: {other:?}"),
         }
+    }
+
+    /// A sign-in whose token ended while the machine slept, and whose service does not answer
+    /// the renewal (the network not back yet), says it is not answering; the next health check,
+    /// which comes as often as a ready server's, asks again, then less often while the service
+    /// does not answer, and signs in once it does. Before, that check waited the two minutes of
+    /// a failed one, and a check at the ready pace kept asking a service down for hours.
+    #[gpui::test]
+    async fn a_sign_in_not_answering_after_a_wake_is_asked_again_soon(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served {
+            lives: 2,
+            ..Served::default()
+        }));
+        let keychain = kept_at_launch(&served);
+        let connection = connection(&served, keychain, cx);
+        let _watch = connection.update(cx, |c, cx| {
+            c.connect(cx);
+            c.watch(cx)
+        });
+        until(cx, "the kept sign-in", |cx| {
+            sign_in_state(&connection, cx).0 == ConnectionState::Ready
+        });
+        // Asleep past the token's end; awake before the network.
+        served.lock().unwrap().token_down = true;
+        std::thread::sleep(Duration::from_millis(2100));
+        cx.executor().advance_clock(Duration::from_secs(2));
+        until(cx, "the sign-in not answering", |cx| {
+            sign_in_state(&connection, cx).2 == "Sign-in not answering"
+        });
+        let refreshes = || {
+            served
+                .lock()
+                .unwrap()
+                .log
+                .iter()
+                .filter(|l| l.starts_with("token refresh_token"))
+                .count()
+        };
+        // Asked again a ready server's interval on, still not answered.
+        let asked = refreshes();
+        cx.executor()
+            .advance_clock(crate::connection::DEFAULT_CHECK_INTERVAL);
+        until(cx, "asked again", |cx| {
+            refreshes() > asked && sign_in_state(&connection, cx).2 == "Sign-in not answering"
+        });
+        // Then twice as long: not asked at the same interval again.
+        let asked = refreshes();
+        cx.executor()
+            .advance_clock(crate::connection::DEFAULT_CHECK_INTERVAL);
+        for _ in 0..3 {
+            never(cx, "asked again at the same interval", |_| {
+                refreshes() > asked
+            });
+        }
+        // The network is back: the check that comes then signs in again.
+        served.lock().unwrap().token_down = false;
+        cx.executor()
+            .advance_clock(crate::connection::DEFAULT_CHECK_INTERVAL);
+        until(cx, "signed in again", |cx| {
+            sign_in_state(&connection, cx).0 == ConnectionState::Ready
+        });
     }
 
     /// Sign-in details the server named that could not be read are read again: by Retry, which
