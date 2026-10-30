@@ -10,7 +10,6 @@ use std::time::{Duration, SystemTime};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use http_client::HttpClient;
-use http_client::http::StatusCode;
 use serde_json::{Map, Value};
 
 use crate::discovery::AuthorizationServer;
@@ -178,6 +177,9 @@ async fn request(
         .map_err(|why| {
             TokenError::Failed(format!("The sign-in service could not be reached: {why}."))
         })?;
+    // An answer that is no JSON at all (a proxy's or a firewall's page) may pass, whatever its
+    // status: taken as a refusal, it would end the sign-in over a page that may be gone next
+    // time.
     let Some(body) = answer.object() else {
         return Err(TokenError::Failed(if answer.body.is_none() {
             "The sign-in service answered with more than 64 KiB.".into()
@@ -216,7 +218,7 @@ async fn request(
             "temporarily_unavailable" | "slow_down" => {
                 TokenError::Failed(said("The sign-in service is busy."))
             }
-            _ if answer.status == StatusCode::TOO_MANY_REQUESTS => {
+            _ if fetch::failed_for_now(answer.status) => {
                 TokenError::Failed(said("The sign-in service is busy."))
             }
             _ => TokenError::Refused(said(&format!(

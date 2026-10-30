@@ -1207,10 +1207,18 @@ impl GraphSession {
                 }
             }
             Err(ReadError::Transport(_)) => {}
-            // The token may have lapsed: the connection asks its source again, once for it.
+            // The token may have lapsed: the connection asks its source again, once for it. A 401
+            // that refused no token (one that never arrived, as a proxy drops it) asks nothing:
+            // the next token would fare no better.
             Err(ReadError::Refused(error)) if error.status == 401 => {
-                self.connection
-                    .update(cx, |connection, cx| connection.read_refused(cx));
+                if error
+                    .challenge
+                    .as_deref()
+                    .is_none_or(graph_client::Challenge::token_refused)
+                {
+                    self.connection
+                        .update(cx, |connection, cx| connection.read_refused(cx));
+                }
             }
             _ => {
                 if self.unavailable.take().is_some() {
@@ -7484,7 +7492,14 @@ mod tests {
                 .unwrap_or_default()
                 .to_owned();
             let log = log.clone();
-            let accepted = format!("Bearer {}", accepted.lock().unwrap());
+            let accepted = *accepted.lock().unwrap();
+            // A token that never arrives, as a proxy drops it.
+            let token = if accepted == DROPPED {
+                String::new()
+            } else {
+                token
+            };
+            let accepted = format!("Bearer {accepted}");
             async move {
                 let mut bytes = Vec::new();
                 request.into_body().read_to_end(&mut bytes).await.ok();
@@ -7521,16 +7536,22 @@ mod tests {
                 let response = Response::builder()
                     .status(status)
                     .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT);
-                let response = if status == 401 {
-                    response.header("www-authenticate", "Bearer")
-                } else {
-                    response
+                // As Omnigraph answers: a token it received and refused is `invalid_token`.
+                let response = match (status, token.is_empty()) {
+                    (401, true) => response.header("www-authenticate", "Bearer"),
+                    (401, false) => {
+                        response.header("www-authenticate", r#"Bearer error="invalid_token""#)
+                    }
+                    _ => response,
                 };
                 Ok(response.body(AsyncBody::from(body.to_string())).unwrap())
             }
         });
         (http, asked)
     }
+
+    /// What `answers_alone` accepts for a token that never arrives, as a proxy drops it.
+    const DROPPED: &str = "(dropped)";
 
     /// The CLI server `personal`, whose token the CLI gives when the test sends it.
     fn waiting_for_its_token(
@@ -7618,6 +7639,13 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(asked(), 3, "the lapsed token asked about again");
         assert!(carried("t3"));
+
+        // A token that never arrives, as a proxy drops it: the 401 refused no token, and the
+        // source is asked nothing, as the next would fare no better.
+        *accepted.lock().unwrap() = DROPPED;
+        session.update(cx, |session, cx| session.reload(cx));
+        cx.run_until_parked();
+        assert_eq!(asked(), 3, "a token that never arrived asks nothing");
     }
 
     /// A graph shown while its connection's token is still on its way from the CLI sends

@@ -16,6 +16,14 @@ pub(crate) const TOKEN_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long a revocation may take.
 pub(crate) const REVOKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Whether an answer of `status` failed for now, so the same request may be answered another
+/// time: a server error, a timeout or too many requests. Any other status is the answer.
+pub(crate) fn failed_for_now(status: StatusCode) -> bool {
+    status.is_server_error()
+        || status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+}
+
 pub(crate) struct Answer {
     pub status: StatusCode,
     /// At most [`MAX_ANSWER_BYTES`]; `None` when the answer was longer, and the rest unread.

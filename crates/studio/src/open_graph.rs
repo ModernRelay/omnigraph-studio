@@ -828,7 +828,7 @@ enum LineAction {
 /// The actions the chosen server's line offers, in order (spec 016). A sign-in being kept offers
 /// none, as it is not to be cancelled; a sign-in held offers Sign out wherever it stands, and
 /// Retry beside it where connecting again is what helps (the server unreachable, the sign-in's
-/// service not answering).
+/// service not answering, the token sent never arrived).
 fn line_actions(c: &Connection) -> Vec<LineAction> {
     actions_for(
         &c.state,
@@ -853,19 +853,21 @@ fn actions_for(
         (_, SignIn::Reading) if holds => vec![LineAction::SignOut],
         (_, SignIn::Finishing { .. }) => Vec::new(),
         (ConnectionState::Connecting, _) if holds => vec![LineAction::Cancel, LineAction::SignOut],
-        // A sign-in as someone else that failed leaves the one held.
+        // A sign-in as someone else that failed leaves the one held, and Retry where its token
+        // never arrived.
         (ConnectionState::Unauthorized, SignIn::Offered { service, .. }) => {
             let mut actions = vec![LineAction::SignIn {
                 service: service.clone(),
             }];
             actions.extend(holds.then_some(LineAction::SignOut));
+            actions.extend(retry);
             actions
         }
         // The one held admitted meanwhile, or the server unreachable.
         (_, SignIn::Offered { .. }) if holds => {
             std::iter::once(LineAction::SignOut).chain(retry).collect()
         }
-        // Not admitted: another account may be.
+        // Not admitted: another account may be. A token that never arrived offers Retry.
         (ConnectionState::Unauthorized, SignIn::SignedIn { .. }) if retry.is_none() => {
             vec![LineAction::SignInAsSomeoneElse, LineAction::SignOut]
         }
@@ -934,7 +936,8 @@ fn retry_button(selected: &Entity<Connection>, cx: &mut Context<OpenGraphModal>)
 }
 
 /// What the chosen server's line says of its state. A 401 says what it was an answer to: no
-/// token at all (a server Studio has none configured for asks for one), or the token sent. A
+/// token at all (a server Studio has none configured for asks for one), a token sent that never
+/// arrived, or the token sent. A
 /// CLI server the CLI gave no token is asked nothing, and says why. A server that offers a
 /// sign-in says where, and who is signed in (spec 016).
 fn server_status(c: &Connection) -> String {
@@ -974,7 +977,7 @@ fn state_status(c: &Connection) -> String {
             return "This server asks you to sign in. Studio is reading how.".into();
         }
         // A sign-in as someone else that failed, the one held standing: the server does not admit
-        // it, or its service did not answer.
+        // it, its service did not answer, or the token sent never arrived.
         (
             SignIn::Offered {
                 service,
@@ -984,6 +987,11 @@ fn state_status(c: &Connection) -> String {
         ) if c.holds_sign_in() => {
             return if c.token_unanswered {
                 format!("{why} You stay signed in at {service}; Studio asks again.")
+            } else if c.token_not_received() {
+                format!(
+                    "{why} You stay signed in at {service}; the server received no token: \
+                     something between them may drop it."
+                )
             } else {
                 format!(
                     "{why} You stay signed in at {service}, as an account this server may not \
@@ -1015,6 +1023,15 @@ fn state_status(c: &Connection) -> String {
             let why = c.token_unread.as_deref().unwrap_or_default();
             return format!("{why} You stay signed in at {service}; Studio asks again.");
         }
+        // A 401 that refused no token: the one sent never arrived.
+        (SignIn::SignedIn { service, .. }, ConnectionState::Unauthorized)
+            if c.token_not_received() =>
+        {
+            return format!(
+                "The server received no token, though Studio sent the one signed in at \
+                 {service}: something between them may drop it."
+            );
+        }
         (
             SignIn::SignedIn {
                 service, account, ..
@@ -1038,6 +1055,11 @@ fn state_status(c: &Connection) -> String {
         (ConnectionState::Unauthorized, Some(reason)) => {
             format!("The Omnigraph CLI gave no token for this server: {reason}")
         }
+        (ConnectionState::Unauthorized, None) if c.token_not_received() => {
+            "The server received no token, though Studio sent one: something between them may \
+             drop it."
+                .into()
+        }
         (ConnectionState::Unauthorized, None) if !c.refused_with_token => {
             "This server asks for a token; none is configured for it.".into()
         }
@@ -1053,13 +1075,15 @@ fn gave_no_token(c: &Connection) -> bool {
 }
 
 /// Whether choosing this server, or its Retry, connects it again: one never connected or
-/// unreachable, one the CLI gave no token, and one whose sign-in details could not be read,
-/// which the connect reads again.
+/// unreachable, one the CLI gave no token, one whose token never arrived (a proxy that drops it,
+/// which may be put right), and one whose sign-in Studio could not use, whose details the
+/// connect reads again.
 fn retries_on_select(c: &Connection) -> bool {
     matches!(
         c.state,
         ConnectionState::Idle | ConnectionState::Unreachable(_)
     ) || gave_no_token(c)
+        || c.token_not_received()
         || matches!(c.sign_in, SignIn::Unavailable(_))
 }
 
@@ -1322,9 +1346,11 @@ mod tests {
     fn a_token_typed_for_one_server_is_cleared_when_another_is_chosen(cx: &mut TestAppContext) {
         let alpha = server(&["one"], cx);
         let beta = server(&["two"], cx);
+        // Each refused the token sent.
         for connection in [&alpha, &beta] {
             connection.update(cx, |connection, _| {
-                connection.state = ConnectionState::Unauthorized
+                connection.state = ConnectionState::Unauthorized;
+                connection.refused_with_token = true;
             });
         }
         let (modal, cx) = dialog(vec![alpha.clone(), beta.clone()], cx);
@@ -1394,21 +1420,29 @@ mod tests {
     fn the_keyboard_reaches_the_token_field_only_where_it_is_drawn(cx: &mut TestAppContext) {
         let refused = server(&["one"], cx);
         refused.update(cx, |connection, _| {
-            connection.state = ConnectionState::Unauthorized
+            connection.state = ConnectionState::Unauthorized;
+            connection.refused_with_token = true;
         });
         let (modal, cx) = dialog(vec![refused.clone()], cx);
         let reaches_token = |cx: &mut VisualTestContext| {
             modal.read_with(cx, |modal, cx| modal.places(cx).contains(&Place::Token))
         };
         assert!(reaches_token(cx));
+        // A token that never arrived: one typed would be dropped the same way.
+        refused.update(cx, |connection, _| connection.refused_with_token = false);
+        assert!(
+            !reaches_token(cx),
+            "a token that never arrived hides the field"
+        );
+        refused.update(cx, |connection, _| connection.refused_with_token = true);
         refused.update(cx, |connection, _| connection.hold_sign_in_for_tests());
         assert!(!reaches_token(cx), "a sign-in under way hides the field");
     }
 
     /// The chosen server's line offers Retry beside a sign-in held wherever connecting again is
     /// what helps: the server unreachable, the sign-in's service not answering, or sign-in
-    /// details that could not be read. One the server does not admit offers another account
-    /// instead. Before, a sign-in held hid Retry, so an unreachable server waited for its next
+    /// details that could not be read, or a token that never arrived. One the server does not
+    /// admit offers another account instead. Before, a sign-in held hid Retry, so an unreachable server waited for its next
     /// check, up to two minutes.
     #[gpui::test]
     fn retry_stands_beside_a_sign_in_where_connecting_again_helps(cx: &mut TestAppContext) {
@@ -1421,6 +1455,7 @@ mod tests {
                 connection.state = state;
                 connection.sign_in = sign_in;
                 connection.token_unread = unread.map(str::to_owned);
+                connection.refused_with_token = true;
                 line_actions(connection)
             })
         };
@@ -1450,10 +1485,36 @@ mod tests {
             offers(ConnectionState::Unauthorized, signed_in(), None, cx),
             [LineAction::SignInAsSomeoneElse, LineAction::SignOut]
         );
+        // A token that never arrived: Retry, once whatever drops it is put right.
+        let not_received = connection.update(cx, |connection, _| {
+            connection.state = ConnectionState::Unauthorized;
+            connection.sign_in = signed_in();
+            connection.token_unread = None;
+            connection.refused_with_token = false;
+            line_actions(connection)
+        });
+        assert_eq!(not_received, [LineAction::SignOut, LineAction::Retry]);
+        // So does a sign-in as someone else that failed, the one held standing.
+        let offered = SignIn::Offered {
+            service: "id.example".into(),
+            why: Some("refused".into()),
+        };
+        assert_eq!(
+            actions_for(&ConnectionState::Unauthorized, &offered, true, true),
+            [
+                LineAction::SignIn {
+                    service: "id.example".into()
+                },
+                LineAction::SignOut,
+                LineAction::Retry
+            ]
+        );
         assert_eq!(
             offers(
                 ConnectionState::Unauthorized,
-                SignIn::Unavailable("the details did not answer".into()),
+                SignIn::Unavailable(graph_store::sign_in::Refusal::passing(
+                    "the details did not answer"
+                )),
                 None,
                 cx
             ),
@@ -1504,9 +1565,11 @@ mod tests {
     #[gpui::test]
     fn a_server_that_offers_a_sign_in_says_where_and_as_whom(cx: &mut TestAppContext) {
         let connection = server(&[], cx);
+        // A 401 here refused the token sent.
         let said = |state: ConnectionState, sign_in: SignIn, cx: &mut TestAppContext| {
             connection.update(cx, |connection, _| {
                 connection.state = state;
+                connection.refused_with_token = true;
                 connection.sign_in = sign_in;
                 (server_status(connection), connection.label())
             })
@@ -1587,6 +1650,20 @@ mod tests {
                 .0
                 .ends_with(&format!("may not admit this account. {left}"))
         );
+        // A token that never arrived reads so, not as an account the server does not admit.
+        let not_received = connection.update(cx, |connection, _| {
+            connection.state = ConnectionState::Unauthorized;
+            connection.refused_with_token = false;
+            connection.sign_in = signed_in();
+            (server_status(connection), connection.label())
+        });
+        assert!(
+            not_received.0.starts_with(
+                "The server received no token, though Studio sent the one signed in at id.example"
+            ),
+            "{not_received:?}"
+        );
+        assert_eq!(not_received.1, "Token not received");
         let offered = || SignIn::Offered {
             service: "id.example".into(),
             why: None,
@@ -1637,6 +1714,7 @@ mod tests {
     #[gpui::test]
     fn a_server_sent_no_token_is_said_to_ask_for_one(cx: &mut TestAppContext) {
         let connection = server(&[], cx);
+        connection.update(cx, |connection, cx| connection.set_token(None, cx));
         let said = |refused_with_token: bool, cx: &mut TestAppContext| {
             connection.update(cx, |connection, _| {
                 connection.state = ConnectionState::Unauthorized;
@@ -1651,6 +1729,20 @@ mod tests {
                 "Asks for a token".to_owned()
             )
         );
+        // One sent that never arrived, as a proxy drops it.
+        connection.update(cx, |connection, cx| {
+            connection.set_token(Some("typed".into()), cx)
+        });
+        assert_eq!(
+            said(false, cx),
+            (
+                "The server received no token, though Studio sent one: something between them \
+                 may drop it."
+                    .to_owned(),
+                "Token not received".to_owned()
+            )
+        );
+        connection.update(cx, |connection, cx| connection.set_token(None, cx));
         assert_eq!(
             said(true, cx),
             (
@@ -1719,7 +1811,12 @@ mod tests {
                 retries_on_select(connection)
             })
         };
+        connection.update(cx, |connection, cx| {
+            connection.set_token(Some("typed".into()), cx);
+            connection.refused_with_token = true;
+        });
         assert!(!gave_none(None, cx), "a refused token");
+        connection.update(cx, |connection, cx| connection.set_token(None, cx));
         assert!(gave_none(Some("login required"), cx));
         let (modal, cx) = dialog(vec![connection.clone()], cx);
         modal.update_in(cx, |modal, window, cx| {

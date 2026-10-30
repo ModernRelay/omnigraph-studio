@@ -58,11 +58,36 @@ pub fn authorization_url(
 
 /// A sign-in that cannot go on, in words the person reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Refusal(pub String);
+pub struct Refusal {
+    pub why: String,
+    /// Asked again, it may go on: what it needed failed for now (no answer, a server error, a
+    /// timeout or too many requests), or what refuses it was read in place of a document that
+    /// did. Otherwise the server's answer, a page where a description should be among them,
+    /// refuses it until the server's owner changes it.
+    pub passing: bool,
+}
+
+impl Refusal {
+    /// What was read refuses the sign-in.
+    pub fn lasting(why: impl Into<String>) -> Self {
+        Self {
+            why: why.into(),
+            passing: false,
+        }
+    }
+
+    /// What the sign-in needed could not be read now.
+    pub fn passing(why: impl Into<String>) -> Self {
+        Self {
+            why: why.into(),
+            passing: true,
+        }
+    }
+}
 
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.why)
     }
 }
 

@@ -508,12 +508,22 @@ impl HttpClient for Transport {
     }
 }
 
+/// A token as a client holds it: a blank one is none, as a server reads `Bearer ` with nothing
+/// after it as no credential (an empty `OMNIGRAPH_STUDIO_TOKEN`, say).
+fn held(token: Option<String>) -> Option<Arc<str>> {
+    token
+        .filter(|token| !token.trim().is_empty())
+        .map(Into::into)
+}
+
 /// The token a client holds, and when it stops being accepted, as the lease it came with says
 /// ([`GraphClient::set_token_ending`]): one lock, so no request reads one without the other.
 struct HeldToken {
     value: Option<Arc<str>>,
     /// `None` for a token that does not end, or not known to.
     ends: Option<SystemTime>,
+    /// Moves each time the value does ([`GraphClient::token_serial`]).
+    serial: u64,
 }
 
 /// A client for one server. Cheap to clone.
@@ -594,8 +604,9 @@ impl GraphClient {
         Ok(Self {
             base,
             token: Arc::new(std::sync::RwLock::new(HeldToken {
-                value: token.map(Into::into),
+                value: held(token),
                 ends: None,
+                serial: 0,
             })),
             ended: Arc::default(),
             waits_begun: Arc::default(),
@@ -750,11 +761,16 @@ impl GraphClient {
     /// other. A request that would send it after then waits for the next
     /// ([`Self::token_ended`]).
     pub fn set_token_ending(&self, token: Option<String>, ends: Option<SystemTime>) -> bool {
-        let token: Option<Arc<str>> = token.map(Into::into);
+        let token = held(token);
         let changed = {
             let mut held = self.held_mut();
             let changed = held.value != token;
-            *held = HeldToken { value: token, ends };
+            let serial = held.serial + u64::from(changed);
+            *held = HeldToken {
+                value: token,
+                ends,
+                serial,
+            };
             changed
         };
         self.wake_waits();
@@ -767,13 +783,23 @@ impl GraphClient {
 
     /// Replaces the token with a renewal of it: the same account's next short-lived token, as
     /// an OAuth refresh gives (spec 016). Nothing read with the old one is read again, so it is
-    /// not counted as another token ([`Self::credential_changes`]).
-    pub fn renew_token(&self, token: String, ends: Option<SystemTime>) {
-        *self.held_mut() = HeldToken {
-            value: Some(token.into()),
-            ends,
+    /// not counted as another token ([`Self::credential_changes`]). Whether it differs from the
+    /// token it replaced.
+    pub fn renew_token(&self, token: String, ends: Option<SystemTime>) -> bool {
+        let token: Arc<str> = token.into();
+        let renewed = {
+            let mut held = self.held_mut();
+            let renewed = held.value.as_deref() != Some(&*token);
+            let serial = held.serial + u64::from(renewed);
+            *held = HeldToken {
+                value: Some(token),
+                ends,
+                serial,
+            };
+            renewed
         };
         self.wake_waits();
+        renewed
     }
 
     fn held_mut(&self) -> std::sync::RwLockWriteGuard<'_, HeldToken> {
@@ -839,6 +865,15 @@ impl GraphClient {
             .waits
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = smol::channel::bounded(1);
+    }
+
+    /// Names the token held: it moves each time the token is replaced by another, a renewal
+    /// included, and with nothing else (a transport change or a retire leaves it).
+    pub fn token_serial(&self) -> u64 {
+        self.token
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .serial
     }
 
     /// Whether a token is held, so the next request sends one.
@@ -1025,6 +1060,7 @@ impl GraphClient {
         timeout: Duration,
         limit: BodyLimit,
     ) -> Result<RawResponse, String> {
+        let head = method == Method::HEAD;
         let (builder, carried) = self.request(method, &url);
         let mut builder = builder.timeout(timeout);
         // A body is JSON unless the caller names its type: a Blob put's is raw bytes.
@@ -1065,7 +1101,8 @@ impl GraphClient {
             BodyLimit::Range { start, len } if status == StatusCode::OK => (start, len),
             BodyLimit::Range { len, .. } => (0, len),
         };
-        let bytes = read_body(response.into_body(), skip, keep)
+        let length = body_length(head, status, &headers);
+        let bytes = read_body(response.into_body(), skip, keep, length)
             .await
             .map_err(|error| describe_transport(&error.into()))?;
         Ok(RawResponse {
@@ -1122,8 +1159,9 @@ impl GraphClient {
                 .await;
                 let _slot = slot.map_err(ReadError::Transport)?;
                 // A token live when the read queued that ended while it did (a sleep across a long
-                // queue) is waited for again, the slot let go meanwhile, where a wait can be
-                // answered ([`Self::listening_holder`]).
+                // queue) is waited for again, the slot let go meanwhile, while a holder listens
+                // to answer the wait ([`Self::listening_holder`]); one that cannot give the next
+                // releases it at once, and the read queues once more.
                 if live && self.holds_ended_token() && self.listening_holder().is_some() {
                     continue;
                 }
@@ -2026,39 +2064,38 @@ fn content_range_starts_at(served: &str, start: u64) -> bool {
         == Some(start)
 }
 
+/// How long a response's body says it is: its `Content-Length`, unless no body follows (an
+/// answer to HEAD, a 204, a 304), where the header names what a GET would have sent.
+fn body_length(head: bool, status: StatusCode, headers: &HeaderMap) -> Option<u64> {
+    if head || status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED {
+        return None;
+    }
+    headers
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
 /// A response body: `skip` bytes read and dropped, then at most `limit` kept, the rest left
-/// unread.
-async fn read_body(mut body: AsyncBody, skip: u64, limit: usize) -> std::io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    // A whole body, every JSON answer's, is read straight into `bytes`: no buffer is made.
-    if skip == 0 && limit == usize::MAX {
-        body.read_to_end(&mut bytes).await?;
-        return Ok(bytes);
+/// unread. What is kept is read straight into the answer, made as large as the body's
+/// `Content-Length` says from the start (within `limit`), so a whole range is not grown to twice
+/// its size at its end; without one, the answer grows as it is read.
+async fn read_body(
+    mut body: AsyncBody,
+    skip: u64,
+    limit: usize,
+    length: Option<u64>,
+) -> std::io::Result<Vec<u8>> {
+    if skip > 0 {
+        let skipped = futures::io::BufReader::with_capacity(64 * 1024, (&mut body).take(skip));
+        futures::io::copy_buf(skipped, &mut futures::io::sink()).await?;
     }
-    let mut buffer = vec![0; limit.min(256 * 1024).max(usize::from(skip > 0) * 64 * 1024)];
-    let mut skipped = 0;
-    while skipped < skip {
-        let want = buffer
-            .len()
-            .min(usize::try_from(skip - skipped).unwrap_or(usize::MAX));
-        let read = body.read(&mut buffer[..want]).await?;
-        if read == 0 {
-            return Ok(bytes);
-        }
-        skipped += read as u64;
-    }
-    if limit == usize::MAX {
-        body.read_to_end(&mut bytes).await?;
-        return Ok(bytes);
-    }
-    while bytes.len() < limit {
-        let want = buffer.len().min(limit - bytes.len());
-        let read = body.read(&mut buffer[..want]).await?;
-        if read == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&buffer[..read]);
-    }
+    let kept = length.map_or(0, |length| {
+        usize::try_from(length.saturating_sub(skip)).map_or(limit, |left| left.min(limit))
+    });
+    // A byte over, where reading to the end finds that nothing follows.
+    let mut bytes = Vec::with_capacity(kept.saturating_add(1));
+    body.take(limit as u64).read_to_end(&mut bytes).await?;
     Ok(bytes)
 }
 
@@ -2146,6 +2183,21 @@ mod tests {
 
     fn client(http: Arc<dyn HttpClient>) -> GraphClient {
         GraphClient::new("http://127.0.0.1:8787", Some("t".into()), http).unwrap()
+    }
+
+    /// A blank token is none, given at the start or later: sent, a server would read `Bearer `
+    /// as no credential, and say it got none.
+    #[test]
+    fn a_blank_token_is_none() {
+        let http = FakeHttpClient::create(|_| async { unreachable!() });
+        let blank = GraphClient::new("http://127.0.0.1:8787", Some(String::new()), http).unwrap();
+        assert!(!blank.holds_token());
+        let held = client(FakeHttpClient::create(|_| async { unreachable!() }));
+        assert!(
+            held.set_token(Some("  ".into())),
+            "the token held is dropped"
+        );
+        assert!(!held.holds_token());
     }
 
     const CHANGE: &str =
@@ -3795,6 +3847,43 @@ mod tests {
                 .fetch_add(buffer.len(), std::sync::atomic::Ordering::SeqCst);
             std::task::Poll::Ready(Ok(buffer.len()))
         }
+    }
+
+    /// A body whose length is said is read into one allocation of that length: a whole range, or
+    /// what is kept of a value read from its start, is not grown to twice its size at its end.
+    #[test]
+    fn a_body_of_known_length_is_read_without_growing() {
+        // Not a power of two, which growth by doubling could land on.
+        let len = (1 << 20) + 3;
+        let whole = block_on(read_body(
+            AsyncBody::from(vec![7_u8; len]),
+            0,
+            len,
+            Some(len as u64),
+        ))
+        .unwrap();
+        assert_eq!(whole.len(), len);
+        assert!(whole.capacity() <= len + 1, "{}", whole.capacity());
+        let cut = block_on(read_body(
+            AsyncBody::from(vec![7_u8; len]),
+            100,
+            len / 2,
+            Some(len as u64),
+        ))
+        .unwrap();
+        assert_eq!(cut.len(), len / 2);
+        assert!(cut.capacity() <= len / 2 + 1, "{}", cut.capacity());
+
+        // No body follows a HEAD, a 204 or a 304, whatever length the header names.
+        let mut headers = HeaderMap::new();
+        headers.insert("content-length", HeaderValue::from_static("10485760"));
+        assert_eq!(
+            body_length(false, StatusCode::OK, &headers),
+            Some(10_485_760)
+        );
+        assert_eq!(body_length(true, StatusCode::OK, &headers), None);
+        assert_eq!(body_length(false, StatusCode::NO_CONTENT, &headers), None);
+        assert_eq!(body_length(false, StatusCode::NOT_MODIFIED, &headers), None);
     }
 
     /// A server that ignores Range sends the whole value: the range is cut from it, and what

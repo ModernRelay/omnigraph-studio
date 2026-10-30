@@ -1296,8 +1296,9 @@ mod tests {
     /// open windows hold, takes the new name and asks the CLI as the new target. A target moved
     /// to a new address takes the graphs remembered for its name, and the connection at the old
     /// address is retired. One that names another proxy, or a certificate authority of its own
-    /// or another bundle of one, keeps its connection, moved to a client made with them; one
-    /// whose transport Studio cannot use is retired.
+    /// or another bundle of one, keeps its connection, moved to a client made with them, and in
+    /// use connects again through it, asking the CLI once; one whose transport Studio cannot use
+    /// is retired.
     #[gpui::test]
     async fn a_renamed_cli_target_keeps_its_connection(cx: &mut TestAppContext) {
         let (http, sent) = answering();
@@ -1385,14 +1386,25 @@ mod tests {
                 Ok(through_http.clone())
             });
         });
+        moved.update(cx, |connection, cx| connection.connect(cx));
+        cx.run_until_parked();
+        cli.asked();
         let mut proxied = server("new", "http://b.test", "renamed");
         proxied.transport.proxy = Some("http://proxy.test:8080".into());
         assert!(apply(&registry, files(vec![proxied]), cx));
+        cx.run_until_parked();
         assert_eq!(find(&registry, "new", cx).unwrap(), moved);
         assert_eq!(
             made.load(Ordering::SeqCst),
             1,
             "a client made for the proxy"
+        );
+        // In use, it connects again through the proxy, and the new target's source is asked
+        // once: the connect's ask of the old one ends.
+        assert_eq!(cli.asked(), ["new"]);
+        assert_eq!(
+            moved.read_with(cx, |connection, _| connection.state.clone()),
+            crate::ConnectionState::Ready
         );
         moved.read_with(cx, |connection, _| {
             assert_eq!(connection.server.known_graphs, ["knowledge"]);
