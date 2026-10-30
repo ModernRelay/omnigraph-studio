@@ -335,6 +335,9 @@ impl ServerHealth {
 }
 
 struct RawResponse {
+    /// The token the request carried: a refusal of one replaced since is not this client's
+    /// last word ([`GraphClient::fetch_reading`]).
+    carried: Option<Arc<str>>,
     status: StatusCode,
     contract: Option<String>,
     /// `Retry-After` in seconds; the HTTP-date form is not used by Omnigraph.
@@ -601,18 +604,21 @@ impl GraphClient {
     }
 
     /// A request to the server as every one is made: with the contract this build speaks and
-    /// this client's token, following no redirect. No route answers with a redirect to follow;
-    /// a Blob's external reference answers 302 with a URI Studio shows and never fetches.
-    fn request(&self, method: Method, url: &Url) -> http_client::Builder {
+    /// this client's token, following no redirect, and the token it carries. No route answers
+    /// with a redirect to follow; a Blob's external reference answers 302 with a URI Studio
+    /// shows and never fetches.
+    fn request(&self, method: Method, url: &Url) -> (http_client::Builder, Option<Arc<str>>) {
         let builder = Request::builder()
             .method(method)
             .uri(url.as_str())
             .header(CONTRACT_HEADER, CONTRACT)
             .follow_redirects(RedirectPolicy::NoFollow);
-        match self.token() {
+        let carried = self.token();
+        let builder = match &carried {
             Some(token) => builder.header("authorization", format!("Bearer {token}")),
             None => builder,
-        }
+        };
+        (builder, carried)
     }
 
     /// Sends `request`, made by [`Self::request`] for `url`, and counts a refusal of it
@@ -828,7 +834,8 @@ impl GraphClient {
         timeout: Duration,
         limit: BodyLimit,
     ) -> Result<RawResponse, String> {
-        let mut builder = self.request(method, &url).timeout(timeout);
+        let (builder, carried) = self.request(method, &url);
+        let mut builder = builder.timeout(timeout);
         // A body is JSON unless the caller names its type: a Blob put's is raw bytes.
         if body.is_some()
             && !headers
@@ -871,6 +878,7 @@ impl GraphClient {
             .await
             .map_err(|error| describe_transport(&error.into()))?;
         Ok(RawResponse {
+            carried,
             status,
             contract,
             retry_after,
@@ -908,6 +916,7 @@ impl GraphClient {
         limit: BodyLimit,
     ) -> Result<RawResponse, ReadError> {
         let mut retries = 0;
+        let mut read_again = false;
         loop {
             let raw = {
                 let _slot = self.read_slots.acquire().await;
@@ -930,6 +939,14 @@ impl GraphClient {
                     smol::Timer::after(wait).await;
                     continue;
                 }
+            }
+            // Refused for a token replaced while the read was under way (a renewal, a refresh
+            // after another read's refusal): read again, once, with the one held now, rather
+            // than say a refusal of a token already gone, which would ask for yet another.
+            if raw.status == StatusCode::UNAUTHORIZED && !read_again && raw.carried != self.token()
+            {
+                read_again = true;
+                continue;
             }
             return Ok(raw);
         }
@@ -1203,7 +1220,7 @@ impl GraphClient {
             return Err(format!("refused path {:?}", request.path_and_query));
         }
         self.fresh_token().await;
-        let mut builder = self.request(request.method, &url);
+        let (mut builder, _) = self.request(request.method, &url);
         for (name, value) in &request.headers {
             builder = builder.header(name.as_str(), value.as_str());
         }
@@ -2312,6 +2329,54 @@ mod tests {
         quick("a request after the holder stopped listening", &|| {
             block_on(held.schema("g")).ok();
         });
+    }
+
+    /// A read refused with 401 for a token replaced while it was under way is read again, once,
+    /// with the token held now, and its answer is that read's. Before, the refusal of a token
+    /// already gone was said, and its holder asked for yet another token.
+    #[test]
+    fn a_read_refused_for_a_token_replaced_meanwhile_is_read_again() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let sent: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let hold = Arc::new(AtomicBool::new(true));
+        let (log, held_back) = (sent.clone(), hold.clone());
+        let http = FakeHttpClient::create(move |request| {
+            let (log, hold) = (log.clone(), held_back.clone());
+            async move {
+                let token = request
+                    .headers()
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
+                log.lock().unwrap().push(token.clone());
+                // The first answer comes once the token is replaced.
+                while token == "Bearer t" && hold.load(Ordering::SeqCst) {
+                    smol::Timer::after(Duration::from_millis(5)).await;
+                }
+                let status = if token == "Bearer t" { 401 } else { 200 };
+                Ok(Response::builder()
+                    .status(status)
+                    .header(CONTRACT_HEADER, CONTRACT)
+                    .body(AsyncBody::from(
+                        r#"{"schema_source": "node A {\n  slug: String @key\n}\n"}"#,
+                    ))
+                    .unwrap())
+            }
+        });
+        let held = client(http);
+        let reader = held.clone();
+        let read = std::thread::spawn(move || block_on(reader.schema("g")));
+        while sent.lock().unwrap().is_empty() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        held.renew_token("next".into());
+        hold.store(false, Ordering::SeqCst);
+        assert!(
+            read.join().unwrap().is_ok(),
+            "read again with the token held now"
+        );
+        assert_eq!(*sent.lock().unwrap(), ["Bearer t", "Bearer next"]);
     }
 
     /// An HTTP client replaced on the client, as when the CLI target's certificate authority
