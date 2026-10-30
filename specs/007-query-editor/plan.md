@@ -155,7 +155,8 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   declares any more goes once a check reads every declaration.
 - A run line above each declaration (a Zed editor block anchored to the declaration, rebuilt
   when the declarations change): ▶ Run, then that declaration's last outcome ("25 rows · 96
-  ms", "Committed · 1 nodes, 0 edges", "Refused", "Outcome unknown · check History"). A line,
+  ms", "Committed · 1 nodes, 0 edges", "Refused", "Not sent · nothing written", "Outcome unknown ·
+  check History"). A line,
   not a gutter glyph: Zed's gutter run indicators belong to its task system, which needs a
   project. A declaration's range excludes its end, so the line above a declaration runs it
   even when the one before it lacks its `}` and runs on to it.
@@ -208,8 +209,11 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   on no branch" for `as unattached branch`; "Created branch x at commit <id>", "Deleted
   branch x", "Merged a into b" (or already up to date), "Published commit <id> to b" and
   "Dropped commit <id>" for statements, which report no counts; "Nothing changed" for no
-  commit. Refused ("Nothing was written", with the server's diagnostic) or unknown ("Check
-  History before trying again") as before. The text is the draft and is never cleared.
+  commit. Refused ("Nothing was written", with the server's diagnostic), not sent ("Not sent:"
+  and why, "Nothing was written.", when the connection is retired (its target gone, or a
+  transport Studio cannot use), the server refused the connection, or the request could not be
+  made; the run reads "Not sent · nothing written") or unknown ("Check History before
+  trying again") as before. The text is the draft and is never cleared.
   Closing the tab does not cancel a write in flight; the session logs its outcome.
 - Parameters of the query under the cursor get an input each; values are typed by
   `gq_language::param_value` and sent as JSON (`null` for an empty nullable).

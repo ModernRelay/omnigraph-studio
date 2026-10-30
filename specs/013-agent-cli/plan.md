@@ -438,7 +438,15 @@ ones, each let go within 10 s and opened again, locked the CLI out).
 Writes are checked on the conversation's graph only. A refusal is a 403 `ErrorOutput` with
 `code: forbidden` and the contract header; its message ends "Nothing was sent." and says what to
 do instead. A CLI with E22 (Omnigraph #981) reports it as not started; an older one still says
-`effects: unknown`, so `AGENTS.md` says a Studio refusal never wrote anything.
+`effects: unknown`, so `AGENTS.md` says a Studio refusal never wrote anything. A request Studio
+never sends is refused the same way: one whose connection is retired (its CLI target gone, or a
+transport Studio cannot use) says to tell the person, and one Studio would not make as asked (a
+path that leaves the server's root) says to change it, or to tell the person. One whose server
+refused the connection is answered 503 `service_unavailable` instead, with
+`disposition: {effects: none, action: retry}`, and says to try again once the server answers. A write to a target already retired is refused so
+before it is a card, as a rule's refusal is: the person is not asked about a write that cannot
+go. One whose target retires while the person decides keeps its card, which then reads "..., so
+nothing was sent."
 
 A forwarded write's answer is read whole (at most 8 MiB) so the card can show it, then sent on.
 When the server's answer is lost, the gateway closes the connection without one, and the CLI

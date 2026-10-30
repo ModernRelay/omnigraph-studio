@@ -4271,6 +4271,9 @@ fn outcome_kind<T>(
         WriteOutcome::Refused(error) => OutcomeKind::Refused {
             message: error.body.error.clone(),
         },
+        WriteOutcome::NotSent { reason } => OutcomeKind::Refused {
+            message: reason.clone(),
+        },
         WriteOutcome::Unknown { reason } => OutcomeKind::Unknown {
             reason: reason.clone(),
         },
@@ -4329,6 +4332,20 @@ mod tests {
     use super::*;
     use crate::cli_tokens::{NoToken, Token, TokenSource};
     use crate::connection::{ConnectionState, ServerEntry, ServerSource};
+
+    /// A write never sent is logged as refused, with why: nothing was written.
+    #[test]
+    fn a_write_never_sent_is_logged_as_refused() {
+        let outcome: WriteOutcome<CommitOutput> = WriteOutcome::NotSent {
+            reason: "the target is gone".into(),
+        };
+        assert_eq!(
+            outcome_kind(&outcome, |commit: &CommitOutput| Some(commit)),
+            OutcomeKind::Refused {
+                message: "the target is gone".into()
+            }
+        );
+    }
 
     /// A scope on main showing answers that depend on these node and edge types.
     fn watching(session: &mut GraphSession, nodes: &[&str], edges: &[&str]) -> ReadScope {

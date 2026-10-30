@@ -1897,6 +1897,34 @@ mod tests {
         }
     }
 
+    /// A write to a server that refuses the connection, through Studio's own transport, is not
+    /// sent: the refusal reaches the client as a refused connection, which it judges by the
+    /// error's kind, so nothing was written and nothing is to be settled.
+    #[test]
+    fn a_write_to_a_server_refusing_connections_is_not_sent() {
+        // A port nothing listens on: bound, then let go.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let http: Arc<dyn HttpClient> =
+            Arc::new(reqwest_client::ReqwestClient::user_agent(crate::USER_AGENT).unwrap());
+        let client =
+            graph_client::GraphClient::new(&format!("http://127.0.0.1:{port}"), None, http)
+                .unwrap();
+        let outcome =
+            smol::block_on(client.mutate("g", &graph_client::api::ChangeRequest::default(), None));
+        assert!(
+            matches!(
+                &outcome,
+                graph_client::WriteOutcome::NotSent { reason }
+                    if reason == "the connection was refused"
+            ),
+            "{outcome:?}"
+        );
+    }
+
     /// A CLI target that trusts its own certificate authority is reached with it, as the CLI
     /// reaches it: trusted with the system's roots (`append`) or alone (`replace`). Studio's own
     /// client, which trusts the system's roots, is refused at the handshake, and so is a bundle

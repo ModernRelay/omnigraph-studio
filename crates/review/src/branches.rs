@@ -598,6 +598,9 @@ impl CreateBranchModal {
                             this.error = Some(format!("Not created: {}", error.body.error).into())
                         }
                     },
+                    WriteOutcome::NotSent { reason } => {
+                        this.error = Some(format!("Not created: {reason}").into())
+                    }
                     WriteOutcome::Unknown { .. } => {
                         this.error = Some(
                             "The outcome is unknown. Check the branch list before trying again."
@@ -894,6 +897,9 @@ impl DeleteBranchModal {
                         WriteOutcome::Committed(_) => cx.emit(DismissEvent),
                         WriteOutcome::Refused(error) => {
                             this.error = Some(format!("Not deleted: {}", error.body.error).into())
+                        }
+                        WriteOutcome::NotSent { reason } => {
+                            this.error = Some(format!("Not deleted: {reason}").into())
                         }
                         WriteOutcome::Unknown { .. } => this.error = Some(
                             "The outcome is unknown. Check the branch list before trying again."

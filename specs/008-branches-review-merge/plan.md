@@ -164,7 +164,11 @@ place), X (designed on 0.13; the better routes are deferred).
   fast-forward"; conflicts show in a banner with Show conflicts, the same list a merge's 409
   gives. A dry run that cannot be read says nothing; Merge stays available either way, since
   the merge itself decides.
-- Outcome shown plainly: fast-forwarded, merged (with commit), already up to date.
+- Outcome shown plainly: fast-forwarded, merged (with commit), already up to date. A merge or a
+  fix never sent (its connection retired, the server refusing the connection, or the request
+  not made) says so, "The merge was not sent: <why>. Nothing was merged.", and leaves nothing
+  to settle (since 2026-10-30; before, a merge or a fix that failed to send read as an unknown
+  outcome, and a merge's was settled by reading the target's history).
 - A 409 opens a conflicts view: one row per conflict with its kind in words ("Changed on both
   branches", "Deleted on main, changed here", "Relationship points to a deleted node"), the
   entity, and the message. Resolution happens on the source branch with ordinary edits; then

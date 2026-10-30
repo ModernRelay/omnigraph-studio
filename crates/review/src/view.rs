@@ -67,12 +67,19 @@ const FORK_BOUND: usize = FORK_PAGE as usize * FORK_PAGES;
 enum FixState {
     Idle,
     Running,
-    Reverted { commit: String },
+    Reverted {
+        commit: String,
+    },
     Saving,
-    Edited { commit: String },
+    Edited {
+        commit: String,
+    },
     Unchanged,
     Moved,
     Refused(String),
+    /// Never sent (its connection retired, the server refusing the connection, or the request
+    /// not made): nothing was written.
+    NotSent(String),
     Unknown,
 }
 
@@ -152,6 +159,9 @@ enum MergeState {
     },
     Conflicts(Vec<MergeConflictOutput>),
     Refused(String),
+    /// Never sent (its connection retired, the server refusing the connection, or the request
+    /// not made): nothing was merged, and nothing is to be settled.
+    NotSent(String),
     Unknown {
         reason: String,
         /// What the target's history shows of it.
@@ -1808,6 +1818,7 @@ impl ReviewView {
             }
             WriteOutcome::Refused(error) if error.status == 412 => FixState::Moved,
             WriteOutcome::Refused(error) => FixState::Refused(error.body.error),
+            WriteOutcome::NotSent { reason } => FixState::NotSent(reason),
             WriteOutcome::Unknown { .. } => FixState::Unknown,
         };
         let landed = matches!(
@@ -2135,6 +2146,7 @@ impl ReviewView {
                     Some(conflicts) if !conflicts.is_empty() => MergeState::Conflicts(conflicts),
                     _ => MergeState::Refused(error.body.error),
                 },
+                WriteOutcome::NotSent { reason } => MergeState::NotSent(reason),
                 WriteOutcome::Unknown { reason } => {
                     let sent = MergeSent {
                         source_head: bound,
@@ -2761,6 +2773,11 @@ impl ReviewView {
                 format!("The merge was refused: {message}. Nothing was merged."),
                 None,
             ),
+            MergeState::NotSent(reason) => (
+                Severity::Error,
+                format!("The merge was not sent: {reason}. Nothing was merged."),
+                None,
+            ),
             MergeState::Unknown { reason, landed, .. } => (
                 Severity::Warning,
                 unknown_merge_words(reason, *landed, &self.target),
@@ -3213,6 +3230,10 @@ fn fix_status(fix: &FixState) -> Option<(String, Color)> {
             Color::Warning,
         ),
         FixState::Refused(message) => (format!("Refused: {message}"), Color::Error),
+        FixState::NotSent(reason) => (
+            format!("Not sent: {reason}. Nothing was written."),
+            Color::Error,
+        ),
         FixState::Unknown => (
             "Outcome unknown. Check History before trying again.".to_owned(),
             Color::Warning,

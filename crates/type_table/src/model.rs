@@ -953,6 +953,10 @@ pub fn save_result(outcome: &WriteOutcome<ChangeOutput>, branch: &str) -> SaveRe
             error.body.precondition_failure.is_some(),
             branch,
         )),
+        WriteOutcome::NotSent { reason } => SaveResult::Refused(Notice::new(
+            Tone::Refused,
+            format!("Not sent: {reason}. Nothing was written."),
+        )),
         WriteOutcome::Unknown { .. } => {
             SaveResult::Unknown(Notice::new(Tone::Unknown, UNKNOWN_MESSAGE))
         }
@@ -1665,6 +1669,19 @@ mod tests {
                 "main"
             ),
             SaveResult::Unknown(Notice::new(Tone::Unknown, UNKNOWN_MESSAGE))
+        );
+        // Never sent (the target retired): nothing was written, said as a refusal, not unknown.
+        assert_eq!(
+            save_result(
+                &WriteOutcome::NotSent {
+                    reason: "The CLI no longer lists the target".into()
+                },
+                "main"
+            ),
+            SaveResult::Refused(Notice::new(
+                Tone::Refused,
+                "Not sent: The CLI no longer lists the target. Nothing was written."
+            ))
         );
         assert_eq!(
             changed_elsewhere(None, Some(&json!("CEO"))).message,

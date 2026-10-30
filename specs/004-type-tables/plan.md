@@ -431,7 +431,9 @@ its open section.
 a proposal or a snapshot, is not a save: "main did not change" with the commit, the draft kept;
 a kind Studio does not know is an unknown outcome (both judged by `OutcomeKind::written`, for
 cell saves, drafts, bulk sets and Blob writes, since 2026-10-21). A 4xx with `ErrorOutput`:
-refused, "Nothing was written." plus the reason. A lost response, a timeout or a response
+refused, "Nothing was written." plus the reason. A write never sent (its connection retired,
+the server refusing the connection, or the request not made): "Not sent:" and why, "Nothing
+was written." (since 2026-10-30). A lost response, a timeout or a response
 without the contract header: unknown, "Check History before trying again; your changes are
 still here", with a button that opens the branch's recent commits.
 

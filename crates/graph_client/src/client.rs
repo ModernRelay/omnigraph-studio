@@ -23,7 +23,8 @@ use crate::api::{
     QueriesCatalogOutput, QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput, SnapshotOutput,
 };
 use crate::{
-    ApiError, CONTRACT, CONTRACT_HEADER, IF_GRAPH_COMMIT_HEADER, WriteOutcome, speaks_contract,
+    Answered, ApiError, CONTRACT, CONTRACT_HEADER, IF_GRAPH_COMMIT_HEADER, WriteOutcome,
+    speaks_contract,
 };
 
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
@@ -499,6 +500,34 @@ pub enum FeedAt<'a> {
     Page(&'a str),
 }
 
+/// Why a request has no answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoAnswer {
+    /// Never sent, as its client is retired ([`GraphClient::retire`]): nothing it asked for
+    /// was done, and nothing that client sends will be.
+    Retired(String),
+    /// Never sent, as Studio would not make it as asked: a path that leaves the server's root,
+    /// or a request that could not be built. Nothing it asked for was done.
+    Unsendable(String),
+    /// Never reached the server, as it refused the connection: a request is written only on a
+    /// connection made (an earlier attempt a client retries is one the server did not process),
+    /// so nothing it asked for was done.
+    Unreached(String),
+    /// It was sent, or may have been, and its answer was lost: a write may have landed.
+    Lost(String),
+}
+
+impl From<NoAnswer> for String {
+    fn from(no: NoAnswer) -> Self {
+        match no {
+            NoAnswer::Retired(reason)
+            | NoAnswer::Unsendable(reason)
+            | NoAnswer::Unreached(reason)
+            | NoAnswer::Lost(reason) => reason,
+        }
+    }
+}
+
 /// The server's transport, which a changed target replaces ([`GraphClient::set_http`]): a client
 /// that sends each request through the one current when it is sent, so everything holding it
 /// moves to a new one together, and a request under way finishes through the one it began with.
@@ -718,18 +747,18 @@ impl GraphClient {
         &self,
         url: &Url,
         request: Request<AsyncBody>,
-    ) -> Result<http_client::Response<AsyncBody>, String> {
+    ) -> Result<http_client::Response<AsyncBody>, NoAnswer> {
         // A retired client sends nothing: each request fails with why it was retired, as given,
         // not read as a transport's failure.
         if let Some(why) = self.retired.get() {
-            return Err(why.clone());
+            return Err(NoAnswer::Retired(why.clone()));
         }
         let response = self
             .http
             .current()
             .send(request)
             .await
-            .map_err(|error| describe_transport(&error))?;
+            .map_err(|error| unanswered_by_transport(&error))?;
         self.note_refusal(url, response.status(), response.headers());
         Ok(response)
     }
@@ -760,6 +789,11 @@ impl GraphClient {
         // What was read, or failed, through the old transport is read again through this one.
         self.credential_changes
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Why the client was retired ([`Self::retire`]), once it was: it sends nothing.
+    pub fn retired(&self) -> Option<&str> {
+        self.retired.get().map(String::as_str)
     }
 
     /// Stops the client and every clone of it for good, as when its CLI target is gone or names
@@ -1044,7 +1078,7 @@ impl GraphClient {
         body: Option<Vec<u8>>,
         headers: &[(&str, &str)],
         timeout: Duration,
-    ) -> Result<RawResponse, String> {
+    ) -> Result<RawResponse, NoAnswer> {
         self.fresh_token().await;
         self.send_now(
             method,
@@ -1069,6 +1103,7 @@ impl GraphClient {
             BodyLimit::First(READ_ANSWER_MAX),
         )
         .await
+        .map_err(String::from)
     }
 
     /// Sends with the token held now, keeping only what `limit` says of the body: the rest is
@@ -1083,7 +1118,7 @@ impl GraphClient {
         headers: &[(&str, &str)],
         timeout: Duration,
         limit: BodyLimit,
-    ) -> Result<RawResponse, String> {
+    ) -> Result<RawResponse, NoAnswer> {
         let head = method == Method::HEAD;
         let (builder, carried) = self.request(method, &url);
         let mut builder = builder.timeout(timeout);
@@ -1100,7 +1135,7 @@ impl GraphClient {
         }
         let request = builder
             .body(body.map(AsyncBody::from).unwrap_or_else(AsyncBody::empty))
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| NoAnswer::Unsendable(error.to_string()))?;
         let response = self.dispatch(&url, request).await?;
         let status = response.status();
         let contract = response
@@ -1128,7 +1163,7 @@ impl GraphClient {
         let length = body_length(head, status, &headers);
         let bytes = read_body(response.into_body(), skip, keep, length)
             .await
-            .map_err(|error| describe_transport(&error.into()))?;
+            .map_err(|error| NoAnswer::Lost(describe_transport(&error.into())))?;
         Ok(RawResponse {
             carried,
             status,
@@ -1201,7 +1236,7 @@ impl GraphClient {
                     limit,
                 )
                 .await
-                .map_err(ReadError::Transport)?
+                .map_err(|no| ReadError::Transport(no.into()))?
             };
             // A read changes nothing, so a rate-limited one waits as asked and goes again.
             if raw.status == StatusCode::TOO_MANY_REQUESTS && retries < READ_RETRIES {
@@ -1483,7 +1518,7 @@ impl GraphClient {
     ) -> WriteOutcome<BlobWriteOutput> {
         match self.send(method, url, body, headers, WRITE_TIMEOUT).await {
             Ok(raw) => classify_write(raw),
-            Err(reason) => WriteOutcome::Unknown { reason },
+            Err(no) => unanswered(no),
         }
     }
 
@@ -1498,7 +1533,7 @@ impl GraphClient {
         let url = self.url(segments, query);
         let raw = match self.send(method, url, body, headers, WRITE_TIMEOUT).await {
             Ok(raw) => raw,
-            Err(reason) => return WriteOutcome::Unknown { reason },
+            Err(no) => return unanswered(no),
         };
         classify_write(raw)
     }
@@ -1510,7 +1545,7 @@ impl GraphClient {
     /// ways and there is no total timeout, as the CLI sets none; a write is sent once and never
     /// retried (constitution III). `path_and_query` is below the server root, without a leading
     /// slash; a path that would leave the root is refused.
-    pub async fn forward(&self, request: ForwardRequest) -> Result<ForwardResponse, String> {
+    pub async fn forward(&self, request: ForwardRequest) -> Result<ForwardResponse, NoAnswer> {
         let path = request
             .path_and_query
             .split(['?', '#'])
@@ -1523,18 +1558,24 @@ impl GraphClient {
                 .any(|segment| segment == ".." || segment == ".")
             || path.contains('\\')
         {
-            return Err(format!("refused path {:?}", request.path_and_query));
+            return Err(NoAnswer::Unsendable(format!(
+                "refused path {:?}",
+                request.path_and_query
+            )));
         }
         let url = self
             .base
             .join(&request.path_and_query)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| NoAnswer::Unsendable(error.to_string()))?;
         // The server receives exactly the path judged here: a join that resolves `%2e%2e`,
         // drops a tab or encodes a byte would send another.
         if !url.as_str().starts_with(self.base.as_str())
             || url.path() != format!("{}{path}", self.base.path())
         {
-            return Err(format!("refused path {:?}", request.path_and_query));
+            return Err(NoAnswer::Unsendable(format!(
+                "refused path {:?}",
+                request.path_and_query
+            )));
         }
         self.fresh_token().await;
         let (mut builder, _) = self.request(request.method, &url);
@@ -1543,7 +1584,7 @@ impl GraphClient {
         }
         let request = builder
             .body(request.body)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| NoAnswer::Unsendable(error.to_string()))?;
         let response = self.dispatch(&url, request).await?;
         Ok(ForwardResponse {
             status: response.status(),
@@ -2029,15 +2070,15 @@ pub fn judge_write<'a>(
     status: StatusCode,
     contract: Option<&str>,
     body: &'a [u8],
-) -> WriteOutcome<&'a [u8]> {
+) -> Answered<&'a [u8]> {
     let contract_ok = speaks_contract(contract);
     if status.is_success() {
         if !contract_ok {
-            return WriteOutcome::Unknown {
+            return Answered::Unknown {
                 reason: "the response did not carry the contract header".into(),
             };
         }
-        return WriteOutcome::Committed(body);
+        return Answered::Committed(body);
     }
     if contract_ok && let Ok(stated) = serde_json::from_slice::<Stated>(body) {
         let effects = stated.disposition.map(|disposition| disposition.effects);
@@ -2050,22 +2091,20 @@ pub fn judge_write<'a>(
             ..ErrorOutput::default()
         });
         return match effects {
-            Some(DispositionEffects::None) => WriteOutcome::Refused(ApiError {
+            Some(DispositionEffects::None) => Answered::Refused(ApiError {
                 status: status.as_u16(),
                 body,
             }),
-            Some(DispositionEffects::Unknown | DispositionEffects::Partial) => {
-                WriteOutcome::Unknown {
-                    reason: format!(
-                        "the server answered {status} and could not say whether the change was \
+            Some(DispositionEffects::Unknown | DispositionEffects::Partial) => Answered::Unknown {
+                reason: format!(
+                    "the server answered {status} and could not say whether the change was \
                          made: {}",
-                        body.error
-                    ),
-                }
-            }
+                    body.error
+                ),
+            },
             // An effect this build does not know, or none: the contract states one on every
             // error, so an answer without one cannot rule the change out.
-            Some(DispositionEffects::Other) | None => WriteOutcome::Unknown {
+            Some(DispositionEffects::Other) | None => Answered::Unknown {
                 reason: format!(
                     "the server answered {status} without saying whether the change was made: {}",
                     body.error
@@ -2073,7 +2112,7 @@ pub fn judge_write<'a>(
             },
         };
     }
-    WriteOutcome::Unknown {
+    Answered::Unknown {
         reason: format!("the server answered {status}"),
     }
 }
@@ -2093,14 +2132,41 @@ struct Stated {
 /// unknown.
 fn classify_write<T: DeserializeOwned>(raw: RawResponse) -> WriteOutcome<T> {
     match judge_write(raw.status, raw.contract.as_deref(), &raw.body) {
-        WriteOutcome::Committed(body) => match serde_json::from_slice(body) {
+        Answered::Committed(body) => match serde_json::from_slice(body) {
             Ok(value) => WriteOutcome::Committed(value),
             Err(error) => WriteOutcome::Unknown {
                 reason: format!("the success response could not be read: {error}"),
             },
         },
-        WriteOutcome::Refused(error) => WriteOutcome::Refused(error),
-        WriteOutcome::Unknown { reason } => WriteOutcome::Unknown { reason },
+        Answered::Refused(error) => WriteOutcome::Refused(error),
+        Answered::Unknown { reason } => WriteOutcome::Unknown { reason },
+    }
+}
+
+/// Why a request the transport failed has no answer, by the error's kind and never its words:
+/// a connection the server refused carried no request ([`NoAnswer::Unreached`]); any other
+/// failure may have come after the request went out ([`NoAnswer::Lost`]).
+fn unanswered_by_transport(error: &anyhow::Error) -> NoAnswer {
+    let refused = error.chain().any(|layer| {
+        layer
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
+    });
+    let why = describe_transport(error);
+    if refused {
+        NoAnswer::Unreached(why)
+    } else {
+        NoAnswer::Lost(why)
+    }
+}
+
+/// A write with no answer: never sent, so nothing was written, or lost, so it may have been.
+fn unanswered<T>(no: NoAnswer) -> WriteOutcome<T> {
+    match no {
+        NoAnswer::Retired(reason) | NoAnswer::Unsendable(reason) | NoAnswer::Unreached(reason) => {
+            WriteOutcome::NotSent { reason }
+        }
+        NoAnswer::Lost(reason) => WriteOutcome::Unknown { reason },
     }
 }
 
@@ -2379,9 +2445,9 @@ mod tests {
                 Some(crate::CONTRACT),
                 body.as_bytes(),
             ) {
-                WriteOutcome::Committed(_) => "committed",
-                WriteOutcome::Refused(_) => "refused",
-                WriteOutcome::Unknown { .. } => "unknown",
+                Answered::Committed(_) => "committed",
+                Answered::Refused(_) => "refused",
+                Answered::Unknown { .. } => "unknown",
             }
         };
         assert_eq!(judge(500, Some("none")), "refused", "nothing was done");
@@ -2414,14 +2480,14 @@ mod tests {
             Some(crate::CONTRACT),
             unread.as_bytes(),
         ) {
-            WriteOutcome::Refused(refusal) => assert_eq!(refusal.body.error, "no"),
+            Answered::Refused(refusal) => assert_eq!(refusal.body.error, "no"),
             _ => panic!("a refusal whose details this build does not read"),
         }
         // Without the contract header the server did not answer, whatever the body says.
         let body = error(Some("none"));
         assert!(matches!(
             judge_write(StatusCode::INTERNAL_SERVER_ERROR, None, body.as_bytes()),
-            WriteOutcome::Unknown { .. }
+            Answered::Unknown { .. }
         ));
     }
 
@@ -3176,6 +3242,11 @@ mod tests {
         held.retire("the target is gone".into());
         assert_eq!(gateway.credential_changes(), changes + 2);
         let refused = block_on(gateway.schema("g")).unwrap_err();
+        // A write is not sent either, and says so: nothing was written.
+        assert!(matches!(
+            block_on(gateway.mutate("g", &ChangeRequest::default(), None)),
+            WriteOutcome::NotSent { reason } if reason == "the target is gone"
+        ));
         assert!(
             format!("{refused:?}").contains("the target is gone"),
             "{refused:?}"
@@ -3186,6 +3257,34 @@ mod tests {
             6,
             "the retired client sent nothing"
         );
+    }
+
+    /// A write whose connection the server refused was never sent, and says so: nothing was
+    /// written. One whose connection failed otherwise (reset) may have landed after it went out,
+    /// and so may one whose failure only says "connection refused" in words: the error's kind
+    /// decides, not its text. Before, every transport failure was an answer lost.
+    #[test]
+    fn a_write_the_server_refused_to_connect_to_is_not_sent() {
+        let failing = |kind: Option<std::io::ErrorKind>| {
+            client(FakeHttpClient::create(move |_| async move {
+                Err(match kind {
+                    Some(kind) => anyhow::Error::from(std::io::Error::from(kind))
+                        .context("error sending request"),
+                    None => anyhow::anyhow!("connection refused, in words alone"),
+                })
+            }))
+        };
+        let write =
+            |client: GraphClient| block_on(client.mutate("g", &ChangeRequest::default(), None));
+        assert!(matches!(
+            write(failing(Some(std::io::ErrorKind::ConnectionRefused))),
+            WriteOutcome::NotSent { reason } if reason == "the connection was refused"
+        ));
+        assert!(matches!(
+            write(failing(Some(std::io::ErrorKind::ConnectionReset))),
+            WriteOutcome::Unknown { .. }
+        ));
+        assert!(matches!(write(failing(None)), WriteOutcome::Unknown { .. }));
     }
 
     /// Stored queries: the catalog decodes (a kind Studio does not know is `Other`), a read
@@ -3359,7 +3458,10 @@ mod tests {
                 headers: Vec::new(),
                 body: AsyncBody::empty(),
             }));
-            assert!(refused.is_err(), "{path} was sent");
+            assert!(
+                matches!(refused, Err(NoAnswer::Unsendable(_))),
+                "{path} was sent"
+            );
         }
         assert!(seen.lock().unwrap().is_empty());
     }

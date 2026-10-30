@@ -14,8 +14,8 @@ mod client;
 pub use api::{CommitChanges, ErrorOutput};
 pub use client::{
     ApiErrorSummary, BlobAt, BlobCell, BlobMeta, CHANGE_READ_TIMEOUT, Challenge, FeedAt,
-    ForwardRequest, ForwardResponse, GraphClient, HistoricalGap, MergePreview, PropertyThen,
-    ReadError, ServerHealth, judge_write, server_root,
+    ForwardRequest, ForwardResponse, GraphClient, HistoricalGap, MergePreview, NoAnswer,
+    PropertyThen, ReadError, ServerHealth, judge_write, server_root,
 };
 pub use http_client::{
     AsyncBody,
@@ -49,8 +49,27 @@ pub enum WriteOutcome<T> {
     Committed(T),
     /// The server refused the change; nothing was written.
     Refused(ApiError),
+    /// Studio never sent the write: its client was retired ([`GraphClient::retire`]), the
+    /// server refused the connection, or the request could not be made. A refusal in the
+    /// constitution's sense (III): nothing was written, and there is nothing to settle, as with
+    /// [`Self::Refused`], though no server answered.
+    NotSent { reason: String },
     /// The response was lost, timed out, or lacked the contract header. Settle it by reading
     /// history, never by sending the write again.
+    Unknown { reason: String },
+}
+
+/// What a server's answer to a write says of it ([`judge_write`]): an answer means the write was
+/// sent, so it was made, refused, or may have been made. [`WriteOutcome`] adds the write never
+/// sent.
+#[expect(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum Answered<T> {
+    /// The server published the change.
+    Committed(T),
+    /// The server refused the change; nothing was written.
+    Refused(ApiError),
+    /// The answer cannot say whether the change was made.
     Unknown { reason: String },
 }
 
