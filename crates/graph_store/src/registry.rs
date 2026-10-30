@@ -102,7 +102,7 @@ pub struct ConnectionRegistry {
     /// The graph ids remembered for each CLI target, as last read or saved.
     known: KnownGraphs,
     /// What a CLI server's connection signs in with when its server asks (spec 016): `None` in
-    /// a test that does not set it ([`Self::set_sign_in_for_tests`]).
+    /// tests.
     sign_in: Option<SignInContext>,
     /// Whether the remembered graphs are written to the data directory: Studio's, not a
     /// test's.
@@ -346,11 +346,6 @@ impl ConnectionRegistry {
     /// Takes `platform` as the system Studio runs on, for the tests of what Studio does where
     /// the CLI gives it no token (Windows).
     #[cfg(any(test, feature = "test-support"))]
-    pub fn set_sign_in_for_tests(&mut self, context: SignInContext) {
-        self.sign_in = Some(context);
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
     pub fn set_platform_for_tests(&mut self, platform: Platform) {
         self.platform = platform;
     }
@@ -369,6 +364,7 @@ impl ConnectionRegistry {
         this.sign_in = Some(SignInContext {
             elsewhere: this.http.clone(),
             keychain: PlatformKeychain::start(cx),
+            turns: sign_in::KeychainTurns::default(),
             identities: sign_in::studio_identities(),
         });
 
@@ -598,17 +594,6 @@ impl ConnectionRegistry {
         }
     }
 
-    /// Brings the CLI's servers in line with the targets the CLI lists, and says whether
-    /// anything changed. An address is one server (spec 003), so a CLI server is its address: a
-    /// target renamed on the same endpoint renames the connection in place, which the windows
-    /// open on it keep, each graph's saved state staying under the name it was opened with until
-    /// it is opened again ([`crate::GraphSession::overrides_key`]). A new address is a new
-    /// connection, with the graphs Studio remembered for its target's name, or for the name at
-    /// the address it left; an address no longer listed leaves the list (a window open on it
-    /// keeps its connection); a target whose entry or token file changed asks the CLI for its
-    /// token again; a target's graph is added. Targets that could not be listed change no server. What could not be
-    /// listed or used, a server that cannot be added included, is a change only when it differs
-    /// from what was kept.
     /// The transports the CLI connections hold, and what makes a client for another, for a
     /// listing to prepare off the main thread ([`prepare_transports`]).
     fn transport_maker(&self) -> (Vec<CliTransport>, TransportHttp) {
@@ -636,6 +621,18 @@ impl ConnectionRegistry {
         }
     }
 
+    /// Brings the CLI's servers in line with the targets the CLI lists, and says whether
+    /// anything changed. An address is one server (spec 003), so a CLI server is its address: a
+    /// target renamed on the same endpoint renames the connection in place, which the windows
+    /// open on it keep, each graph's saved state staying under the name it was opened with until
+    /// it is opened again ([`crate::GraphSession::overrides_key`]); its sign-in, the old name's,
+    /// is dropped ([`Connection::rename`]). A new address is a new connection, with the graphs
+    /// Studio remembered for its target's name, or for the name at the address it left; an
+    /// address no longer listed leaves the list (a window open on it keeps its connection); a
+    /// target whose entry or token file changed asks the CLI for its token again; a target's
+    /// graph is added. Targets that could not be listed change no server. What could not be
+    /// listed or used, a server that cannot be added included, is a change only when it differs
+    /// from what was kept.
     fn apply_cli_targets(
         &mut self,
         targets: CliTargets,
@@ -729,9 +726,8 @@ impl ConnectionRegistry {
                 }
                 connection.update(cx, |connection, cx| {
                     if connection.server.name != server.name {
-                        connection.server.name = server.name.clone();
+                        connection.rename(server.name.clone(), cx);
                         changed = true;
-                        cx.notify();
                     }
                     for graph in &server.graphs {
                         if !connection.server.known_graphs.contains(graph) {
