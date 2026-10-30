@@ -1087,8 +1087,8 @@ fn retries_on_select(c: &Connection) -> bool {
         || matches!(c.sign_in, SignIn::Unavailable(_))
 }
 
-/// What Update token does with the token typed: it lasts this run
-/// ([`ConnectionRegistry::update_token`]), and for a CLI server on Unix the CLI's own command
+/// What Update token does with the token typed: it lasts until Studio quits or asks the CLI for
+/// the target's token again ([`ConnectionRegistry::update_token`]), and for a CLI server on Unix the CLI's own command
 /// keeps one for the CLI and Studio. Where the CLI exports no token (Windows), that command
 /// would make the target one that takes a token, which Studio there refuses
 /// ([`Platform::exports_tokens`]): a CLI server the dialog lists there is an anonymous target,
@@ -1117,13 +1117,15 @@ fn tooltip_for(
              {profile} (for a profile that signs in, your `omnigraph login --profile {profile}`). \
              Studio keeps it in memory and asks the CLI again when the server refuses it; the CLI \
              gives the same token while it holds and a new one once it lapses. A token typed \
-             here is used until Studio quits. Studio's own sign-in will replace this."
+             here is used until Studio quits or asks the CLI for this target's token again. \
+             Studio's own sign-in will replace this."
         );
     }
     match source {
         ServerSource::Cli if platform.exports_tokens() => format!(
-            "Used until Studio quits. To keep one for the CLI and Studio, pipe it to `omnigraph \
-             credentials set --target {name} --stdin`."
+            "Used until Studio quits or asks the CLI for this target's token again. To keep one \
+             for the CLI and Studio, pipe it to `omnigraph credentials set --target {name} \
+             --stdin`."
         ),
         ServerSource::Cli => format!(
             "Used until Studio quits. Studio on Windows cannot use a target that needs a token \
@@ -1775,6 +1777,12 @@ mod tests {
             "{cli}"
         );
         assert!(!cli.contains("login"), "{cli}");
+        // A target the CLI gives tokens for asks it again over a typed token (Refresh, a change
+        // to the target or to the CLI), so the token is not said to last the run.
+        assert!(
+            cli.starts_with("Used until Studio quits or asks the CLI for this target's token"),
+            "{cli}"
+        );
         // Where the CLI exports no token, its command would make a target Studio refuses: the
         // tooltip says the token lasts this run, and names no command.
         assert_eq!(
@@ -1793,7 +1801,8 @@ mod tests {
         let login = tooltip_for(&ServerSource::Cli, "cloud", Some("work"), Platform::Unix);
         assert!(
             login.contains("from its profile work")
-                && login.contains("`omnigraph login --profile work`"),
+                && login.contains("`omnigraph login --profile work`")
+                && login.contains("used until Studio quits or asks the CLI"),
             "{login}"
         );
         assert_eq!(

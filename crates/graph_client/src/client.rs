@@ -108,6 +108,14 @@ impl Challenge {
         self.param("error") == Some("invalid_token")
     }
 
+    /// Whether a 401 whose challenge is `challenge` refused the token its request carried: as
+    /// the challenge says, or, from a server that sends none (an older one), whether one was
+    /// `sent`. One that refused none though a token was sent means it never arrived (a proxy
+    /// dropped it); with none sent, the server asks for one.
+    pub fn refuses(challenge: Option<&Challenge>, sent: bool) -> bool {
+        challenge.map_or(sent, Challenge::token_refused)
+    }
+
     /// Where the server's protected-resource metadata is, when it takes OAuth sign-in.
     pub fn resource_metadata(&self) -> Option<&str> {
         self.param("resource_metadata")

@@ -207,19 +207,18 @@ async fn request(
                 "The sign-in service does not issue tokens for this server: {}",
                 said("it refused the resource.")
             )),
-            "" if answer.status.is_server_error() => TokenError::Failed(format!(
-                "The sign-in service failed ({}).",
-                answer.status.as_u16()
-            )),
-            _ if answer.status.is_server_error() => {
-                TokenError::Failed(said("The sign-in service failed."))
-            }
-            // Busy, or asking to be asked later: it may pass, so the sign-in stands.
-            "temporarily_unavailable" | "slow_down" => {
-                TokenError::Failed(said("The sign-in service is busy."))
-            }
-            _ if fetch::failed_for_now(answer.status) => {
-                TokenError::Failed(said("The sign-in service is busy."))
+            // Failed for now, busy, or asking to be asked later: it may pass, so the sign-in
+            // stands.
+            _ if fetch::failed_for_now(answer.status)
+                || matches!(error, "temporarily_unavailable" | "slow_down") =>
+            {
+                TokenError::Failed(if !answer.status.is_server_error() {
+                    said("The sign-in service is busy.")
+                } else if error.is_empty() {
+                    format!("The sign-in service failed ({}).", answer.status.as_u16())
+                } else {
+                    said("The sign-in service failed.")
+                })
             }
             _ => TokenError::Refused(said(&format!(
                 "The sign-in service refused ({}).",

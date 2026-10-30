@@ -1211,11 +1211,8 @@ impl GraphSession {
             // that refused no token (one that never arrived, as a proxy drops it) asks nothing:
             // the next token would fare no better.
             Err(ReadError::Refused(error)) if error.status == 401 => {
-                if error
-                    .challenge
-                    .as_deref()
-                    .is_none_or(graph_client::Challenge::token_refused)
-                {
+                let sent = self.connection.read(cx).has_token();
+                if graph_client::Challenge::refuses(error.challenge.as_deref(), sent) {
                     self.connection
                         .update(cx, |connection, cx| connection.read_refused(cx));
                 }

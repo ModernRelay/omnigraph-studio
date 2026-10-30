@@ -512,7 +512,7 @@ impl ConnectionRegistry {
     /// changed address or a rotated token reaches Studio without a restart; a CLI installed,
     /// upgraded or removed also asks every CLI server's token again. Each look and each listing
     /// runs off the main thread. The CLI's secure store cannot be watched: a token kept there
-    /// is asked for again on connect, after a 401 and on Refresh.
+    /// is asked for again on connect, after a 401 that refused it and on Refresh.
     fn watch_cli_targets(&mut self, cx: &mut Context<Self>) {
         let dir = self.operator_dir.clone();
         let lister = self.lister.clone();
@@ -902,8 +902,9 @@ impl ConnectionRegistry {
         })
     }
 
-    /// Replaces a server's token for this run and reconnects: for a CLI server until Refresh or
-    /// a change to its target asks the CLI again, since Studio writes none of the CLI's files.
+    /// Replaces a server's token for this run and reconnects: for a CLI server whose token the CLI
+    /// gives, until Studio asks the CLI again (Refresh, a change to its target or to the CLI),
+    /// since Studio writes none of the CLI's files.
     pub fn update_token(
         &mut self,
         connection: &Entity<Connection>,

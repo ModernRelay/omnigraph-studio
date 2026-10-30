@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 use futures::channel::oneshot;
 use gpui::{Context, EventEmitter, Task};
 use graph_client::api::{GraphInfo, HealthOutput};
-use graph_client::{GraphClient, ReadError};
+use graph_client::{Challenge, GraphClient, ReadError};
 use http_client::HttpClient;
 use oauth_client::TokenError;
 use studio_settings::StudioSettings;
@@ -148,11 +148,12 @@ pub struct Connection {
     /// CLI server's is the CLI's `credentials export`. `None` for a server given its token.
     token_source: Option<Arc<dyn TokenSource>>,
     /// The token held was given (typed in), so the source is not asked until
-    /// [`Connection::refresh_token`].
+    /// [`Connection::refresh_token`] or a new source ([`Connection::take_token_from`]).
     token_given: bool,
     /// The token held is the one the source just gave for the connect under way.
     token_fresh: bool,
-    /// The source was asked again after a 401, which it is once until a connect is ready.
+    /// The source was asked again after a 401 that refused its token, which it is once until a
+    /// connect is ready.
     asked_after_refusal: bool,
     /// The credential generation ([`GraphClient::credential_changes`]) a graph read was last
     /// refused under ([`Connection::read_refused`]): the source is asked again once for each
@@ -174,8 +175,8 @@ pub struct Connection {
     /// Raised while a window waits for the source's answer ([`Connection::wait_for_token`]):
     /// the CLI serves this ask before the others waiting for it. Lowered when it answers.
     hurry: Arc<AtomicBool>,
-    /// The source asked again while the connection stands (after a 401, on Refresh, for a
-    /// changed target, for a renewal), and what for. A change of source ends it
+    /// The source asked again while the connection stands (after a 401 that refused its token, on
+    /// Refresh, for a changed target, for a renewal), and what for. A change of source ends it
     /// ([`Connection::replace_source`]).
     _asking: Option<(Ask, Task<()>)>,
     /// Answers a request that found the token held ended ([`GraphClient::token_ended`]), from
@@ -210,7 +211,8 @@ pub struct Connection {
     /// The sign-in the token comes from, when it comes from one.
     oauth: Option<OAuthSource>,
     /// How long the short-lived token held stands, and whose it is: the next one of the same
-    /// holder ([`Lease::holder`]) replaces it quietly.
+    /// holder ([`Lease::holder`]), from the same source, replaces it quietly, unless a 401 stands
+    /// or it answers a Refresh.
     lease: Option<Lease>,
     /// The sign-in under way: reading its service, waiting for the browser, or finishing.
     signing_in: Option<SigningIn>,
@@ -334,7 +336,9 @@ enum ConnectStep {
 enum Ask {
     /// A connect waits for it, and goes on with what it gives.
     Connect,
-    /// The token held is near its end: the next one of the same holder replaces it quietly.
+    /// The token held is near its end. The next one of the same holder, from the same source,
+    /// replaces it quietly, unless a 401 stands; a Refresh's never does
+    /// ([`Connection::token_answered`] decides for every answer, a connect's too).
     Renewal,
     /// The server refused the token held: its answer is tried at once, and no failure keeps
     /// the refused token.
@@ -453,8 +457,9 @@ impl Connection {
     }
 
     /// Takes its token from `source` each time it is asked: on each connect, before anything is
-    /// sent; once more after a 401; and on Refresh ([`Connection::refresh_token`]). A server
-    /// with a source is sent nothing without a token from it.
+    /// sent; once more after a 401 that refused its token; and on Refresh
+    /// ([`Connection::refresh_token`]). A server with a source is sent nothing without a token
+    /// from it.
     pub(crate) fn with_token_source(mut self, source: Option<Arc<dyn TokenSource>>) -> Self {
         self.token_source = source;
         self
@@ -568,8 +573,9 @@ impl Connection {
         cx.notify();
     }
 
-    /// A read on one of the server's graphs was answered 401 while it carried the source's token:
-    /// the token may have lapsed (a managed data token lives an hour), with `/healthz`, which
+    /// A read on one of the server's graphs was answered 401 refusing the source's token it
+    /// carried ([`graph_client::Challenge::refuses`]; one that refused none, the token never
+    /// arriving, is not told here): the token may have lapsed (a managed data token lives an hour), with `/healthz`, which
     /// asks for none, still answering. The source is told ([`TokenSource::note_refused`]), then
     /// asked again, once for the token held: a renewed token replaces it and what was read is
     /// read again ([`ConnectionEvent::CredentialChanged`]); the same token leaves the read
@@ -952,8 +958,9 @@ impl Connection {
     }
 
     /// Replaces the token with one given to it, typed in after the server refused the old one
-    /// (spec 003): a token source is not asked over it until Refresh. Requests made after this
-    /// use it, and a connection in use checks again; one not yet used connects when it is.
+    /// (spec 003): a token source is not asked over it until [`Self::refresh_token`] (the
+    /// person's Refresh, or a change to the CLI) or a new source. Requests made after this use
+    /// it, and a connection in use checks again; one not yet used connects when it is.
     pub fn set_token(&mut self, token: Option<String>, cx: &mut Context<Self>) {
         let was_ready = self.token_ready();
         self.token_given = true;
@@ -1190,11 +1197,13 @@ impl Connection {
     /// Takes the state a failed read left, noting for a 401 whether the server refused the
     /// token sent ([`Self::refused_with_token`]). A token from the source that the server
     /// refused is asked for once more: a rotated one connects again, the same one stays
-    /// refused, and nothing is asked again until a connect is ready or the person refreshes.
-    /// One the server did not refuse is not asked about.
+    /// refused, and a probe's 401 asks nothing again until a connect is ready,
+    /// [`Self::refresh_token`] (the person's Refresh, or a change to the CLI) or a new source. A
+    /// graph read's 401 has its own bound ([`Self::read_refused`]). One the server did not
+    /// refuse is not asked about.
     fn refused(&mut self, failed: Failed, token_sent: bool, cx: &mut Context<Self>) {
         if failed.state == ConnectionState::Unauthorized {
-            self.refused_with_token = failed.token_refused.unwrap_or(token_sent);
+            self.refused_with_token = Challenge::refuses(failed.challenge.as_deref(), token_sent);
             if self.refused_with_token {
                 self.probe_refused = Some(self.client.token_serial());
             }
@@ -1211,8 +1220,12 @@ impl Connection {
                 }
                 self.ask_for_token(Ask::AfterRefusal, cx);
             }
-            match failed.sign_in {
-                Some(metadata) => self.offered_sign_in(metadata, cx),
+            match failed
+                .challenge
+                .as_deref()
+                .and_then(Challenge::resource_metadata)
+            {
+                Some(metadata) => self.offered_sign_in(metadata.to_owned(), cx),
                 // A server that no longer offers a sign-in asks for a token instead.
                 None if matches!(self.sign_in, SignIn::Unavailable(_)) => {
                     self.sign_in = SignIn::NotOffered;
@@ -2092,23 +2105,20 @@ enum Probe {
     Failed(Failed),
 }
 
-/// A read that left the connection unusable: the state it leaves, and for a 401 whether the
-/// server's challenge says it refused the token sent (`None` from a server that sends none,
-/// one before Omnigraph #1122).
+/// A read that left the connection unusable: the state it leaves, and a 401's challenge, which
+/// says whether it refused the token sent ([`Challenge::refuses`]) and where the server's
+/// sign-in details are (`resource_metadata`), when it offers a sign-in. `None` from a server
+/// that sends none.
 struct Failed {
     state: ConnectionState,
-    token_refused: Option<bool>,
-    /// Where the 401's challenge says the server's sign-in details are
-    /// (`resource_metadata`), when it offers a sign-in.
-    sign_in: Option<String>,
+    challenge: Option<Box<Challenge>>,
 }
 
 impl From<ConnectionState> for Failed {
     fn from(state: ConnectionState) -> Self {
         Self {
             state,
-            token_refused: None,
-            sign_in: None,
+            challenge: None,
         }
     }
 }
@@ -2159,12 +2169,7 @@ async fn list_graphs(client: &GraphClient) -> Result<GraphListing, Failed> {
         Err(ReadError::Refused(summary)) if summary.status == 401 => {
             return Err(Failed {
                 state: ConnectionState::Unauthorized,
-                token_refused: summary.challenge.as_deref().map(|c| c.token_refused()),
-                sign_in: summary
-                    .challenge
-                    .as_deref()
-                    .and_then(|c| c.resource_metadata())
-                    .map(str::to_owned),
+                challenge: summary.challenge,
             });
         }
         // A credential that may not list the server's graphs may still discover its own.
@@ -3591,10 +3596,13 @@ mod tests {
             connection.read_with(cx, |connection, _| connection.client().credential_changes())
         };
         let asks_for_one = |connection: &mut Connection, cx: &mut Context<Connection>| {
+            // A bare `Bearer` challenge: the server found no token.
             let failed = Failed {
                 state: ConnectionState::Unauthorized,
-                token_refused: Some(false),
-                sign_in: None,
+                challenge: Some(Box::new(Challenge {
+                    scheme: "Bearer".into(),
+                    params: Vec::new(),
+                })),
             };
             connection.refused(failed, true, cx);
         };
