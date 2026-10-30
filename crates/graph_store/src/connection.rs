@@ -8,13 +8,15 @@ use std::time::{Duration, Instant, SystemTime};
 use futures::channel::oneshot;
 use gpui::{Context, EventEmitter, Task};
 use graph_client::api::{GraphInfo, HealthOutput};
-use graph_client::{GraphClient, ReadError};
+use graph_client::{Challenge, GraphClient, ReadError};
 use http_client::HttpClient;
 use oauth_client::TokenError;
 use studio_settings::StudioSettings;
 
 use crate::cli_tokens::{Lease, NoToken, Token, TokenSource};
-use crate::sign_in::{self, End, Kept, KeychainTurn, OAuthSource, Service, SignIn, SignInContext};
+use crate::sign_in::{
+    self, End, Kept, KeychainTurn, OAuthSource, Refusal, Service, SignIn, SignInContext,
+};
 
 /// Where Studio learned about a server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,9 +59,10 @@ pub enum ConnectionState {
     ContractMismatch {
         served: Option<String>,
     },
-    /// The server answered 401: the token sent was refused, or none was sent
-    /// ([`Connection::refused_with_token`] says which). Also a server whose token source gave
-    /// none ([`Connection::token_unread`] says why), which is asked nothing without one.
+    /// The server answered 401: the token sent was refused, the one sent never arrived, or none
+    /// was sent ([`Connection::refused_with_token`] and [`Connection::has_token`] say which).
+    /// Also a server whose token source gave none ([`Connection::token_unread`] says why), which
+    /// is asked nothing without one.
     Unauthorized,
     Unreachable(String),
 }
@@ -135,7 +138,8 @@ pub struct Connection {
     /// Whether the server refused the token of the request it answered with 401
     /// ([`ConnectionState::Unauthorized`]): its challenge says `error="invalid_token"`, or, from
     /// a server that sends no challenge, the request carried one. Otherwise the server asks for
-    /// a token rather than refusing one.
+    /// a token rather than refusing one: none was sent, or the one sent never arrived (a proxy
+    /// that drops it), as [`Connection::has_token`] tells.
     pub refused_with_token: bool,
     /// The token held is the one the current source last gave: an ask that fails for a reason
     /// that may pass leaves it in use while it lives ([`Self::keeps_token`]).
@@ -144,29 +148,38 @@ pub struct Connection {
     /// CLI server's is the CLI's `credentials export`. `None` for a server given its token.
     token_source: Option<Arc<dyn TokenSource>>,
     /// The token held was given (typed in), so the source is not asked until
-    /// [`Connection::refresh_token`].
+    /// [`Connection::refresh_token`] or a new source ([`Connection::take_token_from`]).
     token_given: bool,
     /// The token held is the one the source just gave for the connect under way.
     token_fresh: bool,
-    /// The source was asked again after a 401, which it is once until a connect is ready.
+    /// The source was asked again after a 401 that refused its token, which it is once until a
+    /// connect is ready.
     asked_after_refusal: bool,
     /// The credential generation ([`GraphClient::credential_changes`]) a graph read was last
-    /// refused under ([`Connection::read_refused`]): the source is asked again once for each.
-    /// Also the one a token given after a refusal arrived under, which is that one more try: a
-    /// read it carries that is refused asks nothing until a read with it is taken
-    /// ([`Connection::read_taken`]), so a server that does not admit the account is not asked in
-    /// a loop by a source that gives a new token each time, and a token that lapses later is.
+    /// refused under ([`Connection::read_refused`]): the source is asked again once for each
+    /// token held. Also the one held once the source answered an ask after a refusal, a probe's
+    /// or a read's, the refused token given back included, which is that one more try: a read
+    /// it carries that is refused asks nothing until a read with it is taken
+    /// ([`Connection::read_taken`]) or a quiet replacement gives another token, so a server that
+    /// does not admit the account is not asked in a loop by a source that gives a new token each
+    /// time, and a token that lapses later is.
     read_refused_under: Option<u64>,
+    /// The token ([`GraphClient::token_serial`]) a 401 to the connect's probe or to the graph
+    /// list refused ([`Connection::refused`], [`Connection::refused_with_token`]): while it is
+    /// held, the next is a new credential whatever asks for it, a connect from that state
+    /// included, as a transport change starts, and a failure to give one does not keep it. A
+    /// probe the server answers clears it.
+    probe_refused: Option<u64>,
     /// The source has answered since it was set, with a token or why it gave none: requests
     /// sent from then carry what it gave ([`Connection::token_ready`]).
     token_answered: bool,
     /// Raised while a window waits for the source's answer ([`Connection::wait_for_token`]):
     /// the CLI serves this ask before the others waiting for it. Lowered when it answers.
     hurry: Arc<AtomicBool>,
-    /// The source asked again while the connection stands (after a 401, on Refresh, for a
-    /// changed target, for a renewal), what for, and which source: one replaced since is not
-    /// answered ([`Connection::asking`]).
-    _asking: Option<(Ask, Arc<dyn TokenSource>, Task<()>)>,
+    /// The source asked again while the connection stands (after a 401 that refused its token, on
+    /// Refresh, for a changed target, for a renewal), and what for. A change of source ends it
+    /// ([`Connection::replace_source`]).
+    _asking: Option<(Ask, Task<()>)>,
     /// Answers a request that found the token held ended ([`GraphClient::token_ended`]), from
     /// the first connect on: asks for the next, checks a server away, or releases the requests
     /// waiting ([`Connection::token_ended`]).
@@ -199,7 +212,8 @@ pub struct Connection {
     /// The sign-in the token comes from, when it comes from one.
     oauth: Option<OAuthSource>,
     /// How long the short-lived token held stands, and whose it is: the next one of the same
-    /// holder ([`Lease::holder`]) replaces it quietly.
+    /// holder ([`Lease::holder`]), from the same source, replaces it quietly, unless a 401 stands
+    /// or it answers a Refresh.
     lease: Option<Lease>,
     /// The sign-in under way: reading its service, waiting for the browser, or finishing.
     signing_in: Option<SigningIn>,
@@ -209,7 +223,8 @@ pub struct Connection {
     left: Kept,
     /// The ask for the next short-lived token, before the one held ends.
     _renewal: Option<Task<()>>,
-    /// The renewal came while nothing watched the server: the next watch asks.
+    /// The renewal came while nothing watched the server: the next watch asks, unless a renewal
+    /// was scheduled since ([`Connection::schedule_renewal`]).
     renewal_missed: bool,
     /// How many checks in a row have come after a sign-in's service did not answer: the next
     /// comes after the ready interval, doubled for each, up to a failed check's. Any answer
@@ -322,7 +337,9 @@ enum ConnectStep {
 enum Ask {
     /// A connect waits for it, and goes on with what it gives.
     Connect,
-    /// The token held is near its end: the next one of the same holder replaces it quietly.
+    /// The token held is near its end. The next one of the same holder, from the same source,
+    /// replaces it quietly, unless a 401 stands; a Refresh's never does
+    /// ([`Connection::token_answered`] decides for every answer, a connect's too).
     Renewal,
     /// The server refused the token held: its answer is tried at once, and no failure keeps
     /// the refused token.
@@ -344,36 +361,42 @@ pub(crate) const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 impl EventEmitter<ConnectionEvent> for Connection {}
 
 impl Connection {
+    /// What a 401 says of the sign-in held: its service did not answer (the sign-in stands; it
+    /// was neither refused nor ended), the token sent never arrived, or the server does not
+    /// admit the account.
+    fn held_sign_in_label(&self) -> String {
+        if self.token_unanswered {
+            "Sign-in not answering".into()
+        } else if self.token_not_received() {
+            "Token not received".into()
+        } else {
+            "Not admitted".into()
+        }
+    }
+
     /// The status-bar text for its state: a 401 to a request that carried no token says the
     /// server asks for one, and a token source that gave none says so, rather than that a token
     /// was refused.
     pub fn label(&self) -> String {
         if self.state == ConnectionState::Unauthorized {
-            // A sign-in whose service did not answer stands; it was neither refused nor ended.
-            if self.token_unanswered && matches!(self.sign_in, SignIn::SignedIn { .. }) {
-                return "Sign-in not answering".into();
-            }
             match &self.sign_in {
                 SignIn::NotOffered if self.signing_in.is_some() => return "Signing in…".into(),
                 SignIn::NotOffered => {}
                 SignIn::Reading => return "Reading how to sign in".into(),
                 // A sign-in as someone else that failed, the one held standing: the server does
-                // not admit it, or its service did not answer.
-                SignIn::Offered { .. } if self.oauth.is_some() => {
-                    return if self.token_unanswered {
-                        "Sign-in not answering".into()
-                    } else {
-                        "Not admitted".into()
-                    };
-                }
+                // not admit it, its service did not answer, or the token sent never arrived.
+                SignIn::Offered { .. } if self.oauth.is_some() => return self.held_sign_in_label(),
                 SignIn::Offered { .. } => return "Sign in needed".into(),
                 SignIn::Unavailable(_) => return "Sign-in unavailable".into(),
                 SignIn::Waiting { .. } | SignIn::Finishing { .. } => return "Signing in…".into(),
-                SignIn::SignedIn { .. } => return "Not admitted".into(),
+                SignIn::SignedIn { .. } => return self.held_sign_in_label(),
             }
         }
         match (&self.state, &self.token_unread) {
             (ConnectionState::Unauthorized, Some(_)) => "No token from the CLI".into(),
+            (ConnectionState::Unauthorized, None) if self.token_not_received() => {
+                "Token not received".into()
+            }
             (ConnectionState::Unauthorized, None) if !self.refused_with_token => {
                 "Asks for a token".into()
             }
@@ -403,6 +426,7 @@ impl Connection {
             token_fresh: false,
             asked_after_refusal: false,
             read_refused_under: None,
+            probe_refused: None,
             token_answered: false,
             hurry: Arc::default(),
             _asking: None,
@@ -434,8 +458,9 @@ impl Connection {
     }
 
     /// Takes its token from `source` each time it is asked: on each connect, before anything is
-    /// sent; once more after a 401; and on Refresh ([`Connection::refresh_token`]). A server
-    /// with a source is sent nothing without a token from it.
+    /// sent; once more after a 401 that refused its token; and on Refresh
+    /// ([`Connection::refresh_token`]). A server with a source is sent nothing without a token
+    /// from it.
     pub(crate) fn with_token_source(mut self, source: Option<Arc<dyn TokenSource>>) -> Self {
         self.token_source = source;
         self
@@ -455,11 +480,15 @@ impl Connection {
                 futures::future::pending().boxed()
             }
         }
-        self.token_source = Some(Arc::new(Waiting));
+        self.replace_source(Some(Arc::new(Waiting)));
     }
 
-    /// Replaces where the token comes from (the CLI target changed) and asks it at once; with
-    /// none, the token is dropped (the target is anonymous now).
+    /// Replaces where the token comes from (the CLI target changed), ending every ask of the old
+    /// one. A connection in use, or one whose connect was asking (a window waiting on it among
+    /// them), asks the new one at once; a connect under way starts again with it. With none, where
+    /// a source was held the token held is dropped (the target is anonymous now) and a connection
+    /// in use connects again; otherwise nothing changes, so a sign-in held, or a token typed for an
+    /// anonymous target, stays.
     pub(crate) fn take_token_from(
         &mut self,
         source: Option<Arc<dyn TokenSource>>,
@@ -474,12 +503,14 @@ impl Connection {
             self.drop_sign_in(cx);
         }
         let had = self.token_source.is_some();
-        self.token_source = source;
+        let connect_asked = self.replace_source(source);
         // A window reads with the new source's token, waiting for its answer, not with what the
         // old one gave; one waiting for the old one's answer reads without a token now if there
-        // is no new one.
+        // is no new one. A token typed in no longer stands.
         if self.token_source.is_some() {
             self.token_answered = false;
+            self.token_given = false;
+            self.asked_after_refusal = false;
         }
         if !was_ready && self.token_ready() {
             cx.emit(ConnectionEvent::TokenReady);
@@ -487,7 +518,15 @@ impl Connection {
         // The token held is the old source's: the new one's failure does not keep it.
         self.token_from_source = false;
         if self.token_source.is_some() {
-            self.refresh_token(cx);
+            // A connect under way starts again, asking the new source: its probe would send the
+            // old source's token. After a Cancel, a window still waiting asks it.
+            if self.state == ConnectionState::Connecting {
+                self.connect(cx);
+            } else if connect_asked {
+                self.ask_for_token(Ask::Connect, cx);
+            } else if self.state != ConnectionState::Idle {
+                self.ask_for_token(Ask::Again, cx);
+            }
         } else if had {
             self.token_given = false;
             self.forget_lease();
@@ -501,7 +540,8 @@ impl Connection {
     /// server in use is checked again through it, so one the old transport could not reach does
     /// not wait for its next health check. A sign-in keeps going: a refresh under way finishes
     /// and is kept, as a new sign-in read from the keychain here would race it for the refresh
-    /// token it rotates. The registry asks the token source again too, since the target changed.
+    /// token it rotates. The registry asks the token source again too, since the target
+    /// changed: the source it takes starts this connect again ([`Self::take_token_from`]).
     pub(crate) fn replace_http(&mut self, http: Arc<dyn HttpClient>, cx: &mut Context<Self>) {
         self.client.set_http(http);
         cx.emit(ConnectionEvent::CredentialChanged);
@@ -519,13 +559,12 @@ impl Connection {
         // once that is dropped, without one.
         self.client.retire(why.clone());
         self.drop_sign_in(cx);
-        self.token_source = None;
+        self.replace_source(None);
         self.token_given = false;
         self.token_answered = true;
         self.client.set_token(None);
         self.token_from_source = false;
         self.token_unanswered = false;
-        self._asking = None;
         self._connect = None;
         self._listing = None;
         self._health_check = None;
@@ -535,8 +574,9 @@ impl Connection {
         cx.notify();
     }
 
-    /// A read on one of the server's graphs was answered 401 while it carried the source's token:
-    /// the token may have lapsed (a managed data token lives an hour), with `/healthz`, which
+    /// A read on one of the server's graphs was answered 401 refusing the source's token it
+    /// carried ([`graph_client::Challenge::refuses`]; one that refused none, the token never
+    /// arriving, is not told here): the token may have lapsed (a managed data token lives an hour), with `/healthz`, which
     /// asks for none, still answering. The source is told ([`TokenSource::note_refused`]), then
     /// asked again, once for the token held: a renewed token replaces it and what was read is
     /// read again ([`ConnectionEvent::CredentialChanged`]); the same token leaves the read
@@ -602,21 +642,42 @@ impl Connection {
         }
     }
 
+    /// Takes the token from `source` from now on; every change of source comes through here. The
+    /// old source's asks, a connect's among them, are answered for nobody, so they end: one
+    /// answered later could put back a token that was dropped (the person's signed-out one among
+    /// them), and a CLI export each runs with them would hold the CLI's turn from the new
+    /// source's asks. Returns whether a connect was asking, for the caller to ask in its place.
+    fn replace_source(&mut self, source: Option<Arc<dyn TokenSource>>) -> bool {
+        self.token_source = source;
+        self._asking = None;
+        let connect_asked = self.connect_step() == Some(ConnectStep::Asking);
+        if connect_asked {
+            self._connect = None;
+        }
+        connect_asked
+    }
+
     /// Asks the token source for a token, for what `ask` says. A connect's ask is the connect's
     /// task; another replaces the one before it.
     fn ask_for_token(&mut self, ask: Ask, cx: &mut Context<Self>) {
         let Some(source) = self.token_source.clone() else {
             return;
         };
-        // A renewal leaves an ask after a refusal or a Refresh to answer: that answer replaces
-        // the token as a new credential, reads again what was refused, and schedules the next
-        // renewal. Taken as a renewal, it would replace the token quietly.
+        // A Refresh while the source is asked again after a refusal asks in its place, as one
+        // after the refusal: it reads the source as it is now (a credential put right meanwhile),
+        // and its answer still replaces the refused token as a new credential.
+        let ask = match (ask, self.asking()) {
+            (Ask::Again, Some(Ask::AfterRefusal)) => Ask::AfterRefusal,
+            _ => ask,
+        };
+        // A renewal waits for any other ask under way, which gives the next token too and
+        // schedules the next renewal.
         if ask == Ask::Renewal && self.asking().is_some_and(|asking| asking != Ask::Renewal) {
             return;
         }
         let hurry = self.hurry.clone();
-        let asked = source.clone();
-        let source_asked = source.clone();
+        // Only an ask of the source in use answers: a change of source ends the old one's
+        // ([`Self::replace_source`]).
         let asking = cx.spawn(async move |this, cx| {
             let answer = cx.background_executor().spawn(source.token(hurry)).await;
             this.update(cx, |this, cx| {
@@ -625,33 +686,14 @@ impl Connection {
                 } else {
                     this._asking = None;
                 }
-                // Taken only while the token still comes from the source asked: one a sign-out,
-                // a sign-in or the CLI's credential replaced meanwhile could put back a token
-                // that was dropped, the person's signed-out one among them.
-                if this
-                    .token_source
-                    .as_ref()
-                    .is_some_and(|current| Arc::ptr_eq(current, &asked))
-                {
-                    this.token_answered(answer, ask, cx);
-                } else if ask == Ask::Connect {
-                    // A connect that waited on it asks the source now in use, which may give
-                    // the token already held and so start no connect of its own; after a
-                    // Cancel, a window waiting for the token still gets it, and the connection
-                    // stays as Cancel left it.
-                    if this.state == ConnectionState::Connecting {
-                        this.connect(cx);
-                    } else if !this.token_ready() {
-                        this.ask_for_token(Ask::Connect, cx);
-                    }
-                }
+                this.token_answered(answer, ask, cx);
             })
             .ok();
         });
         if ask == Ask::Connect {
             self._connect = Some((ConnectStep::Asking, asking));
         } else {
-            self._asking = Some((ask, source_asked, asking));
+            self._asking = Some((ask, asking));
         }
     }
 
@@ -685,27 +727,33 @@ impl Connection {
     }
 
     /// Whether the client holds a token, so the next request sends one.
-    fn has_token(&self) -> bool {
+    pub fn has_token(&self) -> bool {
         self.client.holds_token()
     }
 
-    /// The ask under way of the source in use, if any. One of a source replaced since (a
-    /// sign-out, a sign-in, the CLI's credential) is not answered, so it waits for nothing.
+    /// The ask under way, if any, which is of the source in use.
     fn asking(&self) -> Option<Ask> {
-        let (ask, of, _) = self._asking.as_ref()?;
-        let current = self.token_source.as_ref()?;
-        Arc::ptr_eq(of, current).then_some(*ask)
+        self._asking.as_ref().map(|(ask, _)| *ask)
     }
 
     /// Takes the source's answer to `ask`. A token connects (for a connect under way, or when it
-    /// changed). A source that could not answer leaves a token it gave in use while it lives
-    /// ([`Self::keeps_token`]), unless the server just refused that token; so does a sign-in a
+    /// is a new credential). A source that could not answer leaves a token it gave in use while it lives
+    /// ([`Self::keeps_token`]), unless the server refused that token
+    /// (while the source is asked again after the 401, or the 401 to a connect stands); so does a
+    /// sign-in a
     /// finishing one replaces, until that one is taken. Otherwise no token
     /// sends nothing more, the connection refused with why. The answer to a connect cancelled
     /// while a window waited for its token ([`Self::cancel`]) is taken, and the connection
     /// stays as Cancel left it.
     fn token_answered(&mut self, answer: Result<Token, NoToken>, ask: Ask, cx: &mut Context<Self>) {
         let connecting = ask == Ask::Connect && self.state == ConnectionState::Connecting;
+        // The source is asked again after the server's 401 to the token held: this answers that
+        // ask, or another (a connect) while it is out, and gives the one more try.
+        let after_refusal = ask == Ask::AfterRefusal || self.asking() == Some(Ask::AfterRefusal);
+        // The server refused the token held: after its 401 to a read, or since a probe's 401
+        // refused this very token (a connect started since). A failure to give the next does not
+        // keep the refused one.
+        let refused = after_refusal || self.probe_refused == Some(self.client.token_serial());
         let was_ready = self.token_ready();
         self.token_answered = true;
         self.hurry.store(false, Ordering::SeqCst);
@@ -717,9 +765,7 @@ impl Connection {
             // So does the answer of the sign-in a finishing one replaces, that it ended: the
             // token it gave stands until the finishing one is taken, a moment later, with its own.
             Err(no)
-                if (no.passing || self.finishing_over_held())
-                    && ask != Ask::AfterRefusal
-                    && self.keeps_token() =>
+                if (no.passing || self.finishing_over_held()) && !refused && self.keeps_token() =>
             {
                 self.keep_token(ask, connecting, cx);
                 return;
@@ -734,9 +780,15 @@ impl Connection {
         if let Some(lease) = &lease {
             self.schedule_renewal(lease.renew_at, cx);
         }
-        // A renewal, the same holder's next short-lived token while the connection stands:
-        // nothing read with the last one is read again.
-        let renewal = ask == Ask::Renewal
+        // The same holder's next short-lived token, from the source that gave the one held: a
+        // renewal, or a connect's answer once the renewal fell due (one put off while the server
+        // could not be reached). Nothing read with the last one is read again. A token after a
+        // refusal, or while a 401 stands, is a new credential, tried at once, and what was
+        // refused is read again; so is a Refresh's, as the person asked to read again.
+        let renewal = !refused
+            && self.state != ConnectionState::Unauthorized
+            && ask != Ask::Again
+            && self.token_from_source
             && self.has_token()
             && lease.is_some()
             && lease.as_ref().map(|lease| &lease.holder)
@@ -746,26 +798,33 @@ impl Connection {
         self.token_unanswered = false;
         // A request that would send it after its end waits for the next, which this asks for.
         let ends = self.lease.as_ref().map(|lease| lease.expires_at);
-        if renewal {
-            self.client.renew_token(token.into_string(), ends);
-            cx.emit(ConnectionEvent::StateChanged);
-            cx.notify();
-            return;
-        }
-        let changed = self
-            .client
-            .set_token_ending(Some(token.into_string()), ends);
-        if changed {
-            if ask == Ask::AfterRefusal {
-                self.read_refused_under = Some(self.client.credential_changes());
+        let changed = if renewal {
+            // Another token: a read refused under it asks again.
+            if self.client.renew_token(token.into_string(), ends) {
+                self.read_refused_under = None;
             }
+            false
+        } else {
+            self.client
+                .set_token_ending(Some(token.into_string()), ends)
+        };
+        // A connect's token while the ask after a refusal is out is that ask's answer: it ends.
+        if after_refusal && ask == Ask::Connect {
+            self._asking = None;
+        }
+        // A token given after a refusal, a probe's or a read's, is that refusal's one more try,
+        // the refused one given back included: a read refused under it asks nothing more.
+        if after_refusal {
+            self.read_refused_under = Some(self.client.credential_changes());
+        }
+        if changed {
             cx.emit(ConnectionEvent::CredentialChanged);
         }
         let unread_changed = self.token_unread.take().is_some();
         if connecting || (changed && self.state != ConnectionState::Idle) {
             self.token_fresh = true;
             self.connect(cx);
-        } else if unread_changed {
+        } else if renewal || unread_changed {
             cx.emit(ConnectionEvent::StateChanged);
             cx.notify();
         }
@@ -829,7 +888,7 @@ impl Connection {
             self.note_signed_in();
             self.token_unread = Some(no.why);
         } else if let Some(source) = self.oauth.take() {
-            self.token_source = None;
+            self.replace_source(None);
             self.token_unread = None;
             match &mut self.signing_in {
                 None => {
@@ -902,8 +961,9 @@ impl Connection {
     }
 
     /// Replaces the token with one given to it, typed in after the server refused the old one
-    /// (spec 003): a token source is not asked over it until Refresh. Requests made after this
-    /// use it, and a connection in use checks again; one not yet used connects when it is.
+    /// (spec 003): a token source is not asked over it until [`Self::refresh_token`] (the
+    /// person's Refresh, or a change to the CLI) or a new source. Requests made after this use
+    /// it, and a connection in use checks again; one not yet used connects when it is.
     pub fn set_token(&mut self, token: Option<String>, cx: &mut Context<Self>) {
         let was_ready = self.token_ready();
         self.token_given = true;
@@ -1058,6 +1118,7 @@ impl Connection {
                         this.graphs = graphs;
                         this.state = ConnectionState::Ready;
                         this.asked_after_refusal = false;
+                        this.probe_refused = None;
                     }
                     Probe::Failed(failed) => this.refused(failed, token_sent, cx),
                 }
@@ -1093,11 +1154,11 @@ impl Connection {
     /// or a connect probing with that token, has its source asked for it, which the request
     /// waits for. A server that could not be reached is checked at once, whether or not
     /// anything shows it: back, it connects again, which asks; still away, the requests waiting
-    /// when the check began are released, and the next request to find it so has it checked
-    /// again, as the network may be back by then. Elsewhere (the server refused the token, a
-    /// connect was cancelled, no source to ask) nothing gives the next now, and the requests
-    /// waiting are released. The end stands throughout, so a request during a later connect's
-    /// ask waits for its token.
+    /// when the check began are released, unless an ask begun meanwhile gives the next, and the
+    /// next request to find it so has it checked again, as the network may be back by then.
+    /// Elsewhere (the server refused the token, a connect was cancelled, no source to ask)
+    /// nothing gives the next now, and the requests waiting are released. The end stands
+    /// throughout, so a request during a later connect's ask waits for its token.
     fn token_ended(&mut self, cx: &mut Context<Self>) {
         if !self.client.holds_ended_token() || self.next_token_coming() {
             return;
@@ -1139,23 +1200,35 @@ impl Connection {
     /// Takes the state a failed read left, noting for a 401 whether the server refused the
     /// token sent ([`Self::refused_with_token`]). A token from the source that the server
     /// refused is asked for once more: a rotated one connects again, the same one stays
-    /// refused, and nothing is asked again until a connect is ready or the person refreshes.
+    /// refused, and a probe's 401 asks nothing again until a connect is ready,
+    /// [`Self::refresh_token`] (the person's Refresh, or a change to the CLI) or a new source. A
+    /// graph read's 401 has its own bound ([`Self::read_refused`]). One the server did not
+    /// refuse is not asked about.
     fn refused(&mut self, failed: Failed, token_sent: bool, cx: &mut Context<Self>) {
         if failed.state == ConnectionState::Unauthorized {
-            self.refused_with_token = failed.token_refused.unwrap_or(token_sent);
+            self.refused_with_token = Challenge::refuses(failed.challenge.as_deref(), token_sent);
+            if self.refused_with_token {
+                self.probe_refused = Some(self.client.token_serial());
+            }
             // A refused token is not renewed: the ask below is the one more try, and a token
             // the server takes schedules its own renewal.
             self._renewal = None;
             self.renewal_missed = false;
-            if token_sent && !self.asked_after_refusal && self.asks_token_source() {
+            // A 401 that refused no token (one that never arrived, as a proxy drops it) asks
+            // nothing: the next token would fare no better.
+            if self.refused_with_token && !self.asked_after_refusal && self.asks_token_source() {
                 self.asked_after_refusal = true;
                 if let Some(source) = &self.token_source {
                     source.note_refused();
                 }
                 self.ask_for_token(Ask::AfterRefusal, cx);
             }
-            match failed.sign_in {
-                Some(metadata) => self.offered_sign_in(metadata, cx),
+            match failed
+                .challenge
+                .as_deref()
+                .and_then(Challenge::resource_metadata)
+            {
+                Some(metadata) => self.offered_sign_in(metadata.to_owned(), cx),
                 // A server that no longer offers a sign-in asks for a token instead.
                 None if matches!(self.sign_in, SignIn::Unavailable(_)) => {
                     self.sign_in = SignIn::NotOffered;
@@ -1222,7 +1295,7 @@ impl Connection {
             this.update(cx, |this, cx| {
                 this.signing_in = None;
                 match found {
-                    Err(why) => this.sign_in = SignIn::Unavailable(why),
+                    Err(refusal) => this.sign_in = SignIn::Unavailable(refusal),
                     Ok(service) => {
                         let host = service.host();
                         this.service = Some(service.clone());
@@ -1562,16 +1635,17 @@ impl Connection {
                             under_way.replaced = replaced;
                         }
                     }
-                    Err(why) => {
+                    Err(refusal) => {
                         this.sign_in = match (&this.oauth, replaced) {
                             (Some(held), _) => SignIn::Offered {
                                 service: held.host(),
-                                why: Some(why),
+                                why: Some(refusal.why),
                             },
-                            (None, Some((_, ended))) => {
-                                SignIn::Unavailable(format!("{why} {ended}"))
-                            }
-                            (None, None) => SignIn::Unavailable(why),
+                            (None, Some((_, ended))) => SignIn::Unavailable(Refusal {
+                                why: format!("{} {ended}", refusal.why),
+                                ..refusal
+                            }),
+                            (None, None) => SignIn::Unavailable(refusal),
                         };
                         cx.emit(ConnectionEvent::StateChanged);
                         cx.notify();
@@ -1608,7 +1682,7 @@ impl Connection {
             return;
         };
         let was_ready = self.token_ready();
-        self.token_source = None;
+        self.replace_source(None);
         if !was_ready {
             cx.emit(ConnectionEvent::TokenReady);
         }
@@ -1629,13 +1703,21 @@ impl Connection {
         cx.notify();
     }
 
-    /// Whether the person is asked for a token: the server refused the one sent, or got none, and
-    /// offers no sign-in, with none under way (one finishing that a drop or a rename ended is kept
-    /// before anything else is asked).
+    /// Whether the person is asked for a token: the server refused the one sent, or none was sent,
+    /// and offers no sign-in, with none under way (one finishing that a drop or a rename ended is
+    /// kept before anything else is asked). One sent that never arrived is not asked for: a token
+    /// typed would be dropped the same way.
     pub fn asks_token(&self) -> bool {
         self.state == ConnectionState::Unauthorized
+            && !self.token_not_received()
             && self.sign_in == SignIn::NotOffered
             && self.signing_in.is_none()
+    }
+
+    /// Whether the server's 401 refused no token though one was sent: it never arrived (a proxy
+    /// between them dropped it, say), so a token typed would be dropped the same way.
+    pub fn token_not_received(&self) -> bool {
+        self.state == ConnectionState::Unauthorized && !self.refused_with_token && self.has_token()
     }
 
     /// Holds a sign-in under way, as a test's state.
@@ -1793,7 +1875,7 @@ impl Connection {
         self.left = Kept::Nothing;
         if held {
             let was_ready = self.token_ready();
-            self.token_source = None;
+            self.replace_source(None);
             if !was_ready {
                 cx.emit(ConnectionEvent::TokenReady);
             }
@@ -1809,7 +1891,7 @@ impl Connection {
     fn use_sign_in(&mut self, source: OAuthSource, cx: &mut Context<Self>) {
         self.left = Kept::Nothing;
         self.oauth = Some(source.clone());
-        self.token_source = Some(Arc::new(source));
+        self.replace_source(Some(Arc::new(source)));
         self.token_given = false;
         self.asked_after_refusal = false;
         // The token held, if any, is another credential's: the sign-in's failure does not keep it.
@@ -1842,8 +1924,10 @@ impl Connection {
     }
 
     /// Asks for the next short-lived token `at` that time, if a view still shows the server;
-    /// otherwise the next view to show it asks.
+    /// otherwise the next view to show it asks. A renewal scheduled replaces one owed: a token
+    /// given since answered it, or this retry asks in its place.
     fn schedule_renewal(&mut self, at: SystemTime, cx: &mut Context<Self>) {
+        self.renewal_missed = false;
         let wait = at.duration_since(SystemTime::now()).unwrap_or_default();
         self._renewal = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(wait).await;
@@ -1969,10 +2053,11 @@ impl Connection {
             // would be refused alike, and would take the token field away while it is typed
             // in. A new token connects again; a source that could not answer is asked again,
             // and sign-in details that could not be read are read again, by the connect below.
+            // Details read that Studio cannot use are not: they stand until Retry.
             Ok(_)
                 if self.state == ConnectionState::Unauthorized
                     && !self.token_unanswered
-                    && !matches!(self.sign_in, SignIn::Unavailable(_)) =>
+                    && !matches!(&self.sign_in, SignIn::Unavailable(refusal) if refusal.passing) =>
             {
                 ConnectionState::Unauthorized
             }
@@ -2023,23 +2108,20 @@ enum Probe {
     Failed(Failed),
 }
 
-/// A read that left the connection unusable: the state it leaves, and for a 401 whether the
-/// server's challenge says it refused the token sent (`None` from a server that sends none,
-/// one before Omnigraph #1122).
+/// A read that left the connection unusable: the state it leaves, and a 401's challenge, which
+/// says whether it refused the token sent ([`Challenge::refuses`]) and where the server's
+/// sign-in details are (`resource_metadata`), when it offers a sign-in. `None` from a server
+/// that sends none.
 struct Failed {
     state: ConnectionState,
-    token_refused: Option<bool>,
-    /// Where the 401's challenge says the server's sign-in details are
-    /// (`resource_metadata`), when it offers a sign-in.
-    sign_in: Option<String>,
+    challenge: Option<Box<Challenge>>,
 }
 
 impl From<ConnectionState> for Failed {
     fn from(state: ConnectionState) -> Self {
         Self {
             state,
-            token_refused: None,
-            sign_in: None,
+            challenge: None,
         }
     }
 }
@@ -2090,12 +2172,7 @@ async fn list_graphs(client: &GraphClient) -> Result<GraphListing, Failed> {
         Err(ReadError::Refused(summary)) if summary.status == 401 => {
             return Err(Failed {
                 state: ConnectionState::Unauthorized,
-                token_refused: summary.challenge.as_deref().map(|c| c.token_refused()),
-                sign_in: summary
-                    .challenge
-                    .as_deref()
-                    .and_then(|c| c.resource_metadata())
-                    .map(str::to_owned),
+                challenge: summary.challenge,
             });
         }
         // A credential that may not list the server's graphs may still discover its own.
@@ -2235,9 +2312,9 @@ mod tests {
         });
     }
 
-    /// A connect that waited on a token source replaced meanwhile asks the source now in use:
-    /// one that gives the token already held starts no connect of its own, and without this
-    /// the connection stayed connecting.
+    /// A connect that waited on a token source replaced meanwhile asks the source now in use in
+    /// its place, the old ask ended: one that gives the token already held starts no connect of
+    /// its own, and without this the connection stayed connecting.
     #[gpui::test]
     async fn a_connect_whose_source_was_replaced_asks_the_new_one(cx: &mut TestAppContext) {
         let first = Arc::new(Gated::default());
@@ -2254,8 +2331,7 @@ mod tests {
             c.take_token_from(Some(Arc::new(Gated::default())), cx)
         });
         cx.run_until_parked();
-        answer.send(Token::typed("first".into())).ok();
-        cx.run_until_parked();
+        assert!(answer.is_canceled(), "the old source's ask ended");
         connection.read_with(cx, |c, _| assert_eq!(c.state, ConnectionState::Ready));
 
         // A window waiting for the token, its connect cancelled: the source in use is asked, the
@@ -2271,8 +2347,7 @@ mod tests {
             c.take_token_from(Some(Arc::new(Gated::default())), cx)
         });
         cx.run_until_parked();
-        answer.send(Token::typed("first".into())).ok();
-        cx.run_until_parked();
+        assert!(answer.is_canceled(), "the old source's ask ended");
         connection.read_with(cx, |c, _| {
             assert!(c.token_ready(), "the waiting window gets its token");
             assert_eq!(c.state, ConnectionState::Idle);
@@ -2290,13 +2365,14 @@ mod tests {
                 }
             })
         });
-        let (_answer, gate) = oneshot::channel::<Token>();
+        let (answer, gate) = oneshot::channel::<Token>();
         *waited.0.lock().unwrap() = Some(gate);
         connection.update(cx, |c, cx| c.wait_for_token(cx));
         cx.run_until_parked();
         connection.update(cx, |c, cx| c.cancel(cx));
         connection.update(cx, |c, cx| c.take_token_from(None, cx));
         cx.run_until_parked();
+        assert!(answer.is_canceled(), "the old source's ask ended");
         connection.read_with(cx, |c, _| assert!(c.token_ready()));
         assert_eq!(
             readied.get(),
@@ -2834,6 +2910,44 @@ mod tests {
         assert_eq!(asked(), 2, "a token typed in is not asked about");
     }
 
+    /// The ask after a probe's 401 is the one more try for the graph reads too: a read refused
+    /// under the token it gave, the refused one given back included, asks nothing until a read
+    /// with it is taken. Before, a source that gave the refused token back was asked again by
+    /// the next read's 401: one more CLI export, or refresh, for a token already asked about.
+    #[gpui::test]
+    async fn the_ask_after_a_probes_refusal_is_the_reads_one_more_try(cx: &mut TestAppContext) {
+        let source = Arc::new(Scripted::default());
+        source.unnumbered.store(true, Ordering::SeqCst);
+        let (connection, _, _) = sourced(source.clone(), cx);
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        cx.run_until_parked();
+        let asked = || source.asked.load(Ordering::SeqCst);
+        assert_eq!(asked(), 1);
+        // The probe's 401 refuses the token: the source is asked once more, and gives it back.
+        connection.update(cx, |connection, cx| {
+            let failed = Failed {
+                state: ConnectionState::Unauthorized,
+                challenge: Some(Box::new(Challenge {
+                    scheme: "Bearer".into(),
+                    params: vec![("error".into(), "invalid_token".into())],
+                })),
+            };
+            connection.refused(failed, true, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(asked(), 2, "asked once after the probe's refusal");
+        connection.update(cx, |connection, cx| connection.read_refused(cx));
+        cx.run_until_parked();
+        assert_eq!(asked(), 2, "a read refused under that token asked again");
+        // A read taken with it lets a later refusal ask.
+        connection.update(cx, |connection, cx| {
+            connection.read_taken();
+            connection.read_refused(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(asked(), 3);
+    }
+
     /// A renewal due while the source is asked again after a refused read leaves that ask to
     /// answer: its token replaces the refused one as a new credential, so what was refused is
     /// read again. Before, the renewal took the ask's place and replaced the token quietly, and
@@ -3012,6 +3126,9 @@ mod tests {
         /// How long each answer's token lives, an hour and more when none is left.
         lives: std::sync::Mutex<Vec<Duration>>,
         gate: std::sync::Mutex<Option<futures::future::Shared<oneshot::Receiver<()>>>>,
+        /// Each answer's token is the answer as written, not numbered by the ask: the same
+        /// token again, as a sign-in gives the one it holds while it is fresh.
+        unnumbered: AtomicBool,
     }
 
     impl TokenSource for Scripted {
@@ -3028,6 +3145,7 @@ mod tests {
                     answers.remove(0)
                 }
             };
+            let unnumbered = self.unnumbered.load(Ordering::SeqCst);
             let gate = self.gate.lock().unwrap().take();
             let lives = {
                 let mut lives = self.lives.lock().unwrap();
@@ -3045,7 +3163,11 @@ mod tests {
                 answer
                     .map(|token| {
                         Token::leased(
-                            format!("{token} {asked}"),
+                            if unnumbered {
+                                token.to_owned()
+                            } else {
+                                format!("{token} {asked}")
+                            },
                             Lease {
                                 expires_at: now + lives,
                                 renew_at: now + Duration::from_secs(3600),
@@ -3198,6 +3320,373 @@ mod tests {
         );
     }
 
+    /// The same holder's next token from the source that gave the one held replaces it quietly
+    /// for a renewal and for a connect once the server is back (its renewal put off while it
+    /// could not be reached); a Refresh's is a new credential, as the person asked to read
+    /// again. After a refused read the next is a
+    /// new credential, tried at once: after a refused read (a Refresh asks in place of the ask
+    /// after it, as one, and a connect's answer that comes first is one too, and the one more
+    /// try), or while the server refuses it. So is a new source's token. Before, only a renewal's answer was quiet, so a reconnect had every
+    /// open graph forget what it read and read it all again.
+    #[gpui::test]
+    async fn the_same_holders_next_token_is_no_new_credential(cx: &mut TestAppContext) {
+        let source = Arc::new(Scripted::default());
+        let (connection, sent, _) = sourced(source.clone(), cx);
+        let _watch = connection.update(cx, |connection, cx| {
+            connection.connect(cx);
+            connection.watch(cx)
+        });
+        cx.run_until_parked();
+        let credential = |cx: &mut TestAppContext| {
+            connection.read_with(cx, |connection, _| connection.client().credential_changes())
+        };
+        let first = credential(cx);
+
+        // Back after the server could not be reached: the connect asks, and probes with the
+        // next token.
+        connection.update(cx, |connection, cx| {
+            connection.state = ConnectionState::Unreachable("away".into());
+            connection.connect(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(source.asked.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            sent.lock().unwrap().last().map(String::as_str),
+            Some("Bearer token 2"),
+            "the probe carried the next token"
+        );
+        assert_eq!(
+            connection.read_with(cx, |connection, _| connection.state.clone()),
+            ConnectionState::Ready
+        );
+        assert_eq!(
+            credential(cx),
+            first,
+            "a reconnect's token is no new credential"
+        );
+
+        connection.update(cx, |connection, cx| connection.refresh_token(cx));
+        cx.run_until_parked();
+        assert_eq!(source.asked.load(Ordering::SeqCst), 3);
+        assert_eq!(credential(cx), first + 1, "a Refresh's is a new credential");
+
+        // A read refused: a Refresh meanwhile asks in place of the ask after it.
+        let (_held, gate) = oneshot::channel::<()>();
+        *source.gate.lock().unwrap() = Some(gate.shared());
+        connection.update(cx, |connection, cx| connection.read_refused(cx));
+        cx.run_until_parked();
+        assert_eq!(source.asked.load(Ordering::SeqCst), 4);
+        connection.update(cx, |connection, cx| connection.refresh_token(cx));
+        cx.run_until_parked();
+        assert_eq!(source.asked.load(Ordering::SeqCst), 5, "the Refresh asks");
+        assert_eq!(
+            credential(cx),
+            first + 2,
+            "the token after a refused read is a new credential"
+        );
+        // As the ask after the refusal, it is the one more try: a read it carries that is
+        // refused asks nothing more.
+        connection.update(cx, |connection, cx| connection.read_refused(cx));
+        cx.run_until_parked();
+        assert_eq!(source.asked.load(Ordering::SeqCst), 5);
+
+        // A read refused again, once one was taken, and a connect whose answer comes before the
+        // ask after it, which then ends.
+        let (held, gate) = oneshot::channel::<()>();
+        *source.gate.lock().unwrap() = Some(gate.shared());
+        connection.update(cx, |connection, cx| {
+            connection.read_taken();
+            connection.read_refused(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(source.asked.load(Ordering::SeqCst), 6);
+        connection.update(cx, |connection, cx| {
+            connection.state = ConnectionState::Unreachable("away".into());
+            connection.connect(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(source.asked.load(Ordering::SeqCst), 7);
+        assert_eq!(
+            credential(cx),
+            first + 3,
+            "the connect's token, while the ask after a refusal is out, is a new credential"
+        );
+        assert!(held.is_canceled(), "the ask after the refusal ended");
+        // It is that one more try: a read it carries that is refused asks nothing more.
+        connection.update(cx, |connection, cx| connection.read_refused(cx));
+        cx.run_until_parked();
+        assert_eq!(source.asked.load(Ordering::SeqCst), 7);
+
+        // Another source's, though its account is the same.
+        let next: Arc<dyn TokenSource> = Arc::new(Scripted::default());
+        connection.update(cx, |connection, cx| {
+            connection.take_token_from(Some(next), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            credential(cx),
+            first + 4,
+            "a new source's token is a new credential"
+        );
+    }
+
+    /// The one more try a token given after a refusal is ends with that token: a quiet
+    /// renewal's token, refused for a read, has the source asked again; the same token given
+    /// again keeps it. Before, the marker outlived its token, and a later refusal asked nothing
+    /// until a read was taken.
+    #[gpui::test]
+    async fn a_quiet_renewal_ends_the_one_more_try(cx: &mut TestAppContext) {
+        let source = Arc::new(Scripted::default());
+        let (connection, _, _) = sourced(source.clone(), cx);
+        let _watch = connection.update(cx, |connection, cx| {
+            connection.connect(cx);
+            connection.watch(cx)
+        });
+        cx.run_until_parked();
+        connection.update(cx, |connection, cx| connection.read_refused(cx));
+        cx.run_until_parked();
+        assert_eq!(source.asked.load(Ordering::SeqCst), 2);
+        let noted =
+            |cx: &mut TestAppContext| connection.read_with(cx, |c, _| c.read_refusal_noted());
+        assert!(noted(cx));
+        // The same token given again.
+        source.unnumbered.store(true, Ordering::SeqCst);
+        *source.answers.lock().unwrap() = vec![Some("token 2")];
+        connection.update(cx, |connection, cx| {
+            connection.ask_for_token(Ask::Renewal, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(source.asked.load(Ordering::SeqCst), 3);
+        assert!(noted(cx), "the same token is still the one more try");
+        source.unnumbered.store(false, Ordering::SeqCst);
+        connection.update(cx, |connection, cx| {
+            connection.ask_for_token(Ask::Renewal, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(source.asked.load(Ordering::SeqCst), 4);
+        assert!(!noted(cx));
+        connection.update(cx, |connection, cx| connection.read_refused(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            source.asked.load(Ordering::SeqCst),
+            5,
+            "the renewed token's refusal asks"
+        );
+    }
+
+    /// A new source ends the asks of the one it replaces, which nobody answers: a CLI export
+    /// each runs ends with it rather than hold the CLI's turn from the new source's asks, and a
+    /// connect under way starts again, asking the new source once. Before, a Refresh's ask ran
+    /// on, and so did a connect's (a changed transport starts one) before the new source was
+    /// asked twice, by a Refresh and by the connect again, and a connect's probe went out with
+    /// the old source's token.
+    #[gpui::test]
+    async fn a_new_source_ends_the_ask_of_the_one_it_replaces(cx: &mut TestAppContext) {
+        let source = Arc::new(Scripted::default());
+        let (connection, sent, http) = sourced(source.clone(), cx);
+        let _watch = connection.update(cx, |connection, cx| {
+            connection.connect(cx);
+            connection.watch(cx)
+        });
+        cx.run_until_parked();
+        let (held, gate) = oneshot::channel::<()>();
+        *source.gate.lock().unwrap() = Some(gate.shared());
+        connection.update(cx, |connection, cx| connection.refresh_token(cx));
+        cx.run_until_parked();
+        assert_eq!(source.asked.load(Ordering::SeqCst), 2);
+        let next = Arc::new(Scripted::default());
+        connection.update(cx, |connection, cx| {
+            connection.replace_http(http, cx);
+            connection.take_token_from(Some(next.clone() as Arc<dyn TokenSource>), cx);
+        });
+        cx.run_until_parked();
+        assert!(held.is_canceled(), "the old source's ask ended");
+        assert_eq!(next.asked.load(Ordering::SeqCst), 1);
+
+        // A connect asking, and the source replaced.
+        let (held, gate) = oneshot::channel::<()>();
+        *next.gate.lock().unwrap() = Some(gate.shared());
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        cx.run_until_parked();
+        assert_eq!(next.asked.load(Ordering::SeqCst), 2);
+        let third = Arc::new(Scripted::default());
+        connection.update(cx, |connection, cx| {
+            connection.take_token_from(Some(third.clone() as Arc<dyn TokenSource>), cx)
+        });
+        cx.run_until_parked();
+        assert!(
+            held.is_canceled(),
+            "the connect's ask of the old source ended"
+        );
+        assert_eq!(third.asked.load(Ordering::SeqCst), 1, "asked once");
+        assert_eq!(
+            connection.read_with(cx, |connection, _| connection.state.clone()),
+            ConnectionState::Ready
+        );
+
+        // A connect about to probe with the old source's token: it probes with the new one's.
+        let fourth = Arc::new(Scripted::default());
+        *fourth.answers.lock().unwrap() = vec![Some("fourth")];
+        let before = sent.lock().unwrap().len();
+        connection.update(cx, |connection, cx| {
+            connection.token_fresh = true;
+            connection.connect(cx);
+            connection.take_token_from(Some(fourth.clone() as Arc<dyn TokenSource>), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(sent.lock().unwrap()[before..], ["Bearer fourth 1"]);
+        assert_eq!(fourth.asked.load(Ordering::SeqCst), 1);
+    }
+
+    /// A Refresh the source cannot answer now, while the server refuses the token held, drops
+    /// it, as the ask after the refusal would: the connection says why, and the next health
+    /// check asks again. Before, it kept the refused token, which no health check asked about
+    /// again. So does a connect from that state, and its token is a new credential: before, the
+    /// connect's state hid the refusal.
+    #[gpui::test]
+    async fn a_refresh_that_fails_after_a_refusal_drops_the_refused_token(cx: &mut TestAppContext) {
+        let source = Arc::new(Scripted::default());
+        let (connection, _, _) = sourced(source.clone(), cx);
+        let _watch = connection.update(cx, |connection, cx| {
+            connection.connect(cx);
+            connection.watch(cx)
+        });
+        cx.run_until_parked();
+        *source.answers.lock().unwrap() = vec![None];
+        connection.update(cx, |connection, cx| {
+            connection.state = ConnectionState::Unauthorized;
+            connection.refused_with_token = true;
+            connection.probe_refused = Some(connection.client().token_serial());
+            connection.refresh_token(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(source.asked.load(Ordering::SeqCst), 2);
+        connection.read_with(cx, |connection, _| {
+            assert!(!connection.has_token(), "the refused token is dropped");
+            assert!(connection.token_unanswered, "asked again at the next check");
+            assert_eq!(connection.state, ConnectionState::Unauthorized);
+        });
+
+        // A connect from the refused state (a changed transport starts one): the same holder's
+        // next token is a new credential, and a failure to give one drops the refused token.
+        let source = Arc::new(Scripted::default());
+        let (connection, _, http) = sourced(source.clone(), cx);
+        let _watch = connection.update(cx, |connection, cx| {
+            connection.connect(cx);
+            connection.watch(cx)
+        });
+        cx.run_until_parked();
+        let credential = |cx: &mut TestAppContext| {
+            connection.read_with(cx, |connection, _| connection.client().credential_changes())
+        };
+        // The probe's 401 to the token held, its one more ask spent.
+        let refuse = |connection: &mut Connection, cx: &mut Context<Connection>| {
+            connection.asked_after_refusal = true;
+            connection.refused(ConnectionState::Unauthorized.into(), true, cx);
+        };
+        let first = credential(cx);
+        connection.update(cx, |connection, cx| {
+            refuse(connection, cx);
+            connection.connect(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(credential(cx), first + 1, "a new credential");
+        // A probe the server answers with the token held ends the refusal: the next is quiet.
+        connection.update(cx, |connection, cx| {
+            refuse(connection, cx);
+            connection.token_fresh = true;
+            connection.connect(cx);
+        });
+        cx.run_until_parked();
+        let taken = credential(cx);
+        connection.update(cx, |connection, cx| {
+            connection.ask_for_token(Ask::Renewal, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            credential(cx),
+            taken,
+            "quiet once the server took the token"
+        );
+        *source.answers.lock().unwrap() = vec![None];
+        connection.update(cx, |connection, cx| {
+            refuse(connection, cx);
+            connection.replace_http(http.clone(), cx);
+        });
+        cx.run_until_parked();
+        connection.read_with(cx, |connection, _| {
+            assert!(!connection.has_token(), "the refused token is dropped");
+            assert!(connection.token_unanswered);
+        });
+    }
+
+    /// A 401 whose challenge says the token was not refused (a proxy that drops it, a server
+    /// that asks for one): while it stands, even a renewal's token connects again, as any token
+    /// does then, and a failure to give one keeps the token, as nothing refused it; a connect
+    /// started from it renews the token quietly.
+    #[gpui::test]
+    async fn a_401_that_refused_no_token_is_no_refusal_of_it(cx: &mut TestAppContext) {
+        let source = Arc::new(Scripted::default());
+        let (connection, _, _) = sourced(source.clone(), cx);
+        let _watch = connection.update(cx, |connection, cx| {
+            connection.connect(cx);
+            connection.watch(cx)
+        });
+        cx.run_until_parked();
+        let credential = |cx: &mut TestAppContext| {
+            connection.read_with(cx, |connection, _| connection.client().credential_changes())
+        };
+        let asks_for_one = |connection: &mut Connection, cx: &mut Context<Connection>| {
+            // A bare `Bearer` challenge: the server found no token.
+            let failed = Failed {
+                state: ConnectionState::Unauthorized,
+                challenge: Some(Box::new(Challenge {
+                    scheme: "Bearer".into(),
+                    params: Vec::new(),
+                })),
+            };
+            connection.refused(failed, true, cx);
+        };
+        let first = credential(cx);
+        connection.update(cx, |connection, cx| asks_for_one(connection, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            source.asked.load(Ordering::SeqCst),
+            1,
+            "the source is asked nothing"
+        );
+        connection.update(cx, |connection, cx| {
+            connection.ask_for_token(Ask::Renewal, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            connection.read_with(cx, |connection, _| connection.state.clone()),
+            ConnectionState::Ready,
+            "the renewal's token connected again"
+        );
+        assert_eq!(credential(cx), first + 1);
+        *source.answers.lock().unwrap() = vec![None];
+        connection.update(cx, |connection, cx| {
+            asks_for_one(connection, cx);
+            connection.refresh_token(cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            connection.read_with(cx, |connection, _| connection.has_token()),
+            "a token nothing refused is kept"
+        );
+        connection.update(cx, |connection, cx| {
+            asks_for_one(connection, cx);
+            connection.connect(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            connection.read_with(cx, |connection, _| connection.state.clone()),
+            ConnectionState::Ready
+        );
+        assert_eq!(credential(cx), first + 1, "nothing refused the token");
+    }
+
     /// A server whose sign-in details could not be read, that no longer offers a sign-in, asks
     /// for a token instead. Before, it stayed "Sign-in unavailable", connected again at every
     /// health check.
@@ -3230,7 +3719,8 @@ mod tests {
         };
         let connection = cx.new(|_| Connection::new(server, Some("typed".into()), http).unwrap());
         connection.update(cx, |connection, cx| {
-            connection.sign_in = SignIn::Unavailable("the details did not answer".into());
+            connection.sign_in =
+                SignIn::Unavailable(Refusal::passing("the details did not answer"));
             connection.connect(cx);
         });
         cx.run_until_parked();
@@ -3401,11 +3891,23 @@ mod tests {
         // A request while the connect asks waits for its token, and still does after a Cancel
         // leaves the ask to the waiting window, past the second it tells again.
         let before = sent.lock().unwrap().len();
+        let waits_before =
+            connection.read_with(cx, |connection, _| connection.client.waits_begun());
         let request = std::thread::spawn(move || smol::block_on(client.graphs()).is_ok());
-        for _ in 0..30 {
+        for _ in 0..400 {
             cx.run_until_parked();
+            if connection.read_with(cx, |connection, _| connection.client.waits_begun())
+                > waits_before
+            {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
+        assert!(
+            connection.read_with(cx, |connection, _| connection.client.waits_begun())
+                > waits_before,
+            "the request waiting"
+        );
         connection.update(cx, |connection, cx| connection.cancel(cx));
         for _ in 0..150 {
             cx.run_until_parked();
@@ -3430,9 +3932,9 @@ mod tests {
     }
 
     /// A request still waiting when the renewal lands may tell once more, as it does each
-    /// second; that tell finds the renewed token standing and asks nothing, and once that token
-    /// ends a request waits for the next. Before, such a tell took the renewed token for one
-    /// that does not end.
+    /// second; that tell finds the renewed token standing, asks nothing and leaves its end, so
+    /// once that token ends a request waits for the next. Before, such a tell took the renewed
+    /// token for one that does not end.
     #[gpui::test]
     async fn a_late_tell_leaves_the_renewed_tokens_end_standing(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
@@ -3446,12 +3948,21 @@ mod tests {
         );
         assert_eq!(source.asked.load(Ordering::SeqCst), 1);
         // A tell while the token held stands, as one sent before a renewal landed comes.
-        connection.update(cx, |connection, cx| connection.token_ended(cx));
+        let ends = connection.update(cx, |connection, cx| {
+            connection.token_ended(cx);
+            connection.lease_ends()
+        });
         cx.run_until_parked();
         assert_eq!(
             source.asked.load(Ordering::SeqCst),
             1,
             "the tell asks nothing"
+        );
+        assert!(ends.is_some());
+        assert_eq!(
+            connection.read_with(cx, |connection, _| connection.client.token_ends()),
+            ends,
+            "the end stands"
         );
         // The token then ends, as across a sleep: a request waits for the next.
         let client = connection.update(cx, |connection, _| {
@@ -3479,8 +3990,7 @@ mod tests {
 
     /// A renewal that came while nothing showed the server is owed to the token it would have
     /// renewed: a new source's token (the CLI target changed) drops it with that token's lease,
-    /// and the next watch asks nothing. Before, it asked the new source again, running the CLI
-    /// for nothing.
+    /// and the next watch asks nothing. Before, it asked the new source again for nothing.
     #[gpui::test]
     async fn a_new_source_is_not_asked_for_the_renewal_owed_to_the_one_before(
         cx: &mut TestAppContext,
@@ -3503,6 +4013,47 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(next.asked.load(Ordering::SeqCst), 1, "nothing owed to it");
         assert_eq!(source.asked.load(Ordering::SeqCst), 1);
+    }
+
+    /// A renewal owed while nothing showed the server is answered by a renewal a request asked
+    /// for meanwhile, its token having ended: the next watch asks nothing more. Before, it asked
+    /// again for a token renewed moments ago; the sign-in answered from memory, but the answer
+    /// was taken again and the next renewal rescheduled.
+    #[gpui::test]
+    async fn a_renewal_owed_is_settled_by_one_a_request_asked_for(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let source = Arc::new(Scripted::default());
+        let (connection, _, _) = sourced(source.clone(), cx);
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        cx.run_until_parked();
+        // Past the token's renewal, with nothing showing the server: the renewal is owed.
+        cx.executor().advance_clock(Duration::from_secs(3600));
+        cx.run_until_parked();
+        assert!(connection.read_with(cx, |connection, _| connection.renewal_missed));
+        // The token ends, and an agent's request has the next asked for.
+        let client = connection.update(cx, |connection, _| {
+            connection
+                .client
+                .set_token_ends(Some(SystemTime::now() - Duration::from_secs(1)));
+            connection.client.clone()
+        });
+        let request = std::thread::spawn(move || smol::block_on(client.graphs()).is_ok());
+        for _ in 0..400 {
+            cx.run_until_parked();
+            if request.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(request.join().unwrap());
+        assert_eq!(
+            source.asked.load(Ordering::SeqCst),
+            2,
+            "renewed for the request"
+        );
+        let _watch = connection.update(cx, |connection, cx| connection.watch(cx));
+        cx.run_until_parked();
+        assert_eq!(source.asked.load(Ordering::SeqCst), 2, "nothing owed");
     }
 
     /// A token typed in outlives the lease of the one it replaced: no renewal of that one, owed

@@ -28,8 +28,9 @@
 //! refuses a second command on a home whose lock another holds; [`run`]), its standard input
 //! empty, and none of Omnigraph's variables ([`omnigraph_variables`]) but `OMNIGRAPH_HOME` and
 //! the one a target's own token source names ([`scrubbed`]). A token is asked for when its
-//! server connects, once more after a 401, and on Refresh (`Connection`), not on a timer: the
-//! secure store cannot be watched.
+//! server connects, once more after a 401 that refused it, on Refresh, and when the target or the
+//! CLI changes (`Connection`, `ConnectionRegistry`), not on a timer: the secure store cannot be
+//! watched.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -102,8 +103,9 @@ pub struct Token {
 }
 
 /// How long a short-lived token stands, and whose it is: an OAuth access token's (spec 016). The
-/// connection asks for the next before it ends, and the next one of the same holder replaces it
-/// quietly, as nothing read with it needs reading again.
+/// connection asks for the next before it ends, and the next one of the same holder, from the
+/// same source, replaces it quietly, unless a 401 stands or it answers a Refresh, as nothing read
+/// with it needs reading again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lease {
     pub expires_at: std::time::SystemTime,
@@ -188,7 +190,8 @@ impl From<NoToken> for String {
 }
 
 /// Where a connection's token comes from each time it is asked (`Connection`): on each connect,
-/// once more after a 401, and on Refresh. A failure says why, and whether it may pass.
+/// once more after a 401 that refused its token, on Refresh and when the CLI changes, and before
+/// a token with a lease ends ([`Lease`]). A failure says why, and whether it may pass.
 /// `hurry` is raised while a window waits for the token: its ask goes before the others
 /// waiting for the CLI ([`TURN`]), however long it has waited already.
 pub trait TokenSource: Send + Sync + 'static {
@@ -200,7 +203,8 @@ pub trait TokenSource: Send + Sync + 'static {
         None
     }
 
-    /// The server refused the last token this source gave (a 401 to a request that carried it),
+    /// The server refused the last token this source gave (a 401 that refused it, not one that
+    /// found none),
     /// said before the source is asked again: a source that keeps a token it can renew renews it
     /// rather than giving the same one back. The CLI's sources keep nothing.
     fn note_refused(&self) {}

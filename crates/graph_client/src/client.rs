@@ -108,6 +108,14 @@ impl Challenge {
         self.param("error") == Some("invalid_token")
     }
 
+    /// Whether a 401 whose challenge is `challenge` refused the token its request carried: as
+    /// the challenge says, or, from a server that sends none (an older one), whether one was
+    /// `sent`. One that refused none though a token was sent means it never arrived (a proxy
+    /// dropped it); with none sent, the server asks for one.
+    pub fn refuses(challenge: Option<&Challenge>, sent: bool) -> bool {
+        challenge.map_or(sent, Challenge::token_refused)
+    }
+
     /// Where the server's protected-resource metadata is, when it takes OAuth sign-in.
     pub fn resource_metadata(&self) -> Option<&str> {
         self.param("resource_metadata")
@@ -508,12 +516,22 @@ impl HttpClient for Transport {
     }
 }
 
+/// A token as a client holds it: a blank one is none, as a server reads `Bearer ` with nothing
+/// after it as no credential (an empty `OMNIGRAPH_STUDIO_TOKEN`, say).
+fn held(token: Option<String>) -> Option<Arc<str>> {
+    token
+        .filter(|token| !token.trim().is_empty())
+        .map(Into::into)
+}
+
 /// The token a client holds, and when it stops being accepted, as the lease it came with says
 /// ([`GraphClient::set_token_ending`]): one lock, so no request reads one without the other.
 struct HeldToken {
     value: Option<Arc<str>>,
     /// `None` for a token that does not end, or not known to.
     ends: Option<SystemTime>,
+    /// Moves each time the value does ([`GraphClient::token_serial`]).
+    serial: u64,
 }
 
 /// A client for one server. Cheap to clone.
@@ -532,9 +550,10 @@ pub struct GraphClient {
     /// The number up to which the holder released the requests waiting
     /// ([`Self::release_waits`]). Shared by every clone.
     waits_released: Arc<std::sync::atomic::AtomicU64>,
-    /// Wakes the requests waiting for the next token when what they wait on changes: each
-    /// waits on the channel current when it looked, which a change replaces, closing it
-    /// ([`Self::wake_waits`]). Shared by every clone.
+    /// Wakes the requests waiting (for the next token; for a read slot or out a 429, should the
+    /// client be retired) when what they wait on changes: each waits on the channel current
+    /// when it looked, which a change replaces, closing it ([`Self::wake_waits`]). Shared by
+    /// every clone.
     waits: Arc<std::sync::Mutex<(smol::channel::Sender<()>, smol::channel::Receiver<()>)>>,
     /// The server's transport, one for every clone and for whatever else reaches the server's
     /// address ([`Self::transport`]): a target whose transport changed is reached through the
@@ -593,8 +612,9 @@ impl GraphClient {
         Ok(Self {
             base,
             token: Arc::new(std::sync::RwLock::new(HeldToken {
-                value: token.map(Into::into),
+                value: held(token),
                 ends: None,
+                serial: 0,
             })),
             ended: Arc::default(),
             waits_begun: Arc::default(),
@@ -728,8 +748,8 @@ impl GraphClient {
 
     /// Stops the client and every clone of it for good, as when its CLI target is gone or names
     /// a transport Studio cannot use: every request after fails with `why`, and nothing is sent,
-    /// a request waiting for the next token included. What was read is read again, and fails
-    /// so. The first reason given stands.
+    /// a request waiting for the next token, a read slot or out a 429 included, at once. What
+    /// was read is read again, and fails so. The first reason given stands.
     pub fn retire(&self, why: String) {
         if self.retired.set(why).is_ok() {
             self.credential_changes
@@ -749,11 +769,16 @@ impl GraphClient {
     /// other. A request that would send it after then waits for the next
     /// ([`Self::token_ended`]).
     pub fn set_token_ending(&self, token: Option<String>, ends: Option<SystemTime>) -> bool {
-        let token: Option<Arc<str>> = token.map(Into::into);
+        let token = held(token);
         let changed = {
             let mut held = self.held_mut();
             let changed = held.value != token;
-            *held = HeldToken { value: token, ends };
+            let serial = held.serial + u64::from(changed);
+            *held = HeldToken {
+                value: token,
+                ends,
+                serial,
+            };
             changed
         };
         self.wake_waits();
@@ -766,13 +791,23 @@ impl GraphClient {
 
     /// Replaces the token with a renewal of it: the same account's next short-lived token, as
     /// an OAuth refresh gives (spec 016). Nothing read with the old one is read again, so it is
-    /// not counted as another token ([`Self::credential_changes`]).
-    pub fn renew_token(&self, token: String, ends: Option<SystemTime>) {
-        *self.held_mut() = HeldToken {
-            value: Some(token.into()),
-            ends,
+    /// not counted as another token ([`Self::credential_changes`]). Whether it differs from the
+    /// token it replaced.
+    pub fn renew_token(&self, token: String, ends: Option<SystemTime>) -> bool {
+        let token: Arc<str> = token.into();
+        let renewed = {
+            let mut held = self.held_mut();
+            let renewed = held.value.as_deref() != Some(&*token);
+            let serial = held.serial + u64::from(renewed);
+            *held = HeldToken {
+                value: Some(token),
+                ends,
+                serial,
+            };
+            renewed
         };
         self.wake_waits();
+        renewed
     }
 
     fn held_mut(&self) -> std::sync::RwLockWriteGuard<'_, HeldToken> {
@@ -820,13 +855,33 @@ impl GraphClient {
         self.wake_waits();
     }
 
-    /// Wakes the requests waiting for the next token to look again, once what they wait on
-    /// changed: the channel each waits on closes as this replaces it.
+    /// The channel a wait sleeps on, which [`Self::wake_waits`] closes. Taken before the wait
+    /// looks at what it waits for, so a change made after the look wakes it.
+    fn wake_channel(&self) -> smol::channel::Receiver<()> {
+        self.waits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .1
+            .clone()
+    }
+
+    /// Wakes the requests waiting (for the next token, for a read slot, out a 429) to look
+    /// again, once what they wait on changed: the channel each waits on closes as this replaces
+    /// it.
     fn wake_waits(&self) {
         *self
             .waits
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = smol::channel::bounded(1);
+    }
+
+    /// Names the token held: it moves each time the token is replaced by another, a renewal
+    /// included, and with nothing else (a transport change or a retire leaves it).
+    pub fn token_serial(&self) -> u64 {
+        self.token
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .serial
     }
 
     /// Whether a token is held, so the next request sends one.
@@ -871,26 +926,14 @@ impl GraphClient {
         };
         let mut told: Option<Instant> = None;
         loop {
-            // Taken before looking, so a change made after the look wakes this wait.
-            let woken = self
-                .waits
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .1
-                .clone();
+            let woken = self.wake_channel();
             if !self.holds_ended_token() {
                 return true;
             }
-            if Instant::now() >= until || released() || self.retired.get().is_some() {
+            if Instant::now() >= until || released() {
                 return false;
             }
-            let holder = self
-                .ended
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone()
-                .filter(|holder| holder.receiver_count() > 0);
-            let Some(holder) = holder else {
+            let Some(holder) = self.listening_holder() else {
                 return false;
             };
             let now = Instant::now();
@@ -913,6 +956,39 @@ impl GraphClient {
             )
             .await;
         }
+    }
+
+    /// Why the client was retired, once it is ([`Self::retire`], which wakes the waits).
+    async fn retired_now(&self) -> String {
+        loop {
+            let woken = self.wake_channel();
+            if let Some(why) = self.retired.get() {
+                return why.clone();
+            }
+            woken.recv().await.ok();
+        }
+    }
+
+    /// The holder told when a request finds the token held ended, while one listens and the
+    /// client is not retired: whom a wait for the next token can be answered by.
+    fn listening_holder(&self) -> Option<smol::channel::Sender<()>> {
+        if self.retired.get().is_some() {
+            return None;
+        }
+        self.ended
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .filter(|holder| holder.receiver_count() > 0)
+    }
+
+    /// When the token held stops being accepted, for a test.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn token_ends(&self) -> Option<SystemTime> {
+        self.token
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .ends
     }
 
     fn token(&self) -> Option<Arc<str>> {
@@ -980,8 +1056,9 @@ impl GraphClient {
     }
 
     /// Sends with the token held now, keeping only what `limit` says of the body: the rest is
-    /// never read. A caller sending a token waits for a fresh one first, once per attempt
-    /// ([`Self::fresh_token`]); the public routes take none.
+    /// never read. A caller sending a token waits for a fresh one first ([`Self::fresh_token`]),
+    /// once per attempt, and a read again should its token end while it queued for a slot and a
+    /// wait can be answered; the public routes take none.
     async fn send_now(
         &self,
         method: Method,
@@ -991,6 +1068,7 @@ impl GraphClient {
         timeout: Duration,
         limit: BodyLimit,
     ) -> Result<RawResponse, String> {
+        let head = method == Method::HEAD;
         let (builder, carried) = self.request(method, &url);
         let mut builder = builder.timeout(timeout);
         // A body is JSON unless the caller names its type: a Blob put's is raw bytes.
@@ -1031,7 +1109,8 @@ impl GraphClient {
             BodyLimit::Range { start, len } if status == StatusCode::OK => (start, len),
             BodyLimit::Range { len, .. } => (0, len),
         };
-        let bytes = read_body(response.into_body(), skip, keep)
+        let length = body_length(head, status, &headers);
+        let bytes = read_body(response.into_body(), skip, keep, length)
             .await
             .map_err(|error| describe_transport(&error.into()))?;
         Ok(RawResponse {
@@ -1045,7 +1124,8 @@ impl GraphClient {
     }
 
     /// Sends a read once one of the connection's read slots is free; one refused with 429
-    /// waits as asked, without its slot, and goes again.
+    /// waits as asked, without its slot, and goes again. A retire ends the wait for a slot or
+    /// out a 429 at once.
     async fn fetch(
         &self,
         method: Method,
@@ -1079,10 +1159,18 @@ impl GraphClient {
             // or check of a server away serves them all, not a slot's worth in turn.
             let live = self.fresh_token().await;
             let raw = {
-                let _slot = self.read_slots.acquire().await;
+                // Refused at once if the client is retired while the read queues, not when a slot
+                // frees behind reads still under way.
+                let slot = smol::future::or(async { Ok(self.read_slots.acquire().await) }, async {
+                    Err(self.retired_now().await)
+                })
+                .await;
+                let _slot = slot.map_err(ReadError::Transport)?;
                 // A token live when the read queued that ended while it did (a sleep across a long
-                // queue) is waited for again, the slot let go meanwhile.
-                if live && self.holds_ended_token() {
+                // queue) is waited for again, the slot let go meanwhile, while a holder listens
+                // to answer the wait ([`Self::listening_holder`]); one that cannot give the next
+                // releases it at once, and the read queues once more.
+                if live && self.holds_ended_token() && self.listening_holder().is_some() {
                     continue;
                 }
                 self.send_now(
@@ -1101,7 +1189,16 @@ impl GraphClient {
                 let wait = raw.retry_after.unwrap_or(DEFAULT_RETRY_AFTER);
                 if wait <= MAX_RETRY_AFTER {
                     retries += 1;
-                    smol::Timer::after(wait).await;
+                    // Cut short by a retire, whose refusal the next attempt meets.
+                    smol::future::or(
+                        async {
+                            smol::Timer::after(wait).await;
+                        },
+                        async {
+                            self.retired_now().await;
+                        },
+                    )
+                    .await;
                     continue;
                 }
             }
@@ -1975,39 +2072,38 @@ fn content_range_starts_at(served: &str, start: u64) -> bool {
         == Some(start)
 }
 
+/// How long a response's body says it is: its `Content-Length`, unless no body follows (an
+/// answer to HEAD, a 204, a 304), where the header names what a GET would have sent.
+fn body_length(head: bool, status: StatusCode, headers: &HeaderMap) -> Option<u64> {
+    if head || status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED {
+        return None;
+    }
+    headers
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
 /// A response body: `skip` bytes read and dropped, then at most `limit` kept, the rest left
-/// unread.
-async fn read_body(mut body: AsyncBody, skip: u64, limit: usize) -> std::io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    // A whole body, every JSON answer's, is read straight into `bytes`: no buffer is made.
-    if skip == 0 && limit == usize::MAX {
-        body.read_to_end(&mut bytes).await?;
-        return Ok(bytes);
+/// unread. What is kept is read straight into the answer, made as large as the body's
+/// `Content-Length` says from the start (within `limit`), so a whole range is not grown to twice
+/// its size at its end; without one, the answer grows as it is read.
+async fn read_body(
+    mut body: AsyncBody,
+    skip: u64,
+    limit: usize,
+    length: Option<u64>,
+) -> std::io::Result<Vec<u8>> {
+    if skip > 0 {
+        let skipped = futures::io::BufReader::with_capacity(64 * 1024, (&mut body).take(skip));
+        futures::io::copy_buf(skipped, &mut futures::io::sink()).await?;
     }
-    let mut buffer = vec![0; limit.min(256 * 1024).max(usize::from(skip > 0) * 64 * 1024)];
-    let mut skipped = 0;
-    while skipped < skip {
-        let want = buffer
-            .len()
-            .min(usize::try_from(skip - skipped).unwrap_or(usize::MAX));
-        let read = body.read(&mut buffer[..want]).await?;
-        if read == 0 {
-            return Ok(bytes);
-        }
-        skipped += read as u64;
-    }
-    if limit == usize::MAX {
-        body.read_to_end(&mut bytes).await?;
-        return Ok(bytes);
-    }
-    while bytes.len() < limit {
-        let want = buffer.len().min(limit - bytes.len());
-        let read = body.read(&mut buffer[..want]).await?;
-        if read == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&buffer[..read]);
-    }
+    let kept = length.map_or(0, |length| {
+        usize::try_from(length.saturating_sub(skip)).map_or(limit, |left| left.min(limit))
+    });
+    // A byte over, where reading to the end finds that nothing follows.
+    let mut bytes = Vec::with_capacity(kept.saturating_add(1));
+    body.take(limit as u64).read_to_end(&mut bytes).await?;
     Ok(bytes)
 }
 
@@ -2095,6 +2191,21 @@ mod tests {
 
     fn client(http: Arc<dyn HttpClient>) -> GraphClient {
         GraphClient::new("http://127.0.0.1:8787", Some("t".into()), http).unwrap()
+    }
+
+    /// A blank token is none, given at the start or later: sent, a server would read `Bearer `
+    /// as no credential, and say it got none.
+    #[test]
+    fn a_blank_token_is_none() {
+        let http = FakeHttpClient::create(|_| async { unreachable!() });
+        let blank = GraphClient::new("http://127.0.0.1:8787", Some(String::new()), http).unwrap();
+        assert!(!blank.holds_token());
+        let held = client(FakeHttpClient::create(|_| async { unreachable!() }));
+        assert!(
+            held.set_token(Some("  ".into())),
+            "the token held is dropped"
+        );
+        assert!(!held.holds_token());
     }
 
     const CHANGE: &str =
@@ -2702,6 +2813,38 @@ mod tests {
     /// the ended one.
     #[test]
     fn a_read_whose_token_ended_while_it_queued_waits_for_the_next() {
+        use std::sync::atomic::AtomicBool;
+        let (held, slots, sent) = slots_taken();
+        let told = held.token_ended();
+        // Polled by hand: queued for a slot with a live token, which then ends.
+        let woken = Arc::new(Woken(AtomicBool::new(false)));
+        let waker = futures::task::waker(woken.clone());
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut queued = Box::pin(held.schema("g"));
+        assert!(queued.as_mut().poll(&mut context).is_pending(), "queued");
+        held.set_token_ends(Some(SystemTime::now()));
+        slots.release();
+        // With a slot, it finds its token ended, and waits for the next, telling the holder.
+        assert!(queued.as_mut().poll(&mut context).is_pending(), "waits");
+        assert!(told.try_recv().is_ok(), "the holder told");
+        woken.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        held.renew_token(
+            "next".into(),
+            Some(SystemTime::now() + Duration::from_secs(300)),
+        );
+        assert!(
+            woken.0.load(std::sync::atomic::Ordering::SeqCst),
+            "woken by the renewal"
+        );
+        assert!(queued.as_mut().poll(&mut context).is_ready(), "sent");
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), READ_CONCURRENCY + 1, "{sent:?}");
+        assert_eq!(sent.last().map(String::as_str), Some("Bearer next"));
+    }
+
+    /// A client whose read slots are all taken by reads its server answers only once the guard
+    /// returned lets go, and the token each request carried, in order.
+    fn slots_taken() -> (GraphClient, SlotsTaken, Arc<std::sync::Mutex<Vec<String>>>) {
         use std::sync::atomic::{AtomicBool, Ordering};
         let hold = Arc::new(AtomicBool::new(true));
         let sent: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
@@ -2716,7 +2859,6 @@ mod tests {
                     .unwrap_or_default()
                     .to_owned();
                 log.lock().unwrap().push(token);
-                // The reads that fill the slots answer once the test lets them.
                 while holding.load(Ordering::SeqCst) {
                     smol::Timer::after(Duration::from_millis(5)).await;
                 }
@@ -2728,12 +2870,14 @@ mod tests {
             }
         });
         let held = client(http);
-        let told = held.token_ended();
-        let read = |held: &GraphClient| {
-            let held = held.clone();
-            std::thread::spawn(move || block_on(held.schema("g")).ok())
-        };
-        let filling: Vec<_> = (0..READ_CONCURRENCY).map(|_| read(&held)).collect();
+        let filling = (0..READ_CONCURRENCY)
+            .map(|_| {
+                let held = held.clone();
+                std::thread::spawn(move || {
+                    block_on(held.schema("g")).ok();
+                })
+            })
+            .collect();
         let started = Instant::now();
         while sent.lock().unwrap().len() < READ_CONCURRENCY {
             assert!(
@@ -2742,23 +2886,105 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
-        // Queued for a slot with a live token, which then ends.
-        let queued = read(&held);
-        std::thread::sleep(Duration::from_millis(300));
-        held.set_token_ends(Some(SystemTime::now()));
-        hold.store(false, Ordering::SeqCst);
-        for done in filling {
-            done.join().unwrap();
+        (held, SlotsTaken { hold, filling }, sent)
+    }
+
+    /// The reads holding a client's read slots ([`slots_taken`]): let go when released, or when
+    /// dropped, so a test that fails does not leave them waiting.
+    struct SlotsTaken {
+        hold: Arc<std::sync::atomic::AtomicBool>,
+        filling: Vec<std::thread::JoinHandle<()>>,
+    }
+
+    impl SlotsTaken {
+        /// Lets the reads be answered, and waits until they are.
+        fn release(mut self) {
+            self.hold.store(false, std::sync::atomic::Ordering::SeqCst);
+            for read in self.filling.drain(..) {
+                read.join().unwrap();
+            }
         }
-        assert!(told_within(&told), "the queued read waits for the next");
-        held.renew_token(
-            "next".into(),
-            Some(SystemTime::now() + Duration::from_secs(300)),
+    }
+
+    impl Drop for SlotsTaken {
+        fn drop(&mut self) {
+            self.hold.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A waker that notes it was woken, for a request polled by hand.
+    struct Woken(std::sync::atomic::AtomicBool);
+
+    impl futures::task::ArcWake for Woken {
+        fn wake_by_ref(this: &Arc<Self>) {
+            this.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A read queued for a slot is refused as soon as its client is retired, not when a slot
+    /// frees behind reads still under way: polled by hand, it is woken by the retire itself.
+    #[test]
+    fn a_read_queued_when_its_client_is_retired_is_refused_at_once() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::Poll;
+        let (held, slots, sent) = slots_taken();
+        let woken = Arc::new(Woken(AtomicBool::new(false)));
+        let waker = futures::task::waker(woken.clone());
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut queued = Box::pin(held.schema("g"));
+        assert!(queued.as_mut().poll(&mut context).is_pending(), "queued");
+        assert!(!woken.0.load(Ordering::SeqCst));
+        held.retire("the target is gone".into());
+        assert!(woken.0.load(Ordering::SeqCst), "woken by the retire");
+        let Poll::Ready(Err(ReadError::Transport(why))) = queued.as_mut().poll(&mut context) else {
+            panic!("refused at once");
+        };
+        assert_eq!(why, "the target is gone");
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            READ_CONCURRENCY,
+            "nothing more sent"
         );
-        queued.join().unwrap();
-        let sent = sent.lock().unwrap();
-        assert_eq!(sent.len(), READ_CONCURRENCY + 1, "{sent:?}");
-        assert_eq!(sent.last().map(String::as_str), Some("Bearer next"));
+        slots.release();
+    }
+
+    /// A read sleeping out a 429's Retry-After is refused as soon as its client is retired, not
+    /// when the sleep ends, and is not sent again.
+    #[test]
+    fn a_read_sleeping_out_a_429_is_refused_when_its_client_is_retired() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::task::Poll;
+        let sent = Arc::new(AtomicUsize::new(0));
+        let count = sent.clone();
+        let http = FakeHttpClient::create(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            async move {
+                Ok(Response::builder()
+                    .status(429)
+                    .header("retry-after", "30")
+                    .header(CONTRACT_HEADER, CONTRACT)
+                    .body(AsyncBody::from("{}"))
+                    .unwrap())
+            }
+        });
+        let held = client(http);
+        let woken = Arc::new(Woken(AtomicBool::new(false)));
+        let waker = futures::task::waker(woken.clone());
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut read = Box::pin(held.schema("g"));
+        assert!(
+            read.as_mut().poll(&mut context).is_pending(),
+            "sleeping out the 429"
+        );
+        assert_eq!(sent.load(Ordering::SeqCst), 1);
+        assert!(!woken.0.load(Ordering::SeqCst));
+        held.retire("the target is gone".into());
+        assert!(woken.0.load(Ordering::SeqCst), "woken by the retire");
+        let Poll::Ready(Err(ReadError::Transport(why))) = read.as_mut().poll(&mut context) else {
+            panic!("refused at once");
+        };
+        assert_eq!(why, "the target is gone");
+        assert_eq!(sent.load(Ordering::SeqCst), 1, "not sent again");
     }
 
     /// An HTTP client replaced on the client, as when the CLI target's certificate authority
@@ -3629,6 +3855,43 @@ mod tests {
                 .fetch_add(buffer.len(), std::sync::atomic::Ordering::SeqCst);
             std::task::Poll::Ready(Ok(buffer.len()))
         }
+    }
+
+    /// A body whose length is said is read into one allocation of that length: a whole range, or
+    /// what is kept of a value read from its start, is not grown to twice its size at its end.
+    #[test]
+    fn a_body_of_known_length_is_read_without_growing() {
+        // Not a power of two, which growth by doubling could land on.
+        let len = (1 << 20) + 3;
+        let whole = block_on(read_body(
+            AsyncBody::from(vec![7_u8; len]),
+            0,
+            len,
+            Some(len as u64),
+        ))
+        .unwrap();
+        assert_eq!(whole.len(), len);
+        assert!(whole.capacity() <= len + 1, "{}", whole.capacity());
+        let cut = block_on(read_body(
+            AsyncBody::from(vec![7_u8; len]),
+            100,
+            len / 2,
+            Some(len as u64),
+        ))
+        .unwrap();
+        assert_eq!(cut.len(), len / 2);
+        assert!(cut.capacity() <= len / 2 + 1, "{}", cut.capacity());
+
+        // No body follows a HEAD, a 204 or a 304, whatever length the header names.
+        let mut headers = HeaderMap::new();
+        headers.insert("content-length", HeaderValue::from_static("10485760"));
+        assert_eq!(
+            body_length(false, StatusCode::OK, &headers),
+            Some(10_485_760)
+        );
+        assert_eq!(body_length(true, StatusCode::OK, &headers), None);
+        assert_eq!(body_length(false, StatusCode::NO_CONTENT, &headers), None);
+        assert_eq!(body_length(false, StatusCode::NOT_MODIFIED, &headers), None);
     }
 
     /// A server that ignores Range sends the whole value: the range is cut from it, and what
