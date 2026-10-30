@@ -661,8 +661,8 @@ impl OAuthSource {
         self.inner.kept()
     }
 
-    /// Revokes `token`, an earlier item's the keychain let go of, through the sign-in's client
-    /// now.
+    /// Revokes `token`, an earlier item's the keychain let go of, through the server's transport
+    /// as it is now for a service at the server's address, Studio's own client elsewhere.
     pub(crate) fn revoke(&self, token: String) {
         self.inner.service.revoke(token);
     }
