@@ -6088,6 +6088,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "model"
+version = "0.2.2"
+dependencies = [
+ "futures",
+ "http_client",
+ "log",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "smol",
+]
+
+[[package]]
 name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8459,6 +8472,7 @@ dependencies = [
  "graph_store",
  "http_client",
  "menu",
+ "serde",
  "serde_json",
  "studio_actions",
  "studio_theme",
@@ -9817,7 +9831,9 @@ dependencies = [
  "graph_store",
  "http_client",
  "libc",
+ "log",
  "menu",
+ "model",
  "serde",
  "serde_json",
  "studio_actions",
@@ -10785,6 +10801,7 @@ dependencies = [
  "menu",
  "objc2-core-foundation",
  "objc2-core-graphics",
+ "serde",
  "serde_json",
  "studio_actions",
  "studio_settings",

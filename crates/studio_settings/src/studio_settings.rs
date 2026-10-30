@@ -316,6 +316,42 @@ pub struct AgentSettings {
     pub ask_before_writes: bool,
 }
 
+/// Model calls through OpenRouter (spec 019): the model each kind of task runs on, whether a
+/// key is stored, and the tasks allowed to send their input.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct ModelSettings {
+    /// The model for quick answers of a line or two: a table filter from a sentence, a cell's
+    /// value. Claude Haiku 5.5 was right on every filter tried in 1.5 to 2.8 s.
+    #[schemars(title = "Fast model", extend("x-control" = "model"))]
+    pub fast: String,
+    /// The model for careful answers: a branch summary. Claude Sonnet 5.5 wrote the best one
+    /// tried, in about 10 s.
+    #[schemars(title = "Careful model", extend("x-control" = "model"))]
+    pub careful: String,
+    /// Studio sends a task's input to OpenRouter and the model named above, with your key,
+    /// which the system keychain holds. Nothing is sent without a key. Your own Anthropic,
+    /// OpenAI or Google key, set in your OpenRouter workspace, is used for that provider's
+    /// models and billed to that account.
+    #[schemars(title = "OpenRouter key", extend("x-control" = "openrouter-key"))]
+    pub key_stored: bool,
+    /// Each task says what it sends before its first call; the ones you allowed are listed
+    /// here. Clear the list and each asks again.
+    #[schemars(title = "Allowed tasks", extend("x-control" = "task-list"))]
+    pub data_leaves_for: Vec<String>,
+}
+
+impl Default for ModelSettings {
+    fn default() -> Self {
+        Self {
+            fast: "anthropic/claude-haiku-5.5".into(),
+            careful: "anthropic/claude-sonnet-5.5".into(),
+            key_stored: false,
+            data_leaves_for: Vec::new(),
+        }
+    }
+}
+
 /// The whole settings document. Each field's doc comment is its row's description in the
 /// settings tab, and its `schemars` attributes give the title, section, range and control
 /// ([`fields`]).
@@ -362,6 +398,8 @@ pub struct StudioSettings {
     pub omnigraph_cli: Option<String>,
     #[schemars(extend("x-section" = "Agent"))]
     pub agent: AgentSettings,
+    #[schemars(extend("x-section" = "Models"))]
+    pub models: ModelSettings,
     /// Per-graph overrides, keyed by [`overrides_key`]; edited in the settings tab's graph
     /// scope.
     #[schemars(extend("x-hidden" = true))]
@@ -386,6 +424,7 @@ impl Default for StudioSettings {
             studio: StudioOptions::default(),
             omnigraph_cli: None,
             agent: AgentSettings::default(),
+            models: ModelSettings::default(),
             graphs: BTreeMap::new(),
             panels: BTreeMap::new(),
         }

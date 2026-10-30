@@ -26,6 +26,12 @@
     "env": {},
     "ask_before_writes": false
   },
+  "models": {
+    "fast": "anthropic/claude-haiku-5.5",
+    "careful": "anthropic/claude-sonnet-5.5",
+    "key_stored": false,
+    "data_leaves_for": []
+  },
   "graphs": {},
   "panels": {}
 }

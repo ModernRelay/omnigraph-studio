@@ -443,12 +443,23 @@ mod tests {
                 "omnigraph_cli",
                 "agent.command",
                 "agent.ask_before_writes",
+                "models.fast",
+                "models.careful",
+                "models.key_stored",
+                "models.data_leaves_for",
             ],
             "agent.env, a map, and panels are edited in settings.json or elsewhere"
         );
         assert_eq!(
             sections(),
-            ["Appearance", "Browsing", "Connection", "Updates", "Agent"]
+            [
+                "Appearance",
+                "Browsing",
+                "Connection",
+                "Updates",
+                "Agent",
+                "Models"
+            ]
         );
     }
 

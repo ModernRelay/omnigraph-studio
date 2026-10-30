@@ -7,6 +7,7 @@ mod blob;
 mod blob_view;
 mod blob_write;
 mod dialogs;
+mod fill;
 mod grouping;
 mod model;
 mod node_page;
@@ -20,6 +21,7 @@ mod table;
 mod test_support;
 mod text_editor;
 mod types_list;
+mod words;
 mod write;
 
 use gpui::{App, AppContext as _, Context, Entity, Window};

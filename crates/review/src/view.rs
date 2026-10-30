@@ -26,17 +26,19 @@ use graph_store::{
 };
 use serde_json::Value;
 use studio_actions::review::{
-    AcceptAndNext, EditChange, Merge, NextChange, PreviousChange, RevertAndNext,
+    AcceptAndNext, EditChange, Merge, NextChange, PreviousChange, RevertAndNext, Summarize,
 };
 use studio_actions::workspace::Refresh;
 use studio_ui::ds::{radii, space};
 use studio_ui::{ChangeCard, change_counts, group_digits, short_commit_id, type_swatch};
+use studio_workspace::models::{Error as ModelError, Models, Request as ModelRequest};
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace, workspace_for};
 use ui::prelude::*;
 use ui::{KeyBinding, PopoverMenu, Severity, Tooltip};
 
 use crate::conflicts::{conflict_wording, resolution_hint};
 use crate::scope_menu::ScopeMenu;
+use crate::summary;
 
 /// How long typing in the search pauses before the cards are filtered.
 const SEARCH_DELAY: Duration = Duration::from_millis(80);
@@ -225,6 +227,23 @@ struct ReviewData {
     /// stopped the read: `commits` are the branch's own read, so their count and authors are
     /// not all known.
     commits_capped: Option<Capped>,
+}
+
+/// The model's summary of the branch (spec 019): none asked, waiting for the person to allow
+/// the task, under way, done, or failed with why.
+enum SummaryState {
+    None,
+    Consent,
+    Running {
+        _call: Task<()>,
+    },
+    Done {
+        answer: summary::Answer,
+        model: String,
+        titles: usize,
+        cut: bool,
+    },
+    Failed(String),
 }
 
 /// A fix asked for on a card: sent once the fixes before it are back.
@@ -458,6 +477,8 @@ pub struct ReviewView {
     bound_head: Option<String>,
     /// What the review holds, in a sentence, made when it loads: the header draws at every frame.
     summary: String,
+    /// A model's summary of the branch (spec 019), kept until the head moves.
+    ai_summary: SummaryState,
     /// Reviewed marks, by entity and what its change does ([`mark_of`]), kept across Refresh:
     /// an entity changed again since is reviewed again.
     reviewed_keys: HashSet<u64>,
@@ -630,6 +651,7 @@ impl ReviewView {
             conflict_list: ListState::new(0, ListAlignment::Top, px(800.)),
             bound_head: None,
             summary: String::new(),
+            ai_summary: SummaryState::None,
             reviewed_keys: HashSet::new(),
             merge: MergeState::Idle,
             logged_merge_held: false,
@@ -932,6 +954,9 @@ impl ReviewView {
                     if let Some(&ix) = data.by_key.get(key) {
                         self.cards[ix].fix = fix.clone();
                     }
+                }
+                if self.bound_head != data.head {
+                    self.ai_summary = SummaryState::None;
                 }
                 self.bound_head = data.head.clone();
                 let schema_moved = std::mem::take(&mut self.schema_moved_while_loading);
@@ -2418,13 +2443,193 @@ impl ReviewView {
                     .child(merge_button),
             )
             .child(h_flex().gap(px(space::MD)).child(scope_menu).child(search))
-            .child(studio_ui::ds::text::plain(sentence))
+            .child(
+                h_flex()
+                    .gap(px(space::MD))
+                    .items_center()
+                    .child(studio_ui::ds::text::plain(sentence))
+                    .child(div().flex_1())
+                    .when(
+                        self.data.is_some() && matches!(self.load, LoadState::Ready),
+                        |row| row.child(self.render_summarize_button(cx)),
+                    ),
+            )
             .when(!detail.is_empty(), |d| {
                 d.child(studio_ui::ds::text::muted(detail))
             })
+            .children(self.render_ai_summary(cx))
             .children(counts)
             .children(banners)
             .into_any_element()
+    }
+
+    // ---- a model's summary (spec 019) ----
+
+    fn render_summarize_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let running = matches!(self.ai_summary, SummaryState::Running { .. });
+        let label = match &self.ai_summary {
+            SummaryState::Done { .. } => "Summarize again",
+            _ => "Summarize",
+        };
+        studio_ui::ds::button("summarize", label)
+            .style(ButtonStyle::Subtle)
+            .start_icon(Icon::new(IconName::ZedAssistant))
+            .disabled(running)
+            .tooltip(|_, cx| {
+                Tooltip::for_action(
+                    "A model's summary of the branch, for the reviewer",
+                    &Summarize,
+                    cx,
+                )
+            })
+            .on_click(cx.listener(|this, _, _, cx| this.summarize(cx)))
+            .into_any_element()
+    }
+
+    fn render_ai_summary(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let card = |cx: &App| {
+            studio_ui::ds::card(cx)
+                .px(px(space::LG))
+                .py(px(space::MD))
+                .gap(px(space::SM))
+        };
+        Some(match &self.ai_summary {
+            SummaryState::None => return None,
+            SummaryState::Consent => {
+                let model = Models::model_for(summary::TASK.tier, cx);
+                card(cx)
+                    .child(studio_ui::ds::text::body(format!(
+                        "{} go to {model}.",
+                        summary::TASK.sends
+                    )))
+                    .child(
+                        h_flex()
+                            .gap(px(space::SM))
+                            .child(
+                                studio_ui::ds::button("summary-send", "Send")
+                                    .on_click(cx.listener(|this, _, _, cx| this.allow_summary(cx))),
+                            )
+                            .child(
+                                studio_ui::ds::button("summary-not-now", "Not now")
+                                    .style(ButtonStyle::Subtle)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.ai_summary = SummaryState::None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .into_any_element()
+            }
+            SummaryState::Running { .. } => card(cx)
+                .child(
+                    h_flex()
+                        .gap(px(space::SM))
+                        .items_center()
+                        .child(studio_ui::ds::spinner())
+                        .child(studio_ui::ds::text::muted("Summarizing the branch…")),
+                )
+                .into_any_element(),
+            SummaryState::Failed(why) => card(cx)
+                .child(studio_ui::ds::text::error(why.clone()))
+                .into_any_element(),
+            SummaryState::Done {
+                answer,
+                model,
+                titles,
+                cut,
+            } => {
+                let mut meta = format!(
+                    "{model} · sent {}",
+                    studio_ui::plural(*titles, "record's title", "records' titles")
+                );
+                if *cut {
+                    meta.push_str(&format!(
+                        " · the first {} changes of each type",
+                        summary::PER_TYPE
+                    ));
+                }
+                card(cx)
+                    .child(studio_ui::ds::text::body(answer.headline.clone()))
+                    .children(answer.points.iter().map(|point| {
+                        h_flex()
+                            .gap(px(space::SM))
+                            .items_start()
+                            .child(studio_ui::ds::text::muted("•"))
+                            .child(studio_ui::ds::text::body(point.clone()))
+                    }))
+                    .when(!answer.needs_attention.is_empty(), |card| {
+                        card.child(studio_ui::ds::text::meta("Needs attention"))
+                            .children(answer.needs_attention.iter().map(|line| {
+                                h_flex()
+                                    .gap(px(space::SM))
+                                    .items_start()
+                                    .child(studio_ui::ds::icon::meta(IconName::Warning))
+                                    .child(studio_ui::ds::text::body(line.clone()))
+                            }))
+                    })
+                    .child(studio_ui::ds::text::meta(meta))
+                    .into_any_element()
+            }
+        })
+    }
+
+    fn summarize(&mut self, cx: &mut Context<Self>) {
+        if self.data.is_none() || matches!(self.ai_summary, SummaryState::Running { .. }) {
+            return;
+        }
+        let Some(models) = Models::try_global(cx) else {
+            self.ai_summary = SummaryState::Failed(ModelError::NoKey.to_string());
+            cx.notify();
+            return;
+        };
+        if !Models::allowed(&summary::TASK, cx) {
+            self.ai_summary = SummaryState::Consent;
+            cx.notify();
+            return;
+        }
+        self.start_summary(models, cx);
+    }
+
+    fn allow_summary(&mut self, cx: &mut Context<Self>) {
+        Models::allow(&summary::TASK, cx);
+        match Models::try_global(cx) {
+            Some(models) => self.start_summary(models, cx),
+            None => self.ai_summary = SummaryState::None,
+        }
+        cx.notify();
+    }
+
+    fn start_summary(&mut self, models: Entity<Models>, cx: &mut Context<Self>) {
+        let Some(data) = &self.data else {
+            return;
+        };
+        let condensed = summary::condense(&self.branch, &self.target, &data.folded, &data.counts);
+        let (titles, cut) = (condensed.titles, condensed.cut);
+        let request = ModelRequest {
+            task: &summary::TASK,
+            instructions: summary::INSTRUCTIONS,
+            input: condensed.text,
+            schema: summary::schema(),
+        };
+        let call = models.read(cx).call::<summary::Answer>(request, cx);
+        let task = cx.spawn(async move |this, cx| {
+            let answer = call.await;
+            this.update(cx, |this, cx| {
+                this.ai_summary = match answer {
+                    Ok(answer) => SummaryState::Done {
+                        answer: answer.value,
+                        model: answer.model,
+                        titles,
+                        cut,
+                    },
+                    Err(error) => SummaryState::Failed(error.to_string()),
+                };
+                cx.notify();
+            })
+            .ok();
+        });
+        self.ai_summary = SummaryState::Running { _call: task };
+        cx.notify();
     }
 
     fn render_merge_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -3841,6 +4046,7 @@ impl Render for ReviewView {
             // Merge is registered only while the credential may merge (constitution VIII).
             .when(self.merge_refusal(cx).is_none(), |view| {
                 view.on_action(cx.listener(|this, _: &Merge, _, cx| this.merge(cx)))
+                    .on_action(cx.listener(|this, _: &Summarize, _, cx| this.summarize(cx)))
             })
             // ⌘R reads the review again, as its Refresh buttons do, and goes on to the
             // workspace, which reads the graph's schema, branches and counts again.

@@ -22,6 +22,7 @@ members = [
     "crates/agent_panel",
     "crates/studio_update",
     "crates/oauth_client",
+    "crates/model",
     "grammars/tree-sitter-gq",
     "grammars/tree-sitter-pg",
 ]
@@ -55,6 +56,7 @@ graph_client = { path = "crates/graph_client" }
 graph_store = { path = "crates/graph_store" }
 studio_update = { path = "crates/studio_update" }
 oauth_client = { path = "crates/oauth_client" }
+model = { path = "crates/model" }
 gq_language = { path = "crates/gq_language" }
 command_palette = { path = "crates/command_palette" }
 type_table = { path = "crates/type_table" }

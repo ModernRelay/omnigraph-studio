@@ -1,6 +1,6 @@
 # 019: Model calls through OpenRouter
 
-Status: draft · 2026-10-29
+Status: built 2026-10-30; the three uses wait for a live check with a key
 
 ## Problem
 
@@ -160,12 +160,21 @@ pub struct Answer<T> {
     pub elapsed: Duration,
 }
 
-pub enum Error { NoKey, Refused(u16, String), NotInSchema(String), TooLarge, Timeout, Cancelled, Network(String) }
+pub enum Error { NoKey, Refused(u16, String), NotInSchema(String), TooLarge, Timeout, Network(String) }
 
 impl Client {
-    pub fn call<T: DeserializeOwned + JsonSchema>(&self, request: Request<'_>, cancel: Cancel) -> impl Future<Output = Result<Answer<T>, Error>>;
+    /// Dropping the future ends the call.
+    pub async fn call<T: DeserializeOwned>(&self, model: &str, key: &str, request: Request<'_>) -> Result<Answer<T>, Error>;
+    pub async fn list_models(&self) -> Result<Vec<ModelChoice>, Error>;
 }
 ```
+
+The crate holds no key and reads no setting: the caller gives the model and the key with each
+call. `studio_workspace::models::Models`, one per app, is what views call: it reads the key
+from the keychain, names the model for a task's tier from the settings, keeps the consent
+list, caches the model list, and runs each call off the main thread as a `Task` whose drop
+ends the call. A schema is a `serde_json::Value` the feature builds (its enums come from the
+graph's schema, not a Rust type).
 
 - `call` builds the body: the instructions as the system message, the input as the user
   message, `response_format` with the task's schema under `strict: true`, `max_tokens` from the
@@ -193,14 +202,16 @@ A **Models** section:
 |---|---|---|
 | `models.fast` | `anthropic/claude-haiku-5.5` | model picker |
 | `models.careful` | `anthropic/claude-sonnet-5.5` | model picker |
-| `models.data_leaves_for` | `[]` | read-only list of the tasks allowed so far |
+| `models.data_leaves_for` | `[]` | the tasks allowed so far, with **Ask again** |
+| `models.key_stored` | `false` | **OpenRouter key**: whether the keychain holds one; a masked field, Store, Remove |
 
-and one row, **OpenRouter key**, that stores to the keychain and shows "Stored" or "None". A
-second row, **Provider keys**, explains BYOK in one line ("Your own Anthropic, OpenAI or Google
-key, set in your OpenRouter workspace, is used for that provider's models and billed to that
-account") with a button that opens `https://openrouter.ai/settings/integrations`. Studio holds
-no provider key: OpenRouter is the one place they live, and a request never carries one. The
-model picker lists `GET /api/v1/models` filtered to `structured_outputs`, as "name · $in/$out
+The key row writes the key to the keychain and shows "Stored" or "None"; `key_stored` only
+mirrors that, so the row reads right at start, and the key itself is never in the file. The
+row's description explains BYOK in one line ("Your own Anthropic, OpenAI or Google key, set in
+your OpenRouter workspace, is used for that provider's models and billed to that account")
+and a **Provider keys…** button opens `https://openrouter.ai/settings/integrations`. Studio
+holds no provider key: OpenRouter is the one place they live, and a request never carries one.
+The model picker lists `GET /api/v1/models` filtered to `structured_outputs`, as "name · $in/$out
 per million", read once a day and kept in the data directory; without a key or network it holds
 the two defaults. The section's description: "Studio sends a task's input to OpenRouter and the
 model it names. Each task says what it sends before its first call. Nothing is sent without a
@@ -233,7 +244,7 @@ replaces the filters the first made and keeps ones added by hand. Measured: 1.5�
 Haiku with every answer right; the field shows its spinner meanwhile and Escape cancels.
 
 **Branch summary** (`review`). A **Summarize** button beside the review's sentence
-(`studio_review::Summarize`, no default binding) calls `branch-summary` (Careful; 64 KB in,
+(`studio_review::Summarize`, ⌘⇧M) calls `branch-summary` (Careful; 64 KB in,
 1,200 tokens out, 60 s) with the branch name, the target, and the changes condensed as the
 review groups them: per type, the count by operation, then each change as its operation, id,
 title (the `name`, `title` or `subject` property, cut at 80 characters) and, for an update, the
@@ -245,15 +256,18 @@ which counted every type, named the three edits to existing records and spotted 
 emails; 2.5 s on Flash Lite, thin. A review over the byte cap sends its first 25 changes per
 type and says so.
 
-**Fill a column** (`type_table`, after spec 014's editing). A column header's menu gets
-**Fill from…** (`studio_table::FillColumn`): the person picks the source columns and writes
-one line ("the city from the address"). Each row is one `column-fill` call (Fast; 4 KB in,
+**Fill a column** (`type_table`, after spec 014's editing). The bulk bar, which already holds
+the selected rows and a property to set, gets **Fill with a model…** (`studio_table::FillColumn`, ⌘⇧L):
+a row under it names the target, offers the source columns (every other scalar column, each
+one a toggle) and takes one line ("the city from the address"). Each row is one `column-fill` call (Fast; 4 KB in,
 200 tokens out, 10 s) with the target property's type and enum values, the source cells, and
 the instruction; the answer is `{value: string | null, sure: bool}`. Rows run eight at a time
-over the selected rows, at most 500 (IX), each answer shown in its cell as a suggestion (the
-draft style of spec 014) with unsure ones marked; **Apply** writes the accepted ones as one
-batch on the session's branch, as a paste would, and Escape discards the rest. A cell the
-person edited meanwhile is skipped.
+over the selected rows, at most 500 (IX), each sure answer put on its cell as a draft (spec 014), which the drafts bar saves as one
+commit or discards; an unsure answer is counted and left empty rather than marked, since a
+draft the person did not mean to keep is worse than a cell to fill by hand. A cell holding a
+draft or an edit, one whose value moved while its call was out, and one the answer is the
+same for or does not fit are skipped and counted. Closing the row stops the fill; the drafts
+made stay.
 
 ### What a later use needs
 
@@ -306,6 +320,8 @@ A call is never retried. The model list is read at most once a day.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-30 | The crate sends the schema under strict with the provider policy, parses the answer as the task's type, and tells its errors apart | `model` `a_call_sends_the_schema_and_parses_the_answer`, `errors_are_told_apart`, `the_model_list_keeps_schema_models_with_prices` (a fake HTTP client) | Pass |
+| 2026-10-30 | A sentence's answer becomes filters the type takes, and a branch condenses to titles and changed property names without values | `type_table` `words::tests::an_answer_becomes_filters_the_type_takes`, `fill::tests::a_rows_input_names_the_target_and_its_sources`; `review` `summary::tests::the_input_holds_titles_and_changed_property_names_but_no_values` | Pass. The live calls were not run from the app yet: no key is stored in it |
 | 2026-10-29 | Direct schema-bound calls answer filters in 1–3 s and agent routes in 4–6 s; ACP without a schema does not keep the shape | Eight requests on `Event`, graded; `claude -p`, `codex exec`, warm ACP sessions of both agents, OpenRouter with four models, Anthropic direct (scratchpad `nlfilter/`, scripts `run.sh`, `direct.py`, `acp_turns.py`, `grade.py`) | As in the table above. Haiku, Flash Lite and the CLIs 8/8; nano 5/8; ACP 0/5 with the wrong field names |
 | 2026-10-29 | The Auto Router is right but slower than a named model; Jev is certain on read-versus-write and unsure on a 100-way type choice | `direct.py` with `openrouter/auto`; `jev.py` (six sentences, a Choice over the schema's node types and a Noul) | Auto 8/8 at 3–5 s via Azure; Jev 0.4–6 s, Noul right 6/6 (0.98 vs ≤ 0.04), Choice 4/6 |
 | 2026-10-29 | A condensed 294-change branch summarizes well in ~10 s | `direct_summary.py` on Sonnet and Flash Lite; `claude -p` Sonnet; `codex exec` Astra | Sonnet 9.5 s and best; Astra 15 s; `claude -p` 28 s at 7.3¢; Flash Lite 2.5 s but generic |
