@@ -67,26 +67,26 @@ inspectors = { path = "crates/inspectors" }
 agent_panel = { path = "crates/agent_panel" }
 
 # Zed, one release tag for every crate (docs/zed-pin.md). GPL-3.0-or-later and Apache-2.0.
-gpui = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
-ui = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
-theme = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
-menu = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
-collections = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
-util = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
-http_client = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
-reqwest_client = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
+gpui = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
+ui = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
+theme = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
+menu = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
+collections = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
+util = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
+http_client = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
+reqwest_client = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
 # The reqwest fork Zed v1.23.2 pins, with its features, for a CLI target that trusts its own
 # certificate authority (spec 003): `reqwest_client` takes a `reqwest::Client` built with roots.
 reqwest = { package = "zed-reqwest", git = "https://github.com/zed-industries/reqwest.git", rev = "33bc764aa15ff7b200bf7c93bd96e24878d53e14", default-features = false, features = ["charset", "http2", "macos-system-configuration", "multipart", "rustls-tls-native-roots", "socks", "stream"] }
-editor = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
-markdown = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
-language = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
-settings = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
-release_channel = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
-zlog = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
-theme_settings = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
-assets = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
+editor = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
+markdown = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
+language = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
+settings = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
+release_channel = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
+zlog = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
+theme_settings = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
+assets = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
 
 # Omnigraph's parser and type checker. MIT; no Lance dependency.
 omnigraph-compiler = { git = "https://github.com/ModernRelay/omnigraph", tag = "v0.14.0" }
@@ -145,8 +145,10 @@ tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev
 notify = { git = "https://github.com/zed-industries/notify", rev = "d842f16b2716bd60f09caf3ae3a894237ab38f54" }
 notify-types = { git = "https://github.com/zed-industries/notify", rev = "d842f16b2716bd60f09caf3ae3a894237ab38f54" }
 async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }
-async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
-calloop = { git = "https://github.com/zed-industries/calloop" }
+async-task = { git = "https://github.com/zed-industries/async-task.git", rev = "015845a19fc31752c02367567d3b8900a406f9da" }
+calloop = { git = "https://github.com/zed-industries/calloop", rev = "3759371fee14c40066d64777e2a36b6ffcc22590" }
+# Avoid panicking when a failed EGL call reports EGL_SUCCESS (Zed's patch at the pin).
+khronos-egl = { git = "https://github.com/zed-industries/khronos-egl", rev = "42214b36347b108fd9630ca6254b96dde59e04fe" }
 
 [profile.dev]
 split-debuginfo = "unpacked"
@@ -171,7 +173,6 @@ gpui_macros = { opt-level = 3 }
 derive_refineable = { opt-level = 3 }
 settings_macros = { opt-level = 3 }
 ui_macros = { opt-level = 3 }
-util_macros = { opt-level = 3 }
 quote = { opt-level = 3 }
 syn = { opt-level = 3 }
 proc-macro2 = { opt-level = 3 }

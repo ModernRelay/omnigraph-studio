@@ -26,7 +26,7 @@ intelligence. See `README.md`.
 
 | What | Pin | Where |
 |---|---|---|
-| Zed crates | tag `v1.23.2` (`c0199504b9cc`) | `Cargo.toml` `[workspace.dependencies]` |
+| Zed crates | tag `v1.26.2` (`c4273271092b`) | `Cargo.toml` `[workspace.dependencies]` |
 | Rust | `1.98.1`, Zed's toolchain at that tag | `rust-toolchain.toml` |
 | Omnigraph HTTP contract | `0.14` (the `v0.14.0` release) | `crates/graph_client/openapi/omnigraph-0.14.0.json` |
 | `omnigraph-compiler` | tag `v0.14.0` | `Cargo.toml` |

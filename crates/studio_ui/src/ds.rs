@@ -9,12 +9,12 @@
 
 use std::time::Duration;
 
+use crate::motion;
 use gpui::{
-    AnyElement, Animation, AnimationExt as _, App, Bounds, BoxShadow, ClickEvent, Corners, Div,
+    Animation, AnimationExt as _, AnyElement, App, Bounds, BoxShadow, ClickEvent, Corners, Div,
     ElementId, Hsla, MouseButton, Pixels, SharedString, Stateful, Transformation, Window,
     percentage, point,
 };
-use crate::motion;
 use studio_settings::{StudioSettings, WindowStyle};
 use ui::prelude::*;
 use ui::{Tooltip, rems_from_px};
@@ -1016,7 +1016,11 @@ pub fn type_dot(type_name: &str) -> Div {
 pub fn live_dot(id: impl Into<SharedString>, color: Hsla, beat: Option<u64>, cx: &App) -> Div {
     /// How far the ring goes past the dot's edge.
     const REACH: f32 = 4.;
-    let dot = div().size(px(size::DOT)).flex_none().rounded_full().bg(color);
+    let dot = div()
+        .size(px(size::DOT))
+        .flex_none()
+        .rounded_full()
+        .bg(color);
     let Some(beat) = beat.filter(|_| motion::enabled(cx)) else {
         return dot;
     };
@@ -1881,8 +1885,9 @@ fn pill_frame(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
         .overflow_hidden()
 }
 
-/// The hairline between a pill's segments, the pill's full height.
-fn pill_rule(cx: &App) -> Div {
+/// The hairline between a pill's segments, the pill's full height: a filter's, a toolbar
+/// chip's, and the filter being written.
+pub fn pill_rule(cx: &App) -> Div {
     div()
         .w(px(size::HAIRLINE))
         .h_full()
@@ -1953,16 +1958,17 @@ impl RenderOnce for ControlChip {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         // The button fills the chip, so its label is as far in as a button's and its hover
         // fill is the chip's own shape.
-        pill_frame(self.id, cx)
-            .child(self.button)
-            .when_some(self.clear, |chip, (tooltip, on_clear)| {
+        pill_frame(self.id, cx).child(self.button).when_some(
+            self.clear,
+            |chip, (tooltip, on_clear)| {
                 chip.child(pill_rule(cx)).child(pill_end(
                     pill_button("clear", IconName::Close, Color::Muted, cx)
                         .debug_selector(|| "chip-clear".into())
                         .tooltip(Tooltip::text(tooltip))
                         .on_click(move |event, window, cx| on_clear(event, window, cx)),
                 ))
-            })
+            },
+        )
     }
 }
 

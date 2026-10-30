@@ -17,7 +17,7 @@ jobs:
     outputs:
       code: ${{ steps.diff.outputs.code }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 2
       # The checkout is the pull request's merge commit; its first parent is the base.
@@ -48,7 +48,7 @@ jobs:
           git config --global core.longpaths true
           echo "CARGO_NET_GIT_FETCH_WITH_CLI=true" >> "$GITHUB_ENV"
         shell: bash
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Linux packages
         if: runner.os == 'Linux'
         run: |
@@ -57,7 +57,7 @@ jobs:
             libx11-xcb-dev libxcb1-dev libfontconfig1-dev libvulkan-dev libssl-dev pkg-config
       - name: Rust toolchain from rust-toolchain.toml
         run: rustup show
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -79,7 +79,7 @@ jobs:
   structure:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: python3 script/check-layers.py
       - run: python3 script/check-design-tokens.py
       - run: python3 script/check-brand.py
@@ -88,7 +88,7 @@ jobs:
   deny:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
       # Every release bundle ships the third-party notices; a crate whose licence cannot be read
       # fails here, before a release does.

@@ -2,11 +2,12 @@
 
 Status: implemented for a CLI server target with `auth: anonymous` whose server offers sign-in
 (`oauth_client`, `graph_store::sign_in`, 2026-10-26), and tested end to end against Omnigraph
-v0.14.0 (`script/dev-sign-in`). Studio has no client identity yet (open question 1): until its
-metadata document is published or it is registered, a real sign-in service refuses it, and only
-`OMNIGRAPH_STUDIO_OAUTH_CLIENT` (development) signs in. A managed target still reaches its
-cluster on the CLI's login (spec 003, since 2026-10-25) until the managed control plane's
-prerequisites below are met · 2026-10-26
+v0.14.0 (`script/dev-sign-in`). Studio's client ID is its metadata document,
+`https://www.omnigraph.dev/oauth/studio-client-metadata.json` (ModernRelay/brand#26), and the
+managed control plane's AuthKit takes it on any loopback port (2026-10-29). A managed target
+still reaches its cluster on the CLI's login (spec 003, since 2026-10-25) until the managed
+control plane's other prerequisites below are met ·
+2026-10-29
 
 ## Problem
 
@@ -135,13 +136,18 @@ Studio restarts; they hold no secrets.
 
 ### Client identity
 
-- Studio's `client_id` is the URL of its Client ID Metadata Document, an HTTPS JSON document
-  ModernRelay publishes at a stable address (open question 1), used with an authorization
+- Studio's `client_id` is the URL of its Client ID Metadata Document,
+  `https://www.omnigraph.dev/oauth/studio-client-metadata.json`, served by the omnigraph.dev
+  site (ModernRelay/brand, `apps/omnigraph/public/oauth/`) and used with an authorization
   server whose metadata says `client_id_metadata_document_supported: true`:
-  `{"client_id": <its URL>, "client_name": "Omnigraph Studio", "redirect_uris":
-  ["http://127.0.0.1/callback"], "grant_types": ["authorization_code", "refresh_token"],
-  "response_types": ["code"], "token_endpoint_auth_method": "none"}`. The loopback redirect is
-  listed without a port; the authorization server must accept any port on it (RFC 8252 §7.3).
+  `{"client_id": <its URL>, "client_name": "Omnigraph Studio", "client_uri":
+  "https://www.omnigraph.dev", "logo_uri": <its logo beside it>, "application_type": "native",
+  "redirect_uris": ["http://127.0.0.1/callback"], "grant_types": ["authorization_code",
+  "refresh_token"], "response_types": ["code"], "token_endpoint_auth_method": "none"}`. The
+  loopback redirect is listed without a port; the authorization server must accept any port on
+  it (RFC 8252 §7.3), as it must for Claude Code's document, which does the same. The URL is on
+  `www.` because the apex redirects, and a service must not follow a redirect to the document.
+  It is Studio's identity: another URL is another client, and everyone signed in signs in again.
 - An authorization server that does not accept a metadata-document client ID may have Studio
   pre-registered as a public client with loopback redirects. Its ID is kept in Studio per
   issuer, as data shipped with Studio, not typed by the person. A registered ID is used before
@@ -194,10 +200,25 @@ Studio restarts; they hold no secrets.
   token is written to disk, logs, saved state, links, crash reports or any agent's environment;
   the agent gateway uses Studio's connection, and the agent never sees the token.
 - A keychain that refuses the write leaves the sign-in good for this run and says so ("Signed
-  in for this session; the keychain did not keep it"); there is no file fallback.
+  in for this session; the keychain did not keep it"); there is no file fallback. A sign-in the
+  keychain keeps nothing of deletes the item at its target, so the next launch does not read an
+  earlier account's; one the keychain does not delete is said with it. A delete is done when the
+  key holds no item afterwards: macOS and Windows refuse to delete an item that is not there.
 - **Sign out** drops the access token, deletes the keychain item and, when the authorization
   server publishes a `revocation_endpoint`, revokes the refresh token there (RFC 7009),
-  bounded to 10 seconds and not retried.
+  bounded to 10 seconds and not retried. A keychain that refuses the delete leaves the person
+  signed out for this run and says so ("The keychain kept a sign-in it would not delete"),
+  since the next launch would read the item back. The
+  keychain's answer is taken before the revocation is sent; a sign-in made meanwhile reaches
+  the keychain after it, and a refresh the service answers after the sign-out writes nothing
+  there (its rotated token is the one revoked). A sign-in the service ends (`invalid_grant`)
+  forgets the item the same way. An item left is the connection's to say, whatever its
+  state, until a sign-in is taken; it is not a message a later attempt replaces. A target's
+  keychain work (a sign-in's write or delete, a sign-out's delete, a launch's read) takes its
+  turns in order, and a sign-in cancelled after the service gave it tokens revokes its refresh
+  token. A keychain
+  that cannot be read is taken as holding nothing, as a launch takes it: one unreadable only
+  for the moment (macOS, locked) can then keep an item unsaid.
 
 ### Refresh
 
@@ -273,7 +294,7 @@ Studio restarts; they hold no secrets.
   - enable and qualify a standard OAuth resource profile on managed servers, so they run with
     OIDC identity trust (which also admits the resource's host for MCP);
   - register Studio as a public client with loopback redirects, or accept its Client ID
-    Metadata Document;
+    Metadata Document. Done (2026-10-29): its AuthKit takes metadata documents;
   - name each managed cluster's resource on its own data host, `https://<data host>/mcp`, and
     forward that path and its metadata through the data host's public route, which OAuth alone
     does not create. Done (2026-10-23): a client following RFC 9728 §3.3 (the MCP TypeScript
@@ -282,6 +303,7 @@ Studio restarts; they hold no secrets.
   Its authorization server is AuthKit. Studio must not depend on `/openapi.json` being
   reachable through every deployment's proxy.
 - **ModernRelay**: publish Studio's Client ID Metadata Document at a stable HTTPS address.
+  Done (2026-10-29, ModernRelay/brand#26).
 - **Omnigraph**: nothing beyond what 0.14.0 serves (A1 is implemented); tracked in #1025.
 - **Studio's CLI finder** (spec 003): it chooses a CLI by `version --json`, and 0.14.0's CLI
   reports access protocol 2 (target and credential 2 as well); Studio must accept it before a
@@ -317,21 +339,19 @@ Studio restarts; they hold no secrets.
 
 ## Open questions
 
-1. Where Studio's Client ID Metadata Document is published, and whether the managed control
-   plane's authorization server accepts it for Studio, or Studio is pre-registered there (and
-   with which ID per environment). The managed control plane prefers metadata-document
-   clients and keeps pre-registration for clients that need it.
-2. Whether that authorization server accepts a loopback redirect on any port (RFC 8252 §7.3)
-   for a public client.
-3. Which scopes Studio requests so that a refresh token is issued (for example
-   `offline_access`), and how long a refresh token lasts. That they rotate and must repeat the
-   resource is settled.
+1. Settled (2026-10-29): the managed control plane's AuthKit takes Studio's metadata
+   document; no environment needs a registered ID.
+2. Settled (2026-10-29): AuthKit takes the document's loopback redirect on any port.
+3. How long a refresh token lasts. AuthKit lists `offline_access`, so Studio requests it; that
+   refresh tokens rotate and must repeat the resource is settled.
 4. How a person in several organizations gets a token for the target's organization: the
    hosted flow's organization choice, or a hint Studio sends.
 5. What to show for the account: `sub` is an opaque identifier, and Studio requests no ID
    token.
 6. What to do with metadata naming several authorization servers (none does today).
-7. Whether the authorization server publishes a `revocation_endpoint`.
+7. Settled (2026-10-29): AuthKit publishes no `revocation_endpoint`, so Sign out deletes the
+   refresh token from the keychain without revoking it, and it stays usable at AuthKit until
+   it ends.
 
 ## Validation log
 
@@ -351,6 +371,16 @@ Studio restarts; they hold no secrets.
 
 | 2026-10-26 | A second review of #12 (the session sharing the checkout, read-only) | `graph_store` `a_dropped_ask_leaves_its_refresh_to_finish` (the service holds its answer after rotating the refresh token; the ask is dropped there; the next ask is answered without asking again), `a_new_transport_keeps_the_sign_in_through_it` (extended: the server is checked again through the new client unasked); `oauth_client` token test (a clock ten minutes ahead keeps `expires_in`) | Fixed: refreshes run on their own task and asks join them; a renewal is quiet by its flag and holder, not only when the server is ready; the lifetime is `expires_in` alone, renewed no sooner than a second; a transport change checks a server in use again. Not taken here, as older than this PR: a token source's temporary failure dropping a working token, one failed health check showing Unreachable for two minutes, the CLI's stdin write without a timeout |
 | 2026-10-28 | A sign-in whose service does not answer stands | `graph_store` `sign_in::tests::a_sign_in_whose_service_does_not_answer_stands` (a kept sign-in whose service answers 503 at launch, then again at a renewal), `connection::tests::a_renewal_that_cannot_be_answered_keeps_the_token_held` (asked again halfway to the token's end, then renewed quietly); `studio` `a_server_that_offers_a_sign_in_says_where_and_as_whom` (extended: the status line and chip) | All pass. At launch the server read Sign-in not answering, signed in as the keychain's account, with no browser opened and the keychain item kept; the next health check signed in. At the renewal the token stayed in use with the same credential. Before, both ended the sign-in and offered a browser sign-in. This takes the first of the three items the 2026-10-26 review left; the other two (a single failed health check, the CLI's stdin write) were fixed on main in #13 |
+| 2026-10-29 | A keychain that refuses the keep or the delete is said, and a missing item is no refusal | `graph_store` `sign_in::tests::a_server_that_offers_sign_in_is_signed_in_through_the_browser` (extended: a refused write; the sign-out of that unkept sign-in; a refused delete at sign-out; a sign-in kept nothing of over an item the keychain will not delete; a refused write over an earlier item) and `a_rotation_the_keychain_refuses_leaves_what_it_holds_said` (a refused rotated token: a kept sign-in reads not kept, an earlier one stays said), with the test keychain refusing to delete a missing item; Zed `v1.23.2` and `v1.26.2` `delete_credentials` (`gpui_macos`, then `gpui_apple/src/keychain.rs`: `SecItemDelete` succeeds only with `errSecSuccess`; `gpui_windows`: `CredDeleteW` fails on `ERROR_NOT_FOUND`; `gpui_linux`: a missing item returns `Ok`) and `read_credentials` (macOS and Windows return `None` for a missing item) | Pass. The refused write reads not kept, with the keychain empty, and its sign-out says nothing; the refused delete is said at the offered sign-in, the item still in the keychain; a sign-in kept nothing of reads that the next launch reads the earlier one; a refused write over an earlier item deletes it. Before, every refused delete was dropped without a word, so the next launch read the item back and, where the service had not revoked it, signed in with it, an earlier account's included. Checking the first fix against the platforms found that a sign-out with nothing to delete would have been said as a refusal on macOS and Windows: a delete is now done when the key holds no item afterwards |
+| 2026-10-29 | An independent review of the custody change holds | `graph_store` `sign_in::tests`: `a_delete_is_done_when_the_next_launch_reads_nothing`, `a_rotation_the_keychain_refuses_leaves_what_it_holds_said` (now refreshing, checked by the service taking the token), `a_grant_the_service_ended_says_what_the_keychain_kept`, `a_refresh_that_answers_after_its_sign_out_keeps_nothing`; `studio` `a_server_that_offers_a_sign_in_says_where_and_as_whom` (Not admitted over an earlier item) | Pass. Taken: the rotation test passed without refreshing, as an ended access token counts as fresh for a second; a read that failed counted as an item left, where a launch reads nothing, so a Linux keychain without a Secret Service would have said a refusal at every sign-in and sign-out; an ended grant dropped a refused delete; Not admitted did not say an earlier item; a sign-out's answer came after its revocation and was matched by the service alone, so it could land on a later sign-out, and a refresh running across a sign-out wrote its rotated token after it began. Not taken: a refused rotation reads not kept although the key holds this account's token from before, which a service that keeps old refresh tokens valid would honour at the next launch, for the same account |
+| 2026-10-29 | A second independent review of the custody change holds | `graph_store` `sign_in::tests`: `a_refresh_that_answers_after_its_sign_out_keeps_nothing` (extended: the sign-out revokes the rotated token), `a_sign_in_made_during_a_sign_out_reaches_the_keychain_after_it` (a delete held open; fails without the turn, checked by removing it), `a_server_that_offers_sign_in_is_signed_in_through_the_browser` (extended: an item left survives a sign-in begun and cancelled), `a_grant_the_service_ended_says_what_the_keychain_kept`; `studio` `a_server_that_offers_a_sign_in_says_where_and_as_whom` (an item left, said while a sign-in is offered) | Pass. Taken: a refresh answered after its sign-out kept nothing, but so held no rotated token, and the sign-out revoked the retired one, leaving the live token valid; an item left was said only in a message, which a sign-in begun and given up, or failed, replaced; the turn had no test; the sign-in-not-answering status did not say an item left. Stated rather than changed: an unreadable keychain counts as holding nothing |
+| 2026-10-29 | A third independent review of the custody change holds | `graph_store` `sign_in::tests::a_sign_in_made_during_a_sign_out_reaches_the_keychain_after_it` (rewritten: a sign-in cancelled while its turn waits revokes its token; one let through holds its own token, compared exactly), `a_server_that_offers_sign_in_is_signed_in_through_the_browser` (an unkept sign-out leaves nothing said, now checked where it is kept); `studio` `a_server_that_offers_a_sign_in_says_where_and_as_whom` (what was kept, said while the server is unreachable) | Pass. Taken: what a held sign-in kept was read only while it showed signed in, so after Not admitted a sign-in begun and given up lost it; the status said it only in sign-in states; a sign-in cancelled while its keychain work waited dropped a refresh token the service honours; a sign-in took its turn when it began, and turns did not chain; a launch's read took none; two tests checked less than they claimed; this log held the 2026-10-29 second-review row twice |
+| 2026-10-29 | A fourth independent review of the custody change finds the queue and the revocation guard sound | `graph_store` `sign_in::tests::a_server_that_offers_sign_in_is_signed_in_through_the_browser` (extended: the CLI's credential replaces a sign-in whose token the keychain does not hold, over an earlier item) | Pass. It found no defect in the queue, `Unclaimed`, `kept_behind` or the status, and checked that turns resolve, the queue keeps about two links, and the ordering tests fail without their fixes. Taken: a sign-in dropped for the CLI's credential lost an earlier item's warning and left its refresh token, which the keychain did not hold, unrevoked; the guard was made a tick after the exchange, so a cancel in between dropped the tokens; a launch read that found nothing left an item said. Not taken, as before this change and needing an unlikely race: a late answer from a sign-in already replaced is not told from the current one's |
+| 2026-10-29 | The two items left open are closed | `graph_store` `sign_in::tests::a_rotation_the_keychain_refuses_leaves_what_it_holds_said` (extended: a refused rotation forgets the token from before, and says one the keychain will not delete), `connection::tests::a_token_answered_after_its_source_was_replaced_is_not_taken`, `a_connect_whose_source_was_replaced_asks_the_new_one` | Pass. A refused rotation left this account's token from before in the keychain while saying the sign-in lasts until Studio quits; a service that keeps old refresh tokens honoured would have signed the next launch in with it. It is forgotten now, as a sign-in that keeps nothing forgets. A token source's answer was taken whatever source the connection had come to take its token from: a Refresh or renewal under way at a sign-out could put the signed-out token back. An answer is now taken only from the source still in use, and a connect that waited on a source replaced meanwhile asks the one now in use, which may give the token already held and so start no connect of its own |
+| 2026-10-29 | A fifth independent review, of the last three commits | `graph_store` `connection::tests::a_connect_whose_source_was_replaced_asks_the_new_one` (extended: a window waiting after a Cancel), `sign_in::tests::a_sign_in_dropped_during_a_refresh_is_decided_after_it` | Pass. It found no answer of the source in use dropped, no double revocation and no guard held across an await. Taken: a connect's answer dropped for a replaced source, the connection idle after a Cancel, left a waiting window without its token; a sign-in dropped for the CLI's credential was judged before a refresh under way settled, so a token it rotated could be left with nobody; a sign-in given up while it waited for the one it replaced could lose that one's revocation. Endings now run on their own once begun |
+| 2026-10-29 | A sixth independent review, of the endings commit | `graph_store` `sign_in::tests::a_refresh_that_answers_after_its_sign_out_keeps_nothing` (extended: the sign-in reads not kept), `connection::tests::a_connect_whose_source_was_replaced_asks_the_new_one` (extended: the target made anonymous while a window waits) | Pass. It found no defect in that commit. Taken, from its edges: a refresh answered after its sign-in ended still said the keychain held the sign-in, so an ending deciding by that (the CLI's credential) could leave the rotated token unrevoked; a window waiting for a source's answer did not hear the token was ready when the source went |
+| 2026-10-29 | Studio's metadata document follows the draft and the clients that use it | draft-ietf-oauth-client-id-metadata-document (July 2026) §3 (URL rules), §4 (`client_id` equal to the fetched URL, served 200 as JSON), §4.2 (exact redirect match), §5 (no redirect followed); the documents Claude Code and VS Code publish; `graph_store` `sign_in::tests::studio_s_client_id_is_a_metadata_document_url` | The URL is `https` with a path and no query or fragment, on `www.` since the apex redirects. §4.2 asks for an exact redirect match while Studio's port changes at each sign-in; Claude Code lists `http://127.0.0.1/callback` without a port too, so a sign-in through AuthKit on a free port is the check that remains (open question 2) |
+| 2026-10-29 | The managed control plane's AuthKit takes Studio's metadata document on any loopback port | `creative-fruit-62.authkit.app/.well-known/oauth-authorization-server`; its `/oauth2/authorize` with Studio's client ID, PKCE S256, `scope=offline_access` and `redirect_uri` `http://127.0.0.1:54321/callback`, then port 61987, then the path `/elsewhere`, then `http://localhost:54321/callback`, then with a `resource`; the document served by omnigraph.dev | The metadata says `client_id_metadata_document_supported: true`, S256, scopes `offline_access` among four, and no `revocation_endpoint`. Both ports reach the sign-in page; the other path and `localhost` get `invalid_redirect_uri`, so the document is read. With no resource indicators configured a `resource` is accepted and, by WorkOS's documentation, ignored, so the token's audience is the environment's and Studio refuses it until the control plane registers the cluster's resource. The document is served 200 as `application/json`, its `client_id` its own URL |
 
 ## Corrections
 

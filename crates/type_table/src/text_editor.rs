@@ -18,8 +18,8 @@ use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use serde_json::{Value, json};
 use studio_actions::node::SaveText;
 use studio_workspace::{Item, ItemEvent, SavedItem};
+use ui::Tooltip;
 use ui::prelude::*;
-use ui::{Tooltip};
 
 use crate::model::{Notice, SaveResult, Tone, edited, node_label, node_rows};
 

@@ -185,7 +185,9 @@ schema, the agent skill's `upstream/`).
 
 ## Upgrade drills
 
-None yet.
+| Date | From → to | Breaks | Time | What it took |
+|---|---|---|---|---|
+| 2026-10-29 | `v1.23.2` → `v1.26.2` (`c4273271`), Rust 1.98.1 at both | 4 compile errors, all the scroll event's rename; 1 stale profile entry | About 2 hours, most of it the first build | Zed's 20 entries and its patches (`async-task` from Zed's fork, `calloop` at a rev, `khronos-egl` added); `deny.toml` allows `zed-industries/async-task`, `khronos-egl`, `oo7` and `gfx-rs/wgpu`, and no longer `smol-rs/async-task` or `proptest-rs/proptest`. `wgpu` 30 needed the lock's wasm-bindgen family and `cfg_aliases` moved together, one `cargo update` over all of them; `zstd` 0.11 left the graph. `ScrollWheelEvent` is `ScrollEvent`, `PlatformInput::ScrollWheel` is `Scroll` and `on_scroll_wheel` is `on_scroll` (10 sites, 4 files; the two simulated wheels give their `source`); `util_macros` left Zed, so its `[profile.dev.package]` entry matched nothing. Copied files compared: `context_menu` adds only a `spacing` option for `ListItem` rows, which `menu.rs` draws as `MenuRow`; `pane` only the rename; `data_table`, `pane_group`, `command_palette` and `action_completion_provider` unchanged; `git_graph`'s lane assignment unchanged. Checked: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (1,071 passed), the layer, design-token, brand and release-file scripts, `cargo deny check` (all ok). `type_table`'s frame instrument (200 rows, 20 columns, the grid cached) went from 9.72, 9.64 and 9.61 ms a frame to 9.53, 9.60 and 9.50 |
 
 ## Corrections
 

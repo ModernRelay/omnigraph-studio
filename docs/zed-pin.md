@@ -4,8 +4,8 @@ Studio depends on Zed's crates from git, all at one release tag (constitution XI
 are not published to crates.io, and Zed's main branch changes daily, so the pin moves only on
 purpose.
 
-**Current pin:** `v1.23.2` (commit `c0199504b9cce79bc27524950022ed701bc3ebd5`, released
-2026-10-07). Rust `1.98.1`, Zed's toolchain at that tag.
+**Current pin:** `v1.26.2` (commit `c4273271092b0287f7d181f616bd5171e0a2f70c`, released
+2026-10-28). Rust `1.98.1`, Zed's toolchain at that tag.
 
 ## What Studio takes from Zed
 
