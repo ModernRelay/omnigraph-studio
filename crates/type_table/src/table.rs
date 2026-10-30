@@ -117,8 +117,8 @@ struct FilterDraft {
     _suggest_task: Option<Task<()>>,
 }
 
-/// The sentence field's state (spec 019): open for typing, with what the last answer could not
-/// use; waiting for the person to allow the task; calling; or failed, with why.
+/// The sentence field's state (spec 019): idle, with what the last answer could not use;
+/// calling; or failed, with why.
 enum WordsState {
     Typing(Option<String>),
     Running { _call: Task<()> },
@@ -519,10 +519,10 @@ pub struct TypeTable {
     toolbar_menus: [PopoverMenuHandle<ContextMenu>; 4],
     filter_draft: Option<FilterDraft>,
     filter_editor: Entity<Editor>,
-    /// Filter in words (spec 019): the sentence field, what its call is doing, and the filters
-    /// its last answer made, which the next answer replaces.
+    /// Filter in words (spec 019): the toolbar's sentence field, what its call is doing, and
+    /// the filters its last answer made, which the next answer replaces.
     words_editor: Entity<Editor>,
-    words: Option<WordsState>,
+    words: WordsState,
     words_made: Vec<Filter>,
     /// Fill a column (spec 019): the instruction field and the fill under way, in the bulk bar.
     fill_editor: Entity<Editor>,
@@ -750,11 +750,7 @@ impl TypeTable {
         });
         let words_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text(
-                "Filter in words, for example dinners last month",
-                window,
-                cx,
-            );
+            editor.set_placeholder_text("Filter in words…", window, cx);
             editor.set_text_style_refinement(studio_ui::ds::field_text(cx));
             editor
         });
@@ -843,7 +839,7 @@ impl TypeTable {
             filter_draft: None,
             filter_editor,
             words_editor,
-            words: None,
+            words: WordsState::Typing(None),
             words_made: Vec::new(),
             fill_editor,
             fill: None,
@@ -5235,7 +5231,7 @@ impl TypeTable {
     }
 
     fn confirm_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.words.is_some() && self.words_editor.focus_handle(cx).is_focused(window) {
+        if self.words_editor.focus_handle(cx).is_focused(window) {
             self.run_words(cx);
             return;
         }
@@ -6414,9 +6410,12 @@ impl TypeTable {
     // ---- actions ----
 
     fn on_cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
-        // Esc closes the sentence field; a call under way is dropped with it, and the filters
-        // it made stay as pills.
-        if self.words.take().is_some() {
+        // Esc leaves the sentence field and clears what it said; a call under way is dropped,
+        // and the filters it made stay as pills.
+        if self.words_editor.focus_handle(cx).is_focused(window)
+            || !matches!(self.words, WordsState::Typing(None))
+        {
+            self.words = WordsState::Typing(None);
             window.focus(&self.focus_handle, cx);
             cx.notify();
             return;
@@ -6967,9 +6966,6 @@ impl TypeTable {
     // ---- filter in words (spec 019) ----
 
     fn open_words(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.words.is_none() {
-            self.words = Some(WordsState::Typing(None));
-        }
         window.focus(&self.words_editor.focus_handle(cx), cx);
         cx.notify();
     }
@@ -6990,11 +6986,11 @@ impl TypeTable {
     /// ↵ in the sentence field: the sentence goes to the model, once the task is allowed.
     fn run_words(&mut self, cx: &mut Context<Self>) {
         let sentence = self.words_editor.read(cx).text(cx).trim().to_owned();
-        if sentence.is_empty() || matches!(self.words, Some(WordsState::Running { .. })) {
+        if sentence.is_empty() || matches!(self.words, WordsState::Running { .. }) {
             return;
         }
         let Some(models) = Models::try_global(cx) else {
-            self.words = Some(WordsState::Failed(ModelError::NoKey.to_string()));
+            self.words = WordsState::Failed(ModelError::NoKey.to_string());
             cx.notify();
             return;
         };
@@ -7024,41 +7020,46 @@ impl TypeTable {
                         this.filters.extend(filters);
                         let note = (!refused.is_empty())
                             .then(|| format!("Could not use: {}", refused.join("; ")));
-                        this.words = Some(WordsState::Typing(note));
+                        this.words = WordsState::Typing(note);
                         this.reload(true, cx);
                     }
-                    Err(error) => this.words = Some(WordsState::Failed(error.to_string())),
+                    Err(error) => this.words = WordsState::Failed(error.to_string()),
                 }
                 cx.notify();
             })
             .ok();
         });
-        self.words = Some(WordsState::Running { _call: task });
+        self.words = WordsState::Running { _call: task };
         cx.notify();
     }
 
-    /// The sentence field in the filter bar, with what its call is doing beside it.
-    fn render_words(&self, state: &WordsState, cx: &mut Context<Self>) -> AnyElement {
-        let running = matches!(state, WordsState::Running { .. });
-        let failed = matches!(state, WordsState::Failed(_));
-        let mut row = h_flex().gap(px(space::SM)).items_center().child(
-            studio_ui::ds::field_frame(failed, cx)
-                .key_context("FilterWords")
-                .w(px(studio_ui::ds::size::FIELD_WIDE))
-                .child(studio_ui::ds::icon::meta(IconName::ZedAssistant))
-                .child(studio_ui::ds::field_input(self.words_editor.clone()))
-                .when(running, |field| field.child(studio_ui::ds::spinner())),
-        );
-        match state {
-            WordsState::Typing(Some(note)) => {
-                row = row.child(studio_ui::ds::text::muted(note.clone()));
-            }
-            WordsState::Failed(why) => {
-                row = row.child(studio_ui::ds::text::error(why.clone()));
-            }
-            _ => {}
-        }
-        row.into_any_element()
+    /// The toolbar's sentence field (spec 019): a search field with the model's mark, its
+    /// spinner while the call is out, and the field's red line when the call failed; the
+    /// answer's filters are the bar's pills. ↵ asks, Esc leaves.
+    fn render_words_field(&self, cx: &mut Context<Self>) -> AnyElement {
+        let running = matches!(self.words, WordsState::Running { .. });
+        let failed = matches!(self.words, WordsState::Failed(_));
+        let about = match &self.words {
+            WordsState::Failed(why) => why.clone(),
+            _ => format!(
+                "Filter in words (↵): {} go to {}",
+                words::TASK.sends,
+                Models::model_for(words::TASK.tier, cx)
+            ),
+        };
+        studio_ui::ds::field_frame(failed, cx)
+            .id("filter-words")
+            .key_context("FilterWords")
+            .w(px(studio_ui::ds::size::FIELD_WIDE))
+            .tooltip(Tooltip::text(about))
+            .child(
+                Icon::new(IconName::ZedAssistant)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(studio_ui::ds::field_input(self.words_editor.clone()))
+            .when(running, |field| field.child(studio_ui::ds::spinner()))
+            .into_any_element()
     }
 
     fn filter_by_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -7210,6 +7211,7 @@ impl TypeTable {
                 )
             })
             .child(div().flex_1())
+            .child(self.render_words_field(cx))
             .child(
                 // The controls as chips (spec 002, "Control chips"): each set one says what it
                 // is set to and clears with its ×.
@@ -7267,7 +7269,12 @@ impl TypeTable {
     }
 
     fn render_filter_bar(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.filters.is_empty() && self.filter_draft.is_none() && self.words.is_none() {
+        let words_note = match &self.words {
+            WordsState::Typing(Some(note)) => Some(studio_ui::ds::text::muted(note.clone())),
+            WordsState::Failed(why) => Some(studio_ui::ds::text::error(why.clone())),
+            _ => None,
+        };
+        if self.filters.is_empty() && self.filter_draft.is_none() && words_note.is_none() {
             return None;
         }
         let editor_bg = studio_ui::ds::surface::document(cx);
@@ -7463,9 +7470,7 @@ impl TypeTable {
                 .child(pill)
                 .children(draft.error.clone().map(studio_ui::ds::text::error));
         }
-        if let Some(state) = &self.words {
-            bar = bar.child(self.render_words(state, cx));
-        }
+        bar = bar.children(words_note);
         if !self.filters.is_empty() {
             bar = bar.child(div().flex_1()).child(
                 studio_ui::ds::button("clear-filters", "Clear all")

@@ -210,16 +210,15 @@ impl Models {
 
     /// The model the settings name for a tier, or the tier's default when they name none.
     pub fn model_for(tier: Tier, cx: &App) -> String {
-        let settings = &StudioSettings::get(cx).models;
-        let named = match tier {
-            Tier::Fast => &settings.fast,
-            Tier::Careful => &settings.careful,
-        };
-        if named.trim().is_empty() {
-            tier.default_model().to_owned()
-        } else {
-            named.clone()
-        }
+        // Settings not set up (a view's test): the tier's default.
+        let named = cx
+            .try_global::<StudioSettings>()
+            .map(|settings| match tier {
+                Tier::Fast => settings.models.fast.clone(),
+                Tier::Careful => settings.models.careful.clone(),
+            })
+            .filter(|named| !named.trim().is_empty());
+        named.unwrap_or_else(|| tier.default_model().to_owned())
     }
 
     /// Asks the task's model for `request`'s answer, off the main thread. Dropping the task

@@ -231,9 +231,11 @@ filter box, since the key is the person's own and the settings row already says 
 
 ### First uses
 
-**Table filter from a sentence** (`type_table`). The table's filter bar gets a text field,
-"Filter in words…" (`studio_table::FilterInWords`, ⌘⇧F; the pill bar's + menu offers it). Enter
-calls `table-filter` (Fast; 8 KB in, 300 tokens out, 10 s) with the type's property names and
+**Table filter from a sentence** (`type_table`). The table's toolbar holds a search field,
+"Filter in words…", always shown, before the control chips: the design system's field frame
+with the model's mark where the search field has its glass, its spinner while a call is out,
+and its red line when one failed, with why in its tooltip (`studio_table::FilterInWords`,
+⌘⇧F, puts the cursor in it). Enter calls `table-filter` (Fast; 8 KB in, 300 tokens out, 10 s) with the type's property names and
 value types, its enums' values, its relationship keys (`relationship_key`), the 16 operators
 with one line each on what they take, today's date, and the sentence. The schema is built per
 type: `property` an enum of the type's keys, `op` an enum of the operators, `value` a list of
@@ -241,7 +243,7 @@ strings. The answer's filters go through `builder::build`'s checks; any it refus
 and the bar says "Could not use: {property}". The rest become pills as if added by hand, so
 they are seen and removable, and the table reads as it does for any filter. A second sentence
 replaces the filters the first made and keeps ones added by hand. Measured: 1.5–2.8 s on
-Haiku with every answer right; the field shows its spinner meanwhile and Escape cancels.
+Haiku with every answer right; Escape leaves the field and clears what it said.
 The Fill button's tooltip and the Summarize button's name what goes out and to which model.
 
 **Branch summary** (`review`). A **Summarize** button beside the review's sentence
