@@ -169,6 +169,9 @@ pub struct Connection {
     /// changed target, for a renewal), what for, and which source: one replaced since is not
     /// answered ([`Connection::asking`]).
     _asking: Option<(Ask, Arc<dyn TokenSource>, Task<()>)>,
+    /// Asks for the next token when a request finds the one held ended
+    /// ([`GraphClient::token_ended`]), from the first connect on.
+    _ended: Option<Task<()>>,
     _task: Option<Task<()>>,
     /// The graph list read again after it could not be read ([`Connection::list_graphs_again`]).
     _listing: Option<Task<()>>,
@@ -409,6 +412,7 @@ impl Connection {
             token_answered: false,
             hurry: Arc::default(),
             _asking: None,
+            _ended: None,
             _task: None,
             _listing: None,
             _health_check: None,
@@ -739,12 +743,17 @@ impl Connection {
         self.token_unanswered = false;
         if renewal {
             self.client.renew_token(token.into_string());
+            self.client
+                .set_token_ends(self.lease.as_ref().map(|lease| lease.expires_at));
             cx.emit(ConnectionEvent::StateChanged);
             cx.notify();
             return;
         }
         self.has_token = true;
         let changed = self.client.set_token(Some(token.into_string()));
+        // A request that would send it after then waits for the next, which this asks for.
+        self.client
+            .set_token_ends(self.lease.as_ref().map(|lease| lease.expires_at));
         if changed {
             if ask == Ask::AfterRefusal {
                 self.read_refused_under = Some(self.client.credential_changes());
@@ -1010,6 +1019,7 @@ impl Connection {
 
     /// Checks health and contract, then reads the graph list.
     pub fn connect(&mut self, cx: &mut Context<Self>) {
+        self.listen_for_ended_tokens(cx);
         self.state = ConnectionState::Connecting;
         // The probe reads the list itself.
         self._listing = None;
@@ -1053,6 +1063,36 @@ impl Connection {
             })
             .ok();
         }));
+    }
+
+    /// From the first connect on, asks for the next token when a request finds the one held
+    /// ended ([`Self::token_ended`]).
+    fn listen_for_ended_tokens(&mut self, cx: &mut Context<Self>) {
+        if self._ended.is_some() {
+            return;
+        }
+        let ended = self.client.token_ended();
+        self._ended = Some(cx.spawn(async move |this, cx| {
+            while ended.recv().await.is_ok() {
+                if this.update(cx, |this, cx| this.token_ended(cx)).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// A request found the token held ended, as after the machine slept past its renewal: the
+    /// source is asked for the next, which the request waits for, unless an ask is under way,
+    /// whose answer it takes.
+    fn token_ended(&mut self, cx: &mut Context<Self>) {
+        if self.asking().is_none()
+            && self
+                .lease
+                .as_ref()
+                .is_some_and(|lease| SystemTime::now() >= lease.expires_at)
+        {
+            self.ask_for_token(Ask::Renewal, cx);
+        }
     }
 
     /// The CLI profile whose managed data token this server's token is, when it is one
@@ -3110,6 +3150,47 @@ mod tests {
             assert_eq!(connection.state, ConnectionState::Unauthorized);
             assert_eq!(connection.sign_in, SignIn::NotOffered);
         });
+    }
+
+    /// A request that finds the token held ended (the machine slept past its renewal and its
+    /// end) has the source asked for the next, waits for it, and goes with it. Before, the ended
+    /// token was sent and refused, and a write had to be sent again.
+    #[gpui::test]
+    async fn a_request_with_an_ended_token_waits_for_the_next(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let source = Arc::new(Scripted::default());
+        let connection = sourced(source.clone(), cx);
+        let _watch = connection.update(cx, |connection, cx| {
+            connection.connect(cx);
+            connection.watch(cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(source.asked.load(Ordering::SeqCst), 1);
+        // The machine slept past the token's end.
+        let client = connection.update(cx, |connection, _| {
+            let ended = SystemTime::now() - Duration::from_secs(1);
+            connection.lease.as_mut().unwrap().expires_at = ended;
+            connection.client.set_token_ends(Some(ended));
+            connection.client.clone()
+        });
+        let request = std::thread::spawn(move || smol::block_on(client.graphs()).is_ok());
+        for _ in 0..400 {
+            cx.run_until_parked();
+            if request.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            request.is_finished(),
+            "the request waited for the next token"
+        );
+        assert!(request.join().unwrap());
+        assert_eq!(
+            source.asked.load(Ordering::SeqCst),
+            2,
+            "the next token asked for"
+        );
     }
 
     /// A renewal the source cannot answer now leaves the token held in use, unsaid: the

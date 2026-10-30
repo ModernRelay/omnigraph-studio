@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use futures::AsyncReadExt;
 use http_client::http::{HeaderMap, HeaderValue, Method, Request, StatusCode};
@@ -35,6 +35,11 @@ const READ_RETRIES: usize = 2;
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// The wait when a 429 names none.
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
+/// How long a request whose token ended waits for the next before it sends what it holds: a
+/// sign-in's refresh (15 seconds) and its one retry after 5.
+const ENDED_TOKEN_WAIT: Duration = Duration::from_secs(25);
+/// How often a request waiting for the next token looks for it.
+const ENDED_TOKEN_LOOK: Duration = Duration::from_millis(50);
 /// How many reads one connection has on the wire at once (spec 003). A server admits a bounded
 /// number of reads across all its clients (it refuses past its read ingress cap, 64 by
 /// default), so a view that asks for many counts at once queues here rather than being refused
@@ -473,6 +478,13 @@ pub struct GraphClient {
     /// Shared by every clone, as the connection's one token: a token replaced after the server
     /// refused the old one reaches every holder, a running agent's gateway among them.
     token: Arc<std::sync::RwLock<Option<Arc<str>>>>,
+    /// When the token held stops being accepted, as the lease it came with says
+    /// ([`Self::set_token_ends`]); `None` for one that does not end, or not known to. Shared by
+    /// every clone, as the token is.
+    token_ends: Arc<std::sync::RwLock<Option<SystemTime>>>,
+    /// Told each time a request finds the token held ended ([`Self::token_ended`]). Shared by
+    /// every clone.
+    ended: (smol::channel::Sender<()>, smol::channel::Receiver<()>),
     /// Shared by every clone, as the token is: a target whose transport changed is reached
     /// through the new one by every holder ([`Self::set_http`]).
     http: Arc<std::sync::RwLock<Arc<dyn HttpClient>>>,
@@ -526,6 +538,8 @@ impl GraphClient {
         Ok(Self {
             base,
             token: Arc::new(std::sync::RwLock::new(token.map(Into::into))),
+            token_ends: Arc::default(),
+            ended: smol::channel::bounded(1),
             http: Arc::new(std::sync::RwLock::new(http)),
             read_slots: Arc::new(smol::lock::Semaphore::new(READ_CONCURRENCY)),
             credential_changes: Arc::default(),
@@ -647,6 +661,7 @@ impl GraphClient {
             return false;
         }
         *held = token;
+        self.set_token_ends(None);
         self.credential_changes
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         true
@@ -660,6 +675,46 @@ impl GraphClient {
             .token
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(token.into());
+        self.set_token_ends(None);
+    }
+
+    /// When the token held stops being accepted, as the lease it came with says; `None` for one
+    /// that does not end, or not known to. A token set or renewed is not known to end until this
+    /// says so. A request that would send it after then waits for the next
+    /// ([`Self::token_ended`]).
+    pub fn set_token_ends(&self, ends: Option<SystemTime>) {
+        *self
+            .token_ends
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ends;
+    }
+
+    /// Told each time a request finds the token held ended, as when the machine slept past its
+    /// renewal: the holder asks for the next, which the request waits for, a while
+    /// ([`ENDED_TOKEN_WAIT`]), before it sends what it holds.
+    pub fn token_ended(&self) -> smol::channel::Receiver<()> {
+        self.ended.1.clone()
+    }
+
+    /// Whether the token held has ended, as its lease says.
+    fn holds_ended_token(&self) -> bool {
+        self.token().is_some()
+            && self
+                .token_ends
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some_and(|ends| SystemTime::now() >= ends)
+    }
+
+    /// Waits, while the token held has ended and for at most [`ENDED_TOKEN_WAIT`], for the
+    /// next, telling the holder ([`Self::token_ended`]); a request then carries whatever it
+    /// holds, which a server that refuses it says so as before.
+    async fn fresh_token(&self) {
+        let until = Instant::now() + ENDED_TOKEN_WAIT;
+        while self.holds_ended_token() && Instant::now() < until {
+            self.ended.0.try_send(()).ok();
+            smol::Timer::after(ENDED_TOKEN_LOOK).await;
+        }
     }
 
     fn token(&self) -> Option<Arc<str>> {
@@ -720,6 +775,7 @@ impl GraphClient {
         timeout: Duration,
         limit: BodyLimit,
     ) -> Result<RawResponse, String> {
+        self.fresh_token().await;
         let mut builder = self.request(method, &url).timeout(timeout);
         // A body is JSON unless the caller names its type: a Blob put's is raw bytes.
         if body.is_some()
@@ -1094,6 +1150,7 @@ impl GraphClient {
         {
             return Err(format!("refused path {:?}", request.path_and_query));
         }
+        self.fresh_token().await;
         let mut builder = self.request(request.method, &url);
         for (name, value) in &request.headers {
             builder = builder.header(name.as_str(), value.as_str());
@@ -2125,6 +2182,59 @@ mod tests {
         .unwrap();
         block_on(gateway.schema("g")).ok();
         assert_eq!(*sent.lock().unwrap(), ["Bearer new", "Bearer new"]);
+    }
+
+    /// A request that would send a token its lease says has ended waits for the next, telling
+    /// the token's holder to ask for it, and carries the next; a token not known to end is sent
+    /// as it is. Before, the ended token was sent, and refused, after the machine slept past its
+    /// renewal.
+    #[test]
+    fn a_request_waits_for_the_next_token_once_the_one_held_ended() {
+        let sent: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let log = sent.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let log = log.clone();
+            async move {
+                let token = request
+                    .headers()
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
+                log.lock().unwrap().push(token);
+                Ok(Response::builder()
+                    .status(200)
+                    .header(CONTRACT_HEADER, CONTRACT)
+                    .body(AsyncBody::from("{}"))
+                    .unwrap())
+            }
+        });
+        let held = client(http);
+        held.set_token_ends(Some(SystemTime::now() - Duration::from_secs(1)));
+        let ended = held.token_ended();
+        let holder = held.clone();
+        // The holder, told, renews; not told within a while, it does nothing.
+        let renewed = std::thread::spawn(move || {
+            let told = block_on(smol::future::or(
+                async { ended.recv().await.is_ok() },
+                async {
+                    smol::Timer::after(Duration::from_secs(5)).await;
+                    false
+                },
+            ));
+            if told {
+                holder.renew_token("next".into());
+                holder.set_token_ends(Some(SystemTime::now() + Duration::from_secs(300)));
+            }
+        });
+        block_on(held.schema("g")).ok();
+        renewed.join().unwrap();
+        assert_eq!(*sent.lock().unwrap(), ["Bearer next"]);
+
+        // A token not known to end is sent at once.
+        held.set_token(Some("typed".into()));
+        block_on(held.schema("g")).ok();
+        assert_eq!(sent.lock().unwrap().last().unwrap(), "Bearer typed");
     }
 
     /// An HTTP client replaced on the client, as when the CLI target's certificate authority
