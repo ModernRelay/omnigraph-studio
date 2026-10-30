@@ -7047,8 +7047,7 @@ impl TypeTable {
                 Models::model_for(words::TASK.tier, cx)
             ),
         };
-        studio_ui::ds::field_frame(failed, cx)
-            .id("filter-words")
+        studio_ui::ds::pill_field("filter-words", failed, cx)
             .key_context("FilterWords")
             .w(px(studio_ui::ds::size::FIELD_WIDE))
             .tooltip(Tooltip::text(about))

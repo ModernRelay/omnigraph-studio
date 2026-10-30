@@ -232,8 +232,8 @@ filter box, since the key is the person's own and the settings row already says 
 ### First uses
 
 **Table filter from a sentence** (`type_table`). The table's toolbar holds a search field,
-"Filter in words…", always shown, before the control chips: the design system's field frame
-with the model's mark where the search field has its glass, its spinner while a call is out,
+"Filter in words…", always shown, before the control chips: a pill on the chips' height
+(`ds::pill_field`) with the model's mark where the search field has its glass, its spinner while a call is out,
 and its red line when one failed, with why in its tooltip (`studio_table::FilterInWords`,
 ⌘⇧F, puts the cursor in it). Enter calls `table-filter` (Fast; 8 KB in, 300 tokens out, 10 s) with the type's property names and
 value types, its enums' values, its relationship keys (`relationship_key`), the 16 operators

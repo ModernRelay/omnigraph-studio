@@ -1885,6 +1885,24 @@ fn pill_frame(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
         .overflow_hidden()
 }
 
+/// A text field in a toolbar, on a chip's height: a pill holding an icon and its editor, so
+/// it sits level with the control chips beside it; invalid, it has the field's red ring in
+/// place of its shadow.
+pub fn pill_field(id: impl Into<ElementId>, invalid: bool, cx: &App) -> Stateful<Div> {
+    pill_frame(id, cx)
+        .px(px(space::CONTROL_INSET))
+        .gap(px(space::SM))
+        .when(invalid, |pill| {
+            pill.shadow(vec![gpui::BoxShadow {
+                color: surface::error_border(cx),
+                offset: gpui::point(px(0.), px(0.)),
+                blur_radius: px(0.),
+                spread_radius: px(size::HAIRLINE),
+                inset: false,
+            }])
+        })
+}
+
 /// The hairline between a pill's segments, the pill's full height: a filter's, a toolbar
 /// chip's, and the filter being written.
 pub fn pill_rule(cx: &App) -> Div {
