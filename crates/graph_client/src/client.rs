@@ -475,6 +475,61 @@ pub enum FeedAt<'a> {
     Page(&'a str),
 }
 
+/// The server's transport, which a changed target replaces ([`GraphClient::set_http`]): a client
+/// that sends each request through the one current when it is sent, so everything holding it
+/// moves to a new one together, and a request under way finishes through the one it began with.
+struct Transport(std::sync::RwLock<Arc<dyn HttpClient>>);
+
+impl Transport {
+    fn current(&self) -> Arc<dyn HttpClient> {
+        self.0
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+impl HttpClient for Transport {
+    // Nothing reads these of the server's transport: each transport puts its own agent and proxy
+    // on what it sends.
+    fn user_agent(&self) -> Option<&HeaderValue> {
+        None
+    }
+
+    fn proxy(&self) -> Option<&http_client::Url> {
+        None
+    }
+
+    fn send(
+        &self,
+        request: Request<AsyncBody>,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<http_client::Response<AsyncBody>>> {
+        self.current().send(request)
+    }
+}
+
+/// What a retired client's requests go through ([`GraphClient::retire`]): each fails with why,
+/// and nothing is sent.
+struct Retired(String);
+
+impl HttpClient for Retired {
+    fn user_agent(&self) -> Option<&HeaderValue> {
+        None
+    }
+
+    fn proxy(&self) -> Option<&http_client::Url> {
+        None
+    }
+
+    fn send(
+        &self,
+        _: Request<AsyncBody>,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<http_client::Response<AsyncBody>>> {
+        let why = self.0.clone();
+        Box::pin(async move { Err(anyhow::anyhow!(why)) })
+    }
+}
+
 /// The token a client holds, and when it stops being accepted, as the lease it came with says
 /// ([`GraphClient::set_token_ending`]): one lock, so no request reads one without the other.
 #[derive(Default)]
@@ -504,9 +559,13 @@ pub struct GraphClient {
     /// waits on the channel current when it looked, which a change replaces, closing it
     /// ([`Self::wake_waits`]). Shared by every clone.
     waits: Arc<std::sync::Mutex<(smol::channel::Sender<()>, smol::channel::Receiver<()>)>>,
-    /// Shared by every clone, as the token is: a target whose transport changed is reached
-    /// through the new one by every holder ([`Self::set_http`]).
-    http: Arc<std::sync::RwLock<Arc<dyn HttpClient>>>,
+    /// The server's transport, one for every clone and for whatever else reaches the server's
+    /// address ([`Self::transport`]): a target whose transport changed is reached through the
+    /// new one by every holder ([`Self::set_http`]).
+    http: Arc<Transport>,
+    /// Why the client was stopped for good ([`Self::retire`]): no request is sent after.
+    /// Shared by every clone.
+    retired: Arc<std::sync::OnceLock<String>>,
     /// Shared by every clone, so the bound holds for the whole connection.
     read_slots: Arc<smol::lock::Semaphore>,
     /// How often the token was replaced by another ([`Self::credential_changes`]), and how often
@@ -564,7 +623,8 @@ impl GraphClient {
             waits_begun: Arc::default(),
             waits_released: Arc::default(),
             waits: Arc::new(std::sync::Mutex::new(smol::channel::bounded(1))),
-            http: Arc::new(std::sync::RwLock::new(http)),
+            http: Arc::new(Transport(std::sync::RwLock::new(http))),
+            retired: Arc::default(),
             read_slots: Arc::new(smol::lock::Semaphore::new(READ_CONCURRENCY)),
             credential_changes: Arc::default(),
             refusals: Arc::default(),
@@ -572,7 +632,7 @@ impl GraphClient {
     }
 
     /// A count that moves whenever the token is replaced by another, or the transport it is sent
-    /// through ([`Self::set_http`]): everything read with the old one, and what it was allowed to
+    /// through ([`Self::set_http`]), or the client is retired ([`Self::retire`]): everything read with the old one, and what it was allowed to
     /// do, is to be read again with the new, which may see less, or (a new certificate
     /// authority) reach what the old one could not.
     pub fn credential_changes(&self) -> u64 {
@@ -655,25 +715,53 @@ impl GraphClient {
         Ok(response)
     }
 
-    /// The HTTP client requests go through now.
+    /// The HTTP client requests go through now: once the client is retired, one that refuses
+    /// each.
     fn http(&self) -> Arc<dyn HttpClient> {
-        self.http
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        match self.retired.get() {
+            Some(why) => Arc::new(Retired(why.clone())),
+            None => self.http.current(),
+        }
     }
 
-    /// Replaces the HTTP client for this client and every clone of it, as when the CLI target's
-    /// proxy or certificate authority changed; requests sent after this go through it, and one
-    /// under way finishes through the one it started with.
+    /// The server's transport as one client, for requests to the server's address that are not
+    /// this client's (a sign-in's): each goes through the transport current when it is sent
+    /// ([`Self::set_http`]). Retiring the client does not stop them, so a sign-in's last
+    /// revocation still reaches its service.
+    pub fn transport(&self) -> Arc<dyn HttpClient> {
+        self.http.clone()
+    }
+
+    /// Replaces the server's transport for this client, every clone of it and every holder of
+    /// [`Self::transport`], as when the CLI target's proxy or certificate authority changed;
+    /// requests sent after this go through it, and one under way finishes through the one it
+    /// started with.
     pub fn set_http(&self, http: Arc<dyn HttpClient>) {
+        // One that sent through itself would recurse on the next request.
+        assert!(
+            !std::ptr::addr_eq(Arc::as_ptr(&http), Arc::as_ptr(&self.http)),
+            "a transport that sends through itself"
+        );
         *self
             .http
+            .0
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = http;
         // What was read, or failed, through the old transport is read again through this one.
         self.credential_changes
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Stops the client and every clone of it for good, as when its CLI target is gone or names
+    /// a transport Studio cannot use: every request after fails with `why`, and nothing is sent,
+    /// a request waiting for the next token included. What was read is read again, and fails
+    /// so. The first reason given stands.
+    pub fn retire(&self, why: String) {
+        if self.retired.set(why).is_ok() {
+            self.credential_changes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.wake_waits();
+        }
     }
 
     /// Replaces the token for this client and every clone of it; requests sent after this use
@@ -815,7 +903,11 @@ impl GraphClient {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .1
                 .clone();
-            if !self.holds_ended_token() || Instant::now() >= until || released() {
+            if !self.holds_ended_token()
+                || Instant::now() >= until
+                || released()
+                || self.retired.get().is_some()
+            {
                 return;
             }
             let holder = self
@@ -2511,6 +2603,23 @@ mod tests {
         quick("a request after the holder stopped listening", &|| {
             block_on(held.schema("g")).ok();
         });
+
+        // Retired while a request waits for the next token: it stops waiting at once, refused,
+        // and sends nothing.
+        let again = held.token_ended();
+        held.set_token_ends(Some(SystemTime::now()));
+        let before = sent.lock().unwrap().len();
+        let waiting = request(&held);
+        assert!(told_within(&again), "told by the waiting request");
+        let started = Instant::now();
+        held.retire("the target is gone".into());
+        assert!(waiting.join().unwrap().is_none(), "refused");
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(sent.lock().unwrap().len(), before, "nothing sent");
     }
 
     /// Whether the holder was told within five seconds, so a test that stops telling fails
@@ -2574,8 +2683,10 @@ mod tests {
     }
 
     /// An HTTP client replaced on the client, as when the CLI target's certificate authority
-    /// changed, is the one every clone sends through next: none keeps the old trust, and the
-    /// change counts as a credential change, so what was read is read again.
+    /// changed, is the one every clone, and every holder of its transport (a sign-in's requests
+    /// to the server's address), sends through next: none keeps the old trust, and the change
+    /// counts as a credential change, so what was read is read again. A retired client sends
+    /// nothing, while its transport still does, for a sign-in's last revocation.
     #[test]
     fn a_replaced_http_client_reaches_every_clone() {
         let answering = |name: &'static str, seen: Arc<std::sync::Mutex<Vec<&'static str>>>| {
@@ -2593,13 +2704,37 @@ mod tests {
         let seen: Arc<std::sync::Mutex<Vec<&'static str>>> = Arc::default();
         let held = client(answering("old", seen.clone()));
         let gateway = held.clone();
+        let sign_in = held.transport();
+        let to_service = || {
+            let request = Request::builder()
+                .uri("http://127.0.0.1:8787/oauth/token")
+                .body(AsyncBody::empty())
+                .unwrap();
+            block_on(sign_in.send(request)).is_ok()
+        };
         block_on(gateway.schema("g")).ok();
+        assert!(to_service());
         let changes = held.credential_changes();
         held.set_http(answering("new", seen.clone()));
         assert_eq!(gateway.credential_changes(), changes + 1);
         block_on(gateway.schema("g")).ok();
         block_on(held.schema("g")).ok();
-        assert_eq!(*seen.lock().unwrap(), ["old", "new", "new"]);
+        assert!(to_service());
+        assert_eq!(*seen.lock().unwrap(), ["old", "old", "new", "new", "new"]);
+
+        held.retire("the target is gone".into());
+        assert_eq!(gateway.credential_changes(), changes + 2);
+        let refused = block_on(gateway.schema("g")).unwrap_err();
+        assert!(
+            format!("{refused:?}").contains("the target is gone"),
+            "{refused:?}"
+        );
+        assert!(to_service(), "the transport still sends");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            6,
+            "the retired client sent nothing"
+        );
     }
 
     /// Stored queries: the catalog decodes (a kind Studio does not know is `Other`), a read

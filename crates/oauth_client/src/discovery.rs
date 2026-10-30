@@ -40,16 +40,6 @@ impl Clients {
         &self.endpoint
     }
 
-    /// The same clients, with `at_endpoint` for the server's origin: the CLI target's transport
-    /// changed (another proxy or certificate authority).
-    pub fn through(&self, at_endpoint: Arc<dyn HttpClient>) -> Self {
-        Self {
-            endpoint: self.endpoint.clone(),
-            at_endpoint,
-            elsewhere: self.elsewhere.clone(),
-        }
-    }
-
     /// The client for a request to `url`, to hold across an await.
     pub fn client_for(&self, url: &Url) -> Arc<dyn HttpClient> {
         if url.origin() == self.endpoint.origin() {
@@ -402,12 +392,6 @@ mod tests {
             identities.for_server(&server).as_deref(),
             Some("https://studio.example/client.json")
         );
-        // A new client for the target replaces only the one for the server's own address.
-        let moved = clients.through(client("next", Vec::new(), seen.clone()));
-        for url in [METADATA, "https://id.example/token"] {
-            let client = moved.client_for(&Url::parse(url).unwrap());
-            smol::block_on(client.get(url, http_client::AsyncBody::default(), false)).ok();
-        }
         // The server's own address through the target's client, the sign-in service through
         // Studio's.
         assert_eq!(
@@ -416,8 +400,6 @@ mod tests {
                 format!("target {METADATA}"),
                 "studio https://id.example/.well-known/oauth-authorization-server/tenant"
                     .to_owned(),
-                format!("next {METADATA}"),
-                "studio https://id.example/token".to_owned(),
             ]
         );
     }

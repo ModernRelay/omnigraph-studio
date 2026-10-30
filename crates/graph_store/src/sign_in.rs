@@ -488,9 +488,10 @@ pub(crate) struct OAuthSource {
 }
 
 struct Inner {
-    /// Its sign-in service, whose clients its requests take: those it was read with at first,
-    /// then those a new transport for the server's address makes ([`OAuthSource::reach_through`]).
-    service: Mutex<Service>,
+    /// Its sign-in service, whose clients its requests take: the server's transport for the
+    /// server's address, which a changed target replaces for every holder
+    /// ([`graph_client::GraphClient::transport`]), and Studio's own client elsewhere.
+    service: Service,
     key: String,
     keychain: Arc<dyn Keychain>,
     held: smol::lock::Mutex<Held>,
@@ -622,7 +623,7 @@ impl OAuthSource {
         Self {
             inner: Arc::new(Inner {
                 key: service.key(target),
-                service: Mutex::new(service),
+                service,
                 keychain,
                 held: smol::lock::Mutex::new(held),
                 account: Mutex::new(account),
@@ -639,12 +640,12 @@ impl OAuthSource {
 
     /// Its sign-in service's host, as the person reads it.
     pub(crate) fn host(&self) -> String {
-        self.inner.service_now(Service::host)
+        self.inner.service.host()
     }
 
     /// The key a sign-in to its service at `target` is kept under ([`Service::key`]).
     pub(crate) fn service_key(&self, target: &str) -> String {
-        self.inner.service_now(|service| service.key(target))
+        self.inner.service.key(target)
     }
 
     pub(crate) fn account(&self) -> String {
@@ -663,19 +664,7 @@ impl OAuthSource {
     /// Revokes `token`, an earlier item's the keychain let go of, through the sign-in's client
     /// now.
     pub(crate) fn revoke(&self, token: String) {
-        self.inner.revoke(token);
-    }
-
-    /// Sends the sign-in's requests to the server's address through `http` from now on: the
-    /// CLI target's transport changed. The sign-in stands, and a refresh under way finishes
-    /// with its client and keeps what it gives.
-    pub(crate) fn reach_through(&self, http: Arc<dyn HttpClient>) {
-        let mut service = self
-            .inner
-            .service
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        service.clients = service.clients.through(http);
+        self.inner.service.revoke(token);
     }
 
     /// Ends the sign-in for `how`. No refresh begins after this, and one under way touches the
@@ -740,7 +729,7 @@ impl OAuthSource {
                 None => inner.settle().await,
             };
             if !keeps_token && let Some(refresh) = refresh {
-                inner.revoke(refresh);
+                inner.service.revoke(refresh);
             }
         })
         .detach();
@@ -834,31 +823,12 @@ impl Inner {
         forgotten(self.keychain.as_ref(), self.key()).await
     }
 
-    /// Revokes `token` through the sign-in's client now.
-    fn revoke(&self, token: String) {
-        self.service().revoke(token);
-    }
-
-    /// Its service as it is now, a transport change included.
-    fn service(&self) -> Service {
-        self.service_now(Service::clone)
-    }
-
-    /// What `read` reads of its service as it is now.
-    fn service_now<T>(&self, read: impl FnOnce(&Service) -> T) -> T {
-        read(&self.service.lock().unwrap_or_else(PoisonError::into_inner))
-    }
-
     /// The refresh token held once a refresh in flight has settled, taken for the ending, and
     /// what that refresh learned of the keychain's item after the sign-in ended.
     async fn settle(&self) -> (Option<String>, Option<Stale>) {
         let mut held = self.held.lock().await;
         held.access = None;
         (held.refresh.take(), held.stale.take())
-    }
-
-    fn token_client(&self) -> Arc<dyn HttpClient> {
-        self.service_now(Service::token_client)
     }
 
     /// The access token held while it is fresh; otherwise the one the refresh under way gives,
@@ -970,7 +940,7 @@ impl Inner {
                 .unwrap_or_else(PoisonError::into_inner)
                 .take()
         {
-            self.revoke(token);
+            self.service.revoke(token);
         }
     }
 
@@ -982,10 +952,10 @@ impl Inner {
             held.access = None;
             return Err(NoToken::lasting("The sign-in has ended. Sign in again."));
         };
-        let service = self.service();
+        let service = &self.service;
+        let http = service.token_client();
         let mut failed_once = false;
         loop {
-            let http = self.token_client();
             let answered =
                 oauth_client::refresh(http.as_ref(), &service.server, &refresh, service.expected())
                     .await;
@@ -1061,7 +1031,7 @@ impl Inner {
                 Err(TokenError::Unusable { why, refresh_token }) => {
                     held.access = None;
                     if let Some(rotated) = refresh_token.filter(|new| *new != refresh) {
-                        self.revoke(rotated);
+                        self.service.revoke(rotated);
                         // The token held is spent by that rotation: nothing to revoke later.
                         held.refresh = None;
                         if ended {
@@ -3393,8 +3363,10 @@ mod tests {
     }
 
     /// A sign-in read, or made in the browser, while the target's transport changes takes the
-    /// new client when it finishes: requests to the server's address, to a sign-in service there
-    /// included, do not stay on the proxy or certificate authority the task started with.
+    /// new client: requests to the server's address, to a sign-in service there included, the
+    /// code exchange of a browser sign-in under way among them, do not stay on the proxy or
+    /// certificate authority the task started with. Before, the exchange went through the client
+    /// the browser sign-in began with.
     #[gpui::test]
     async fn a_sign_in_finished_after_a_transport_change_takes_the_new_client(
         cx: &mut TestAppContext,
@@ -3432,10 +3404,10 @@ mod tests {
         connection.update(cx, |c, cx| c.sign_out(cx));
         until(cx, "the revocation", |_| logged(&served, "revoke r1"));
         let requests = served.lock().unwrap().requests.clone();
-        // The exchange went through the client its sign-in started with, the one discovery
-        // finished under; what the sign-in kept takes the newest.
+        // The exchange, under way when the transport changed, and what the sign-in kept take
+        // the newest.
         assert!(
-            requests.contains(&format!("next {SERVER}/oauth/token")),
+            requests.contains(&format!("third {SERVER}/oauth/token")),
             "{requests:?}"
         );
         assert!(
@@ -3444,7 +3416,9 @@ mod tests {
         );
         for stale in [
             format!("first {SERVER}/oauth/token"),
+            format!("next {SERVER}/oauth/token"),
             format!("first {SERVER}/oauth/revoke"),
+            format!("next {SERVER}/oauth/revoke"),
         ] {
             assert!(!requests.contains(&stale), "{requests:?}");
         }
