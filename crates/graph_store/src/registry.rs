@@ -1832,6 +1832,37 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A listing the CLI was too busy to make is made again at the next check, though there is
+    /// no operator file. Before, the file was kept unstamped, which a file that is not there
+    /// matches, so the busy notice stood until something else changed.
+    #[gpui::test]
+    async fn a_listing_the_cli_was_too_busy_for_is_made_at_the_next_check(cx: &mut TestAppContext) {
+        let (http, _) = answering();
+        let listing = HeldListing::default();
+        let dir = std::env::temp_dir().join(format!("studio-busy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = cli_config::config_path(&dir);
+        assert!(!config.exists(), "no operator file");
+        listing
+            .next()
+            .send(cli_config::unlisted(&config, "the CLI was busy".into()))
+            .ok();
+        let registry = cx.new(|cx| {
+            let mut registry = ConnectionRegistry::empty(http, Some(dir.clone()));
+            registry.lister = listing.lister();
+            registry.start_listing(cx);
+            registry
+        });
+        cx.run_until_parked();
+        assert_eq!(listing.asked(), 1);
+        listing.next().send(CliTargets::default()).ok();
+        cx.executor().advance_clock(OPERATOR_POLL);
+        cx.run_until_parked();
+        assert_eq!(listing.asked(), 2, "listed again at the next check");
+        registry.read_with(cx, |registry, _| assert!(registry.notices().is_empty()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The CLI the settings name (`omnigraph_cli`) is where Studio looks first, its `~` taken
     /// as the home folder, for its servers and for the agent alike (`cli_tokens::candidates`).
     /// Naming another lists the targets again at the next check; an empty setting names none.

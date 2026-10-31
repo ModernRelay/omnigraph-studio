@@ -236,13 +236,11 @@ pub async fn read_targets(
     let asked = "`omnigraph target list --json`";
     let turn = match cli_tokens::take_turn(&Arc::default(), cli_tokens::READ_TIMEOUT, asked).await {
         Ok(turn) => turn,
-        // Not listed, so the file is kept with a stamp no file has: the next check lists the
-        // targets again, an operator file that is not there (no stamp) included.
         Err(busy) => {
-            return CliTargets {
-                watched: vec![(config.clone(), Some(UNLISTED))],
-                ..refused(format!("Studio could not list the CLI's targets: {busy}"))
-            };
+            return unlisted(
+                &config,
+                format!("Studio could not list the CLI's targets: {busy}"),
+            );
         }
     };
     let cli = match cli_tokens::find_cli(programs, &turn).await {
@@ -323,6 +321,18 @@ pub type FileStamp = (SystemTime, u64, u32);
 
 /// The stamp of a file whose listing did not happen: no file has it.
 const UNLISTED: FileStamp = (SystemTime::UNIX_EPOCH, u64::MAX, u32::MAX);
+
+/// A listing that did not happen (the CLI busy), saying `why`: the operator file `config` is
+/// kept with a stamp no file has, so the next check lists the targets again, an operator file
+/// that is not there (no stamp) included.
+pub(crate) fn unlisted(config: &Path, why: String) -> CliTargets {
+    CliTargets {
+        servers: None,
+        errors: vec![why],
+        watched: vec![(config.to_path_buf(), Some(UNLISTED))],
+        managed: Vec::new(),
+    }
+}
 
 /// When each of `paths` was last written, its size and its permissions (`None` for one that is
 /// not there): a stamp that differs from the last one means the targets are listed again. A token
