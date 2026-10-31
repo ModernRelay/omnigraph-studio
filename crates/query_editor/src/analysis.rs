@@ -22,7 +22,9 @@ pub struct Analysis {
 impl Analysis {
     /// Checks `text` against `schema`. Runs off the main thread.
     pub fn new(schema: &SchemaModel, text: String) -> Self {
-        let outline = gq_language::outline(&text);
+        // Made once, for the outline and every problem's underline.
+        let tokens = gq_language::tokenize(&text);
+        let outline = gq_language::outline_of(&text, &tokens);
         let checked = gq_language::check(schema, &text);
         // The whole text's check describes the declarations it parsed in the order of the
         // text, so each is taken by its place: two may share a name, and the name would give
@@ -70,8 +72,6 @@ impl Analysis {
             );
             checked_alone.push(declaration);
         }
-        // Made once for every problem's underline, rather than once each.
-        let tokens = gq_language::tokenize(&text);
         let mut problems: Vec<(Diagnostic, Option<Range<usize>>)> = checked
             .diagnostics
             .into_iter()
