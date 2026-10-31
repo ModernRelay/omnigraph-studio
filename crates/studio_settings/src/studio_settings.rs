@@ -186,7 +186,7 @@ impl Default for StudioOptions {
             tree_page_size: 50,
             canvas_max_nodes: 2000,
             health_check_seconds: 30,
-            show_performance: true,
+            show_performance: false,
             auto_update: true,
         }
     }
