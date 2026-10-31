@@ -17,6 +17,9 @@ studio_ui = { workspace = true }
 studio_actions = { workspace = true }
 studio_settings = { workspace = true }
 graph_store = { workspace = true }
+model = { workspace = true }
+http_client = { workspace = true }
+log = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
@@ -26,13 +29,13 @@ libc = { workspace = true }
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 graph_client = { workspace = true }
-http_client = { workspace = true }
+graph_store = { workspace = true, features = ["test-support"] }
 studio_settings = { workspace = true, features = ["test-support"] }
 studio_theme = { workspace = true, features = ["test-support"] }
 
 [features]
 # `Workspace::toast_messages`, for the tests of crates that show toasts.
-test-support = []
+test-support = ["graph_store/test-support"]
 
 [lints]
 workspace = true

@@ -30,7 +30,7 @@ pub(crate) fn change_refusal(
 /// How a write bound to the values it was read at ended: sent, with the server's outcome, or
 /// not sent.
 // Made once per write and matched at once, into the outcome: boxing it saves nothing.
-#[allow(clippy::large_enum_variant)]
+#[expect(clippy::large_enum_variant)]
 pub(crate) enum Bound {
     Sent(WriteOutcome<ChangeOutput>),
     /// A list read at the branch's head holds another value than the one the write is bound
@@ -66,43 +66,11 @@ impl Bound {
 /// One node a write sets, by id, with each property it sets and the value it was read at.
 type Read = (String, Vec<(String, Value)>);
 
-/// Sends the write to `branch`, the one the value was read on, and resolves with how it ended;
-/// `Err` when no write can be built. `read_at` is the commit the caller read `old` at, when it
-/// read it there (see [`send_bound`]).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn write_property(
-    session: &Entity<GraphSession>,
-    branch: &str,
-    schema: &SchemaModel,
-    type_name: &str,
-    id: &str,
-    property: &str,
-    old: &Value,
-    new: &Value,
-    read_at: Option<String>,
-    cx: &mut App,
-) -> Result<Task<SaveResult>, String> {
-    let query = builder::update_cell(schema, type_name, property, id, old, new)
-        .map_err(|error| error.to_string())?;
-    let description = format!("Set {property} of {id}");
-    let read = vec![(id.to_owned(), vec![(property.to_owned(), old.clone())])];
-    let sent = send_bound(
-        session,
-        branch,
-        schema,
-        type_name,
-        read,
-        read_at,
-        query,
-        description,
-        cx,
-    )?;
-    let branch = branch.to_owned();
-    Ok(cx.spawn(async move |_| sent.await.result(&branch)))
-}
-
-/// Writes several properties of node `id` in one commit, each `(property, the value it was
-/// read at, the new value)`, as [`write_property`] writes one.
+/// Writes properties of node `id` to `branch`, the one they were read on, in one commit, each
+/// `(property, the value it was read at, the new value)`, and resolves with how it ended; `Err`
+/// when no write can be built. `read_at` is the commit the caller read the values at, when it
+/// read them there (see [`send_bound`]).
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn write_properties(
     session: &Entity<GraphSession>,
     branch: &str,
@@ -110,20 +78,24 @@ pub(crate) fn write_properties(
     type_name: &str,
     id: &str,
     cells: &[(String, Value, Value)],
+    read_at: Option<String>,
     cx: &mut App,
 ) -> Result<Task<SaveResult>, String> {
     let row = builder::RowEdit {
         id: id.to_owned(),
         cells: cells.to_vec(),
     };
-    let description = format!("Save {} changes of {id}", cells.len());
+    let description = match cells {
+        [(property, _, _)] => format!("Set {property} of {id}"),
+        _ => format!("Save {} changes of {id}", cells.len()),
+    };
     let sent = write_rows(
         session,
         branch,
         schema,
         type_name,
         &[row],
-        None,
+        read_at,
         description,
         cx,
     )?;
@@ -134,7 +106,7 @@ pub(crate) fn write_properties(
 /// Saves edits of several nodes in one commit, each row's cells `(property, the value it was
 /// read at, the new value)`: a row whose values changed elsewhere is left alone whole, and the
 /// commit's `affected_nodes` comes back short by it.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn write_rows(
     session: &Entity<GraphSession>,
     branch: &str,
@@ -172,7 +144,7 @@ pub(crate) fn write_rows(
 
 /// Sets `property` to `new` on several nodes in one commit, each `(id, the value it was read
 /// at)`, as [`write_rows`] saves rows.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn write_cells(
     session: &Entity<GraphSession>,
     branch: &str,
@@ -211,7 +183,7 @@ pub(crate) fn write_cells(
 /// otherwise the nodes holding a list are read together at the branch's head, and the write is
 /// bound to the commit they were found at. A change made elsewhere since the values were read
 /// is found by the comparison, and one made after it by the head having moved.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn send_bound(
     session: &Entity<GraphSession>,
     branch: &str,
@@ -417,15 +389,13 @@ mod tests {
         let schema = gq_language::SchemaModel::parse(TAGGED).unwrap();
         let save = |old: Value, cx: &mut TestAppContext| {
             let task = cx.update(|cx| {
-                write_property(
+                write_properties(
                     &session,
                     "main",
                     &schema,
                     "Person",
                     "p1",
-                    "tags",
-                    &old,
-                    &json!(["a", "c"]),
+                    &[("tags".into(), old, json!(["a", "c"]))],
                     None,
                     cx,
                 )

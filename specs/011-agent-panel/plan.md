@@ -2,8 +2,9 @@
 
 Status: implemented · 2026-10-12. Since 2026-10-13 the agent reaches the graph only through the
 `omnigraph` CLI and a Studio gateway ([spec 013](../013-agent-cli/plan.md)); the tools and
-proposal cards below are replaced by `omnigraph_cli`, `omnigraph_run` and spec 013's write
-cards.
+proposal cards below are replaced by spec 013's write cards. Since 2026-10-28 Studio serves no
+MCP server: each conversation works in a folder of its own, where the agent runs `./omnigraph`
+as `AGENTS.md` there says.
 
 ## Problem
 
@@ -60,18 +61,29 @@ change the agent makes must be visible and approved before it lands, and must ar
 |---|---|---|
 | Panel | `crates/agent_panel` (layer 5) | The thread view, the composer, approval cards |
 | ACP host | `crates/agent_panel/src/host.rs` | Spawns the agent, speaks ACP v1, turns traffic into thread events |
-| Tool server | `crates/agent_panel/src/tools.rs`, `mcp.rs` | MCP over a Unix socket; executes tools on the person's `GraphSession` |
-| Proxy | `omnigraph-studio mcp-proxy <socket>` in `crates/studio/src/main.rs` (`agent_panel::proxy`) | The stdio MCP server the agent starts; copies bytes between its stdio and Studio's socket |
-| Test agent | `crates/agent_panel/examples/test_agent.rs` | A scripted ACP agent for end-to-end checks without a model or network; it reports its tool calls in the Claude adapter's wire format (`…/claude-agent-acp`, the MCP tool in `_meta.claudeCode.toolName`, the result as the call's content), and "list" in a prompt reads three people, rows Studio shows as a record card |
+| CLI home and gateway | `crates/agent_panel/src/cli_home.rs`, `gateway.rs` (spec 013) | The conversation's `./omnigraph`, `AGENTS.md`, and the loopback gateway it reaches |
+| Test agent | `crates/agent_panel/examples/test_agent.rs` | A scripted ACP agent for end-to-end checks without a model; it runs `./omnigraph` in the session's folder as a shell tool would, each command a tool call titled with it |
 
-The proxy holds no token and no logic. The agent never learns the server URL or token.
+The agent is never given the server URL or the person's token.
 
 ### Choosing an agent
 
-Setting `agent.command` (a list: program then arguments) and `agent.env` (a map). Empty by
-default: the panel then offers **Claude Agent**, **Codex** and **Custom command…**. A preset
-writes the crate's preset command to settings, and the panel always shows the command it runs.
-Nothing is downloaded until the person picks one and sends a prompt.
+Setting `agent.command` (a list: program then arguments) is the default agent, and `agent.env`
+(a map) the environment of every agent. Empty by default: the panel then offers **Claude
+Agent**, **Codex** and **Custom command…**. A preset writes the crate's preset command to
+settings, and the panel always shows the command it runs. Nothing is downloaded until the
+person picks one.
+
+Each conversation runs its own agent, as each of Zed's threads does: the one it was held with
+(`SessionRecord::agent`), else the default when it opened. The composer's model menu, or the
+agent's name in its place before the agent offers a model, has a section of models per agent
+(the presets, then a configured command that is none of them): the running agent's from its
+model option, the current one checked; another agent's as it offered them when it last ran
+(kept with its preferences), or "Default model" before it ever has. A model of another agent
+runs that agent with it: the model is remembered as the agent's preference, which its new
+session takes as it opens. Choosing another agent makes it the default. A conversation nothing was sent in
+yet changes agent in place; one that holds messages keeps its agent, and the choice opens a new
+conversation. **Custom agent…** opens Settings for a custom command.
 
 ### Lifecycle
 
@@ -79,10 +91,14 @@ Nothing is downloaded until the person picks one and sends a prompt.
 `Prompting` (Stop sends `session/cancel`) → `Ready`. If the process exits, `Exited` shows the
 exit status and the last 20 lines (at most 4 KB) of its stderr, and **Restart**. Changing the
 graph or closing the window ends the agent (the process group is killed; on Windows, the job
-Studio's launcher holds it in, spec 013) and removes the socket.
+Studio's launcher holds it in, spec 013).
 
-The agent starts when the first message is sent, so that message waits for the start (a first
-`npx` fetch and the agent's own MCP servers take seconds). It is not queued: it shows in the
+The agent starts when the conversation's tab is first drawn, new or restored, as Zed connects
+when a thread opens: it is usually ready by the time the first message is written. A new
+conversation joins the graph's list when its first message is sent; one closed or switched to
+another agent before that leaves nothing behind, its folder included
+(`AgentPanel::discard_unused_folder`). A message sent before the agent is ready waits for the
+start (a first `npx` fetch takes seconds). It is not queued: it shows in the
 thread at once as the person's, with "Starting the agent…" under it, and is sent as the first
 turn when the agent is ready (`AgentPanel::opening`); messages sent after it wait in the queue
 behind it. A start that has not answered in 20 s says "The agent has not answered yet" with
@@ -91,21 +107,14 @@ the message ("Not sent yet: it goes when the agent starts again") under the agen
 reads as its reason without the protocol library's debugging fields. A message sent before an
 agent is chosen goes once one is.
 
-`session/new` gets `cwd` = `<data dir>/agent/workspace` (created empty) and one MCP server:
-`{ name: "omnigraph", command: <Studio's executable>, args: ["mcp-proxy", <socket>] }`. The
-socket is `<runtime dir>/<pid>-<n>.sock`, where the runtime directory is
-`$TMPDIR/omnigraph-studio` on macOS (the per-user temporary directory), and
-`$XDG_RUNTIME_DIR/omnigraph-studio`, else `/tmp/omnigraph-studio-$USER`, on Linux. Studio
-creates it with mode `0700`, refuses an existing one that is not a real directory owned by the
-user with mode `0700`, and refuses a socket path longer than 100 bytes. Unix socket paths are
-limited to 104 bytes on macOS. On Windows the socket is a Unix socket too (`uds_windows`,
-Windows 10 1809 and later), in `%TEMP%\omnigraph-studio`: the person's temporary folder is under
-their profile, which only they, the system and administrators can open, and the folder takes
-that access; Windows has no mode bits to check.
+`session/new` gets the conversation's own folder as `cwd`, `<agent dir>/graphs/<graph>/<branch>-<random>`
+(`sessions::working_dir`; a saved conversation keeps the folder it ran in), and no MCP server.
+Studio writes the CLI, its home and `AGENTS.md` there first (spec 013).
 
 ### Tools
 
-Replaced on 2026-10-13 by spec 013's `omnigraph_cli` and `omnigraph_run`. As first built:
+Replaced on 2026-10-13 by spec 013's `omnigraph_cli` and `omnigraph_run` MCP tools, which were
+removed on 2026-10-28 for `./omnigraph` in the conversation's folder. As first built:
 
 | Tool | Arguments | Does |
 |---|---|---|
@@ -138,18 +147,11 @@ from the branch the person was on when the session started.
 
 ### The agent's own permission requests
 
-`session/request_permission` for one of Studio's tools is answered with the agent's
-allow-once option at once: reads are read-only and writes have Studio's own approval, so asking
-twice would only add noise. A request that offers no allow-once is shown as a card, as any
-other tool's is: Studio never picks a lasting allow, or a refusal, for the person. A call is Studio's by what the agent's adapter, named at
-`initialize`, says it is, never by its title, which the model writes (claude-agent-acp titles
-a shell call with its command): Claude's `_meta.claudeCode.toolName` is
-`mcp__omnigraph__omnigraph_run` or `…omnigraph_cli`, and a Codex MCP call's input names server
-`omnigraph` and the tool (`tools::StudioTool::of`). Codex asks permission for an MCP call by
-its id alone (codex-acp 2.2.2), so a call is also Studio's when its first update said so.
-Another adapter's calls are never Studio's.
-Any other request (file edits, shell commands) shows a card with the agent's own options;
-closing the panel answers `Cancelled`. Only its buttons answer it (since 2026-10-21): ⌘Y, ⌘⌥Y and
+Every `session/request_permission` shows a card with the agent's own options: Studio never
+picks one for the person. Since 2026-10-28 Studio serves no tools of its own, so no request is
+answered without asking; before, a request for `omnigraph_cli` or `omnigraph_run` was allowed
+once at once, by what the agent's adapter said the call was.
+Closing the panel answers `Cancelled`. Only its buttons answer it (since 2026-10-21): ⌘Y, ⌘⌥Y and
 ⌘⌥N answer the write card that waits longest and shows them, never an agent's request, whose
 "always" option is a lasting rule of the agent's own that ⌘⌥Y ("Always on this branch" for a
 write) must not pick unseen.
@@ -161,19 +163,10 @@ replies as markdown, with the agent's mark once per turn rather than on every ch
 tool calls and thoughts folded into one muted line that says what happened ("Thought 1 time,
 read the schema, ran 2 queries", then "· 1 failed" in the error colour when a call failed), with
 a turning arrow while a step runs and a chevron that opens the steps under a hairline: each
-call by name, with no mark when it went well, a turning arrow while it runs and "… failed" in
-the error colour, and each thought's text. A query the agent runs is not folded: as Delta
-shows an edit, a line "Query people" (the declared name in the code font, "Running" while it
-runs, "· failed" when it failed) stands over the query in a code card with the query editor's
-colours (`TokenKind::syntax_name`, shared with spec 007's editor), with its parameters on one
-muted line under it, taken from the call's `rawInput`; the line folds the card. When the call's
-result, as the agent reported it (its content's text, else its raw output; Claude's adapter
-sends an MCP tool's result so), holds the CLI's JSON rows (`omnigraph_run`'s "exit 0", the
-output, then `[stderr]`, or the CLI's output alone), a record card under the query shows them,
-after the reference chat's: a title line (a neutral tile, "3 rows" or "5 of 200 rows", and
-where they were read, "main"), then the rows in the type table's cells, a header cell per
-column (the icon of what its first value holds and the column's name) over the values, at most
-5 rows and 4 columns and a reading column wide. A finished turn ends in its actions under its
+call by its title, with no mark when it went well, a turning arrow while it runs and "… failed"
+in the error colour, and each thought's text. The query cards and record cards Studio drew for
+`omnigraph_run` calls went with that tool on 2026-10-28; a write's query and outcome show on
+its write card (spec 013). A finished turn ends in its actions under its
 last reply: Copy (the turn's reply text) and how many tools it called, muted; the agent offers
 no retry or rating, so there is none. The plan as a list with each entry's status. Steps
 of a turn sit 12 px apart and a new question opens 16 px more. Other updates are ignored. The
@@ -184,9 +177,8 @@ first entry that changed (`thread_blocks`), so a streamed token costs its own tu
 turn before it; a block never spans a message of the person's, and a turn's blocks read only its
 own entries and whether a message follows it. It follows the newest reply while it is scrolled
 to its end; a person reading further up stays where they are, and sending a message returns to
-the end. A tool call keeps its input and result only when it is Studio's (a query and its rows
-show from them); another tool's row shows its title and how it went, so its result is not kept,
-nor its input past 4 KiB (`kept_input`): Claude's Read and Write calls carry whole files.
+the end. A tool call keeps only its title and status: Claude's Read and Write calls carry whole
+files.
 
 The composer, after the reference chat's (since 2026-10-21): a card (`ds::composer_card`)
 holding the message and, on one line at its end, the controls that send it, under the thread's
@@ -233,10 +225,12 @@ Query text, parameters, rows, tokens and prompt text. Agent stderr is shown only
 
 | Decision | Rejected alternatives | Why |
 |---|---|---|
-| Studio serves the tools and executes them on its own session | Point the agent at Omnigraph's `/mcp`; give the agent the CLI and a token | The token would leave Studio, and 0.13's MCP cannot write. Executing in Studio lets one place enforce the agent branch and the approval |
-| A stdio proxy to a Unix socket | MCP over ACP (`unstable_mcp_over_acp`); an HTTP MCP server on loopback | Stdio is the one transport every ACP agent supports. A loopback port is reachable by any local process; a socket in a `0700` directory is not |
+| Studio serves the tools and executes them on its own session (until 2026-10-13; spec 013 replaced them with the CLI and a gateway) | Point the agent at Omnigraph's `/mcp`; give the agent the CLI and a token | The token would leave Studio, and 0.13's MCP cannot write. Executing in Studio lets one place enforce the agent branch and the approval |
+| No MCP server (since 2026-10-28; before, a stdio proxy to a Unix socket) | Keep the proxy for the CLI's path and `omnigraph_run` | A folder per conversation gives the agent its CLI by a fixed name, and both agents run unsandboxed, so their shells reach the gateway (spec 013) |
 | Depend on `agent-client-protocol` 2.2.0, default features | Fork Zed's `agent_servers` and `agent_ui`; Zed's unstable feature set | Zed's crates need its project and terminal layers. Stable v1 is what released agents speak |
 | No default agent | Default to the Claude preset | Running `npx …@latest` downloads code; the person should choose it |
+| Start the agent when a conversation's tab is shown (since 2026-10-29) | Start it on the first message | Zed's way: the start's seconds pass while the person writes, and a failed start shows before anything is sent. The process is shared and the branch is made on the first write, so an unused tab costs one `session/new` and a folder it removes |
+| The agent is per conversation, chosen in the model menu (since 2026-10-29) | One agent in Settings for every conversation | Zed ties a thread to its agent and picks it from the new-thread menu; a switch in Settings left every conversation held with the other agent unopenable |
 | Approval is Studio's, not the agent's permission prompt | Rely on the agent asking | Agents differ in whether and how they ask; the guarantee has to hold for every agent |
 | One agent branch per agent session | Write to the person's branch; one branch per proposal | Review works per branch (spec 008), and one branch keeps a session's changes together |
 
@@ -388,6 +382,11 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-29 | The model menu lists each agent's models, and a model of another agent runs that agent | `agent_panel` `sessions::tests::an_agents_models_are_kept_apart_from_its_options`; `cargo test -p agent_panel`, clippy `-D warnings` | Pass. The menu is not drawn by a test |
+| 2026-10-29 | A conversation runs the agent it was held with, starts it when shown, and joins the list on its first message | `agent_panel` `panel::tests::a_conversation_runs_the_agent_it_was_held_with` (held agent, default, a custom command offered beside the presets), `a_restored_conversation_starts_its_agent_when_shown`; `cargo test -p agent_panel`, clippy `-D warnings` | Pass. The menu and the in-place switch are not drawn by a test; checked by hand in the running app |
+| 2026-10-28 | The panel serves no MCP server, and each conversation has a folder of its own | `agent_panel` `sessions::tests::each_conversation_has_a_folder_of_its_own`, `cli_home::tests::agents_md_names_the_cli_the_branch_and_the_rules`, `a_conversation_home_holds_its_config_token_and_wrapper`, `panel::tests::a_run_of_steps_reads_as_one_sentence`, `streaming_into_the_last_turn_keeps_the_earlier_turns_blocks`; `cargo test -p agent_panel -p studio`, clippy `-D warnings` | See spec 013's log of the same date. `socket.rs`, `mcp.rs`, `tools.rs` and the `mcp-proxy` command are gone; every permission request is the person's; the thread shows each tool call by its title |
+| 2026-10-29 | A conversation restored behind another tab starts no agent until it is shown | `agent_panel::panel::open_session` and `AgentPanel::start_when_shown` by reading: the start is owed to the tab's next draw, as the other views' reads are (`type_table` `a_page_not_drawn_reads_nothing` and siblings test that mechanism); `cargo test -p agent_panel`, clippy `-D warnings` | Pass. Before, every conversation tab the workspace restored started its agent at launch, a process and a replay each, shown or not; one opened from the list starts as its tab draws |
+| 2026-10-28 | A rename or a delete begun before a conversation was rebound finishes on it | `agent_panel` `sessions::tests::a_rebound_conversation_is_found_by_its_old_id` (rebound twice; an unknown id left alone), `SessionsPanel::commit_rename` and `delete` by reading | Pass. Before, a rename typed, or a delete confirmed, while the agent opened a new conversation in place of one it could not load went to the old id: the name was lost, and the agent was asked to delete a conversation it never had |
 | 2026-10-26 | The first message waiting for the agent can be taken back, and an unseen merge keeps Open history | `studio` `activity::tests::open_history_is_offered_for_an_unsettled_outcome_on_a_listed_branch` (a merge the history has not shown keeps it); the agent panel's Edit compiles and passes clippy; CI on PR #11 (run 40281608899), Check on macOS, Linux and Windows: `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` | All pass: 1014 passed on macOS, 1009 on Linux, 979 on Windows; 0 failed. The Edit button itself is not drawn by a test |
 | 2026-10-26 | A first message shows in the thread while the agent starts, and the whole flow reads right | `agent_panel` `a_first_message_opens_the_conversation_and_later_ones_queue`, `streaming_into_the_last_turn_keeps_the_earlier_turns_blocks` (the waiting block ends the thread, before the stop's callout), `a_run_of_steps_reads_as_one_sentence`, `host::tests::an_agents_error_reads_without_the_librarys_internals`; offscreen snapshots on the dev graph with a stand-in ACP agent whose start takes 6 to 90 s: a first send, a second send while starting, a start past 20 s, an agent that exits at once, a send while a turn runs, Stop; then Codex (`@agentclientprotocol/codex-acp` 2.2.2) asked to reply "ok" and to count Person nodes, and the conversation opened again | Before: Ragnor's first message on `mr-ops` sat in "1 queued message" with Send now while the agent started, under the empty "Ask about the graph", with only an orange dot to say why, and the restart button showed from the first second. After: the message is in the thread with "Starting the agent…", a second waits in the queue behind it, both go in order once the agent is ready; past 20 s the thread says the agent has not answered, with Start again; an agent that exits shows "Process exited with exit status: 1" (before, the library's JSON with a path into `~/.cargo/registry`) above the message, kept to send. Codex answered "ok" and "200 Person nodes" (the sidebar's count); its run's line now says "used 3 other tools" beside Studio's own, so the parts add up to the turn's tool calls (before, "used 6 tools" read as the total beside "9 tool calls"); the context ring shows its percentage, so a nearly empty one no longer reads as a spinner. The conversation came back with its history. Outside Studio, `codex-acp` answered `initialize` in 3 s and `session/new` in 1 to 4 s with and without Studio's MCP proxy; a `session/load` of a conversation another Codex client holds is refused (`thread_active_writer`), which Studio answers by opening a new one. The ten minutes Ragnor's live message waited were not reproduced |
 | 2026-10-24 | A conversations file set aside is told, naming it and where it went | `agent_panel` `a_file_set_aside_is_told_once` (a version-2 file with a `cwd: null` record, as v0.2.1 wrote; the file written again; one that cannot be set aside), `a_file_that_does_not_parse_is_set_aside_whole` (extended: each file set aside yields a notice naming it and the file it went to; one of another version says so) | One record of an older form still sets the whole file aside, with no record read on its own (Studio keeps no backwards compatibility). The index now holds a notice, “The agent conversations list … could not be read (…), so it starts empty; the file is kept as ….unreadable-…”, shown once as an error toast in the active window when the index is first looked at with a window open (`AgentSessions::tell_pending`), as the removed `servers.json` was. A file that could not be set aside holds no notice: the Conversations panel's note says it. Before, the list emptied and nothing said so unless the rename failed |

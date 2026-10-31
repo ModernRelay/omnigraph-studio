@@ -77,7 +77,10 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   file that changed while its tab was open,
   and a tab with nothing unsaved takes the file's text when its editor takes the keyboard
   again. The left dock's Queries panel lists the folder,
-  newest first; New query, Open a file… and Show the folder are icon buttons in its title
+  newest first, when it is drawn (a hidden panel lists nothing), each file's age drawn again
+  each minute it is shown; after a switch to another graph, the last graph's files are not
+  shown while this one's are listed (since 2026-10-28; before, they stayed, and opened, until
+  the listing landed, and an age stood until something else drew the panel). New query, Open a file… and Show the folder are icon buttons in its title
   line. Its rows take the keyboard as Studio's other lists do: shown from its button or key,
   the panel has it; ↑ and ↓ move among the rows that open a query (saved files, stored
   queries), passing over headers and notes and stopping at either end; ↵ opens the one selected
@@ -211,7 +214,9 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 - Parameters of the query under the cursor get an input each; values are typed by
   `gq_language::param_value` and sent as JSON (`null` for an empty nullable).
 - ⌘⇧↵ sends `explain query …` and shows the logical, physical and DataFusion trees indented by
-  depth, then the planner's notes. Each operator's details read as named facts (muted name,
+  depth, then the planner's notes. Only a run that explains shows its answer as a plan: a read
+  whose columns are named `tree`, `depth`, `node` and `detail` shows them as rows (since
+  2026-10-28; before, the column names alone decided). Each operator's details read as named facts (muted name,
   plain value): a filter is its text, an edge selection `Knows out`, a list its items, and
   bookkeeping (ids, table versions, statistics, tie-breaks) is left out; the tooltip has every
   fact in full.
@@ -264,6 +269,7 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-28 | A suggested edit, a plan and the Queries panel say what is so | `query_editor` `server_positions_map_back_into_the_editor` (extended: a range of the settings prefix that ends at its end), `only_an_explain_is_shown_as_a_plan` (a read with `explain`'s columns, then an explain), `the_rows_are_selected_and_opened_by_keys` (extended: another graph shown before its folder is listed) | All pass. Before: a prefix range ending at its end was mapped to end at the declaration, so its edit replaced the queries between them; a read with those four columns drew as a plan; the last graph's files stayed listed after a switch |
 | 2026-10-22 | A gone file back empty is a change | `query_editor` `a_saved_tabs_text_outlives_its_file`, extended: the file back empty, found as the editor takes the keyboard and by ⌘S; failing with a save that expects the empty text while the file is gone | Either way the tab's text stayed under the changed-on-disk bar, ⌘S asked, and the file stayed empty. Undone, ⌘S found the empty file holding what it expected and wrote the tab's text over it, with no bar. A save now expects anything, the text last read or written, or no file (`Expected`) |
 | 2026-10-21 | A file that comes back to a tab that outlived it is compared with what the tab knew of it | `query_editor` `a_saved_tabs_text_outlives_its_file`, extended: the file gone at a restart, then back holding the tab's text (found as the editor takes the keyboard, then a draft saved), back holding the text a draft was typed over (found by ⌘S), back holding other text (found either way), and the tab remembered while gone; run again with the old comparison put back, and again with the remembered hash taken from the empty text | Back as the tab knew it: no bar, and ⌘S wrote the draft, by a second write when ⌘S found the file. Back holding other text: the tab's text stayed under the changed-on-disk bar, and ⌘S wrote nothing and asked. Remembered while gone, the tab kept the hash of `query kept() {}`. With the old comparison the bar showed over the unchanged file; with the old hash the tab was remembered as typed over the empty text (`fnv1a64:cbf29ce484222325:0`) |
 | 2026-10-21 | A suggestion's Apply needs the text it was made for; newer rows stay newer across a branch switch; a saved tab's text outlives its file | Regression review of `e54cdab`; `query_editor` `a_suggested_edit_is_not_applied_over_text_changed_where_it_goes` (`()` typed where it inserts `()`, and the whole text replaced by the file's, take Apply back), `rows_stay_newer_across_a_branch_switch` (flagged on main, away on dev with no Refresh and no read, flagged again back on main; a move while on dev kept), `a_saved_tabs_text_outlives_its_file` (a saved tab whose file is gone stays with its text, the bar and Save As, and ⌘S writes it back; one whose file reads shows the file; a text over 256 KB is not kept). All three fail with the old behaviour put back | Each held edit is checked against its place with 16 bytes either side, anchored in the text as run: an insertion's place alone holds no text, so text typed there, or the whole text replaced, left it "holding". `BranchChanged` compares the rows with the head instead of clearing their flag, and Refresh reads only on the rows' own branch. Before, `e54cdab` remembered a saved tab without its text and closed it with "could not be read" when its file was gone |

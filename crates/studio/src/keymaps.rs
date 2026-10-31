@@ -209,11 +209,12 @@ fn reload(read: std::io::Result<Option<String>>, cx: &mut App) {
 }
 
 /// `keymap.json`, written with a starting point when the person has none: an empty section to
-/// fill in and Studio's own bindings as a commented reference.
+/// fill in and Studio's own bindings as a commented reference. Only where there is no file: one
+/// made after the look, by the person or another Studio, is kept.
 pub(crate) fn user_keymap_file() -> std::io::Result<PathBuf> {
     let path = studio_settings::keymap_path();
     if !path.exists() {
-        studio_settings::write_atomic(
+        studio_settings::write_new(
             &path,
             starting_keymap().as_bytes(),
             studio_settings::Access::Private,

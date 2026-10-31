@@ -190,7 +190,7 @@ impl Render for SchemaView {
                         .px(px(studio_ui::ds::space::MD))
                         .pb(px(studio_ui::ds::space::XS))
                         .child(
-                            studio_ui::ds::toolbar_button("newer-schema", "Newer schema · Refresh")
+                            studio_ui::ds::button("newer-schema", "Newer schema · Refresh")
                                 .style(ButtonStyle::Tinted(TintColor::Accent))
                                 .tooltip(Tooltip::text(
                                     "The schema changed elsewhere; show the one the graph has now",

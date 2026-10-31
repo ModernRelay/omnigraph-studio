@@ -6,13 +6,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use base64::Engine as _;
 use futures::AsyncReadExt as _;
 use futures::channel::oneshot;
 use futures::future::BoxFuture;
-use http_client::http::header::CONTENT_LENGTH;
-use http_client::{AsyncBody, HttpClient, HttpRequestExt as _, RedirectPolicy, Request};
+use http_client::http::header::{CONTENT_LENGTH, LOCATION};
+use http_client::{AsyncBody, HttpClient, HttpRequestExt as _, RedirectPolicy, Request, Response};
 use minisign_verify::{PublicKey, Signature};
 
 use crate::{InstallError, Installer, Job, install};
@@ -64,6 +64,56 @@ impl Installer for BundleInstaller {
     }
 }
 
+/// A GET of `url` over HTTPS alone, its redirects followed by hand, each on to an `https`
+/// address at most [`MAX_REDIRECTS`] times: a plain-HTTP hop could be changed on the way, and
+/// the update's manifest and file come over HTTPS only (spec 017). `timeout` bounds each hop.
+pub(crate) async fn get_over_https(
+    http: &Arc<dyn HttpClient>,
+    url: &str,
+    timeout: Option<Duration>,
+) -> Result<Response<AsyncBody>> {
+    let mut url = url.to_owned();
+    for _ in 0..=MAX_REDIRECTS {
+        if !over_https_or_loopback(&url) {
+            bail!("the release host sent Studio to an address that is not HTTPS");
+        }
+        let mut request = Request::get(url.as_str()).follow_redirects(RedirectPolicy::NoFollow);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        let response = http.send(request.body(AsyncBody::default())?).await?;
+        if !response.status().is_redirection() {
+            return Ok(response);
+        }
+        let location = response
+            .headers()
+            .get(LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .context("the release host redirected without an address")?;
+        // An address on the same host names its path alone.
+        url = match location.strip_prefix('/') {
+            Some(path) if !path.starts_with('/') => {
+                let host = url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/");
+                format!("{host}/{path}")
+            }
+            _ => location.to_owned(),
+        };
+    }
+    bail!("the release host redirected more than {MAX_REDIRECTS} times")
+}
+
+/// Whether `url` may be fetched: over HTTPS, or at a loopback address (a test's server),
+/// which nothing on the network can change on the way.
+fn over_https_or_loopback(url: &str) -> bool {
+    url.starts_with("https://")
+        || ["http://127.0.0.1", "http://localhost", "http://[::1]"]
+            .iter()
+            .any(|host| {
+                url.strip_prefix(host)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with([':', '/']))
+            })
+}
+
 /// The whole file at `url`, refused past `limit` bytes whether the host says its length or
 /// not; `progress` hears each whole percent of a length it says.
 async fn fetch(
@@ -72,11 +122,7 @@ async fn fetch(
     limit: u64,
     progress: Box<dyn Fn(u8) + Send>,
 ) -> Result<Vec<u8>> {
-    let request = Request::get(url)
-        .follow_redirects(RedirectPolicy::FollowLimit(MAX_REDIRECTS))
-        .timeout(DOWNLOAD_TIMEOUT)
-        .body(AsyncBody::default())?;
-    let mut response = http.send(request).await?;
+    let mut response = get_over_https(&http, url, Some(DOWNLOAD_TIMEOUT)).await?;
     if !response.status().is_success() {
         bail!("the release host answered {}", response.status());
     }
@@ -206,6 +252,43 @@ mod tests {
             percents.windows(2).all(|pair| pair[0] < pair[1]),
             "{percents:?}"
         );
+    }
+
+    /// Redirects are followed on to HTTPS addresses only, a path on the same host included: one
+    /// to plain HTTP is refused, and nothing is read from it.
+    #[test]
+    fn a_download_follows_redirects_over_https_only() {
+        let redirecting = |to: &'static str| -> Arc<dyn HttpClient> {
+            FakeHttpClient::create(move |request| {
+                let response = if request.uri().path() == "/u" {
+                    Response::builder()
+                        .status(302)
+                        .header(LOCATION, to)
+                        .body(AsyncBody::default())
+                        .unwrap()
+                } else {
+                    Response::builder()
+                        .status(200)
+                        .body(AsyncBody::from(b"file".to_vec()))
+                        .unwrap()
+                };
+                async move { Ok(response) }
+            })
+        };
+        for to in ["https://files/f", "/f"] {
+            let (_, progress) = heard();
+            let bytes = block_on(fetch(redirecting(to), "https://x/u", 1024, progress)).unwrap();
+            assert_eq!(bytes, b"file", "{to}");
+        }
+        let (_, progress) = heard();
+        let error = block_on(fetch(
+            redirecting("http://files/f"),
+            "https://x/u",
+            1024,
+            progress,
+        ))
+        .unwrap_err();
+        assert!(error.to_string().contains("not HTTPS"), "{error}");
     }
 
     #[test]

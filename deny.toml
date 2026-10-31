@@ -76,7 +76,10 @@ allow-git = [
     "https://github.com/ModernRelay/omnigraph",
     # Zed's own git dependencies and patches at the pinned tag.
     "https://github.com/zed-industries/async-process.git",
-    "https://github.com/smol-rs/async-task.git",
+    "https://github.com/zed-industries/async-task.git",
+    "https://github.com/zed-industries/khronos-egl",
+    "https://github.com/zed-industries/oo7",
+    "https://github.com/gfx-rs/wgpu",
     "https://github.com/tree-sitter/tree-sitter",
     "https://github.com/zed-industries/calloop",
     "https://github.com/zed-industries/notify",
@@ -88,6 +91,5 @@ allow-git = [
     "https://github.com/zed-industries/async-tar",
     "https://github.com/zed-industries/trash-rs",
     "https://github.com/zed-industries/wasm_thread",
-    "https://github.com/proptest-rs/proptest",
     "https://github.com/zed-industries/lsp-types",
 ]

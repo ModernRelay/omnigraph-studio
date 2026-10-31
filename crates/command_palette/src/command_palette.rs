@@ -8,7 +8,7 @@
 //!
 //! Layer 5 (`docs/architecture.md`). Plan: `specs/002-app-shell/plan.md`.
 //!
-// Written after zed-industries/zed crates/command_palette/src/command_palette.rs @ v1.23.2: the
+// Written after zed-industries/zed crates/command_palette/src/command_palette.rs @ v1.26.2: the
 // palette lists `window.available_actions` captured from the previously focused element,
 // restores that focus, then dispatches. Studio does not depend on Zed's `picker`, which needs
 // `project` and `workspace`; the list, matching and persistence are Studio's own.
@@ -545,6 +545,12 @@ impl CommandPalette {
         self._catalog = None;
         let (mut rows, mut candidates) = (Vec::new(), Vec::new());
         add_stored_rows(session, window, cx, &mut rows, &mut candidates);
+        self.insert_fixed(rows, candidates, cx);
+    }
+
+    /// Puts `rows`, with their `candidates`, after the fixed rows and before any node found,
+    /// the selection staying on its row.
+    fn insert_fixed(&mut self, rows: Vec<Row>, candidates: Vec<Candidate>, cx: &mut Context<Self>) {
         let selected = self.selected_key();
         let at = self.fixed;
         self.fixed += rows.len();
@@ -577,13 +583,7 @@ impl CommandPalette {
                 (row, candidate)
             })
             .unzip();
-        let selected = self.selected_key();
-        let at = self.fixed;
-        self.fixed += rows.len();
-        self.rows.splice(at..at, rows);
-        self.candidates.splice(at..at, candidates);
-        self.update_matches(cx);
-        self.select_key(selected, cx);
+        self.insert_fixed(rows, candidates, cx);
     }
 
     /// After a pause in typing, looks up nodes whose id starts with, or label contains, the

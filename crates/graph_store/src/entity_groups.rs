@@ -733,10 +733,11 @@ fn section_of(change: &FoldedChange) -> GroupSection {
 
 /// An edge type in words, as a relationship line reads it: `WorksAt` is "works at", and the
 /// end types a name repeats are left out (`NoteAboutPerson` from Note to Person is "about").
+/// The start type is left out only as a whole word: `ClaimedBy` from Claim is "claimed by".
 pub fn relationship_words(edge: &str, from: &str, to: &str) -> String {
     let mut core = edge;
     if let Some(rest) = core.strip_prefix(from)
-        && !rest.is_empty()
+        && rest.starts_with(|c: char| c.is_uppercase() || c == '_' || c == '-')
     {
         core = rest;
     }
@@ -1151,5 +1152,11 @@ mod tests {
             "member of"
         );
         assert_eq!(relationship_words("HasV2Key", "Doc", "Key"), "has v2");
+        assert_eq!(
+            relationship_words("ClaimedBy", "Claim", "Person"),
+            "claimed by"
+        );
+        assert_eq!(relationship_words("ClaimFrom", "Claim", "Source"), "from");
+        assert_eq!(relationship_words("Claim_from", "Claim", "Source"), "from");
     }
 }

@@ -17,9 +17,11 @@ pub struct NodePage {
     type_name: String,
     id: String,
     at_commit: Option<String>,
+    /// The node's label as the tab last named it, saved with the tab: a page restored behind
+    /// another tab reads nothing until it is shown, and its tab is named by this until then.
+    saved_label: Option<String>,
     /// The tab as it was last told: its title, and whether it says newer data.
     tab: (String, bool),
-    focus_handle: FocusHandle,
     _subscription: Subscription,
 }
 
@@ -29,6 +31,7 @@ impl NodePage {
         type_name: String,
         id: String,
         at_commit: Option<String>,
+        saved_label: Option<String>,
         cx: &mut Context<Self>,
     ) -> Self {
         let view = {
@@ -38,27 +41,34 @@ impl NodePage {
         // The tab's title is the node's label once it is read, and its dot says newer data:
         // the tab is told when either changes, not at each change of the view, which draws
         // itself.
-        let subscription = cx.observe(&view, |this, view, cx| {
-            let view = view.read(cx);
-            let tab = (view.title(), view.is_newer());
+        let subscription = cx.observe(&view, |this, _, cx| {
+            let tab = (this.title(cx), this.view.read(cx).is_newer());
             if tab != this.tab {
                 this.tab = tab;
                 cx.emit(ItemEvent::UpdateTab);
             }
         });
-        let tab = {
-            let view = view.read(cx);
-            (view.title(), view.is_newer())
-        };
-        Self {
+        let mut page = Self {
             view,
             type_name,
             id,
             at_commit,
-            tab,
-            focus_handle: cx.focus_handle(),
+            saved_label,
+            tab: (String::new(), false),
             _subscription: subscription,
-        }
+        };
+        page.tab = (page.title(cx), page.view.read(cx).is_newer());
+        page
+    }
+
+    /// What names the tab: the node's label once the page reads it, else the one the tab was
+    /// saved with, else the node's id.
+    fn title(&self, cx: &App) -> String {
+        self.view
+            .read(cx)
+            .label()
+            .or_else(|| self.saved_label.clone())
+            .unwrap_or_else(|| self.id.clone())
     }
 
     /// One page per node at the head, and one per node and commit.
@@ -72,15 +82,17 @@ impl NodePage {
 
 impl EventEmitter<ItemEvent> for NodePage {}
 
+/// The page's keyboard is its view's, so the view's keys (⌘S saves the drafts) reach it when the
+/// tab is shown, with no field open.
 impl Focusable for NodePage {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.view.read(cx).focus_handle(cx)
     }
 }
 
 impl Item for NodePage {
     fn tab_title(&self, cx: &App) -> SharedString {
-        self.view.read(cx).title().into()
+        self.title(cx).into()
     }
 
     fn tab_icon(&self, _cx: &App) -> Option<IconName> {
@@ -95,13 +107,19 @@ impl Item for NodePage {
         self.view.read(cx).is_newer()
     }
 
-    fn serialize(&self, _cx: &App) -> Option<SavedItem> {
+    fn serialize(&self, cx: &App) -> Option<SavedItem> {
+        let label = self
+            .view
+            .read(cx)
+            .label()
+            .or_else(|| self.saved_label.clone());
         Some(SavedItem {
             kind: "node".into(),
             data: json!({
                 "type_name": self.type_name,
                 "id": self.id,
                 "at_commit": self.at_commit,
+                "label": label,
             }),
         })
     }
@@ -112,7 +130,6 @@ impl Render for NodePage {
         div()
             .id("node-page")
             .key_context("NodePage")
-            .track_focus(&self.focus_handle)
             .size_full()
             .bg(studio_ui::ds::surface::document(cx))
             // The page scrolls as a list of its own, drawing only what is in view.

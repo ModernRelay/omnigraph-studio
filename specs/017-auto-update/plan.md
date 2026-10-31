@@ -122,12 +122,15 @@ them by exchanging its bundle with the update's.
 
 ### What the releases serve
 
-- **Full releases.** A tagged release is published without `--prerelease`, so GitHub's
-  `latest` names it. A `0.x` version already says that things may change.
-- **Signed or not published.** A tag push fails before `gh release create` unless the macOS
-  app passes `codesign --verify --deep --strict` against the CLI's requirement with Studio's
-  team, and the disk image passes `xcrun stapler validate`. A hand-run build may still be ad
-  hoc; it is never published.
+- **Full releases.** A tagged release with a signed app is published without `--prerelease`,
+  so GitHub's `latest` names it. A `0.x` version already says that things may change.
+- **Signed, or a pre-release.** With the Apple secrets set, a tag's release fails before
+  `gh release create` unless the macOS app passes `codesign --verify --deep --strict` against
+  the CLI's requirement with Studio's team, and the disk image passes `xcrun stapler validate`.
+  Without them the app is signed ad hoc and the release is published as a pre-release, not
+  `latest`, which neither the updater nor `omnigraph studio` reads, so no unsigned app reaches
+  either (since 2026-10-29, for 0.2.2; before, such a tag failed). A hand-run build may still be
+  ad hoc; it is never published.
 - **The update file.** `script/bundle-mac` also writes `Omnigraph-Studio-<version>-arm64.app.tar.gz`,
   the signed app with `Omnigraph Studio.app/` as its top directory. The workflow's `sign-update`
   job signs it with `cargo packager signer sign` (cargo-packager `0.11.8`, installed from

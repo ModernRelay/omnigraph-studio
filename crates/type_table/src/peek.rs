@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use editor::{Editor, EditorEvent};
 use gpui::{
-    App, AsyncApp, ClipboardItem, Context, Entity, ExternalPaths, Focusable as _, ListAlignment,
-    ListState, Render, SharedString, Subscription, Task, WeakEntity, Window, list,
+    App, AsyncApp, ClipboardItem, Context, Entity, ExternalPaths, FocusHandle, Focusable,
+    ListAlignment, ListState, Render, SharedString, Subscription, Task, WeakEntity, Window, list,
 };
 use gq_language::builder::Depends;
 use gq_language::input::edit_text;
@@ -30,7 +30,7 @@ use studio_actions::table::{SelectNextSuggestion, SelectPreviousSuggestion};
 use studio_ui::ds::space;
 use studio_ui::menu::ContextMenu;
 use ui::prelude::*;
-use ui::{Indicator, PopoverMenu, ToggleState, Tooltip};
+use ui::{PopoverMenu, ToggleState, Tooltip};
 
 use crate::blob::{
     IMAGE_MAX, KIND_PREFIX, PREVIEW_PREFIX, Preview, bytes_wanted, preview, read_range,
@@ -423,7 +423,7 @@ pub struct NodePeek {
     /// Properties being edited; a changed one stays open until it is saved or cancelled.
     edits: HashMap<String, FieldEdit>,
     /// Properties whose write is out, shown with their new value and a dot.
-    saving: HashSet<String>,
+    saving: Writing,
     /// Properties the table this peek was opened from has a save of out: shown with a dot over
     /// the value the node holds at the view's commit, and not edited here until it lands.
     saving_elsewhere: HashSet<String>,
@@ -474,11 +474,19 @@ pub struct NodePeek {
     /// Conflicts whose read of the node gave way to a newer one, waiting for what that one
     /// finds ([`Self::landed_or_newer`]).
     node_waiters: Vec<futures::channel::oneshot::Sender<Held>>,
+    /// The node is read when the view is next drawn ([`Self::owe_node`]): a page restored with
+    /// the workspace, or one behind another tab when its branch moves, reads nothing until it
+    /// is shown.
+    node_owed: bool,
     /// Refresh asking after the branch's head before it reads the node again.
     _refresh: Option<Task<()>>,
     /// Takes the copied mark down; a refresh keeps it, and a second copy starts it again.
     _copied: Option<Task<()>>,
     _subscription: Subscription,
+    /// The view's keyboard: ⌘S saves its drafts while it, or a field in it, has it. A page hands
+    /// its focus here ([`crate::node_page::NodePage`]), so the keys reach the view with no field
+    /// open.
+    focus_handle: FocusHandle,
 }
 
 impl NodePeek {
@@ -504,7 +512,7 @@ impl NodePeek {
     /// [`Self::new`] for a row a table shows: its Blob values are where the table's hold
     /// (`blobs`), which may be past `snapshot` after the table's own Blob write, and each one
     /// the table read is shown as its cell shows it.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn from_table(
         session: Entity<GraphSession>,
         subject: PeekSubject,
@@ -555,7 +563,7 @@ impl NodePeek {
         page
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn build(
         session: Entity<GraphSession>,
         subject: PeekSubject,
@@ -582,7 +590,7 @@ impl NodePeek {
             {
                 this.schema = session.read(cx).schema_model();
                 if this.schema.is_some() && this.values.loaded().is_none() {
-                    this.load_node(cx);
+                    this.owe_node(cx);
                 }
                 cx.notify();
                 return;
@@ -613,10 +621,10 @@ impl NodePeek {
                 && session.read(cx).branch != this.branch
             {
                 let left = std::mem::replace(&mut this.branch, session.read(cx).branch.clone());
-                // A file still being stored goes on to the branch left, and its toast tells how
-                // it ended: the new branch's values show none of it, and its head moves are
+                // A write still out goes on to the branch left, and is shown there again if the
+                // view comes back before it lands; a file being stored tells how it ended in its
+                // toast. The new branch's values show none of it, and its head moves are
                 // compared again.
-                this.saving.clear();
                 this.saving_elsewhere.clear();
                 for slot in &mut this.blobs {
                     slot.edit = None;
@@ -675,7 +683,7 @@ impl NodePeek {
             markdown: HashMap::new(),
             plain_text: HashMap::new(),
             edits: HashMap::new(),
-            saving: HashSet::new(),
+            saving: Writing::default(),
             saving_elsewhere: HashSet::new(),
             blobs_at: blobs.at,
             adding: None,
@@ -697,6 +705,8 @@ impl NodePeek {
             _node_read: None,
             node_reads: 0,
             node_waiters: Vec::new(),
+            node_owed: false,
+            focus_handle: cx.focus_handle(),
             _refresh: None,
             _copied: None,
             _subscription: subscription,
@@ -731,14 +741,9 @@ impl NodePeek {
                     .ok();
                 });
             }
-            None => this.load_node(cx),
+            None => this.owe_node(cx),
         }
         this
-    }
-
-    /// What names the node: its label, or its id until it is read or when it has none.
-    pub fn title(&self) -> String {
-        self.label().unwrap_or_else(|| self.subject.id().to_owned())
     }
 
     /// The branch moved past the commit shown.
@@ -778,7 +783,7 @@ impl NodePeek {
         count > 0 && (self.page || count <= i64::from(NEIGHBOUR_LIMIT))
     }
 
-    fn label(&self) -> Option<String> {
+    pub(crate) fn label(&self) -> Option<String> {
         let values = self.values.loaded()?;
         if let PeekSubject::Edge { .. } = &self.subject {
             let from = values.get(FROM_COLUMN)?.as_str()?;
@@ -818,7 +823,18 @@ impl NodePeek {
     /// under the session's schema.
     fn reload(&mut self, cx: &mut Context<Self>) {
         self.forget_shown(cx);
-        self.load_node(cx);
+        self.owe_node(cx);
+    }
+
+    /// Reads the node when the view is next drawn ([`Self::node_owed`]). A read still out is
+    /// let go, and what waited for it hears it found nothing: what it would show belongs to
+    /// what the view let go. Until the draw the node is not being read, so a conflict's read
+    /// waits for none ([`Self::landed_or_newer`]).
+    fn owe_node(&mut self, cx: &mut Context<Self>) {
+        self._node_read = None;
+        self.wake_node_waiters(None);
+        self.values = Loadable::NotLoaded;
+        self.node_owed = true;
         cx.notify();
     }
 
@@ -839,6 +855,20 @@ impl NodePeek {
         self.groups.clear();
         self.absent.clear();
         self.groups_absent.clear();
+        // So do the Blob values shown, their previews and the reads still out: nothing of them
+        // shows, or is saved to a file, under the new read, which reads them again if the node
+        // is there. A value being saved to a file, or a file being stored, goes on.
+        self.release_images(cx);
+        self.blobs.retain(|slot| {
+            slot._save.is_some() || slot.edit.as_ref().is_some_and(BlobEdit::is_saving)
+        });
+        for slot in &mut self.blobs {
+            slot.meta = Loadable::NotLoaded;
+            slot.preview = Loadable::NotLoaded;
+            slot.head.clear();
+            slot.bytes_at = None;
+            slot._task = None;
+        }
         // What it showed is let go; what it reads now is told again, under the new schema too.
         if let Some(scope) = &self.scope {
             self.session.update(cx, |session, _| {
@@ -1091,7 +1121,9 @@ impl NodePeek {
     /// Whether a write of the view's, or of the table it was opened from, is out: a head seen
     /// meanwhile may be its commit, and is compared once they are in.
     fn writes_out(&self) -> bool {
-        !self.saving.is_empty() || !self.edge_writes.is_empty() || !self.saving_elsewhere.is_empty()
+        self.saving.any_on(&self.branch)
+            || !self.edge_writes.is_empty()
+            || !self.saving_elsewhere.is_empty()
     }
 
     /// One of the view's own writes, or its table's, landed at `commit` on `parent`: made on the
@@ -1485,7 +1517,7 @@ impl NodePeek {
         // sent, after the file is read.
         let bound_at = Rc::new(RefCell::new(read_at.clone()));
         slot.edit = Some(BlobEdit::Saving(change.clone()));
-        self.saving.insert(property.to_owned());
+        self.saving.insert(&self.branch, property);
         let (cell, branch) = (self.blob_cell(property), self.branch.clone());
         let write = match &change {
             BlobChange::Upload(path) => {
@@ -1558,7 +1590,7 @@ impl NodePeek {
         cx: &mut Context<Self>,
     ) {
         let (written, bound_at) = landed;
-        self.saving.remove(property);
+        self.saving.remove(branch, property);
         let index = self.blobs.iter().position(|slot| slot.property == property);
         // The view reads another branch now; the write's outcome is told by its toast.
         if self.branch != branch {
@@ -1702,7 +1734,6 @@ impl NodePeek {
     }
 
     fn render_blobs(&self, cx: &mut Context<Self>) -> AnyElement {
-        let border = studio_ui::ds::surface::rule(cx);
         let drop_bg = studio_ui::ds::surface::drop_target(cx);
         v_flex()
             .gap(px(space::MD))
@@ -1765,14 +1796,12 @@ impl NodePeek {
                         Some(studio_ui::ds::text::muted("Empty value").into_any_element())
                     }
                     (_, Loadable::Loaded(Preview::Image(image))) => Some(
-                        div()
+                        studio_ui::ds::lifted(div(), cx)
                             .w_full()
                             .flex()
                             .justify_center()
                             .p(px(space::MD))
                             .rounded(px(studio_ui::ds::radii(cx).md))
-                            .border_1()
-                            .border_color(border)
                             .child(
                                 gpui::img(image.source())
                                     .max_w_full()
@@ -1871,7 +1900,7 @@ impl NodePeek {
                             .child(studio_ui::ds::icon::meta(IconName::File))
                             .child(studio_ui::ds::text::body(slot.property.clone()))
                             .when(saving, |line| {
-                                line.child(Indicator::dot().color(Color::Warning))
+                                line.child(studio_ui::ds::dot(Color::Warning))
                             })
                             .child(studio_ui::ds::text::meta(facts))
                             .child(div().flex_1())
@@ -2200,7 +2229,7 @@ impl NodePeek {
     /// the same commit (`snapshot`), once per property: `read_without` is what this read left
     /// out already. Otherwise a group read whole says why on its count, and one whose count was
     /// shown says why under it.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn group_refused(
         &mut self,
         index: usize,
@@ -2474,7 +2503,7 @@ impl NodePeek {
             return;
         }
         if !self.edits_property(&property, cx)
-            || self.saving.contains(&name)
+            || self.saving.on(&self.branch, &name)
             || self.saving_elsewhere.contains(&name)
         {
             return;
@@ -2663,9 +2692,12 @@ impl NodePeek {
             return;
         };
         let name = property.name.clone();
-        // A field open when the access route refused the branch: what was typed stays as its
-        // draft, and nothing is sent.
-        if self.change_refusal(cx).is_some() {
+        // A field open when the access route refused the branch, or a property already being
+        // written (here, or by another view of the node; a switch clicked twice before it was
+        // drawn again): what was typed stays as its draft, and nothing is sent. One write of a
+        // property is out at a time, so two never land in an order nobody chose.
+        let writing = self.saving.on(&self.branch, &name) || self.saving_elsewhere.contains(&name);
+        if writing || self.change_refusal(cx).is_some() {
             self.edits.remove(&name);
             if !same_value(&old, &new) {
                 self.put_draft(&name, old, text, cx);
@@ -2673,15 +2705,13 @@ impl NodePeek {
             cx.notify();
             return;
         }
-        let write = match crate::write::write_property(
+        let write = match crate::write::write_properties(
             &self.session,
             &self.branch,
             &schema,
             &type_name,
             &id,
-            &name,
-            &old,
-            &new,
+            &[(name.clone(), old.clone(), new.clone())],
             None,
             cx,
         ) {
@@ -2700,7 +2730,7 @@ impl NodePeek {
         }
         let (session, key) = (self.session.clone(), self.draft_key(&name));
         let sent = self.held_draft(&name, cx);
-        self.saving.insert(name);
+        self.saving.insert(&self.branch, &name);
         let branch = self.branch.clone();
         // Detached: closing the page or moving the peek never cancels a write.
         cx.spawn_in(window, async move |this, cx| {
@@ -2724,7 +2754,7 @@ impl NodePeek {
                     return;
                 }
                 // The view reads another branch now; the property's draft was the branch left's.
-                this.saving.remove(&property.name);
+                this.saving.remove(&branch, &property.name);
                 this.settle_draft_on(&branch, &property.name, sent.as_ref(), keep.clone(), cx);
                 cx.notify();
             });
@@ -2758,7 +2788,7 @@ impl NodePeek {
             sent,
         } = field;
         let name = property.name.clone();
-        self.saving.remove(&name);
+        self.saving.remove(&self.branch, &name);
         match result {
             SaveResult::Saved { commit, parent } => {
                 let branch = self.branch.clone();
@@ -2775,7 +2805,7 @@ impl NodePeek {
             SaveResult::NoMatch => {
                 self.put_back(&name, &new, shown);
                 self.newer = true;
-                self.reread_conflict(property, (old, text), sent, window, cx);
+                self.reread_conflict(property, (old, new, text), sent, window, cx);
             }
             SaveResult::Refused(notice) | SaveResult::Unknown(notice) => {
                 self.put_back(&name, &new, shown);
@@ -2793,20 +2823,24 @@ impl NodePeek {
     /// the session then holds ([`Self::reread_at_head`]). The field opens again bound to the
     /// value the view then shows, which the notice names. When the node could not be read, or
     /// the read still finds the value the field was typed over, it stays bound to that value.
-    /// The field shows as saving until the read lands. `edit` is the value the field was bound
-    /// to and its text; `sent` the property's draft as the write went out, which a draft
-    /// retyped or let go elsewhere meanwhile no longer is, and stands.
+    /// A read that finds the value the write would have made has nothing left to write: an
+    /// earlier try whose outcome was unknown landed, or the same change was made elsewhere. The
+    /// field closes and its draft goes, as ⌘S's drafts do ([`Self::drafts_read`]), rather than
+    /// the person's own change being said to be another's. The field shows as saving until the
+    /// read lands. `edit` is the value the field was bound to, the value it would have written
+    /// and its text; `sent` the property's draft as the write went out, which a draft retyped
+    /// or let go elsewhere meanwhile no longer is, and stands.
     fn reread_conflict(
         &mut self,
         property: gq_language::Property,
-        edit: (Value, String),
+        edit: (Value, Value, String),
         sent: Option<DraftEntry>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (old, text) = edit;
+        let (old, new, text) = edit;
         let name = property.name.clone();
-        self.saving.insert(name.clone());
+        self.saving.insert(&self.branch, &name);
         let (session, branch, key) = (
             self.session.clone(),
             self.branch.clone(),
@@ -2830,10 +2864,24 @@ impl NodePeek {
                 Err(_) => None,
             };
             let shown = this.update_in(cx, |this, window, cx| {
-                this.saving.remove(&name);
+                this.saving.remove(&branch, &name);
                 if this.branch == branch {
                     // Without a read of its own, it settles against what the view shows.
                     let now = found.or_else(|| this.values.loaded().cloned().map(Some));
+                    let written = match &now {
+                        Some(Some(values)) => {
+                            same_value(values.get(&name).unwrap_or(&Value::Null), &new)
+                        }
+                        _ => false,
+                    };
+                    if written {
+                        this.settle_draft_on(&branch, &name, sent.as_ref(), None, cx);
+                        if !this.writes_out() {
+                            this.compare_head(cx);
+                        }
+                        cx.notify();
+                        return;
+                    }
                     let (bound, notice) = match &now {
                         Some(Some(values)) => {
                             let value = values.get(&name).cloned().unwrap_or(Value::Null);
@@ -2883,8 +2931,9 @@ impl NodePeek {
     /// and [`Self::drafts_read`] settles the drafts against what it then shows; each shows as
     /// saving until the read lands.
     fn reread_drafts(&mut self, sent: Vec<SentDraft>, cx: &mut Context<Self>) {
-        self.saving
-            .extend(sent.iter().map(|draft| draft.name.clone()));
+        for draft in &sent {
+            self.saving.insert(&self.branch, &draft.name);
+        }
         let branch = self.branch.clone();
         let head = self
             .session
@@ -2908,7 +2957,7 @@ impl NodePeek {
             };
             this.update(cx, |this, cx| {
                 for draft in &sent {
-                    this.saving.remove(&draft.name);
+                    this.saving.remove(&branch, &draft.name);
                 }
                 // The view reads another branch now: the drafts stay as they were typed there.
                 if this.branch == branch {
@@ -3128,6 +3177,15 @@ impl NodePeek {
                 .is_some_and(|edge| edge.at_most_one)
     }
 
+    /// Why group `index` takes no relationship change now: one to it is out, and a second sent
+    /// meanwhile would be sent on top of a result not known yet (a second edge to the same node,
+    /// a removal of one already gone).
+    fn edge_write_refusal(&self, index: usize) -> Option<String> {
+        self.edge_writes
+            .contains(&index)
+            .then(|| "A change to this relationship is being saved".to_owned())
+    }
+
     /// "+ Add": a search over the other type, this node already the relationship's end.
     fn start_add(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self
@@ -3136,6 +3194,7 @@ impl NodePeek {
             .is_some_and(|adding| adding.index == index)
             || self.change_refusal(cx).is_some()
             || self.replace_refusal(index).is_some()
+            || self.edge_write_refusal(index).is_some()
         {
             return;
         }
@@ -3328,6 +3387,9 @@ impl NodePeek {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.edge_write_refusal(index).is_some() {
+            return;
+        }
         if self.removing.as_deref() == Some(edge_id.as_str()) {
             self.removing = None;
             self.write_edge(index, EdgeChange::Remove(edge_id), None, window, cx);
@@ -3359,6 +3421,10 @@ impl NodePeek {
         let Some(group) = self.groups.get(index).map(|group| group.group.clone()) else {
             return;
         };
+        // One change to the group at a time: a second waits for the first's result.
+        if self.edge_write_refusal(index).is_some() {
+            return;
+        }
         // Asked for before the access route refused the branch: nothing is sent, and the group
         // says why.
         if let Some(reason) = self.change_refusal(cx) {
@@ -3530,9 +3596,26 @@ impl NodePeek {
         if self.saving_drafts || !self.edits_relationships() || self.change_refusal(cx).is_some() {
             return;
         }
-        // An open field joins the others.
+        // An open field joins the others with what it holds now. One showing a notice stays open,
+        // its reason in view, so its text is taken into its draft here: the draft would else be
+        // what an earlier leave kept, older than what the field shows.
         let open: Vec<String> = self.edits.keys().cloned().collect();
         for name in open {
+            let typed = self
+                .edits
+                .get(&name)
+                .filter(|edit| edit.notice.is_some())
+                .map(|edit| {
+                    let text = edit.editor.read(cx).text(cx);
+                    (
+                        self.asks_nothing(&name, edit, &text),
+                        edit.old.clone(),
+                        text,
+                    )
+                });
+            if let Some((false, old, text)) = typed {
+                self.put_draft(&name, old, text, cx);
+            }
             self.left_field(&name, cx);
         }
         let (PeekSubject::Node { type_name, id }, Some(schema)) =
@@ -3544,7 +3627,7 @@ impl NodePeek {
         for (name, draft) in self.node_drafts(cx) {
             // A field's own save under way keeps its draft until it lands; sent again, the two
             // writes would race on one value.
-            if self.saving.contains(&name) {
+            if self.saving.on(&self.branch, &name) {
                 continue;
             }
             let Some(property) = schema
@@ -3604,6 +3687,7 @@ impl NodePeek {
             &type_name,
             &id,
             &cells,
+            None,
             cx,
         ) {
             Ok(write) => write,
@@ -3616,7 +3700,7 @@ impl NodePeek {
         self.saving_drafts = true;
         self.drafts_notice = None;
         for draft in &sent {
-            self.saving.insert(draft.name.clone());
+            self.saving.insert(&self.branch, &draft.name);
         }
         let session = self.session.clone();
         let keys: Vec<(DraftKey, DraftEntry)> = sent
@@ -3629,7 +3713,7 @@ impl NodePeek {
             let shown = this.update(cx, |this, cx| {
                 this.saving_drafts = false;
                 for draft in &sent {
-                    this.saving.remove(&draft.name);
+                    this.saving.remove(&branch, &draft.name);
                 }
                 // The view reads another branch now: the drafts saved were the branch left's.
                 if this.branch != branch {
@@ -3712,7 +3796,7 @@ impl NodePeek {
             h_flex()
                 .gap(px(space::SM))
                 .items_center()
-                .child(Indicator::dot().color(Color::Accent))
+                .child(studio_ui::ds::dot(Color::Accent))
                 .child(studio_ui::ds::text::body(label))
                 .children(self.drafts_notice.as_ref().map(|notice| {
                     studio_ui::ds::text::meta(notice.message.clone()).color(notice.tone.color())
@@ -3788,10 +3872,28 @@ impl NodePeek {
             return;
         };
         // Runs every frame: a text is parsed only when it is new, so an unchanged view costs a
-        // comparison per property.
+        // comparison per property, and nothing is made or kept.
         let Some(schema) = self.schema.clone() else {
             return;
         };
+        let mut shown = 0;
+        let unchanged = listed_properties(&schema, &self.subject)
+            .into_iter()
+            .filter(|property| reads_as_markdown(property))
+            .filter_map(|property| {
+                let text = values.get(&property.name).and_then(Value::as_str)?;
+                Some((&property.name, text))
+            })
+            .all(|(name, text)| {
+                shown += 1;
+                self.markdown
+                    .get(name)
+                    .is_some_and(|(drawn, _)| drawn == text)
+                    || self.plain_text.get(name).is_some_and(|drawn| drawn == text)
+            });
+        if unchanged && shown == self.markdown.len() + self.plain_text.len() {
+            return;
+        }
         let mut wanted: HashSet<String> = HashSet::new();
         for property in listed_properties(&schema, &self.subject) {
             let name = property.name.clone();
@@ -3901,7 +4003,7 @@ impl NodePeek {
             .change_refusal(cx)
             .filter(|_| property.editable_in_cell() && !editable);
         let editing = self.edits.contains_key(name);
-        let saving = self.saving.contains(name) || self.saving_elsewhere.contains(name);
+        let saving = self.saving.on(&self.branch, name) || self.saving_elsewhere.contains(name);
         // An unsaved value shows what was typed, with a dot, and opens on a click.
         let draft = (editable && !editing && !saving)
             .then(|| self.draft_of(name, cx))
@@ -3980,7 +4082,7 @@ impl NodePeek {
                         },
                         cx,
                     ))
-                    .child(Indicator::dot().color(Color::Accent))
+                    .child(studio_ui::ds::dot(Color::Accent))
                     .into_any_element()
             }
             None => match state.picker.take() {
@@ -4042,7 +4144,7 @@ impl NodePeek {
                 .gap(px(space::SM))
                 .items_start()
                 .child(studio_ui::ds::text::body(draft.text.clone()))
-                .child(Indicator::dot().color(Color::Accent))
+                .child(studio_ui::ds::dot(Color::Accent))
                 .into_any_element(),
             None => match self.markdown.get(name) {
                 // GPUI's text takes its size from the element around it, so the labels' size
@@ -4082,7 +4184,7 @@ impl NodePeek {
                 head.child(
                     div()
                         .debug_selector(move || draft_selector.clone())
-                        .child(Indicator::dot().color(Color::Accent)),
+                        .child(studio_ui::ds::dot(Color::Accent)),
                 )
             })
             .child(div().flex_1())
@@ -4179,7 +4281,7 @@ impl NodePeek {
                         div()
                             .id(("peek-saving", index))
                             .tooltip(Tooltip::text("Saving…"))
-                            .child(Indicator::dot().color(Color::Warning)),
+                            .child(studio_ui::ds::dot(Color::Warning)),
                     )
                     .into_any_element(),
             );
@@ -4408,7 +4510,7 @@ impl NodePeek {
                 let unknown = notice.tone == Tone::Unknown;
                 h_flex()
                     .gap(px(space::SM))
-                    .child(Indicator::dot().color(notice.tone.color()))
+                    .child(studio_ui::ds::dot(notice.tone.color()))
                     .child(studio_ui::ds::text::meta(notice.message).color(notice.tone.color()))
                     // Whether the save landed is in the branch's history.
                     .when(unknown, |row| {
@@ -4507,7 +4609,7 @@ impl NodePeek {
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(index, cx)))
             .when_some(failed, |d, error| d.tooltip(Tooltip::text(error)))
             .when(self.edge_writes.contains(&index), |header| {
-                header.child(Indicator::dot().color(Color::Warning))
+                header.child(studio_ui::ds::dot(Color::Warning))
             })
             .children(add)
             .child(studio_ui::ds::text::meta(count));
@@ -4550,6 +4652,7 @@ impl NodePeek {
             && matches!(self.groups[index].count, Loadable::Loaded(n) if n > 0);
         let refused = self
             .change_refusal(cx)
+            .or_else(|| self.edge_write_refusal(index))
             .or_else(|| self.replace_refusal(index));
         let tooltip = if let Some(reason) = refused.clone() {
             reason
@@ -4667,6 +4770,7 @@ impl NodePeek {
                 "Remove",
             )
             .style(ButtonStyle::Tinted(ui::TintColor::Error))
+            .disabled(self.edge_write_refusal(index).is_some())
             .tooltip(Tooltip::text(format!(
                 "Remove this {edge}; both nodes stay"
             )))
@@ -4676,7 +4780,9 @@ impl NodePeek {
             }))
             .into_any_element();
         }
-        let refused = self.change_refusal(cx);
+        let refused = self
+            .change_refusal(cx)
+            .or_else(|| self.edge_write_refusal(index));
         studio_ui::ds::value_remove(SharedString::from(format!("peek-remove-{index}-{n}")))
             .disabled(refused.is_some())
             .tooltip(Tooltip::text(
@@ -5004,6 +5110,47 @@ fn group_note(note: Label) -> AnyElement {
         .into_any_element()
 }
 
+/// The properties the view is writing, each under the branch its write goes to. A write still
+/// out on a branch the view left shows again, and holds a second write of its property back,
+/// when the view comes back to that branch; the branch shown sees only its own.
+#[derive(Default)]
+struct Writing(HashMap<String, HashSet<String>>);
+
+impl Writing {
+    fn insert(&mut self, branch: &str, property: &str) {
+        self.0
+            .entry(branch.to_owned())
+            .or_default()
+            .insert(property.to_owned());
+    }
+
+    fn remove(&mut self, branch: &str, property: &str) {
+        if let Some(properties) = self.0.get_mut(branch) {
+            properties.remove(property);
+            if properties.is_empty() {
+                self.0.remove(branch);
+            }
+        }
+    }
+
+    /// Whether `property` is being written on `branch`.
+    fn on(&self, branch: &str, property: &str) -> bool {
+        self.0
+            .get(branch)
+            .is_some_and(|properties| properties.contains(property))
+    }
+
+    /// Whether anything is being written on `branch`.
+    fn any_on(&self, branch: &str) -> bool {
+        self.0.contains_key(branch)
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 fn section(title: &'static str) -> impl IntoElement {
     div()
         .pt(px(space::MD))
@@ -5011,8 +5158,17 @@ fn section(title: &'static str) -> impl IntoElement {
         .child(studio_ui::ds::text::meta(title))
 }
 
+impl Focusable for NodePeek {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl Render for NodePeek {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.node_owed) {
+            cx.defer_in(window, |this, _, cx| this.load_node(cx));
+        }
         self.sync_markdown(cx);
         self.render_list(cx)
     }
@@ -5097,6 +5253,7 @@ impl NodePeek {
         div()
             .id("node-peek")
             .key_context("NodeView")
+            .track_focus(&self.focus_handle)
             .when(writable, |view| {
                 view.on_action(cx.listener(Self::save_drafts))
                     .on_action(cx.listener(Self::on_save_field))
@@ -5201,7 +5358,7 @@ impl NodePeek {
                     )
                     .child(div().flex_1())
                     .children(open_page.map(|open| {
-                        studio_ui::ds::toolbar_icon_button("peek-open-page", IconName::ArrowUpRight)
+                        studio_ui::ds::icon_button("peek-open-page", IconName::ArrowUpRight)
                             .icon_color(Color::Muted)
                             .tooltip(Tooltip::text("Open the node's page"))
                             .on_click(move |_, window, cx| {
@@ -5214,7 +5371,7 @@ impl NodePeek {
                             id: id.clone(),
                         };
                         header.child(
-                            studio_ui::ds::toolbar_button("peek-explore", "Explore")
+                            studio_ui::ds::button("peek-explore", "Explore")
                                 .style(ButtonStyle::Subtle)
                                 .start_icon(
                                     Icon::new(IconName::Crosshair),
@@ -5344,7 +5501,7 @@ impl NodePeek {
     /// What the view shows of property `name`, and whether it shows it saving: for tests of the
     /// views that open a peek.
     pub(crate) fn shown(&self, name: &str) -> (Value, bool) {
-        let saving = self.saving.contains(name) || self.saving_elsewhere.contains(name);
+        let saving = self.saving.on(&self.branch, name) || self.saving_elsewhere.contains(name);
         (self.value_of(name), saving)
     }
 
@@ -5505,6 +5662,60 @@ mod tests {
             cx.debug_bounds("peek-folded-draft-name").is_some(),
             "a folded text's draft shows its dot"
         );
+    }
+
+    /// A node page shown with no field open takes ⌘S: the page's keyboard is its view's, so the
+    /// key reaches the view's drafts. Before, the page held a focus of its own outside the view,
+    /// and ⌘S saved nothing until a field inside was being edited.
+    #[gpui::test]
+    async fn a_page_with_no_field_open_saves_its_drafts_with_cmd_s(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+            cx.bind_keys([gpui::KeyBinding::new(
+                "cmd-s",
+                SaveNodeDrafts,
+                Some("NodeView"),
+            )]);
+        });
+        let session = session(PEOPLE, cx);
+        cx.run_until_parked();
+        let (page, cx) = cx.add_window_view({
+            let session = session.clone();
+            move |_, cx| {
+                crate::node_page::NodePage::new(
+                    session,
+                    "Person".into(),
+                    "p1".into(),
+                    None,
+                    None,
+                    cx,
+                )
+            }
+        });
+        cx.run_until_parked();
+        let key = DraftKey {
+            type_name: "Person".into(),
+            id: "p1".into(),
+            property: "name".into(),
+        };
+        session.update(cx, |session, cx| {
+            let draft = DraftEntry {
+                old: json!("Ada"),
+                text: "Ada King".into(),
+            };
+            session.set_draft(key.clone(), draft, cx);
+        });
+        cx.update(|window, cx| {
+            let focus = page.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-s");
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| {
+            assert!(session.draft(&key).is_none(), "saved, and let go")
+        });
     }
 
     /// A page at the branch head follows the window to another branch and reads its node there.
@@ -5770,6 +5981,36 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert_eq!(view.value_of("name"), json!("Ada Lovelace"));
             assert_eq!(view.snapshot.as_deref(), Some("c2"));
+        });
+    }
+
+    /// ⌘S saves what an open field holds now, one kept open by a notice too, not the older
+    /// draft an earlier leave kept.
+    #[gpui::test]
+    async fn save_takes_what_an_open_field_with_a_notice_holds(cx: &mut TestAppContext) {
+        let session = session(PEOPLE, cx);
+        let (view, cx) = page(session.clone(), cx);
+        view.update_in(cx, |view, window, cx| {
+            let person = view.schema.as_ref().unwrap().node("Person").unwrap();
+            let property = person.property("name").unwrap().clone();
+            view.start_edit(property.clone(), window, cx);
+            let editor = view.edits["name"].editor.clone();
+            editor.update(cx, |editor, cx| editor.set_text("First", window, cx));
+            view.left_field("name", cx);
+            view.start_edit(property, window, cx);
+            let editor = view.edits["name"].editor.clone();
+            editor.update(cx, |editor, cx| editor.set_text("Second", window, cx));
+            // Refused, the field stays open with its reason.
+            view.edits.get_mut("name").unwrap().notice = Some(Notice::new(Tone::Refused, "no"));
+            view.save_drafts(&SaveNodeDrafts, window, cx)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.value_of("name"),
+                json!("Second"),
+                "what the field holds"
+            );
         });
     }
 
@@ -6590,7 +6831,8 @@ mod tests {
     }
 
     /// A relationship is removed on the second press of its ×, as its own commit, which the
-    /// view moves to (spec 014).
+    /// view moves to (spec 014). While that write is out, the group takes no other change:
+    /// presses and an add send nothing more.
     #[gpui::test]
     async fn a_relationship_is_removed_on_the_second_press(cx: &mut TestAppContext) {
         let (view, cx) = page(session(KNOWS, cx), cx);
@@ -6601,6 +6843,11 @@ mod tests {
             assert!(view.edge_writes.is_empty(), "nothing is written yet");
             view.press_remove(0, "e1".into(), window, cx);
             assert!(view.edge_writes.contains(&0), "the second press writes");
+            view.press_remove(0, "e1".into(), window, cx);
+            view.press_remove(0, "e1".into(), window, cx);
+            assert!(view.removing.is_none(), "no press while the write is out");
+            view.start_add(0, window, cx);
+            assert!(view.adding.is_none(), "no add while the write is out");
         });
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
@@ -6965,7 +7212,7 @@ mod tests {
             let editor = view.edits["name"].editor.clone();
             editor.update(cx, |editor, cx| editor.set_text("Ada Lovelace", window, cx));
             view.save_field("name", window, cx);
-            assert!(view.saving.contains("name"), "the write is out");
+            assert!(view.saving.on("main", "name"), "the write is out");
         });
         drop(view);
         cx.update(|window, _| window.remove_window());
@@ -6985,6 +7232,70 @@ mod tests {
         );
     }
 
+    /// One write of a property is out at a time: a second, from a control drawn before the first
+    /// went out, sends nothing and keeps its text as the property's draft. Before, both went,
+    /// and landed in whatever order the server took them.
+    #[gpui::test]
+    async fn a_second_write_of_a_property_waits_as_a_draft(cx: &mut TestAppContext) {
+        let session = session(PEOPLE, cx);
+        let (view, cx) = page(session.clone(), cx);
+        view.update_in(cx, |view, window, cx| {
+            let person = view.schema.as_ref().unwrap().node("Person").unwrap();
+            let property = person.property("name").unwrap().clone();
+            let old = view.value_of("name");
+            let first = json!("Ada Lovelace");
+            view.write_value(
+                property.clone(),
+                old,
+                first.clone(),
+                "Ada Lovelace".into(),
+                window,
+                cx,
+            );
+            assert!(view.saving.on("main", "name"), "the first is out");
+            view.write_value(
+                property,
+                first.clone(),
+                json!("Ada King"),
+                "Ada King".into(),
+                window,
+                cx,
+            );
+            assert_eq!(view.value_of("name"), first, "the second was not sent");
+            assert_eq!(
+                view.draft_of("name", cx).map(|draft| draft.text).as_deref(),
+                Some("Ada King")
+            );
+        });
+    }
+
+    /// A write still out when the view leaves its branch shows again when the view comes back
+    /// before it lands, so its property is not written a second time; the other branch shows
+    /// none of it. Before, the markers went with the switch, and the property read as idle.
+    #[gpui::test]
+    async fn a_write_out_shows_again_on_its_branch(cx: &mut TestAppContext) {
+        let session = session(PEOPLE, cx);
+        let (view, cx) = page(session.clone(), cx);
+        view.update_in(cx, |view, window, cx| {
+            let property = view.property_named("name").unwrap().clone();
+            view.start_edit(property, window, cx);
+            let editor = view.edits["name"].editor.clone();
+            editor.update(cx, |editor, cx| editor.set_text("Ada Lovelace", window, cx));
+            view.save_field("name", window, cx);
+            assert!(view.shown("name").1, "the write is out");
+        });
+        session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        view.read_with(cx, |view, _| {
+            assert!(!view.shown("name").1, "fix writes nothing")
+        });
+        session.update(cx, |session, cx| session.set_branch("main".into(), cx));
+        view.read_with(cx, |view, _| {
+            assert!(view.shown("name").1, "shown again on main")
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(view.saving.is_empty(), "landed"));
+    }
+
     /// A write refused after the view followed the window to another branch keeps its text as
     /// the property's draft on the branch it was typed on, and leaves the new branch alone.
     #[gpui::test]
@@ -6999,7 +7310,7 @@ mod tests {
             let editor = view.edits["name"].editor.clone();
             editor.update(cx, |editor, cx| editor.set_text("Ada Lovelace", window, cx));
             view.save_field("name", window, cx);
-            assert!(view.saving.contains("name"), "the write is out");
+            assert!(view.saving.on("main", "name"), "the write is out");
         });
         session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
         cx.run_until_parked();
@@ -7031,7 +7342,7 @@ mod tests {
             let person = view.schema.as_ref().unwrap().node("Person").unwrap();
             let property = person.property("name").unwrap().clone();
             view.reload(cx);
-            assert!(matches!(view.values, Loadable::Loading), "read again");
+            assert!(view.values.loaded().is_none(), "read again");
             let field = FieldWrite {
                 property,
                 old: json!("Ada"),
@@ -7078,7 +7389,7 @@ mod tests {
         let name = view.read_with(cx, |view, _| view.property_named("name").cloned().unwrap());
         let saved = |parent: &str, commit: &str, cx: &mut VisualTestContext| {
             view.update_in(cx, |view, window, cx| {
-                view.saving.insert("name".into());
+                view.saving.insert("main", "name");
                 let field = FieldWrite {
                     property: name.clone(),
                     old: json!("Ada"),
@@ -7119,6 +7430,34 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert_eq!(view.snapshot.as_deref(), Some("c1"));
             assert_eq!(view.value_of("name"), json!("Ada"), "what c1 holds");
+        });
+    }
+
+    /// A write that matched nothing because what it would make is there already (an earlier
+    /// try whose outcome was unknown landed, or the same change was made elsewhere) is written:
+    /// the field closes, its draft goes, and nothing says the value changed elsewhere. Before,
+    /// the person's own change was named as another's, and the field stayed open on it.
+    #[gpui::test]
+    async fn a_conflict_with_the_value_typed_closes_the_field(cx: &mut TestAppContext) {
+        let (session, writer) = crate::test_support::session_routing_unmatched(
+            PEOPLE,
+            |request| {
+                let name = match request["at"].as_str() {
+                    Some("c2") => "Ada Lovelace",
+                    _ => "Ada",
+                };
+                json!([{ "n": { "@id": "p1", "slug": "p1", "name": name } }])
+            },
+            cx,
+        );
+        let (view, cx) = page(session.clone(), cx);
+        writer.commit("c2", vec![changed("node", "Person", "p1", None)]);
+        edit_name(&view, "Ada Lovelace", cx);
+        view.read_with(cx, |view, cx| {
+            assert!(!view.edits.contains_key("name"), "the field closed");
+            assert_eq!(view.value_of("name"), json!("Ada Lovelace"));
+            assert!(view.draft_of("name", cx).is_none(), "no draft is left");
+            assert!(view.saving.is_empty());
         });
     }
 
@@ -7533,7 +7872,11 @@ mod tests {
             session.schema_model().unwrap()
         });
         let (ada, ida) = (json!("Ada"), json!("Ida"));
-        let query = builder::update_cell(&schema, "Person", "name", "p1", &ada, &ida).unwrap();
+        let edit = builder::RowEdit {
+            id: "p1".into(),
+            cells: vec![("name".into(), ada, ida)],
+        };
+        let query = builder::update_rows(&schema, "Person", &[edit]).unwrap();
         view.update(cx, |view, cx| view.reload(cx));
         session
             .update(cx, |session, cx| {
@@ -7616,6 +7959,91 @@ mod tests {
         });
         cx.run_until_parked();
         (view, session, blobs, cx)
+    }
+
+    /// A reload lets go of the Blob values shown, as of everything read at the old commit: on a
+    /// branch where the node is not, none of the old branch's values shows or is saved.
+    #[gpui::test]
+    async fn a_reload_lets_go_of_the_blob_values_shown(cx: &mut TestAppContext) {
+        let (view, _, _, cx) = page_with_doc(Some(b"hello"), None, cx);
+        view.update(cx, |view, cx| {
+            assert!(matches!(view.blobs[0].meta, Loadable::Loaded(_)));
+            view.forget_shown(cx);
+            assert!(
+                view.blobs.is_empty(),
+                "nothing of the old commit's values stays"
+            );
+        });
+    }
+
+    /// A page not drawn (restored with the workspace behind another tab) reads nothing: not when
+    /// it is made, nor when its branch moves. It reads its node once it is drawn. Before, every
+    /// such page read its node, then its relationships and Blobs, at start and at each move.
+    #[gpui::test]
+    async fn a_page_not_drawn_reads_nothing(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let session = session(PEOPLE, cx);
+        cx.run_until_parked();
+        let hidden =
+            cx.new(|cx| NodePeek::page(session.clone(), "Person".into(), "p1".into(), None, cx));
+        cx.run_until_parked();
+        session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        cx.run_until_parked();
+        hidden.read_with(cx, |hidden, _| {
+            assert!(hidden._node_read.is_none(), "no read sent");
+            assert!(matches!(hidden.values, Loadable::NotLoaded));
+            assert!(hidden.node_owed, "it reads when drawn");
+        });
+        // Drawn, it reads.
+        let (shown, cx) = cx.add_window_view(move |_, cx| {
+            NodePeek::page(session, "Person".into(), "p1".into(), None, cx)
+        });
+        cx.run_until_parked();
+        shown.read_with(cx, |shown, _| {
+            assert!(matches!(shown.values, Loadable::Loaded(_)));
+        });
+    }
+
+    /// A text with markup is parsed once while it stands: a frame that finds it as drawn makes
+    /// nothing, a changed text is parsed again, and one that reads as itself is a label.
+    #[gpui::test]
+    async fn a_texts_markdown_is_made_once_while_it_stands(cx: &mut TestAppContext) {
+        let session = session(PEOPLE, cx);
+        let (view, cx) = page(session, cx);
+        view.update(cx, |view, cx| {
+            let set = |view: &mut NodePeek, text: &str| {
+                let Loadable::Loaded(values) = &mut view.values else {
+                    panic!("the node is read");
+                };
+                values.insert("name".into(), json!(text));
+            };
+            let made = |view: &NodePeek| view.markdown.get("name").map(|(_, md)| md.entity_id());
+            set(view, "**Ada** Lovelace");
+            view.sync_markdown(cx);
+            let first = made(view).expect("a markdown view");
+            view.sync_markdown(cx);
+            assert_eq!(made(view), Some(first), "the same text is not parsed again");
+            set(view, "**Ada** King");
+            view.sync_markdown(cx);
+            assert!(
+                made(view).is_some_and(|again| again != first),
+                "a changed one is"
+            );
+            set(view, "Ada");
+            view.sync_markdown(cx);
+            assert_eq!(made(view), None);
+            assert_eq!(view.plain_text.get("name").map(String::as_str), Some("Ada"));
+            // A text gone (cleared) leaves nothing drawn for it, though every other is as drawn.
+            let Loadable::Loaded(values) = &mut view.values else {
+                panic!("the node is read");
+            };
+            values.insert("name".into(), Value::Null);
+            view.sync_markdown(cx);
+            assert!(view.plain_text.is_empty() && view.markdown.is_empty());
+        });
     }
 
     /// Save… reads the value a slot shows where it is held, the value its size is: a file
@@ -7748,13 +8176,14 @@ mod tests {
         let file = crate::test_support::upload_file("notes.txt", b"new notes", None);
         view.update(cx, |view, cx| view.upload_blob("doc", file, cx));
         cx.run_until_parked();
-        view.read_with(cx, |view, _| assert!(view.saving.contains("doc")));
+        view.read_with(cx, |view, _| assert!(view.saving.on("main", "doc")));
 
         session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert_eq!(view.branch, "fix");
-            assert!(view.saving.is_empty(), "nothing of fix is being saved");
+            assert!(!view.saving.any_on("fix"), "nothing of fix is being saved");
+            assert!(view.saving.on("main", "doc"), "main's write is still out");
             assert_eq!(view.blobs[0].edit, None);
         });
         open.send(()).ok();
@@ -7783,7 +8212,7 @@ mod tests {
         view.update(cx, |view, cx| {
             view.upload_blob("doc", file, cx);
             assert!(matches!(view.blobs[0].edit, Some(BlobEdit::Saving(_))));
-            assert!(view.saving.contains("doc"), "its dot shows");
+            assert!(view.saving.on("main", "doc"), "its dot shows");
         });
         cx.run_until_parked();
         let stored = blobs.get("Person/p1/doc").unwrap();

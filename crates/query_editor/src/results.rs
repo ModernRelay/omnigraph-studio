@@ -1,8 +1,6 @@
 //! What the editor shows after a run, as plain data: result tables, explain plans, server
 //! diagnostics mapped back into the editor's text, and the small formats they use (spec 007).
 
-use std::time::Duration;
-
 use std::collections::{HashMap, HashSet};
 
 use gq_language::{ResultColumn, SchemaModel, TokenKind};
@@ -359,23 +357,9 @@ pub fn summarize_detail(detail: &str) -> String {
         .join(", ")
 }
 
-/// `34 ms`, `1.2 s`.
-pub fn format_elapsed(elapsed: Duration) -> String {
-    let ms = elapsed.as_secs_f64() * 1000.;
-    if ms < 1000. {
-        format!("{} ms", ms.round() as u64)
-    } else {
-        format!("{:.1} s", ms / 1000.)
-    }
-}
-
-/// `1 row`, `12,480 rows`: grouped, as Studio writes every count.
+/// `1 row`, `12,480 rows`: a result's row count, as Studio writes every count.
 pub fn rows_label(count: i64) -> String {
-    if count == 1 {
-        "1 row".into()
-    } else {
-        format!("{} rows", studio_ui::group_count(count))
-    }
+    studio_ui::plural(usize::try_from(count).unwrap_or(0), "row", "rows")
 }
 
 /// What a write the server committed did, read from its answer (constitution III): a
@@ -687,11 +671,15 @@ impl SourceMap {
     }
 
     /// A byte range of the text sent, as a range of the editor's text: both ends in the
-    /// settings prefix, or both in the declaration. One that reaches into what the editor
-    /// added (`explain `), or across it, has no place in the editor's text.
+    /// settings prefix, where it is the same range, or both in the declaration. One that
+    /// reaches into what the editor added (`explain `), or across it, has no place in the
+    /// editor's text. A prefix range that ends at the prefix's end ends there in the editor
+    /// too, not at the declaration, which other text in the editor may come between.
     pub fn editor_range(self, sent: std::ops::Range<usize>) -> Option<std::ops::Range<usize>> {
         let declaration = self.prefix_len + self.inserted;
-        if sent.end <= self.prefix_len || sent.start >= declaration {
+        if sent.end <= self.prefix_len {
+            Some(sent)
+        } else if sent.start >= declaration {
             Some(self.editor_offset(sent.start)..self.editor_offset(sent.end))
         } else {
             None
@@ -1217,8 +1205,6 @@ mod tests {
 
     #[test]
     fn small_formats() {
-        assert_eq!(format_elapsed(Duration::from_millis(34)), "34 ms");
-        assert_eq!(format_elapsed(Duration::from_millis(1250)), "1.2 s");
         assert_eq!(rows_label(1), "1 row");
         assert_eq!(rows_label(0), "0 rows");
         assert_eq!(rows_label(12_480), "12,480 rows");
@@ -1236,6 +1222,13 @@ mod tests {
         assert_eq!(map.editor_offset(3), 3);
         assert_eq!(map.editor_offset(19), 41);
         assert_eq!(map.editor_offset(25), 47);
+        // A range in the prefix that ends at its end, `1;\n`, ends there in the editor too: the
+        // first query between the prefix and the explained one is left alone. Before, its end
+        // was taken as the declaration's start, so an edit of it replaced the first query.
+        assert_eq!(map.editor_range(8..11), Some(8..11));
+        assert_eq!(map.editor_range(11..11), Some(11..11));
+        assert_eq!(map.editor_range(19..25), Some(41..47));
+        assert_eq!(map.editor_range(9..20), None, "across the `explain ` added");
         let sent = "set x = 1;\nexplain query b { match { $p: Person } }";
         let diagnostic = server_diagnostic(
             &json!({"code": "Q001", "position": {"line": 2, "column": 15, "byte": 25}, "expected": "expected return_clause"}),

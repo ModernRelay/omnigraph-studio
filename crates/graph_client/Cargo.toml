@@ -20,5 +20,9 @@ smol = { workspace = true }
 [dev-dependencies]
 http_client = { workspace = true, features = ["test-support"] }
 
+[features]
+# Lets a test end the token held, as a sleep past its renewal would (`GraphClient::set_token_ends`).
+test-support = []
+
 [lints]
 workspace = true

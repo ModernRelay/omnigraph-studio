@@ -7,7 +7,7 @@
 //! directory's handle (`openat`); Windows holds each directory's handle so that its path keeps
 //! naming it (`pinned`).
 //!
-//! The working directory itself is Studio's own (`sessions::graph_cwd`) and is opened as it is.
+//! The working directory itself is Studio's own (`sessions::working_dir`) and is opened as it is.
 
 use std::ffi::OsString;
 use std::io;
@@ -26,6 +26,30 @@ pub use unix::Confined;
 
 #[cfg(windows)]
 pub use pinned::Confined;
+
+/// What a confined directory offers on both platforms, over each one's `open_dir`.
+#[cfg(any(unix, windows))]
+impl Confined {
+    /// The directories along `path` (`a/b/c`), each opened as [`Confined::dir`] opens it.
+    pub fn dirs(&self, path: &str) -> io::Result<Self> {
+        self.walk(path, true)
+    }
+
+    /// The directories along `path`, which must exist.
+    pub fn existing_dirs(&self, path: &str) -> io::Result<Self> {
+        self.walk(path, false)
+    }
+
+    fn walk(&self, path: &str, create: bool) -> io::Result<Self> {
+        let mut parts = path.split('/').filter(|part| !part.is_empty());
+        let first = parts
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "an empty path"))?;
+        parts.try_fold(self.open_dir(first, create)?, |dir, part| {
+            dir.open_dir(part, create)
+        })
+    }
+}
 
 /// `len` random bytes as hex: a name no one else picks, or a token no one guesses.
 pub(crate) fn random_hex(len: usize) -> io::Result<String> {
@@ -87,7 +111,7 @@ mod unix {
             self.open_dir(name, true)
         }
 
-        fn open_dir(&self, name: &str, create: bool) -> io::Result<Self> {
+        pub(super) fn open_dir(&self, name: &str, create: bool) -> io::Result<Self> {
             check_name(name)?;
             match rustix::fs::openat(&self.fd, name, DIR, Mode::empty()) {
                 Ok(fd) => Ok(Self { fd }),
@@ -102,26 +126,6 @@ mod unix {
                 Err(Errno::LOOP | Errno::NOTDIR) => Err(refused(name)),
                 Err(error) => Err(error.into()),
             }
-        }
-
-        /// The directories along `path` (`a/b/c`), each opened as [`Confined::dir`] opens it.
-        pub fn dirs(&self, path: &str) -> io::Result<Self> {
-            self.walk(path, true)
-        }
-
-        /// The directories along `path`, which must exist.
-        pub fn existing_dirs(&self, path: &str) -> io::Result<Self> {
-            self.walk(path, false)
-        }
-
-        fn walk(&self, path: &str, create: bool) -> io::Result<Self> {
-            let mut parts = path.split('/').filter(|part| !part.is_empty());
-            let first = parts
-                .next()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "an empty path"))?;
-            parts.try_fold(self.open_dir(first, create)?, |dir, part| {
-                dir.open_dir(part, create)
-            })
         }
 
         /// The regular file `name`, opened for reading; a link, a pipe or anything else is
@@ -209,12 +213,14 @@ mod unix {
 
         /// Removes the file or link `name`; a link's target is never touched.
         pub fn remove(&self, name: &std::ffi::OsStr) -> io::Result<()> {
+            check_os_name(name)?;
             rustix::fs::unlinkat(&self.fd, name, AtFlags::empty())?;
             Ok(())
         }
 
         /// Removes the directory `name` when it is empty; one holding anything stays.
         pub fn remove_dir(&self, name: &str) -> io::Result<()> {
+            check_name(name)?;
             rustix::fs::unlinkat(&self.fd, name, AtFlags::REMOVEDIR)?;
             Ok(())
         }
@@ -224,13 +230,6 @@ mod unix {
             rustix::fs::fchmod(&self.fd, Mode::from_raw_mode(mode as _))?;
             Ok(())
         }
-    }
-
-    fn refused(name: &str) -> io::Error {
-        io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("{name} is a link or not what Studio expects there; Studio does not use it"),
-        )
     }
 }
 
@@ -296,7 +295,7 @@ mod pinned {
             self.open_dir(name, true)
         }
 
-        fn open_dir(&self, name: &str, create: bool) -> io::Result<Self> {
+        pub(super) fn open_dir(&self, name: &str, create: bool) -> io::Result<Self> {
             check_name(name)?;
             let path = self.path.join(name);
             let held = match hold(&path, false) {
@@ -317,26 +316,6 @@ mod pinned {
             let mut chain = self.held.clone();
             chain.push(Arc::new(held));
             Ok(Self { path, held: chain })
-        }
-
-        /// The directories along `path` (`a/b/c`), each opened as [`Confined::dir`] opens it.
-        pub fn dirs(&self, path: &str) -> io::Result<Self> {
-            self.walk(path, true)
-        }
-
-        /// The directories along `path`, which must exist.
-        pub fn existing_dirs(&self, path: &str) -> io::Result<Self> {
-            self.walk(path, false)
-        }
-
-        fn walk(&self, path: &str, create: bool) -> io::Result<Self> {
-            let mut parts = path.split('/').filter(|part| !part.is_empty());
-            let first = parts
-                .next()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "an empty path"))?;
-            parts.try_fold(self.open_dir(first, create)?, |dir, part| {
-                dir.open_dir(part, create)
-            })
         }
 
         /// The regular file `name`, opened for reading; a link or anything else is refused.
@@ -407,6 +386,7 @@ mod pinned {
         /// refuses: it is removed as one, which removes the link itself, whatever it points at.
         pub fn remove(&self, name: &std::ffi::OsStr) -> io::Result<()> {
             use std::os::windows::fs::FileTypeExt as _;
+            check_os_name(name)?;
             let path = self.path.join(name);
             if std::fs::symlink_metadata(&path)?
                 .file_type()
@@ -421,6 +401,7 @@ mod pinned {
         /// Removes the directory `name` when it is empty; one holding anything stays. A link to
         /// a folder, a junction included, is removed as a link, whatever it points at.
         pub fn remove_dir(&self, name: &str) -> io::Result<()> {
+            check_name(name)?;
             std::fs::remove_dir(self.path.join(name))
         }
 
@@ -431,13 +412,30 @@ mod pinned {
             Ok(())
         }
     }
+}
 
-    fn refused(name: &str) -> io::Error {
-        io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("{name} is a link or not what Studio expects there; Studio does not use it"),
-        )
+/// Why a name was not used: it is a link, or not the kind of entry Studio expects there.
+#[cfg(any(unix, windows))]
+fn refused(name: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("{name} is a link or not what Studio expects there; Studio does not use it"),
+    )
+}
+
+/// [`check_name`] for a name an entry listing gave, which may not be text: it names one entry of
+/// the folder, never the folder itself, its parent or a path. A `\` parts a path on Windows
+/// alone; elsewhere it is a name's own.
+fn check_os_name(name: &std::ffi::OsStr) -> io::Result<()> {
+    let bytes = name.as_encoded_bytes();
+    let parts = |byte: &u8| *byte == b'/' || *byte == 0 || (cfg!(windows) && *byte == b'\\');
+    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.iter().any(parts) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name:?} is not a file name"),
+        ));
     }
+    Ok(())
 }
 
 /// A name of one part: no separator, not `.` or `..`.

@@ -32,8 +32,9 @@ pub struct SessionRecord {
     /// The person's own name for it, which wins over the agent's.
     pub title_override: Option<String>,
     pub created_at: DateTime<Utc>,
-    /// The last message the person sent. The list sorts by it, as Zed's sorts by the last
-    /// interaction, so a conversation finishing in the background does not move its row.
+    /// When the person last wrote in it, or it last opened ready (or was imported, at the
+    /// agent's last activity). The list sorts by it, as Zed's sorts by the last interaction, so
+    /// a conversation finishing in the background does not move its row.
     pub updated_at: DateTime<Utc>,
     /// The agent's branch, and whether it was created yet.
     pub branch: String,
@@ -83,7 +84,15 @@ pub struct AgentSessions {
     /// Agent branches given to conversations begun in this run, by graph, before their records
     /// are written at Ready ([`Self::claim_branch`]).
     claimed: HashSet<(String, String)>,
+    /// The ids conversations were rebound from in this run, oldest first, each with the id it
+    /// moved to ([`Self::rebind`]), [`REBOUND_KEPT`] at most: a rename or a delete begun on a
+    /// conversation's old id finishes on its new one ([`Self::current`]).
+    rebound: Vec<(String, String)>,
 }
+
+/// How many rebinds [`AgentSessions`] keeps: one happens when an agent could not load a
+/// conversation it was asked for, so a run sees few.
+const REBOUND_KEPT: usize = 64;
 
 struct GlobalSessions(Entity<AgentSessions>);
 
@@ -107,7 +116,7 @@ impl AgentSessions {
         sessions
     }
 
-    fn load(path: PathBuf) -> Self {
+    pub(crate) fn load(path: PathBuf) -> Self {
         let (Stored { value, saving }, notice) = read_records(&path);
         Self {
             path,
@@ -118,6 +127,7 @@ impl AgentSessions {
             unread: HashSet::new(),
             deleted: HashSet::new(),
             claimed: HashSet::new(),
+            rebound: Vec::new(),
         }
     }
 
@@ -205,15 +215,33 @@ impl AgentSessions {
     /// load it, and a new conversation took its place on its branch.
     pub fn rebind(&mut self, old: &str, new: String, cx: &mut Context<Self>) {
         if let Some(record) = self.records.iter_mut().find(|record| record.session == old) {
-            record.session = new;
+            record.session = new.clone();
             self.live.remove(old);
             self.unread.remove(old);
+            if self.rebound.len() == REBOUND_KEPT {
+                self.rebound.remove(0);
+            }
+            self.rebound.push((old.to_owned(), new));
             self.save();
             cx.notify();
         }
     }
 
-    /// Records a conversation, or updates its branch, keeping its title, times and marks.
+    /// The id conversation `id` has now: the one it was rebound to, if it was, through each
+    /// rebind since.
+    pub fn current(&self, id: &str) -> String {
+        let mut id = id.to_owned();
+        // Each rebind is looked through once, so a cycle cannot hold it.
+        for (old, new) in &self.rebound {
+            if *old == id {
+                id = new.clone();
+            }
+        }
+        id
+    }
+
+    /// Records a conversation, or updates its branch, keeping its title, times and pin; one
+    /// opened again leaves the archive.
     pub fn upsert(&mut self, record: SessionRecord, cx: &mut Context<Self>) {
         match self
             .records
@@ -268,14 +296,18 @@ impl AgentSessions {
         );
     }
 
-    /// The agent's title, which replaces any earlier one.
+    /// The agent's title, which replaces any earlier one: one line, cut ([`title_of`]), so it
+    /// fits a row and can be typed into the delete confirmation. One without text is not taken.
     pub fn set_title(&mut self, session: &str, title: String, cx: &mut Context<Self>) {
+        let Some(title) = title_of(&title) else {
+            return;
+        };
         self.update(session, |record| record.title = Some(title), cx);
     }
 
     /// The start of the first message, until the agent names the conversation.
     pub fn suggest_title(&mut self, session: &str, message: &str, cx: &mut Context<Self>) {
-        let Some(title) = provisional_title(message) else {
+        let Some(title) = title_of(message) else {
             return;
         };
         self.update(
@@ -399,11 +431,17 @@ impl AgentSessions {
 }
 
 /// Where a conversation runs: where it ran before (`saved`), so a resumed one finds the agent's
-/// own record of it whatever key its graph had then; a new one in its graph's directory.
-pub fn working_dir(saved: Option<&SessionRecord>, graph: &str) -> PathBuf {
+/// own record of it whatever key its graph had then; a new one in a folder of its own in its
+/// graph's directory, named for its `branch`, which holds its CLI and `AGENTS.md`
+/// ([`crate::cli_home`]).
+pub fn working_dir(saved: Option<&SessionRecord>, graph: &str, branch: &str) -> PathBuf {
     match saved {
         Some(saved) => saved.cwd.clone(),
-        None => graph_cwd(graph),
+        None => {
+            // A tab that starts again on the same branch gets another folder.
+            let random = crate::confined::random_hex(4).unwrap_or_default();
+            graph_cwd(graph).join(format!("{}-{random}", branch.replace('/', "-")))
+        }
     }
 }
 
@@ -424,8 +462,8 @@ pub fn graph_cwd(graph: &str) -> PathBuf {
         .join(format!("{slug}-{hash:08x}"))
 }
 
-/// The folder of what agents keep on this machine, their working directories and their
-/// conversations' private CLI homes: `agent` in Studio's data folder, or on Windows in its
+/// The folder of what agents keep on this machine, their working directories with their
+/// conversations' CLI homes: `agent` in Studio's data folder, or on Windows in its
 /// local counterpart ([`local_counterpart`]).
 fn agent_dir() -> PathBuf {
     let data = studio_settings::data_dir();
@@ -457,14 +495,10 @@ fn local_counterpart(data: &Path, roaming: Option<&Path>, local: Option<&Path>) 
     (data.parent() == Some(roaming)).then(|| local.join(name))
 }
 
-/// Where each conversation's private CLI home is made: outside every working directory, so
-/// an agent cannot change what `omnigraph_run` runs, and beside them on this machine.
-pub fn private_homes() -> PathBuf {
-    agent_dir().join("homes")
-}
-
-/// The first line of a message, cut to a title's length on a character.
-fn provisional_title(message: &str) -> Option<String> {
+/// A title as Studio keeps one: the first line with text, cut to a title's length on a
+/// character; `None` for text without any. The start of the first message is one until the
+/// agent names the conversation, and the agent's titles and imported ones are taken so too.
+pub(crate) fn title_of(message: &str) -> Option<String> {
     const TITLE_CHARS: usize = 80;
     let line = message
         .lines()
@@ -505,13 +539,6 @@ fn read_text(path: &Path) -> Result<Option<String>, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.to_string()),
     }
-}
-
-/// Moves a state file Studio could not use out of the way of the next save, renamed beside
-/// itself: whether it may be saved over now. Not when the rename fails (on Windows, another
-/// program holds it open without letting it be renamed): the file then stays as it is.
-fn set_aside(path: &Path) -> bool {
-    studio_settings::set_aside(path).is_some()
 }
 
 /// The records on disk, and what the person is told when the file was set aside. A file that
@@ -583,9 +610,12 @@ fn read(path: &Path) -> Stored<Map<String, Value>> {
             value,
             saving: true,
         },
+        // A file Studio could not use is moved out of the way of the next save, renamed beside
+        // itself; when that fails (on Windows, another program holds it open), it stays as it
+        // is and is not saved over.
         None => Stored {
             value: Map::new(),
-            saving: set_aside(path),
+            saving: studio_settings::set_aside(path).is_some(),
         },
     }
 }
@@ -597,6 +627,13 @@ fn preferences_path() -> PathBuf {
         .join("agent")
         .join("preferences.json")
 }
+
+/// Where an agent's preferences keep the models it offered when it last ran; no option has
+/// this id, so it is never set on a session.
+const MODELS: &str = "@models";
+
+/// An agent's model option's id, and each of its values with its name.
+pub type Models = (String, Vec<(String, String)>);
 
 /// The preferences, read from their file once and then kept; each change is written in turn,
 /// off the main thread, unless the file could not be read and stays where it was.
@@ -618,6 +655,29 @@ impl Preferences {
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// The option values to set on the agent's next session.
+    fn options(&mut self, command: &[String]) -> Map<String, Value> {
+        let mut options = self.of(command);
+        options.remove(MODELS);
+        options
+    }
+
+    /// The models the agent offered when it last ran, for the model menu to list while another
+    /// agent runs.
+    fn models(&mut self, command: &[String]) -> Option<Models> {
+        serde_json::from_value(self.of(command).remove(MODELS)?).ok()
+    }
+
+    /// Keeps the models the agent offers, written only when they changed.
+    fn remember_models(&mut self, command: &[String], option: &str, values: Vec<(String, String)>) {
+        let offered = (option.to_owned(), values);
+        if self.models(command).as_ref() != Some(&offered)
+            && let Ok(value) = serde_json::to_value(&offered)
+        {
+            self.prefer(command, MODELS, value);
+        }
     }
 
     fn prefer(&mut self, command: &[String], option: &str, value: Value) {
@@ -656,7 +716,16 @@ fn with_preferences<T>(f: impl FnOnce(&mut Preferences) -> T) -> T {
 }
 
 pub fn preferences(command: &[String]) -> Map<String, Value> {
-    with_preferences(|preferences| preferences.of(command))
+    with_preferences(|preferences| preferences.options(command))
+}
+
+/// The models an agent offered when it last ran ([`Preferences::models`]).
+pub fn models(command: &[String]) -> Option<Models> {
+    with_preferences(|preferences| preferences.models(command))
+}
+
+pub fn remember_models(command: &[String], option: &str, values: Vec<(String, String)>) {
+    with_preferences(|preferences| preferences.remember_models(command, option, values));
 }
 
 pub fn prefer(command: &[String], option: &str, value: Value) {
@@ -686,6 +755,27 @@ mod tests {
         }
     }
 
+    /// A conversation rebound in this run is found by an id it had before, through each rebind
+    /// since, and its old ids keep none of its state.
+    #[gpui::test]
+    fn a_rebound_conversation_is_found_by_its_old_id(cx: &mut gpui::TestAppContext) {
+        let path = std::env::temp_dir().join(format!("studio-rebind-{}.json", std::process::id()));
+        let sessions = cx.new(|_| AgentSessions::load(path.clone()));
+        sessions.update(cx, |sessions, cx| {
+            sessions.upsert(record("a", "server/crm", "claude", 0), cx);
+            sessions.rebind("a", "b".into(), cx);
+            sessions.rebind("b", "c".into(), cx);
+            assert_eq!(sessions.current("a"), "c");
+            assert_eq!(sessions.current("b"), "c");
+            assert_eq!(sessions.current("c"), "c");
+            assert_eq!(sessions.current("other"), "other");
+            // A rebind of an id no record has changes nothing.
+            sessions.rebind("gone", "d".into(), cx);
+            assert_eq!(sessions.current("gone"), "gone");
+        });
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn each_graph_has_a_directory_of_its_own() {
         let a = graph_cwd("server/crm");
@@ -694,17 +784,26 @@ mod tests {
         assert!(a.to_string_lossy().contains("server-crm-"));
     }
 
-    /// On Windows agents work, and their conversations' CLI homes with a session token and a
-    /// certificate are kept, in the local application folder, never the roaming one, which
+    /// A new conversation works in a folder of its own in its graph's directory, named for its
+    /// branch, another each time; a saved one where it ran before.
+    #[test]
+    fn each_conversation_has_a_folder_of_its_own() {
+        let first = working_dir(None, "server/crm", "agent/20261028-101500");
+        let again = working_dir(None, "server/crm", "agent/20261028-101500");
+        assert_eq!(first.parent(), Some(graph_cwd("server/crm").as_path()));
+        assert_ne!(first, again);
+        let name = first.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("agent-20261028-101500-"), "{name}");
+        let saved = record("s1", "server/crm", "agent", 1);
+        assert_eq!(working_dir(Some(&saved), "other", "agent/x"), saved.cwd);
+    }
+
+    /// On Windows agents work, with their conversations' CLI homes holding a session token and
+    /// a certificate, in the local application folder, never the roaming one, which
     /// folder redirection can put on a network share where cmd cannot work. A data folder set
     /// elsewhere keeps its agents.
     #[test]
     fn agents_work_in_the_local_folder_of_studios_roaming_data() {
-        // The homes and the working directories are found in one folder.
-        assert_eq!(
-            private_homes().parent(),
-            graph_cwd("g").parent().and_then(Path::parent)
-        );
         let profile = std::env::temp_dir().join("profile");
         let (roaming, local) = (
             profile.join("AppData").join("Roaming"),
@@ -1158,9 +1257,9 @@ mod tests {
     #[test]
     fn a_long_first_line_is_cut_on_a_character() {
         let long = "word ".repeat(40);
-        let title = provisional_title(&long).unwrap();
+        let title = title_of(&long).unwrap();
         assert!(title.chars().count() <= 80 && title.ends_with('…'));
-        assert_eq!(provisional_title("  \n "), None);
+        assert_eq!(title_of("  \n "), None);
     }
 
     #[test]
@@ -1193,6 +1292,36 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An agent's models are kept for the menu to list while another agent runs, and are never
+    /// among the options set on its next session.
+    #[test]
+    fn an_agents_models_are_kept_apart_from_its_options() {
+        let dir = std::env::temp_dir().join(format!("studio-agent-models-{}", std::process::id()));
+        let path = dir.join("preferences.json");
+        let codex = vec!["codex-acp".to_owned()];
+        let kept = |path: &Path| Preferences {
+            path: path.to_owned(),
+            records: None,
+        };
+        let models = vec![
+            ("gpt-5.5".to_owned(), "GPT-5.5".to_owned()),
+            ("gpt-5.5-mini".to_owned(), "GPT-5.5 mini".to_owned()),
+        ];
+        let mut preferences = kept(&path);
+        assert_eq!(preferences.models(&codex), None);
+        preferences.prefer(&codex, "model", json!("gpt-5.5"));
+        preferences.remember_models(&codex, "model", models.clone());
+        studio_settings::writes_done();
+        let mut preferences = kept(&path);
+        assert_eq!(
+            preferences.models(&codex),
+            Some(("model".to_owned(), models))
+        );
+        let options = preferences.options(&codex);
+        assert_eq!(options.keys().collect::<Vec<_>>(), ["model"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

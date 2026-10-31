@@ -34,8 +34,8 @@ pub use resize::{
     COLUMN_MAX_WIDTH, COLUMN_MIN_WIDTH, ColumnDrag, ColumnResize, clamp_width, column_resize_handle,
 };
 pub use values::{
-    CopyableValue, format_bytes, group_count, group_digits, now_micros, relative_span,
-    relative_time, short_commit_id, utc_date_time, value_text,
+    CopyableValue, format_bytes, format_elapsed, group_count, group_digits, now_micros, plural,
+    relative_span, relative_time, short_commit_id, utc_date_time, value_text,
 };
 
 /// A column in a data grid.

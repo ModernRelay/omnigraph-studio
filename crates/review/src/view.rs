@@ -26,17 +26,19 @@ use graph_store::{
 };
 use serde_json::Value;
 use studio_actions::review::{
-    AcceptAndNext, EditChange, Merge, NextChange, PreviousChange, RevertAndNext,
+    AcceptAndNext, EditChange, Merge, NextChange, PreviousChange, RevertAndNext, Summarize,
 };
 use studio_actions::workspace::Refresh;
 use studio_ui::ds::{radii, space};
 use studio_ui::{ChangeCard, change_counts, group_digits, short_commit_id, type_swatch};
+use studio_workspace::models::{Error as ModelError, Models, Request as ModelRequest};
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace, workspace_for};
 use ui::prelude::*;
 use ui::{KeyBinding, PopoverMenu, Severity, Tooltip};
 
 use crate::conflicts::{conflict_wording, resolution_hint};
 use crate::scope_menu::ScopeMenu;
+use crate::summary;
 
 /// How long typing in the search pauses before the cards are filtered.
 const SEARCH_DELAY: Duration = Duration::from_millis(80);
@@ -229,6 +231,22 @@ struct ReviewData {
     /// stopped the read: `commits` are the branch's own read, so their count and authors are
     /// not all known.
     commits_capped: Option<Capped>,
+}
+
+/// The model's summary of the branch (spec 019): none asked, waiting for the person to allow
+/// the task, under way, done, or failed with why.
+enum SummaryState {
+    None,
+    Running {
+        _call: Task<()>,
+    },
+    Done {
+        answer: summary::Answer,
+        model: String,
+        titles: usize,
+        cut: bool,
+    },
+    Failed(String),
 }
 
 /// A fix asked for on a card: sent once the fixes before it are back.
@@ -462,6 +480,8 @@ pub struct ReviewView {
     bound_head: Option<String>,
     /// What the review holds, in a sentence, made when it loads: the header draws at every frame.
     summary: String,
+    /// A model's summary of the branch (spec 019), kept until the head moves.
+    ai_summary: SummaryState,
     /// Reviewed marks, by entity and what its change does ([`mark_of`]), kept across Refresh:
     /// an entity changed again since is reviewed again.
     reviewed_keys: HashSet<u64>,
@@ -507,6 +527,9 @@ pub struct ReviewView {
     /// The target moved since the dry run: it is read again at the next frame the review is
     /// drawn in ([`ReviewView::preview_moved`]), and a hidden review reads nothing.
     preview_owed: bool,
+    /// The review is read when it is next drawn ([`Self::owe_read`]): a review restored behind
+    /// another tab reads no diff, nor after a new token, until it is shown.
+    read_owed: bool,
     /// The target's head as the session knew it when the dry run was asked for.
     preview_target: Option<String>,
     _load_task: Option<Task<()>>,
@@ -636,6 +659,7 @@ impl ReviewView {
             conflict_list: ListState::new(0, ListAlignment::Top, px(800.)),
             bound_head: None,
             summary: String::new(),
+            ai_summary: SummaryState::None,
             reviewed_keys: HashSet::new(),
             merge: MergeState::Idle,
             logged_merge_held: false,
@@ -655,6 +679,7 @@ impl ReviewView {
             _target_watch: target_watch,
             preview_again: false,
             preview_owed: false,
+            read_owed: false,
             preview_target: None,
             _load_task: None,
             _slow_task: None,
@@ -666,12 +691,20 @@ impl ReviewView {
             _fix_task: None,
             _subscriptions: vec![subscription, search_subscription],
         };
-        // Read as any Refresh is: a merge of these branches whose response was lost and may
-        // still land, sent from a review closed since or open elsewhere, is where this one
-        // starts, from the session's log.
-        view.reload(cx);
+        // Read as any Refresh is, once shown: a merge of these branches whose response was lost
+        // and may still land, sent from a review closed since or open elsewhere, is where this
+        // one starts, from the session's log.
+        view.owe_read(cx);
         view.logged_merge_held = view.logged_merge_may_land(cx);
         view
+    }
+
+    /// Reads the review again from the branch head when it is next drawn ([`Self::read_owed`]),
+    /// as [`Self::reload`] does at once.
+    fn owe_read(&mut self, cx: &mut Context<Self>) {
+        self.load = LoadState::Loading { folded: 0 };
+        self.read_owed = true;
+        cx.notify();
     }
 
     /// The session logged an outcome, recorded what a target's history showed of a lost merge,
@@ -765,7 +798,7 @@ impl ReviewView {
         self._names_task = None;
         self.preview = Preview::Unread;
         self._preview_task = None;
-        self.reload(cx);
+        self.owe_read(cx);
     }
 
     /// Another writer's schema: the cards were made under the one before, as are those of a
@@ -942,6 +975,9 @@ impl ReviewView {
                     if let Some(&ix) = data.by_key.get(key) {
                         self.cards[ix].fix = fix.clone();
                     }
+                }
+                if self.bound_head != data.head {
+                    self.ai_summary = SummaryState::None;
                 }
                 self.bound_head = data.head.clone();
                 let schema_moved = std::mem::take(&mut self.schema_moved_while_loading);
@@ -2182,7 +2218,7 @@ impl ReviewView {
         let mergeable = self.mergeable(cx);
         let merge_refused = self.merge_refusal(cx);
         let delete_refused = self.delete_refusal(cx);
-        let merge_button = studio_ui::ds::toolbar_button(
+        let merge_button = studio_ui::ds::button(
             "merge",
             format!("Merge {} into {}", self.branch, self.target),
         )
@@ -2212,7 +2248,7 @@ impl ReviewView {
             move |_, cx| Tooltip::with_meta(title.clone(), None, cli.clone(), cx)
         })
         .on_click(cx.listener(|this, _, _, cx| this.merge(cx)));
-        let refresh = studio_ui::ds::toolbar_icon_button("refresh", IconName::RotateCw)
+        let refresh = studio_ui::ds::icon_button("refresh", IconName::RotateCw)
             .tooltip(refresh_tooltip(
                 "Read the branch and its target again",
                 &self.focus_handle,
@@ -2375,7 +2411,7 @@ impl ReviewView {
         let view = cx.entity().downgrade();
         let scope_menu = PopoverMenu::new("review-scope")
             .trigger(
-                studio_ui::ds::toolbar_button("review-scope-button", scope_label)
+                studio_ui::ds::button("review-scope-button", scope_label)
                     .style(ButtonStyle::Outlined)
                     .end_icon(Icon::new(IconName::ChevronDown)),
             )
@@ -2432,13 +2468,159 @@ impl ReviewView {
                     .child(merge_button),
             )
             .child(h_flex().gap(px(space::MD)).child(scope_menu).child(search))
-            .child(studio_ui::ds::text::plain(sentence))
+            .child(
+                h_flex()
+                    .gap(px(space::MD))
+                    .items_center()
+                    .child(studio_ui::ds::text::plain(sentence))
+                    .child(div().flex_1())
+                    .when(
+                        self.data.is_some() && matches!(self.load, LoadState::Ready),
+                        |row| row.child(self.render_summarize_button(cx)),
+                    ),
+            )
             .when(!detail.is_empty(), |d| {
                 d.child(studio_ui::ds::text::muted(detail))
             })
+            .children(self.render_ai_summary(cx))
             .children(counts)
             .children(banners)
             .into_any_element()
+    }
+
+    // ---- a model's summary (spec 019) ----
+
+    fn render_summarize_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let running = matches!(self.ai_summary, SummaryState::Running { .. });
+        let label = match &self.ai_summary {
+            SummaryState::Done { .. } => "Summarize again",
+            _ => "Summarize",
+        };
+        studio_ui::ds::button("summarize", label)
+            .style(ButtonStyle::Subtle)
+            .start_icon(Icon::new(IconName::ZedAssistant))
+            .disabled(running)
+            .tooltip(|_, cx| {
+                Tooltip::with_meta(
+                    "A model's summary of the branch, for the reviewer",
+                    Some(&Summarize),
+                    format!(
+                        "{} go to {}",
+                        summary::TASK.sends,
+                        Models::model_for(summary::TASK.tier, cx)
+                    ),
+                    cx,
+                )
+            })
+            .on_click(cx.listener(|this, _, _, cx| this.summarize(cx)))
+            .into_any_element()
+    }
+
+    fn render_ai_summary(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let card = |cx: &App| {
+            studio_ui::ds::card(cx)
+                .px(px(space::LG))
+                .py(px(space::MD))
+                .gap(px(space::SM))
+        };
+        Some(match &self.ai_summary {
+            SummaryState::None => return None,
+            SummaryState::Running { .. } => card(cx)
+                .child(
+                    h_flex()
+                        .gap(px(space::SM))
+                        .items_center()
+                        .child(studio_ui::ds::spinner())
+                        .child(studio_ui::ds::text::muted("Summarizing the branch…")),
+                )
+                .into_any_element(),
+            SummaryState::Failed(why) => card(cx)
+                .child(studio_ui::ds::text::error(why.clone()))
+                .into_any_element(),
+            SummaryState::Done {
+                answer,
+                model,
+                titles,
+                cut,
+            } => {
+                let mut meta = format!(
+                    "{model} · sent {}",
+                    studio_ui::plural(*titles, "record's title", "records' titles")
+                );
+                if *cut {
+                    meta.push_str(&format!(
+                        " · the first {} changes of each type",
+                        summary::PER_TYPE
+                    ));
+                }
+                card(cx)
+                    .child(studio_ui::ds::text::body(answer.headline.clone()))
+                    .children(answer.points.iter().map(|point| {
+                        h_flex()
+                            .gap(px(space::SM))
+                            .items_start()
+                            .child(studio_ui::ds::text::muted("•"))
+                            .child(studio_ui::ds::text::body(point.clone()))
+                    }))
+                    .when(!answer.needs_attention.is_empty(), |card| {
+                        card.child(studio_ui::ds::text::meta("Needs attention"))
+                            .children(answer.needs_attention.iter().map(|line| {
+                                h_flex()
+                                    .gap(px(space::SM))
+                                    .items_start()
+                                    .child(studio_ui::ds::icon::meta(IconName::Warning))
+                                    .child(studio_ui::ds::text::body(line.clone()))
+                            }))
+                    })
+                    .child(studio_ui::ds::text::meta(meta))
+                    .into_any_element()
+            }
+        })
+    }
+
+    fn summarize(&mut self, cx: &mut Context<Self>) {
+        if self.data.is_none() || matches!(self.ai_summary, SummaryState::Running { .. }) {
+            return;
+        }
+        let Some(models) = Models::try_global(cx) else {
+            self.ai_summary = SummaryState::Failed(ModelError::NoKey.to_string());
+            cx.notify();
+            return;
+        };
+        self.start_summary(models, cx);
+    }
+
+    fn start_summary(&mut self, models: Entity<Models>, cx: &mut Context<Self>) {
+        let Some(data) = &self.data else {
+            return;
+        };
+        let condensed = summary::condense(&self.branch, &self.target, &data.folded, &data.counts);
+        let (titles, cut) = (condensed.titles, condensed.cut);
+        let request = ModelRequest {
+            task: &summary::TASK,
+            instructions: summary::INSTRUCTIONS,
+            input: condensed.text,
+            schema: summary::schema(),
+        };
+        let call = models.read(cx).call::<summary::Answer>(request, cx);
+        let task = cx.spawn(async move |this, cx| {
+            let answer = call.await;
+            this.update(cx, |this, cx| {
+                this.ai_summary = match answer {
+                    Ok(answer) => SummaryState::Done {
+                        answer: answer.value,
+                        model: answer.model,
+                        titles,
+                        cut,
+                    },
+                    Err(error) => SummaryState::Failed(error.to_string()),
+                };
+                cx.notify();
+            })
+            .ok();
+        });
+        self.ai_summary = SummaryState::Running { _call: task };
+        cx.notify();
     }
 
     fn render_merge_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -2447,9 +2629,8 @@ impl ReviewView {
                 Preview::Conflicts(conflicts) => (
                     Severity::Warning,
                     format!(
-                        "{} conflict{} would stop a merge into {} now. {}",
-                        conflicts.len(),
-                        if conflicts.len() == 1 { "" } else { "s" },
+                        "{} would stop a merge into {} now. {}",
+                        studio_ui::plural(conflicts.len(), "conflict", "conflicts"),
                         self.target,
                         resolution_hint(&self.branch, &self.target)
                     ),
@@ -2558,9 +2739,8 @@ impl ReviewView {
             MergeState::Conflicts(conflicts) => (
                 Severity::Error,
                 format!(
-                    "{} conflict{} stopped the merge, and nothing was merged. {}",
-                    conflicts.len(),
-                    if conflicts.len() == 1 { "" } else { "s" },
+                    "{} stopped the merge, and nothing was merged. {}",
+                    studio_ui::plural(conflicts.len(), "conflict", "conflicts"),
                     resolution_hint(&self.branch, &self.target)
                 ),
                 Some(
@@ -2644,15 +2824,12 @@ impl ReviewView {
             .px(px(space::XL))
             .pb(px(space::MD))
             .child(
-                h_flex()
-                    .id(("conflict", ix))
+                studio_ui::ds::lifted(h_flex().id(("conflict", ix)), cx)
                     .w_full()
                     .gap(px(space::LG))
                     .px(px(space::LG))
                     .py(px(space::MD))
                     .rounded(px(radii(cx).md))
-                    .border_1()
-                    .border_color(studio_ui::ds::surface::rule(cx))
                     .bg(studio_ui::ds::surface::document(cx))
                     .child(Icon::new(IconName::GitMergeConflict).color(Color::Conflict))
                     .child(
@@ -2915,17 +3092,14 @@ impl ReviewView {
             .collect();
         card = card.relationships(counts, lines);
         if left_out > 0 {
-            card = card.relationships_footer(
-                studio_ui::ds::button(
-                    ("more-relationships", ix),
-                    change_cards::more_lines_label(left_out),
-                )
-                .style(ButtonStyle::Subtle)
-                .on_click(cx.listener(move |this, _, _, cx| {
+            card = card.relationships_footer(change_cards::more_lines_button(
+                ix,
+                left_out,
+                cx.listener(move |this, _, _, cx| {
                     this.card_lines.show_more(card_key.clone(), shown);
                     cx.notify();
-                })),
-            );
+                }),
+            ));
         }
         card.on_click(cx.listener(move |this, _, _, cx| {
             let primary = this
@@ -2986,13 +3160,7 @@ fn unknown_merge_words(reason: &str, landed: Check, target: &str) -> String {
 /// lists. Counts are of commits at or below the reviewed head, never of the commits the branch
 /// made after it, which the pages read too.
 fn capped_commits_note(data: &ReviewData, branch: &str, target: &str) -> Option<String> {
-    let commits = |n: usize| {
-        format!(
-            "{} commit{}",
-            group_digits(n),
-            if n == 1 { "" } else { "s" }
-        )
-    };
+    let commits = |n: usize| studio_ui::plural(n, "commit", "commits");
     Some(match data.commits_capped.as_ref()? {
         Capped::Own { read: 0 } => format!(
             "{branch} has more than {} commits since this review was read: Studio read no \
@@ -3828,6 +3996,9 @@ impl Render for ReviewView {
         if std::mem::take(&mut self.preview_owed) {
             cx.defer_in(window, |this, _, cx| this.preview_moved(cx));
         }
+        if std::mem::take(&mut self.read_owed) {
+            cx.defer_in(window, |this, _, cx| this.reload(cx));
+        }
         let header = self.render_header(cx);
         let body = match (&self.load, &self.data) {
             (LoadState::Ready, Some(_)) if self.show_conflicts => self.render_conflicts(cx),
@@ -3872,11 +4043,8 @@ impl Render for ReviewView {
             _ => studio_ui::ds::loading_state("Reading changes…").into_any_element(),
         };
         // Typing in the search box must not move between cards.
-        let mut context = gpui::KeyContext::new_with_defaults();
-        context.add("Review");
-        if self.search.focus_handle(cx).is_focused(window) {
-            context.add("searching");
-        }
+        let context =
+            studio_ui::ds::search_key_context("Review", &self.search.focus_handle(cx), window);
         v_flex()
             .key_context(context)
             .track_focus(&self.focus_handle)
@@ -3899,6 +4067,7 @@ impl Render for ReviewView {
             // Merge is registered only while the credential may merge (constitution VIII).
             .when(self.merge_refusal(cx).is_none(), |view| {
                 view.on_action(cx.listener(|this, _: &Merge, _, cx| this.merge(cx)))
+                    .on_action(cx.listener(|this, _: &Summarize, _, cx| this.summarize(cx)))
             })
             // ⌘R reads the review again, as its Refresh buttons do, and goes on to the
             // workspace, which reads the graph's schema, branches and counts again.
@@ -4083,6 +4252,35 @@ pub(crate) mod tests {
             mark_of(&change("p2", json!({"name": "Ada"}))),
             "another entity"
         );
+    }
+
+    /// A review not drawn (restored with the workspace behind another tab) reads no diff until
+    /// it is shown; drawn, it reads. Before, every restored review read its whole diff at start.
+    #[gpui::test]
+    async fn a_review_not_drawn_reads_no_diff(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _) = reviewed_server_writing(false, cx);
+        let (_blank, cx) = cx.add_window_view(|_, _| gpui::EmptyView);
+        let hidden = cx.update(|window, cx| {
+            let session = session.clone();
+            cx.new(|cx| ReviewView::new(session, "feature".into(), "main".into(), window, cx))
+        });
+        cx.run_until_parked();
+        hidden.read_with(cx, |view, _| {
+            assert!(
+                view._load_task.is_none() && view.data.is_none(),
+                "no diff read"
+            );
+            assert!(view.read_owed, "it reads when drawn");
+        });
+        let (shown, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        shown.read_with(cx, |view, _| assert!(matches!(view.load, LoadState::Ready)));
     }
 
     /// Fixes asked for one after the other go one at a time, each bound to the commit the one

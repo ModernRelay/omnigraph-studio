@@ -12,7 +12,7 @@ use editor::Editor;
 use gpui::{
     App, AppContext as _, Bounds, Context, Entity, EventEmitter, ExternalPaths, FocusHandle,
     Focusable, ImageFormat, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled,
+    ParentElement, Pixels, Point, Render, ScrollDelta, ScrollEvent, SharedString, Styled,
     Subscription, SvgRenderer, Task, Window, canvas, checkerboard, div, img, point,
 };
 use gq_language::{BuiltQuery, builder};
@@ -148,6 +148,9 @@ pub struct BlobView {
     /// The read, started when the tab is first drawn: tabs restored with the workspace read
     /// nothing until they are shown.
     _load: Option<Task<()>>,
+    /// The read is asked for by a draw, and starts once the draw is done ([`Self::start_load`]):
+    /// it asks the session, which a draw does not change.
+    load_asked: bool,
     _export: Option<Task<()>>,
     /// Draws the tab again when what the credential may do is read, or the branch list, which
     /// Choose File and Clear follow, and when the schema is, which a tab opened at the head
@@ -201,6 +204,7 @@ impl BlobView {
             export: None,
             focus_handle: cx.focus_handle(),
             _load: None,
+            load_asked: false,
             _export: None,
             _session: events,
         }
@@ -468,7 +472,7 @@ impl BlobView {
         cx.notify();
     }
 
-    fn scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn scroll(&mut self, event: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
         let delta = match event.delta {
             ScrollDelta::Pixels(pixels) => pixels,
             ScrollDelta::Lines(lines) => point(px(lines.x * 20.), px(lines.y * 20.)),
@@ -532,19 +536,22 @@ impl BlobView {
     }
 
     /// Hands the value to the system's own application for its kind, through an owner-only
-    /// folder in Studio's data directory that keeps a day's worth.
+    /// folder in Studio's data directory that keeps a day's worth, in a folder of its own
+    /// ([`open_folder`]).
     fn open_elsewhere(&mut self, cx: &mut Context<Self>) {
         let directory = studio_settings::data_dir().join("blobs");
-        let path = directory.join(self.file_name());
+        let name = self.file_name();
         self.export = Some(Export::Busy("Opening…"));
         cx.notify();
-        // The folder is made private and emptied of day-old files off the main thread.
+        // The folder is made private and emptied of day-old values off the main thread.
         self._export = Some(cx.spawn(async move |this, cx| {
             let prepared = cx
-                .background_spawn(async move { prepare_open_folder(&directory) })
+                .background_spawn(async move {
+                    prepare_open_folder(&directory).and_then(|()| open_folder(&directory))
+                })
                 .await;
             this.update(cx, |this, cx| match prepared {
-                Ok(()) => this.write_to(path, true, cx),
+                Ok(folder) => this.write_to(folder.join(name), true, cx),
                 Err(error) => {
                     this.export = Some(Export::Failed(format!("Could not write: {error}")));
                     cx.notify();
@@ -788,7 +795,7 @@ impl BlobView {
             Some(BlobEdit::Saving(_)) => parts.push(
                 h_flex()
                     .gap(px(ds::space::SM))
-                    .child(ui::Indicator::dot().color(Color::Warning))
+                    .child(studio_ui::ds::dot(Color::Warning))
                     .child(ds::text::meta(format!("Saving to {}…", self.branch)))
                     .into_any_element(),
             ),
@@ -929,9 +936,15 @@ impl BlobView {
                         ds::surface::chrome(cx),
                         ds::space::MD * scale.max(0.5),
                     ))
-                    .border_1()
-                    .border_color(ds::surface::rule(cx))
                     .child(img(image.source()).size_full())
+                    // On the image's edge, over it: a border would sit outside it.
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .border_1()
+                            .border_color(ds::surface::image_outline(cx)),
+                    )
                     .into_any_element()
             }
             // An SVG, or before the tab is measured: fitted by the element.
@@ -954,7 +967,7 @@ impl BlobView {
             .cursor_grab()
             .child(measure)
             .child(frame)
-            .on_scroll_wheel(cx.listener(Self::scroll))
+            .on_scroll(cx.listener(Self::scroll))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, _, cx| {
@@ -1029,8 +1042,26 @@ impl BlobView {
     }
 }
 
+/// A folder of its own, in `directory`, for one value handed to another application: a value
+/// is named by its node and property (`blob::file_name`), which another graph's or another
+/// commit's value can share, and a file written over would change under the application still
+/// showing the first.
+fn open_folder(directory: &std::path::Path) -> std::io::Result<PathBuf> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    let folder = directory.join(format!(
+        "{stamp:x}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&folder)?;
+    Ok(folder)
+}
+
 /// The folder values are handed to other applications from: owner-only, emptied of anything a
-/// day old.
+/// day old, a value's own folder ([`open_folder`]) with the value in it.
 fn prepare_open_folder(directory: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(directory)?;
     #[cfg(unix)]
@@ -1047,7 +1078,11 @@ fn prepare_open_folder(directory: &std::path::Path) -> std::io::Result<()> {
             .and_then(|modified| modified.elapsed().ok())
             .is_some_and(|age| age > day);
         if old {
-            std::fs::remove_file(entry.path()).ok();
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                std::fs::remove_dir_all(entry.path()).ok();
+            } else {
+                std::fs::remove_file(entry.path()).ok();
+            }
         }
     }
     Ok(())
@@ -1331,55 +1366,82 @@ impl Item for BlobView {
     }
 }
 
-impl Render for BlobView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self._load.is_none() {
-            match self.reading_at() {
-                Some(at) => {
-                    let load = Self::load(
-                        &self.session,
-                        &self.cell,
-                        &self.branch,
-                        Some(at),
-                        None,
-                        window,
-                        cx,
-                    );
-                    self._load = Some(load);
+impl BlobView {
+    /// Whether the read can start: the tab reads at a commit, or the schema it reads the head
+    /// with is in. Asked by a draw, which changes nothing in the session.
+    fn can_load(&self, cx: &App) -> bool {
+        self.reading_at().is_some() || matches!(self.session.read(cx).schema, Loadable::Loaded(_))
+    }
+
+    /// Starts the read a draw asked for ([`Self::load_asked`]), unless one is out.
+    fn start_load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self._load.is_some() {
+            return;
+        }
+        match self.reading_at() {
+            Some(at) => {
+                let load = Self::load(
+                    &self.session,
+                    &self.cell,
+                    &self.branch,
+                    Some(at),
+                    None,
+                    window,
+                    cx,
+                );
+                self._load = Some(load);
+            }
+            // Opened at the head, the value is the session's branch's, which a write goes to,
+            // or the branch the tab was saved on: the head is read first with the schema's
+            // probe, so this waits for the schema, and is drawn again when it comes.
+            None => {
+                let session = self.session.read(cx);
+                if !self.branch_given {
+                    self.branch = session.branch.clone();
                 }
-                // Opened at the head, the value is the session's branch's, which a write goes
-                // to, or the branch the tab was saved on: the head is read first with the
-                // schema's probe, so this waits for the schema, and is drawn again when it comes.
-                None => {
-                    let session = self.session.read(cx);
-                    if !self.branch_given {
-                        self.branch = session.branch.clone();
+                match &session.schema {
+                    Loadable::Loaded(schema) => {
+                        let probe = builder::head_probe(schema);
+                        self.content = Loadable::Loading;
+                        let load = Self::load(
+                            &self.session,
+                            &self.cell,
+                            &self.branch,
+                            None,
+                            probe,
+                            window,
+                            cx,
+                        );
+                        self._load = Some(load);
                     }
-                    match &session.schema {
-                        Loadable::Loaded(schema) => {
-                            let probe = builder::head_probe(schema);
-                            self.content = Loadable::Loading;
-                            let load = Self::load(
-                                &self.session,
-                                &self.cell,
-                                &self.branch,
-                                None,
-                                probe,
-                                window,
-                                cx,
-                            );
-                            self._load = Some(load);
-                        }
-                        Loadable::Failed(error) => self.content = Loadable::Failed(error.clone()),
-                        Loadable::NotLoaded | Loadable::Loading => {}
-                    }
+                    // A schema that failed, or is not in any more, leaves the tab to its next
+                    // draw.
+                    Loadable::Failed(_) | Loadable::NotLoaded | Loadable::Loading => {}
                 }
             }
         }
+    }
+}
+
+impl Render for BlobView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Asked only when it can start, so a tab waiting for the schema draws once and waits
+        // for it, which draws the tab again ([`SessionEvent::SchemaChanged`]).
+        if self._load.is_none() && !self.load_asked {
+            if self.can_load(cx) {
+                self.load_asked = true;
+                cx.defer_in(window, |this, window, cx| {
+                    this.load_asked = false;
+                    this.start_load(window, cx);
+                });
+            } else if let Loadable::Failed(error) = &self.session.read(cx).schema {
+                self.content = Loadable::Failed(error.clone());
+            }
+        }
         // The branch the tab writes to is known once it is first drawn; a list held then may
-        // be older than it.
+        // be older than it. Asked after the draw, as the read is.
         if self.branch_listed == BranchListed::Unseen {
-            self.follow_branch_list(cx);
+            cx.defer_in(window, |this, _, cx| this.follow_branch_list(cx));
         }
         let body = match &self.content {
             Loadable::Loading | Loadable::NotLoaded => {
@@ -2360,13 +2422,40 @@ mod tests {
         assert_eq!(pages[0].1, PDF_DRAW_WIDTH);
     }
 
+    /// The folder values are opened from keeps a day: a fresh value stays, a day-old value's
+    /// own folder goes with what it holds. Two opens of values of one name (another graph's,
+    /// another commit's) are written to two places, so neither replaces the other.
     #[test]
     fn the_open_folder_keeps_a_day() {
         let dir = std::env::temp_dir().join(format!("studio-blob-open-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
         prepare_open_folder(&dir).unwrap();
         std::fs::write(dir.join("fresh.txt"), b"x").unwrap();
+        let (first, second) = (open_folder(&dir).unwrap(), open_folder(&dir).unwrap());
+        assert_ne!(first, second, "each open its own folder");
+        std::fs::write(first.join("p1-photo.png"), b"one").unwrap();
+        std::fs::write(second.join("p1-photo.png"), b"two").unwrap();
+        assert_eq!(std::fs::read(first.join("p1-photo.png")).unwrap(), b"one");
+        let two_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 60 * 60);
+        let mut folder = std::fs::OpenOptions::new();
+        folder.read(true);
+        // Windows opens a folder only with FILE_FLAG_BACKUP_SEMANTICS, and sets its times only
+        // through a handle with FILE_WRITE_ATTRIBUTES.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            folder.access_mode(0x0100).custom_flags(0x0200_0000);
+        }
+        folder
+            .open(&first)
+            .unwrap()
+            .set_modified(two_days_ago)
+            .unwrap();
         prepare_open_folder(&dir).unwrap();
         assert!(dir.join("fresh.txt").exists());
+        assert!(!first.exists(), "a day-old value's folder goes whole");
+        assert!(second.join("p1-photo.png").exists());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;

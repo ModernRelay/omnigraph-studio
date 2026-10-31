@@ -145,15 +145,7 @@ impl Analysis {
         offset: usize,
     ) -> Option<(&gq_language::Declaration, Option<&QueryInfo>)> {
         let declaration = self.outline.declaration_at(offset)?;
-        let index = self
-            .outline
-            .declarations
-            .iter()
-            .position(|d| d == declaration)?;
-        Some((
-            declaration,
-            self.queries.get(index).and_then(Option::as_ref),
-        ))
+        Some((declaration, self.query_of(declaration)))
     }
 }
 

@@ -17,10 +17,10 @@ conversation's CLI.
 
 ## What is different in Studio
 
-- Run the CLI by the absolute path the `omnigraph_cli` tool gives you, with no `--target` or
-  `--graph`: its config makes Studio's target and this graph the default. Or run it through the
-  `omnigraph_run` tool, which adds both. Never another `omnigraph` on PATH, and never another
-  `--target`, a storage URI or `--as`.
+- Run the CLI as `./omnigraph` in your working directory (`.\omnigraph.cmd` on Windows), as
+  `AGENTS.md` says, with no `--target` or `--graph`: its config makes Studio's target and this
+  graph the default. Never another `omnigraph` on PATH, and never another `--target`, a storage
+  URI or `--as`.
 - The CLI is already set up. Skip the guide's parts on installing, `~/.omnigraph/config.yaml`,
   credentials, targets, clusters, deployments, aliases, upgrades, migrations and server policy:
   those are the person's.
@@ -34,8 +34,7 @@ conversation's CLI.
   `commit list --branch <your branch>` before trying again; never repeat a write blindly. A
   Studio refusal says "Nothing was sent": nothing was written.
 - Check a query before running it: save the schema with `schema show`, then
-  `lint --query <file> --schema <file>`. Lint works offline, so it also runs where your shell
-  has no network.
+  `lint --query <file> --schema <file>`. Lint works offline.
 
 ## Where to look
 

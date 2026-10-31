@@ -26,8 +26,7 @@ use std::time::Instant;
 use gpui::{
     App, AppContext as _, Bounds, ContentMask, Context, Entity, EventEmitter, FocusHandle,
     Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Pixels,
-    Point, Render, ScrollWheelEvent, SharedString, Size, Subscription, Task, Window, anchored,
-    canvas, deferred, point, px,
+    Point, Render, ScrollEvent, SharedString, Size, Subscription, Task, Window, canvas, point, px,
 };
 use graph_store::{
     EntryKind, Exploration, ExplorationEvent, ExplorePath, GraphSession, GroupKey, Loadable,
@@ -642,11 +641,30 @@ impl GraphCanvas {
         cx.notify();
     }
 
-    /// Lays out what the walk's changes left to lay out: called when the canvas is drawn.
+    /// Lays out what the walk's changes left to lay out: called when the canvas is drawn. A
+    /// change that leaves the walk's scene as it is drawn (a page asked for and not in yet, a
+    /// selection, a read that changes no chip) lays out nothing: with no layout under way and
+    /// no chip being dragged, the chips stay where they are. Pins and Reset layout ask for a
+    /// layout of the same scene, and go through [`Self::rebuild`].
     fn lay_out_owed(&mut self, cx: &mut Context<Self>) {
-        if self.layout_owed {
-            self.rebuild(cx);
+        if !self.layout_owed {
+            return;
         }
+        let settled = self.draws_exploration()
+            && self.layout_task.is_none()
+            && self.next_layout.is_none()
+            && !self.drag.as_ref().is_some_and(|drag| drag.moved);
+        if settled && let Some(scene) = self.explore_scene(cx) {
+            let root = self.exploration.read(cx).root().cloned();
+            if self.layout_key == Some((Mode::Explore, root)) && *self.scene == scene {
+                self.layout_owed = false;
+                return;
+            }
+            self.layout_owed = false;
+            self.lay_out_explore(scene, cx);
+            return;
+        }
+        self.rebuild(cx);
     }
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
@@ -1775,11 +1793,11 @@ impl GraphCanvas {
                             }
                         }),
                     );
-                    let choices = schema
+                    let sections = schema
                         .as_ref()
-                        .map(|schema| gq_language::builder::GroupBy::choices(schema, &group))
+                        .map(|schema| gq_language::builder::GroupBy::sections(schema, &group))
                         .unwrap_or_default();
-                    if exploring && !choices.is_empty() {
+                    if exploring && !sections.is_empty() {
                         let (this, path, current) =
                             (this.clone(), node.path.clone(), grouping.clone());
                         let group = group.clone();
@@ -1802,14 +1820,18 @@ impl GraphCanvas {
                                 None,
                                 set(None),
                             );
-                            for by in &choices {
-                                menu = menu.toggleable_entry(
-                                    by.label(),
-                                    current.as_ref() == Some(by),
-                                    IconPosition::Start,
-                                    None,
-                                    set(Some(by.clone())),
-                                );
+                            // As the tree's menu shows them (spec 005).
+                            for (heading, section) in &sections {
+                                menu = menu.separator().header(heading.clone());
+                                for by in section {
+                                    menu = menu.toggleable_entry(
+                                        by.label(),
+                                        current.as_ref() == Some(by),
+                                        IconPosition::Start,
+                                        None,
+                                        set(Some(by.clone())),
+                                    );
+                                }
                             }
                             menu
                         });
@@ -1986,7 +2008,7 @@ impl GraphCanvas {
         cx.notify();
     }
 
-    fn scroll(&mut self, event: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn scroll(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.settle_camera();
         self.camera_touched = true;
         let delta = event.delta.pixel_delta(window.line_height());
@@ -2278,13 +2300,12 @@ impl GraphCanvas {
         let summary = match self.mode() {
             Mode::Results => {
                 let count = self.scene.nodes.len();
-                let noun = if count == 1 { "node" } else { "nodes" };
                 let title = self
                     .results
                     .as_ref()
                     .map(|(_, r)| r.title.clone())
                     .unwrap_or_default();
-                format!("{title} · {count} {noun}")
+                format!("{title} · {}", studio_ui::plural(count, "node", "nodes"))
             }
             Mode::Explore => {
                 let root = exploration
@@ -2296,9 +2317,8 @@ impl GraphCanvas {
                             .unwrap_or_else(|| root.id.clone())
                     })
                     .unwrap_or_default();
-                let nodes = self.node_count;
-                let noun = if nodes == 1 { "node" } else { "nodes" };
-                format!("From {root} · {nodes} {noun}")
+                let nodes = studio_ui::plural(self.node_count, "node", "nodes");
+                format!("From {root} · {nodes}")
             }
         };
         let root_error = match (&state.root_status, self.mode()) {
@@ -2371,26 +2391,21 @@ impl GraphCanvas {
                         panel("canvas-zoom")
                             .when(!self.pinned.is_empty(), |panel| {
                                 panel.child(
-                                    studio_ui::ds::bar_icon_button(
-                                        "reset-layout",
-                                        IconName::RotateCcw,
-                                    )
-                                    .tooltip(|_window, cx| {
-                                        Tooltip::for_action(
-                                            "Reset the layout: forget the nodes you placed",
-                                            &ResetLayout,
-                                            cx,
-                                        )
-                                    })
-                                    .on_click(cx.listener(
-                                        |this, _, window, cx| {
+                                    studio_ui::ds::icon_button("reset-layout", IconName::RotateCcw)
+                                        .tooltip(|_window, cx| {
+                                            Tooltip::for_action(
+                                                "Reset the layout: forget the nodes you placed",
+                                                &ResetLayout,
+                                                cx,
+                                            )
+                                        })
+                                        .on_click(cx.listener(|this, _, window, cx| {
                                             this.reset_layout(&ResetLayout, window, cx)
-                                        },
-                                    )),
+                                        })),
                                 )
                             })
                             .child(
-                                studio_ui::ds::bar_icon_button("zoom-out", IconName::Dash)
+                                studio_ui::ds::icon_button("zoom-out", IconName::Dash)
                                     .tooltip(|_window, cx| {
                                         Tooltip::for_action("Zoom out", &ZoomOut, cx)
                                     })
@@ -2408,7 +2423,7 @@ impl GraphCanvas {
                                     })),
                             )
                             .child(
-                                studio_ui::ds::bar_icon_button("zoom-in", IconName::Plus)
+                                studio_ui::ds::icon_button("zoom-in", IconName::Plus)
                                     .tooltip(|_window, cx| {
                                         Tooltip::for_action("Zoom in", &ZoomIn, cx)
                                     })
@@ -2717,22 +2732,17 @@ impl Render for GraphCanvas {
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up_out))
-            .on_scroll_wheel(cx.listener(Self::scroll))
+            .on_scroll(cx.listener(Self::scroll))
             .on_pinch(cx.listener(Self::pinch))
             .child(canvas)
             .children(area)
             .children(body.map(|body| div().absolute().size_full().top_0().left_0().child(body)))
             .child(overlay)
-            .children(self.context_menu.as_ref().map(|(menu, position, _)| {
-                deferred(
-                    anchored()
-                        .position(*position)
-                        .anchor(gpui::Anchor::TopLeft)
-                        .snap_to_window_with_margin(px(space::MD))
-                        .child(menu.clone()),
-                )
-                .with_priority(1)
-            }))
+            .children(
+                self.context_menu
+                    .as_ref()
+                    .map(|(menu, position, _)| studio_ui::ds::menu_at(menu.clone(), *position)),
+            )
             // Nothing drawn yet: the start state says it all.
             .when(!self.scene.nodes.is_empty(), |canvas| {
                 canvas.child(self.render_caption(cx))
@@ -3082,6 +3092,57 @@ mod tests {
         canvas.update(cx, |canvas, cx| canvas.pointer_left(cx));
         cx.run_until_parked();
         assert!(!asked(cx), "stopped, and nothing says they were asked for");
+    }
+
+    /// A walk's change that leaves its scene as drawn lays out nothing: the chips stay put, and
+    /// no layout runs off the main thread for them. Before, every change laid the same scene
+    /// out again, as "+K more" did while its page was read. A change of the scene lays out.
+    #[gpui::test]
+    async fn a_change_that_moves_no_chip_lays_out_nothing(cx: &mut gpui::TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let (session, _served) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\n",
+            |_| serde_json::json!([{ "id": "p1", "label": "Ada", "n": 1 }]),
+            cx,
+        );
+        cx.run_until_parked();
+        let canvas = cx.new(|cx| GraphCanvas::new(session, cx));
+        let exploration = canvas.read_with(cx, |canvas, _| canvas.exploration.clone());
+        exploration.update(cx, |exploration, cx| {
+            exploration.root_at(NodeRef::new("Person", "p1"), cx)
+        });
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        canvas.update(cx, |canvas, cx| canvas.lay_out_owed(cx));
+        cx.run_until_parked();
+        let laid_out = canvas.read_with(cx, |canvas, _| {
+            assert!(!canvas.scene.nodes.is_empty());
+            canvas.layout_generation
+        });
+
+        canvas.update(cx, |canvas, cx| {
+            canvas.owe_layout(cx);
+            canvas.lay_out_owed(cx);
+            assert!(!canvas.layout_owed);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            canvas.read_with(cx, |canvas, _| canvas.layout_generation),
+            laid_out,
+            "the same scene is not laid out again"
+        );
+
+        exploration.update(cx, |exploration, cx| {
+            exploration.root_at(NodeRef::new("Person", "p2"), cx)
+        });
+        canvas.update(cx, |canvas, cx| canvas.lay_out_owed(cx));
+        cx.run_until_parked();
+        assert!(
+            canvas.read_with(cx, |canvas, _| canvas.layout_generation) > laid_out,
+            "another scene is"
+        );
     }
 
     /// Show on canvas of a node the exploration shows selects it there: it does not start the

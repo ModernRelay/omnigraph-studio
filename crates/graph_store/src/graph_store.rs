@@ -32,7 +32,7 @@ use gpui::App;
 pub use access::{AccessScope, Allowed};
 pub use changes::{
     ChangeFold, FoldedChange, FoldedChanges, ForkSearch, NetChange, PropertyDiff,
-    REVIEW_CHANGE_CAP, TypeCounts, contains_merge_of, plural, summary_sentence,
+    REVIEW_CHANGE_CAP, TypeCounts, contains_merge_of, summary_sentence,
 };
 pub use connection::{
     Connection, ConnectionEvent, ConnectionState, ConnectionWatch, GraphListing, ServerEntry,

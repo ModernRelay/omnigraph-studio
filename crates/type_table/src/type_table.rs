@@ -7,6 +7,7 @@ mod blob;
 mod blob_view;
 mod blob_write;
 mod dialogs;
+mod fill;
 mod grouping;
 mod model;
 mod node_page;
@@ -20,6 +21,7 @@ mod table;
 mod test_support;
 mod text_editor;
 mod types_list;
+mod words;
 mod write;
 
 use gpui::{App, AppContext as _, Context, Entity, Window};
@@ -61,7 +63,8 @@ pub fn init(cx: &mut App) {
                 id,
                 at_commit: text("at_commit"),
             };
-            open_node_page(workspace, &action, window, cx);
+            // Named as it was until it is shown: a page behind another tab reads nothing.
+            open_node_page(workspace, &action, text("label"), window, cx);
         }
     });
     // A text property's editor comes back reading the node at the head.
@@ -218,7 +221,7 @@ pub fn init(cx: &mut App) {
             cx.propagate();
         });
         workspace.register_action(|workspace, action: &OpenNodePage, window, cx| {
-            open_node_page(workspace, action, window, cx);
+            open_node_page(workspace, action, None, window, cx);
         });
         workspace.register_action(|workspace, action: &OpenTextEditor, window, cx| {
             open_text_editor(workspace, action, window, cx);
@@ -339,6 +342,7 @@ fn open_text_editor(
 fn open_node_page(
     workspace: &mut Workspace,
     action: &OpenNodePage,
+    saved_label: Option<String>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
@@ -352,7 +356,7 @@ fn open_node_page(
         action.at_commit.clone(),
     );
     workspace.open_item(key, window, cx, move |_window, cx| {
-        NodePage::new(session, type_name, id, at_commit, cx)
+        NodePage::new(session, type_name, id, at_commit, saved_label, cx)
     });
 }
 

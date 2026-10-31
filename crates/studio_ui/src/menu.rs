@@ -1,6 +1,7 @@
 //! Studio's context menu (spec 002, "Menus"). Copied from Zed's
-//! `crates/ui/src/components/context_menu.rs` at v1.23.2 (c0199504), Copyright Zed Industries,
-//! licensed GPL-3.0-or-later as Studio is, and restyled after Tower's menus: a floating card
+//! `crates/ui/src/components/context_menu.rs` at v1.23.2 (c0199504; compared at v1.26.2,
+//! c4273271, which adds only a `spacing` option for Zed's `ListItem` rows, drawn here as
+//! `MenuRow`), Copyright Zed Industries, licensed GPL-3.0-or-later as Studio is, and restyled after Tower's menus: a floating card
 //! with the modal's fill, hairline and shadow, rows 26 px high inset within its corner, the
 //! hovered or keyboard-highlighted row on a faint ink fill, quiet group headers and hairline
 //! separators. Its behaviour — keyboard navigation, submenus, actions and accessibility — is

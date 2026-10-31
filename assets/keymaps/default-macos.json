@@ -238,6 +238,8 @@
       "cmd-r": "studio_table::RefreshTable",
       "cmd-n": "studio_table::InsertRow",
       "cmd-f": "studio_table::AddFilter",
+      "cmd-shift-f": "studio_table::FilterInWords",
+      "cmd-shift-l": "studio_table::FillColumn",
       "cmd-alt-backspace": "studio_table::ClearFilters"
     }
   },
@@ -373,7 +375,8 @@
     "bindings": {
       "cmd-y": "studio_review::AcceptAndNext",
       "alt-cmd-z": "studio_review::RevertAndNext",
-      "cmd-shift-enter": "studio_review::Merge"
+      "cmd-shift-enter": "studio_review::Merge",
+      "cmd-shift-m": "studio_review::Summarize"
     }
   },
   {

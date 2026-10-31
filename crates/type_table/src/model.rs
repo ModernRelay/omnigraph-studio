@@ -1593,7 +1593,7 @@ mod tests {
     fn committed(affected: i64, parent: Option<&str>) -> WriteOutcome<ChangeOutput> {
         WriteOutcome::Committed(ChangeOutput {
             branch: "main".into(),
-            query_name: "studio_set".into(),
+            query_name: "studio_save_rows".into(),
             affected_nodes: affected,
             affected_edges: 0,
             commit: (affected > 0).then(|| CommitOutput {

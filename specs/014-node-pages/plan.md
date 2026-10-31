@@ -145,7 +145,12 @@ Four parts, built in this order; each lands on its own.
   the text editor's save lets the property's draft go too. A save, or the read after one that
   matched nothing, settles a draft only while it is as the save sent it: one retyped or let go
   in another view during the round trip stands, and nothing reopens over it
-  (`GraphSession::settle_draft_on`). Opening a cell or a field no longer
+  (`GraphSession::settle_draft_on`). A read after a field's save that matched nothing and finds
+  the value the save would have made (an earlier try whose outcome was unknown landed, or the
+  same change made elsewhere) closes the field and lets its draft go, as ⌘S's drafts do, rather
+  than naming the person's own change as another's. One write of a property is out at a time:
+  a second, from a control drawn before the first went out, is kept as the property's draft
+  (both since 2026-10-28). Opening a cell or a field no longer
   takes its draft, so Esc ends the edit and keeps it; switching branch keeps each branch's
   drafts for when it is shown again (they were dropped before). A field open when the page or
   the peek follows the window to another branch, or when the peek goes, is kept as its draft
@@ -206,7 +211,11 @@ Four parts, built in this order; each lands on its own.
   more, its count past that) when its row is first laid out, so a type with dozens of
   relationships reads only those in view, and scrolling reads the rest, each once. The peek that
   follows a table's cursor waits a moment before reading, and a hidden inspector reads nothing.
-  What the table counted for the row is shown without a read.
+  Nor does a page, or a property's text editor, that is not drawn: one restored with the
+  workspace behind another tab reads its node when it is first shown, and one behind another
+  tab when the branch moves reads it again then; the tab is named by the node's label it was
+  saved with until the page reads it (since 2026-10-29; before, each read at start and at
+  every move). What the table counted for the row is shown without a read.
 - **The relationships a node is known to have are listed first**: a group with neighbours, one
   whose count failed (its reason in the tooltip), and one with a write or its outcome out. The
   groups not counted yet follow in schema order, each with "…" until it is read; once read, a
@@ -279,6 +288,8 @@ Four parts, built in this order; each lands on its own.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-29 | Views not drawn read nothing, a write out shows again on its branch, and ⌘S reaches a page with no field open | `type_table` `a_page_not_drawn_reads_nothing` (made, then the branch moved, with no window: no read, then drawn: read), `text_editor::tests::a_tab_not_drawn_reads_nothing` (an editor in a window that draws a blank root), `a_nodes_page_reads_it_and_names_its_tab` (extended: the saved label names a restored page before it reads), `a_write_out_shows_again_on_its_branch` (main → fix → main before the write lands), `a_page_with_no_field_open_saves_its_drafts_with_cmd_s`; the Blob tab's first read asked after its draw, and only when it can start | All pass. Before: every restored page and text editor read its node at start and at every branch move, shown or not; a write's markers went with a branch switch, so coming back before it landed let the property be written again; a page's own focus sat outside its view, so ⌘S saved nothing until a field was open. A first version of the Blob tab's deferral redrew itself in a loop while waiting for the schema, caught by its tests hanging |
+| 2026-10-28 | A save that finds its own value written closes the field, one write of a property is out at a time, and markdown is made once | `type_table` `a_conflict_with_the_value_typed_closes_the_field` (a write matching nothing at a head that holds what it would write), `a_second_write_of_a_property_waits_as_a_draft`, `a_texts_markdown_is_made_once_while_it_stands` (a text kept, changed, plain, then cleared) | All pass. Before: the field reopened saying the value had changed elsewhere to what the person typed; two writes of one property could both go; the markdown views were walked with an allocation per property each frame (texts were already parsed once) |
 | 2026-10-21 | A long text's controls sit in its head | `type_table` `a_long_texts_controls_and_folded_draft_sit_in_its_head` (a page's name made long: "Open in the editor" within the head's bounds; folded with a draft, its dot there), failing with the controls appended after the text as before, the button 32 px under the head | A regression review found the long text's "Open in the editor", saving dot and "Copied" stacked under the text, each a 32 px line, the hover-only button a blank strip, and a folded text's draft without its dot |
 | 2026-10-21 | A property reads as a row with its value in a pill; a long text leaves its pill; a relationship lists its neighbours as rows | `type_table` `a_long_text_leaves_its_box_and_a_short_one_stays` (a name, an email-like value with no words to wrap at, a sentence); `studio_ui` `property_and_control_parts_draw_at_their_sizes`; the 163 other `type_table` tests unchanged (fields, drafts, conflicts, relationship writes, Blob slots); offscreen snapshots of person-000001's peek in the dev graph, at rest and with the pointer on a neighbour and on a header, and of keyset-paging in the `notes` graph | Name, email and dates in pills beside their icons; tags wrapped as pills; "contributes → Project", "knows → Person" and "worksAt → Company" over rows of marks and names, the × and the "+" only under the pointer; the note's body under a "body" fold at the full width. A first pass boxed neighbours as values with their × and "+" always shown, which read as clutter beside the reference |
 | 2026-10-21 | A field open when the view follows another branch stays a draft there | `type_table` `open_fields_stay_drafts_on_the_branch_a_page_leaves` (name refused with a 403 and opened again with its notice, title being typed), failing with the fields cleared as before; `peek` `a_refused_field_opens_again_with_its_text_and_reason` (the peek going keeps the refused text) unchanged | After the session moved to fix, main held name "Ada Lovelace" bound to "Ada" and title "Countess" bound to null, fix none, and no field stayed open. Before, both texts were lost: a field with a notice stays open after a blur, so nothing else had kept it |

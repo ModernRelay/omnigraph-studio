@@ -24,8 +24,7 @@ pub(crate) struct Starters {
 impl Starters {
     /// The processes the client of the connection from `client` to `server` was started under,
     /// from its parent up to Studio. None on other platforms, nor when Studio cannot tell which
-    /// process the client is, nor for one Studio started itself (`omnigraph_run`), which only
-    /// its connection's end tells gone.
+    /// process the client is.
     pub(crate) async fn of(client: Option<SocketAddr>, server: Option<SocketAddr>) -> Self {
         #[cfg(windows)]
         if let (Some(SocketAddr::V4(client)), Some(SocketAddr::V4(server))) = (client, server) {
@@ -306,19 +305,16 @@ pub(crate) mod stand_in {
         std::fs::create_dir_all(root).unwrap();
         let home = crate::cli_home::CliHome::write(
             root,
-            &root.join("private"),
             crate::cli_home::GatewayAccess {
                 port,
                 token: "t",
                 certificate: sends.map_or("", |(_, certificate)| certificate),
             },
             "knowledge",
-            "agent/x",
-            "main",
         )
         .unwrap();
         assert!(home.use_cli(&std::env::current_exe().unwrap()).unwrap());
-        let wrapper = run(&home.command, port, sends.map(|(sends, _)| (root, sends)));
+        let wrapper = run(&home.command(), port, sends.map(|(sends, _)| (root, sends)));
         (home, wrapper)
     }
 

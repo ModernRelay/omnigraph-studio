@@ -38,9 +38,9 @@ use studio_actions::workspace::Refresh;
 use studio_ui::ds::{Dotted as _, space};
 use studio_ui::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::{
-    ColumnDrag, ColumnResize, GridColumn, GridPlace, ROW_HEIGHT, columns_in_view, format_value,
-    grid_cell, grid_header, grid_places, is_numeric, resizable_grid_header, short_commit_id,
-    value_text,
+    ColumnDrag, ColumnResize, GridColumn, GridPlace, ROW_HEIGHT, columns_in_view, format_elapsed,
+    format_value, grid_cell, grid_header, grid_places, is_numeric, resizable_grid_header,
+    short_commit_id, value_text,
 };
 use studio_workspace::{Item, ItemEvent, ItemStatus, KeyHint, SavedItem};
 use ui::prelude::*;
@@ -50,7 +50,7 @@ use crate::analysis::Analysis;
 use crate::completion::GqCompletionProvider;
 use crate::results::{
     PlanItem, ResultGraph, ResultTable, ServerDiagnostic, SourceMap, WriteEffect, diff_page_text,
-    format_elapsed, is_branch_diff, is_plan, plan_items, rows_label, server_diagnostic, type_label,
+    is_branch_diff, is_plan, plan_items, rows_label, server_diagnostic, type_label,
 };
 
 /// How long typing pauses before the source is checked again.
@@ -90,6 +90,9 @@ struct Prepared {
     publication: Publication,
     /// Which page of a paged read (`branch diff`) this asks for, from 1; 0 for any other run.
     page: usize,
+    /// It asks for a plan (`explain`): only its answer is shown as one, whatever another
+    /// read's columns are called.
+    explain: bool,
 }
 
 /// Where a read's rows came from, as its answer says.
@@ -210,9 +213,10 @@ impl Answer {
         result: Result<ReadOutput, ReadError>,
         columns: Option<&[ResultColumn]>,
         schema: Option<Arc<SchemaModel>>,
+        explain: bool,
     ) -> Self {
         match result {
-            Ok(output) if is_plan(&output.columns) => Answer::Plan(output),
+            Ok(output) if explain && is_plan(&output.columns) => Answer::Plan(output),
             Ok(mut output) => {
                 let built = BuiltRows::new(&mut output, columns, schema);
                 Answer::Rows(output, built)
@@ -1169,7 +1173,7 @@ impl QueryEditor {
         };
         PopoverMenu::new("snapshot-picker")
             .trigger(
-                studio_ui::ds::toolbar_button("snapshot-picker-button", label)
+                studio_ui::ds::button("snapshot-picker-button", label)
                     .style(ButtonStyle::Subtle)
                     .start_icon(Icon::new(if pinned.is_some() {
                         IconName::GitCommit
@@ -1575,7 +1579,9 @@ impl QueryEditor {
                     }
                     path
                 }
-                SaveTarget::New { dir, name } => unused_path(&dir, &name),
+                SaveTarget::New { dir, name } => {
+                    return write_unused(&dir, &name, written.as_bytes()).map(Saved::Written);
+                }
             };
             studio_settings::write_atomic(&path, written.as_bytes(), studio_settings::Access::Keep)
                 .map(|()| Saved::Written(path))
@@ -2143,6 +2149,7 @@ impl QueryEditor {
             destroys: None,
             publication: Publication::Branch,
             page: 0,
+            explain: false,
         })
     }
 
@@ -2393,6 +2400,7 @@ impl QueryEditor {
                 publication: gq_language::check::statement_publication(&source),
                 // A diff answers a page at a time; this asks for its first.
                 page: usize::from(is_branch_diff(&source)),
+                explain: statement == gq_language::Statement::ExplainLoad,
                 text: source.clone(),
                 name: None,
                 label,
@@ -2480,6 +2488,7 @@ impl QueryEditor {
             destroys,
             publication,
             page: 0,
+            explain: explained,
         })
     }
 
@@ -2700,8 +2709,11 @@ impl QueryEditor {
             let elapsed = started.elapsed();
             // The rows are built off the main thread: a large answer would hold up frames.
             let columns = prepared.columns.clone();
+            let explain = prepared.explain;
             let answer = cx
-                .background_spawn(async move { Answer::of(result, columns.as_deref(), schema) })
+                .background_spawn(
+                    async move { Answer::of(result, columns.as_deref(), schema, explain) },
+                )
                 .await;
             this.update(cx, |this, cx| {
                 // A new output replaces the plan whose operator lit the text.
@@ -2729,7 +2741,12 @@ impl QueryEditor {
         elapsed: Duration,
         schema: Option<Arc<SchemaModel>>,
     ) {
-        let answer = Answer::of(result, prepared.columns.as_deref(), schema);
+        let answer = Answer::of(
+            result,
+            prepared.columns.as_deref(),
+            schema,
+            prepared.explain,
+        );
         self.show_read(prepared, read_at, answer, elapsed);
     }
 
@@ -3266,7 +3283,7 @@ impl QueryEditor {
                 if rows.next.is_some() {
                     let focus = self.main_focus(cx);
                     end.push(
-                        ds::toolbar_button("result-next-page", "Next page")
+                        ds::button("result-next-page", "Next page")
                             .style(ButtonStyle::Subtle)
                             .start_icon(Icon::new(IconName::ArrowRight))
                             .key_binding(KeyBinding::for_action_in(&NextPage, &focus, cx))
@@ -3299,7 +3316,7 @@ impl QueryEditor {
                 if let Some(graph) = rows.graph.clone() {
                     let title = format!("{} · result", rows.label);
                     end.push(
-                        ds::toolbar_button("result-canvas", "Canvas")
+                        ds::button("result-canvas", "Canvas")
                             .style(ButtonStyle::Subtle)
                             .start_icon(Icon::new(IconName::GitGraph))
                             .tooltip(Tooltip::text(format!(
@@ -3445,7 +3462,7 @@ impl QueryEditor {
             .when(self.is_stale(cx), |toolbar| {
                 let focus = focus.clone();
                 toolbar.child(
-                    studio_ui::ds::toolbar_button("newer-rows", "Newer data · Refresh")
+                    studio_ui::ds::button("newer-rows", "Newer data · Refresh")
                         .style(ButtonStyle::Tinted(ui::TintColor::Accent))
                         .disabled(busy)
                         .tooltip(move |_window, cx| {
@@ -3464,7 +3481,7 @@ impl QueryEditor {
             // A stored query's plan needs its text, which the server does not send.
             .when(self.stored.is_none(), |toolbar| {
                 toolbar.child(
-                    studio_ui::ds::toolbar_button("explain", "Explain")
+                    studio_ui::ds::button("explain", "Explain")
                         .start_icon(Icon::new(IconName::ListTree))
                         .key_binding(KeyBinding::for_action_in(&Explain, &focus, cx))
                         .tooltip({
@@ -3484,7 +3501,7 @@ impl QueryEditor {
                 )
             })
             .child(
-                studio_ui::ds::toolbar_button("run", "Run")
+                studio_ui::ds::button("run", "Run")
                     .style(ButtonStyle::Filled)
                     .start_icon(Icon::new(IconName::PlayFilled))
                     .key_binding(KeyBinding::for_action_in(&Run, &focus, cx))
@@ -3806,7 +3823,6 @@ impl QueryEditor {
     fn render_confirm(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         use studio_ui::ds::{self, size, space};
         let pending = self.pending_write.as_ref()?;
-        let (background, border) = (ds::surface::warning(cx), ds::surface::warning_border(cx));
         let (said, button) = confirm_words(&pending.prepared, &pending.branch);
         let what = match &pending.typed {
             Some(typed) => typed.what.clone(),
@@ -3824,21 +3840,11 @@ impl QueryEditor {
             None => self.confirm_focus.clone(),
         };
         Some(
-            h_flex()
+            warning_bar(what, cx)
                 .key_context("QueryConfirm")
                 .track_focus(&self.confirm_focus)
                 .on_action(cx.listener(Self::confirm_write))
                 .on_action(cx.listener(Self::cancel_write))
-                .flex_none()
-                .min_h(px(size::STRIP))
-                .px(px(space::EDGE))
-                .gap(px(space::INLINE))
-                .items_center()
-                .bg(background)
-                .border_b_1()
-                .border_color(border)
-                .child(studio_ui::ds::icon::lead(IconName::Warning).color(Color::Warning))
-                .child(div().flex_1().min_w_0().child(ds::text::body(what)))
                 .children(typed)
                 .child(
                     h_flex()
@@ -3875,7 +3881,7 @@ impl QueryEditor {
     /// is kept, and the person saves it over the file (↵ once ⌘S asked) or takes the file's
     /// text. Nothing is written over the file without it.
     fn render_disk_change(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        use studio_ui::ds::{self, size, space};
+        use studio_ui::ds::{self, space};
         let change = self.disk_change.as_ref()?;
         let name = self.path.as_deref().map(file_name).unwrap_or_default();
         let said = if change.asked {
@@ -3891,7 +3897,7 @@ impl QueryEditor {
         };
         let focus = self.file_focus.clone();
         Some(
-            h_flex()
+            warning_bar(said, cx)
                 .key_context("QueryConfirm")
                 .track_focus(&self.file_focus)
                 .on_action(
@@ -3901,16 +3907,6 @@ impl QueryEditor {
                     window.focus(&this.editor_focus, cx);
                     cx.notify();
                 }))
-                .flex_none()
-                .min_h(px(size::STRIP))
-                .px(px(space::EDGE))
-                .gap(px(space::INLINE))
-                .items_center()
-                .bg(ds::surface::warning(cx))
-                .border_b_1()
-                .border_color(ds::surface::warning_border(cx))
-                .child(studio_ui::ds::icon::lead(IconName::Warning).color(Color::Warning))
-                .child(div().flex_1().min_w_0().child(ds::text::body(said)))
                 .child(
                     h_flex()
                         .gap(px(space::XS))
@@ -3941,25 +3937,16 @@ impl QueryEditor {
     /// The bar that says the tab's file is gone, so the text it holds is on no disk: Save As
     /// keeps it elsewhere, and Save writes it back where it was.
     fn render_file_gone(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        use studio_ui::ds::{self, size, space};
+        use studio_ui::ds;
         self.file_gone.as_ref()?;
         let name = self.path.as_deref().map(file_name).unwrap_or_default();
         let focus = self.editor_focus.clone();
+        let said = format!(
+            "{name} is not on disk any more: it was moved or deleted. This is the text the tab \
+             last held; Save As keeps it, and Save writes it back where it was."
+        );
         Some(
-            h_flex()
-                .flex_none()
-                .min_h(px(size::STRIP))
-                .px(px(space::EDGE))
-                .gap(px(space::INLINE))
-                .items_center()
-                .bg(ds::surface::warning(cx))
-                .border_b_1()
-                .border_color(ds::surface::warning_border(cx))
-                .child(studio_ui::ds::icon::lead(IconName::Warning).color(Color::Warning))
-                .child(div().flex_1().min_w_0().child(ds::text::body(format!(
-                    "{name} is not on disk any more: it was moved or deleted. This is the text \
-                     the tab last held; Save As keeps it, and Save writes it back where it was."
-                ))))
+            warning_bar(said, cx)
                 .child(
                     ds::button("file-gone-save-as", "Save As…")
                         .style(ButtonStyle::Filled)
@@ -4470,14 +4457,19 @@ impl QueryEditor {
                 counts,
                 elapsed,
             } => {
-                let count =
-                    |n: i64, one: &str| format!("{n} {one}{}", if n == 1 { "" } else { "s" });
+                let count = |n: i64, one: &str, many: &str| {
+                    studio_ui::plural(usize::try_from(n).unwrap_or(0), one, many)
+                };
                 let mut facts = Vec::new();
                 if let Some((nodes, edges)) = counts {
                     facts.push(
                         ds::meta(
                             IconName::Hash,
-                            format!("{}, {}", count(*nodes, "node"), count(*edges, "edge")),
+                            format!(
+                                "{}, {}",
+                                count(*nodes, "node", "nodes"),
+                                count(*edges, "edge", "edges")
+                            ),
                         )
                         .into_any_element(),
                     );
@@ -4556,7 +4548,7 @@ impl QueryEditor {
 
     /// An outcome or a failure: its icon and title, then what to do, its facts and the place
     /// in the query the server pointed at.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn render_message(
         &self,
         icon: IconName,
@@ -4810,9 +4802,34 @@ fn param_type(param: &ParamDescriptor) -> String {
     }
 }
 
-/// `dir/name.gq`, or `dir/name-2.gq` and so on when that is taken.
-fn unused_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
-    let safe: String = name
+/// A bar across the top of the tab that holds it up (a write to confirm, its file changed or
+/// gone): the warning icon and what it says; the caller adds its actions at the end.
+fn warning_bar(said: impl Into<SharedString>, cx: &App) -> Div {
+    use studio_ui::ds::{self, size, space};
+    h_flex()
+        .flex_none()
+        .min_h(px(size::STRIP))
+        .px(px(space::EDGE))
+        .gap(px(space::INLINE))
+        .items_center()
+        .bg(ds::surface::warning(cx))
+        .border_b_1()
+        .border_color(ds::surface::warning_border(cx))
+        .child(ds::icon::lead(IconName::Warning).color(Color::Warning))
+        .child(div().flex_1().min_w_0().child(ds::text::body(said)))
+}
+
+/// Writes `contents` to `dir/name.gq`, or to `dir/name-2.gq` and so on when that is taken,
+/// and returns where. Never over a file: one made at the name between the look and the write, by
+/// the person or another program, is kept, and the next name is tried. The name is cut to 200
+/// bytes on a character's edge: a file system refuses one over 255, and the write's temporary
+/// file beside it takes a few more.
+fn write_unused(
+    dir: &std::path::Path,
+    name: &str,
+    contents: &[u8],
+) -> std::io::Result<std::path::PathBuf> {
+    let mut safe: String = name
         .chars()
         .map(|c| {
             if c.is_alphanumeric() || matches!(c, '-' | '_') {
@@ -4822,13 +4839,20 @@ fn unused_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
             }
         })
         .collect();
-    let mut candidate = dir.join(format!("{safe}.gq"));
-    let mut n = 2;
-    while candidate.exists() {
-        candidate = dir.join(format!("{safe}-{n}.gq"));
-        n += 1;
+    safe.truncate(safe.floor_char_boundary(200));
+    for n in 1.. {
+        let candidate = match n {
+            1 => dir.join(format!("{safe}.gq")),
+            n => dir.join(format!("{safe}-{n}.gq")),
+        };
+        // A name taken (a link to nothing included) is passed over without writing.
+        if candidate.symlink_metadata().is_err()
+            && studio_settings::write_new(&candidate, contents, studio_settings::Access::Keep)?
+        {
+            return Ok(candidate);
+        }
     }
-    candidate
+    unreachable!("a free name is found before the numbers run out")
 }
 
 /// A declaration's last outcome, shown on its run line.
@@ -4972,6 +4996,33 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// A new query is written beside the files of its name, never over one: `name.gq` taken,
+    /// it goes to `name-2.gq`, and what was there is kept.
+    #[test]
+    fn a_new_query_is_written_beside_files_of_its_name() {
+        let dir = std::env::temp_dir().join(format!("query-editor-unused-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            write_unused(&dir, "top people", b"first").unwrap(),
+            dir.join("top_people.gq")
+        );
+        assert_eq!(
+            write_unused(&dir, "top people", b"second").unwrap(),
+            dir.join("top_people-2.gq")
+        );
+        // A query of any name is saved: its file's name is cut to what a file system takes.
+        let long = write_unused(&dir, &"週次".repeat(150), b"long").unwrap();
+        assert!(long.file_name().unwrap().len() <= 255);
+        assert_eq!(std::fs::read(&long).unwrap(), b"long");
+        assert_eq!(std::fs::read(dir.join("top_people.gq")).unwrap(), b"first");
+        assert_eq!(
+            std::fs::read(dir.join("top_people-2.gq")).unwrap(),
+            b"second"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// The confirm bar names the whole statement, its target included when it is on a line of
     /// its own.
@@ -5211,6 +5262,41 @@ mod tests {
                 Output::Rows(rows) => rows.widths.clone(),
                 _ => panic!("no rows"),
             }
+        }
+
+        /// Only a run that explained shows its answer as a plan: a read that returns columns
+        /// named as `explain`'s are shows them as rows. Before, the column names alone decided,
+        /// so such a read's rows were drawn as a plan's operators.
+        #[gpui::test]
+        async fn only_an_explain_is_shown_as_a_plan(cx: &mut TestAppContext) {
+            init(cx);
+            let session = session(cx);
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(1, session, window, cx));
+            editor.update(cx, |editor, _| {
+                let output = || -> ReadOutput {
+                    serde_json::from_value(json!({
+                        "query_name": "people",
+                        "target": {"branch": "main"},
+                        "row_count": 1,
+                        "columns": ["tree", "depth", "node", "detail"],
+                        "rows": [{"tree": "logical", "depth": 0, "node": "Scan", "detail": ""}],
+                    }))
+                    .unwrap()
+                };
+                let at = || ReadAt::Branch("main".into());
+                editor.finish_read(people(), at(), Ok(output()), Duration::ZERO, None);
+                assert!(matches!(editor.output, Output::Rows(_)), "a read's rows");
+                let explained = Prepared {
+                    explain: true,
+                    ..people()
+                };
+                editor.finish_read(explained, at(), Ok(output()), Duration::ZERO, None);
+                assert!(
+                    matches!(editor.output, Output::Plan(_)),
+                    "an explain's plan"
+                );
+            });
         }
 
         /// A result column dragged to a width keeps it in the next result that has a column of

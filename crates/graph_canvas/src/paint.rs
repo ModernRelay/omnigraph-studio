@@ -200,7 +200,7 @@ struct Piece {
 }
 
 /// Paints the scene and records each node's chip on screen, for hit testing.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn paint(
     scene: &Scene,
     texts: &[ChipText],
@@ -884,7 +884,7 @@ fn pill_layout(
 }
 
 /// A chip centred on `at`: an optional letter mark, then the pieces of text. Returns its bounds.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn paint_pill(
     at: Point<Pixels>,
     pieces: &[Piece],

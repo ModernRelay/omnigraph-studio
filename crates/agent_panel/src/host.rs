@@ -17,20 +17,17 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     BooleanConfigOptionCapabilities, CancelNotification, ClientCapabilities,
     ClientSessionCapabilities, CloseSessionRequest, ContentBlock, DeleteSessionRequest,
-    Implementation, InitializeRequest, ListSessionsRequest, LoadSessionRequest, McpServer,
-    McpServerStdio, NewSessionRequest, PermissionOptionKind, PromptRequest,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
-    SessionConfigOptionValue, SessionConfigOptionsCapabilities, SessionId, SessionInfo,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason, TextContent,
+    Implementation, InitializeRequest, ListSessionsRequest, LoadSessionRequest, NewSessionRequest,
+    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    ResumeSessionRequest, SessionConfigId, SessionConfigOption, SessionConfigOptionValue,
+    SessionConfigOptionsCapabilities, SessionId, SessionInfo, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, StopReason, TextContent,
 };
 use agent_client_protocol::{
     AcpAgent, AcpAgentConfig, Agent, ConnectionTo, LineDirection, SentRequest,
 };
 use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
-
-use crate::tools;
 
 /// Lines of the agent's stderr kept for the "stopped" state.
 const STDERR_LINES: usize = 20;
@@ -66,15 +63,19 @@ pub struct AgentLaunch {
     pub env: BTreeMap<String, String>,
 }
 
+impl AgentLaunch {
+    /// The agent the settings name, with codex-acp starting unsandboxed ([`crate::codex`]).
+    pub fn new(command: Vec<String>, mut env: BTreeMap<String, String>) -> Self {
+        crate::codex::unsandbox(&command, &mut env);
+        Self { command, env }
+    }
+}
+
 /// One conversation on the agent.
 #[derive(Debug, Clone)]
 pub struct SessionLaunch {
     /// The session's working directory.
     pub cwd: PathBuf,
-    /// The stdio MCP server the agent starts for it: Studio's own executable as `mcp-proxy`,
-    /// with the conversation's own socket.
-    pub mcp_command: PathBuf,
-    pub mcp_args: Vec<String>,
     /// A session to come back to, when the agent can load or resume one.
     pub resume: Option<String>,
 }
@@ -99,9 +100,6 @@ pub enum Opened {
 }
 
 pub enum HostEvent {
-    /// The adapter the agent runs as, before anything of the session: a loaded session replays
-    /// its tool calls before `Ready`, and each is told apart by its adapter.
-    Adapter(tools::Adapter),
     /// The session is open.
     Ready {
         agent: String,
@@ -171,12 +169,15 @@ pub enum ConnectionCommand {
 struct Routes {
     sessions: HashMap<SessionId, mpsc::UnboundedSender<HostEvent>>,
     early: HashMap<SessionId, VecDeque<SessionUpdate>>,
-    /// The tool calls that are Studio's own, by id, as their first update said: Codex asks
-    /// permission for an MCP call with its id alone.
-    studio_calls: HashMap<String, tools::StudioTool>,
+    /// The sessions in `early` in the order they began keeping updates, the oldest first (and
+    /// ids since let go, skipped): a new one takes the oldest's place when they are full.
+    early_order: VecDeque<SessionId>,
     /// Sessions their conversation closed: an update that comes after is not kept as early,
     /// where it would take the place of a session about to open.
     closed: HashSet<SessionId>,
+    /// The sessions in `closed` in the order they closed, the oldest first (and ids since
+    /// opened again, skipped): the oldest is forgotten first.
+    closed_order: VecDeque<SessionId>,
     /// Sessions the agent is asked to close for a conversation whose panel let go of them, until
     /// it answers: a load sent before that answer runs beside the close, which can take the
     /// session from under it.
@@ -200,31 +201,16 @@ enum Claim {
 
 /// The most closed sessions remembered, so their late updates are dropped.
 const CLOSED_SESSIONS: usize = 256;
-/// The most of Studio's tool calls remembered for their permission requests.
-const STUDIO_CALLS: usize = 256;
+
+/// Drops from `order` the ids `kept` no longer holds once it is past twice `bound`, so an order
+/// whose ids come and go stays bounded.
+fn compact(order: &mut VecDeque<SessionId>, bound: usize, kept: impl Fn(&SessionId) -> bool) {
+    if order.len() > 2 * bound {
+        order.retain(|id| kept(id));
+    }
+}
 
 impl Routes {
-    /// Remembers a tool call that is one of Studio's tools, by what the adapter said of it.
-    fn note_tool_call(&mut self, adapter: tools::Adapter, update: &SessionUpdate) {
-        let (id, studio) = match update {
-            SessionUpdate::ToolCall(call) => (
-                &call.tool_call_id,
-                tools::StudioTool::of(adapter, call.meta.as_ref(), call.raw_input.as_ref()),
-            ),
-            SessionUpdate::ToolCallUpdate(call) => (
-                &call.tool_call_id,
-                tools::StudioTool::of(adapter, call.meta.as_ref(), call.fields.raw_input.as_ref()),
-            ),
-            _ => return,
-        };
-        if let Some(studio) = studio {
-            if self.studio_calls.len() >= STUDIO_CALLS {
-                self.studio_calls.clear();
-            }
-            self.studio_calls.insert(id.to_string(), studio);
-        }
-    }
-
     fn update(&mut self, session: SessionId, update: SessionUpdate) {
         match self.sessions.get(&session) {
             Some(events) => {
@@ -232,14 +218,28 @@ impl Routes {
             }
             None if self.closed.contains(&session) => {}
             // Kept for a session about to be routed (a load's replay can come first), for a
-            // few sessions at a time.
-            None if self.early.contains_key(&session) || self.early.len() < EARLY_SESSIONS => {
+            // few sessions at a time: a new one takes the place of the one that began longest
+            // ago, so sessions never routed (strays) do not keep one about to open from its own.
+            None => {
+                if !self.early.contains_key(&session) {
+                    if self.early.len() >= EARLY_SESSIONS {
+                        while let Some(oldest) = self.early_order.pop_front() {
+                            if self.early.remove(&oldest).is_some() {
+                                break;
+                            }
+                        }
+                    }
+                    self.early_order.push_back(session.clone());
+                    let early = &self.early;
+                    compact(&mut self.early_order, EARLY_SESSIONS, |id| {
+                        early.contains_key(id)
+                    });
+                }
                 let early = self.early.entry(session).or_default();
                 if early.len() < EARLY_UPDATES {
                     early.push_back(update);
                 }
             }
-            None => {}
         }
     }
 
@@ -260,10 +260,20 @@ impl Routes {
             .is_some_and(|routed| routed.same_receiver(events))
         {
             self.sessions.remove(session);
-            if self.closed.len() >= CLOSED_SESSIONS {
-                self.closed.clear();
+            // The session closed longest ago is forgotten first: its late updates are over.
+            if self.closed.insert(session.clone()) {
+                self.closed_order.push_back(session.clone());
+                while self.closed.len() > CLOSED_SESSIONS {
+                    let Some(oldest) = self.closed_order.pop_front() else {
+                        break;
+                    };
+                    self.closed.remove(&oldest);
+                }
+                let closed = &self.closed;
+                compact(&mut self.closed_order, CLOSED_SESSIONS, |id| {
+                    closed.contains(id)
+                });
             }
-            self.closed.insert(session.clone());
             if closing {
                 self.closing.insert(session.clone());
             } else {
@@ -305,6 +315,16 @@ impl Routes {
         }
         self.add(session, events);
         Claim::Routed
+    }
+
+    /// Waits for `session` to be free of every conversation and of a close the agent has not
+    /// answered, as its delete must; `None` when it is free now.
+    fn until_free(&mut self, session: &SessionId) -> Option<oneshot::Receiver<()>> {
+        let held = self.sessions.contains_key(session) || self.closing.contains(session);
+        match held.then(|| self.wait(session.clone())) {
+            Some(Claim::Wait(freed)) => Some(freed),
+            _ => None,
+        }
     }
 
     /// Waits for `session` to be freed. Conversations that stopped waiting (their panel let go,
@@ -423,10 +443,7 @@ async fn connect(
         if let Ok(mut lines) = stderr.lock() {
             // Cut by bytes, the budget's unit, on a character: a long line cut by characters
             // could still be over the budget and push itself out.
-            let mut end = line.len().min(STDERR_BYTES);
-            while !line.is_char_boundary(end) {
-                end -= 1;
-            }
+            let end = line.floor_char_boundary(STDERR_BYTES);
             lines.push_back(line[..end].to_owned());
             while lines.len() > STDERR_LINES
                 || lines.iter().map(String::len).sum::<usize>() > STDERR_BYTES
@@ -438,18 +455,12 @@ async fn connect(
 
     let updates = routes.clone();
     let permissions = routes.clone();
-    // Known once the agent answers `initialize`, before any session or permission request.
-    let adapter: Arc<Mutex<tools::Adapter>> = Arc::default();
-    let asked_by = adapter.clone();
-    let noted_by = adapter.clone();
     agent_client_protocol::Client
         .builder()
         .name("omnigraph-studio")
         .on_receive_notification(
             async move |notification: SessionNotification, _connection| {
-                let adapter = noted_by.lock().map(|adapter| *adapter).unwrap_or_default();
                 if let Ok(mut routes) = updates.lock() {
-                    routes.note_tool_call(adapter, &notification.update);
                     routes.update(notification.session_id, notification.update);
                 }
                 Ok(())
@@ -458,35 +469,6 @@ async fn connect(
         )
         .on_receive_request(
             async move |request: RequestPermissionRequest, responder, connection| {
-                let adapter = asked_by.lock().map(|adapter| *adapter).unwrap_or_default();
-                let call = &request.tool_call;
-                let studio = tools::StudioTool::of(
-                    adapter,
-                    call.meta.as_ref(),
-                    call.fields.raw_input.as_ref(),
-                )
-                .or_else(|| {
-                    let routes = permissions.lock().ok()?;
-                    routes
-                        .studio_calls
-                        .get(&call.tool_call_id.to_string())
-                        .copied()
-                });
-                // Studio's reads are read-only and its writes go through Studio's own approval
-                // setting, so the agent's prompt for them is allowed at once, for this call
-                // alone. Offered no allow-once (a lasting allow, or a refusal, first), the
-                // person is asked, as for any other tool.
-                if studio.is_some()
-                    && let Some(allow) = request
-                        .options
-                        .iter()
-                        .find(|option| option.kind == PermissionOptionKind::AllowOnce)
-                {
-                    let outcome = RequestPermissionOutcome::Selected(
-                        SelectedPermissionOutcome::new(allow.option_id.clone()),
-                    );
-                    return responder.respond(RequestPermissionResponse::new(outcome));
-                }
                 let events = permissions
                     .lock()
                     .ok()
@@ -529,18 +511,6 @@ async fn connect(
                 .await?;
             let capabilities = &initialized.agent_capabilities;
             let sessions = &capabilities.session_capabilities;
-            let adapter = {
-                let named = initialized
-                    .agent_info
-                    .as_ref()
-                    .map_or(tools::Adapter::Other, |info| {
-                        tools::Adapter::named(&info.name)
-                    });
-                if let Ok(mut shared) = adapter.lock() {
-                    *shared = named;
-                }
-                named
-            };
             let agent = AgentInfo {
                 name: initialized
                     .agent_info
@@ -573,7 +543,6 @@ async fn connect(
                         commands,
                     } => {
                         // Already in `opening`, from `AgentConnection::open`.
-                        events.unbounded_send(HostEvent::Adapter(adapter)).ok();
                         let session = open_session(
                             connection.clone(),
                             launch,
@@ -601,18 +570,23 @@ async fn connect(
                     ConnectionCommand::Delete { session, reply } => {
                         let connection_for_delete = connection.clone();
                         let can_delete = agent.delete;
+                        let routes = routes.clone();
                         connection.spawn(async move {
-                            let result = if can_delete {
+                            let session = SessionId::new(session);
+                            // A conversation that holds the session lets it go first, cancelled
+                            // and closed: deleted under it, the session would be deleted
+                            // mid-turn, then closed once gone.
+                            let result = if !can_delete {
+                                Err("The agent cannot delete its conversations.".to_owned())
+                            } else if let Err(reason) = free(&routes, &session).await {
+                                Err(reason)
+                            } else {
                                 connection_for_delete
-                                    .send_request(DeleteSessionRequest::new(SessionId::new(
-                                        session,
-                                    )))
+                                    .send_request(DeleteSessionRequest::new(session))
                                     .block_task()
                                     .await
                                     .map(|_| ())
                                     .map_err(|error| error.to_string())
-                            } else {
-                                Err("The agent cannot delete its conversations.".to_owned())
                             };
                             reply.send(result).ok();
                             Ok(())
@@ -654,9 +628,6 @@ async fn open_session(
             opening.retain(|waiting| !waiting.same_receiver(&events));
         }
     };
-    let mcp =
-        McpServerStdio::new("omnigraph", launch.mcp_command.clone()).args(launch.mcp_args.clone());
-    let mcp_servers = vec![McpServer::Stdio(mcp)];
     // What the panel sends while the session opens, for the session once it is open.
     let mut held = Vec::new();
     // Come back to the earlier conversation when the agent can load it (with its messages) or
@@ -686,20 +657,16 @@ async fn open_session(
             return Ok(());
         }
         if can.load {
-            let request = connection.send_request(
-                LoadSessionRequest::new(id.clone(), launch.cwd.clone())
-                    .mcp_servers(mcp_servers.clone()),
-            );
+            let request =
+                connection.send_request(LoadSessionRequest::new(id.clone(), launch.cwd.clone()));
             let loaded = open_request(&connection, request, &events, &mut commands, &mut held);
             if let Ok(loaded) = loaded.await {
                 opened = Some((id.clone(), Opened::Loaded));
                 config_options = loaded.config_options.unwrap_or_default();
             }
         } else {
-            let request = connection.send_request(
-                ResumeSessionRequest::new(id.clone(), launch.cwd.clone())
-                    .mcp_servers(mcp_servers.clone()),
-            );
+            let request =
+                connection.send_request(ResumeSessionRequest::new(id.clone(), launch.cwd.clone()));
             let resumed = open_request(&connection, request, &events, &mut commands, &mut held);
             if let Ok(resumed) = resumed.await {
                 opened = Some((id.clone(), Opened::Resumed));
@@ -721,8 +688,7 @@ async fn open_session(
     let (session_id, opened) = match opened {
         Some(opened) => opened,
         None => {
-            let request = connection
-                .send_request(NewSessionRequest::new(launch.cwd.clone()).mcp_servers(mcp_servers));
+            let request = connection.send_request(NewSessionRequest::new(launch.cwd.clone()));
             let created = open_request(&connection, request, &events, &mut commands, &mut held);
             match created.await {
                 Ok(created) => {
@@ -875,6 +841,29 @@ impl NotRouted {
                 failed: false,
             })
             .ok();
+    }
+}
+
+/// Waits, at most [`FREED_WITHIN`], for `session` to be free ([`Routes::until_free`]).
+async fn free(routes: &SharedRoutes, session: &SessionId) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + FREED_WITHIN;
+    loop {
+        let freed = routes
+            .lock()
+            .ok()
+            .and_then(|mut routes| routes.until_free(session));
+        let Some(freed) = freed else {
+            return Ok(());
+        };
+        let freed = futures::FutureExt::fuse(freed);
+        let late = futures::FutureExt::fuse(smol::Timer::at(deadline));
+        futures::pin_mut!(freed, late);
+        futures::select_biased! {
+            _ = freed => {}
+            _ = late => {
+                return Err("the conversation is still open at the agent".to_owned());
+            }
+        }
     }
 }
 
@@ -1112,28 +1101,6 @@ mod tests {
         assert_eq!(error_words(&bare), "Internal error");
     }
 
-    /// Codex asks permission for an MCP call by its id alone: the call is Studio's tool by what
-    /// its first update said.
-    #[test]
-    fn a_tool_call_is_remembered_as_studios_by_its_first_update() {
-        use agent_client_protocol::schema::v1::ToolCall;
-        let mut routes = Routes::default();
-        let call = |id: &str, server: &str| {
-            SessionUpdate::ToolCall(ToolCall::new(id.to_owned(), "Call").raw_input(
-                serde_json::json!({ "server": server, "tool": "omnigraph_run", "arguments": {} }),
-            ))
-        };
-        routes.note_tool_call(tools::Adapter::Codex, &call("t1", "omnigraph"));
-        routes.note_tool_call(tools::Adapter::Codex, &call("t2", "elsewhere"));
-        routes.note_tool_call(tools::Adapter::Other, &call("t3", "omnigraph"));
-        assert_eq!(routes.studio_calls.get("t1"), Some(&tools::StudioTool::Run));
-        assert!(!routes.studio_calls.contains_key("t2"));
-        assert!(
-            !routes.studio_calls.contains_key("t3"),
-            "only by its adapter's word"
-        );
-    }
-
     fn chunk(text: &str) -> SessionUpdate {
         SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
             text,
@@ -1154,8 +1121,6 @@ mod tests {
             .unbounded_send(ConnectionCommand::Open {
                 launch: SessionLaunch {
                     cwd: std::env::temp_dir(),
-                    mcp_command: "studio".into(),
-                    mcp_args: Vec::new(),
                     resume: None,
                 },
                 events,
@@ -1172,6 +1137,32 @@ mod tests {
             exited |= matches!(event, HostEvent::Exited { failed: true, .. });
         }
         assert!(exited, "the conversation is told the agent stopped");
+    }
+
+    /// A delete waits for the session to be free: routed to a conversation, it is freed when that
+    /// one lets go; being closed, when the agent answers the close.
+    #[test]
+    fn a_session_is_free_once_let_go_and_its_close_answered() {
+        let mut routes = Routes::default();
+        let session = SessionId::new("a");
+        assert!(routes.until_free(&session).is_none(), "nobody holds it");
+        let (tx, _rx) = mpsc::unbounded();
+        routes.add(session.clone(), tx.clone());
+        let mut freed = routes
+            .until_free(&session)
+            .expect("a conversation holds it");
+        assert!(matches!(freed.try_recv(), Ok(None)));
+        assert!(routes.remove(&session, &tx, true));
+        assert!(
+            matches!(freed.try_recv(), Ok(None)),
+            "the close is not answered yet"
+        );
+        let mut closed = routes
+            .until_free(&session)
+            .expect("the agent is closing it");
+        routes.close_answered(&session);
+        assert!(freed.try_recv().is_err() && closed.try_recv().is_err());
+        assert!(routes.until_free(&session).is_none());
     }
 
     #[test]
@@ -1206,6 +1197,11 @@ mod tests {
         for n in 0..EARLY_SESSIONS * 2 {
             routes.update(SessionId::new(format!("stray-{n}")), chunk("x"));
         }
+        assert!(routes.early.len() <= EARLY_SESSIONS);
+        // A session about to open keeps its updates however many strays came first: the oldest
+        // stray gives its place.
+        routes.update(SessionId::new("about-to-open"), chunk("x"));
+        assert!(routes.early.contains_key(&SessionId::new("about-to-open")));
         assert!(routes.early.len() <= EARLY_SESSIONS);
 
         // The session reopened by another conversation keeps its route when the first one

@@ -15,6 +15,11 @@ pub const SCHEME: &str = "omnigraph-studio";
 /// The longest query text a link may fill in; a longer one is refused rather than cut.
 pub const QUERY_TEXT_MAX: usize = 64 * 1024;
 
+/// The longest link read at all: the longest query text, each of its bytes percent-encoded as
+/// three, and room for the rest. A longer one is refused before it is parsed, whose cost grows
+/// with it.
+const LINK_MAX: usize = QUERY_TEXT_MAX * 3 + 4 * 1024;
+
 /// Where a link points: a server Studio knows, a graph on it, and optionally a branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
@@ -52,6 +57,12 @@ impl DeepLink {
 
 /// Reads a link, or says what is wrong with it.
 pub fn parse(link: &str) -> Result<DeepLink, String> {
+    if link.len() > LINK_MAX {
+        return Err(format!(
+            "The link is longer than {} KB; open its query from a file instead.",
+            LINK_MAX / 1024
+        ));
+    }
     let url = Url::parse(link.trim()).map_err(|_| "This is not a Studio link.".to_owned())?;
     if url.scheme() != SCHEME {
         return Err(format!("Studio opens {SCHEME}:// links only."));
@@ -175,5 +186,17 @@ mod tests {
             "a".repeat(QUERY_TEXT_MAX + 1)
         );
         assert!(parse(&long).unwrap_err().contains("longer than"));
+        // The longest text, every byte encoded, still reads; a link past that is refused unread.
+        let encoded = format!(
+            "omnigraph-studio://query?server=http://x&graph=g&text={}",
+            "%41".repeat(QUERY_TEXT_MAX)
+        );
+        assert!(matches!(parse(&encoded), Ok(DeepLink::Query { .. })));
+        let huge = format!("{encoded}{}", "a".repeat(LINK_MAX));
+        assert!(
+            parse(&huge)
+                .unwrap_err()
+                .starts_with("The link is longer than")
+        );
     }
 }

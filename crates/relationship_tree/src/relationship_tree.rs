@@ -24,7 +24,7 @@ use gpui::{
     Focusable, KeyContext, KeyDownEvent, ListSizingBehavior, Render, ScrollStrategy, Subscription,
     UniformListScrollHandle, Window, uniform_list,
 };
-use gq_language::builder::{GroupBy, GroupOn};
+use gq_language::builder::GroupBy;
 use graph_store::{
     Entry, EntryKind, Exploration, ExplorationEvent, GraphSession, Loadable, NodeRef, SessionEvent,
 };
@@ -1137,7 +1137,7 @@ impl RelationshipTree {
             .anchor(gpui::Anchor::TopRight)
             .menu(move |window, cx| {
                 // Built when the menu opens, not for every row drawn.
-                let choices = GroupBy::choices(&schema, &group);
+                let sections = GroupBy::sections(&schema, &group);
                 let (exploration, group, path, current) = (
                     exploration.clone(),
                     group.clone(),
@@ -1166,20 +1166,8 @@ impl RelationshipTree {
                         None,
                         set(None),
                     );
-                    for (on, title) in [
-                        (GroupOn::Node, group.other_type.clone()),
-                        (GroupOn::Edge, group.edge.clone()),
-                        (
-                            GroupOn::Relationship,
-                            format!("{}'s relationships", group.other_type),
-                        ),
-                    ] {
-                        let section: Vec<&GroupBy> =
-                            choices.iter().filter(|by| by.on == on).collect();
-                        if section.is_empty() {
-                            continue;
-                        }
-                        menu = menu.separator().header(title);
+                    for (heading, section) in &sections {
+                        menu = menu.separator().header(heading.clone());
                         for by in section {
                             menu = menu.toggleable_entry(
                                 by.label(),

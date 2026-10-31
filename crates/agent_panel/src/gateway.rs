@@ -12,7 +12,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use futures::channel::{mpsc, oneshot};
@@ -30,7 +30,65 @@ use smol::net::{TcpListener, TcpStream};
 
 use crate::gateway_rules::{self, Incoming, Sandbox, Verdict, WriteKind, WriteSummary};
 use crate::requester::Starters;
-use crate::socket::Standing;
+
+/// The most connections the gateway's listener serves at once, so connections held open by
+/// another process cannot use up Studio's file descriptors.
+const MAX_CONNECTIONS: usize = 64;
+
+/// How long a listener waits after a connection it could not take, before taking the next.
+const ACCEPT_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Whether a connection's peer proved itself to the listener (the gateway's token, checked
+/// once a request's headers are in): its server says so, and a full listener lets go of
+/// connections that have not first ([`serve_each`]).
+#[derive(Clone, Default)]
+struct Standing(Arc<AtomicBool>);
+
+impl Standing {
+    fn prove(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    fn proved(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// Serves each connection `accept` takes on a task of its own, at most [`MAX_CONNECTIONS`] at
+/// once, telling `serve` the connection's [`Standing`] for it to raise. A full listener closes
+/// the oldest connection whose peer has not proved itself to take the next (its task is
+/// dropped), so connections another local process holds open never keep out one that proves
+/// itself; with every one proved, the next is closed unread. A connection it could not take
+/// (out of descriptors, reset before it was taken) ends that connection, not the listener.
+async fn serve_each<C, A, S>(mut accept: impl FnMut() -> A, serve: impl Fn(C, Standing) -> S)
+where
+    A: Future<Output = std::io::Result<C>>,
+    S: Future<Output = ()> + Send + 'static,
+{
+    // Oldest first.
+    let mut connections: Vec<(smol::Task<()>, Standing)> = Vec::new();
+    loop {
+        let Ok(connection) = accept().await else {
+            smol::Timer::after(ACCEPT_RETRY).await;
+            continue;
+        };
+        connections.retain(|(task, _)| !task.is_finished());
+        if connections.len() >= MAX_CONNECTIONS {
+            match connections
+                .iter()
+                .position(|(_, standing)| !standing.proved())
+            {
+                Some(oldest) => drop(connections.remove(oldest)),
+                None => {
+                    drop(connection);
+                    continue;
+                }
+            }
+        }
+        let standing = Standing::default();
+        connections.push((smol::spawn(serve(connection, standing.clone())), standing));
+    }
+}
 
 /// The most a request's line and headers may take.
 const MAX_HEAD: usize = 64 * 1024;
@@ -168,7 +226,7 @@ impl Gateway {
         });
         async move {
             let Some(listener) = listener else { return };
-            crate::socket::serve_each(
+            serve_each(
                 || listener.accept(),
                 |(stream, _), standing| {
                     serve_connection(stream, acceptor.clone(), shared.clone(), standing)
@@ -1084,12 +1142,113 @@ async fn stream_back(
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::time::Duration;
 
     use futures::StreamExt as _;
     use http_client::FakeHttpClient;
     use http_client::http::Response;
 
     use super::*;
+
+    /// A connection as the listener test offers it: it notes its id when it is closed, whether
+    /// served or closed unread.
+    struct Offered {
+        id: usize,
+        proves: bool,
+        closed: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl Drop for Offered {
+        fn drop(&mut self) {
+            self.closed.lock().unwrap().push(self.id);
+        }
+    }
+
+    /// A full listener closes the oldest connection whose peer has not proved itself to take
+    /// the next, so connections another local process holds open, idle within their bound,
+    /// never keep out one that proves itself (the agent's CLI with its token). With every one
+    /// proved, the next is closed unread.
+    /// A full listener closes the oldest connection whose peer has not proved itself to take
+    /// the next, so connections another local process holds open, idle within their bound,
+    /// never keep out one that proves itself (the agent's CLI with its token). With every one
+    /// proved, the next is closed unread.
+    #[test]
+    fn a_full_listener_lets_go_of_the_oldest_unproved_connection() {
+        smol::block_on(async {
+            let (offer, offered) = smol::channel::unbounded::<Offered>();
+            let closed = Arc::new(Mutex::new(Vec::new()));
+            let served = Arc::new(Mutex::new(Vec::new()));
+            let listening = {
+                let served = served.clone();
+                smol::spawn(serve_each(
+                    move || {
+                        let offered = offered.clone();
+                        async move { offered.recv().await.map_err(std::io::Error::other) }
+                    },
+                    move |connection: Offered, standing: Standing| {
+                        served.lock().unwrap().push(connection.id);
+                        if connection.proves {
+                            standing.prove();
+                        }
+                        async move {
+                            let _held = connection;
+                            futures::future::pending::<()>().await;
+                        }
+                    },
+                ))
+            };
+            let mut next = 0;
+            let mut connect = |proves: bool| {
+                let connection = Offered {
+                    id: next,
+                    proves,
+                    closed: closed.clone(),
+                };
+                next += 1;
+                offer.try_send(connection).unwrap();
+            };
+            async fn until(done: impl Fn() -> bool) {
+                let by = Instant::now() + Duration::from_secs(5);
+                while !done() {
+                    assert!(Instant::now() < by, "the listener never took it");
+                    smol::Timer::after(Duration::from_millis(1)).await;
+                }
+            }
+            let taken = |n: usize| served.lock().unwrap().len() == n;
+            // A dropped task's future is dropped on the executor, so in no set order.
+            let closed_now = || {
+                let mut closed = closed.lock().unwrap().clone();
+                closed.sort_unstable();
+                closed
+            };
+
+            // The agent's CLI, then connections another process opens and holds.
+            connect(true);
+            for _ in 1..MAX_CONNECTIONS {
+                connect(false);
+            }
+            until(|| taken(MAX_CONNECTIONS)).await;
+            assert!(closed_now().is_empty());
+            // Full: the next, proved or not, takes the oldest unproved one's place.
+            connect(false);
+            until(|| taken(MAX_CONNECTIONS + 1) && closed_now() == [1]).await;
+            connect(true);
+            until(|| taken(MAX_CONNECTIONS + 2) && closed_now() == [1, 2]).await;
+            // Proved ones take every unproved one's place, the one that took the first's
+            // included, and the CLI's stays.
+            for _ in 3..=MAX_CONNECTIONS {
+                connect(true);
+            }
+            let expected: Vec<usize> = (1..=MAX_CONNECTIONS).collect();
+            until(|| taken(2 * MAX_CONNECTIONS) && closed_now() == expected).await;
+            // With every one proved, the next is closed unread.
+            connect(false);
+            until(|| closed_now().len() == MAX_CONNECTIONS + 1).await;
+            assert_eq!(closed_now().last(), Some(&(2 * MAX_CONNECTIONS)));
+            assert!(taken(2 * MAX_CONNECTIONS), "closed unread");
+            drop(listening);
+        });
+    }
 
     const AGENT: &str = "agent/20261013-101500";
 
@@ -2029,15 +2188,8 @@ mod tests {
                 std::env::temp_dir().join(format!("studio-gateway-tls-{}", std::process::id()));
             std::fs::remove_dir_all(&cwd).ok();
             std::fs::create_dir_all(&cwd).unwrap();
-            let home = crate::cli_home::CliHome::write(
-                &cwd,
-                &cwd.join("private"),
-                gateway.access(),
-                "knowledge",
-                AGENT,
-                "main",
-            )
-            .unwrap();
+            let home =
+                crate::cli_home::CliHome::write(&cwd, gateway.access(), "knowledge").unwrap();
             let port = gateway.port;
             let (events_tx, _events) = mpsc::unbounded();
             let _serve = smol::spawn(gateway.serve(client, sandbox(), events_tx));
@@ -2090,8 +2242,8 @@ mod tests {
 
     /// A real omnigraph CLI that reads Omnigraph's version-1 operator configuration is chosen
     /// for the home Studio writes, and reaches the gateway over HTTPS with that home's token and
-    /// certificate, both as the agent's shell runs it (the wrapper) and as `omnigraph_run` does
-    /// (the private home): each request reaches the server with the person's token. The fake
+    /// certificate as the agent's shell runs it (the wrapper): the request reaches the server
+    /// with the person's token. The fake
     /// server's answer need not be one the CLI reads; what reached it is what is checked.
     #[test]
     #[ignore = "needs: OMNIGRAPH_STUDIO_LIVE_CLI, an omnigraph CLI of Omnigraph v0.14.0 or later"]
@@ -2106,15 +2258,8 @@ mod tests {
                 std::env::temp_dir().join(format!("studio-gateway-live-{}", std::process::id()));
             std::fs::remove_dir_all(&cwd).ok();
             std::fs::create_dir_all(&cwd).unwrap();
-            let home = crate::cli_home::CliHome::write(
-                &cwd,
-                &cwd.join("private"),
-                gateway.access(),
-                "knowledge",
-                AGENT,
-                "main",
-            )
-            .unwrap();
+            let home =
+                crate::cli_home::CliHome::write(&cwd, gateway.access(), "knowledge").unwrap();
             let (events_tx, _events) = mpsc::unbounded();
             let _serve = smol::spawn(gateway.serve(client, sandbox(), events_tx));
             let chosen = crate::cli_home::choose_cli(&home, vec![cli]).await;
@@ -2122,10 +2267,7 @@ mod tests {
                 panic!("{why}");
             }
             let args = ["branch", "list", "--json"];
-            let plan = crate::cli_home::check_run_args(&args.map(str::to_owned), &cwd, "knowledge")
-                .unwrap();
-            let (run, _) = crate::cli_home::run(&home, &cwd, plan).await;
-            let shell = smol::process::Command::new(&home.command)
+            let shell = smol::process::Command::new(home.command())
                 .args(args)
                 .stdin(std::process::Stdio::null())
                 .output()
@@ -2133,7 +2275,7 @@ mod tests {
                 .unwrap();
             let shell = String::from_utf8_lossy(&shell.stderr).into_owned();
             let seen = seen.lock().unwrap();
-            assert_eq!(seen.len(), 2, "omnigraph_run: {run}\nshell: {shell}");
+            assert_eq!(seen.len(), 1, "shell: {shell}");
             for (method, uri, auth, contract, _) in seen.iter() {
                 assert_eq!(
                     (method.as_str(), uri.as_str()),
@@ -2170,7 +2312,7 @@ mod end_to_end {
 
     /// Runs the conversation's wrapper; returns success, stdout and stderr.
     fn run(home: &CliHome, args: &[&str]) -> (bool, String, String) {
-        let output = Command::new(&home.command)
+        let output = Command::new(home.command())
             .args(args)
             .stdin(std::process::Stdio::null())
             .output()
@@ -2200,15 +2342,7 @@ mod end_to_end {
         std::fs::create_dir_all(&cwd).unwrap();
 
         let mut gateway = Gateway::bind().unwrap();
-        let home = CliHome::write(
-            &cwd,
-            &cwd.join("private"),
-            gateway.access(),
-            &graph,
-            &branch,
-            "main",
-        )
-        .unwrap();
+        let home = CliHome::write(&cwd, gateway.access(), &graph).unwrap();
         let (events_tx, mut events) = mpsc::unbounded();
         let serve = gateway.serve(
             client,
@@ -2257,33 +2391,6 @@ mod end_to_end {
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             run(&home, &args)
         };
-
-        // The same CLI run from Studio for a sandboxed agent (`omnigraph_run`): a read returned
-        // whole, and one saved to a file in the working directory.
-        let read = [
-            "query",
-            "-e",
-            "query q() { match { $p: Person } return { count($p) as n } }",
-            "--json",
-        ]
-        .map(str::to_owned);
-        let mut plan = cli_home::check_run_args(&read, &cwd, &graph).unwrap();
-        let (text, failed) = smol::block_on(cli_home::run(&home, &cwd, plan.clone()));
-        assert!(
-            !failed && text.starts_with("exit 0") && text.contains("\"rows\""),
-            "{text}"
-        );
-        plan.save_to = Some(cli_home::RunFile {
-            parts: cli_home::inside(&cwd, "count.json").unwrap(),
-            output: true,
-        });
-        let (text, failed) = smol::block_on(cli_home::run(&home, &cwd, plan));
-        assert!(!failed && text.contains("output saved to"), "{text}");
-        assert!(
-            std::fs::read_to_string(cwd.join("count.json"))
-                .unwrap()
-                .contains("\"rows\"")
-        );
 
         // A read on main.
         let (ok, out, err) = call(with(&[

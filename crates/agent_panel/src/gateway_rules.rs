@@ -208,7 +208,8 @@ fn graph_route(request: &Incoming<'_>, sandbox: &Sandbox, graph: &str, rest: &[&
             }
             Verdict::Write(WriteSummary {
                 kind: WriteKind::Load,
-                summary: format!("Load ({}) into {}", mode.unwrap_or("?"), sandbox.branch),
+                // The server merges a load whose mode is left out, so the card says it.
+                summary: format!("Load ({}) into {}", mode.unwrap_or("merge"), sandbox.branch),
                 query: None,
                 params: None,
                 creates_branch: if from.is_some() {

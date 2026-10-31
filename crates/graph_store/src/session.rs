@@ -1207,10 +1207,15 @@ impl GraphSession {
                 }
             }
             Err(ReadError::Transport(_)) => {}
-            // The token may have lapsed: the connection asks its source again, once for it.
+            // The token may have lapsed: the connection asks its source again, once for it. A 401
+            // that refused no token (one that never arrived, as a proxy drops it) asks nothing:
+            // the next token would fare no better.
             Err(ReadError::Refused(error)) if error.status == 401 => {
-                self.connection
-                    .update(cx, |connection, cx| connection.read_refused(cx));
+                let sent = self.connection.read(cx).has_token();
+                if graph_client::Challenge::refuses(error.challenge.as_deref(), sent) {
+                    self.connection
+                        .update(cx, |connection, cx| connection.read_refused(cx));
+                }
             }
             _ => {
                 if self.unavailable.take().is_some() {
@@ -1221,6 +1226,11 @@ impl GraphSession {
                     if self.shown {
                         self.check_heads(cx);
                     }
+                }
+                // The token was taken: should it lapse later, its refusal asks the source again.
+                if self.connection.read(cx).read_refusal_noted() {
+                    self.connection
+                        .update(cx, |connection, _| connection.read_taken());
                 }
                 // The policy may allow less than was read: the client counted the refusal, and
                 // what the credential may do is read again, as after a refused write.
@@ -4317,7 +4327,7 @@ mod tests {
     use http_client::{AsyncBody, FakeHttpClient};
 
     use super::*;
-    use crate::cli_tokens::{Token, TokenSource};
+    use crate::cli_tokens::{NoToken, Token, TokenSource};
     use crate::connection::{ConnectionState, ServerEntry, ServerSource};
 
     /// A scope on main showing answers that depend on these node and edge types.
@@ -7436,11 +7446,14 @@ mod tests {
         fn token(
             &self,
             _: Arc<AtomicBool>,
-        ) -> futures::future::BoxFuture<'static, Result<Token, String>> {
+        ) -> futures::future::BoxFuture<'static, Result<Token, NoToken>> {
             let gate = self.0.lock().unwrap().take();
             async move {
                 match gate {
-                    Some(gate) => gate.await.map(Token::new).map_err(|_| "gone".into()),
+                    Some(gate) => gate
+                        .await
+                        .map(Token::new)
+                        .map_err(|_| NoToken::lasting("gone")),
                     None => Ok(Token::new("good")),
                 }
             }
@@ -7454,6 +7467,14 @@ mod tests {
     /// A server that answers the token `good` alone, and every read of the graph `knowledge`
     /// sent to it.
     fn answers_good_alone() -> (Arc<dyn http_client::HttpClient>, GraphReads) {
+        answers_alone(Arc::new(std::sync::Mutex::new("good")))
+    }
+
+    /// A server that answers the token `accepted` names alone, which a test changes, as a token
+    /// lapses; and every read of the graph `knowledge` sent to it.
+    fn answers_alone(
+        accepted: Arc<std::sync::Mutex<&'static str>>,
+    ) -> (Arc<dyn http_client::HttpClient>, GraphReads) {
         use futures::AsyncReadExt as _;
         use serde_json::json;
 
@@ -7468,6 +7489,14 @@ mod tests {
                 .unwrap_or_default()
                 .to_owned();
             let log = log.clone();
+            let accepted = *accepted.lock().unwrap();
+            // A token that never arrives, as a proxy drops it.
+            let token = if accepted == DROPPED {
+                String::new()
+            } else {
+                token
+            };
+            let accepted = format!("Bearer {accepted}");
             async move {
                 let mut bytes = Vec::new();
                 request.into_body().read_to_end(&mut bytes).await.ok();
@@ -7480,7 +7509,7 @@ mod tests {
                         200,
                         json!({ "status": "ok", "version": "0.14.0", "internal_schema_version": 16 }),
                     )
-                } else if token != "Bearer good" {
+                } else if token != accepted {
                     (
                         401,
                         json!({ "error": "unauthorized", "code": "unauthorized" }),
@@ -7504,16 +7533,22 @@ mod tests {
                 let response = Response::builder()
                     .status(status)
                     .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT);
-                let response = if status == 401 {
-                    response.header("www-authenticate", "Bearer")
-                } else {
-                    response
+                // As Omnigraph answers: a token it received and refused is `invalid_token`.
+                let response = match (status, token.is_empty()) {
+                    (401, true) => response.header("www-authenticate", "Bearer"),
+                    (401, false) => {
+                        response.header("www-authenticate", r#"Bearer error="invalid_token""#)
+                    }
+                    _ => response,
                 };
                 Ok(response.body(AsyncBody::from(body.to_string())).unwrap())
             }
         });
         (http, asked)
     }
+
+    /// What `answers_alone` accepts for a token that never arrives, as a proxy drops it.
+    const DROPPED: &str = "(dropped)";
 
     /// The CLI server `personal`, whose token the CLI gives when the test sends it.
     fn waiting_for_its_token(
@@ -7534,6 +7569,80 @@ mod tests {
                 .with_token_source(Some(source))
         });
         (connection, give)
+    }
+
+    /// A token the source gave after a refused read is asked about again when a later read is
+    /// refused for it (it lapsed, an hour on), once a read with it was taken; a server that
+    /// refuses every token given is not asked in a loop (`connection::tests::
+    /// a_read_refused_for_its_token_asks_the_source_once`). Before, a token given after a
+    /// refusal was never asked about again, so once it lapsed every read stayed refused until
+    /// Refresh.
+    #[gpui::test]
+    async fn a_token_given_after_a_refusal_is_asked_about_again_once_a_read_took_it(
+        cx: &mut TestAppContext,
+    ) {
+        /// Gives `t1`, `t2`, `t3` in turn, then `t3` again.
+        #[derive(Default)]
+        struct Turns(std::sync::Mutex<usize>);
+        impl TokenSource for Turns {
+            fn token(
+                &self,
+                _: Arc<AtomicBool>,
+            ) -> futures::future::BoxFuture<'static, Result<Token, NoToken>> {
+                let mut asked = self.0.lock().unwrap();
+                *asked += 1;
+                let token = ["t1", "t2", "t3"][(*asked - 1).min(2)];
+                async move { Ok(Token::new(token)) }.boxed()
+            }
+        }
+        let accepted = Arc::new(std::sync::Mutex::new("t1"));
+        let (http, sent) = answers_alone(accepted.clone());
+        let source = Arc::new(Turns::default());
+        let asked = || *source.0.lock().unwrap();
+        let server = ServerEntry {
+            name: "personal".into(),
+            url: "https://graph.test".into(),
+            source: ServerSource::Cli,
+            known_graphs: Vec::new(),
+        };
+        let held: Arc<dyn TokenSource> = source.clone();
+        let connection = cx.new(|_| {
+            Connection::new(server, None, http)
+                .unwrap()
+                .with_token_source(Some(held))
+        });
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        let session =
+            cx.update(|cx| open_session(connection.clone(), "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        assert_eq!(asked(), 1);
+        let carried = |token: &str| {
+            let sent = std::mem::take(&mut *sent.lock().unwrap());
+            sent.iter()
+                .any(|(_, carried)| carried == &format!("Bearer {token}"))
+        };
+        assert!(carried("t1"));
+
+        // `t1` lapses: the read refused asks again, and `t2` reads.
+        *accepted.lock().unwrap() = "t2";
+        session.update(cx, |session, cx| session.reload(cx));
+        cx.run_until_parked();
+        assert_eq!(asked(), 2);
+        assert!(carried("t2"));
+
+        // An hour on, `t2` lapses in turn: asked again, and `t3` reads.
+        *accepted.lock().unwrap() = "t3";
+        session.update(cx, |session, cx| session.reload(cx));
+        cx.run_until_parked();
+        assert_eq!(asked(), 3, "the lapsed token asked about again");
+        assert!(carried("t3"));
+
+        // A token that never arrives, as a proxy drops it: the 401 refused no token, and the
+        // source is asked nothing, as the next would fare no better.
+        *accepted.lock().unwrap() = DROPPED;
+        session.update(cx, |session, cx| session.reload(cx));
+        cx.run_until_parked();
+        assert_eq!(asked(), 3, "a token that never arrived asks nothing");
     }
 
     /// A graph shown while its connection's token is still on its way from the CLI sends

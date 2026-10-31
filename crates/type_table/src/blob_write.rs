@@ -550,7 +550,7 @@ pub(crate) fn notice_row(
     let unknown = notice.tone == Tone::Unknown;
     h_flex()
         .gap(px(studio_ui::ds::space::SM))
-        .child(ui::Indicator::dot().color(notice.tone.color()))
+        .child(studio_ui::ds::dot(notice.tone.color()))
         .child(
             studio_ui::ds::text::meta(notice.message.clone())
                 .color(notice.tone.color())

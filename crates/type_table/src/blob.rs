@@ -206,9 +206,13 @@ fn svg_root(text: &str) -> bool {
     })
 }
 
-/// The file name a saved value is offered under: the row and the property, and the extension
-/// of what its first bytes say it is ([`value_kind`]: `.png`, `.svg`, `.pdf`, `.txt` for text,
-/// `.bin` otherwise).
+/// The most bytes of a saved value's file name before its extension: macOS and Linux refuse a
+/// name over 255 bytes, and a row's id is data of any length.
+const FILE_STEM_MAX: usize = 200;
+
+/// The file name a saved value is offered under: the row and the property, cut to
+/// [`FILE_STEM_MAX`] bytes on a character's edge, and the extension of what its first bytes say
+/// it is ([`value_kind`]: `.png`, `.svg`, `.pdf`, `.txt` for text, `.bin` otherwise).
 pub fn suggested_file_name(id: &str, property: &str, prefix: &[u8]) -> String {
     let safe = |part: &str| -> String {
         part.chars()
@@ -231,7 +235,9 @@ pub fn suggested_file_name(id: &str, property: &str, prefix: &[u8]) -> String {
         ValueKind::Text if !prefix.is_empty() => "txt",
         ValueKind::Image(_) | ValueKind::Text | ValueKind::Binary => "bin",
     };
-    format!("{}-{}.{extension}", safe(id), safe(property))
+    let mut stem = format!("{}-{}", safe(id), safe(property));
+    stem.truncate(stem.floor_char_boundary(FILE_STEM_MAX));
+    format!("{stem}.{extension}")
 }
 
 /// A value being saved to a file: written to a `.part` file of its own beside it, range by
@@ -434,10 +440,7 @@ pub fn preview(bytes: Vec<u8>, size: u64, svg: &SvgRenderer) -> Preview {
         ValueKind::Image(_) | ValueKind::Pdf | ValueKind::Binary => None,
     };
     if let Some(text) = text {
-        let mut end = text.len().min(TEXT_SHOWN);
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
+        let end = text.floor_char_boundary(TEXT_SHOWN);
         return Preview::Text {
             text: text[..end].to_owned(),
             more: size - end as u64,
@@ -568,6 +571,15 @@ mod tests {
             suggested_file_name("n1", "scan", b"%PDF-1.7\n%"),
             "n1-scan.pdf"
         );
+        // An id of any length, in letters of several bytes, still names a file a file system
+        // takes: cut on a character's edge, the extension kept.
+        let long = suggested_file_name(&"日本".repeat(200), "notes", b"hello");
+        assert!(
+            long.len() <= 255 && long.ends_with(".txt"),
+            "{}",
+            long.len()
+        );
+        assert!(long.starts_with("日本日本"));
     }
 
     /// An SVG is text whose first element is `<svg`, past what may come before it; markup
