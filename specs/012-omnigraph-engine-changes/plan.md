@@ -323,6 +323,59 @@ high bit set, which is no `int64`: the edge server answered one with
 format), so a client generated from it decodes every answer the server sends. *Waits:* 004,
 007. *Today:* Studio decodes them as `u64`; its contract tests compare field names only.
 
+### Reading changes
+
+Measured on the hosted personal graph (server `0.14.1-edge+7711e4a`, a read-only token, from the
+person's Mac over HTTPS) on 2026-10-25; the readings are in spec 008's validation log. Each page
+of changes is worked out whole before the server answers, and the server sets no deadline, so
+until these land Studio waits up to five minutes for a read of changes
+(`graph_client::CHANGE_READ_TIMEOUT`), and a review says when the server is still working.
+
+**E35. Diff cost that follows the changes, not the tables.**
+[ModernRelay/omnigraph#969](https://github.com/ModernRelay/omnigraph/issues/969). `GET /diff` and
+`GET /branches/diff` read both full tables of every type the two endpoints differ in, unless the
+endpoints are one transaction apart, so a review costs what the touched tables hold rather than
+what the branch changed. The diff from a branch's merge base to its head,
+350 changes, took 60.3 s cold and 37 to 43 s warm; the same diff of `type=Artifact` alone (about
+100,000 rows, changed by 3 of the branch's commits) took 47.6 s, and of any other single type 7.9
+to 9.6 s. The draft RFC [ModernRelay/omnigraph#1171](https://github.com/ModernRelay/omnigraph/pull/1171)
+proposes finding the changed rows by fragment identity, as branch merge does, so the cost follows
+the change. Engine rule: a diff stays pinned to the two commits it resolved, and a page stays
+bounded by its `limit` and byte budget. *Waits:* 008. *Today:* a review's reads of changes wait
+up to five minutes, and after 10 s it says the server is still working out the changes.
+
+**E36. A change page that resumes its work.**
+[ModernRelay/omnigraph#970](https://github.com/ModernRelay/omnigraph/issues/970). Every page of
+the change feed, a diff or a commit's changes restarts its comparison (plans it again, resolves
+its endpoints again, sorts the keys again) and skips to the token's position, so a review of
+several pages pays the whole comparison once a page. Engine rule: a page token is a checksummed
+claim, not a signed one; what a page resumes from is checked again, never trusted. *Waits:* 008,
+009. *Today:* Studio asks for the server's largest page (8,192 changes), so most reviews are one
+page, and each page waits up to five minutes.
+
+**E37. A commit found without reading every branch.**
+[ModernRelay/omnigraph#972](https://github.com/ModernRelay/omnigraph/issues/972). A commit that
+exists only on a branch, named by its id as a diff side or as the commit whose changes are read,
+is found by checking out every live branch's `__manifest`. `GET /diff` from a branch's head to
+itself, zero changes, took 12.7 to 13.6 s with the head named by commit id, about 6 to 9 s more
+than naming the branch; one commit's changes took 4.5 to 17.7 s, about 13 s for a one-change
+commit on the branch. *Waits:* 008, 009. *Today:* Studio names commits by id, which pins what it
+reads (constitution II), and pays the lookup. Naming the branch instead could not keep a review
+exact without reading a page twice when the branch moves (spec 008, Decisions).
+
+**E38. A work bound on a change-feed page.**
+[ModernRelay/omnigraph#1157](https://github.com/ModernRelay/omnigraph/issues/1157). A page of `GET /changes`
+works through up to 128 commits (`CHANGE_FEED_DEFAULT_COMMITS_PER_POLL`,
+`crates/omnigraph/src/changes/model.rs:36` at `7711e4a`; the route passes `max_commits: None`,
+`crates/omnigraph-server/src/handlers.rs:4862`) and the HTTP API has no parameter to lower it
+(`CHANGE_FEED_PARAMS`): `limit` bounds the changes a page returns, not the work before it answers.
+The feed from the fork of `review-commercial-profile-20261019` (9 commits, 366 changes) took 54.4 s
+as one page. A `max_commits` parameter, or a page that ends at a commit boundary once a time
+budget is spent, would keep each answer short and let a client show progress; RFC #1171 adds a
+commit-ceiling parameter and a work ceiling to the feed. Engine rule: a page
+still ends on a whole commit and its cursor resumes after it. *Waits:* 008. *Today:* the feed is
+read in pages of up to 8,192 changes, each waited for up to five minutes.
+
 ### In 0.14, not in 0.13.0
 
 Studio's minimum server serves these, so it uses them without asking the server's OpenAPI
@@ -357,6 +410,8 @@ Then engine changes still open:
 6. E20 delegated credentials (an RFC), which retires spec 013's gateway rules.
 7. E16 neighbourhood counts.
 8. E12, E13, E14, E17, E18, E19 as the matching Studio work starts.
+9. E35 to E38, which make a large graph's review take seconds rather than a minute; E37 is the
+   smallest.
 
 ## Decisions
 
@@ -370,6 +425,7 @@ Then engine changes still open:
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-26 | A review's reads of changes take most of a minute on the personal graph, for reasons in the engine (E35 to E38) | The readings of 2026-10-25 in spec 008's validation log; issues #969, #970, #972 and #1157 and the draft RFC #1171 (`gh issue view`, `gh pr view`, all open on 2026-10-27); Omnigraph `7711e4a`: `changes/model.rs:36`, `handlers.rs:4862` and `CHANGE_FEED_PARAMS`, `db/omnigraph.rs` `prepare_diff` and `reopen_diff_continuation` | Filed as E35 (#969), E36 (#970), E37 (#972) and E38 (#1157, filed after: the feed's 128-commit page has no HTTP parameter). Studio waits five minutes for a read of changes and says the server is still working (spec 008) |
 | 2026-10-22 | The first published build whose CLI reads Studio's home is `edge-20261022-7fff9df` | `git ls-remote --tags` of ModernRelay/omnigraph (`edge-20261021-888223b`, then `edge-20261022-7fff9df` at `7fff9dfd`); `git merge-base --is-ancestor ff542202 7fff9dfd`; the installed `0.14.0-edge+7fff9df`'s `version --json` and `config validate --operator-config` on a file with a loopback server target of `auth: {provider: anonymous}`, beside `0.14.0-edge+888223b`'s | `7fff9dfd` contains `ff542202`. `7fff9df` reports protocols `target` 1, `credential` 1, `access` 1 and passes the file; `888223b` reports the same protocols and refuses it (`invalid type: string "anonymous", expected internally tagged enum StrictAuthProfile`) |
 | 2026-10-21 | The CLI reads only the version-1 operator configuration, and no published build reads Studio's home yet | Omnigraph main `97788d37`: `operator_schema.rs` (`target_config_version` refused), the diff `888223b7..ff542202` of `operator_schema.rs` (server `auth` from a map to one provider), `commands/targets/args.rs` (`config validate`); `gh release list` (newest `edge-20261021-888223b`, 2026-10-22 00:21 UTC); `~/.local/bin/omnigraph version --json` and `config validate --operator-config /dev/null` | `0.14.0-edge+50283ce` reports `http_contract` 0.14 and `protocols.target` 1, and answers "unrecognized subcommand 'config'" (exit 2). `888223b` has #1115 without #1126. E34 filed as #1127 |
 | 2026-10-21 | The server's version fields are wider than its contract says (E30) | `omnigraph-api-types/src/lib.rs` at `7fd9cc9` (`CommitOutput`, `SnapshotOutput`, `SnapshotDatasetOutput`, `SchemaApplyOutput`, `PublishedDatasetVersionConflictOutput`: `u64`; its own test decodes `9_223_372_036_854_775_809u64`); `crates/graph_client/openapi/omnigraph-0.14.0-edge.json` (`int64`, `minimum: 0`); what the running app was answered by the edge server; `graph_client` `a_detached_manifest_version_decodes` | A write `as commit` was answered with `graph_manifest_version: 10415222161995537841`, which Studio's `i64` refused to decode, so the write read as unknown; as `u64` it decodes, and the query editor says it is held |
