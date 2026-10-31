@@ -4,6 +4,7 @@
 mod about;
 mod activity;
 pub mod deep_link;
+#[cfg(debug_assertions)]
 mod design_gallery;
 mod keymaps;
 pub mod logging;
@@ -53,6 +54,7 @@ pub fn init(cx: &mut App) {
     inspectors::init(cx);
     agent_panel::init(cx);
 
+    #[cfg(debug_assertions)]
     studio_workspace::register_item_kind(cx, "design-system", |_, workspace, window, cx| {
         open_design_system(workspace, window, cx);
     });
@@ -163,6 +165,9 @@ pub fn init(cx: &mut App) {
         let session = workspace.session().cloned();
         let activity = cx.new(|cx| activity::ActivityLog::new(handle, session, window, cx));
         workspace.set_activity_view(activity.into(), cx);
+        // The gallery is for working on Studio: a release build offers no such action, and a tab
+        // saved by a debug build does not open in one.
+        #[cfg(debug_assertions)]
         workspace.register_action(
             |workspace, _: &studio_actions::workspace::OpenDesignSystem, window, cx| {
                 open_design_system(workspace, window, cx);
@@ -204,6 +209,7 @@ fn update_is(cx: &App, test: impl Fn(&UpdateState) -> bool) -> bool {
 }
 
 /// Opens the design system's gallery tab, or shows the one open.
+#[cfg(debug_assertions)]
 fn open_design_system(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     workspace.open_item(
         "design-system",

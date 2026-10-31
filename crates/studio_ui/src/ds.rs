@@ -1,7 +1,7 @@
 //! Studio's design system (spec 002, "Visual language"): tokens, then components built only
 //! from tokens. Surfaces compose these; they do not pick their own paddings, radii, shadows or
-//! colours. The gallery tab (`studio::OpenDesignSystem`) renders every piece in both window
-//! styles, and changes are judged there first.
+//! colours. The gallery tab (`studio::OpenDesignSystem`, in debug builds) renders every piece in both
+//! window styles, and changes are judged there first.
 //!
 //! Sources: Delta's window (measured from the mock on delta.dev) and Zed's `ui` components;
 //! layout and polish rules: group with space, not lines; concentric radii; shadows for
