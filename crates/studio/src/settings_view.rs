@@ -93,6 +93,11 @@ impl Focusable for SettingsView {
 }
 
 impl Item for SettingsView {
+    /// Settings read nothing from a graph's server.
+    fn reads_graph(&self) -> bool {
+        false
+    }
+
     fn tab_title(&self, _cx: &App) -> SharedString {
         "Settings".into()
     }

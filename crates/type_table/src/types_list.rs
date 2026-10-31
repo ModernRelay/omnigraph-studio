@@ -108,6 +108,17 @@ impl Render for TypesList {
             return v_flex().into_any_element();
         };
         let s = session.read(cx);
+        // The window's tab says where to sign in and offers it; this says why there are no
+        // types, rather than the refused read's 401 and a Try again that would be refused too.
+        if !matches!(s.schema, Loadable::Loaded(_))
+            && let Some(prompt) = s.connection.read(cx).sign_in_prompt()
+        {
+            return studio_ui::ds::sidebar_note(format!(
+                "Sign in to {} to see its types.",
+                prompt.server
+            ))
+            .into_any_element();
+        }
         let schema = match &s.schema {
             Loadable::Loaded(schema) => schema.clone(),
             Loadable::Failed(error) => {
