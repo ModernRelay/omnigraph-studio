@@ -2186,7 +2186,8 @@ impl Render for HistoryView {
                             .min_w_0()
                             .overflow_hidden()
                             .tooltip(Tooltip::text(format!(
-                                "{error}. The commits shown are as read before."
+                                "{}. The commits shown are as read before.",
+                                studio_ui::clause(error.as_ref())
                             )))
                             .child(
                                 studio_ui::ds::text::error("The newest commits could not be read")

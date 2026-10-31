@@ -21,8 +21,8 @@ use futures_rustls::TlsAcceptor;
 use futures_rustls::rustls::ServerConfig;
 use graph_client::api::CommitKind;
 use graph_client::{
-    AsyncBody, CONTRACT, CONTRACT_HEADER, ForwardRequest, GraphClient, HeaderMap, Method,
-    StatusCode, WriteOutcome,
+    Answered, AsyncBody, CONTRACT, CONTRACT_HEADER, ForwardRequest, GraphClient, HeaderMap, Method,
+    NoAnswer, StatusCode,
 };
 use serde::Deserialize as _;
 use serde_json::{Value, json};
@@ -430,6 +430,13 @@ async fn handle(
             stream_back(stream, &method, response).await;
         }
         Verdict::Write(write) => {
+            // A target already retired sends nothing: the agent is told so at once, as a read
+            // is, rather than the person being asked to approve a write that cannot go. One that
+            // retires while the person decides is refused when sent (`NoAnswer::Retired`).
+            if let Some(why) = shared.client.retired() {
+                answer(stream, 403, "forbidden", &retired_refusal(why)).await;
+                return;
+            }
             // Whoever ran the command, as they are now (`requester`): on Windows the CLI can
             // outlive a command stopped by its process id, its connection open.
             let starters = Starters::of(client, server).await;
@@ -519,8 +526,14 @@ async fn handle(
             .detach();
             // When the server's answer was lost, the CLI's connection closes without one, and
             // the CLI reports the outcome as unknown, as it is.
-            if let Ok(Some((status, headers, body))) = reply_rx.await {
-                write_buffered(stream, status, &headers, &body).await;
+            match reply_rx.await {
+                Ok(Some(Reply::Server(status, headers, body))) => {
+                    write_buffered(stream, status, &headers, &body).await
+                }
+                Ok(Some(Reply::NotSent(unsent))) => {
+                    answer(stream, unsent.status, unsent.code, &unsent.message).await
+                }
+                _ => {}
             }
         }
     }
@@ -606,12 +619,22 @@ fn forward_request(request: Request, body: Option<Vec<u8>>) -> ForwardRequest {
 
 /// Reads a write's answer whole, and what it says happened to a write of `kind`.
 async fn read_write_answer(
-    response: Result<graph_client::ForwardResponse, String>,
+    response: Result<graph_client::ForwardResponse, NoAnswer>,
     kind: WriteKind,
-) -> (Seen, Option<(StatusCode, HeaderMap, Vec<u8>)>) {
+) -> (Seen, Option<Reply>) {
     let mut response = match response {
         Ok(response) => response,
-        Err(reason) => return (Seen::Unknown(reason), None),
+        Err(no) => {
+            return match unsent_refusal(&no) {
+                // Never sent (the target retired, the connection refused, or a request Studio
+                // would not make): nothing was written, and the CLI is told so.
+                Some(unsent) => (
+                    Seen::Refused(graph_store::nothing_sent(&String::from(no))),
+                    Some(Reply::NotSent(unsent)),
+                ),
+                None => (Seen::Unknown(String::from(no)), None),
+            };
+        }
     };
     let mut body = Vec::new();
     // One byte past the limit tells a whole answer from a cut one.
@@ -642,14 +665,70 @@ async fn read_write_answer(
     // Judged as Studio's own writes are, a success whose body cannot be read included: it
     // confirms nothing.
     let outcome = match graph_client::judge_write(response.status, contract, &body) {
-        WriteOutcome::Committed(body) => match serde_json::from_slice::<Value>(body) {
+        Answered::Committed(body) => match serde_json::from_slice::<Value>(body) {
             Ok(json) => seen_written(&json, kind),
             Err(error) => Seen::Unknown(format!("the success response could not be read: {error}")),
         },
-        WriteOutcome::Refused(error) => Seen::Refused(error.body.error),
-        WriteOutcome::Unknown { reason } => Seen::Unknown(reason),
+        Answered::Refused(error) => Seen::Refused(error.body.error),
+        Answered::Unknown { reason } => Seen::Unknown(reason),
     };
-    (outcome, Some((response.status, response.headers, body)))
+    (
+        outcome,
+        Some(Reply::Server(response.status, response.headers, body)),
+    )
+}
+
+/// The CLI's refusal of a request to a retired target ([`NoAnswer::Retired`]).
+fn retired_refusal(why: &str) -> String {
+    format!(
+        "Studio: {}. Tell the person what this says. Nothing was sent.",
+        studio_ui::clause(why)
+    )
+}
+
+/// How the CLI is answered for a request never sent ([`answer`]): its status, code and message.
+#[derive(Debug)]
+struct Unsent {
+    status: u16,
+    code: &'static str,
+    message: String,
+}
+
+/// The CLI's answer to a request never sent, or `None` for one whose answer was lost: as every
+/// gateway refusal does (spec 013), it says what to do instead and ends "Nothing was sent.",
+/// which the agent reads as nothing written. A request Studio refused is a 403 `forbidden`, to
+/// be fixed first; one whose server refused the connection is a 503 `service_unavailable`, to be
+/// tried again once the server answers.
+fn unsent_refusal(no: &NoAnswer) -> Option<Unsent> {
+    let forbidden = |message| Unsent {
+        status: 403,
+        code: "forbidden",
+        message,
+    };
+    match no {
+        NoAnswer::Retired(why) => Some(forbidden(retired_refusal(why))),
+        NoAnswer::Unsendable(why) => Some(forbidden(format!(
+            "Studio: {}. Change the request, or tell the person what this says. Nothing was \
+             sent.",
+            studio_ui::clause(why)
+        ))),
+        NoAnswer::Unreached(why) => Some(Unsent {
+            status: 503,
+            code: "service_unavailable",
+            message: format!(
+                "Studio: the server could not be reached ({why}). Try again once it answers, or \
+                 tell the person. Nothing was sent."
+            ),
+        }),
+        NoAnswer::Lost(_) => None,
+    }
+}
+
+/// What the CLI is answered with once a forwarded write ends: the server's answer, or the
+/// refusal of one never sent.
+enum Reply {
+    Server(StatusCode, HeaderMap, Vec<u8>),
+    NotSent(Unsent),
 }
 
 /// What a success answer to a write of `kind` says it did. A write's receipt names its commit
@@ -1077,18 +1156,24 @@ async fn write_buffered(
 async fn stream_back(
     stream: &mut (impl AsyncWrite + Unpin),
     method: &str,
-    response: Result<graph_client::ForwardResponse, String>,
+    response: Result<graph_client::ForwardResponse, NoAnswer>,
 ) {
     let mut response = match response {
         Ok(response) => response,
-        Err(reason) => {
-            answer(
-                stream,
-                502,
-                "internal",
-                &format!("Studio could not reach the graph's server: {reason}"),
-            )
-            .await;
+        Err(no) => {
+            match unsent_refusal(&no) {
+                Some(unsent) => answer(stream, unsent.status, unsent.code, &unsent.message).await,
+                None => {
+                    let reason = String::from(no);
+                    answer(
+                        stream,
+                        502,
+                        "internal",
+                        &format!("Studio could not reach the graph's server: {reason}"),
+                    )
+                    .await
+                }
+            }
             return;
         }
     };
@@ -1543,6 +1628,56 @@ mod tests {
     /// or a body that cannot be read, confirms nothing.
     #[test]
     fn a_writes_success_answer_says_what_it_did() {
+        // A write the client never sent wrote nothing: its outcome says so, and the CLI is
+        // answered that nothing was sent and what to do, rather than left to report it unknown.
+        // One whose answer was lost stays unknown, with nothing to answer.
+        let (seen, reply) = smol::block_on(super::read_write_answer(
+            Err(NoAnswer::Retired("the target is gone".into())),
+            WriteKind::Mutate,
+        ));
+        assert_eq!(
+            seen,
+            super::Seen::Refused("the target is gone, so nothing was sent.".into())
+        );
+        assert!(matches!(reply, Some(super::Reply::NotSent(unsent))
+            if unsent.status == 403
+                && unsent.message
+                    == "Studio: the target is gone. Tell the person what this says. Nothing was sent."));
+        // One Studio would not make as asked says to change it.
+        let (seen, reply) = smol::block_on(super::read_write_answer(
+            Err(NoAnswer::Unsendable("refused path \"../x\"".into())),
+            WriteKind::Mutate,
+        ));
+        assert_eq!(
+            seen,
+            super::Seen::Refused("refused path \"../x\", so nothing was sent.".into())
+        );
+        assert!(matches!(reply, Some(super::Reply::NotSent(unsent))
+            if unsent.status == 403
+                && unsent.message == "Studio: refused path \"../x\". Change the request, or tell \
+                                      the person what this says. Nothing was sent."));
+        // One whose server refused the connection may be tried again once it answers: a 503
+        // whose disposition says so (`effects: none`, `action: retry`), nothing having been sent.
+        let (seen, reply) = smol::block_on(super::read_write_answer(
+            Err(NoAnswer::Unreached("the connection was refused".into())),
+            WriteKind::Mutate,
+        ));
+        assert_eq!(
+            seen,
+            super::Seen::Refused("the connection was refused, so nothing was sent.".into())
+        );
+        assert!(matches!(reply, Some(super::Reply::NotSent(unsent))
+            if unsent.status == 503
+                && unsent.code == "service_unavailable"
+                && unsent.message.ends_with("Try again once it answers, or tell the person. \
+                                             Nothing was sent.")));
+        let (seen, reply) = smol::block_on(super::read_write_answer(
+            Err(NoAnswer::Lost("the connection closed".into())),
+            WriteKind::Mutate,
+        ));
+        assert_eq!(seen, super::Seen::Unknown("the connection closed".into()));
+        assert!(reply.is_none());
+
         let answer = |kind: WriteKind, body: &str| {
             let mut headers = HeaderMap::new();
             headers.append(CONTRACT_HEADER, CONTRACT.parse().unwrap());
@@ -1922,6 +2057,7 @@ mod tests {
     fn the_gateway_checks_the_session_then_forwards_reads_and_approved_writes() {
         smol::block_on(async {
             let (client, seen) = upstream();
+            let upstream_client = client.clone();
             let mut gateway = Gateway::bind().unwrap();
             let (cli, token) = (Cli::of(&gateway), gateway.token.clone());
             let (events_tx, mut events) = mpsc::unbounded();
@@ -2171,6 +2307,76 @@ mod tests {
             assert_eq!(status, 200);
             assert_eq!(body, r#"{"rows":[{"n":200}]}"#);
             assert_eq!(seen.lock().unwrap().len(), 4);
+
+            // The target retired (the CLI no longer lists it) while the person decides a write:
+            // approved, it is answered that nothing was sent, as the gateway's own refusals
+            // are, and its outcome is a refusal, not unknown. A read, and a write asked after,
+            // are refused at once, the person not asked.
+            let mutation =
+                r#"{"query":"query m() { … }","name":"m","branch":"agent/20261013-101500"}"#;
+            let allowed = smol::spawn(call(
+                cli.clone(),
+                post("/graphs/knowledge/mutate", &token, Some(CONTRACT), mutation),
+            ));
+            let Some(GatewayEvent::Write { decide, .. }) = events.next().await else {
+                panic!("no write event")
+            };
+            upstream_client.retire("the target is gone".into());
+            let refused_so = |status: u16, body: &str| {
+                assert_eq!(status, 403, "{body}");
+                let refused: Value = serde_json::from_str(body).unwrap();
+                assert_eq!(refused["code"], "forbidden", "{body}");
+                assert_eq!(
+                    refused["disposition"],
+                    json!({ "effects": "none", "action": "fix" }),
+                    "{body}"
+                );
+                assert!(
+                    body.contains(
+                        "Studio: the target is gone. Tell the person what this says. Nothing was \
+                         sent."
+                    ),
+                    "{body}"
+                );
+            };
+            let (status, _, body) = call(
+                cli.clone(),
+                post(
+                    "/graphs/knowledge/query",
+                    &token,
+                    Some(CONTRACT),
+                    r#"{"query":"q","branch":"main"}"#,
+                ),
+            )
+            .await;
+            refused_so(status, &body);
+            let after = smol::spawn(call(
+                cli.clone(),
+                post("/graphs/knowledge/mutate", &token, Some(CONTRACT), mutation),
+            ));
+            let futures::future::Either::Left(((status, _, body), _)) =
+                futures::future::select(after, events.next()).await
+            else {
+                panic!("the person was asked to approve a write to a retired target")
+            };
+            refused_so(status, &body);
+            let recorded: Arc<Mutex<Option<super::Seen>>> = Arc::default();
+            let record = recorded.clone();
+            decide
+                .send(Some(Box::new(move |seen: &super::Seen| {
+                    *record.lock().unwrap() = Some(seen.clone());
+                })))
+                .ok()
+                .unwrap();
+            let (status, _, body) = allowed.await;
+            refused_so(status, &body);
+            assert_eq!(
+                recorded.lock().unwrap().clone(),
+                Some(super::Seen::Refused(
+                    "the target is gone, so nothing was sent.".into()
+                ))
+            );
+            assert_eq!(seen.lock().unwrap().len(), 4, "nothing reached the server");
         });
     }
 

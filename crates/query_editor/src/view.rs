@@ -281,6 +281,11 @@ enum WriteResult {
         message: String,
         diagnostic: Option<ServerDiagnostic>,
     },
+    /// The write was never sent (its connection retired, the server refusing the connection,
+    /// or the request not made): nothing was written.
+    NotSent {
+        reason: String,
+    },
     Unknown {
         reason: String,
     },
@@ -3048,6 +3053,10 @@ impl QueryEditor {
                         text: "Refused · nothing written".into(),
                         failed: true,
                     },
+                    WriteOutcome::NotSent { .. } => RunNote {
+                        text: "Not sent · nothing written".into(),
+                        failed: true,
+                    },
                     WriteOutcome::Unknown { .. } => RunNote {
                         text: "Outcome unknown · check History".into(),
                         failed: true,
@@ -3074,6 +3083,7 @@ impl QueryEditor {
                             .and_then(|d| server_diagnostic(d, &sent_text, map)),
                         message: error.body.error,
                     },
+                    WriteOutcome::NotSent { reason } => WriteResult::NotSent { reason },
                     WriteOutcome::Unknown { reason } => WriteResult::Unknown { reason },
                 });
                 this.replace_output(written, cx);
@@ -4516,6 +4526,15 @@ impl QueryEditor {
                 Some("Nothing was written. Your query is unchanged; fix it and run again.".into()),
                 Vec::new(),
                 diagnostic.clone(),
+                cx,
+            ),
+            WriteResult::NotSent { reason } => self.render_message(
+                IconName::XCircle,
+                Color::Error,
+                format!("Not sent: {reason}"),
+                Some("Nothing was written.".into()),
+                Vec::new(),
+                None,
                 cx,
             ),
             WriteResult::Unknown { reason } => self.render_message(

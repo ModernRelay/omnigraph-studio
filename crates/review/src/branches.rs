@@ -598,6 +598,9 @@ impl CreateBranchModal {
                             this.error = Some(format!("Not created: {}", error.body.error).into())
                         }
                     },
+                    WriteOutcome::NotSent { reason } => {
+                        this.error = Some(format!("Not created: {reason}").into())
+                    }
                     WriteOutcome::Unknown { .. } => {
                         this.error = Some(
                             "The outcome is unknown. Check the branch list before trying again."
@@ -863,9 +866,10 @@ impl DeleteBranchModal {
                             this.error = Some(
                                 match &holds {
                                     Holds::Unknown(error) => format!(
-                                        "Studio could not check {} again: {error}. Type its \
-                                         name to delete it.",
-                                        this.branch
+                                        "Studio could not check {} again: {}. Type its name to \
+                                         delete it.",
+                                        this.branch,
+                                        studio_ui::clause(&error.to_string())
                                     ),
                                     _ => format!(
                                         "{} has a commit {TARGET} does not since this opened; \
@@ -894,6 +898,9 @@ impl DeleteBranchModal {
                         WriteOutcome::Committed(_) => cx.emit(DismissEvent),
                         WriteOutcome::Refused(error) => {
                             this.error = Some(format!("Not deleted: {}", error.body.error).into())
+                        }
+                        WriteOutcome::NotSent { reason } => {
+                            this.error = Some(format!("Not deleted: {reason}").into())
                         }
                         WriteOutcome::Unknown { .. } => this.error = Some(
                             "The outcome is unknown. Check the branch list before trying again."

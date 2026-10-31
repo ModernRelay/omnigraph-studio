@@ -934,6 +934,17 @@ pub enum SaveResult {
 
 pub const UNKNOWN_MESSAGE: &str = "Check History before trying again; your changes are still here";
 
+/// What a write never sent says: why, and that nothing was written.
+pub(crate) fn not_sent_notice(reason: &str) -> Notice {
+    Notice::new(
+        Tone::Refused,
+        format!(
+            "Not sent: {}. Nothing was written.",
+            studio_ui::clause(reason)
+        ),
+    )
+}
+
 /// Classifies a write's outcome. `branch` names the write target in a denial.
 pub fn save_result(outcome: &WriteOutcome<ChangeOutput>, branch: &str) -> SaveResult {
     match outcome {
@@ -953,6 +964,7 @@ pub fn save_result(outcome: &WriteOutcome<ChangeOutput>, branch: &str) -> SaveRe
             error.body.precondition_failure.is_some(),
             branch,
         )),
+        WriteOutcome::NotSent { reason } => SaveResult::Refused(not_sent_notice(reason)),
         WriteOutcome::Unknown { .. } => {
             SaveResult::Unknown(Notice::new(Tone::Unknown, UNKNOWN_MESSAGE))
         }
@@ -1665,6 +1677,19 @@ mod tests {
                 "main"
             ),
             SaveResult::Unknown(Notice::new(Tone::Unknown, UNKNOWN_MESSAGE))
+        );
+        // Never sent (the target retired): nothing was written, said as a refusal, not unknown.
+        assert_eq!(
+            save_result(
+                &WriteOutcome::NotSent {
+                    reason: "The CLI no longer lists the target".into()
+                },
+                "main"
+            ),
+            SaveResult::Refused(Notice::new(
+                Tone::Refused,
+                "Not sent: The CLI no longer lists the target. Nothing was written."
+            ))
         );
         assert_eq!(
             changed_elsewhere(None, Some(&json!("CEO"))).message,

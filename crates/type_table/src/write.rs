@@ -27,8 +27,9 @@ pub(crate) fn change_refusal(
         .refusal(AccessAction::Change, &AccessScope::branch(branch))
 }
 
-/// How a write bound to the values it was read at ended: sent, with the server's outcome, or
-/// not sent.
+/// How a write bound to the values it was read at ended: the write's own outcome, never sent
+/// among them (`Sent`), or held back before it was sent, as the values it is bound to moved or
+/// could not be read.
 // Made once per write and matched at once, into the outcome: boxing it saves nothing.
 #[expect(clippy::large_enum_variant)]
 pub(crate) enum Bound {

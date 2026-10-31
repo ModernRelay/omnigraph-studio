@@ -144,6 +144,13 @@ pub fn grid_cell(width: Pixels, align_right: bool) -> Div {
         .when(align_right, |d| d.justify_end())
 }
 
+/// `text` without the one stop that ends it, for a sentence that goes on after it: a message
+/// quoted into "<message>. Nothing was written." ends once, whether or not it ended its own
+/// sentence. An ellipsis ("...") keeps reading as one.
+pub fn clause(text: &str) -> &str {
+    text.strip_suffix('.').unwrap_or(text)
+}
+
 /// How a JSON value from a query result reads in a cell. Null is an em dash; lists show the
 /// first items then "+N"; objects show their `@id` when they have one.
 pub fn format_value(value: &Value) -> String {

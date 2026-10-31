@@ -3058,7 +3058,8 @@ impl Workspace {
         let mut tooltip = connection_tooltip(&url, &state, actor.as_deref());
         if let Some(reason) = &unavailable {
             tooltip = format!(
-                "This graph is unavailable: {reason}. Reads resume when it is ready. · {tooltip}"
+                "This graph is unavailable: {}. Reads resume when it is ready. · {tooltip}",
+                studio_ui::clause(reason)
             );
         }
         let trigger = ButtonLike::new("graph-switcher")
@@ -4421,8 +4422,9 @@ fn toast_text(entry: &graph_store::OutcomeEntry) -> String {
             studio_ui::short_commit_id(commit)
         ),
         OutcomeKind::Refused { message } => format!(
-            "{} · refused: {message}. Nothing was written.",
-            entry.description
+            "{} · refused: {}. Nothing was written.",
+            entry.description,
+            studio_ui::clause(message)
         ),
         // Its history is the branch's, which Open history shows.
         OutcomeKind::Unknown { .. } => format!(
@@ -7078,6 +7080,36 @@ mod tests {
             cx.emit(SessionEvent::ActivityChanged);
         });
         cx.run_until_parked();
+    }
+
+    /// A refusal's toast ends its message once, whether or not the message ends its own
+    /// sentence, as a server's and a write never sent ("…, so nothing was sent.") do. Before, those
+    /// read "… sent.. Nothing was written."
+    #[test]
+    fn a_refusal_toast_ends_its_message_once() {
+        let entry = |message: &str| graph_store::OutcomeEntry {
+            at: std::time::SystemTime::now(),
+            branch: "main".into(),
+            description: "Revert Person p1".into(),
+            outcome: OutcomeKind::Refused {
+                message: message.into(),
+            },
+            follow_up: None,
+            merge: None,
+        };
+        assert_eq!(
+            toast_text(&entry("the target is gone, so nothing was sent.")),
+            "Revert Person p1 · refused: the target is gone, so nothing was sent. Nothing was \
+             written."
+        );
+        assert_eq!(
+            toast_text(&entry("the policy denies it")),
+            "Revert Person p1 · refused: the policy denies it. Nothing was written."
+        );
+        assert_eq!(
+            toast_text(&entry("the server is busy...")),
+            "Revert Person p1 · refused: the server is busy... Nothing was written."
+        );
     }
 
     /// A delete's Undo, which only its toast offers, is offered though another write of the
