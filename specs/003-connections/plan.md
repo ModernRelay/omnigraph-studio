@@ -79,8 +79,8 @@ dialog by keyboard), X (capabilities from the served document).
     is refused with exit 2. It exports a managed target's cluster data token without starting a
     login: the one it has cached while that still validates, else a new one it asks the issuer
     for with a 3600 s lifetime, which the issuer may shorten (one made with `omnigraph cluster
-    token --ttl` can last up to 86400 s; `managed/data.rs`). Asked again after a 401 the cache
-    still validates, it gives the same token; a target whose endpoint pin no longer matches
+    token --ttl` can last up to 86400 s; `managed/data.rs`). Asked again after a 401 that refused
+    it, while the cache still validates, it gives the same token; a target whose endpoint pin no longer matches
     fails the export. `credentials status --target` refuses a managed target ("managed
     credentials set/status/remove require explicit --profile"). On a system other than Unix it refuses every export: at main `242ab02f` its
     check of standard output (`commands::targets::stdout_is_pipe` in `commands/targets/mod.rs`)
@@ -153,8 +153,8 @@ dialog by keyboard), X (capabilities from the served document).
      Studio signs in itself (spec 016), and it departs from RFC 1017's A2, which has Studio not
      borrow that token; the person chose it on 2026-10-25, and A2's amendment is proposed
      (Omnigraph #1152). Its token is asked for with `credentials export` alone, kept in memory
-     only, and asked for again after a 401: a lapsed one is replaced, and one refused for
-     another reason comes back the same and stays refused. `target inspect` must still name that
+     only, and asked for again after a 401 that refused it: a lapsed one is replaced, and one
+     refused for another reason comes back the same and stays refused. `target inspect` must still name that
      managed target at that endpoint. The Open dialog names the CLI profile the token comes
      from, and choosing the server or its Retry asks the CLI again after it gave none (since
      2026-10-25: before, nothing asked again until Refresh, so a person who signed in after the
@@ -204,10 +204,17 @@ dialog by keyboard), X (capabilities from the served document).
      from a pipe: an `env` variable, a `file`, the CLI's secure `store` and an `exec` helper are
      each resolved by Omnigraph's code. It is asked for when the server connects, before
      anything is sent, and a graph's first reads wait until it is in (`Connection::token_ready`,
-     since 2026-10-22); once more after a 401 to a token from it, never again until a connect is
-     ready; on the person's Refresh alone, not when a graph is first shown, whose first reads
-     use the connect's token (since 2026-10-22; before, opening a graph asked twice and dropped a
-     token typed in); and when the target's entry or token file changes. The secure store
+     since 2026-10-22); once more after a 401 that refused a token from it (one that refused none,
+     the token never arriving, asks nothing); on the person's Refresh, not when a graph is first
+     shown, whose first reads use the connect's token (since 2026-10-22; before, opening a graph
+     asked twice and dropped a token typed in); when the target's entry or token file changes;
+     and when a CLI is installed, upgraded or removed. After an ask after a refusal, a 401 to
+     any request of the graph (a read, a write, the agent's through its gateway) asks nothing
+     until the server takes a request of a graph with the token held or the credential changes otherwise
+     (a renewal's or a Refresh's token, a new transport); after a probe's ask, a probe's 401 asks
+     nothing until a connect is ready, the token is asked for anew (Refresh, a change to the CLI)
+     or a new source is taken (since 2026-10-30; before, a read's 401 asked again when the
+     probe's ask gave the refused token back). The secure store
      cannot be watched, so nothing polls it. Each ask runs `credentials status` first: a
      credential it finds missing (`absent`, `unavailable`) is said (`No credential is configured
      for 'personal': its token file … is not there`) and nothing is exported or sent. Then the
@@ -233,8 +240,8 @@ dialog by keyboard), X (capabilities from the served document).
      parked graph asks the server nothing (since 2026-10-21), and its views hear of its branch
      list only then, since History reads on it; neither shows any of the old token's meanwhile
      (spec 002, "What the credential may do"; `docs/architecture.md` says what is kept and
-     why). A token typed into Studio for a CLI server stands until Refresh, or a change to its
-     target, asks the CLI again.
+     why). A token typed into Studio for a CLI server stands until Refresh, a change to its
+     target, or a CLI installed, upgraded or removed, asks the CLI again.
 2. A server is added as a CLI target, through the CLI (since 2026-10-22): Studio keeps no
    server list and no token of its own (RFC 1017; its "Studio keeps its own server list and
    token copies" alternative is rejected). Add server runs `omnigraph target add NAME` with the
@@ -334,9 +341,10 @@ request that carried a token is taken as refused. A CLI server the CLI gave no t
 nothing, and reads "The Omnigraph CLI gave no token for this server:" with the CLI's reason
 (since 2026-10-21; before, the token of a target in the old format whose saved token was bound to
 another endpoint was not sent, and its server answered 401).
-Update token's token lasts the run (until Refresh, for a CLI server), and
-its tooltip names `omnigraph credentials set --target <name> --stdin`, which keeps one for the
-CLI and Studio (since 2026-10-21; before, a server sent no token was said to have refused it,
+Update token's token lasts until Studio quits or, for a CLI server whose token the CLI gives,
+asks the CLI again (at Refresh, or a change to the target or to the CLI). On Unix a CLI server
+target's tooltip names `omnigraph credentials set --target <name> --stdin`, which keeps one for
+the CLI and Studio, and a managed profile's names `omnigraph login --profile` (since 2026-10-21; before, a server sent no token was said to have refused it,
 and the tooltip named `omnigraph login`, which is managed sign-in only now).
 
 ### Requests (`graph_client`)

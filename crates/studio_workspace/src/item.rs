@@ -102,6 +102,13 @@ pub trait Item: Render + Focusable + EventEmitter<ItemEvent> {
     fn caches_its_parts(&self) -> bool {
         false
     }
+
+    /// The tab shows what the window's graph reads from its server, so while the server asks
+    /// for a sign-in nobody holds its pane shows the sign-in instead ([`crate::sign_in_prompt`]).
+    /// A tab that reads nothing from it (settings, the agent) is drawn as it is.
+    fn reads_graph(&self) -> bool {
+        true
+    }
 }
 
 pub trait ItemHandle: 'static {
@@ -117,6 +124,7 @@ pub trait ItemHandle: 'static {
     fn serialize(&self, cx: &App) -> Option<SavedItem>;
     fn status(&self, window: &mut Window, cx: &mut App) -> Option<ItemStatus>;
     fn caches_its_parts(&self, cx: &App) -> bool;
+    fn reads_graph(&self, cx: &App) -> bool;
 }
 
 impl<T: Item> ItemHandle for Entity<T> {
@@ -166,5 +174,9 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn caches_its_parts(&self, cx: &App) -> bool {
         self.read(cx).caches_its_parts()
+    }
+
+    fn reads_graph(&self, cx: &App) -> bool {
+        self.read(cx).reads_graph()
     }
 }

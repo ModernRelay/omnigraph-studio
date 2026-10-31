@@ -10,7 +10,6 @@ use std::time::{Duration, SystemTime};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use http_client::HttpClient;
-use http_client::http::StatusCode;
 use serde_json::{Map, Value};
 
 use crate::discovery::AuthorizationServer;
@@ -178,6 +177,9 @@ async fn request(
         .map_err(|why| {
             TokenError::Failed(format!("The sign-in service could not be reached: {why}."))
         })?;
+    // An answer that is no JSON at all (a proxy's or a firewall's page) may pass, whatever its
+    // status: taken as a refusal, it would end the sign-in over a page that may be gone next
+    // time.
     let Some(body) = answer.object() else {
         return Err(TokenError::Failed(if answer.body.is_none() {
             "The sign-in service answered with more than 64 KiB.".into()
@@ -205,19 +207,18 @@ async fn request(
                 "The sign-in service does not issue tokens for this server: {}",
                 said("it refused the resource.")
             )),
-            "" if answer.status.is_server_error() => TokenError::Failed(format!(
-                "The sign-in service failed ({}).",
-                answer.status.as_u16()
-            )),
-            _ if answer.status.is_server_error() => {
-                TokenError::Failed(said("The sign-in service failed."))
-            }
-            // Busy, or asking to be asked later: it may pass, so the sign-in stands.
-            "temporarily_unavailable" | "slow_down" => {
-                TokenError::Failed(said("The sign-in service is busy."))
-            }
-            _ if answer.status == StatusCode::TOO_MANY_REQUESTS => {
-                TokenError::Failed(said("The sign-in service is busy."))
+            // Failed for now, busy, or asking to be asked later: it may pass, so the sign-in
+            // stands.
+            _ if fetch::failed_for_now(answer.status)
+                || matches!(error, "temporarily_unavailable" | "slow_down") =>
+            {
+                TokenError::Failed(if !answer.status.is_server_error() {
+                    said("The sign-in service is busy.")
+                } else if error.is_empty() {
+                    format!("The sign-in service failed ({}).", answer.status.as_u16())
+                } else {
+                    said("The sign-in service failed.")
+                })
             }
             _ => TokenError::Refused(said(&format!(
                 "The sign-in service refused ({}).",

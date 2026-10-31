@@ -963,6 +963,17 @@ pub enum SaveResult {
 
 pub const UNKNOWN_MESSAGE: &str = "Check History before trying again; your changes are still here";
 
+/// What a write never sent says: why, and that nothing was written.
+pub(crate) fn not_sent_notice(reason: &str) -> Notice {
+    Notice::new(
+        Tone::Refused,
+        format!(
+            "Not sent: {}. Nothing was written.",
+            studio_ui::clause(reason)
+        ),
+    )
+}
+
 /// Classifies a write's outcome. `branch` names the write target in a denial.
 pub fn save_result(outcome: &WriteOutcome<ChangeOutput>, branch: &str) -> SaveResult {
     match outcome {
@@ -978,10 +989,11 @@ pub fn save_result(outcome: &WriteOutcome<ChangeOutput>, branch: &str) -> SaveRe
         },
         WriteOutcome::Refused(error) => SaveResult::Refused(refusal(
             error.status,
-            &error.body.error,
+            error.reason(),
             error.body.precondition_failure.is_some(),
             branch,
         )),
+        WriteOutcome::NotSent { reason } => SaveResult::Refused(not_sent_notice(reason)),
         WriteOutcome::Unknown { .. } => {
             SaveResult::Unknown(Notice::new(Tone::Unknown, UNKNOWN_MESSAGE))
         }
@@ -1643,6 +1655,8 @@ mod tests {
     fn refused(status: u16, precondition: bool) -> WriteOutcome<ChangeOutput> {
         WriteOutcome::Refused(ApiError {
             status,
+            unauthorized: None,
+            token_replaced: false,
             body: ErrorOutput {
                 error: "policy denied".into(),
                 precondition_failure: precondition.then(|| PreconditionFailureOutput {
@@ -1686,6 +1700,24 @@ mod tests {
             panic!()
         };
         assert_eq!(notice.message, "Nothing was written. policy denied");
+        // A 401 says what became of the token, not the server's words.
+        let unauthorized = WriteOutcome::Refused(ApiError {
+            status: 401,
+            unauthorized: Some(graph_client::Unauthorized::TokenNotReceived),
+            token_replaced: false,
+            body: ErrorOutput {
+                error: "unauthorized".into(),
+                ..Default::default()
+            },
+        });
+        let SaveResult::Refused(notice) = save_result(&unauthorized, "main") else {
+            panic!()
+        };
+        assert_eq!(
+            notice.message,
+            "Nothing was written. The server received no token, though Studio sent one: \
+             something between them may drop it."
+        );
         assert_eq!(
             save_result(
                 &WriteOutcome::Unknown {
@@ -1694,6 +1726,19 @@ mod tests {
                 "main"
             ),
             SaveResult::Unknown(Notice::new(Tone::Unknown, UNKNOWN_MESSAGE))
+        );
+        // Never sent (the target retired): nothing was written, said as a refusal, not unknown.
+        assert_eq!(
+            save_result(
+                &WriteOutcome::NotSent {
+                    reason: "The CLI no longer lists the target".into()
+                },
+                "main"
+            ),
+            SaveResult::Refused(Notice::new(
+                Tone::Refused,
+                "Not sent: The CLI no longer lists the target. Nothing was written."
+            ))
         );
         assert_eq!(
             changed_elsewhere(None, Some(&json!("CEO"))).message,

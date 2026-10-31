@@ -23,10 +23,19 @@ use crate::api::{
     QueriesCatalogOutput, QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput, SnapshotOutput,
 };
 use crate::{
-    ApiError, CONTRACT, CONTRACT_HEADER, IF_GRAPH_COMMIT_HEADER, WriteOutcome, speaks_contract,
+    Answered, ApiError, CONTRACT, CONTRACT_HEADER, IF_GRAPH_COMMIT_HEADER, WriteOutcome,
+    speaks_contract,
 };
 
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a read of changes waits for its answer: a page of a branch's change feed, of a diff,
+/// of one commit's changes, and a merge's dry run. The server works such a page out whole before
+/// it answers and sets no deadline of its own, and the work grows with the tables the changes
+/// touch, not with the page (spec 012, E35 to E38): on the hosted personal graph (Omnigraph
+/// `0.14.1-edge`, 2026-10-25) one page of a branch's review took 37 to 60 s, so a 60 s read
+/// failed about as often as it answered. As long as a write, which the server also works out
+/// whole. A read is still sent once, unless refused with 429.
+pub const CHANGE_READ_TIMEOUT: Duration = Duration::from_secs(300);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(300);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 /// How many times a read refused with 429 is tried again (spec 003). Writes never are.
@@ -79,6 +88,8 @@ pub struct ApiErrorSummary {
     /// The `Bearer` challenge a 401 carried (`WWW-Authenticate`), which a server sends with
     /// every 401 since Omnigraph #1122; `None` otherwise, and from an older server.
     pub challenge: Option<Box<Challenge>>,
+    /// What a 401 says of the token the read carried; `None` for any other status.
+    pub unauthorized: Option<Unauthorized>,
 }
 
 /// A `WWW-Authenticate` challenge: its scheme and its parameters, as RFC 9110 §11.6.1 writes
@@ -209,6 +220,55 @@ impl Challenge {
     }
 }
 
+/// What a 401 says of the token its request carried, judged from its `Bearer` challenge and
+/// whether the request carried one ([`Self::judge`]). A read's, a write's, the agent's and a
+/// probe's 401 are judged, and said, alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unauthorized {
+    /// The server refused the token it received: it may have lapsed, or not admit this account.
+    TokenRefused,
+    /// A token was sent but the server received none: something between them dropped it, and
+    /// would drop another alike.
+    TokenNotReceived,
+    /// No token was sent, and the server asks for one.
+    TokenNeeded,
+}
+
+impl Unauthorized {
+    /// The judgement of a 401 whose challenge is `challenge`, to a request that carried a token
+    /// when `sent`: refused as the challenge says, or, from a server that sends none (an older
+    /// one), whenever one was sent. One that refused none though a token was sent means it never
+    /// arrived; with none sent, the server asks for one.
+    pub fn judge(challenge: Option<&Challenge>, sent: bool) -> Self {
+        if challenge.map_or(sent, Challenge::token_refused) {
+            Self::TokenRefused
+        } else if sent {
+            Self::TokenNotReceived
+        } else {
+            Self::TokenNeeded
+        }
+    }
+
+    /// The judgement as Studio says it, one sentence.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::TokenRefused => "The server refused the token.",
+            Self::TokenNotReceived => {
+                "The server received no token, though Studio sent one: something between them \
+                 may drop it."
+            }
+            Self::TokenNeeded => "This server asks for a token; none is configured for it.",
+        }
+    }
+}
+
+/// A 401's judgement ([`Unauthorized`]), from the response and the token its request carried;
+/// `None` for any other status.
+fn unauthorized_of(status: StatusCode, headers: &HeaderMap, carried: bool) -> Option<Unauthorized> {
+    (status == StatusCode::UNAUTHORIZED)
+        .then(|| Unauthorized::judge(Challenge::bearer(headers).as_ref(), carried))
+}
+
 /// What a read at a commit was refused for because the commit predates the current schema: a
 /// historical read is written against the current schema, and a type or property the commit
 /// does not hold under its current name is refused, named, rather than read as null.
@@ -286,6 +346,14 @@ impl ApiErrorSummary {
 fn quoted(text: &str) -> Option<String> {
     let inner = text.strip_prefix('\'')?.strip_suffix('\'')?;
     (!inner.is_empty() && !inner.contains('\'')).then(|| inner.to_owned())
+}
+
+impl ReadError {
+    /// Whether the server took the request and had not answered when Studio stopped waiting
+    /// for it: a timeout once the connection was open, not one opening it.
+    pub fn timed_out(&self) -> bool {
+        matches!(self, ReadError::Transport(cause) if cause == REQUEST_TIMED_OUT)
+    }
 }
 
 impl std::fmt::Display for ReadError {
@@ -475,6 +543,34 @@ pub enum FeedAt<'a> {
     Page(&'a str),
 }
 
+/// Why a request has no answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoAnswer {
+    /// Never sent, as its client is retired ([`GraphClient::retire`]): nothing it asked for
+    /// was done, and nothing that client sends will be.
+    Retired(String),
+    /// Never sent, as Studio would not make it as asked: a path that leaves the server's root,
+    /// or a request that could not be built. Nothing it asked for was done.
+    Unsendable(String),
+    /// Never reached the server, as it refused the connection: a request is written only on a
+    /// connection made (an earlier attempt a client retries is one the server did not process),
+    /// so nothing it asked for was done.
+    Unreached(String),
+    /// It was sent, or may have been, and its answer was lost: a write may have landed.
+    Lost(String),
+}
+
+impl From<NoAnswer> for String {
+    fn from(no: NoAnswer) -> Self {
+        match no {
+            NoAnswer::Retired(reason)
+            | NoAnswer::Unsendable(reason)
+            | NoAnswer::Unreached(reason)
+            | NoAnswer::Lost(reason) => reason,
+        }
+    }
+}
+
 /// The server's transport, which a changed target replaces ([`GraphClient::set_http`]): a client
 /// that sends each request through the one current when it is sent, so everything holding it
 /// moves to a new one together, and a request under way finishes through the one it began with.
@@ -508,12 +604,22 @@ impl HttpClient for Transport {
     }
 }
 
+/// A token as a client holds it: a blank one is none, as a server reads `Bearer ` with nothing
+/// after it as no credential (an empty `OMNIGRAPH_STUDIO_TOKEN`, say).
+fn held(token: Option<String>) -> Option<Arc<str>> {
+    token
+        .filter(|token| !token.trim().is_empty())
+        .map(Into::into)
+}
+
 /// The token a client holds, and when it stops being accepted, as the lease it came with says
 /// ([`GraphClient::set_token_ending`]): one lock, so no request reads one without the other.
 struct HeldToken {
     value: Option<Arc<str>>,
     /// `None` for a token that does not end, or not known to.
     ends: Option<SystemTime>,
+    /// Moves each time the value does ([`GraphClient::token_serial`]).
+    serial: u64,
 }
 
 /// A client for one server. Cheap to clone.
@@ -532,9 +638,10 @@ pub struct GraphClient {
     /// The number up to which the holder released the requests waiting
     /// ([`Self::release_waits`]). Shared by every clone.
     waits_released: Arc<std::sync::atomic::AtomicU64>,
-    /// Wakes the requests waiting for the next token when what they wait on changes: each
-    /// waits on the channel current when it looked, which a change replaces, closing it
-    /// ([`Self::wake_waits`]). Shared by every clone.
+    /// Wakes the requests waiting (for the next token; for a read slot or out a 429, should the
+    /// client be retired) when what they wait on changes: each waits on the channel current
+    /// when it looked, which a change replaces, closing it ([`Self::wake_waits`]). Shared by
+    /// every clone.
     waits: Arc<std::sync::Mutex<(smol::channel::Sender<()>, smol::channel::Receiver<()>)>>,
     /// The server's transport, one for every clone and for whatever else reaches the server's
     /// address ([`Self::transport`]): a target whose transport changed is reached through the
@@ -550,6 +657,10 @@ pub struct GraphClient {
     /// ([`Self::refusals`]). Shared by every clone.
     credential_changes: Arc<std::sync::atomic::AtomicU64>,
     refusals: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    /// The credential generation whose refusal the token source was last asked about, until the
+    /// server takes a request with the token held ([`Self::refusal_asked`]). Shared by every
+    /// clone.
+    refusal_asked: Arc<std::sync::Mutex<Option<u64>>>,
 }
 
 impl std::fmt::Debug for GraphClient {
@@ -575,6 +686,11 @@ pub struct ForwardResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub body: AsyncBody,
+    /// The token the request carried was replaced before its answer came: a 401 says nothing of
+    /// the one held now.
+    pub token_replaced: bool,
+    /// What a 401 says of the token the request carried; `None` for any other status.
+    pub unauthorized: Option<Unauthorized>,
 }
 
 impl GraphClient {
@@ -593,8 +709,9 @@ impl GraphClient {
         Ok(Self {
             base,
             token: Arc::new(std::sync::RwLock::new(HeldToken {
-                value: token.map(Into::into),
+                value: held(token),
                 ends: None,
+                serial: 0,
             })),
             ended: Arc::default(),
             waits_begun: Arc::default(),
@@ -605,7 +722,64 @@ impl GraphClient {
             read_slots: Arc::new(smol::lock::Semaphore::new(READ_CONCURRENCY)),
             credential_changes: Arc::default(),
             refusals: Arc::default(),
+            refusal_asked: Arc::default(),
         })
+    }
+
+    /// The credential generation ([`Self::credential_changes`]) whose refusal the token source
+    /// was last asked about: another refusal under it asks nothing more, that one more try
+    /// spent, until the server takes a request of a graph's own routes with the token held (a
+    /// read, a write, the agent's), so a token that lapses later is asked about again.
+    pub fn refusal_asked(&self) -> Option<u64> {
+        *self
+            .refusal_asked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Notes that the token source was asked about a refusal under `generation`, the one more
+    /// try; `None` forgets it, as a token renewed under a refusal does.
+    pub fn note_refusal_asked(&self, generation: Option<u64>) {
+        *self
+            .refusal_asked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = generation;
+    }
+
+    /// The server answered a request to `url` that carried `carried` with `status`, in
+    /// `contract`'s words: a success or a 403 to a graph's own route (a read, a write, the
+    /// agent's) took that token, so when it is the token held, the one more try after a refusal
+    /// ends ([`Self::refusal_asked`]). A 404 does not count, as the server checks no token on a
+    /// path it does not route; nor do the server-level listing and health: a server that refused
+    /// a graph's reads but answered its listing would be asked in a loop.
+    fn note_answer(
+        &self,
+        url: &Url,
+        carried: &Option<Arc<str>>,
+        status: StatusCode,
+        contract: Option<&str>,
+    ) {
+        if (status.is_success() || status == StatusCode::FORBIDDEN)
+            && speaks_contract(contract)
+            && self.graph_of(url).is_some()
+            && *carried == self.token()
+        {
+            self.note_refusal_asked(None);
+        }
+    }
+
+    /// The graph whose own route `url` is (`graphs/{id}/…`, one segment at least under it), if
+    /// it is one.
+    fn graph_of(&self, url: &Url) -> Option<String> {
+        let below = url.path().strip_prefix(self.base.path()).unwrap_or("");
+        let mut segments = below.split('/');
+        if segments.next() != Some("graphs") {
+            return None;
+        }
+        match (segments.next(), segments.next()) {
+            (Some(id), Some(_)) => Some(decode_segment(id)),
+            _ => None,
+        }
     }
 
     /// A count that moves whenever the token is replaced by another, the transport it is sent
@@ -641,20 +815,14 @@ impl GraphClient {
         if status != StatusCode::FORBIDDEN || !speaks_contract(contract) {
             return;
         }
-        let below = url.path().strip_prefix(self.base.path()).unwrap_or("");
-        let mut segments = below.split('/');
-        if segments.next() != Some("graphs") {
-            return;
-        }
-        // The id, then at least one segment of a graph's route under it.
-        let (Some(id), Some(_)) = (segments.next(), segments.next()) else {
+        let Some(graph) = self.graph_of(url) else {
             return;
         };
         *self
             .refusals
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(decode_segment(id))
+            .entry(graph)
             .or_default() += 1;
     }
 
@@ -682,18 +850,18 @@ impl GraphClient {
         &self,
         url: &Url,
         request: Request<AsyncBody>,
-    ) -> Result<http_client::Response<AsyncBody>, String> {
+    ) -> Result<http_client::Response<AsyncBody>, NoAnswer> {
         // A retired client sends nothing: each request fails with why it was retired, as given,
         // not read as a transport's failure.
         if let Some(why) = self.retired.get() {
-            return Err(why.clone());
+            return Err(NoAnswer::Retired(why.clone()));
         }
         let response = self
             .http
             .current()
             .send(request)
             .await
-            .map_err(|error| describe_transport(&error))?;
+            .map_err(|error| unanswered_by_transport(&error))?;
         self.note_refusal(url, response.status(), response.headers());
         Ok(response)
     }
@@ -726,10 +894,15 @@ impl GraphClient {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Why the client was retired ([`Self::retire`]), once it was: it sends nothing.
+    pub fn retired(&self) -> Option<&str> {
+        self.retired.get().map(String::as_str)
+    }
+
     /// Stops the client and every clone of it for good, as when its CLI target is gone or names
     /// a transport Studio cannot use: every request after fails with `why`, and nothing is sent,
-    /// a request waiting for the next token included. What was read is read again, and fails
-    /// so. The first reason given stands.
+    /// a request waiting for the next token, a read slot or out a 429 included, at once. What
+    /// was read is read again, and fails so. The first reason given stands.
     pub fn retire(&self, why: String) {
         if self.retired.set(why).is_ok() {
             self.credential_changes
@@ -749,11 +922,16 @@ impl GraphClient {
     /// other. A request that would send it after then waits for the next
     /// ([`Self::token_ended`]).
     pub fn set_token_ending(&self, token: Option<String>, ends: Option<SystemTime>) -> bool {
-        let token: Option<Arc<str>> = token.map(Into::into);
+        let token = held(token);
         let changed = {
             let mut held = self.held_mut();
             let changed = held.value != token;
-            *held = HeldToken { value: token, ends };
+            let serial = held.serial + u64::from(changed);
+            *held = HeldToken {
+                value: token,
+                ends,
+                serial,
+            };
             changed
         };
         self.wake_waits();
@@ -766,13 +944,23 @@ impl GraphClient {
 
     /// Replaces the token with a renewal of it: the same account's next short-lived token, as
     /// an OAuth refresh gives (spec 016). Nothing read with the old one is read again, so it is
-    /// not counted as another token ([`Self::credential_changes`]).
-    pub fn renew_token(&self, token: String, ends: Option<SystemTime>) {
-        *self.held_mut() = HeldToken {
-            value: Some(token.into()),
-            ends,
+    /// not counted as another token ([`Self::credential_changes`]). Whether it differs from the
+    /// token it replaced.
+    pub fn renew_token(&self, token: String, ends: Option<SystemTime>) -> bool {
+        let token: Arc<str> = token.into();
+        let renewed = {
+            let mut held = self.held_mut();
+            let renewed = held.value.as_deref() != Some(&*token);
+            let serial = held.serial + u64::from(renewed);
+            *held = HeldToken {
+                value: Some(token),
+                ends,
+                serial,
+            };
+            renewed
         };
         self.wake_waits();
+        renewed
     }
 
     fn held_mut(&self) -> std::sync::RwLockWriteGuard<'_, HeldToken> {
@@ -820,13 +1008,33 @@ impl GraphClient {
         self.wake_waits();
     }
 
-    /// Wakes the requests waiting for the next token to look again, once what they wait on
-    /// changed: the channel each waits on closes as this replaces it.
+    /// The channel a wait sleeps on, which [`Self::wake_waits`] closes. Taken before the wait
+    /// looks at what it waits for, so a change made after the look wakes it.
+    fn wake_channel(&self) -> smol::channel::Receiver<()> {
+        self.waits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .1
+            .clone()
+    }
+
+    /// Wakes the requests waiting (for the next token, for a read slot, out a 429) to look
+    /// again, once what they wait on changed: the channel each waits on closes as this replaces
+    /// it.
     fn wake_waits(&self) {
         *self
             .waits
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = smol::channel::bounded(1);
+    }
+
+    /// Names the token held: it moves each time the token is replaced by another, a renewal
+    /// included, and with nothing else (a transport change or a retire leaves it).
+    pub fn token_serial(&self) -> u64 {
+        self.token
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .serial
     }
 
     /// Whether a token is held, so the next request sends one.
@@ -871,26 +1079,14 @@ impl GraphClient {
         };
         let mut told: Option<Instant> = None;
         loop {
-            // Taken before looking, so a change made after the look wakes this wait.
-            let woken = self
-                .waits
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .1
-                .clone();
+            let woken = self.wake_channel();
             if !self.holds_ended_token() {
                 return true;
             }
-            if Instant::now() >= until || released() || self.retired.get().is_some() {
+            if Instant::now() >= until || released() {
                 return false;
             }
-            let holder = self
-                .ended
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone()
-                .filter(|holder| holder.receiver_count() > 0);
-            let Some(holder) = holder else {
+            let Some(holder) = self.listening_holder() else {
                 return false;
             };
             let now = Instant::now();
@@ -913,6 +1109,39 @@ impl GraphClient {
             )
             .await;
         }
+    }
+
+    /// Why the client was retired, once it is ([`Self::retire`], which wakes the waits).
+    async fn retired_now(&self) -> String {
+        loop {
+            let woken = self.wake_channel();
+            if let Some(why) = self.retired.get() {
+                return why.clone();
+            }
+            woken.recv().await.ok();
+        }
+    }
+
+    /// The holder told when a request finds the token held ended, while one listens and the
+    /// client is not retired: whom a wait for the next token can be answered by.
+    fn listening_holder(&self) -> Option<smol::channel::Sender<()>> {
+        if self.retired.get().is_some() {
+            return None;
+        }
+        self.ended
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .filter(|holder| holder.receiver_count() > 0)
+    }
+
+    /// When the token held stops being accepted, for a test.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn token_ends(&self) -> Option<SystemTime> {
+        self.token
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .ends
     }
 
     fn token(&self) -> Option<Arc<str>> {
@@ -952,7 +1181,7 @@ impl GraphClient {
         body: Option<Vec<u8>>,
         headers: &[(&str, &str)],
         timeout: Duration,
-    ) -> Result<RawResponse, String> {
+    ) -> Result<RawResponse, NoAnswer> {
         self.fresh_token().await;
         self.send_now(
             method,
@@ -977,11 +1206,13 @@ impl GraphClient {
             BodyLimit::First(READ_ANSWER_MAX),
         )
         .await
+        .map_err(String::from)
     }
 
     /// Sends with the token held now, keeping only what `limit` says of the body: the rest is
-    /// never read. A caller sending a token waits for a fresh one first, once per attempt
-    /// ([`Self::fresh_token`]); the public routes take none.
+    /// never read. A caller sending a token waits for a fresh one first ([`Self::fresh_token`]),
+    /// once per attempt, and a read again should its token end while it queued for a slot and a
+    /// wait can be answered; the public routes take none.
     async fn send_now(
         &self,
         method: Method,
@@ -990,7 +1221,8 @@ impl GraphClient {
         headers: &[(&str, &str)],
         timeout: Duration,
         limit: BodyLimit,
-    ) -> Result<RawResponse, String> {
+    ) -> Result<RawResponse, NoAnswer> {
+        let head = method == Method::HEAD;
         let (builder, carried) = self.request(method, &url);
         let mut builder = builder.timeout(timeout);
         // A body is JSON unless the caller names its type: a Blob put's is raw bytes.
@@ -1006,7 +1238,7 @@ impl GraphClient {
         }
         let request = builder
             .body(body.map(AsyncBody::from).unwrap_or_else(AsyncBody::empty))
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| NoAnswer::Unsendable(error.to_string()))?;
         let response = self.dispatch(&url, request).await?;
         let status = response.status();
         let contract = response
@@ -1031,9 +1263,11 @@ impl GraphClient {
             BodyLimit::Range { start, len } if status == StatusCode::OK => (start, len),
             BodyLimit::Range { len, .. } => (0, len),
         };
-        let bytes = read_body(response.into_body(), skip, keep)
+        let length = body_length(head, status, &headers);
+        let bytes = read_body(response.into_body(), skip, keep, length)
             .await
-            .map_err(|error| describe_transport(&error.into()))?;
+            .map_err(|error| NoAnswer::Lost(describe_transport(&error.into())))?;
+        self.note_answer(&url, &carried, status, contract.as_deref());
         Ok(RawResponse {
             carried,
             status,
@@ -1044,14 +1278,16 @@ impl GraphClient {
         })
     }
 
-    /// Sends a read once one of the connection's read slots is free; one refused with 429
-    /// waits as asked, without its slot, and goes again.
+    /// Sends a read once one of the connection's read slots is free, waiting up to `timeout`
+    /// for its answer; one refused with 429 waits as asked, without its slot, and goes again. A
+    /// retire ends the wait for a slot or out a 429 at once.
     async fn fetch(
         &self,
         method: Method,
         url: Url,
         body: Option<Vec<u8>>,
         headers: &[(&str, &str)],
+        timeout: Duration,
     ) -> Result<RawResponse, ReadError> {
         self.fetch_reading(
             method,
@@ -1059,6 +1295,7 @@ impl GraphClient {
             body,
             headers,
             BodyLimit::First(READ_ANSWER_MAX),
+            timeout,
         )
         .await
     }
@@ -1071,6 +1308,7 @@ impl GraphClient {
         body: Option<Vec<u8>>,
         headers: &[(&str, &str)],
         limit: BodyLimit,
+        timeout: Duration,
     ) -> Result<RawResponse, ReadError> {
         let mut retries = 0;
         let mut read_again = false;
@@ -1079,10 +1317,18 @@ impl GraphClient {
             // or check of a server away serves them all, not a slot's worth in turn.
             let live = self.fresh_token().await;
             let raw = {
-                let _slot = self.read_slots.acquire().await;
+                // Refused at once if the client is retired while the read queues, not when a slot
+                // frees behind reads still under way.
+                let slot = smol::future::or(async { Ok(self.read_slots.acquire().await) }, async {
+                    Err(self.retired_now().await)
+                })
+                .await;
+                let _slot = slot.map_err(ReadError::Transport)?;
                 // A token live when the read queued that ended while it did (a sleep across a long
-                // queue) is waited for again, the slot let go meanwhile.
-                if live && self.holds_ended_token() {
+                // queue) is waited for again, the slot let go meanwhile, while a holder listens
+                // to answer the wait ([`Self::listening_holder`]); one that cannot give the next
+                // releases it at once, and the read queues once more.
+                if live && self.holds_ended_token() && self.listening_holder().is_some() {
                     continue;
                 }
                 self.send_now(
@@ -1090,18 +1336,27 @@ impl GraphClient {
                     url.clone(),
                     body.clone(),
                     headers,
-                    READ_TIMEOUT,
+                    timeout,
                     limit,
                 )
                 .await
-                .map_err(ReadError::Transport)?
+                .map_err(|no| ReadError::Transport(no.into()))?
             };
             // A read changes nothing, so a rate-limited one waits as asked and goes again.
             if raw.status == StatusCode::TOO_MANY_REQUESTS && retries < READ_RETRIES {
                 let wait = raw.retry_after.unwrap_or(DEFAULT_RETRY_AFTER);
                 if wait <= MAX_RETRY_AFTER {
                     retries += 1;
-                    smol::Timer::after(wait).await;
+                    // Cut short by a retire, whose refusal the next attempt meets.
+                    smol::future::or(
+                        async {
+                            smol::Timer::after(wait).await;
+                        },
+                        async {
+                            self.retired_now().await;
+                        },
+                    )
+                    .await;
                     continue;
                 }
             }
@@ -1129,6 +1384,23 @@ impl GraphClient {
             .await
     }
 
+    /// [`Self::read`] of changes: a `GET` that waits up to [`CHANGE_READ_TIMEOUT`].
+    async fn read_changes<T: DeserializeOwned>(
+        &self,
+        segments: &[&str],
+        query: &[(&str, &str)],
+    ) -> Result<T, ReadError> {
+        self.read_within(
+            Method::GET,
+            segments,
+            query,
+            None,
+            READ_ANSWER_MAX,
+            CHANGE_READ_TIMEOUT,
+        )
+        .await
+    }
+
     /// [`Self::read`] of an answer of at most `cap` bytes. One byte past `cap` is read, to know
     /// the answer goes on, and none after it: a longer answer is [`ReadError::TooLarge`], never
     /// a part of one decoded as if it were whole.
@@ -1140,9 +1412,25 @@ impl GraphClient {
         body: Option<Vec<u8>>,
         cap: usize,
     ) -> Result<T, ReadError> {
+        self.read_within(method, segments, query, body, cap, READ_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::read_capped`], waiting up to `timeout` for the answer.
+    async fn read_within<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        segments: &[&str],
+        query: &[(&str, &str)],
+        body: Option<Vec<u8>>,
+        cap: usize,
+        timeout: Duration,
+    ) -> Result<T, ReadError> {
         let url = self.url(segments, query);
         let limit = BodyLimit::First(cap.saturating_add(1));
-        let raw = self.fetch_reading(method, url, body, &[], limit).await?;
+        let raw = self
+            .fetch_reading(method, url, body, &[], limit, timeout)
+            .await?;
         if !raw.status.is_success() {
             return Err(refusal(&raw));
         }
@@ -1182,7 +1470,9 @@ impl GraphClient {
         at: BlobAt<'_>,
     ) -> Result<BlobMeta, ReadError> {
         let url = self.blob_url(graph, cell, at);
-        let raw = self.fetch(Method::HEAD, url, None, &[]).await?;
+        let raw = self
+            .fetch(Method::HEAD, url, None, &[], READ_TIMEOUT)
+            .await?;
         let header = |name: &str| {
             raw.headers
                 .get(name)
@@ -1243,6 +1533,7 @@ impl GraphClient {
                     start: range.start,
                     len,
                 },
+                READ_TIMEOUT,
             )
             .await?;
         match raw.status.as_u16() {
@@ -1278,6 +1569,7 @@ impl GraphClient {
                     diagnostic: None,
                     change_diff_refusal: None,
                     challenge: None,
+                    unauthorized: None,
                 }))
             }
             _ => Err(refusal(&raw)),
@@ -1301,7 +1593,7 @@ impl GraphClient {
         let url = self.blob_url(graph, cell, BlobAt::Branch(branch));
         let mut headers = vec![("content-type", "application/octet-stream")];
         headers.extend(if_match.map(|tag| ("if-match", tag)));
-        self.send_blob_write(Method::PUT, url, Some(bytes), &headers)
+        self.send_write(Method::PUT, url, Some(bytes), &headers)
             .await
     }
 
@@ -1318,21 +1610,7 @@ impl GraphClient {
         let url = self.blob_url(graph, cell, BlobAt::Branch(branch));
         let headers: Vec<(&str, &str)> =
             if_match.map(|tag| ("if-match", tag)).into_iter().collect();
-        self.send_blob_write(Method::DELETE, url, None, &headers)
-            .await
-    }
-
-    async fn send_blob_write(
-        &self,
-        method: Method,
-        url: Url,
-        body: Option<Vec<u8>>,
-        headers: &[(&str, &str)],
-    ) -> WriteOutcome<BlobWriteOutput> {
-        match self.send(method, url, body, headers, WRITE_TIMEOUT).await {
-            Ok(raw) => classify_write(raw),
-            Err(reason) => WriteOutcome::Unknown { reason },
-        }
+        self.send_write(Method::DELETE, url, None, &headers).await
     }
 
     async fn write<T: DeserializeOwned>(
@@ -1343,12 +1621,31 @@ impl GraphClient {
         body: Option<Vec<u8>>,
         headers: &[(&str, &str)],
     ) -> WriteOutcome<T> {
-        let url = self.url(segments, query);
-        let raw = match self.send(method, url, body, headers, WRITE_TIMEOUT).await {
-            Ok(raw) => raw,
-            Err(reason) => return WriteOutcome::Unknown { reason },
-        };
-        classify_write(raw)
+        self.send_write(method, self.url(segments, query), body, headers)
+            .await
+    }
+
+    /// Sends a write once and judges its answer, or says why it has none.
+    async fn send_write<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        url: Url,
+        body: Option<Vec<u8>>,
+        headers: &[(&str, &str)],
+    ) -> WriteOutcome<T> {
+        match self.send(method, url, body, headers, WRITE_TIMEOUT).await {
+            Ok(raw) => {
+                let token_replaced = raw.carried != self.token();
+                match classify_write(raw) {
+                    WriteOutcome::Refused(error) => WriteOutcome::Refused(ApiError {
+                        token_replaced,
+                        ..error
+                    }),
+                    outcome => outcome,
+                }
+            }
+            Err(no) => unanswered(no),
+        }
     }
 
     // ---- public reads ----
@@ -1358,7 +1655,7 @@ impl GraphClient {
     /// ways and there is no total timeout, as the CLI sets none; a write is sent once and never
     /// retried (constitution III). `path_and_query` is below the server root, without a leading
     /// slash; a path that would leave the root is refused.
-    pub async fn forward(&self, request: ForwardRequest) -> Result<ForwardResponse, String> {
+    pub async fn forward(&self, request: ForwardRequest) -> Result<ForwardResponse, NoAnswer> {
         let path = request
             .path_and_query
             .split(['?', '#'])
@@ -1371,31 +1668,44 @@ impl GraphClient {
                 .any(|segment| segment == ".." || segment == ".")
             || path.contains('\\')
         {
-            return Err(format!("refused path {:?}", request.path_and_query));
+            return Err(NoAnswer::Unsendable(format!(
+                "refused path {:?}",
+                request.path_and_query
+            )));
         }
         let url = self
             .base
             .join(&request.path_and_query)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| NoAnswer::Unsendable(error.to_string()))?;
         // The server receives exactly the path judged here: a join that resolves `%2e%2e`,
         // drops a tab or encodes a byte would send another.
         if !url.as_str().starts_with(self.base.as_str())
             || url.path() != format!("{}{path}", self.base.path())
         {
-            return Err(format!("refused path {:?}", request.path_and_query));
+            return Err(NoAnswer::Unsendable(format!(
+                "refused path {:?}",
+                request.path_and_query
+            )));
         }
         self.fresh_token().await;
-        let (mut builder, _) = self.request(request.method, &url);
+        let (mut builder, carried) = self.request(request.method, &url);
         for (name, value) in &request.headers {
             builder = builder.header(name.as_str(), value.as_str());
         }
         let request = builder
             .body(request.body)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| NoAnswer::Unsendable(error.to_string()))?;
         let response = self.dispatch(&url, request).await?;
+        let contract = response
+            .headers()
+            .get(CONTRACT_HEADER)
+            .and_then(|value: &HeaderValue| value.to_str().ok());
+        self.note_answer(&url, &carried, response.status(), contract);
         Ok(ForwardResponse {
             status: response.status(),
+            unauthorized: unauthorized_of(response.status(), response.headers(), carried.is_some()),
             headers: response.headers().clone(),
+            token_replaced: carried != self.token(),
             body: response.into_body(),
         })
     }
@@ -1598,13 +1908,8 @@ impl GraphClient {
         if let Some(token) = page_token {
             query.push(("page_token", token));
         }
-        self.read(
-            Method::GET,
-            &["graphs", graph, "commits", commit_id, "changes"],
-            &query,
-            None,
-        )
-        .await
+        self.read_changes(&["graphs", graph, "commits", commit_id, "changes"], &query)
+            .await
     }
 
     /// `GET /graphs/{id}/diff`: one page of the net changes from commit `from` to commit
@@ -1622,8 +1927,7 @@ impl GraphClient {
         if let Some(token) = page_token {
             query.push(("page_token", token));
         }
-        self.read(Method::GET, &["graphs", graph, "diff"], &query, None)
-            .await
+        self.read_changes(&["graphs", graph, "diff"], &query).await
     }
 
     /// `GET /graphs/{id}/branches/merge-base`: what a merge of `source` into `target` would
@@ -1660,7 +1964,13 @@ impl GraphClient {
             dry_run: true,
         };
         let raw = self
-            .fetch(Method::POST, url, Some(json(&request)), &[])
+            .fetch(
+                Method::POST,
+                url,
+                Some(json(&request)),
+                &[],
+                CHANGE_READ_TIMEOUT,
+            )
             .await?;
         check_contract(&raw)?;
         if raw.status.is_success() {
@@ -1694,7 +2004,7 @@ impl GraphClient {
             FeedAt::Page(token) => ("page_token", token),
         });
         query.extend(types.iter().map(|name| ("type", name.as_str())));
-        self.read(Method::GET, &["graphs", graph, "changes"], &query, None)
+        self.read_changes(&["graphs", graph, "changes"], &query)
             .await
     }
 
@@ -1828,13 +2138,15 @@ fn refusal(raw: &RawResponse) -> ReadError {
     }
 }
 
-/// A refusal's summary: its body, and a 401's challenge.
+/// A refusal's summary: its body, and a 401's challenge and what it says of the token the read
+/// carried.
 fn summary(raw: &RawResponse) -> ApiErrorSummary {
     let status = raw.status;
     let challenge = (status == StatusCode::UNAUTHORIZED)
         .then(|| Challenge::bearer(&raw.headers))
         .flatten()
         .map(Box::new);
+    let unauthorized = unauthorized_of(status, &raw.headers, raw.carried.is_some());
     match serde_json::from_slice::<ErrorOutput>(&raw.body) {
         Ok(error) => ApiErrorSummary {
             status: status.as_u16(),
@@ -1843,6 +2155,7 @@ fn summary(raw: &RawResponse) -> ApiErrorSummary {
             diagnostic: error.diagnostic,
             change_diff_refusal: error.change_diff_refusal.map(Box::new),
             challenge,
+            unauthorized,
         },
         Err(_) => ApiErrorSummary {
             status: status.as_u16(),
@@ -1854,6 +2167,7 @@ fn summary(raw: &RawResponse) -> ApiErrorSummary {
             diagnostic: None,
             change_diff_refusal: None,
             challenge,
+            unauthorized,
         },
     }
 }
@@ -1877,15 +2191,15 @@ pub fn judge_write<'a>(
     status: StatusCode,
     contract: Option<&str>,
     body: &'a [u8],
-) -> WriteOutcome<&'a [u8]> {
+) -> Answered<&'a [u8]> {
     let contract_ok = speaks_contract(contract);
     if status.is_success() {
         if !contract_ok {
-            return WriteOutcome::Unknown {
+            return Answered::Unknown {
                 reason: "the response did not carry the contract header".into(),
             };
         }
-        return WriteOutcome::Committed(body);
+        return Answered::Committed(body);
     }
     if contract_ok && let Ok(stated) = serde_json::from_slice::<Stated>(body) {
         let effects = stated.disposition.map(|disposition| disposition.effects);
@@ -1898,22 +2212,22 @@ pub fn judge_write<'a>(
             ..ErrorOutput::default()
         });
         return match effects {
-            Some(DispositionEffects::None) => WriteOutcome::Refused(ApiError {
+            Some(DispositionEffects::None) => Answered::Refused(ApiError {
                 status: status.as_u16(),
                 body,
+                unauthorized: None,
+                token_replaced: false,
             }),
-            Some(DispositionEffects::Unknown | DispositionEffects::Partial) => {
-                WriteOutcome::Unknown {
-                    reason: format!(
-                        "the server answered {status} and could not say whether the change was \
+            Some(DispositionEffects::Unknown | DispositionEffects::Partial) => Answered::Unknown {
+                reason: format!(
+                    "the server answered {status} and could not say whether the change was \
                          made: {}",
-                        body.error
-                    ),
-                }
-            }
+                    body.error
+                ),
+            },
             // An effect this build does not know, or none: the contract states one on every
             // error, so an answer without one cannot rule the change out.
-            Some(DispositionEffects::Other) | None => WriteOutcome::Unknown {
+            Some(DispositionEffects::Other) | None => Answered::Unknown {
                 reason: format!(
                     "the server answered {status} without saying whether the change was made: {}",
                     body.error
@@ -1921,7 +2235,7 @@ pub fn judge_write<'a>(
             },
         };
     }
-    WriteOutcome::Unknown {
+    Answered::Unknown {
         reason: format!("the server answered {status}"),
     }
 }
@@ -1941,14 +2255,66 @@ struct Stated {
 /// unknown.
 fn classify_write<T: DeserializeOwned>(raw: RawResponse) -> WriteOutcome<T> {
     match judge_write(raw.status, raw.contract.as_deref(), &raw.body) {
-        WriteOutcome::Committed(body) => match serde_json::from_slice(body) {
+        Answered::Committed(body) => match serde_json::from_slice(body) {
             Ok(value) => WriteOutcome::Committed(value),
             Err(error) => WriteOutcome::Unknown {
                 reason: format!("the success response could not be read: {error}"),
             },
         },
-        WriteOutcome::Refused(error) => WriteOutcome::Refused(error),
-        WriteOutcome::Unknown { reason } => WriteOutcome::Unknown { reason },
+        Answered::Refused(error) => WriteOutcome::Refused(ApiError {
+            unauthorized: unauthorized_of(raw.status, &raw.headers, raw.carried.is_some()),
+            ..error
+        }),
+        Answered::Unknown { reason } => WriteOutcome::Unknown { reason },
+    }
+}
+
+/// Why a request the transport failed has no answer, by the error's kind and never its words:
+/// one that never opened a connection carried no request ([`NoAnswer::Unreached`],
+/// [`never_connected`]); any other failure may have come after the request went out
+/// ([`NoAnswer::Lost`]).
+fn unanswered_by_transport(error: &anyhow::Error) -> NoAnswer {
+    let why = describe_transport(error);
+    if never_connected(error) {
+        NoAnswer::Unreached(why)
+    } else {
+        NoAnswer::Lost(why)
+    }
+}
+
+/// Whether the request failed before a connection to the server opened, by the error's kind:
+/// reqwest's transport could not connect (`is_connect`: the name did not resolve, the server
+/// refused the connection or did not answer it within the connect timeout, the TLS handshake
+/// or a proxy's tunnel failed), or an io `ConnectionRefused` is anywhere in its chain (from
+/// another transport). A request goes out only on a connection that opened, so none of these
+/// sent it; a failure on one that did, a pooled one reused included, may come after it went.
+fn never_connected(error: &anyhow::Error) -> bool {
+    connection_refused(error)
+        || error.chain().any(|layer| {
+            layer
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_connect)
+        })
+}
+
+/// Whether the server refused the connection, by the error's kind: an io `ConnectionRefused`
+/// anywhere in its chain, whatever its text says (Windows words it "No connection could be made
+/// because the target machine actively refused it").
+fn connection_refused(error: &anyhow::Error) -> bool {
+    error.chain().any(|layer| {
+        layer
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
+    })
+}
+
+/// A write with no answer: never sent, so nothing was written, or lost, so it may have been.
+fn unanswered<T>(no: NoAnswer) -> WriteOutcome<T> {
+    match no {
+        NoAnswer::Retired(reason) | NoAnswer::Unsendable(reason) | NoAnswer::Unreached(reason) => {
+            WriteOutcome::NotSent { reason }
+        }
+        NoAnswer::Lost(reason) => WriteOutcome::Unknown { reason },
     }
 }
 
@@ -1975,41 +2341,45 @@ fn content_range_starts_at(served: &str, start: u64) -> bool {
         == Some(start)
 }
 
+/// How long a response's body says it is: its `Content-Length`, unless no body follows (an
+/// answer to HEAD, a 204, a 304), where the header names what a GET would have sent.
+fn body_length(head: bool, status: StatusCode, headers: &HeaderMap) -> Option<u64> {
+    if head || status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED {
+        return None;
+    }
+    headers
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
 /// A response body: `skip` bytes read and dropped, then at most `limit` kept, the rest left
-/// unread.
-async fn read_body(mut body: AsyncBody, skip: u64, limit: usize) -> std::io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    // A whole body, every JSON answer's, is read straight into `bytes`: no buffer is made.
-    if skip == 0 && limit == usize::MAX {
-        body.read_to_end(&mut bytes).await?;
-        return Ok(bytes);
+/// unread. What is kept is read straight into the answer, made as large as the body's
+/// `Content-Length` says from the start (within `limit`), so a whole range is not grown to twice
+/// its size at its end; without one, the answer grows as it is read.
+async fn read_body(
+    mut body: AsyncBody,
+    skip: u64,
+    limit: usize,
+    length: Option<u64>,
+) -> std::io::Result<Vec<u8>> {
+    if skip > 0 {
+        let skipped = futures::io::BufReader::with_capacity(64 * 1024, (&mut body).take(skip));
+        futures::io::copy_buf(skipped, &mut futures::io::sink()).await?;
     }
-    let mut buffer = vec![0; limit.min(256 * 1024).max(usize::from(skip > 0) * 64 * 1024)];
-    let mut skipped = 0;
-    while skipped < skip {
-        let want = buffer
-            .len()
-            .min(usize::try_from(skip - skipped).unwrap_or(usize::MAX));
-        let read = body.read(&mut buffer[..want]).await?;
-        if read == 0 {
-            return Ok(bytes);
-        }
-        skipped += read as u64;
-    }
-    if limit == usize::MAX {
-        body.read_to_end(&mut bytes).await?;
-        return Ok(bytes);
-    }
-    while bytes.len() < limit {
-        let want = buffer.len().min(limit - bytes.len());
-        let read = body.read(&mut buffer[..want]).await?;
-        if read == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&buffer[..read]);
-    }
+    let kept = length.map_or(0, |length| {
+        usize::try_from(length.saturating_sub(skip)).map_or(limit, |left| left.min(limit))
+    });
+    // A byte over, where reading to the end finds that nothing follows.
+    let mut bytes = Vec::with_capacity(kept.saturating_add(1));
+    body.take(limit as u64).read_to_end(&mut bytes).await?;
     Ok(bytes)
 }
+
+/// A request the server took and had not answered within its timeout ([`ReadError::timed_out`]).
+const REQUEST_TIMED_OUT: &str = "the request timed out";
+/// A connection that did not open within its timeout: no server was reached.
+const CONNECT_TIMED_OUT: &str = "the connection timed out";
 
 /// What went wrong reaching the server, in words: a class (refused, timed out, name not found,
 /// TLS, connection closed) or else the innermost cause, with any URL removed. The client's own
@@ -2022,8 +2392,16 @@ fn describe_transport(error: &anyhow::Error) -> String {
         .collect();
     let all = layers.join(" ").to_lowercase();
     let class = if all.contains("timed out") || all.contains("timeout") {
-        Some("the request timed out")
-    } else if all.contains("connection refused") {
+        // A connection that never opened reached no server (`client error (Connect)` is
+        // hyper's layer for it); a request that did was waiting for the server's answer.
+        if all.contains("(connect)") {
+            Some(CONNECT_TIMED_OUT)
+        } else {
+            Some(REQUEST_TIMED_OUT)
+        }
+    } else if connection_refused(error) {
+        // By its kind alone: a failure that only says so in words may come after sending, and
+        // is not said as one that sent nothing.
         Some("the connection was refused")
     } else if all.contains("dns error")
         || all.contains("lookup address")
@@ -2095,6 +2473,21 @@ mod tests {
 
     fn client(http: Arc<dyn HttpClient>) -> GraphClient {
         GraphClient::new("http://127.0.0.1:8787", Some("t".into()), http).unwrap()
+    }
+
+    /// A blank token is none, given at the start or later: sent, a server would read `Bearer `
+    /// as no credential, and say it got none.
+    #[test]
+    fn a_blank_token_is_none() {
+        let http = FakeHttpClient::create(|_| async { unreachable!() });
+        let blank = GraphClient::new("http://127.0.0.1:8787", Some(String::new()), http).unwrap();
+        assert!(!blank.holds_token());
+        let held = client(FakeHttpClient::create(|_| async { unreachable!() }));
+        assert!(
+            held.set_token(Some("  ".into())),
+            "the token held is dropped"
+        );
+        assert!(!held.holds_token());
     }
 
     const CHANGE: &str =
@@ -2202,9 +2595,9 @@ mod tests {
                 Some(crate::CONTRACT),
                 body.as_bytes(),
             ) {
-                WriteOutcome::Committed(_) => "committed",
-                WriteOutcome::Refused(_) => "refused",
-                WriteOutcome::Unknown { .. } => "unknown",
+                Answered::Committed(_) => "committed",
+                Answered::Refused(_) => "refused",
+                Answered::Unknown { .. } => "unknown",
             }
         };
         assert_eq!(judge(500, Some("none")), "refused", "nothing was done");
@@ -2237,14 +2630,14 @@ mod tests {
             Some(crate::CONTRACT),
             unread.as_bytes(),
         ) {
-            WriteOutcome::Refused(refusal) => assert_eq!(refusal.body.error, "no"),
+            Answered::Refused(refusal) => assert_eq!(refusal.body.error, "no"),
             _ => panic!("a refusal whose details this build does not read"),
         }
         // Without the contract header the server did not answer, whatever the body says.
         let body = error(Some("none"));
         assert!(matches!(
             judge_write(StatusCode::INTERNAL_SERVER_ERROR, None, body.as_bytes()),
-            WriteOutcome::Unknown { .. }
+            Answered::Unknown { .. }
         ));
     }
 
@@ -2368,6 +2761,86 @@ mod tests {
                 "{} {path} is not a route of the contract",
                 method.to_uppercase()
             );
+        }
+    }
+
+    /// A read of changes, which the server works out whole whatever the page, waits as long as a
+    /// write; every other read waits a minute, as before.
+    #[test]
+    fn a_read_of_changes_waits_longer_than_other_reads() {
+        /// Each request's method and path, and the timeout it was sent with.
+        type Sent = Vec<(String, Option<Duration>)>;
+        let sent: Arc<std::sync::Mutex<Sent>> = Arc::default();
+        let log = sent.clone();
+        let http = FakeHttpClient::create(move |request| {
+            log.lock().unwrap().push((
+                format!("{} {}", request.method(), request.uri().path()),
+                request
+                    .extensions()
+                    .get::<http_client::RequestTimeout>()
+                    .map(|timeout| timeout.0),
+            ));
+            async move {
+                Ok(Response::builder()
+                    .status(200)
+                    .header(CONTRACT_HEADER, CONTRACT)
+                    .body(AsyncBody::from("{}"))
+                    .unwrap())
+            }
+        });
+        let at = client(http);
+        let graph = "knowledge";
+        let cell = BlobCell {
+            edge: false,
+            type_name: "Person".into(),
+            id: "p1".into(),
+            property: "photo".into(),
+        };
+        let query = QueryRequest {
+            query: "query q() {}".into(),
+            name: None,
+            params: None,
+            branch: Some("main".into()),
+            snapshot: None,
+        };
+        let taken = || std::mem::take(&mut *sent.lock().unwrap());
+        block_on(async {
+            at.changes(graph, "main", FeedAt::Start("now"), &[], 10)
+                .await
+                .ok();
+            at.diff(graph, "c1", "c2", None, 10).await.ok();
+            at.commit_changes(graph, "c1", None, 10).await.ok();
+            at.merge_preview(graph, "feature", "main").await.ok();
+        });
+        let changes = taken();
+        block_on(async {
+            at.graphs().await.ok();
+            at.schema(graph).await.ok();
+            at.snapshot(graph, "main").await.ok();
+            at.query(graph, &query).await.ok();
+            at.stored_queries(graph).await.ok();
+            at.access(graph, Some("main"), None).await.ok();
+            at.branches(graph).await.ok();
+            at.commit_page(graph, "main", 1, None).await.ok();
+            at.commit(graph, "c1").await.ok();
+            at.merge_base(graph, "feature", "main").await.ok();
+            at.blob_head(graph, &cell, BlobAt::Branch("main"))
+                .await
+                .ok();
+            at.blob_bytes(graph, &cell, BlobAt::Snapshot("c1"), 0..10)
+                .await
+                .ok();
+        });
+        let others = taken();
+        assert!(CHANGE_READ_TIMEOUT > READ_TIMEOUT);
+        assert_eq!(CHANGE_READ_TIMEOUT, WRITE_TIMEOUT);
+        assert_eq!(changes.len(), 4, "{changes:?}");
+        for (route, timeout) in &changes {
+            assert_eq!(*timeout, Some(CHANGE_READ_TIMEOUT), "{route}");
+        }
+        assert_eq!(others.len(), 12, "{others:?}");
+        for (route, timeout) in &others {
+            assert_eq!(*timeout, Some(READ_TIMEOUT), "{route}");
         }
     }
 
@@ -2702,6 +3175,38 @@ mod tests {
     /// the ended one.
     #[test]
     fn a_read_whose_token_ended_while_it_queued_waits_for_the_next() {
+        use std::sync::atomic::AtomicBool;
+        let (held, slots, sent) = slots_taken();
+        let told = held.token_ended();
+        // Polled by hand: queued for a slot with a live token, which then ends.
+        let woken = Arc::new(Woken(AtomicBool::new(false)));
+        let waker = futures::task::waker(woken.clone());
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut queued = Box::pin(held.schema("g"));
+        assert!(queued.as_mut().poll(&mut context).is_pending(), "queued");
+        held.set_token_ends(Some(SystemTime::now()));
+        slots.release();
+        // With a slot, it finds its token ended, and waits for the next, telling the holder.
+        assert!(queued.as_mut().poll(&mut context).is_pending(), "waits");
+        assert!(told.try_recv().is_ok(), "the holder told");
+        woken.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        held.renew_token(
+            "next".into(),
+            Some(SystemTime::now() + Duration::from_secs(300)),
+        );
+        assert!(
+            woken.0.load(std::sync::atomic::Ordering::SeqCst),
+            "woken by the renewal"
+        );
+        assert!(queued.as_mut().poll(&mut context).is_ready(), "sent");
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), READ_CONCURRENCY + 1, "{sent:?}");
+        assert_eq!(sent.last().map(String::as_str), Some("Bearer next"));
+    }
+
+    /// A client whose read slots are all taken by reads its server answers only once the guard
+    /// returned lets go, and the token each request carried, in order.
+    fn slots_taken() -> (GraphClient, SlotsTaken, Arc<std::sync::Mutex<Vec<String>>>) {
         use std::sync::atomic::{AtomicBool, Ordering};
         let hold = Arc::new(AtomicBool::new(true));
         let sent: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
@@ -2716,7 +3221,6 @@ mod tests {
                     .unwrap_or_default()
                     .to_owned();
                 log.lock().unwrap().push(token);
-                // The reads that fill the slots answer once the test lets them.
                 while holding.load(Ordering::SeqCst) {
                     smol::Timer::after(Duration::from_millis(5)).await;
                 }
@@ -2728,12 +3232,14 @@ mod tests {
             }
         });
         let held = client(http);
-        let told = held.token_ended();
-        let read = |held: &GraphClient| {
-            let held = held.clone();
-            std::thread::spawn(move || block_on(held.schema("g")).ok())
-        };
-        let filling: Vec<_> = (0..READ_CONCURRENCY).map(|_| read(&held)).collect();
+        let filling = (0..READ_CONCURRENCY)
+            .map(|_| {
+                let held = held.clone();
+                std::thread::spawn(move || {
+                    block_on(held.schema("g")).ok();
+                })
+            })
+            .collect();
         let started = Instant::now();
         while sent.lock().unwrap().len() < READ_CONCURRENCY {
             assert!(
@@ -2742,23 +3248,105 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
-        // Queued for a slot with a live token, which then ends.
-        let queued = read(&held);
-        std::thread::sleep(Duration::from_millis(300));
-        held.set_token_ends(Some(SystemTime::now()));
-        hold.store(false, Ordering::SeqCst);
-        for done in filling {
-            done.join().unwrap();
+        (held, SlotsTaken { hold, filling }, sent)
+    }
+
+    /// The reads holding a client's read slots ([`slots_taken`]): let go when released, or when
+    /// dropped, so a test that fails does not leave them waiting.
+    struct SlotsTaken {
+        hold: Arc<std::sync::atomic::AtomicBool>,
+        filling: Vec<std::thread::JoinHandle<()>>,
+    }
+
+    impl SlotsTaken {
+        /// Lets the reads be answered, and waits until they are.
+        fn release(mut self) {
+            self.hold.store(false, std::sync::atomic::Ordering::SeqCst);
+            for read in self.filling.drain(..) {
+                read.join().unwrap();
+            }
         }
-        assert!(told_within(&told), "the queued read waits for the next");
-        held.renew_token(
-            "next".into(),
-            Some(SystemTime::now() + Duration::from_secs(300)),
+    }
+
+    impl Drop for SlotsTaken {
+        fn drop(&mut self) {
+            self.hold.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A waker that notes it was woken, for a request polled by hand.
+    struct Woken(std::sync::atomic::AtomicBool);
+
+    impl futures::task::ArcWake for Woken {
+        fn wake_by_ref(this: &Arc<Self>) {
+            this.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A read queued for a slot is refused as soon as its client is retired, not when a slot
+    /// frees behind reads still under way: polled by hand, it is woken by the retire itself.
+    #[test]
+    fn a_read_queued_when_its_client_is_retired_is_refused_at_once() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::Poll;
+        let (held, slots, sent) = slots_taken();
+        let woken = Arc::new(Woken(AtomicBool::new(false)));
+        let waker = futures::task::waker(woken.clone());
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut queued = Box::pin(held.schema("g"));
+        assert!(queued.as_mut().poll(&mut context).is_pending(), "queued");
+        assert!(!woken.0.load(Ordering::SeqCst));
+        held.retire("the target is gone".into());
+        assert!(woken.0.load(Ordering::SeqCst), "woken by the retire");
+        let Poll::Ready(Err(ReadError::Transport(why))) = queued.as_mut().poll(&mut context) else {
+            panic!("refused at once");
+        };
+        assert_eq!(why, "the target is gone");
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            READ_CONCURRENCY,
+            "nothing more sent"
         );
-        queued.join().unwrap();
-        let sent = sent.lock().unwrap();
-        assert_eq!(sent.len(), READ_CONCURRENCY + 1, "{sent:?}");
-        assert_eq!(sent.last().map(String::as_str), Some("Bearer next"));
+        slots.release();
+    }
+
+    /// A read sleeping out a 429's Retry-After is refused as soon as its client is retired, not
+    /// when the sleep ends, and is not sent again.
+    #[test]
+    fn a_read_sleeping_out_a_429_is_refused_when_its_client_is_retired() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::task::Poll;
+        let sent = Arc::new(AtomicUsize::new(0));
+        let count = sent.clone();
+        let http = FakeHttpClient::create(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            async move {
+                Ok(Response::builder()
+                    .status(429)
+                    .header("retry-after", "30")
+                    .header(CONTRACT_HEADER, CONTRACT)
+                    .body(AsyncBody::from("{}"))
+                    .unwrap())
+            }
+        });
+        let held = client(http);
+        let woken = Arc::new(Woken(AtomicBool::new(false)));
+        let waker = futures::task::waker(woken.clone());
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut read = Box::pin(held.schema("g"));
+        assert!(
+            read.as_mut().poll(&mut context).is_pending(),
+            "sleeping out the 429"
+        );
+        assert_eq!(sent.load(Ordering::SeqCst), 1);
+        assert!(!woken.0.load(Ordering::SeqCst));
+        held.retire("the target is gone".into());
+        assert!(woken.0.load(Ordering::SeqCst), "woken by the retire");
+        let Poll::Ready(Err(ReadError::Transport(why))) = read.as_mut().poll(&mut context) else {
+            panic!("refused at once");
+        };
+        assert_eq!(why, "the target is gone");
+        assert_eq!(sent.load(Ordering::SeqCst), 1, "not sent again");
     }
 
     /// An HTTP client replaced on the client, as when the CLI target's certificate authority
@@ -2804,6 +3392,11 @@ mod tests {
         held.retire("the target is gone".into());
         assert_eq!(gateway.credential_changes(), changes + 2);
         let refused = block_on(gateway.schema("g")).unwrap_err();
+        // A write is not sent either, and says so: nothing was written.
+        assert!(matches!(
+            block_on(gateway.mutate("g", &ChangeRequest::default(), None)),
+            WriteOutcome::NotSent { reason } if reason == "the target is gone"
+        ));
         assert!(
             format!("{refused:?}").contains("the target is gone"),
             "{refused:?}"
@@ -2814,6 +3407,292 @@ mod tests {
             6,
             "the retired client sent nothing"
         );
+    }
+
+    /// The one more try after a refusal ends when the server takes a request of a graph's own
+    /// routes with the token held: a success or a 403, under the contract header, by a read or
+    /// the agent's forward alike. The server-level listing, an answer without the contract
+    /// header (from something in between) and a 404 (a path the server may not check the token
+    /// on) end nothing.
+    #[test]
+    fn a_request_taken_ends_the_one_more_try() {
+        let answering = |status: u16, contract: bool| {
+            client(FakeHttpClient::create(move |_| async move {
+                let mut response = Response::builder().status(status);
+                if contract {
+                    response = response.header(CONTRACT_HEADER, CONTRACT);
+                }
+                Ok(response.body(AsyncBody::from(r#"{"graphs":[]}"#)).unwrap())
+            }))
+        };
+        let forwarded = |client: &GraphClient, path: &str| {
+            client.note_refusal_asked(Some(7));
+            let request = ForwardRequest {
+                method: Method::GET,
+                path_and_query: path.into(),
+                headers: Vec::new(),
+                body: AsyncBody::empty(),
+            };
+            block_on(client.forward(request)).ok();
+            client.refusal_asked().is_none()
+        };
+        assert!(forwarded(&answering(200, true), "graphs/g/schema"));
+        assert!(forwarded(&answering(403, true), "graphs/g/schema"));
+        assert!(!forwarded(&answering(200, true), "graphs"), "the listing");
+        assert!(
+            !forwarded(&answering(200, false), "graphs/g/schema"),
+            "without the contract header"
+        );
+        assert!(!forwarded(&answering(404, true), "graphs/g/nope"), "a 404");
+        // A success to a token replaced while the request was out took the old token, not the
+        // one held.
+        let held: Arc<std::sync::OnceLock<GraphClient>> = Arc::default();
+        let replacing = held.clone();
+        let replaced = client(FakeHttpClient::create(move |_| {
+            if let Some(client) = replacing.get() {
+                client.set_token(Some("t2".into()));
+            }
+            async move {
+                Ok(Response::builder()
+                    .status(200)
+                    .header(CONTRACT_HEADER, CONTRACT)
+                    .body(AsyncBody::from("{}"))
+                    .unwrap())
+            }
+        }));
+        held.set(replaced.clone()).ok();
+        assert!(
+            !forwarded(&replaced, "graphs/g/schema"),
+            "a token replaced in flight"
+        );
+        // A read, through the same door.
+        let read = answering(200, true);
+        read.note_refusal_asked(Some(7));
+        block_on(read.graphs()).ok();
+        assert!(read.refusal_asked().is_some(), "the listing, read");
+        block_on(read.schema("g")).ok();
+        assert!(read.refusal_asked().is_none(), "a graph's read");
+    }
+
+    /// A 401 to a token replaced while the request was out says so, for a write and a forwarded
+    /// request alike: it says nothing of the token held now, which is not asked about.
+    #[test]
+    fn a_401_to_a_token_replaced_meanwhile_says_so() {
+        let held: Arc<std::sync::OnceLock<GraphClient>> = Arc::default();
+        let replacing = held.clone();
+        let http = FakeHttpClient::create(move |_| {
+            // The token is replaced while the request is out.
+            if let Some(client) = replacing.get() {
+                client.set_token(Some("t2".into()));
+            }
+            async move {
+                Ok(Response::builder()
+                    .status(401)
+                    .header(CONTRACT_HEADER, CONTRACT)
+                    .header("www-authenticate", r#"Bearer error="invalid_token""#)
+                    .body(AsyncBody::from(
+                        r#"{"error":"unauthorized","code":"unauthorized","disposition":{"execution":"not_started","effects":"none","action":"fix"}}"#,
+                    ))
+                    .unwrap())
+            }
+        });
+        let client = client(http);
+        held.set(client.clone()).ok();
+        assert!(matches!(
+            block_on(client.mutate("g", &ChangeRequest::default(), None)),
+            WriteOutcome::Refused(ApiError {
+                status: 401,
+                token_replaced: true,
+                ..
+            })
+        ));
+        client.set_token(Some("t".into()));
+        let request = ForwardRequest {
+            method: Method::GET,
+            path_and_query: "graphs/g/schema".into(),
+            headers: Vec::new(),
+            body: AsyncBody::empty(),
+        };
+        assert!(block_on(client.forward(request)).is_ok_and(|response| response.token_replaced));
+    }
+
+    /// A 401 says what became of the token its request carried, from its challenge and whether
+    /// it carried one, alike for a read, a write and a forwarded request: refused
+    /// (`invalid_token`), never received (a bare `Bearer` though one was sent: a proxy dropped
+    /// it), or none sent. A write's reason says it in Studio's words; any other refusal keeps
+    /// the server's. Before, a read's hint said every 401 refused the token, and a write's said
+    /// the server's text.
+    #[test]
+    fn a_401_says_what_became_of_the_token() {
+        let answering = |status: u16, challenge: &'static str| {
+            FakeHttpClient::create(move |_| async move {
+                Ok(Response::builder()
+                    .status(status)
+                    .header(CONTRACT_HEADER, CONTRACT)
+                    .header("www-authenticate", challenge)
+                    .body(AsyncBody::from(
+                        r#"{"error":"server words","code":"unauthorized","disposition":{"execution":"not_started","effects":"none","action":"fix"}}"#,
+                    ))
+                    .unwrap())
+            })
+        };
+        let judged = |token: Option<&str>, status: u16, challenge: &'static str| {
+            let client = GraphClient::new(
+                "http://127.0.0.1:8787",
+                token.map(str::to_owned),
+                answering(status, challenge),
+            )
+            .unwrap();
+            let read = match block_on(client.schema("g")) {
+                Err(ReadError::Refused(summary)) => summary.unauthorized,
+                other => panic!("{other:?}"),
+            };
+            let WriteOutcome::Refused(write) =
+                block_on(client.mutate("g", &ChangeRequest::default(), None))
+            else {
+                panic!("the write was not refused");
+            };
+            let request = ForwardRequest {
+                method: Method::GET,
+                path_and_query: "graphs/g/schema".into(),
+                headers: Vec::new(),
+                body: AsyncBody::empty(),
+            };
+            let forwarded = block_on(client.forward(request)).unwrap().unauthorized;
+            assert_eq!(write.unauthorized, read);
+            assert_eq!(forwarded, read);
+            let reason = write.reason().to_owned();
+            (read, reason)
+        };
+        let refused = r#"Bearer error="invalid_token""#;
+        assert_eq!(
+            judged(Some("t"), 401, refused),
+            (
+                Some(Unauthorized::TokenRefused),
+                Unauthorized::TokenRefused.reason().to_owned()
+            )
+        );
+        assert_eq!(
+            judged(Some("t"), 401, "Bearer").0,
+            Some(Unauthorized::TokenNotReceived)
+        );
+        assert_eq!(
+            judged(None, 401, "Bearer").0,
+            Some(Unauthorized::TokenNeeded)
+        );
+        // From a server that sends no challenge, a 401 to a token sent refused it.
+        assert_eq!(
+            judged(Some("t"), 401, "Basic").0,
+            Some(Unauthorized::TokenRefused)
+        );
+        assert_eq!(
+            judged(Some("t"), 403, refused),
+            (None, "server words".to_owned())
+        );
+    }
+
+    /// A write whose connection the server refused was never sent, and says so: nothing was
+    /// written. One whose connection failed otherwise (reset) may have landed after it went out,
+    /// and so may one whose failure only says "connection refused" in words: the error's kind
+    /// decides, not its text. Before, every transport failure was an answer lost.
+    #[test]
+    fn a_write_the_server_refused_to_connect_to_is_not_sent() {
+        let failing = |kind: Option<std::io::ErrorKind>| {
+            client(FakeHttpClient::create(move |_| async move {
+                Err(match kind {
+                    Some(kind) => anyhow::Error::from(std::io::Error::from(kind))
+                        .context("error sending request"),
+                    None => anyhow::anyhow!("connection refused, in words alone"),
+                })
+            }))
+        };
+        let write =
+            |client: GraphClient| block_on(client.mutate("g", &ChangeRequest::default(), None));
+        assert!(matches!(
+            write(failing(Some(std::io::ErrorKind::ConnectionRefused))),
+            WriteOutcome::NotSent { reason } if reason == "the connection was refused"
+        ));
+        // Said the same where the system words it otherwise, as Windows does (error 10061).
+        let windows = client(FakeHttpClient::create(|_| async {
+            Err(anyhow::Error::from(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "No connection could be made because the target machine actively refused it. \
+                 (os error 10061)",
+            ))
+            .context("tcp connect error"))
+        }));
+        assert!(matches!(
+            write(windows),
+            WriteOutcome::NotSent { reason } if reason == "the connection was refused"
+        ));
+        assert!(matches!(
+            write(failing(Some(std::io::ErrorKind::ConnectionReset))),
+            WriteOutcome::Unknown { .. }
+        ));
+        // Said in its own words: nothing here says it was not sent.
+        assert!(matches!(
+            write(failing(None)),
+            WriteOutcome::Unknown { reason } if reason == "connection refused, in words alone"
+        ));
+    }
+
+    /// Through the transport Studio sends with, every write that never opened a connection was
+    /// never sent, whatever stopped it: a name that does not resolve, a refused connection, a
+    /// TLS handshake that fails. One whose connection opened and closed after it went out may
+    /// have landed. Before, only a refused connection said it was not sent.
+    #[test]
+    fn a_write_that_never_connected_is_not_sent() {
+        use std::io::{Read as _, Write as _};
+        let http: Arc<dyn HttpClient> =
+            Arc::new(reqwest_client::ReqwestClient::user_agent("studio-test").unwrap());
+        let write = |base: &str| {
+            let client = GraphClient::new(base, Some("t".into()), http.clone()).unwrap();
+            block_on(client.mutate("g", &ChangeRequest::default(), None))
+        };
+        // `.invalid` never resolves (RFC 6761).
+        assert!(matches!(
+            write("http://studio-test.invalid"),
+            WriteOutcome::NotSent { .. }
+        ));
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        assert!(matches!(
+            write(&format!("http://127.0.0.1:{port}")),
+            WriteOutcome::NotSent { reason } if reason == "the connection was refused"
+        ));
+        // A listener that answers a TLS hello in plain HTTP: the handshake fails.
+        let plain = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = plain.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut hello = [0; 512];
+            if let Ok((mut stream, _)) = plain.accept()
+                && stream.read(&mut hello).is_ok_and(|read| read > 0)
+            {
+                stream
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n")
+                    .ok();
+            }
+        });
+        assert!(matches!(
+            write(&format!("https://127.0.0.1:{port}")),
+            WriteOutcome::NotSent { .. }
+        ));
+        // A server that reads the write, then closes without answering.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = silent.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut request = [0; 4096];
+            if let Ok((mut stream, _)) = silent.accept()
+                && stream.read(&mut request).is_ok_and(|read| read > 0)
+            {
+                drop(stream);
+            }
+        });
+        assert!(matches!(
+            write(&format!("http://127.0.0.1:{port}")),
+            WriteOutcome::Unknown { .. }
+        ));
     }
 
     /// Stored queries: the catalog decodes (a kind Studio does not know is `Other`), a read
@@ -2987,7 +3866,10 @@ mod tests {
                 headers: Vec::new(),
                 body: AsyncBody::empty(),
             }));
-            assert!(refused.is_err(), "{path} was sent");
+            assert!(
+                matches!(refused, Err(NoAnswer::Unsendable(_))),
+                "{path} was sent"
+            );
         }
         assert!(seen.lock().unwrap().is_empty());
     }
@@ -3472,6 +4354,7 @@ mod tests {
                 diagnostic: None,
                 change_diff_refusal: None,
                 challenge: None,
+                unauthorized: None,
             }
             .historical_gap()
         };
@@ -3629,6 +4512,43 @@ mod tests {
                 .fetch_add(buffer.len(), std::sync::atomic::Ordering::SeqCst);
             std::task::Poll::Ready(Ok(buffer.len()))
         }
+    }
+
+    /// A body whose length is said is read into one allocation of that length: a whole range, or
+    /// what is kept of a value read from its start, is not grown to twice its size at its end.
+    #[test]
+    fn a_body_of_known_length_is_read_without_growing() {
+        // Not a power of two, which growth by doubling could land on.
+        let len = (1 << 20) + 3;
+        let whole = block_on(read_body(
+            AsyncBody::from(vec![7_u8; len]),
+            0,
+            len,
+            Some(len as u64),
+        ))
+        .unwrap();
+        assert_eq!(whole.len(), len);
+        assert!(whole.capacity() <= len + 1, "{}", whole.capacity());
+        let cut = block_on(read_body(
+            AsyncBody::from(vec![7_u8; len]),
+            100,
+            len / 2,
+            Some(len as u64),
+        ))
+        .unwrap();
+        assert_eq!(cut.len(), len / 2);
+        assert!(cut.capacity() <= len / 2 + 1, "{}", cut.capacity());
+
+        // No body follows a HEAD, a 204 or a 304, whatever length the header names.
+        let mut headers = HeaderMap::new();
+        headers.insert("content-length", HeaderValue::from_static("10485760"));
+        assert_eq!(
+            body_length(false, StatusCode::OK, &headers),
+            Some(10_485_760)
+        );
+        assert_eq!(body_length(true, StatusCode::OK, &headers), None);
+        assert_eq!(body_length(false, StatusCode::NO_CONTENT, &headers), None);
+        assert_eq!(body_length(false, StatusCode::NOT_MODIFIED, &headers), None);
     }
 
     /// A server that ignores Range sends the whole value: the range is cut from it, and what
@@ -3979,6 +4899,32 @@ mod tests {
             ReadError::Transport(describe_transport(&refused)).to_string(),
             "Could not reach the server: the connection was refused"
         );
+    }
+
+    /// A timeout says whether the server was reached: reqwest's chain for a request the server
+    /// had not answered in time, and for a connection that did not open in time (hyper's
+    /// `Connect` layer under it), at `zed-reqwest` `33bc764` and `hyper-util` 0.1.17.
+    #[test]
+    fn a_timeout_says_whether_the_server_was_reached() {
+        let url = "error sending request for url (https://graph.example.com/graphs/g/diff?from=a)";
+        let unanswered =
+            anyhow::Error::new(std::io::Error::other("operation timed out")).context(url);
+        let unopened = anyhow::Error::new(std::io::Error::other("operation timed out"))
+            .context("client error (Connect)")
+            .context(url);
+        let unanswered = ReadError::Transport(describe_transport(&unanswered));
+        let unopened = ReadError::Transport(describe_transport(&unopened));
+        assert!(unanswered.timed_out());
+        assert_eq!(
+            unanswered.to_string(),
+            "Could not reach the server: the request timed out"
+        );
+        assert!(!unopened.timed_out());
+        assert_eq!(
+            unopened.to_string(),
+            "Could not reach the server: the connection timed out"
+        );
+        assert!(!ReadError::Transport("the connection was refused".into()).timed_out());
     }
 
     #[test]

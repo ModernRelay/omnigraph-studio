@@ -34,6 +34,11 @@ impl Focusable for DesignGallery {
 }
 
 impl Item for DesignGallery {
+    /// The gallery reads nothing from a graph's server.
+    fn reads_graph(&self) -> bool {
+        false
+    }
+
     fn tab_title(&self, _cx: &App) -> SharedString {
         "Design system".into()
     }

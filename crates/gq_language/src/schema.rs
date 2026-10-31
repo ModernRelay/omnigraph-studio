@@ -310,6 +310,16 @@ impl SchemaModel {
                 .eq(other.nodes.iter().map(NodeType::label_property))
     }
 
+    /// [`Self::same_as`] for two schemas a view may hold, either absent: none is the same as
+    /// none, and the same model is the same without comparing it.
+    pub fn same_held(a: Option<&std::sync::Arc<Self>>, b: Option<&std::sync::Arc<Self>>) -> bool {
+        match (a, b) {
+            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b) || a.same_as(b),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
     pub fn edge(&self, name: &str) -> Option<&EdgeType> {
         self.edges.get(*self.edge_index.get(name)?)
     }

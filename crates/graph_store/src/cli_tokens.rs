@@ -28,8 +28,9 @@
 //! refuses a second command on a home whose lock another holds; [`run`]), its standard input
 //! empty, and none of Omnigraph's variables ([`omnigraph_variables`]) but `OMNIGRAPH_HOME` and
 //! the one a target's own token source names ([`scrubbed`]). A token is asked for when its
-//! server connects, once more after a 401, and on Refresh (`Connection`), not on a timer: the
-//! secure store cannot be watched.
+//! server connects, once more after a 401 that refused it, on Refresh, and when the target or the
+//! CLI changes (`Connection`, `ConnectionRegistry`), not on a timer: the secure store cannot be
+//! watched.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -102,8 +103,9 @@ pub struct Token {
 }
 
 /// How long a short-lived token stands, and whose it is: an OAuth access token's (spec 016). The
-/// connection asks for the next before it ends, and the next one of the same holder replaces it
-/// quietly, as nothing read with it needs reading again.
+/// connection asks for the next before it ends, and the next one of the same holder, from the
+/// same source, replaces it quietly, unless a 401 stands or it answers a Refresh, as nothing read
+/// with it needs reading again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lease {
     pub expires_at: std::time::SystemTime,
@@ -188,7 +190,8 @@ impl From<NoToken> for String {
 }
 
 /// Where a connection's token comes from each time it is asked (`Connection`): on each connect,
-/// once more after a 401, and on Refresh. A failure says why, and whether it may pass.
+/// once more after a 401 that refused its token, on Refresh and when the CLI changes, and before
+/// a token with a lease ends ([`Lease`]). A failure says why, and whether it may pass.
 /// `hurry` is raised while a window waits for the token: its ask goes before the others
 /// waiting for the CLI ([`TURN`]), however long it has waited already.
 pub trait TokenSource: Send + Sync + 'static {
@@ -200,7 +203,14 @@ pub trait TokenSource: Send + Sync + 'static {
         None
     }
 
-    /// The server refused the last token this source gave (a 401 to a request that carried it),
+    /// The organization a sign-in to the server must be in, when this is a managed target's
+    /// login: the one its profile names.
+    fn organization(&self) -> Option<String> {
+        None
+    }
+
+    /// The server refused the last token this source gave (a 401 that refused it, not one that
+    /// found none),
     /// said before the source is asked again: a source that keeps a token it can renew renews it
     /// rather than giving the same one back. The CLI's sources keep nothing.
     fn note_refused(&self) {}
@@ -542,6 +552,28 @@ pub(crate) async fn list_targets(
     }
 }
 
+/// The organization the managed profile `profile` names, as `credentials status --profile NAME
+/// --json` reports it (`owner.organization_id`), without a service or a secret: `None` when it
+/// names none.
+pub(crate) async fn profile_organization(
+    cli: &FoundCli,
+    turn: &Held,
+    profile: &str,
+) -> Result<Option<String>, String> {
+    let args = ["credentials", "status", "--profile", profile, "--json"];
+    let answer = json_answer(cli, turn, &[], &args)
+        .await
+        .map_err(|no| no.why)?;
+    match answer.pointer("/owner/organization_id") {
+        Some(Value::String(id)) if !id.is_empty() => Ok(Some(id.clone())),
+        Some(Value::Null) => Ok(None),
+        _ => Err(format!(
+            "`omnigraph {}` did not say the profile's organization",
+            args.join(" ")
+        )),
+    }
+}
+
 /// What `target inspect NAME --json` says of one target, without a server or a secret.
 async fn inspect_target(cli: &FoundCli, turn: &Held, name: &str) -> Result<Value, NoToken> {
     json_answer(cli, turn, &[], &["target", "inspect", name, "--json"]).await
@@ -848,7 +880,14 @@ impl TokenSource for CliTokenSource {
 
     fn login_profile(&self) -> Option<String> {
         match &self.credential {
-            CliCredential::Managed { profile } => Some(profile.clone()),
+            CliCredential::Managed { profile, .. } => Some(profile.clone()),
+            _ => None,
+        }
+    }
+
+    fn organization(&self) -> Option<String> {
+        match &self.credential {
+            CliCredential::Managed { organization, .. } => organization.clone(),
             _ => None,
         }
     }
@@ -1425,6 +1464,11 @@ case "$*" in
     lock
     echo "target $4 (explicit): server; config=$dir/config.yaml" >&2
     cat "$dir/status-$4.json"; exit 0 ;;
+  "credentials status --profile "*)
+    lock
+    [ -f "$dir/profile-$4.json" ] || {{ echo "Error: profile '$4' is not configured" >&2; exit 1; }}
+    echo "profile $4 (explicit): api https://api.example.com; config=$dir/config.yaml" >&2
+    cat "$dir/profile-$4.json"; exit 0 ;;
   "credentials export --target "*)
     lock
     env | sed 's/=.*//' | grep '^OMNIGRAPH_' > "$dir/export-env"
@@ -1470,6 +1514,18 @@ exit 64
                 ),
             );
             self.status(name, endpoint, "unknown");
+        }
+
+        /// The managed profile `name`, in `organization` when it names one, as `credentials
+        /// status --profile` describes it.
+        fn profile(&self, name: &str, organization: Option<&str>) {
+            let organization = organization.map_or("null".to_owned(), |id| format!(r#""{id}""#));
+            self.write(
+                &format!("profile-{name}.json"),
+                &format!(
+                    r#"{{"owner":{{"kind":"profile","owner_id":"o","profile_id":"p","route":"https://api.example.com","organization_id":{organization}}},"profile":"{name}","availability":"unknown","identity":"unknown","server_validity":"unverified","observed_at":"2026-10-30T20:19:39Z","verified_at":null,"session":{{"availability":"unknown","identity":"unknown","reason":"noninteractive secure-store inspection is unavailable"}}}}"#
+                ),
+            );
         }
 
         fn status(&self, name: &str, endpoint: &str, availability: &str) {
@@ -1680,6 +1736,7 @@ exit 64
                 ca = ca_file.display()
             ),
         );
+        cli.profile("work", Some("org_work"));
         let home = cli.dir.join("home");
         let listed = smol::block_on(read_targets(Some(&home), &cli.programs(), Platform::Unix));
         let servers = listed.servers.clone().unwrap();
@@ -1703,7 +1760,8 @@ exit 64
                     "https://cluster.example.com",
                     vec!["crm".to_owned()],
                     CliAuth::Token(CliCredential::Managed {
-                        profile: "work".into()
+                        profile: "work".into(),
+                        organization: Some("org_work".into()),
                     }),
                     None
                 ),
@@ -1810,10 +1868,14 @@ exit 64
                 ("control", "work", "c2", "i2", None, None),
             ]
         );
+        // The managed profile's organization is read once, though two targets name it; neither
+        // command reads a credential.
         assert_eq!(
             cli.commands(),
-            ["target list --json"],
-            "one command, which reads no credential"
+            [
+                "target list --json",
+                "credentials status --profile work --json"
+            ],
         );
 
         // Where the CLI exports no token (Windows), the same CLI is found and the same targets
@@ -1888,6 +1950,60 @@ exit 64
     /// most 1 MiB holding PEM certificates, at least one, trusted with the system's roots
     /// (`append`) or alone (`replace`), and never with an HTTPS proxy. Every bundle a target
     /// names is watched, one that cannot be used too, so putting it right lands its target.
+    /// A managed profile the CLI cannot describe still lands its clusters, on the CLI's login
+    /// alone, and says why its sign-ins are checked by the server alone; one in no organization
+    /// names none.
+    #[test]
+    fn a_managed_profile_the_cli_cannot_describe_is_said() {
+        let cache = probing();
+        let cli = StandIn::new(&cache, "profiles");
+        cli.write(
+            "targets.json",
+            r#"{
+  "lost": {"kind": "managed", "profile": "gone", "cluster_id": "c1", "cluster_incarnation": "i1", "endpoint": "https://lost.example.com/"},
+  "solo": {"kind": "managed", "profile": "own", "cluster_id": "c2", "cluster_incarnation": "i2", "endpoint": "https://solo.example.com/"}
+}"#,
+        );
+        cli.profile("own", None);
+        let home = cli.dir.join("home");
+        let listed = smol::block_on(read_targets(Some(&home), &cli.programs(), Platform::Unix));
+        let landed: Vec<_> = listed
+            .servers
+            .unwrap()
+            .into_iter()
+            .map(|server| (server.name, server.auth))
+            .collect();
+        assert_eq!(
+            landed,
+            [
+                (
+                    "lost".to_owned(),
+                    CliAuth::Token(CliCredential::Managed {
+                        profile: "gone".into(),
+                        organization: None,
+                    })
+                ),
+                (
+                    "solo".to_owned(),
+                    CliAuth::Token(CliCredential::Managed {
+                        profile: "own".into(),
+                        organization: None,
+                    })
+                ),
+            ]
+        );
+        assert_eq!(listed.errors.len(), 1, "{:?}", listed.errors);
+        assert!(
+            listed.errors[0]
+                .starts_with("Studio could not read which organization CLI profile 'gone' is in (")
+                && listed.errors[0].contains("profile 'gone' is not configured")
+                && listed.errors[0]
+                    .ends_with("so a sign-in to its clusters is checked by the server alone"),
+            "{}",
+            listed.errors[0]
+        );
+    }
+
     #[test]
     fn a_targets_certificate_authority_is_read_as_the_cli_reads_it() {
         let dir = std::env::temp_dir().join(format!("studio-ca-bundles-{}", std::process::id()));
@@ -2087,6 +2203,7 @@ exit 64
             endpoint,
             CliCredential::Managed {
                 profile: "work".into(),
+                organization: Some("org_work".into()),
             },
         );
         assert_eq!(source.login_profile().as_deref(), Some("work"));
@@ -2800,7 +2917,10 @@ exit 64
         assert_eq!(lists.load(std::sync::atomic::Ordering::SeqCst), listed);
         stale.read_with(cx, |connection, _| {
             assert_eq!(connection.state, ConnectionState::Unauthorized);
-            assert!(connection.refused_with_token);
+            assert_eq!(
+                connection.refusal,
+                Some(graph_client::Unauthorized::TokenRefused)
+            );
             assert_eq!(connection.label(), "Token refused");
         });
         stale.update(cx, |connection, cx| connection.refresh_token(cx));
@@ -2850,7 +2970,7 @@ exit 64
         assert_eq!(lists.load(std::sync::atomic::Ordering::SeqCst), 0);
         connection.read_with(cx, |connection, _| {
             assert_eq!(connection.state, ConnectionState::Unauthorized);
-            assert!(!connection.refused_with_token);
+            assert_eq!(connection.refusal, None, "no 401 stands: nothing was sent");
             assert!(!connection.token_unanswered);
             assert_eq!(connection.token_unread.as_deref(), Some(reason));
             assert_eq!(connection.label(), "No token from the CLI");
@@ -2958,7 +3078,10 @@ exit 64
         cx.run_until_parked();
         connection.read_with(cx, |connection, _| {
             assert_eq!(connection.state, ConnectionState::Unauthorized);
-            assert!(!connection.refused_with_token);
+            assert_eq!(
+                connection.refusal,
+                Some(graph_client::Unauthorized::TokenNeeded)
+            );
             assert_eq!(connection.label(), "Asks for a token");
         });
     }

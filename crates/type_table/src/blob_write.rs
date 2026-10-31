@@ -526,9 +526,12 @@ async fn written(
                     "Nothing was written: the server takes no value this large. {}",
                     error.body.error
                 ),
-                _ => format!("Nothing was written. {}", error.body.error),
+                _ => format!("Nothing was written. {}", error.reason()),
             };
             BlobWritten::Refused(Notice::new(Tone::Refused, message))
+        }
+        WriteOutcome::NotSent { reason } => {
+            BlobWritten::Refused(crate::model::not_sent_notice(&reason))
         }
         WriteOutcome::Unknown { .. } => BlobWritten::Unknown(Notice::new(
             Tone::Unknown,
@@ -787,6 +790,25 @@ mod tests {
     #[gpui::test]
     async fn a_blob_write_held_off_its_branch_is_not_saved(cx: &mut gpui::TestAppContext) {
         let (session, _) = crate::test_support::session_with_blobs(NOTES, cx);
+        // A write never sent wrote nothing, and says why.
+        let task = cx.update(|cx| {
+            let session = session.clone();
+            cx.spawn(async move |cx| {
+                let outcome = WriteOutcome::NotSent {
+                    reason: "the target is gone".into(),
+                };
+                written(outcome, &session, "main", &cell(false), true, cx).await
+            })
+        });
+        cx.run_until_parked();
+        let BlobWritten::Refused(notice) = futures::executor::block_on(task) else {
+            panic!("a write never sent is not saved");
+        };
+        assert_eq!(
+            notice.message,
+            "Not sent: the target is gone. Nothing was written."
+        );
+
         let receipt = |kind: &str| -> BlobWriteOutput {
             serde_json::from_value(serde_json::json!({
                 "selector": {"entity": "node", "type": "Note", "id": "n1", "property": "attachment"},

@@ -35,8 +35,8 @@ pub use changes::{
     REVIEW_CHANGE_CAP, TypeCounts, contains_merge_of, summary_sentence,
 };
 pub use connection::{
-    Connection, ConnectionEvent, ConnectionState, ConnectionWatch, GraphListing, ServerEntry,
-    ServerSource,
+    Connection, ConnectionEvent, ConnectionState, ConnectionWatch, GraphListing, HeldRefusal,
+    PromptAction, ServerEntry, ServerSource, SignInPrompt,
 };
 pub use degrees::page_counts;
 pub use entity_groups::{
@@ -63,7 +63,7 @@ pub mod cli {
 pub use session::{
     BranchStart, DraftEntry, DraftKey, ExternalWrite, FollowUp, GraphSession, HeadWatch, HeldAs,
     Loadable, MergeEntry, MergeSent, MergeSettled, OutcomeEntry, OutcomeKind, ServerState,
-    SessionEvent, open_session, open_session_behind,
+    SessionEvent, nothing_sent, open_session, open_session_behind,
 };
 
 /// The user agent of Studio's requests.

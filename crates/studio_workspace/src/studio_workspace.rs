@@ -13,6 +13,7 @@ mod pane;
 mod panels;
 mod persistence;
 mod process_stats;
+mod sign_in_prompt;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -52,6 +53,7 @@ pub use persistence::{
     SavedGraph, SavedItem, SavedPane, SavedSession, SavedWindow, SavedWorkspace,
     keep_saved_windows, load_windows, register_item_kind, saved_window_bounds,
 };
+pub use sign_in_prompt::sign_in_prompt;
 
 /// A modal: dismissing it emits [`DismissEvent`]. Following Zed's modal layer, the workspace
 /// asks [`ModalView::on_before_dismiss`] before every close.
@@ -3058,7 +3060,8 @@ impl Workspace {
         let mut tooltip = connection_tooltip(&url, &state, actor.as_deref());
         if let Some(reason) = &unavailable {
             tooltip = format!(
-                "This graph is unavailable: {reason}. Reads resume when it is ready. · {tooltip}"
+                "This graph is unavailable: {}. Reads resume when it is ready. · {tooltip}",
+                studio_ui::clause(reason)
             );
         }
         let trigger = ButtonLike::new("graph-switcher")
@@ -3507,7 +3510,19 @@ impl Workspace {
             .pane(pane_id)
             .and_then(|pane| pane.active_item())
             .is_some();
-        let body = match self.pane(pane_id).and_then(|pane| pane.active_item()) {
+        let active = self.pane(pane_id).and_then(|pane| pane.active_item());
+        // A tab that reads the graph shows the sign-in its server asks for instead of the 401s
+        // its reads would get.
+        let prompt = active
+            .filter(|item| item.reads_graph(cx))
+            .and_then(|_| sign_in_prompt(&self.session.as_ref()?.read(cx).connection, cx));
+        let body = match active {
+            Some(_) if prompt.is_some() => div()
+                .flex_1()
+                .min_h_0()
+                .overflow_hidden()
+                .children(prompt)
+                .into_any_element(),
             // Cached, as Zed caches each pane: the tab's view is drawn again only when it
             // notifies, so a hover or a toast elsewhere replays it from the last frame. A tab
             // that caches its own costly part is drawn uncached, or that part would be drawn
@@ -4421,8 +4436,9 @@ fn toast_text(entry: &graph_store::OutcomeEntry) -> String {
             studio_ui::short_commit_id(commit)
         ),
         OutcomeKind::Refused { message } => format!(
-            "{} · refused: {message}. Nothing was written.",
-            entry.description
+            "{} · refused: {}. Nothing was written.",
+            entry.description,
+            studio_ui::clause(message)
         ),
         // Its history is the branch's, which Open history shows.
         OutcomeKind::Unknown { .. } => format!(
@@ -5666,6 +5682,123 @@ mod tests {
         workspace.read_with(cx, |workspace, _| {
             assert!(workspace.session().is_none(), "closed once confirmed");
         });
+    }
+
+    /// A tab that draws `name`, reading the window's graph or not.
+    struct TabProbe {
+        focus_handle: FocusHandle,
+        name: &'static str,
+        reads: bool,
+    }
+
+    impl EventEmitter<ItemEvent> for TabProbe {}
+
+    impl Focusable for TabProbe {
+        fn focus_handle(&self, _: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    impl Render for TabProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let name = self.name;
+            div()
+                .size_full()
+                .track_focus(&self.focus_handle)
+                .debug_selector(move || name.into())
+        }
+    }
+
+    impl Item for TabProbe {
+        fn tab_title(&self, _: &App) -> SharedString {
+            self.name.into()
+        }
+
+        fn reads_graph(&self) -> bool {
+            self.reads
+        }
+    }
+
+    /// While the graph's server asks for a sign-in nobody holds, a tab that reads the graph says
+    /// who asks and where, and offers Sign in, in place of its refused reads; a tab that reads
+    /// nothing from the server is drawn as it is. Once the server stops asking, the tab is drawn
+    /// again: the pane read the connection when it drew, so the connection's change redraws it.
+    #[gpui::test]
+    fn a_tab_that_reads_the_graph_shows_the_sign_in_its_server_asks_for(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+        });
+        let http = http_client::FakeHttpClient::create(|_| async {
+            Ok(http_client::http::Response::builder()
+                .status(404)
+                .body(http_client::AsyncBody::default())
+                .unwrap())
+        });
+        let server = graph_store::ServerEntry {
+            name: "until-labs".into(),
+            url: "http://studio.test".into(),
+            source: graph_store::ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| graph_store::Connection::new(server, None, http).unwrap());
+        let session = cx
+            .new(|cx| GraphSession::new(connection.clone(), "strategy".into(), "main".into(), cx));
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.graph_order.push(session.entity_id());
+            workspace.subscribe_session(session.clone(), cx);
+            workspace.open_item("local".to_owned(), window, cx, |_, cx| TabProbe {
+                focus_handle: cx.focus_handle(),
+                name: "local-probe",
+                reads: false,
+            });
+            workspace.open_item("table".to_owned(), window, cx, |_, cx| TabProbe {
+                focus_handle: cx.focus_handle(),
+                name: "graph-probe",
+                reads: true,
+            });
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("graph-probe").is_some());
+
+        let asks = |asks: bool, cx: &mut gpui::VisualTestContext| {
+            connection.update(cx, |c, cx| {
+                if asks {
+                    c.state = ConnectionState::Unauthorized;
+                    c.sign_in = graph_store::sign_in::SignIn::Offered {
+                        service: "id.test".into(),
+                        why: None,
+                    };
+                } else {
+                    c.state = ConnectionState::Ready;
+                    c.sign_in = graph_store::sign_in::SignIn::NotOffered;
+                }
+                cx.notify();
+            });
+            cx.run_until_parked();
+        };
+        asks(true, cx);
+        assert!(cx.debug_bounds("sign-in-prompt").is_some());
+        assert!(cx.debug_bounds("graph-probe").is_none());
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_item(0, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("local-probe").is_some());
+        assert!(cx.debug_bounds("sign-in-prompt").is_none());
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_item(1, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("sign-in-prompt").is_some());
+        asks(false, cx);
+        assert!(cx.debug_bounds("sign-in-prompt").is_none());
+        assert!(cx.debug_bounds("graph-probe").is_some());
     }
 
     struct StatusProbe;
@@ -7078,6 +7211,36 @@ mod tests {
             cx.emit(SessionEvent::ActivityChanged);
         });
         cx.run_until_parked();
+    }
+
+    /// A refusal's toast ends its message once, whether or not the message ends its own
+    /// sentence, as a server's and a write never sent ("…, so nothing was sent.") do. Before, those
+    /// read "… sent.. Nothing was written."
+    #[test]
+    fn a_refusal_toast_ends_its_message_once() {
+        let entry = |message: &str| graph_store::OutcomeEntry {
+            at: std::time::SystemTime::now(),
+            branch: "main".into(),
+            description: "Revert Person p1".into(),
+            outcome: OutcomeKind::Refused {
+                message: message.into(),
+            },
+            follow_up: None,
+            merge: None,
+        };
+        assert_eq!(
+            toast_text(&entry("the target is gone, so nothing was sent.")),
+            "Revert Person p1 · refused: the target is gone, so nothing was sent. Nothing was \
+             written."
+        );
+        assert_eq!(
+            toast_text(&entry("the policy denies it")),
+            "Revert Person p1 · refused: the policy denies it. Nothing was written."
+        );
+        assert_eq!(
+            toast_text(&entry("the server is busy...")),
+            "Revert Person p1 · refused: the server is busy... Nothing was written."
+        );
     }
 
     /// A delete's Undo, which only its toast offers, is offered though another write of the

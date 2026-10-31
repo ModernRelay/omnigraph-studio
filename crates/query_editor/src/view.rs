@@ -27,7 +27,7 @@ use graph_client::api::{
     ChangeRequest, ParamDescriptor, ParamKind, QueryCatalogEntry, QueryRequest, ReadOutput,
     ReadPageOutput,
 };
-use graph_client::{ReadError, WriteOutcome};
+use graph_client::{ReadError, Unauthorized, WriteOutcome};
 use graph_store::{GraphSession, SessionEvent};
 use serde_json::{Map, Value};
 use studio_actions::query::{
@@ -281,6 +281,11 @@ enum WriteResult {
         message: String,
         diagnostic: Option<ServerDiagnostic>,
     },
+    /// The write was never sent (its connection retired, the server refusing the connection,
+    /// or the request not made): nothing was written.
+    NotSent {
+        reason: String,
+    },
     Unknown {
         reason: String,
     },
@@ -306,18 +311,24 @@ impl Failure {
     fn from_read(error: &ReadError, map: SourceMap, sent: &str) -> Self {
         let (title, hint) = match error {
             ReadError::Refused(summary) => {
-                let hint = match summary.code {
-                    Some(ErrorCode::Unauthorized) => {
-                        "The server refused the token. Reconnect with a valid token."
+                let hint = match (summary.unauthorized, summary.code) {
+                    // What became of the token, as the Open dialog says it: one that never
+                    // arrived would be dropped again, and none sent was not refused.
+                    (Some(Unauthorized::TokenRefused), _) => {
+                        "The server refused the token. Sign in again or update it, then run the \
+                         query again."
                     }
-                    Some(ErrorCode::Forbidden) => "Your token may not read this graph or branch.",
-                    Some(ErrorCode::BadRequest) => {
+                    (Some(unauthorized), _) => unauthorized.reason(),
+                    (None, Some(ErrorCode::Forbidden)) => {
+                        "Your token may not read this graph or branch."
+                    }
+                    (None, Some(ErrorCode::BadRequest)) => {
                         "Fix the query (the problems list shows what the compiler sees) and run it again."
                     }
-                    Some(ErrorCode::GraphUnavailable | ErrorCode::ServiceUnavailable) => {
+                    (None, Some(ErrorCode::GraphUnavailable | ErrorCode::ServiceUnavailable)) => {
                         "The graph is not serving right now. Try again in a moment."
                     }
-                    Some(ErrorCode::TooManyRequests) => {
+                    (None, Some(ErrorCode::TooManyRequests)) => {
                         "The server is busy. Try again in a moment."
                     }
                     _ => "Check the query and the server, then run it again.",
@@ -3048,6 +3059,10 @@ impl QueryEditor {
                         text: "Refused · nothing written".into(),
                         failed: true,
                     },
+                    WriteOutcome::NotSent { .. } => RunNote {
+                        text: "Not sent · nothing written".into(),
+                        failed: true,
+                    },
                     WriteOutcome::Unknown { .. } => RunNote {
                         text: "Outcome unknown · check History".into(),
                         failed: true,
@@ -3072,8 +3087,9 @@ impl QueryEditor {
                             .diagnostic
                             .as_ref()
                             .and_then(|d| server_diagnostic(d, &sent_text, map)),
-                        message: error.body.error,
+                        message: error.reason().to_owned(),
                     },
+                    WriteOutcome::NotSent { reason } => WriteResult::NotSent { reason },
                     WriteOutcome::Unknown { reason } => WriteResult::Unknown { reason },
                 });
                 this.replace_output(written, cx);
@@ -4516,6 +4532,15 @@ impl QueryEditor {
                 Some("Nothing was written. Your query is unchanged; fix it and run again.".into()),
                 Vec::new(),
                 diagnostic.clone(),
+                cx,
+            ),
+            WriteResult::NotSent { reason } => self.render_message(
+                IconName::XCircle,
+                Color::Error,
+                format!("Not sent: {reason}"),
+                Some("Nothing was written.".into()),
+                Vec::new(),
+                None,
                 cx,
             ),
             WriteResult::Unknown { reason } => self.render_message(
@@ -6546,6 +6571,32 @@ mod tests {
             editor.read_with(cx, |editor, cx| assert!(!editor.is_stale(cx)));
         }
 
+        /// A refused read's hint says what became of the token, as the Open dialog does:
+        /// refused, never received (a proxy dropped it, which another token would not get
+        /// past), or none sent. Before, every 401 said the token was refused, and to reconnect
+        /// with a valid one.
+        #[test]
+        fn a_401_hint_says_what_became_of_the_token() {
+            let hint = |unauthorized: Unauthorized| {
+                let refused = ReadError::Refused(graph_client::ApiErrorSummary {
+                    status: 401,
+                    message: "unauthorized".into(),
+                    code: Some(ErrorCode::Unauthorized),
+                    diagnostic: None,
+                    change_diff_refusal: None,
+                    challenge: None,
+                    unauthorized: Some(unauthorized),
+                });
+                Failure::from_read(&refused, SourceMap::default(), "")
+                    .hint
+                    .unwrap()
+            };
+            assert!(hint(Unauthorized::TokenRefused).starts_with("The server refused the token."));
+            for unauthorized in [Unauthorized::TokenNotReceived, Unauthorized::TokenNeeded] {
+                assert_eq!(hint(unauthorized), unauthorized.reason());
+            }
+        }
+
         /// A refused read's diagnostic in contract 0.14's shape points into the query, and its
         /// suggested edit applies where it was meant after an edit above it.
         #[gpui::test]
@@ -6573,6 +6624,7 @@ mod tests {
                     })),
                     change_diff_refusal: None,
                     challenge: None,
+                    unauthorized: None,
                 });
                 let sent = prepared.sent.clone();
                 let at = ReadAt::Branch("main".into());
@@ -6622,6 +6674,7 @@ mod tests {
                 })),
                 change_diff_refusal: None,
                 challenge: None,
+                unauthorized: None,
             });
             let sent = prepared.sent.clone();
             let read_at = ReadAt::Branch("main".into());

@@ -2,8 +2,10 @@
 //! the keychain that keeps a refresh token, and the token source that refreshes from it.
 //!
 //! A connection signs in only to a server whose 401 offers it (`resource_metadata`) and for which
-//! it holds no other credential: a CLI target with `auth: anonymous`. The browser opens only when
-//! the person chooses Sign in; a kept sign-in is refreshed without asking.
+//! it holds no other credential: a CLI target with `auth: anonymous`, or a managed one, whose CLI
+//! login is held back until the server's 401 says it offers no sign-in, and is then used instead.
+//! The browser opens only when the person chooses Sign in; a kept sign-in is refreshed without
+//! asking.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,6 +18,7 @@ use futures::channel::{mpsc, oneshot};
 use futures::future::{BoxFuture, Shared};
 use gpui::App;
 use http_client::HttpClient;
+pub use oauth_client::Refusal;
 use oauth_client::{
     Account, AuthorizationServer, ClientIdentities, Clients, Expected, ProtectedResource,
     TokenError, Tokens,
@@ -337,6 +340,9 @@ pub struct Service {
     pub resource: ProtectedResource,
     pub server: AuthorizationServer,
     pub client_id: String,
+    /// The organization the target names, which a token's `org_id` must equal: a managed
+    /// target's profile's; `None` for a target that names none, and the server checks it alone.
+    pub organization: Option<String>,
     pub(crate) clients: Clients,
 }
 
@@ -370,7 +376,7 @@ impl Service {
             issuer: &self.server.issuer,
             resource: &self.resource.resource,
             client_id: &self.client_id,
-            organization: None,
+            organization: self.organization.as_deref(),
         }
     }
 
@@ -385,28 +391,21 @@ impl Service {
 }
 
 /// Reads and checks the server's sign-in details, its sign-in service's, and which client ID
-/// Studio uses there.
+/// Studio uses there; a token from it must be in `organization` when the target names one.
 pub(crate) async fn discover(
     clients: Clients,
     metadata_url: String,
     identities: ClientIdentities,
-) -> Result<Service, String> {
-    let resource = oauth_client::protected_resource(&clients, &metadata_url)
-        .await
-        .map_err(|refusal| refusal.0)?;
-    let server = oauth_client::authorization_server(&clients, &resource.issuer)
-        .await
-        .map_err(|refusal| refusal.0)?;
-    let client_id = identities.for_server(&server).ok_or_else(|| {
-        format!(
-            "The sign-in service at {} does not accept Omnigraph Studio.",
-            oauth_client::host_of(&server.issuer)
-        )
-    })?;
+    organization: Option<String>,
+) -> Result<Service, Refusal> {
+    let resource = oauth_client::protected_resource(&clients, &metadata_url).await?;
+    let server = oauth_client::authorization_server(&clients, &resource.issuer).await?;
+    let client_id = identities.client_id(&server)?;
     Ok(Service {
         resource,
         server,
         client_id,
+        organization,
         clients,
     })
 }
@@ -424,8 +423,9 @@ pub enum SignIn {
         service: String,
         why: Option<String>,
     },
-    /// The server offers a sign-in Studio cannot use, and why.
-    Unavailable(String),
+    /// The server offers a sign-in Studio cannot use, and why. Details that could not be read
+    /// now ([`Refusal::passing`]) are read again at each health check; any are on Retry.
+    Unavailable(Refusal),
     /// The browser is open at `service`.
     Waiting { service: String },
     /// The service gave the sign-in its tokens, and Studio is keeping them: no longer to be
@@ -1085,7 +1085,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::connection::{Connection, ConnectionState, ServerEntry, ServerSource};
+    use crate::connection::{
+        Connection, ConnectionState, PromptAction, ServerEntry, ServerSource, SignInPrompt,
+    };
 
     const SERVER: &str = "https://graphs.test";
     const RESOURCE: &str = "https://graphs.test/mcp";
@@ -1125,6 +1127,9 @@ mod tests {
         issued: u32,
         /// The server refuses every token, as one that does not admit the account.
         admits_nobody: bool,
+        /// The server's 401 names no sign-in details, as a managed cluster's does before its
+        /// sign-in is enabled.
+        offers_no_sign_in: bool,
         /// How long each access token lives.
         lives: u64,
         /// The sign-in service gives no refresh token.
@@ -1139,6 +1144,8 @@ mod tests {
         /// The sign-in service holds a token answer, made already (a refresh token rotated),
         /// until this is lowered.
         hold_token: bool,
+        /// The sign-in service holds its answer to a refresh alone, as `hold_token` does.
+        hold_refresh: bool,
         /// The sign-in service fails every token request (503) and keeps its grants.
         token_down: bool,
         /// The sign-in service fails this many more token requests, keeping its grants: 503,
@@ -1165,11 +1172,13 @@ mod tests {
                 issued: Default::default(),
                 lives: 300,
                 admits_nobody: Default::default(),
+                offers_no_sign_in: Default::default(),
                 no_refresh: Default::default(),
                 issuer: Default::default(),
                 hold_metadata: Default::default(),
                 fails_metadata: Default::default(),
                 hold_token: Default::default(),
+                hold_refresh: Default::default(),
                 token_down: Default::default(),
                 fails_tokens: Default::default(),
                 fails_status: Default::default(),
@@ -1287,18 +1296,23 @@ mod tests {
         bearer: Option<String>,
         body: String,
     ) -> (u16, Vec<(&'static str, String)>, Value) {
+        let offers = !served.offers_no_sign_in;
         let challenge = |refused: bool| {
             let error = if refused {
                 r#"error="invalid_token", "#
             } else {
                 ""
             };
-            vec![(
-                "www-authenticate",
+            let value = if offers {
                 format!(
                     r#"Bearer {error}resource_metadata="{SERVER}/.well-known/oauth-protected-resource/mcp""#
-                ),
-            )]
+                )
+            } else {
+                format!("Bearer {}", error.trim_end_matches(", "))
+                    .trim_end()
+                    .to_owned()
+            };
+            vec![("www-authenticate", value)]
         };
         let issuer = served.issuer();
         let issued_at = url::Url::parse(&issuer).unwrap();
@@ -1426,10 +1440,14 @@ mod tests {
                         smol::Timer::after(Duration::from_millis(10)).await;
                     }
                 }
+                let refresh = body.contains("grant_type=refresh_token");
                 let (status, headers, page) =
                     answer(&mut served.lock().unwrap(), &method, &url, bearer, body);
                 if url.ends_with("/token") {
-                    while served.lock().unwrap().hold_token {
+                    while {
+                        let served = served.lock().unwrap();
+                        served.hold_token || (refresh && served.hold_refresh)
+                    } {
                         smol::Timer::after(Duration::from_millis(10)).await;
                     }
                 }
@@ -1565,6 +1583,17 @@ mod tests {
         assert_eq!(label, "Sign in needed");
         // Nothing opened a browser on its own.
         assert_eq!(cx.opened_url(), None);
+        // The window's tabs say who asks and where the sign-in is, and offer it, in place of the
+        // refused reads' 401s.
+        let prompt = |cx: &mut TestAppContext| connection.read_with(cx, |c, _| c.sign_in_prompt());
+        assert_eq!(
+            prompt(cx),
+            Some(SignInPrompt {
+                server: "work".into(),
+                says: "work asks you to sign in at id.test.".into(),
+                offers: Some(PromptAction::SignIn),
+            })
+        );
 
         connection.update(cx, |c, cx| c.sign_in(cx));
         assert_eq!(
@@ -1573,10 +1602,19 @@ mod tests {
                 service: "id.test".into()
             }
         );
+        assert_eq!(
+            prompt(cx),
+            Some(SignInPrompt {
+                server: "work".into(),
+                says: "Finish signing in at id.test in your browser.".into(),
+                offers: Some(PromptAction::Cancel),
+            })
+        );
         let browser = approve(&served, &cx.opened_url().unwrap());
         until(cx, "the sign-in", |cx| {
             sign_in_state(&connection, cx).0 == ConnectionState::Ready
         });
+        assert_eq!(prompt(cx), None, "signed in, the tabs read again");
         assert!(
             browser
                 .join()
@@ -1610,6 +1648,10 @@ mod tests {
                 service: "id.test".into(),
                 why: None
             }
+        );
+        assert_eq!(
+            prompt(cx).and_then(|prompt| prompt.offers),
+            Some(PromptAction::SignIn)
         );
 
         // Signed in again, then as another account whose grant gives no refresh token: the
@@ -2104,6 +2146,116 @@ mod tests {
         });
         never(cx, "an item after the sign-out", |_| {
             !keychain.items.lock().unwrap().is_empty()
+        });
+    }
+
+    /// The ask a read's 401 makes of the sign-in, under way when the person signs out or the CLI
+    /// renames the target, is answered for nobody: the ended sign-in's answer neither puts a token
+    /// back nor says the target gave none. Each change of source ends the old one's asks
+    /// (`connection::tests::a_token_answered_after_its_source_was_replaced_is_not_taken` holds
+    /// the CLI's credential to it).
+    #[gpui::test]
+    async fn an_ask_under_way_when_the_sign_in_ends_gives_nobody_its_token(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        for rename in [false, true] {
+            let served = Arc::new(Mutex::new(Served::default()));
+            let keychain = kept_at_launch(&served);
+            let connection = connection(&served, keychain, cx);
+            connection.update(cx, |c, cx| c.connect(cx));
+            until(cx, "the kept sign-in", |cx| {
+                sign_in_state(&connection, cx).0 == ConnectionState::Ready
+            });
+            let refreshes = || {
+                served
+                    .lock()
+                    .unwrap()
+                    .log
+                    .iter()
+                    .filter(|line| line.starts_with("token refresh_token"))
+                    .count()
+            };
+            served.lock().unwrap().hold_token = true;
+            connection.update(cx, |c, cx| c.request_refused(cx));
+            until(cx, "the refresh the 401 asked for", |_| refreshes() == 2);
+            connection.update(cx, |c, cx| {
+                if rename {
+                    c.rename("renamed".into(), cx);
+                } else {
+                    c.sign_out(cx);
+                }
+            });
+            until(cx, "a sign-in offered", |cx| {
+                matches!(sign_in_state(&connection, cx).1, SignIn::Offered { .. })
+            });
+            let answered = |cx: &mut TestAppContext| {
+                connection.read_with(cx, |c, _| c.has_token() || c.token_unread.is_some())
+            };
+            assert!(!answered(cx));
+            served.lock().unwrap().hold_token = false;
+            never(cx, "the ended sign-in's answer taken", answered);
+        }
+    }
+
+    /// A sign-in taken while the one it replaces is asked again after a refusal keeps its own
+    /// token, and that ask is not the new one's: its answer comes for nobody, and a read refused
+    /// under the new token asks the new sign-in again. Without a change of source ending the old
+    /// one's asks, the new token was taken for the answer to the refusal, so a read refused
+    /// under it asked nothing.
+    #[gpui::test]
+    async fn a_sign_in_taken_while_the_one_it_replaces_is_asked_keeps_its_token(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served::default()));
+        let keychain = kept_at_launch(&served);
+        let connection = connection(&served, keychain, cx);
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the kept sign-in", |cx| {
+            sign_in_state(&connection, cx).0 == ConnectionState::Ready
+        });
+        served.lock().unwrap().hold_refresh = true;
+        connection.update(cx, |c, cx| c.request_refused(cx));
+        until(cx, "the refresh the 401 asked for", |_| {
+            served
+                .lock()
+                .unwrap()
+                .log
+                .iter()
+                .filter(|line| line.starts_with("token refresh_token"))
+                .count()
+                == 2
+        });
+        // A sign-in through the browser, whose code exchange is not held, is taken.
+        let before = connection.read_with(cx, |c, _| c.client().credential_changes());
+        connection.update(cx, |c, cx| c.sign_in(cx));
+        let browser = approve(&served, &cx.opened_url().unwrap());
+        until(cx, "the new sign-in taken", |cx| {
+            let (state, sign_in, _) = sign_in_state(&connection, cx);
+            state == ConnectionState::Ready
+                && matches!(sign_in, SignIn::SignedIn { .. })
+                && connection.read_with(cx, |c, _| c.client().credential_changes()) != before
+        });
+        browser.join().unwrap();
+        let changes = connection.read_with(cx, |c, _| c.client().credential_changes());
+        served.lock().unwrap().hold_refresh = false;
+        never(cx, "the replaced sign-in's answer taken", |cx| {
+            let (state, sign_in, _) = sign_in_state(&connection, cx);
+            state != ConnectionState::Ready
+                || !matches!(sign_in, SignIn::SignedIn { .. })
+                || connection.read_with(cx, |c, _| c.client().credential_changes()) != changes
+        });
+        connection.update(cx, |c, cx| c.request_refused(cx));
+        until(cx, "the new sign-in asked after the refusal", |_| {
+            served
+                .lock()
+                .unwrap()
+                .log
+                .iter()
+                .filter(|line| line.starts_with("token refresh_token"))
+                .count()
+                == 3
         });
     }
 
@@ -2705,6 +2857,52 @@ mod tests {
         ));
     }
 
+    /// A sign-in the service ends for good while a connect and the ask after a refused read both
+    /// wait on its refresh is said once: offered again, with why. The first answer drops the
+    /// sign-in, which ends the other ask; without that, the second answer said the target gave
+    /// no token, as if the CLI had given none.
+    #[gpui::test]
+    async fn a_sign_in_ended_while_two_asks_wait_on_it_is_said_once(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served::default()));
+        let keychain = kept_at_launch(&served);
+        let connection = connection(&served, keychain, cx);
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the kept sign-in", |cx| {
+            sign_in_state(&connection, cx).0 == ConnectionState::Ready
+        });
+        {
+            let mut served = served.lock().unwrap();
+            served.refuses_target = true;
+            served.hold_refresh = true;
+        }
+        let refreshes = || {
+            served
+                .lock()
+                .unwrap()
+                .log
+                .iter()
+                .filter(|line| line.starts_with("token refresh_token"))
+                .count()
+        };
+        // The ask after a refused read starts the refresh; a connect's ask joins it.
+        connection.update(cx, |c, cx| c.request_refused(cx));
+        until(cx, "the refresh after the refusal", |_| refreshes() == 2);
+        connection.update(cx, |c, cx| c.connect(cx));
+        cx.run_until_parked();
+        served.lock().unwrap().hold_refresh = false;
+        until(cx, "the sign-in offered again", |cx| {
+            matches!(
+                sign_in_state(&connection, cx).1,
+                SignIn::Offered { why: Some(_), .. }
+            )
+        });
+        never(cx, "the target said to have given no token", |cx| {
+            connection.read_with(cx, |c, _| c.token_unread.is_some())
+        });
+        assert_eq!(refreshes(), 2, "the second ask joined the refresh");
+    }
+
     /// A sign-in under way keeps saying so while the one it replaces answers a renewal: Sign
     /// out, which would end that one mid-sign-in, is not offered.
     #[gpui::test]
@@ -3236,7 +3434,7 @@ mod tests {
         connection.update(cx, |c, cx| c.sign_in(cx));
         assert_eq!(sign_in_state(&connection, cx).1, SignIn::Reading);
         served.lock().unwrap().refresh.clear();
-        connection.update(cx, |c, cx| c.read_refused(cx));
+        connection.update(cx, |c, cx| c.request_refused(cx));
         until(cx, "the one held ended", |cx| {
             !connection.read_with(cx, |c, _| c.holds_sign_in())
         });
@@ -3318,7 +3516,9 @@ mod tests {
     /// Sign-in details the server named that could not be read are read again: by Retry, which
     /// connects again, and by the health check that finds the server still asking for a
     /// sign-in. Before, "Sign-in unavailable" stood for the life of the connection, with no
-    /// button, until the target was renamed or Studio restarted.
+    /// button, until the target was renamed or Studio restarted. Details read that Studio
+    /// cannot use stand until Retry: before, every health check read them again, the status
+    /// going through "Connecting" and "Reading how to sign in" each time.
     #[gpui::test]
     async fn sign_in_details_that_could_not_be_read_are_read_again(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
@@ -3359,6 +3559,41 @@ mod tests {
             .advance_clock(crate::connection::FAILED_CHECK_INTERVAL);
         until(cx, "a sign-in offered at the next check", |cx| {
             offered(&checked, cx)
+        });
+        drop(_watch);
+
+        // A sign-in service that does not accept Studio.
+        let refusing = SignInContext {
+            identities: ClientIdentities::default(),
+            ..context(&served, Arc::default())
+        };
+        let lasting = connection_in(&served, refusing, cx);
+        let _watch = lasting.update(cx, |c, cx| {
+            c.connect(cx);
+            c.watch(cx)
+        });
+        until(cx, "the sign-in refused", |cx| unavailable(&lasting, cx));
+        let details_read = |served: &Arc<Mutex<Served>>| {
+            served
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .any(|request| request.contains("oauth-protected-resource"))
+        };
+        served.lock().unwrap().requests.clear();
+        cx.executor()
+            .advance_clock(crate::connection::FAILED_CHECK_INTERVAL);
+        until(cx, "the next check", |_| {
+            let served = served.lock().unwrap();
+            served.requests.iter().any(|r| r.ends_with("/healthz"))
+        });
+        cx.run_until_parked();
+        assert!(!details_read(&served), "the check reads nothing more");
+        assert!(unavailable(&lasting, cx));
+        lasting.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the details read again on Retry", |_| {
+            details_read(&served)
         });
     }
 
@@ -3481,7 +3716,7 @@ mod tests {
         let clients = Clients::new(url::Url::parse(SERVER).unwrap(), http.clone(), http);
         let identities = identities();
         let metadata = format!("{SERVER}/.well-known/oauth-protected-resource/mcp");
-        smol::block_on(discover(clients, metadata, identities)).unwrap()
+        smol::block_on(discover(clients, metadata, identities, None)).unwrap()
     }
 
     /// A delete is done when the next launch would read nothing at the key: macOS and Windows
@@ -3910,6 +4145,7 @@ mod tests {
     fn a_busy_token_endpoint_is_asked_again() {
         for (status, error) in [
             (429, "rate_limited"),
+            (408, "request_timeout"),
             (400, "slow_down"),
             (400, "temporarily_unavailable"),
         ] {
@@ -4176,6 +4412,177 @@ mod tests {
         assert_eq!(state, ConnectionState::Unauthorized);
         assert_eq!(offer, SignIn::NotOffered);
         assert_eq!(label, "Token refused");
+    }
+
+    /// A managed target's CLI login, as the CLI gives it: the data token it exchanges for the
+    /// profile `work-profile`, which is in `organization`. Counts its asks.
+    #[derive(Default)]
+    struct Login {
+        organization: Option<String>,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TokenSource for Login {
+        fn token(&self, _: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, NoToken>> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            futures::future::ready(Ok(Token::typed("from-the-cli".into()))).boxed()
+        }
+
+        fn login_profile(&self) -> Option<String> {
+            Some("work-profile".into())
+        }
+
+        fn organization(&self) -> Option<String> {
+            self.organization.clone()
+        }
+    }
+
+    impl Login {
+        fn in_organization(organization: &str) -> Arc<Self> {
+            Arc::new(Self {
+                organization: Some(organization.into()),
+                ..Self::default()
+            })
+        }
+
+        fn asked(&self) -> usize {
+            self.asked.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A connection to the managed target `work`, whose CLI login is `login`.
+    fn managed(
+        served: &Arc<Mutex<Served>>,
+        keychain: Arc<MemoryKeychain>,
+        login: Arc<Login>,
+        cx: &mut TestAppContext,
+    ) -> Entity<Connection> {
+        let connection = connection(served, keychain, cx);
+        connection.update(cx, |c, _| {
+            *c = std::mem::replace(
+                c,
+                Connection::new(c.server.clone(), None, fake(served.clone())).unwrap(),
+            )
+            .with_token_source(Some(login));
+        });
+        connection
+    }
+
+    /// A managed cluster that offers a sign-in is signed in to as any server that offers one
+    /// (spec 016, When Studio signs in): its first request carries no token, and the CLI's login
+    /// is never asked, as Studio is a client of its own there. A kept sign-in is refreshed.
+    #[gpui::test]
+    async fn a_managed_target_signs_in_where_its_cluster_offers_it(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served::default()));
+        let login = Login::in_organization("org_1");
+        let connection = managed(&served, kept_at_launch(&served), login.clone(), cx);
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the refresh", |cx| {
+            sign_in_state(&connection, cx).0 == ConnectionState::Ready
+        });
+        assert_eq!(login.asked(), 0, "the CLI's login is not asked");
+        assert_eq!(cx.opened_url(), None);
+        connection.read_with(cx, |c, _| {
+            assert!(c.holds_sign_in());
+            assert_eq!(
+                c.login_profile(),
+                None,
+                "the connection is no CLI profile's"
+            );
+        });
+        assert!(served.lock().unwrap().refused.is_empty());
+
+        // With nothing kept, the cluster asks for a sign-in, and still not the CLI's login.
+        let served = Arc::new(Mutex::new(Served::default()));
+        let login = Login::in_organization("org_1");
+        let connection = managed(&served, Arc::default(), login.clone(), cx);
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the offer", |cx| {
+            matches!(sign_in_state(&connection, cx).1, SignIn::Offered { .. })
+        });
+        assert_eq!(sign_in_state(&connection, cx).2, "Sign in needed");
+        assert_eq!(login.asked(), 0);
+    }
+
+    /// A managed cluster whose 401 offers no sign-in is reached with the CLI's login, the interim
+    /// before clusters offer one (spec 016): its token is asked for once the server's answer says
+    /// so, and from then on at once, without a request that carries none.
+    #[gpui::test]
+    async fn a_managed_target_uses_the_clis_login_where_its_cluster_offers_no_sign_in(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served {
+            offers_no_sign_in: true,
+            accepted: HashSet::from(["from-the-cli".to_owned()]),
+            ..Served::default()
+        }));
+        let login = Login::in_organization("org_1");
+        let connection = managed(&served, Arc::default(), login.clone(), cx);
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the connect", |cx| {
+            sign_in_state(&connection, cx).0 == ConnectionState::Ready
+        });
+        assert_eq!(login.asked(), 1);
+        let (_, offer, _) = sign_in_state(&connection, cx);
+        assert_eq!(offer, SignIn::NotOffered);
+        assert_eq!(
+            connection.read_with(cx, |c, _| c.login_profile()),
+            Some("work-profile".into())
+        );
+        let lists = |served: &Arc<Mutex<Served>>| {
+            served
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .filter(|request| request.ends_with("/graphs"))
+                .count()
+        };
+        assert_eq!(
+            lists(&served),
+            2,
+            "one without a token, then one with the CLI's"
+        );
+
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the second connect", |cx| {
+            sign_in_state(&connection, cx).0 == ConnectionState::Ready
+        });
+        assert_eq!(login.asked(), 2);
+        assert_eq!(lists(&served), 3, "the CLI's token is asked for first now");
+    }
+
+    /// A sign-in to a managed target is in the organization its CLI profile names: a token for
+    /// another is refused before it is used, and said.
+    #[gpui::test]
+    async fn a_sign_in_to_a_managed_target_must_be_in_its_organization(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served::default()));
+        let login = Login::in_organization("org_2");
+        let connection = managed(&served, kept_at_launch(&served), login.clone(), cx);
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the refused refresh", |cx| {
+            matches!(
+                sign_in_state(&connection, cx).1,
+                SignIn::Offered { why: Some(_), .. }
+            )
+        });
+        let (state, offer, _) = sign_in_state(&connection, cx);
+        assert_eq!(state, ConnectionState::Unauthorized);
+        let SignIn::Offered { why: Some(why), .. } = offer else {
+            unreachable!()
+        };
+        assert!(
+            why.contains("The sign-in was for org_1, and this target is in org_2."),
+            "{why}"
+        );
+        assert_eq!(login.asked(), 0);
+        assert!(
+            served.lock().unwrap().refused.is_empty(),
+            "the token was never sent"
+        );
     }
 
     /// One request as a browser sends it, without following a redirect: the `location` of a

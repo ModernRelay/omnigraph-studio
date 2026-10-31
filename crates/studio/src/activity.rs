@@ -241,7 +241,10 @@ fn said(entry: &OutcomeEntry) -> Said {
             verb: "has an unknown outcome",
             commit: None,
             place: Some(("on", branch)),
-            tooltip: Some(format!("{reason}. Check History before trying again.")),
+            tooltip: Some(format!(
+                "{}. Check History before trying again.",
+                studio_ui::clause(reason)
+            )),
         },
     }
 }

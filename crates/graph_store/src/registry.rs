@@ -512,7 +512,7 @@ impl ConnectionRegistry {
     /// changed address or a rotated token reaches Studio without a restart; a CLI installed,
     /// upgraded or removed also asks every CLI server's token again. Each look and each listing
     /// runs off the main thread. The CLI's secure store cannot be watched: a token kept there
-    /// is asked for again on connect, after a 401 and on Refresh.
+    /// is asked for again on connect, after a 401 that refused it and on Refresh.
     fn watch_cli_targets(&mut self, cx: &mut Context<Self>) {
         let dir = self.operator_dir.clone();
         let lister = self.lister.clone();
@@ -902,8 +902,9 @@ impl ConnectionRegistry {
         })
     }
 
-    /// Replaces a server's token for this run and reconnects: for a CLI server until Refresh or
-    /// a change to its target asks the CLI again, since Studio writes none of the CLI's files.
+    /// Replaces a server's token for this run and reconnects: for a CLI server whose token the CLI
+    /// gives, until Studio asks the CLI again (Refresh, a change to its target or to the CLI),
+    /// since Studio writes none of the CLI's files.
     pub fn update_token(
         &mut self,
         connection: &Entity<Connection>,
@@ -1296,8 +1297,9 @@ mod tests {
     /// open windows hold, takes the new name and asks the CLI as the new target. A target moved
     /// to a new address takes the graphs remembered for its name, and the connection at the old
     /// address is retired. One that names another proxy, or a certificate authority of its own
-    /// or another bundle of one, keeps its connection, moved to a client made with them; one
-    /// whose transport Studio cannot use is retired.
+    /// or another bundle of one, keeps its connection, moved to a client made with them, and in
+    /// use connects again through it, asking the CLI once; one whose transport Studio cannot use
+    /// is retired.
     #[gpui::test]
     async fn a_renamed_cli_target_keeps_its_connection(cx: &mut TestAppContext) {
         let (http, sent) = answering();
@@ -1385,14 +1387,25 @@ mod tests {
                 Ok(through_http.clone())
             });
         });
+        moved.update(cx, |connection, cx| connection.connect(cx));
+        cx.run_until_parked();
+        cli.asked();
         let mut proxied = server("new", "http://b.test", "renamed");
         proxied.transport.proxy = Some("http://proxy.test:8080".into());
         assert!(apply(&registry, files(vec![proxied]), cx));
+        cx.run_until_parked();
         assert_eq!(find(&registry, "new", cx).unwrap(), moved);
         assert_eq!(
             made.load(Ordering::SeqCst),
             1,
             "a client made for the proxy"
+        );
+        // In use, it connects again through the proxy, and the new target's source is asked
+        // once: the connect's ask of the old one ends.
+        assert_eq!(cli.asked(), ["new"]);
+        assert_eq!(
+            moved.read_with(cx, |connection, _| connection.state.clone()),
+            crate::ConnectionState::Ready
         );
         moved.read_with(cx, |connection, _| {
             assert_eq!(connection.server.known_graphs, ["knowledge"]);
@@ -1882,6 +1895,34 @@ mod tests {
         for name in ["", "1st", "-x", "a b", "a/b"] {
             assert!(!valid_target_name(name), "{name}");
         }
+    }
+
+    /// A write to a server that refuses the connection, through Studio's own transport, is not
+    /// sent: the refusal reaches the client as a refused connection, which it judges by the
+    /// error's kind, so nothing was written and nothing is to be settled.
+    #[test]
+    fn a_write_to_a_server_refusing_connections_is_not_sent() {
+        // A port nothing listens on: bound, then let go.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let http: Arc<dyn HttpClient> =
+            Arc::new(reqwest_client::ReqwestClient::user_agent(crate::USER_AGENT).unwrap());
+        let client =
+            graph_client::GraphClient::new(&format!("http://127.0.0.1:{port}"), None, http)
+                .unwrap();
+        let outcome =
+            smol::block_on(client.mutate("g", &graph_client::api::ChangeRequest::default(), None));
+        assert!(
+            matches!(
+                &outcome,
+                graph_client::WriteOutcome::NotSent { reason }
+                    if reason == "the connection was refused"
+            ),
+            "{outcome:?}"
+        );
     }
 
     /// A CLI target that trusts its own certificate authority is reached with it, as the CLI

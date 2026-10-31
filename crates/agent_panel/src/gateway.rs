@@ -21,8 +21,8 @@ use futures_rustls::TlsAcceptor;
 use futures_rustls::rustls::ServerConfig;
 use graph_client::api::CommitKind;
 use graph_client::{
-    AsyncBody, CONTRACT, CONTRACT_HEADER, ForwardRequest, GraphClient, HeaderMap, Method,
-    StatusCode, WriteOutcome,
+    Answered, AsyncBody, CONTRACT, CONTRACT_HEADER, ForwardRequest, ForwardResponse, GraphClient,
+    HeaderMap, Method, NoAnswer, StatusCode, Unauthorized,
 };
 use serde::Deserialize as _;
 use serde_json::{Value, json};
@@ -135,6 +135,10 @@ pub enum GatewayEvent {
     /// The CLI stopped waiting before the write was decided (its command timed out or was
     /// stopped): nothing was sent, and nothing will be.
     Abandoned { id: u64 },
+    /// The server refused the token a request the gateway forwarded carried (a 401 that
+    /// refused it, [`Unauthorized::TokenRefused`]): the session asks for the next token as for
+    /// its own requests ([`graph_store::GraphSession::token_refused`]).
+    TokenRefused,
 }
 
 /// What records an approved write's outcome. It is called once, with the outcome, however the
@@ -417,19 +421,33 @@ async fn handle(
         Verdict::Refuse(message) => answer(stream, 403, "forbidden", &message).await,
         Verdict::Read => {
             let method = request.method.clone();
-            let response = shared.client.forward(forward_request(request, None)).await;
+            let response = forward(
+                &shared.client,
+                &shared.events,
+                forward_request(request, None),
+            )
+            .await;
             stream_back(stream, &method, response).await;
         }
         Verdict::ReadWith(body) => {
             let body = serde_json::to_vec(&body).unwrap_or_default();
             let method = request.method.clone();
-            let response = shared
-                .client
-                .forward(forward_request(request, Some(body)))
-                .await;
+            let response = forward(
+                &shared.client,
+                &shared.events,
+                forward_request(request, Some(body)),
+            )
+            .await;
             stream_back(stream, &method, response).await;
         }
         Verdict::Write(write) => {
+            // A target already retired sends nothing: the agent is told so at once, as a read
+            // is, rather than the person being asked to approve a write that cannot go. One that
+            // retires while the person decides is refused when sent (`NoAnswer::Retired`).
+            if let Some(why) = shared.client.retired() {
+                answer(stream, 403, "forbidden", &retired_refusal(why)).await;
+                return;
+            }
             // Whoever ran the command, as they are now (`requester`): on Windows the CLI can
             // outlive a command stopped by its process id, its connection open.
             let starters = Starters::of(client, server).await;
@@ -508,10 +526,11 @@ async fn handle(
             // recorded: the conversation stopping, or the CLI going, would otherwise drop it
             // halfway with the server perhaps committing it unseen.
             let client = shared.client.clone();
-            let forward = forward_request(request, None);
+            let events = shared.events.clone();
+            let request = forward_request(request, None);
             let (reply_tx, reply_rx) = oneshot::channel();
             smol::spawn(async move {
-                let response = client.forward(forward).await;
+                let response = forward(&client, &events, request).await;
                 let (outcome, reply) = read_write_answer(response, kind).await;
                 on_outcome(&outcome);
                 reply_tx.send(reply).ok();
@@ -519,8 +538,14 @@ async fn handle(
             .detach();
             // When the server's answer was lost, the CLI's connection closes without one, and
             // the CLI reports the outcome as unknown, as it is.
-            if let Ok(Some((status, headers, body))) = reply_rx.await {
-                write_buffered(stream, status, &headers, &body).await;
+            match reply_rx.await {
+                Ok(Some(Reply::Server(status, headers, body))) => {
+                    write_buffered(stream, status, &headers, &body).await
+                }
+                Ok(Some(Reply::NotSent(unsent))) => {
+                    answer(stream, unsent.status, unsent.code, &unsent.message).await
+                }
+                _ => {}
             }
         }
     }
@@ -577,6 +602,32 @@ enum Undecided {
     Stopped,
 }
 
+/// Sends `request` on with Studio's token, and says the server refusing that token
+/// ([`GatewayEvent::TokenRefused`]; a 401 without the contract header came from something in
+/// between, and one that refused no token, one that never arrived, would refuse the next
+/// alike), so the token is asked for again as for Studio's own requests: an agent working while
+/// no window reads would otherwise be refused until one did.
+async fn forward(
+    client: &GraphClient,
+    events: &mpsc::UnboundedSender<GatewayEvent>,
+    request: ForwardRequest,
+) -> Result<ForwardResponse, NoAnswer> {
+    let response = client.forward(request).await;
+    if let Ok(response) = &response
+        && response.unauthorized == Some(Unauthorized::TokenRefused)
+        && !response.token_replaced
+        && graph_client::speaks_contract(
+            response
+                .headers
+                .get(CONTRACT_HEADER)
+                .and_then(|value| value.to_str().ok()),
+        )
+    {
+        events.unbounded_send(GatewayEvent::TokenRefused).ok();
+    }
+    response
+}
+
 /// The request as the server is sent it, with `body` in place of the one that came. Taken whole,
 /// so a large body moves into the forward rather than being copied.
 fn forward_request(request: Request, body: Option<Vec<u8>>) -> ForwardRequest {
@@ -606,12 +657,22 @@ fn forward_request(request: Request, body: Option<Vec<u8>>) -> ForwardRequest {
 
 /// Reads a write's answer whole, and what it says happened to a write of `kind`.
 async fn read_write_answer(
-    response: Result<graph_client::ForwardResponse, String>,
+    response: Result<graph_client::ForwardResponse, NoAnswer>,
     kind: WriteKind,
-) -> (Seen, Option<(StatusCode, HeaderMap, Vec<u8>)>) {
+) -> (Seen, Option<Reply>) {
     let mut response = match response {
         Ok(response) => response,
-        Err(reason) => return (Seen::Unknown(reason), None),
+        Err(no) => {
+            return match unsent_refusal(&no) {
+                // Never sent (the target retired, the connection refused, or a request Studio
+                // would not make): nothing was written, and the CLI is told so.
+                Some(unsent) => (
+                    Seen::Refused(graph_store::nothing_sent(&String::from(no))),
+                    Some(Reply::NotSent(unsent)),
+                ),
+                None => (Seen::Unknown(String::from(no)), None),
+            };
+        }
     };
     let mut body = Vec::new();
     // One byte past the limit tells a whole answer from a cut one.
@@ -642,14 +703,70 @@ async fn read_write_answer(
     // Judged as Studio's own writes are, a success whose body cannot be read included: it
     // confirms nothing.
     let outcome = match graph_client::judge_write(response.status, contract, &body) {
-        WriteOutcome::Committed(body) => match serde_json::from_slice::<Value>(body) {
+        Answered::Committed(body) => match serde_json::from_slice::<Value>(body) {
             Ok(json) => seen_written(&json, kind),
             Err(error) => Seen::Unknown(format!("the success response could not be read: {error}")),
         },
-        WriteOutcome::Refused(error) => Seen::Refused(error.body.error),
-        WriteOutcome::Unknown { reason } => Seen::Unknown(reason),
+        Answered::Refused(error) => Seen::Refused(error.body.error),
+        Answered::Unknown { reason } => Seen::Unknown(reason),
     };
-    (outcome, Some((response.status, response.headers, body)))
+    (
+        outcome,
+        Some(Reply::Server(response.status, response.headers, body)),
+    )
+}
+
+/// The CLI's refusal of a request to a retired target ([`NoAnswer::Retired`]).
+fn retired_refusal(why: &str) -> String {
+    format!(
+        "Studio: {}. Tell the person what this says. Nothing was sent.",
+        studio_ui::clause(why)
+    )
+}
+
+/// How the CLI is answered for a request never sent ([`answer`]): its status, code and message.
+#[derive(Debug)]
+struct Unsent {
+    status: u16,
+    code: &'static str,
+    message: String,
+}
+
+/// The CLI's answer to a request never sent, or `None` for one whose answer was lost: as every
+/// gateway refusal does (spec 013), it says what to do instead and ends "Nothing was sent.",
+/// which the agent reads as nothing written. A request Studio refused is a 403 `forbidden`, to
+/// be fixed first; one whose server refused the connection is a 503 `service_unavailable`, to be
+/// tried again once the server answers.
+fn unsent_refusal(no: &NoAnswer) -> Option<Unsent> {
+    let forbidden = |message| Unsent {
+        status: 403,
+        code: "forbidden",
+        message,
+    };
+    match no {
+        NoAnswer::Retired(why) => Some(forbidden(retired_refusal(why))),
+        NoAnswer::Unsendable(why) => Some(forbidden(format!(
+            "Studio: {}. Change the request, or tell the person what this says. Nothing was \
+             sent.",
+            studio_ui::clause(why)
+        ))),
+        NoAnswer::Unreached(why) => Some(Unsent {
+            status: 503,
+            code: "service_unavailable",
+            message: format!(
+                "Studio: the server could not be reached ({why}). Try again once it answers, or \
+                 tell the person. Nothing was sent."
+            ),
+        }),
+        NoAnswer::Lost(_) => None,
+    }
+}
+
+/// What the CLI is answered with once a forwarded write ends: the server's answer, or the
+/// refusal of one never sent.
+enum Reply {
+    Server(StatusCode, HeaderMap, Vec<u8>),
+    NotSent(Unsent),
 }
 
 /// What a success answer to a write of `kind` says it did. A write's receipt names its commit
@@ -1077,18 +1194,24 @@ async fn write_buffered(
 async fn stream_back(
     stream: &mut (impl AsyncWrite + Unpin),
     method: &str,
-    response: Result<graph_client::ForwardResponse, String>,
+    response: Result<graph_client::ForwardResponse, NoAnswer>,
 ) {
     let mut response = match response {
         Ok(response) => response,
-        Err(reason) => {
-            answer(
-                stream,
-                502,
-                "internal",
-                &format!("Studio could not reach the graph's server: {reason}"),
-            )
-            .await;
+        Err(no) => {
+            match unsent_refusal(&no) {
+                Some(unsent) => answer(stream, unsent.status, unsent.code, &unsent.message).await,
+                None => {
+                    let reason = String::from(no);
+                    answer(
+                        stream,
+                        502,
+                        "internal",
+                        &format!("Studio could not reach the graph's server: {reason}"),
+                    )
+                    .await
+                }
+            }
             return;
         }
     };
@@ -1536,6 +1659,108 @@ mod tests {
         });
     }
 
+    /// A request the gateway forwards with Studio's token that the server refuses for it (a 401
+    /// with `error="invalid_token"`) is said to the panel, so the token is asked for again as
+    /// for Studio's own requests; any other answer says nothing, a 401 that refused no token
+    /// (the one sent never arrived) included. Before, the gateway said nothing, and an agent
+    /// working while no window read was refused once the token lapsed, until a window did.
+    #[test]
+    fn a_forwarded_401_refusing_the_token_is_said() {
+        let answering = |status: u16, server: bool, refused: bool| {
+            FakeHttpClient::create(move |_| async move {
+                let mut response = Response::builder().status(status);
+                if server {
+                    response = response.header(CONTRACT_HEADER, CONTRACT);
+                }
+                if status == 401 {
+                    let challenge = if refused {
+                        r#"Bearer error="invalid_token""#
+                    } else {
+                        "Bearer"
+                    };
+                    response = response.header("www-authenticate", challenge);
+                }
+                Ok(response.body(AsyncBody::from("{}")).unwrap())
+            })
+        };
+        smol::block_on(async {
+            // A 401 the server sent refusing the token, one that found none, one from something
+            // in between, and an answer.
+            for (status, server, refused) in [
+                (401, true, true),
+                (401, true, false),
+                (401, false, true),
+                (200, true, false),
+            ] {
+                let client = GraphClient::new(
+                    "http://127.0.0.1:8787",
+                    Some("person-token".into()),
+                    answering(status, server, refused),
+                )
+                .unwrap();
+                let (events_tx, mut events) = mpsc::unbounded();
+                let request = ForwardRequest {
+                    method: Method::GET,
+                    path_and_query: "graphs/knowledge/schema".into(),
+                    headers: Vec::new(),
+                    body: AsyncBody::empty(),
+                };
+                let response = super::forward(&client, &events_tx, request).await;
+                assert_eq!(
+                    response.map(|response| response.status.as_u16()).ok(),
+                    Some(status)
+                );
+                drop(events_tx);
+                let said = events.next().await;
+                if status == 401 && server && refused {
+                    assert!(matches!(said, Some(GatewayEvent::TokenRefused)));
+                } else {
+                    assert!(
+                        said.is_none(),
+                        "a {status} (the server's: {server}, refusing: {refused}) said nothing"
+                    );
+                }
+            }
+        });
+    }
+
+    /// A forwarded request's 401 to a token replaced while it was out says nothing: it refused
+    /// a token no longer held, and asking about the one held could drop it.
+    #[test]
+    fn a_forwarded_401_to_a_replaced_token_says_nothing() {
+        let held: Arc<std::sync::OnceLock<GraphClient>> = Arc::default();
+        let replacing = held.clone();
+        let http = FakeHttpClient::create(move |_| {
+            if let Some(client) = replacing.get() {
+                client.set_token(Some("next-token".into()));
+            }
+            async move {
+                Ok(Response::builder()
+                    .status(401)
+                    .header(CONTRACT_HEADER, CONTRACT)
+                    .header("www-authenticate", r#"Bearer error="invalid_token""#)
+                    .body(AsyncBody::from("{}"))
+                    .unwrap())
+            }
+        });
+        let client =
+            GraphClient::new("http://127.0.0.1:8787", Some("person-token".into()), http).unwrap();
+        held.set(client.clone()).ok();
+        smol::block_on(async {
+            let (events_tx, mut events) = mpsc::unbounded();
+            let request = ForwardRequest {
+                method: Method::GET,
+                path_and_query: "graphs/knowledge/schema".into(),
+                headers: Vec::new(),
+                body: AsyncBody::empty(),
+            };
+            let response = super::forward(&client, &events_tx, request).await;
+            assert!(response.is_ok_and(|response| response.status == StatusCode::UNAUTHORIZED));
+            drop(events_tx);
+            assert!(events.next().await.is_none(), "said for a replaced token");
+        });
+    }
+
     /// A write's success answer says what it did, as Studio's own writes read theirs: its
     /// commit with the commit's kind and its counts, whether a load created its branch, and a
     /// branch's create or delete, which publish none. A stored query that reads wrote nothing,
@@ -1543,6 +1768,56 @@ mod tests {
     /// or a body that cannot be read, confirms nothing.
     #[test]
     fn a_writes_success_answer_says_what_it_did() {
+        // A write the client never sent wrote nothing: its outcome says so, and the CLI is
+        // answered that nothing was sent and what to do, rather than left to report it unknown.
+        // One whose answer was lost stays unknown, with nothing to answer.
+        let (seen, reply) = smol::block_on(super::read_write_answer(
+            Err(NoAnswer::Retired("the target is gone".into())),
+            WriteKind::Mutate,
+        ));
+        assert_eq!(
+            seen,
+            super::Seen::Refused("the target is gone, so nothing was sent.".into())
+        );
+        assert!(matches!(reply, Some(super::Reply::NotSent(unsent))
+            if unsent.status == 403
+                && unsent.message
+                    == "Studio: the target is gone. Tell the person what this says. Nothing was sent."));
+        // One Studio would not make as asked says to change it.
+        let (seen, reply) = smol::block_on(super::read_write_answer(
+            Err(NoAnswer::Unsendable("refused path \"../x\"".into())),
+            WriteKind::Mutate,
+        ));
+        assert_eq!(
+            seen,
+            super::Seen::Refused("refused path \"../x\", so nothing was sent.".into())
+        );
+        assert!(matches!(reply, Some(super::Reply::NotSent(unsent))
+            if unsent.status == 403
+                && unsent.message == "Studio: refused path \"../x\". Change the request, or tell \
+                                      the person what this says. Nothing was sent."));
+        // One whose server refused the connection may be tried again once it answers: a 503
+        // whose disposition says so (`effects: none`, `action: retry`), nothing having been sent.
+        let (seen, reply) = smol::block_on(super::read_write_answer(
+            Err(NoAnswer::Unreached("the connection was refused".into())),
+            WriteKind::Mutate,
+        ));
+        assert_eq!(
+            seen,
+            super::Seen::Refused("the connection was refused, so nothing was sent.".into())
+        );
+        assert!(matches!(reply, Some(super::Reply::NotSent(unsent))
+            if unsent.status == 503
+                && unsent.code == "service_unavailable"
+                && unsent.message.ends_with("Try again once it answers, or tell the person. \
+                                             Nothing was sent.")));
+        let (seen, reply) = smol::block_on(super::read_write_answer(
+            Err(NoAnswer::Lost("the connection closed".into())),
+            WriteKind::Mutate,
+        ));
+        assert_eq!(seen, super::Seen::Unknown("the connection closed".into()));
+        assert!(reply.is_none());
+
         let answer = |kind: WriteKind, body: &str| {
             let mut headers = HeaderMap::new();
             headers.append(CONTRACT_HEADER, CONTRACT.parse().unwrap());
@@ -1550,6 +1825,8 @@ mod tests {
                 status: StatusCode::OK,
                 headers,
                 body: AsyncBody::from(body.to_owned()),
+                token_replaced: false,
+                unauthorized: None,
             };
             smol::block_on(super::read_write_answer(Ok(response), kind)).0
         };
@@ -1759,6 +2036,8 @@ mod tests {
                 status: StatusCode::OK,
                 headers: HeaderMap::new(),
                 body: AsyncBody::from_reader(body),
+                token_replaced: false,
+                unauthorized: None,
             };
             stream_back(&mut stream, "POST", Ok(response)).await;
             drop(stream);
@@ -1922,6 +2201,7 @@ mod tests {
     fn the_gateway_checks_the_session_then_forwards_reads_and_approved_writes() {
         smol::block_on(async {
             let (client, seen) = upstream();
+            let upstream_client = client.clone();
             let mut gateway = Gateway::bind().unwrap();
             let (cli, token) = (Cli::of(&gateway), gateway.token.clone());
             let (events_tx, mut events) = mpsc::unbounded();
@@ -2171,6 +2451,76 @@ mod tests {
             assert_eq!(status, 200);
             assert_eq!(body, r#"{"rows":[{"n":200}]}"#);
             assert_eq!(seen.lock().unwrap().len(), 4);
+
+            // The target retired (the CLI no longer lists it) while the person decides a write:
+            // approved, it is answered that nothing was sent, as the gateway's own refusals
+            // are, and its outcome is a refusal, not unknown. A read, and a write asked after,
+            // are refused at once, the person not asked.
+            let mutation =
+                r#"{"query":"query m() { … }","name":"m","branch":"agent/20261013-101500"}"#;
+            let allowed = smol::spawn(call(
+                cli.clone(),
+                post("/graphs/knowledge/mutate", &token, Some(CONTRACT), mutation),
+            ));
+            let Some(GatewayEvent::Write { decide, .. }) = events.next().await else {
+                panic!("no write event")
+            };
+            upstream_client.retire("the target is gone".into());
+            let refused_so = |status: u16, body: &str| {
+                assert_eq!(status, 403, "{body}");
+                let refused: Value = serde_json::from_str(body).unwrap();
+                assert_eq!(refused["code"], "forbidden", "{body}");
+                assert_eq!(
+                    refused["disposition"],
+                    json!({ "effects": "none", "action": "fix" }),
+                    "{body}"
+                );
+                assert!(
+                    body.contains(
+                        "Studio: the target is gone. Tell the person what this says. Nothing was \
+                         sent."
+                    ),
+                    "{body}"
+                );
+            };
+            let (status, _, body) = call(
+                cli.clone(),
+                post(
+                    "/graphs/knowledge/query",
+                    &token,
+                    Some(CONTRACT),
+                    r#"{"query":"q","branch":"main"}"#,
+                ),
+            )
+            .await;
+            refused_so(status, &body);
+            let after = smol::spawn(call(
+                cli.clone(),
+                post("/graphs/knowledge/mutate", &token, Some(CONTRACT), mutation),
+            ));
+            let futures::future::Either::Left(((status, _, body), _)) =
+                futures::future::select(after, events.next()).await
+            else {
+                panic!("the person was asked to approve a write to a retired target")
+            };
+            refused_so(status, &body);
+            let recorded: Arc<Mutex<Option<super::Seen>>> = Arc::default();
+            let record = recorded.clone();
+            decide
+                .send(Some(Box::new(move |seen: &super::Seen| {
+                    *record.lock().unwrap() = Some(seen.clone());
+                })))
+                .ok()
+                .unwrap();
+            let (status, _, body) = allowed.await;
+            refused_so(status, &body);
+            assert_eq!(
+                recorded.lock().unwrap().clone(),
+                Some(super::Seen::Refused(
+                    "the target is gone, so nothing was sent.".into()
+                ))
+            );
+            assert_eq!(seen.lock().unwrap().len(), 4, "nothing reached the server");
         });
     }
 
@@ -2368,7 +2718,7 @@ mod end_to_end {
                             })))
                             .ok();
                     }
-                    GatewayEvent::Abandoned { .. } => {}
+                    GatewayEvent::Abandoned { .. } | GatewayEvent::TokenRefused => {}
                 }
             }
         });

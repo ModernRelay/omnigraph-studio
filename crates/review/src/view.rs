@@ -42,6 +42,10 @@ use crate::summary;
 
 /// How long typing in the search pauses before the cards are filtered.
 const SEARCH_DELAY: Duration = Duration::from_millis(80);
+/// How long a review is read before it says the server is still working out the changes. A
+/// small branch is read well within it; on a large graph one page of changes takes the server
+/// most of a minute, with nothing to show until it is whole (spec 008, validation 2026-10-26).
+const SLOW_READ: Duration = Duration::from_secs(10);
 
 /// Changes asked for per change-feed page: the server's most (`COMMIT_CHANGES_MAX_CHANGES`),
 /// as the CLI asks when it follows every page. Each page restarts the server's comparison
@@ -63,12 +67,20 @@ const FORK_BOUND: usize = FORK_PAGE as usize * FORK_PAGES;
 enum FixState {
     Idle,
     Running,
-    Reverted { commit: String },
+    Reverted {
+        commit: String,
+    },
     Saving,
-    Edited { commit: String },
+    Edited {
+        commit: String,
+    },
     Unchanged,
     Moved,
     Refused(String),
+    /// Never sent (its connection retired, the server refusing the connection, the request not
+    /// made, or dropped because the fix before it did not land or has an unknown outcome):
+    /// nothing was written.
+    NotSent(String),
     Unknown,
 }
 
@@ -148,6 +160,10 @@ enum MergeState {
     },
     Conflicts(Vec<MergeConflictOutput>),
     Refused(String),
+    /// Never sent (its connection retired, the server refusing the connection, the request not
+    /// made, or the branch's head not read before it): nothing was merged, and nothing is to be
+    /// settled.
+    NotSent(String),
     Unknown {
         reason: String,
         /// What the target's history shows of it.
@@ -435,14 +451,6 @@ fn revert_checks(
 
 /// Whether two schemas group and draw the cards alike: the same text, naming each type's nodes
 /// by the same property. A schema read again with the same text is the same one.
-fn same_schema(a: Option<&Arc<SchemaModel>>, b: Option<&Arc<SchemaModel>>) -> bool {
-    match (a, b) {
-        (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a.same_as(b),
-        (None, None) => true,
-        _ => false,
-    }
-}
-
 pub struct ReviewView {
     session: Entity<GraphSession>,
     branch: String,
@@ -497,6 +505,9 @@ pub struct ReviewView {
     show_conflicts: bool,
     /// Someone else wrote to the branch after this review was read.
     newer: bool,
+    /// The review being read has been read for longer than [`SLOW_READ`]: it says the server is
+    /// still working out the changes.
+    reading_slowly: bool,
     /// Another writer changed the schema while the review being read was read: the review it
     /// finishes with is newer at once.
     schema_moved_while_loading: bool,
@@ -526,6 +537,8 @@ pub struct ReviewView {
     /// The target's head as the session knew it when the dry run was asked for.
     preview_target: Option<String>,
     _load_task: Option<Task<()>>,
+    /// Marks the review being read as slow once [`SLOW_READ`] has passed.
+    _slow_task: Option<Task<()>>,
     _names_task: Option<Task<()>>,
     _preview_task: Option<Task<()>>,
     _merge_task: Option<Task<()>>,
@@ -659,6 +672,7 @@ impl ReviewView {
             delete_branch: true,
             show_conflicts: false,
             newer: false,
+            reading_slowly: false,
             schema_moved_while_loading: false,
             fixes_running: 0,
             fix_queue: VecDeque::new(),
@@ -672,6 +686,7 @@ impl ReviewView {
             read_owed: false,
             preview_target: None,
             _load_task: None,
+            _slow_task: None,
             _names_task: None,
             _preview_task: None,
             _merge_task: None,
@@ -787,6 +802,10 @@ impl ReviewView {
         self._names_task = None;
         self.preview = Preview::Unread;
         self._preview_task = None;
+        // A read under way is the old token's: landing, it would show its cards.
+        self._load_task = None;
+        self._slow_task = None;
+        self.reading_slowly = false;
         self.owe_read(cx);
     }
 
@@ -810,7 +829,7 @@ impl ReviewView {
         let schema = self.session.read(cx).schema_model();
         let shows_head = self.shows_head();
         let Some(data) = &self.data else { return };
-        if same_schema(data.schema.as_ref(), schema.as_ref()) {
+        if SchemaModel::same_held(data.schema.as_ref(), schema.as_ref()) {
             // Grouped as the session's schema groups: a regroup under way is for one since gone.
             self._regroup_task = None;
             return;
@@ -881,6 +900,15 @@ impl ReviewView {
     fn read_again(&mut self, held: Option<ForkRead>, cx: &mut Context<Self>) {
         self.keep_marks();
         self.load = LoadState::Loading { folded: 0 };
+        self.reading_slowly = false;
+        self._slow_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SLOW_READ).await;
+            this.update(cx, |this, cx| {
+                this.reading_slowly = true;
+                cx.notify();
+            })
+            .ok();
+        }));
         self.newer = false;
         self.schema_moved_while_loading = false;
         self.show_conflicts = false;
@@ -936,6 +964,8 @@ impl ReviewView {
         searched: Searched,
         cx: &mut Context<Self>,
     ) {
+        self.reading_slowly = false;
+        self._slow_task = None;
         match result {
             Ok(data) => {
                 self.cards = data
@@ -1785,7 +1815,8 @@ impl ReviewView {
                 }
             }
             WriteOutcome::Refused(error) if error.status == 412 => FixState::Moved,
-            WriteOutcome::Refused(error) => FixState::Refused(error.body.error),
+            WriteOutcome::Refused(error) => FixState::Refused(error.reason().to_owned()),
+            WriteOutcome::NotSent { reason } => FixState::NotSent(reason),
             WriteOutcome::Unknown { .. } => FixState::Unknown,
         };
         let landed = matches!(
@@ -1814,10 +1845,10 @@ impl ReviewView {
     /// perhaps still there.
     fn drop_fixes_after(&mut self, key: &str, unknown: bool) {
         let why = if unknown {
-            "Not sent: whether the relationship that replaced it was removed is not known. \
-             Check History before moving it back."
+            "whether the relationship that replaced it was removed is not known; check History \
+             before moving it back"
         } else {
-            "Not sent: the relationship that replaced it was not removed first."
+            "the relationship that replaced it was not removed first"
         };
         let (dropped, kept): (Vec<Fix>, Vec<Fix>) = std::mem::take(&mut self.fix_queue)
             .into_iter()
@@ -1827,7 +1858,7 @@ impl ReviewView {
             self.fixes_running = self.fixes_running.saturating_sub(1);
             self.fixes_in_flight.remove(&fix.key);
             if let Some(card) = self.card_of(&fix.key).and_then(|ix| self.cards.get_mut(ix)) {
-                card.fix = FixState::Refused(why.into());
+                card.fix = FixState::NotSent(why.into());
             }
         }
     }
@@ -2008,7 +2039,7 @@ impl ReviewView {
                 Ok(base) => (Some(base.source_commit_id), Some(base.target_commit_id)),
                 Err(error) => {
                     this.update(cx, |this, cx| {
-                        this.merge = MergeState::Refused(format!(
+                        this.merge = MergeState::NotSent(format!(
                             "Studio could not read {branch}'s head: {error}"
                         ));
                         this.writes_settled(cx);
@@ -2109,10 +2140,11 @@ impl ReviewView {
                         deleted,
                     }
                 }
-                WriteOutcome::Refused(error) => match error.body.merge_conflicts {
+                WriteOutcome::Refused(mut error) => match error.body.merge_conflicts.take() {
                     Some(conflicts) if !conflicts.is_empty() => MergeState::Conflicts(conflicts),
-                    _ => MergeState::Refused(error.body.error),
+                    _ => MergeState::Refused(error.reason().to_owned()),
                 },
+                WriteOutcome::NotSent { reason } => MergeState::NotSent(reason),
                 WriteOutcome::Unknown { reason } => {
                     let sent = MergeSent {
                         source_head: bound,
@@ -2281,7 +2313,11 @@ impl ReviewView {
                         self.branch
                     )
                 },
-                String::new(),
+                if self.reading_slowly {
+                    "On a large graph this can take a few minutes.".to_owned()
+                } else {
+                    String::new()
+                },
             ),
             (LoadState::Failed(error), _) => (
                 format!("The review could not be read: {error}"),
@@ -2692,7 +2728,11 @@ impl ReviewView {
                 let deletion = match deleted {
                     None => String::new(),
                     Some(Ok(())) => format!(" Deleted {}.", self.branch),
-                    Some(Err(why)) => format!(" {} was not deleted: {why}.", self.branch),
+                    Some(Err(why)) => format!(
+                        " {} was not deleted: {}.",
+                        self.branch,
+                        studio_ui::clause(why)
+                    ),
                 };
                 let beyond = format!("{beyond}{deletion}");
                 (
@@ -2732,7 +2772,18 @@ impl ReviewView {
             ),
             MergeState::Refused(message) => (
                 Severity::Error,
-                format!("The merge was refused: {message}. Nothing was merged."),
+                format!(
+                    "The merge was refused: {}. Nothing was merged.",
+                    studio_ui::clause(message)
+                ),
+                None,
+            ),
+            MergeState::NotSent(reason) => (
+                Severity::Error,
+                format!(
+                    "The merge was not sent: {}. Nothing was merged.",
+                    studio_ui::clause(reason)
+                ),
                 None,
             ),
             MergeState::Unknown { reason, landed, .. } => (
@@ -3109,6 +3160,7 @@ fn merged_check_words(verified: Check, target: &str) -> String {
 /// History that does not show it yet is no proof it will not land: the merge may still be
 /// running on the server.
 fn unknown_merge_words(reason: &str, landed: Check, target: &str) -> String {
+    let reason = studio_ui::clause(reason);
     match landed {
         Check::Reading => format!(
             "The merge outcome is unknown ({reason}). Studio did not retry; reading {target}'s history…"
@@ -3187,6 +3239,13 @@ fn fix_status(fix: &FixState) -> Option<(String, Color)> {
             Color::Warning,
         ),
         FixState::Refused(message) => (format!("Refused: {message}"), Color::Error),
+        FixState::NotSent(reason) => (
+            format!(
+                "Not sent: {}. Nothing was written.",
+                studio_ui::clause(reason)
+            ),
+            Color::Error,
+        ),
         FixState::Unknown => (
             "Outcome unknown. Check History before trying again.".to_owned(),
             Color::Warning,
@@ -3381,6 +3440,22 @@ enum FeedError {
     Failed(String),
 }
 
+/// Why a page of changes could not be read, in words. The server works a page out whole before
+/// it answers and sets no deadline, and on a large graph that takes minutes (spec 012, E35 to
+/// E38): one it took and had not answered when Studio stopped waiting says so, rather than that
+/// the server could not be reached.
+fn change_read_failure(error: &ReadError) -> String {
+    if error.timed_out() {
+        format!(
+            "The server was still working out the changes after {} minutes, and Studio \
+             stopped waiting.",
+            graph_client::CHANGE_READ_TIMEOUT.as_secs() / 60
+        )
+    } else {
+        error.to_string()
+    }
+}
+
 /// Folds `branch`'s change feed from `start` (`after:<fork>`) up to `head`, the change cap, or
 /// a block after `head`.
 async fn fold_feed(
@@ -3408,7 +3483,7 @@ async fn fold_feed(
             .await
             .map_err(|error| match error {
                 ReadError::Refused(refusal) if first && refusal.status == 400 => FeedError::Refused,
-                error => FeedError::Failed(error.to_string()),
+                error => FeedError::Failed(change_read_failure(&error)),
             })?;
         let mut blocks = Vec::new();
         let mut last_commit = None;
@@ -3513,7 +3588,8 @@ async fn fold_pages(
         match next {
             Some(next) if complete && fold.raw_changes() < REVIEW_CHANGE_CAP => token = Some(next),
             Some(_) => return Ok((fold, true)),
-            None => return Ok((fold, false)),
+            // A last page the cap cut is partial too, as the feed's fold says it.
+            None => return Ok((fold, !complete)),
         }
     }
 }
@@ -3776,7 +3852,7 @@ async fn read_review_since_merge(
                         session.diff(&base, &head, token, limit, cx)
                     })
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| change_read_failure(&e))?;
                 let block = ChangeBlockOutput {
                     cause: cause.clone(),
                     changes: page.changes,
@@ -3830,7 +3906,7 @@ async fn read_commit_review(
                         session.commit_changes(&commit, token, limit, cx)
                     })
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| change_read_failure(&e))?;
                 // The page is shared with the session's memo: its changes are copied for the
                 // fold off the main thread.
                 let (cause, changes) = (page.cause, page.changes);
@@ -3982,6 +4058,20 @@ impl Render for ReviewView {
             .into_any_element(),
             (LoadState::Failed(error), _) => {
                 studio_ui::ds::error_state("The review could not be read", error.clone())
+                    .child(
+                        studio_ui::ds::state_action(
+                            "refresh-failed",
+                            "Refresh",
+                            &Refresh,
+                            &self.focus_handle,
+                            cx,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
+                    )
+                    .into_any_element()
+            }
+            _ if self.reading_slowly => {
+                studio_ui::ds::loading_state("The server is still working out the changes…")
                     .into_any_element()
             }
             _ => studio_ui::ds::loading_state("Reading changes…").into_any_element(),
@@ -4198,6 +4288,78 @@ pub(crate) mod tests {
         );
     }
 
+    /// A last page of changes past the cap is said partial, as the feed's fold says it: the cap
+    /// left changes out whether or not the server named a page after it. Before, the diff's
+    /// fold said such a review whole.
+    #[gpui::test]
+    async fn a_last_page_past_the_cap_is_partial(cx: &mut gpui::TestAppContext) {
+        let mut acx = cx.to_async();
+        let cause: ChangeCauseOutput = serde_json::from_value(json!({
+            "graph_commit_id": "c1", "authored_branch": "feature", "authored_at": 0
+        }))
+        .unwrap();
+        let change: graph_client::api::EntityChangeOutput = serde_json::from_value(json!({
+            "kind": "node", "type": { "id": "Person", "name": "Person" }, "id": "p", "op": "update"
+        }))
+        .unwrap();
+        let this = WeakEntity::<ReviewView>::new_invalid();
+        let (fold, partial) = fold_pages(
+            &this,
+            &mut acx,
+            async |_: Option<String>, _: u32, _: &mut AsyncApp| {
+                let changes = (0..=REVIEW_CHANGE_CAP)
+                    .map(|i| graph_client::api::EntityChangeOutput {
+                        id: format!("p{i}"),
+                        ..change.clone()
+                    })
+                    .collect();
+                let block = ChangeBlockOutput {
+                    cause: cause.clone(),
+                    changes,
+                };
+                Ok((block, None))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(fold.raw_changes(), REVIEW_CHANGE_CAP);
+        assert!(partial, "the cap left a change out");
+    }
+
+    /// A review behind another tab whose read is out when the token changes lets that read go:
+    /// it is the old token's, and nothing reads the review again until it is drawn. Before, the
+    /// read stayed, and landing showed the old token's cards, with Revert and Edit, until the
+    /// review was shown.
+    #[gpui::test]
+    async fn a_hidden_reviews_read_under_the_old_token_does_not_land(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _) = reviewed_server_writing(false, cx);
+        let (_blank, cx) = cx.add_window_view(|_, _| gpui::EmptyView);
+        let hidden = cx.update(|window, cx| {
+            let session = session.clone();
+            cx.new(|cx| ReviewView::new(session, "feature".into(), "main".into(), window, cx))
+        });
+        cx.run_until_parked();
+        // A Refresh's read is out under the old token when the token changes.
+        hidden.update(cx, |view, cx| view.reload(cx));
+        session.update(cx, |_, cx| cx.emit(SessionEvent::CredentialChanged));
+        cx.run_until_parked();
+        hidden.read_with(cx, |view, _| {
+            assert!(
+                view.data.is_none() && view.cards.is_empty(),
+                "no cards landed"
+            );
+            assert!(matches!(view.load, LoadState::Loading { .. }));
+            assert!(view.read_owed, "read again when drawn");
+            assert!(!view.reading_slowly);
+        });
+    }
+
     /// A review not drawn (restored with the workspace behind another tab) reads no diff until
     /// it is shown; drawn, it reads. Before, every restored review read its whole diff at start.
     #[gpui::test]
@@ -4366,7 +4528,7 @@ pub(crate) mod tests {
             // The first's outcome is unknown, and the second says so: not that it was not
             // removed.
             assert!(
-                matches!(&view.cards[1].fix, FixState::Refused(why) if why.contains("is not known")),
+                matches!(&view.cards[1].fix, FixState::NotSent(why) if why.contains("is not known")),
                 "{:?}",
                 view.cards[1].fix
             );
@@ -5524,6 +5686,122 @@ pub(crate) mod tests {
         assert_eq!(dry_runs(&asked), 0);
     }
 
+    /// A review whose changes the server takes long to work out says, after [`SLOW_READ`], that
+    /// the server is still working on them, and stops saying so once they are read.
+    #[gpui::test]
+    async fn a_slow_review_says_the_server_is_still_working(cx: &mut gpui::TestAppContext) {
+        use futures::FutureExt as _;
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (answered, held) = futures::channel::oneshot::channel::<()>();
+        let held = std::sync::Mutex::new(Some(held));
+        // The feed's first page after the fork, m1, is the slow read.
+        let (session, _) = fake_server_held(
+            review_answers(
+                None,
+                false,
+                None,
+                "f2",
+                |_| (500, json!({})),
+                |_, _, _| None,
+            ),
+            move |path, query| {
+                let held = held
+                    .lock()
+                    .unwrap()
+                    .take_if(|_| path.ends_with("/changes") && query.contains("after%3Am1"))?;
+                Some(
+                    async move {
+                        held.await.ok();
+                        Ok(())
+                    }
+                    .boxed(),
+                )
+            },
+            cx,
+        );
+        let (view, cx) = cx.add_window_view({
+            let session = session.clone();
+            |window, cx| ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.load, LoadState::Loading { .. }));
+            assert!(!view.reading_slowly, "not yet");
+        });
+        cx.executor().advance_clock(SLOW_READ);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.load, LoadState::Loading { .. }));
+            assert!(view.reading_slowly);
+        });
+        answered.send(()).unwrap();
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.load, LoadState::Ready));
+            assert!(!view.reading_slowly);
+            assert_eq!(view.bound_head.as_deref(), Some("f2"));
+        });
+        // Read again, the review is slow only once its own read is.
+        view.update(cx, |view, cx| view.reload(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.load, LoadState::Ready));
+            assert!(!view.reading_slowly);
+        });
+    }
+
+    /// A page of changes the server had not answered when Studio stopped waiting says the
+    /// server was still working on them, not that it could not be reached, and offers Refresh.
+    #[gpui::test]
+    async fn a_review_that_timed_out_says_the_server_was_still_working(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use futures::FutureExt as _;
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _) = fake_server_held(
+            review_answers(
+                None,
+                false,
+                None,
+                "f2",
+                |_| (500, json!({})),
+                |_, _, _| None,
+            ),
+            |path, query| {
+                (path.ends_with("/changes") && query.contains("after%3Am1"))
+                    .then(|| async { Err(std::io::Error::other("operation timed out")) }.boxed())
+            },
+            cx,
+        );
+        let (view, cx) = cx.add_window_view({
+            let session = session.clone();
+            |window, cx| ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let LoadState::Failed(error) = &view.load else {
+                panic!("the review was read");
+            };
+            assert_eq!(
+                error.as_ref(),
+                "The server was still working out the changes after 5 minutes, and Studio \
+                 stopped waiting."
+            );
+            assert!(!view.reading_slowly);
+        });
+        // Any other failure reads as it came.
+        assert_eq!(
+            change_read_failure(&ReadError::Transport("the connection was refused".into())),
+            "Could not reach the server: the connection was refused"
+        );
+    }
+
     /// A fix asked for while the merge is out is refused on its card until the merge is back,
     /// and offered again then.
     #[gpui::test]
@@ -5589,7 +5867,10 @@ pub(crate) mod tests {
         cx.run_until_parked();
         let grouped_with = |view: &ReviewView| view.data.as_ref().unwrap().schema.clone();
         view.read_with(cx, |view, _| {
-            assert!(same_schema(grouped_with(view).as_ref(), Some(&loaded)));
+            assert!(SchemaModel::same_held(
+                grouped_with(view).as_ref(),
+                Some(&loaded)
+            ));
             let data = view.data.as_ref().unwrap();
             assert_eq!(data.groups, EntityGroups::new(&data.folded, Some(&*loaded)));
         });
@@ -5606,7 +5887,10 @@ pub(crate) mod tests {
             "the schema held, not compiled again"
         );
         view.read_with(cx, |view, _| {
-            assert!(same_schema(grouped_with(view).as_ref(), Some(&again)));
+            assert!(SchemaModel::same_held(
+                grouped_with(view).as_ref(),
+                Some(&again)
+            ));
             assert!(
                 Arc::ptr_eq(&grouped_with(view).unwrap(), &grouped),
                 "not grouped again"
@@ -5709,6 +5993,21 @@ pub(crate) mod tests {
         Entity<GraphSession>,
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) {
+        fake_server(
+            review_answers(access, merged_in, feed, took, write, over),
+            cx,
+        )
+    }
+
+    /// What [`review_server_with`]'s server answers each request's path, query and body with.
+    fn review_answers(
+        access: Option<Value>,
+        merged_in: bool,
+        feed: Option<Value>,
+        took: &'static str,
+        write: impl Fn(usize) -> (u16, Value) + Send + Sync + 'static,
+        over: impl Fn(&str, &str, &str) -> Option<(u16, Value)> + Send + Sync + 'static,
+    ) -> impl Fn(&str, &str, &str) -> (u16, Value) + Send + Sync + 'static {
         let writes = std::sync::atomic::AtomicUsize::new(0);
         let commit = |id: &str, parent: Option<&str>| json!({ "graph_commit_id": id, "graph_manifest_version": 1, "kind": "published", "created_at": 0, "parent_commit_id": parent, "actor_id": "act-dev" });
         let person = |id: &str, op: &str| json!({ "kind": "node", "type": { "id": "Person", "name": "Person" }, "id": id, "op": op, "before": { "properties": { "slug": id } }, "after": { "properties": { "slug": id, "name": "x" } } });
@@ -5738,72 +6037,86 @@ pub(crate) mod tests {
             json!({ "commits": [commit("f2", Some("f1")), commit("f1", Some("m1")), commit("m1", None)] })
         };
         let main = json!({ "commits": [commit("m2", Some("m1")), commit("m1", None)] });
-        fake_server(
-            move |path, query, sent| {
-                if let Some(answer) = over(path, query, sent) {
-                    answer
-                } else if let Some(access) = access.as_ref().filter(|_| path.ends_with("/access")) {
-                    (200, access.clone())
-                } else if path.contains("/mutate") {
-                    write(writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
-                } else if path.ends_with("/branches/merge") {
-                    let merge = json!({ "graph_commit_id": "m3", "graph_manifest_version": 4, "kind": "published", "created_at": 0, "parent_commit_id": "m2", "merged_parent_commit_id": took });
-                    let mut answer = json!({ "source": "feature", "target": "main", "outcome": "merged", "commit": merge });
-                    if sent.contains("\"delete_branch\":true") {
-                        answer["branch_deleted"] = json!(true);
-                    }
-                    (200, answer)
-                } else if path.ends_with("/schema") {
-                    (
-                        200,
-                        json!({ "schema_source": "node Person {\n  slug: String @key\n  name: String?\n}\n" }),
-                    )
-                } else if path.ends_with("/branches/merge-base") {
-                    (200, base.clone())
-                } else if let Some((_, id)) = path
-                    .strip_suffix("/changes")
-                    .and_then(|commit| commit.rsplit_once("/commits/"))
-                {
-                    // One commit's own changes: its block of the feed.
-                    let blocks = feed["blocks"].as_array().cloned().unwrap_or_default();
-                    match blocks
-                        .iter()
-                        .find(|block| block["cause"]["graph_commit_id"] == id)
-                    {
-                        Some(block) => (
-                            200,
-                            json!({ "cause": block["cause"], "changes": block["changes"] }),
-                        ),
-                        None => (
-                            404,
-                            json!({ "error": "no such commit", "code": "not_found" }),
-                        ),
-                    }
-                } else if path.ends_with("/changes") && query.contains("start=after%3Am2") {
-                    (
-                        400,
-                        json!({ "error": "start commit is not on this branch's first-parent chain", "code": "bad_request", "disposition": { "action": "fix", "effects": "none" } }),
-                    )
-                } else if path.ends_with("/changes") {
-                    (200, feed.clone())
-                } else if path.ends_with("/diff") && query.contains("from=m2&to=f2") {
-                    (200, diff.clone())
-                } else if path.ends_with("/commits") && query.contains("branch=feature") {
-                    (200, feature.clone())
-                } else if path.ends_with("/commits") {
-                    (200, main.clone())
-                } else {
-                    (200, json!({ "branches": ["main", "feature"] }))
+        move |path: &str, query: &str, sent: &str| {
+            if let Some(answer) = over(path, query, sent) {
+                answer
+            } else if let Some(access) = access.as_ref().filter(|_| path.ends_with("/access")) {
+                (200, access.clone())
+            } else if path.contains("/mutate") {
+                write(writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+            } else if path.ends_with("/branches/merge") {
+                let merge = json!({ "graph_commit_id": "m3", "graph_manifest_version": 4, "kind": "published", "created_at": 0, "parent_commit_id": "m2", "merged_parent_commit_id": took });
+                let mut answer = json!({ "source": "feature", "target": "main", "outcome": "merged", "commit": merge });
+                if sent.contains("\"delete_branch\":true") {
+                    answer["branch_deleted"] = json!(true);
                 }
-            },
-            cx,
-        )
+                (200, answer)
+            } else if path.ends_with("/schema") {
+                (
+                    200,
+                    json!({ "schema_source": "node Person {\n  slug: String @key\n  name: String?\n}\n" }),
+                )
+            } else if path.ends_with("/branches/merge-base") {
+                (200, base.clone())
+            } else if let Some((_, id)) = path
+                .strip_suffix("/changes")
+                .and_then(|commit| commit.rsplit_once("/commits/"))
+            {
+                // One commit's own changes: its block of the feed.
+                let blocks = feed["blocks"].as_array().cloned().unwrap_or_default();
+                match blocks
+                    .iter()
+                    .find(|block| block["cause"]["graph_commit_id"] == id)
+                {
+                    Some(block) => (
+                        200,
+                        json!({ "cause": block["cause"], "changes": block["changes"] }),
+                    ),
+                    None => (
+                        404,
+                        json!({ "error": "no such commit", "code": "not_found" }),
+                    ),
+                }
+            } else if path.ends_with("/changes") && query.contains("start=after%3Am2") {
+                (
+                    400,
+                    json!({ "error": "start commit is not on this branch's first-parent chain", "code": "bad_request", "disposition": { "action": "fix", "effects": "none" } }),
+                )
+            } else if path.ends_with("/changes") {
+                (200, feed.clone())
+            } else if path.ends_with("/diff") && query.contains("from=m2&to=f2") {
+                (200, diff.clone())
+            } else if path.ends_with("/commits") && query.contains("branch=feature") {
+                (200, feature.clone())
+            } else if path.ends_with("/commits") {
+                (200, main.clone())
+            } else {
+                (200, json!({ "branches": ["main", "feature"] }))
+            }
+        }
     }
 
     /// A session on a server answering each request's path, query and body with `answer`;
     /// every request is recorded, a merge with its body.
     pub(crate) fn fake_server(
         answer: impl Fn(&str, &str, &str) -> (u16, Value) + Send + Sync + 'static,
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<GraphSession>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        fake_server_held(answer, |_, _| None, cx)
+    }
+
+    /// As [`fake_server`], a request whose path and query `held` gives a wait for answered only
+    /// once that wait is over, or never answered when it ends in an error: the request fails
+    /// with it, as one the client stopped waiting for does.
+    fn fake_server_held(
+        answer: impl Fn(&str, &str, &str) -> (u16, Value) + Send + Sync + 'static,
+        held: impl Fn(&str, &str) -> Option<futures::future::BoxFuture<'static, std::io::Result<()>>>
+        + Send
+        + Sync
+        + 'static,
         cx: &mut gpui::TestAppContext,
     ) -> (
         Entity<GraphSession>,
@@ -5820,6 +6133,7 @@ pub(crate) mod tests {
         let http = FakeHttpClient::create(move |request| {
             let path = request.uri().path().to_owned();
             let query = request.uri().query().unwrap_or_default().to_owned();
+            let wait = held(&path, &query);
             let bound = request
                 .headers()
                 .get(graph_client::IF_GRAPH_COMMIT_HEADER)
@@ -5829,6 +6143,9 @@ pub(crate) mod tests {
             let (seen, answer) = (seen.clone(), answer.clone());
             async move {
                 use futures::AsyncReadExt as _;
+                if let Some(wait) = wait {
+                    wait.await?;
+                }
                 let mut sent = String::new();
                 request.into_body().read_to_string(&mut sent).await.ok();
                 let merge = if path.ends_with("/branches/merge") {

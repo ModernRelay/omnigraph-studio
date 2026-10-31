@@ -164,7 +164,7 @@ Agents (claude-agent-acp 0.89.1 with Claude Agent SDK 0.3.293; codex-acp 2.2.2 w
 |---|---|---|
 | Forwarding | `GraphClient::forward` (`crates/graph_client/src/client.rs`) | Sends a request on as it came, with the person's token and the contract header. Bodies stream both ways, no total timeout, never retried, and a path that would leave the server root is refused. The one client crate keeps every request (I) |
 | Rules | `crates/agent_panel/src/gateway_rules.rs` | `classify(request, sandbox) -> Verdict`: read, read with a rewritten body, a write for the agent's branch, or a refusal. The health probe never reaches them: the gateway answers it |
-| Gateway | `crates/agent_panel/src/gateway.rs`, `gateway_tls.rs`, `requester.rs` | A loopback HTTPS (HTTP/1.1 over TLS) server per conversation (`127.0.0.1:0`, one request per connection), with a certificate it makes when it starts. Checks the session token and contract header, applies the rules, forwards, and reports writes to the panel. On Windows it holds the processes a write's CLI was started under while the write waits |
+| Gateway | `crates/agent_panel/src/gateway.rs`, `gateway_tls.rs`, `requester.rs` | A loopback HTTPS (HTTP/1.1 over TLS) server per conversation (`127.0.0.1:0`, one request per connection), with a certificate it makes when it starts. Checks the session token and contract header, applies the rules, forwards, and reports writes to the panel, and a 401 to what it forwarded with Studio's token, so that token is asked for again as for Studio's own requests (since 2026-10-30). On Windows it holds the processes a write's CLI was started under while the write waits |
 | CLI finder | `graph_store::cli` (`crates/graph_store/src/cli_tokens.rs`) | Shared with Studio's own servers (spec 003): where Studio looks for the CLI (`cli::candidates`, the `omnigraph_cli` setting first), the probe and what it remembers (`cli::probe`, `cli_probes.json`), Studio's one turn at the CLI (`cli::take_turn`, `cli::run`), and the Omnigraph variables no process Studio starts inherits (`cli::omnigraph_variables`) |
 | CLI home | `crates/agent_panel/src/cli_home.rs` | In the conversation's folder: the wrapper, the config, token and certificate, and `AGENTS.md`; choosing, of the CLIs the finder takes, the first that reads the home |
 | Panel | `crates/agent_panel/src/panel.rs` | Starts the gateway and home with the conversation, shows each write as a card, and records outcomes in the session's write log (`GraphSession::note_write`) |
@@ -438,7 +438,16 @@ ones, each let go within 10 s and opened again, locked the CLI out).
 Writes are checked on the conversation's graph only. A refusal is a 403 `ErrorOutput` with
 `code: forbidden` and the contract header; its message ends "Nothing was sent." and says what to
 do instead. A CLI with E22 (Omnigraph #981) reports it as not started; an older one still says
-`effects: unknown`, so `AGENTS.md` says a Studio refusal never wrote anything.
+`effects: unknown`, so `AGENTS.md` says a Studio refusal never wrote anything. A request Studio
+never sends is refused the same way: one whose connection is retired (its CLI target gone, or a
+transport Studio cannot use) says to tell the person, and one Studio would not make as asked (a
+path that leaves the server's root) says to change it, or to tell the person. One that never
+opened a connection to its server (refused, a name that does not resolve, a failed TLS
+handshake or proxy tunnel, a connect timeout) is answered 503 `service_unavailable` instead, with
+`disposition: {effects: none, action: retry}`, and says to try again once the server answers. A write to a target already retired is refused so
+before it is a card, as a rule's refusal is: the person is not asked about a write that cannot
+go. One whose target retires while the person decides keeps its card, which then reads "..., so
+nothing was sent."
 
 A forwarded write's answer is read whole (at most 8 MiB) so the card can show it, then sent on.
 When the server's answer is lost, the gateway closes the connection without one, and the CLI
