@@ -1056,6 +1056,7 @@ mod tests {
                     })
                 }),
                 challenge: None,
+                unauthorized: None,
             })
         };
         assert!(is_parentless(&refused(Some((ParentlessCommit, None)))));

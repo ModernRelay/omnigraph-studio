@@ -960,7 +960,7 @@ pub fn save_result(outcome: &WriteOutcome<ChangeOutput>, branch: &str) -> SaveRe
         },
         WriteOutcome::Refused(error) => SaveResult::Refused(refusal(
             error.status,
-            &error.body.error,
+            error.reason(),
             error.body.precondition_failure.is_some(),
             branch,
         )),
@@ -1626,6 +1626,8 @@ mod tests {
     fn refused(status: u16, precondition: bool) -> WriteOutcome<ChangeOutput> {
         WriteOutcome::Refused(ApiError {
             status,
+            unauthorized: None,
+            token_replaced: false,
             body: ErrorOutput {
                 error: "policy denied".into(),
                 precondition_failure: precondition.then(|| PreconditionFailureOutput {
@@ -1669,6 +1671,24 @@ mod tests {
             panic!()
         };
         assert_eq!(notice.message, "Nothing was written. policy denied");
+        // A 401 says what became of the token, not the server's words.
+        let unauthorized = WriteOutcome::Refused(ApiError {
+            status: 401,
+            unauthorized: Some(graph_client::Unauthorized::TokenNotReceived),
+            token_replaced: false,
+            body: ErrorOutput {
+                error: "unauthorized".into(),
+                ..Default::default()
+            },
+        });
+        let SaveResult::Refused(notice) = save_result(&unauthorized, "main") else {
+            panic!()
+        };
+        assert_eq!(
+            notice.message,
+            "Nothing was written. The server received no token, though Studio sent one: \
+             something between them may drop it."
+        );
         assert_eq!(
             save_result(
                 &WriteOutcome::Unknown {

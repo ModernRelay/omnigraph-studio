@@ -15,7 +15,7 @@ pub use api::{CommitChanges, ErrorOutput};
 pub use client::{
     ApiErrorSummary, BlobAt, BlobCell, BlobMeta, CHANGE_READ_TIMEOUT, Challenge, FeedAt,
     ForwardRequest, ForwardResponse, GraphClient, HistoricalGap, MergePreview, NoAnswer,
-    PropertyThen, ReadError, ServerHealth, judge_write, server_root,
+    PropertyThen, ReadError, ServerHealth, Unauthorized, judge_write, server_root,
 };
 pub use http_client::{
     AsyncBody,
@@ -73,9 +73,28 @@ pub enum Answered<T> {
     Unknown { reason: String },
 }
 
-/// A refusal from the server: the HTTP status and the parsed `ErrorOutput` body.
+/// A refusal from the server: the HTTP status, the parsed `ErrorOutput` body, and what a 401
+/// says of the token the write carried.
 #[derive(Debug)]
 pub struct ApiError {
     pub status: u16,
     pub body: ErrorOutput,
+    /// What a 401 says of the token the write carried; `None` for any other status, and from
+    /// [`judge_write`], which sees no request.
+    pub unauthorized: Option<Unauthorized>,
+    /// The token the write carried was replaced before its answer came: a 401 says nothing of
+    /// the one held now.
+    pub token_replaced: bool,
+}
+
+impl ApiError {
+    /// Why the server refused the write, as a sentence: a 401's in Studio's words, which say
+    /// what became of the token (every write site says it alike), any other's as the server
+    /// put it.
+    pub fn reason(&self) -> &str {
+        match self.unauthorized {
+            Some(unauthorized) => unauthorized.reason(),
+            None => &self.body.error,
+        }
+    }
 }
