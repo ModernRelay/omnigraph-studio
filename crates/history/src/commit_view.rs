@@ -455,12 +455,7 @@ impl CommitView {
     /// alike, and leaves them. The changes stay as read; a read under way groups its own.
     fn regroup(&mut self, cx: &mut Context<Self>) {
         let schema = self.session.read(cx).schema_model();
-        let same = match (&self.schema, &schema) {
-            (Some(made), Some(current)) => Arc::ptr_eq(made, current) || made.same_as(current),
-            (None, None) => true,
-            _ => false,
-        };
-        if same {
+        if SchemaModel::same_held(self.schema.as_ref(), schema.as_ref()) {
             // A regroup under way is for a schema since gone.
             self._regroup_task = None;
             return;

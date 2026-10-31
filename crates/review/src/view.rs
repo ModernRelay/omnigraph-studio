@@ -451,14 +451,6 @@ fn revert_checks(
 
 /// Whether two schemas group and draw the cards alike: the same text, naming each type's nodes
 /// by the same property. A schema read again with the same text is the same one.
-fn same_schema(a: Option<&Arc<SchemaModel>>, b: Option<&Arc<SchemaModel>>) -> bool {
-    match (a, b) {
-        (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a.same_as(b),
-        (None, None) => true,
-        _ => false,
-    }
-}
-
 pub struct ReviewView {
     session: Entity<GraphSession>,
     branch: String,
@@ -810,6 +802,10 @@ impl ReviewView {
         self._names_task = None;
         self.preview = Preview::Unread;
         self._preview_task = None;
+        // A read under way is the old token's: landing, it would show its cards.
+        self._load_task = None;
+        self._slow_task = None;
+        self.reading_slowly = false;
         self.owe_read(cx);
     }
 
@@ -833,7 +829,7 @@ impl ReviewView {
         let schema = self.session.read(cx).schema_model();
         let shows_head = self.shows_head();
         let Some(data) = &self.data else { return };
-        if same_schema(data.schema.as_ref(), schema.as_ref()) {
+        if SchemaModel::same_held(data.schema.as_ref(), schema.as_ref()) {
             // Grouped as the session's schema groups: a regroup under way is for one since gone.
             self._regroup_task = None;
             return;
@@ -3592,7 +3588,8 @@ async fn fold_pages(
         match next {
             Some(next) if complete && fold.raw_changes() < REVIEW_CHANGE_CAP => token = Some(next),
             Some(_) => return Ok((fold, true)),
-            None => return Ok((fold, false)),
+            // A last page the cap cut is partial too, as the feed's fold says it.
+            None => return Ok((fold, !complete)),
         }
     }
 }
@@ -4289,6 +4286,78 @@ pub(crate) mod tests {
             mark_of(&change("p2", json!({"name": "Ada"}))),
             "another entity"
         );
+    }
+
+    /// A last page of changes past the cap is said partial, as the feed's fold says it: the cap
+    /// left changes out whether or not the server named a page after it. Before, the diff's
+    /// fold said such a review whole.
+    #[gpui::test]
+    async fn a_last_page_past_the_cap_is_partial(cx: &mut gpui::TestAppContext) {
+        let mut acx = cx.to_async();
+        let cause: ChangeCauseOutput = serde_json::from_value(json!({
+            "graph_commit_id": "c1", "authored_branch": "feature", "authored_at": 0
+        }))
+        .unwrap();
+        let change: graph_client::api::EntityChangeOutput = serde_json::from_value(json!({
+            "kind": "node", "type": { "id": "Person", "name": "Person" }, "id": "p", "op": "update"
+        }))
+        .unwrap();
+        let this = WeakEntity::<ReviewView>::new_invalid();
+        let (fold, partial) = fold_pages(
+            &this,
+            &mut acx,
+            async |_: Option<String>, _: u32, _: &mut AsyncApp| {
+                let changes = (0..=REVIEW_CHANGE_CAP)
+                    .map(|i| graph_client::api::EntityChangeOutput {
+                        id: format!("p{i}"),
+                        ..change.clone()
+                    })
+                    .collect();
+                let block = ChangeBlockOutput {
+                    cause: cause.clone(),
+                    changes,
+                };
+                Ok((block, None))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(fold.raw_changes(), REVIEW_CHANGE_CAP);
+        assert!(partial, "the cap left a change out");
+    }
+
+    /// A review behind another tab whose read is out when the token changes lets that read go:
+    /// it is the old token's, and nothing reads the review again until it is drawn. Before, the
+    /// read stayed, and landing showed the old token's cards, with Revert and Edit, until the
+    /// review was shown.
+    #[gpui::test]
+    async fn a_hidden_reviews_read_under_the_old_token_does_not_land(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _) = reviewed_server_writing(false, cx);
+        let (_blank, cx) = cx.add_window_view(|_, _| gpui::EmptyView);
+        let hidden = cx.update(|window, cx| {
+            let session = session.clone();
+            cx.new(|cx| ReviewView::new(session, "feature".into(), "main".into(), window, cx))
+        });
+        cx.run_until_parked();
+        // A Refresh's read is out under the old token when the token changes.
+        hidden.update(cx, |view, cx| view.reload(cx));
+        session.update(cx, |_, cx| cx.emit(SessionEvent::CredentialChanged));
+        cx.run_until_parked();
+        hidden.read_with(cx, |view, _| {
+            assert!(
+                view.data.is_none() && view.cards.is_empty(),
+                "no cards landed"
+            );
+            assert!(matches!(view.load, LoadState::Loading { .. }));
+            assert!(view.read_owed, "read again when drawn");
+            assert!(!view.reading_slowly);
+        });
     }
 
     /// A review not drawn (restored with the workspace behind another tab) reads no diff until
@@ -5798,7 +5867,10 @@ pub(crate) mod tests {
         cx.run_until_parked();
         let grouped_with = |view: &ReviewView| view.data.as_ref().unwrap().schema.clone();
         view.read_with(cx, |view, _| {
-            assert!(same_schema(grouped_with(view).as_ref(), Some(&loaded)));
+            assert!(SchemaModel::same_held(
+                grouped_with(view).as_ref(),
+                Some(&loaded)
+            ));
             let data = view.data.as_ref().unwrap();
             assert_eq!(data.groups, EntityGroups::new(&data.folded, Some(&*loaded)));
         });
@@ -5815,7 +5887,10 @@ pub(crate) mod tests {
             "the schema held, not compiled again"
         );
         view.read_with(cx, |view, _| {
-            assert!(same_schema(grouped_with(view).as_ref(), Some(&again)));
+            assert!(SchemaModel::same_held(
+                grouped_with(view).as_ref(),
+                Some(&again)
+            ));
             assert!(
                 Arc::ptr_eq(&grouped_with(view).unwrap(), &grouped),
                 "not grouped again"
