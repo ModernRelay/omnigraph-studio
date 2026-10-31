@@ -441,8 +441,9 @@ do instead. A CLI with E22 (Omnigraph #981) reports it as not started; an older 
 `effects: unknown`, so `AGENTS.md` says a Studio refusal never wrote anything. A request Studio
 never sends is refused the same way: one whose connection is retired (its CLI target gone, or a
 transport Studio cannot use) says to tell the person, and one Studio would not make as asked (a
-path that leaves the server's root) says to change it, or to tell the person. One whose server
-refused the connection is answered 503 `service_unavailable` instead, with
+path that leaves the server's root) says to change it, or to tell the person. One that never
+opened a connection to its server (refused, a name that does not resolve, a failed TLS
+handshake or proxy tunnel, a connect timeout) is answered 503 `service_unavailable` instead, with
 `disposition: {effects: none, action: retry}`, and says to try again once the server answers. A write to a target already retired is refused so
 before it is a card, as a rule's refusal is: the person is not asked about a write that cannot
 go. One whose target retires while the person decides keeps its card, which then reads "..., so

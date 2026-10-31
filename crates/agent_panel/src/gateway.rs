@@ -21,8 +21,8 @@ use futures_rustls::TlsAcceptor;
 use futures_rustls::rustls::ServerConfig;
 use graph_client::api::CommitKind;
 use graph_client::{
-    Answered, AsyncBody, CONTRACT, CONTRACT_HEADER, Challenge, ForwardRequest, ForwardResponse,
-    GraphClient, HeaderMap, Method, NoAnswer, StatusCode,
+    Answered, AsyncBody, CONTRACT, CONTRACT_HEADER, ForwardRequest, ForwardResponse, GraphClient,
+    HeaderMap, Method, NoAnswer, StatusCode, Unauthorized,
 };
 use serde::Deserialize as _;
 use serde_json::{Value, json};
@@ -135,10 +135,10 @@ pub enum GatewayEvent {
     /// The CLI stopped waiting before the write was decided (its command timed out or was
     /// stopped): nothing was sent, and nothing will be.
     Abandoned { id: u64 },
-    /// A request the gateway forwarded with Studio's token was answered 401, with this
-    /// challenge: the session asks for the next token as for its own requests
-    /// ([`graph_store::GraphSession::token_refused`]).
-    TokenRefused { challenge: Option<Box<Challenge>> },
+    /// The server refused the token a request the gateway forwarded carried (a 401 that
+    /// refused it, [`Unauthorized::TokenRefused`]): the session asks for the next token as for
+    /// its own requests ([`graph_store::GraphSession::token_refused`]).
+    TokenRefused,
 }
 
 /// What records an approved write's outcome. It is called once, with the outcome, however the
@@ -602,10 +602,11 @@ enum Undecided {
     Stopped,
 }
 
-/// Sends `request` on with Studio's token, and says a 401 the server gives it
-/// ([`GatewayEvent::TokenRefused`]; one without the contract header came from something in
-/// between), so the token is asked for again as for Studio's own requests: an agent working
-/// while no window reads would otherwise be refused until one did.
+/// Sends `request` on with Studio's token, and says the server refusing that token
+/// ([`GatewayEvent::TokenRefused`]; a 401 without the contract header came from something in
+/// between, and one that refused no token, one that never arrived, would refuse the next
+/// alike), so the token is asked for again as for Studio's own requests: an agent working while
+/// no window reads would otherwise be refused until one did.
 async fn forward(
     client: &GraphClient,
     events: &mpsc::UnboundedSender<GatewayEvent>,
@@ -613,7 +614,7 @@ async fn forward(
 ) -> Result<ForwardResponse, NoAnswer> {
     let response = client.forward(request).await;
     if let Ok(response) = &response
-        && response.status == StatusCode::UNAUTHORIZED
+        && response.unauthorized == Some(Unauthorized::TokenRefused)
         && !response.token_replaced
         && graph_client::speaks_contract(
             response
@@ -622,10 +623,7 @@ async fn forward(
                 .and_then(|value| value.to_str().ok()),
         )
     {
-        let challenge = Challenge::bearer(&response.headers).map(Box::new);
-        events
-            .unbounded_send(GatewayEvent::TokenRefused { challenge })
-            .ok();
+        events.unbounded_send(GatewayEvent::TokenRefused).ok();
     }
     response
 }
@@ -1661,32 +1659,43 @@ mod tests {
         });
     }
 
-    /// A request the gateway forwards with Studio's token and the server answers 401 is said to
-    /// the panel with its challenge, so the token is asked for again as for Studio's own
-    /// requests; any other answer says nothing. Before, the gateway said nothing, and an agent
+    /// A request the gateway forwards with Studio's token that the server refuses for it (a 401
+    /// with `error="invalid_token"`) is said to the panel, so the token is asked for again as
+    /// for Studio's own requests; any other answer says nothing, a 401 that refused no token
+    /// (the one sent never arrived) included. Before, the gateway said nothing, and an agent
     /// working while no window read was refused once the token lapsed, until a window did.
     #[test]
-    fn a_forwarded_401_is_said_with_its_challenge() {
-        let answering = |status: u16, server: bool| {
+    fn a_forwarded_401_refusing_the_token_is_said() {
+        let answering = |status: u16, server: bool, refused: bool| {
             FakeHttpClient::create(move |_| async move {
                 let mut response = Response::builder().status(status);
                 if server {
                     response = response.header(CONTRACT_HEADER, CONTRACT);
                 }
                 if status == 401 {
-                    response =
-                        response.header("www-authenticate", r#"Bearer error="invalid_token""#);
+                    let challenge = if refused {
+                        r#"Bearer error="invalid_token""#
+                    } else {
+                        "Bearer"
+                    };
+                    response = response.header("www-authenticate", challenge);
                 }
                 Ok(response.body(AsyncBody::from("{}")).unwrap())
             })
         };
         smol::block_on(async {
-            // A 401 the server sent, one from something in between, and an answer.
-            for (status, server) in [(401, true), (401, false), (200, true)] {
+            // A 401 the server sent refusing the token, one that found none, one from something
+            // in between, and an answer.
+            for (status, server, refused) in [
+                (401, true, true),
+                (401, true, false),
+                (401, false, true),
+                (200, true, false),
+            ] {
                 let client = GraphClient::new(
                     "http://127.0.0.1:8787",
                     Some("person-token".into()),
-                    answering(status, server),
+                    answering(status, server, refused),
                 )
                 .unwrap();
                 let (events_tx, mut events) = mpsc::unbounded();
@@ -1703,16 +1712,12 @@ mod tests {
                 );
                 drop(events_tx);
                 let said = events.next().await;
-                if status == 401 && server {
-                    assert!(matches!(
-                        said,
-                        Some(GatewayEvent::TokenRefused { challenge: Some(challenge) })
-                            if challenge.token_refused()
-                    ));
+                if status == 401 && server && refused {
+                    assert!(matches!(said, Some(GatewayEvent::TokenRefused)));
                 } else {
                     assert!(
                         said.is_none(),
-                        "a {status} (the server's: {server}) said nothing"
+                        "a {status} (the server's: {server}, refusing: {refused}) said nothing"
                     );
                 }
             }
@@ -1821,6 +1826,7 @@ mod tests {
                 headers,
                 body: AsyncBody::from(body.to_owned()),
                 token_replaced: false,
+                unauthorized: None,
             };
             smol::block_on(super::read_write_answer(Ok(response), kind)).0
         };
@@ -2031,6 +2037,7 @@ mod tests {
                 headers: HeaderMap::new(),
                 body: AsyncBody::from_reader(body),
                 token_replaced: false,
+                unauthorized: None,
             };
             stream_back(&mut stream, "POST", Ok(response)).await;
             drop(stream);
@@ -2711,7 +2718,7 @@ mod end_to_end {
                             })))
                             .ok();
                     }
-                    GatewayEvent::Abandoned { .. } | GatewayEvent::TokenRefused { .. } => {}
+                    GatewayEvent::Abandoned { .. } | GatewayEvent::TokenRefused => {}
                 }
             }
         });

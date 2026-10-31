@@ -8,6 +8,7 @@ use gpui::{
     App, Context, DismissEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Render,
     ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window,
 };
+use graph_client::Unauthorized;
 use graph_store::cli_config::{self, Platform};
 use graph_store::sign_in::{Kept, SignIn, left_in_keychain};
 use graph_store::{
@@ -1052,15 +1053,14 @@ fn state_status(c: &Connection) -> String {
         (ConnectionState::Unauthorized, Some(reason)) => {
             format!("The Omnigraph CLI gave no token for this server: {reason}")
         }
+        // As a read or a write says it.
         (ConnectionState::Unauthorized, None) if c.token_not_received() => {
-            "The server received no token, though Studio sent one: something between them may \
-             drop it."
-                .into()
+            Unauthorized::TokenNotReceived.reason().into()
         }
         (ConnectionState::Unauthorized, None) if !c.refused_with_token => {
-            "This server asks for a token; none is configured for it.".into()
+            Unauthorized::TokenNeeded.reason().into()
         }
-        (ConnectionState::Unauthorized, None) => "The server refused the token.".into(),
+        (ConnectionState::Unauthorized, None) => Unauthorized::TokenRefused.reason().into(),
         (state, _) => state.label(),
     }
 }

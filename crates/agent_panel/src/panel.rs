@@ -2089,9 +2089,9 @@ impl AgentPanel {
     fn apply_gateway(&mut self, event: GatewayEvent, cx: &mut Context<Self>) {
         match event {
             GatewayEvent::Write { id, write, decide } => self.gateway_write(id, write, decide, cx),
-            GatewayEvent::TokenRefused { challenge } => self.session.update(cx, |session, cx| {
-                session.token_refused(challenge.as_deref(), cx)
-            }),
+            GatewayEvent::TokenRefused => self
+                .session
+                .update(cx, |session, cx| session.token_refused(cx)),
             GatewayEvent::Abandoned { id } => {
                 if let Some(card) = self.gateway_cards.remove(&id) {
                     self.set_write_state(

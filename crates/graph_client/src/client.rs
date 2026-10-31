@@ -88,6 +88,8 @@ pub struct ApiErrorSummary {
     /// The `Bearer` challenge a 401 carried (`WWW-Authenticate`), which a server sends with
     /// every 401 since Omnigraph #1122; `None` otherwise, and from an older server.
     pub challenge: Option<Box<Challenge>>,
+    /// What a 401 says of the token the read carried; `None` for any other status.
+    pub unauthorized: Option<Unauthorized>,
 }
 
 /// A `WWW-Authenticate` challenge: its scheme and its parameters, as RFC 9110 §11.6.1 writes
@@ -216,7 +218,7 @@ impl Challenge {
     }
 
     /// The `Bearer` challenge among a response's `WWW-Authenticate` values, if any.
-    pub fn bearer(headers: &HeaderMap) -> Option<Challenge> {
+    fn bearer(headers: &HeaderMap) -> Option<Challenge> {
         headers
             .get_all(http_client::http::header::WWW_AUTHENTICATE)
             .iter()
@@ -224,6 +226,53 @@ impl Challenge {
             .flat_map(Challenge::parse_all)
             .find(|challenge| challenge.scheme.eq_ignore_ascii_case("bearer"))
     }
+}
+
+/// What a 401 says of the token its request carried, judged from its `Bearer` challenge and
+/// whether the request carried one ([`Challenge::refuses`]). A read's, a write's and the agent's
+/// 401 are judged, and said, alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unauthorized {
+    /// The server refused the token it received: it may have lapsed, or not admit this account.
+    TokenRefused,
+    /// A token was sent but the server received none: something between them dropped it, and
+    /// would drop another alike.
+    TokenNotReceived,
+    /// No token was sent, and the server asks for one.
+    TokenNeeded,
+}
+
+impl Unauthorized {
+    /// The judgement of a 401 whose challenge is `challenge`, to a request that carried a token
+    /// when `sent`.
+    pub fn judge(challenge: Option<&Challenge>, sent: bool) -> Self {
+        if Challenge::refuses(challenge, sent) {
+            Self::TokenRefused
+        } else if sent {
+            Self::TokenNotReceived
+        } else {
+            Self::TokenNeeded
+        }
+    }
+
+    /// The judgement as Studio says it, one sentence.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::TokenRefused => "The server refused the token.",
+            Self::TokenNotReceived => {
+                "The server received no token, though Studio sent one: something between them \
+                 may drop it."
+            }
+            Self::TokenNeeded => "This server asks for a token; none is configured for it.",
+        }
+    }
+}
+
+/// A 401's judgement ([`Unauthorized`]), from the response and the token its request carried;
+/// `None` for any other status.
+fn unauthorized_of(status: StatusCode, headers: &HeaderMap, carried: bool) -> Option<Unauthorized> {
+    (status == StatusCode::UNAUTHORIZED)
+        .then(|| Unauthorized::judge(Challenge::bearer(headers).as_ref(), carried))
 }
 
 /// What a read at a commit was refused for because the commit predates the current schema: a
@@ -646,6 +695,8 @@ pub struct ForwardResponse {
     /// The token the request carried was replaced before its answer came: a 401 says nothing of
     /// the one held now.
     pub token_replaced: bool,
+    /// What a 401 says of the token the request carried; `None` for any other status.
+    pub unauthorized: Option<Unauthorized>,
 }
 
 impl GraphClient {
@@ -1524,6 +1575,7 @@ impl GraphClient {
                     diagnostic: None,
                     change_diff_refusal: None,
                     challenge: None,
+                    unauthorized: None,
                 }))
             }
             _ => Err(refusal(&raw)),
@@ -1657,6 +1709,7 @@ impl GraphClient {
         self.note_answer(&url, &carried, response.status(), contract);
         Ok(ForwardResponse {
             status: response.status(),
+            unauthorized: unauthorized_of(response.status(), response.headers(), carried.is_some()),
             headers: response.headers().clone(),
             token_replaced: carried != self.token(),
             body: response.into_body(),
@@ -2091,18 +2144,15 @@ fn refusal(raw: &RawResponse) -> ReadError {
     }
 }
 
-/// A 401's `Bearer` challenge, which says whether it refused the token the request carried.
-fn unauthorized_challenge(raw: &RawResponse) -> Option<Box<Challenge>> {
-    (raw.status == StatusCode::UNAUTHORIZED)
-        .then(|| Challenge::bearer(&raw.headers))
-        .flatten()
-        .map(Box::new)
-}
-
-/// A refusal's summary: its body, and a 401's challenge.
+/// A refusal's summary: its body, and a 401's challenge and what it says of the token the read
+/// carried.
 fn summary(raw: &RawResponse) -> ApiErrorSummary {
     let status = raw.status;
-    let challenge = unauthorized_challenge(raw);
+    let challenge = (status == StatusCode::UNAUTHORIZED)
+        .then(|| Challenge::bearer(&raw.headers))
+        .flatten()
+        .map(Box::new);
+    let unauthorized = unauthorized_of(status, &raw.headers, raw.carried.is_some());
     match serde_json::from_slice::<ErrorOutput>(&raw.body) {
         Ok(error) => ApiErrorSummary {
             status: status.as_u16(),
@@ -2111,6 +2161,7 @@ fn summary(raw: &RawResponse) -> ApiErrorSummary {
             diagnostic: error.diagnostic,
             change_diff_refusal: error.change_diff_refusal.map(Box::new),
             challenge,
+            unauthorized,
         },
         Err(_) => ApiErrorSummary {
             status: status.as_u16(),
@@ -2122,6 +2173,7 @@ fn summary(raw: &RawResponse) -> ApiErrorSummary {
             diagnostic: None,
             change_diff_refusal: None,
             challenge,
+            unauthorized,
         },
     }
 }
@@ -2169,7 +2221,7 @@ pub fn judge_write<'a>(
             Some(DispositionEffects::None) => Answered::Refused(ApiError {
                 status: status.as_u16(),
                 body,
-                challenge: None,
+                unauthorized: None,
                 token_replaced: false,
             }),
             Some(DispositionEffects::Unknown | DispositionEffects::Partial) => Answered::Unknown {
@@ -2216,7 +2268,7 @@ fn classify_write<T: DeserializeOwned>(raw: RawResponse) -> WriteOutcome<T> {
             },
         },
         Answered::Refused(error) => WriteOutcome::Refused(ApiError {
-            challenge: unauthorized_challenge(&raw),
+            unauthorized: unauthorized_of(raw.status, &raw.headers, raw.carried.is_some()),
             ..error
         }),
         Answered::Unknown { reason } => WriteOutcome::Unknown { reason },
@@ -2224,15 +2276,31 @@ fn classify_write<T: DeserializeOwned>(raw: RawResponse) -> WriteOutcome<T> {
 }
 
 /// Why a request the transport failed has no answer, by the error's kind and never its words:
-/// a connection the server refused carried no request ([`NoAnswer::Unreached`]); any other
-/// failure may have come after the request went out ([`NoAnswer::Lost`]).
+/// one that never opened a connection carried no request ([`NoAnswer::Unreached`],
+/// [`never_connected`]); any other failure may have come after the request went out
+/// ([`NoAnswer::Lost`]).
 fn unanswered_by_transport(error: &anyhow::Error) -> NoAnswer {
     let why = describe_transport(error);
-    if connection_refused(error) {
+    if never_connected(error) {
         NoAnswer::Unreached(why)
     } else {
         NoAnswer::Lost(why)
     }
+}
+
+/// Whether the request failed before a connection to the server opened, by the error's kind:
+/// reqwest's transport could not connect (`is_connect`: the name did not resolve, the server
+/// refused the connection or did not answer it within the connect timeout, the TLS handshake
+/// or a proxy's tunnel failed), or an io `ConnectionRefused` is anywhere in its chain (from
+/// another transport). A request goes out only on a connection that opened, so none of these
+/// sent it; a failure on one that did, a pooled one reused included, may come after it went.
+fn never_connected(error: &anyhow::Error) -> bool {
+    connection_refused(error)
+        || error.chain().any(|layer| {
+            layer
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_connect)
+        })
 }
 
 /// Whether the server refused the connection, by the error's kind: an io `ConnectionRefused`
@@ -3454,6 +3522,81 @@ mod tests {
         assert!(block_on(client.forward(request)).is_ok_and(|response| response.token_replaced));
     }
 
+    /// A 401 says what became of the token its request carried, from its challenge and whether
+    /// it carried one, alike for a read, a write and a forwarded request: refused
+    /// (`invalid_token`), never received (a bare `Bearer` though one was sent: a proxy dropped
+    /// it), or none sent. A write's reason says it in Studio's words; any other refusal keeps
+    /// the server's. Before, a read's hint said every 401 refused the token, and a write's said
+    /// the server's text.
+    #[test]
+    fn a_401_says_what_became_of_the_token() {
+        let answering = |status: u16, challenge: &'static str| {
+            FakeHttpClient::create(move |_| async move {
+                Ok(Response::builder()
+                    .status(status)
+                    .header(CONTRACT_HEADER, CONTRACT)
+                    .header("www-authenticate", challenge)
+                    .body(AsyncBody::from(
+                        r#"{"error":"server words","code":"unauthorized","disposition":{"execution":"not_started","effects":"none","action":"fix"}}"#,
+                    ))
+                    .unwrap())
+            })
+        };
+        let judged = |token: Option<&str>, status: u16, challenge: &'static str| {
+            let client = GraphClient::new(
+                "http://127.0.0.1:8787",
+                token.map(str::to_owned),
+                answering(status, challenge),
+            )
+            .unwrap();
+            let read = match block_on(client.schema("g")) {
+                Err(ReadError::Refused(summary)) => summary.unauthorized,
+                other => panic!("{other:?}"),
+            };
+            let WriteOutcome::Refused(write) =
+                block_on(client.mutate("g", &ChangeRequest::default(), None))
+            else {
+                panic!("the write was not refused");
+            };
+            let request = ForwardRequest {
+                method: Method::GET,
+                path_and_query: "graphs/g/schema".into(),
+                headers: Vec::new(),
+                body: AsyncBody::empty(),
+            };
+            let forwarded = block_on(client.forward(request)).unwrap().unauthorized;
+            assert_eq!(write.unauthorized, read);
+            assert_eq!(forwarded, read);
+            let reason = write.reason().to_owned();
+            (read, reason)
+        };
+        let refused = r#"Bearer error="invalid_token""#;
+        assert_eq!(
+            judged(Some("t"), 401, refused),
+            (
+                Some(Unauthorized::TokenRefused),
+                Unauthorized::TokenRefused.reason().to_owned()
+            )
+        );
+        assert_eq!(
+            judged(Some("t"), 401, "Bearer").0,
+            Some(Unauthorized::TokenNotReceived)
+        );
+        assert_eq!(
+            judged(None, 401, "Bearer").0,
+            Some(Unauthorized::TokenNeeded)
+        );
+        // From a server that sends no challenge, a 401 to a token sent refused it.
+        assert_eq!(
+            judged(Some("t"), 401, "Basic").0,
+            Some(Unauthorized::TokenRefused)
+        );
+        assert_eq!(
+            judged(Some("t"), 403, refused),
+            (None, "server words".to_owned())
+        );
+    }
+
     /// A write whose connection the server refused was never sent, and says so: nothing was
     /// written. One whose connection failed otherwise (reset) may have landed after it went out,
     /// and so may one whose failure only says "connection refused" in words: the error's kind
@@ -3496,6 +3639,65 @@ mod tests {
         assert!(matches!(
             write(failing(None)),
             WriteOutcome::Unknown { reason } if reason == "connection refused, in words alone"
+        ));
+    }
+
+    /// Through the transport Studio sends with, every write that never opened a connection was
+    /// never sent, whatever stopped it: a name that does not resolve, a refused connection, a
+    /// TLS handshake that fails. One whose connection opened and closed after it went out may
+    /// have landed. Before, only a refused connection said it was not sent.
+    #[test]
+    fn a_write_that_never_connected_is_not_sent() {
+        use std::io::{Read as _, Write as _};
+        let http: Arc<dyn HttpClient> =
+            Arc::new(reqwest_client::ReqwestClient::user_agent("studio-test").unwrap());
+        let write = |base: &str| {
+            let client = GraphClient::new(base, Some("t".into()), http.clone()).unwrap();
+            block_on(client.mutate("g", &ChangeRequest::default(), None))
+        };
+        // `.invalid` never resolves (RFC 6761).
+        assert!(matches!(
+            write("http://studio-test.invalid"),
+            WriteOutcome::NotSent { .. }
+        ));
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        assert!(matches!(
+            write(&format!("http://127.0.0.1:{port}")),
+            WriteOutcome::NotSent { reason } if reason == "the connection was refused"
+        ));
+        // A listener that answers a TLS hello in plain HTTP: the handshake fails.
+        let plain = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = plain.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut hello = [0; 512];
+            if let Ok((mut stream, _)) = plain.accept()
+                && stream.read(&mut hello).is_ok_and(|read| read > 0)
+            {
+                stream
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n")
+                    .ok();
+            }
+        });
+        assert!(matches!(
+            write(&format!("https://127.0.0.1:{port}")),
+            WriteOutcome::NotSent { .. }
+        ));
+        // A server that reads the write, then closes without answering.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = silent.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut request = [0; 4096];
+            if let Ok((mut stream, _)) = silent.accept()
+                && stream.read(&mut request).is_ok_and(|read| read > 0)
+            {
+                drop(stream);
+            }
+        });
+        assert!(matches!(
+            write(&format!("http://127.0.0.1:{port}")),
+            WriteOutcome::Unknown { .. }
         ));
     }
 
@@ -4158,6 +4360,7 @@ mod tests {
                 diagnostic: None,
                 change_diff_refusal: None,
                 challenge: None,
+                unauthorized: None,
             }
             .historical_gap()
         };
