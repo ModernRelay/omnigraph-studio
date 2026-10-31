@@ -35,8 +35,8 @@ pub use changes::{
     REVIEW_CHANGE_CAP, TypeCounts, contains_merge_of, summary_sentence,
 };
 pub use connection::{
-    Connection, ConnectionEvent, ConnectionState, ConnectionWatch, GraphListing, PromptAction,
-    ServerEntry, ServerSource, SignInPrompt,
+    Connection, ConnectionEvent, ConnectionState, ConnectionWatch, GraphListing, HeldRefusal,
+    PromptAction, ServerEntry, ServerSource, SignInPrompt,
 };
 pub use degrees::page_counts;
 pub use entity_groups::{

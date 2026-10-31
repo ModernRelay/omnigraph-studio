@@ -22,13 +22,13 @@ use graph_client::api::{
 };
 use graph_client::{
     ApiErrorSummary, BlobAt, BlobCell, BlobMeta, CommitChanges, FeedAt, GraphClient, ReadError,
-    ServerHealth, WriteOutcome,
+    ServerHealth, Unauthorized, WriteOutcome,
 };
 use serde_json::Value;
 
 use crate::access::{Access, AccessScope, Allowed};
 use crate::carry::{ChangeLog, ChangesSince, FeedFold, Since, answer_unchanged};
-use crate::connection::{Connection, ConnectionEvent, ConnectionWatch};
+use crate::connection::{Connection, ConnectionEvent, ConnectionState, ConnectionWatch};
 use crate::degrees::{DEGREE_BATCH, DegreeBatchKey, DegreeBatches, page_counts};
 use crate::memo::{Held, Memo};
 use crate::scope::{ReadScope, Scope, ScopeSince};
@@ -260,7 +260,9 @@ pub enum SessionEvent {
     AccessChanged,
     /// The connection's token changed, and the session reads under the new one: a view that
     /// shows what it read of the server itself (the storage inspector) reads it again, since
-    /// the new token may see less. A parked graph says so when shown again.
+    /// the new token may see less. Said too when the connection is ready again with the token
+    /// a read was refused under, which is read again alike. A parked graph says so when shown
+    /// again.
     CredentialChanged,
 }
 
@@ -823,6 +825,12 @@ pub struct GraphSession {
     /// A new token came while the graph was parked: its counts, catalog and branch list are
     /// read under it when shown again ([`Self::read_again_for_credential`]).
     credential_owed: bool,
+    /// A read was answered 401 under the token held, which nothing reads again unless the token
+    /// changes: the connection ready again with that token reads it
+    /// ([`Self::connection_state_changed`]).
+    read_refused: bool,
+    /// Whether the connection was ready when last heard from.
+    connection_ready: bool,
     /// What the credential may do was forgotten while parked: it is read when shown again.
     access_owed: bool,
     _connection_watch: Option<ConnectionWatch>,
@@ -936,10 +944,13 @@ impl GraphSession {
             branch_lists_sent: 0,
             branch_list_taken: 0,
             credential_owed: false,
+            read_refused: false,
+            connection_ready: false,
             access_owed: false,
             _connection_watch: None,
         };
         session.credential = session.client(cx).credential_changes();
+        session.connection_ready = session.connection.read(cx).state == ConnectionState::Ready;
         session._connection_events = Some(cx.subscribe(
             &session.connection,
             |this, _, event: &ConnectionEvent, cx| match event {
@@ -947,7 +958,7 @@ impl GraphSession {
                     this.sync_access(cx);
                 }
                 ConnectionEvent::TokenReady => this.open_when_ready(cx),
-                ConnectionEvent::StateChanged => {}
+                ConnectionEvent::StateChanged => this.connection_state_changed(cx),
             },
         ));
         session.labels = session.chosen_labels(cx);
@@ -1042,6 +1053,7 @@ impl GraphSession {
         let credential = client.credential_changes();
         if credential != self.credential {
             self.credential = credential;
+            self.read_refused = false;
             self.forget_reads();
             self.read_again_for_credential(cx);
         }
@@ -1094,8 +1106,9 @@ impl GraphSession {
         self.whole_commit_pages.clear();
     }
 
-    /// Reads again, under a new token, what the session shows of the graph as the old one was
-    /// answered it: the type counts, the stored-query catalog (once wanted) and the branch
+    /// Reads again, under a new token (or the token held, once the connection is ready again
+    /// after a 401 refused reads under it), what the session shows of the graph as the old one
+    /// was answered it: the type counts, the stored-query catalog (once wanted) and the branch
     /// list; and every read a 401 could have refused under the old one: the schema, when none
     /// is held. The new token's policy may refuse it what the old one read, so none of it shows
     /// meanwhile: each is being read, and views hear it, and [`SessionEvent::CredentialChanged`]
@@ -1207,14 +1220,10 @@ impl GraphSession {
                 }
             }
             Err(ReadError::Transport(_)) => {}
-            // The token may have lapsed: the connection asks its source again, once for it. A 401
-            // that refused no token (one that never arrived, as a proxy drops it) asks nothing:
-            // the next token would fare no better.
             Err(ReadError::Refused(error)) if error.status == 401 => {
-                let sent = self.connection.read(cx).has_token();
-                if graph_client::Challenge::refuses(error.challenge.as_deref(), sent) {
-                    self.connection
-                        .update(cx, |connection, cx| connection.read_refused(cx));
+                self.read_refused = true;
+                if error.unauthorized == Some(Unauthorized::TokenRefused) {
+                    self.token_refused(cx);
                 }
             }
             _ => {
@@ -1226,11 +1235,6 @@ impl GraphSession {
                     if self.shown {
                         self.check_heads(cx);
                     }
-                }
-                // The token was taken: should it lapse later, its refusal asks the source again.
-                if self.connection.read(cx).read_refusal_noted() {
-                    self.connection
-                        .update(cx, |connection, _| connection.read_taken());
                 }
                 // The policy may allow less than was read: the client counted the refusal, and
                 // what the credential may do is read again, as after a refused write.
@@ -2501,6 +2505,34 @@ impl GraphSession {
         self.reload(cx);
         let branch = AccessScope::branch(&self.branch);
         self.read_access(branch, cx);
+    }
+
+    /// The server refused the token a request of this graph carried (a read, a write, or the
+    /// agent's through its gateway; [`Unauthorized::TokenRefused`]): it may have lapsed, so the
+    /// connection asks its source again, once for the token held
+    /// ([`Connection::request_refused`]). A 401 that refused no token (one that never arrived, as
+    /// a proxy drops it) is not told here: the next token would fare no better.
+    pub fn token_refused(&mut self, cx: &mut Context<Self>) {
+        self.connection
+            .update(cx, |connection, cx| connection.request_refused(cx));
+    }
+
+    /// The connection's state moved. Ready again with the token a read was refused under (one
+    /// that never arrived, put right and Retried; a refused one given back): what the session
+    /// shows is read again, as under a new token ([`Self::read_again_for_credential`]), since
+    /// nothing else reads what the 401 refused and each view's failure would stand until its own
+    /// Try again. A new token reads it all again itself ([`Self::sync_access`]).
+    fn connection_state_changed(&mut self, cx: &mut Context<Self>) {
+        let ready = self.connection.read(cx).state == ConnectionState::Ready;
+        let was_ready = std::mem::replace(&mut self.connection_ready, ready);
+        if ready
+            && !was_ready
+            && self.read_refused
+            && self.client(cx).credential_changes() == self.credential
+        {
+            self.read_refused = false;
+            self.read_again_for_credential(cx);
+        }
     }
 
     /// Whether a window shows the graph ([`Self::set_shown`]).
@@ -4225,6 +4257,14 @@ impl GraphSession {
             let kind = outcome_kind(&outcome, commit);
             let parent = parent_of(&outcome, commit);
             this.update(cx, |this, cx| {
+                // Refused for its token: asked for the next as for a read, though the write is
+                // not sent again.
+                if let WriteOutcome::Refused(error) = &outcome
+                    && error.unauthorized == Some(Unauthorized::TokenRefused)
+                    && !error.token_replaced
+                {
+                    this.token_refused(cx);
+                }
                 let log = log(this, &outcome, cx);
                 this.finish_write(log, kind, parent, cx);
                 after(this, &outcome, cx);
@@ -4269,7 +4309,7 @@ fn outcome_kind<T>(
             commit(value).map(|commit| (commit.graph_commit_id.clone(), commit.kind)),
         ),
         WriteOutcome::Refused(error) => OutcomeKind::Refused {
-            message: error.body.error.clone(),
+            message: error.reason().to_owned(),
         },
         WriteOutcome::NotSent { reason } => OutcomeKind::Refused {
             message: nothing_sent(reason),
@@ -7537,7 +7577,9 @@ mod tests {
                 } else if token != accepted {
                     (
                         401,
-                        json!({ "error": "unauthorized", "code": "unauthorized" }),
+                        json!({ "error": "unauthorized", "code": "unauthorized",
+                            "disposition": { "execution": "not_started", "effects": "none",
+                                "action": "fix" } }),
                     )
                 } else {
                     let body = match read.as_str() {
@@ -7667,6 +7709,209 @@ mod tests {
         *accepted.lock().unwrap() = DROPPED;
         session.update(cx, |session, cx| session.reload(cx));
         cx.run_until_parked();
+        assert_eq!(asked(), 3, "a token that never arrived asks nothing");
+    }
+
+    /// A graph whose reads were refused because its token never arrived (a proxy dropped it)
+    /// reads them again once the connection is ready again with that token: put right, then
+    /// Retried. The token did not change, so before nothing read them, and each failure stood
+    /// until its own Try again.
+    #[gpui::test]
+    async fn reads_refused_before_the_connection_is_ready_again_are_read_again(
+        cx: &mut TestAppContext,
+    ) {
+        /// Gives `t1` whenever asked.
+        struct Same;
+        impl TokenSource for Same {
+            fn token(
+                &self,
+                _: Arc<AtomicBool>,
+            ) -> futures::future::BoxFuture<'static, Result<Token, NoToken>> {
+                async { Ok(Token::new("t1")) }.boxed()
+            }
+        }
+        let accepted = Arc::new(std::sync::Mutex::new(DROPPED));
+        let (http, _) = answers_alone(accepted.clone());
+        let server = ServerEntry {
+            name: "personal".into(),
+            url: "https://graph.test".into(),
+            source: ServerSource::Cli,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| {
+            Connection::new(server, None, http)
+                .unwrap()
+                .with_token_source(Some(Arc::new(Same)))
+        });
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        let session =
+            cx.update(|cx| open_session(connection.clone(), "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        connection.read_with(cx, |connection, _| assert!(connection.token_not_received()));
+        let schema_loaded = |cx: &mut TestAppContext| {
+            session.read_with(cx, |session, _| {
+                matches!(session.schema, Loadable::Loaded(_))
+            })
+        };
+        assert!(!schema_loaded(cx), "refused while the token is dropped");
+
+        // Put right, then Retry.
+        *accepted.lock().unwrap() = "t1";
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        cx.run_until_parked();
+        connection.read_with(cx, |connection, _| {
+            assert_eq!(connection.state, ConnectionState::Ready)
+        });
+        assert!(schema_loaded(cx), "read again once the connection is ready");
+    }
+
+    /// A write refused for its token asks the source again, as a read does (spec 016, 401 and
+    /// 403), and is not sent again; once the server takes a write with the next token, its lapse
+    /// in turn asks again, though no read took it; one whose token never arrived asks
+    /// nothing. Before, only a read's 401 asked, and only a read taken let the next lapse ask,
+    /// so once a token lapsed writes and the agent's requests were refused until a read
+    /// happened to notice.
+    #[gpui::test]
+    async fn a_write_refused_for_its_token_asks_the_source_again(cx: &mut TestAppContext) {
+        /// Gives `t1`, `t2`, `t3` in turn, then `t3` again.
+        #[derive(Default)]
+        struct Counted(std::sync::Mutex<usize>);
+        impl TokenSource for Counted {
+            fn token(
+                &self,
+                _: Arc<AtomicBool>,
+            ) -> futures::future::BoxFuture<'static, Result<Token, NoToken>> {
+                let mut asked = self.0.lock().unwrap();
+                *asked += 1;
+                let token = ["t1", "t2", "t3"][(*asked - 1).min(2)];
+                async move { Ok(Token::new(token)) }.boxed()
+            }
+        }
+        // A write is refused for any token but `accepted`, as Omnigraph refuses one
+        // (`invalid_token` for a token received, a bare `Bearer` for none), and taken for it. A
+        // graph's read (the branch list a write reads after it) is answered 404, which takes no
+        // token and refuses none: only a write can ask, and only a write taken ends the one
+        // more try.
+        let accepted = Arc::new(std::sync::Mutex::new("t1"));
+        let accepts = accepted.clone();
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sent = writes.clone();
+        let http = FakeHttpClient::create(move |request| {
+            use serde_json::json;
+            let write = request.method() == http_client::http::Method::POST;
+            if write {
+                sent.fetch_add(1, Ordering::SeqCst);
+            }
+            let path = request.uri().path().to_owned();
+            let accepted = *accepts.lock().unwrap();
+            let token = if accepted == DROPPED {
+                String::new()
+            } else {
+                request
+                    .headers()
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            let accepted = format!("Bearer {accepted}");
+            async move {
+                let mut response = Response::builder()
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT);
+                let body = if write && token != accepted {
+                    response = response.status(401).header(
+                        "www-authenticate",
+                        if token.is_empty() {
+                            "Bearer"
+                        } else {
+                            r#"Bearer error="invalid_token""#
+                        },
+                    );
+                    json!({ "error": "unauthorized", "code": "unauthorized",
+                        "disposition": { "execution": "not_started", "effects": "none",
+                            "action": "fix" } })
+                } else if path.ends_with("/healthz") {
+                    json!({ "status": "ok", "version": "0.14.0", "internal_schema_version": 16 })
+                } else if path.ends_with("/graphs") {
+                    json!({ "graphs": [] })
+                } else if write {
+                    json!({ "branches": ["main"] })
+                } else {
+                    response = response.status(404);
+                    json!({ "error": "not found", "code": "not_found" })
+                };
+                Ok(response.body(AsyncBody::from(body.to_string())).unwrap())
+            }
+        });
+        let source = Arc::new(Counted::default());
+        let asked = || *source.0.lock().unwrap();
+        let server = ServerEntry {
+            name: "personal".into(),
+            url: "https://graph.test".into(),
+            source: ServerSource::Cli,
+            known_graphs: Vec::new(),
+        };
+        let held: Arc<dyn TokenSource> = source.clone();
+        let connection = cx.new(|_| {
+            Connection::new(server, None, http)
+                .unwrap()
+                .with_token_source(Some(held))
+        });
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        // Behind its window, so it reads nothing of its own accord.
+        let session = cx.update(|cx| {
+            open_session_behind(connection.clone(), "knowledge".into(), "main".into(), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(asked(), 1);
+
+        // `t1` lapses: the write is refused for it, and the source is asked again.
+        *accepted.lock().unwrap() = "t2";
+        let write = session.update(cx, |session, cx| {
+            session.create_branch("x".into(), BranchStart::Head("main".into()), cx)
+        });
+        cx.run_until_parked();
+        assert!(matches!(
+            write.await,
+            WriteOutcome::Refused(graph_client::ApiError { status: 401, .. })
+        ));
+        assert_eq!(asked(), 2, "the write's refusal asked for the next token");
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            1,
+            "the refused write was not sent again"
+        );
+
+        // `t2` is taken by a write, then lapses in turn: asked again, though no read took it.
+        let write = session.update(cx, |session, cx| {
+            session.create_branch("y".into(), BranchStart::Head("main".into()), cx)
+        });
+        cx.run_until_parked();
+        assert!(!matches!(write.await, WriteOutcome::Refused(_)));
+        *accepted.lock().unwrap() = "t3";
+        let write = session.update(cx, |session, cx| {
+            session.create_branch("z".into(), BranchStart::Head("main".into()), cx)
+        });
+        cx.run_until_parked();
+        assert!(matches!(
+            write.await,
+            WriteOutcome::Refused(graph_client::ApiError { status: 401, .. })
+        ));
+        assert_eq!(asked(), 3, "the second lapse asked again");
+
+        // `t3` is taken; then a token that never arrives: the write's 401 refused none, and
+        // nothing is asked, though a refusal now could ask.
+        let write = session.update(cx, |session, cx| {
+            session.create_branch("v".into(), BranchStart::Head("main".into()), cx)
+        });
+        cx.run_until_parked();
+        assert!(!matches!(write.await, WriteOutcome::Refused(_)));
+        *accepted.lock().unwrap() = DROPPED;
+        let write = session.update(cx, |session, cx| {
+            session.create_branch("w".into(), BranchStart::Head("main".into()), cx)
+        });
+        cx.run_until_parked();
+        assert!(matches!(write.await, WriteOutcome::Refused(_)));
         assert_eq!(asked(), 3, "a token that never arrived asks nothing");
     }
 

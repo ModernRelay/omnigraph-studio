@@ -165,7 +165,7 @@ place), X (designed on 0.13; the better routes are deferred).
   gives. A dry run that cannot be read says nothing; Merge stays available either way, since
   the merge itself decides.
 - Outcome shown plainly: fast-forwarded, merged (with commit), already up to date. A merge or a
-  fix never sent (its connection retired, the server refusing the connection, or the request
+  fix never sent (its connection retired, no connection to the server opened, or the request
   not made; a merge whose branch head could not be read; a fix dropped because the one
   before it did not land or has an unknown outcome) says so ("The merge was not
   sent: <why>. Nothing was merged."; a fix's "Not sent: <why>. Nothing was written."), and

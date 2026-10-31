@@ -1819,7 +1819,7 @@ impl ReviewView {
                 }
             }
             WriteOutcome::Refused(error) if error.status == 412 => FixState::Moved,
-            WriteOutcome::Refused(error) => FixState::Refused(error.body.error),
+            WriteOutcome::Refused(error) => FixState::Refused(error.reason().to_owned()),
             WriteOutcome::NotSent { reason } => FixState::NotSent(reason),
             WriteOutcome::Unknown { .. } => FixState::Unknown,
         };
@@ -2144,9 +2144,9 @@ impl ReviewView {
                         deleted,
                     }
                 }
-                WriteOutcome::Refused(error) => match error.body.merge_conflicts {
+                WriteOutcome::Refused(mut error) => match error.body.merge_conflicts.take() {
                     Some(conflicts) if !conflicts.is_empty() => MergeState::Conflicts(conflicts),
-                    _ => MergeState::Refused(error.body.error),
+                    _ => MergeState::Refused(error.reason().to_owned()),
                 },
                 WriteOutcome::NotSent { reason } => MergeState::NotSent(reason),
                 WriteOutcome::Unknown { reason } => {
