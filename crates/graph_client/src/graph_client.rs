@@ -73,9 +73,15 @@ pub enum Answered<T> {
     Unknown { reason: String },
 }
 
-/// A refusal from the server: the HTTP status and the parsed `ErrorOutput` body.
+/// A refusal from the server: the HTTP status, the parsed `ErrorOutput` body, and a 401's
+/// `Bearer` challenge, which says whether it refused the token the write carried
+/// ([`Challenge::refuses`]).
 #[derive(Debug)]
 pub struct ApiError {
     pub status: u16,
     pub body: ErrorOutput,
+    pub challenge: Option<Box<Challenge>>,
+    /// The token the write carried was replaced before its answer came: a 401 says nothing of
+    /// the one held now.
+    pub token_replaced: bool,
 }

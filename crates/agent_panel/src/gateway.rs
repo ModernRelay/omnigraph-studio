@@ -21,8 +21,8 @@ use futures_rustls::TlsAcceptor;
 use futures_rustls::rustls::ServerConfig;
 use graph_client::api::CommitKind;
 use graph_client::{
-    Answered, AsyncBody, CONTRACT, CONTRACT_HEADER, ForwardRequest, GraphClient, HeaderMap, Method,
-    NoAnswer, StatusCode,
+    Answered, AsyncBody, CONTRACT, CONTRACT_HEADER, Challenge, ForwardRequest, ForwardResponse,
+    GraphClient, HeaderMap, Method, NoAnswer, StatusCode,
 };
 use serde::Deserialize as _;
 use serde_json::{Value, json};
@@ -135,6 +135,10 @@ pub enum GatewayEvent {
     /// The CLI stopped waiting before the write was decided (its command timed out or was
     /// stopped): nothing was sent, and nothing will be.
     Abandoned { id: u64 },
+    /// A request the gateway forwarded with Studio's token was answered 401, with this
+    /// challenge: the session asks for the next token as for its own requests
+    /// ([`graph_store::GraphSession::token_refused`]).
+    TokenRefused { challenge: Option<Box<Challenge>> },
 }
 
 /// What records an approved write's outcome. It is called once, with the outcome, however the
@@ -417,16 +421,23 @@ async fn handle(
         Verdict::Refuse(message) => answer(stream, 403, "forbidden", &message).await,
         Verdict::Read => {
             let method = request.method.clone();
-            let response = shared.client.forward(forward_request(request, None)).await;
+            let response = forward(
+                &shared.client,
+                &shared.events,
+                forward_request(request, None),
+            )
+            .await;
             stream_back(stream, &method, response).await;
         }
         Verdict::ReadWith(body) => {
             let body = serde_json::to_vec(&body).unwrap_or_default();
             let method = request.method.clone();
-            let response = shared
-                .client
-                .forward(forward_request(request, Some(body)))
-                .await;
+            let response = forward(
+                &shared.client,
+                &shared.events,
+                forward_request(request, Some(body)),
+            )
+            .await;
             stream_back(stream, &method, response).await;
         }
         Verdict::Write(write) => {
@@ -515,10 +526,11 @@ async fn handle(
             // recorded: the conversation stopping, or the CLI going, would otherwise drop it
             // halfway with the server perhaps committing it unseen.
             let client = shared.client.clone();
-            let forward = forward_request(request, None);
+            let events = shared.events.clone();
+            let request = forward_request(request, None);
             let (reply_tx, reply_rx) = oneshot::channel();
             smol::spawn(async move {
-                let response = client.forward(forward).await;
+                let response = forward(&client, &events, request).await;
                 let (outcome, reply) = read_write_answer(response, kind).await;
                 on_outcome(&outcome);
                 reply_tx.send(reply).ok();
@@ -588,6 +600,34 @@ enum Undecided {
     Gone,
     /// A process the CLI was started under ended; the CLI still listens.
     Stopped,
+}
+
+/// Sends `request` on with Studio's token, and says a 401 the server gives it
+/// ([`GatewayEvent::TokenRefused`]; one without the contract header came from something in
+/// between), so the token is asked for again as for Studio's own requests: an agent working
+/// while no window reads would otherwise be refused until one did.
+async fn forward(
+    client: &GraphClient,
+    events: &mpsc::UnboundedSender<GatewayEvent>,
+    request: ForwardRequest,
+) -> Result<ForwardResponse, NoAnswer> {
+    let response = client.forward(request).await;
+    if let Ok(response) = &response
+        && response.status == StatusCode::UNAUTHORIZED
+        && !response.token_replaced
+        && graph_client::speaks_contract(
+            response
+                .headers
+                .get(CONTRACT_HEADER)
+                .and_then(|value| value.to_str().ok()),
+        )
+    {
+        let challenge = Challenge::bearer(&response.headers).map(Box::new);
+        events
+            .unbounded_send(GatewayEvent::TokenRefused { challenge })
+            .ok();
+    }
+    response
 }
 
 /// The request as the server is sent it, with `body` in place of the one that came. Taken whole,
@@ -1621,6 +1661,101 @@ mod tests {
         });
     }
 
+    /// A request the gateway forwards with Studio's token and the server answers 401 is said to
+    /// the panel with its challenge, so the token is asked for again as for Studio's own
+    /// requests; any other answer says nothing. Before, the gateway said nothing, and an agent
+    /// working while no window read was refused once the token lapsed, until a window did.
+    #[test]
+    fn a_forwarded_401_is_said_with_its_challenge() {
+        let answering = |status: u16, server: bool| {
+            FakeHttpClient::create(move |_| async move {
+                let mut response = Response::builder().status(status);
+                if server {
+                    response = response.header(CONTRACT_HEADER, CONTRACT);
+                }
+                if status == 401 {
+                    response =
+                        response.header("www-authenticate", r#"Bearer error="invalid_token""#);
+                }
+                Ok(response.body(AsyncBody::from("{}")).unwrap())
+            })
+        };
+        smol::block_on(async {
+            // A 401 the server sent, one from something in between, and an answer.
+            for (status, server) in [(401, true), (401, false), (200, true)] {
+                let client = GraphClient::new(
+                    "http://127.0.0.1:8787",
+                    Some("person-token".into()),
+                    answering(status, server),
+                )
+                .unwrap();
+                let (events_tx, mut events) = mpsc::unbounded();
+                let request = ForwardRequest {
+                    method: Method::GET,
+                    path_and_query: "graphs/knowledge/schema".into(),
+                    headers: Vec::new(),
+                    body: AsyncBody::empty(),
+                };
+                let response = super::forward(&client, &events_tx, request).await;
+                assert_eq!(
+                    response.map(|response| response.status.as_u16()).ok(),
+                    Some(status)
+                );
+                drop(events_tx);
+                let said = events.next().await;
+                if status == 401 && server {
+                    assert!(matches!(
+                        said,
+                        Some(GatewayEvent::TokenRefused { challenge: Some(challenge) })
+                            if challenge.token_refused()
+                    ));
+                } else {
+                    assert!(
+                        said.is_none(),
+                        "a {status} (the server's: {server}) said nothing"
+                    );
+                }
+            }
+        });
+    }
+
+    /// A forwarded request's 401 to a token replaced while it was out says nothing: it refused
+    /// a token no longer held, and asking about the one held could drop it.
+    #[test]
+    fn a_forwarded_401_to_a_replaced_token_says_nothing() {
+        let held: Arc<std::sync::OnceLock<GraphClient>> = Arc::default();
+        let replacing = held.clone();
+        let http = FakeHttpClient::create(move |_| {
+            if let Some(client) = replacing.get() {
+                client.set_token(Some("next-token".into()));
+            }
+            async move {
+                Ok(Response::builder()
+                    .status(401)
+                    .header(CONTRACT_HEADER, CONTRACT)
+                    .header("www-authenticate", r#"Bearer error="invalid_token""#)
+                    .body(AsyncBody::from("{}"))
+                    .unwrap())
+            }
+        });
+        let client =
+            GraphClient::new("http://127.0.0.1:8787", Some("person-token".into()), http).unwrap();
+        held.set(client.clone()).ok();
+        smol::block_on(async {
+            let (events_tx, mut events) = mpsc::unbounded();
+            let request = ForwardRequest {
+                method: Method::GET,
+                path_and_query: "graphs/knowledge/schema".into(),
+                headers: Vec::new(),
+                body: AsyncBody::empty(),
+            };
+            let response = super::forward(&client, &events_tx, request).await;
+            assert!(response.is_ok_and(|response| response.status == StatusCode::UNAUTHORIZED));
+            drop(events_tx);
+            assert!(events.next().await.is_none(), "said for a replaced token");
+        });
+    }
+
     /// A write's success answer says what it did, as Studio's own writes read theirs: its
     /// commit with the commit's kind and its counts, whether a load created its branch, and a
     /// branch's create or delete, which publish none. A stored query that reads wrote nothing,
@@ -1685,6 +1820,7 @@ mod tests {
                 status: StatusCode::OK,
                 headers,
                 body: AsyncBody::from(body.to_owned()),
+                token_replaced: false,
             };
             smol::block_on(super::read_write_answer(Ok(response), kind)).0
         };
@@ -1894,6 +2030,7 @@ mod tests {
                 status: StatusCode::OK,
                 headers: HeaderMap::new(),
                 body: AsyncBody::from_reader(body),
+                token_replaced: false,
             };
             stream_back(&mut stream, "POST", Ok(response)).await;
             drop(stream);
@@ -2574,7 +2711,7 @@ mod end_to_end {
                             })))
                             .ok();
                     }
-                    GatewayEvent::Abandoned { .. } => {}
+                    GatewayEvent::Abandoned { .. } | GatewayEvent::TokenRefused { .. } => {}
                 }
             }
         });

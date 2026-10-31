@@ -216,7 +216,7 @@ impl Challenge {
     }
 
     /// The `Bearer` challenge among a response's `WWW-Authenticate` values, if any.
-    fn bearer(headers: &HeaderMap) -> Option<Challenge> {
+    pub fn bearer(headers: &HeaderMap) -> Option<Challenge> {
         headers
             .get_all(http_client::http::header::WWW_AUTHENTICATE)
             .iter()
@@ -614,6 +614,10 @@ pub struct GraphClient {
     /// ([`Self::refusals`]). Shared by every clone.
     credential_changes: Arc<std::sync::atomic::AtomicU64>,
     refusals: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    /// The credential generation whose refusal the token source was last asked about, until the
+    /// server takes a request with the token held ([`Self::refusal_asked`]). Shared by every
+    /// clone.
+    refusal_asked: Arc<std::sync::Mutex<Option<u64>>>,
 }
 
 impl std::fmt::Debug for GraphClient {
@@ -639,6 +643,9 @@ pub struct ForwardResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub body: AsyncBody,
+    /// The token the request carried was replaced before its answer came: a 401 says nothing of
+    /// the one held now.
+    pub token_replaced: bool,
 }
 
 impl GraphClient {
@@ -670,7 +677,64 @@ impl GraphClient {
             read_slots: Arc::new(smol::lock::Semaphore::new(READ_CONCURRENCY)),
             credential_changes: Arc::default(),
             refusals: Arc::default(),
+            refusal_asked: Arc::default(),
         })
+    }
+
+    /// The credential generation ([`Self::credential_changes`]) whose refusal the token source
+    /// was last asked about: another refusal under it asks nothing more, that one more try
+    /// spent, until the server takes a request of a graph's own routes with the token held (a
+    /// read, a write, the agent's), so a token that lapses later is asked about again.
+    pub fn refusal_asked(&self) -> Option<u64> {
+        *self
+            .refusal_asked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Notes that the token source was asked about a refusal under `generation`, the one more
+    /// try; `None` forgets it, as a token renewed under a refusal does.
+    pub fn note_refusal_asked(&self, generation: Option<u64>) {
+        *self
+            .refusal_asked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = generation;
+    }
+
+    /// The server answered a request to `url` that carried `carried` with `status`, in
+    /// `contract`'s words: a success or a 403 to a graph's own route (a read, a write, the
+    /// agent's) took that token, so when it is the token held, the one more try after a refusal
+    /// ends ([`Self::refusal_asked`]). A 404 does not count, as the server checks no token on a
+    /// path it does not route; nor do the server-level listing and health: a server that refused
+    /// a graph's reads but answered its listing would be asked in a loop.
+    fn note_answer(
+        &self,
+        url: &Url,
+        carried: &Option<Arc<str>>,
+        status: StatusCode,
+        contract: Option<&str>,
+    ) {
+        if (status.is_success() || status == StatusCode::FORBIDDEN)
+            && speaks_contract(contract)
+            && self.graph_of(url).is_some()
+            && *carried == self.token()
+        {
+            self.note_refusal_asked(None);
+        }
+    }
+
+    /// The graph whose own route `url` is (`graphs/{id}/…`, one segment at least under it), if
+    /// it is one.
+    fn graph_of(&self, url: &Url) -> Option<String> {
+        let below = url.path().strip_prefix(self.base.path()).unwrap_or("");
+        let mut segments = below.split('/');
+        if segments.next() != Some("graphs") {
+            return None;
+        }
+        match (segments.next(), segments.next()) {
+            (Some(id), Some(_)) => Some(decode_segment(id)),
+            _ => None,
+        }
     }
 
     /// A count that moves whenever the token is replaced by another, the transport it is sent
@@ -706,20 +770,14 @@ impl GraphClient {
         if status != StatusCode::FORBIDDEN || !speaks_contract(contract) {
             return;
         }
-        let below = url.path().strip_prefix(self.base.path()).unwrap_or("");
-        let mut segments = below.split('/');
-        if segments.next() != Some("graphs") {
-            return;
-        }
-        // The id, then at least one segment of a graph's route under it.
-        let (Some(id), Some(_)) = (segments.next(), segments.next()) else {
+        let Some(graph) = self.graph_of(url) else {
             return;
         };
         *self
             .refusals
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(decode_segment(id))
+            .entry(graph)
             .or_default() += 1;
     }
 
@@ -1164,6 +1222,7 @@ impl GraphClient {
         let bytes = read_body(response.into_body(), skip, keep, length)
             .await
             .map_err(|error| NoAnswer::Lost(describe_transport(&error.into())))?;
+        self.note_answer(&url, &carried, status, contract.as_deref());
         Ok(RawResponse {
             carried,
             status,
@@ -1529,7 +1588,16 @@ impl GraphClient {
         headers: &[(&str, &str)],
     ) -> WriteOutcome<T> {
         match self.send(method, url, body, headers, WRITE_TIMEOUT).await {
-            Ok(raw) => classify_write(raw),
+            Ok(raw) => {
+                let token_replaced = raw.carried != self.token();
+                match classify_write(raw) {
+                    WriteOutcome::Refused(error) => WriteOutcome::Refused(ApiError {
+                        token_replaced,
+                        ..error
+                    }),
+                    outcome => outcome,
+                }
+            }
             Err(no) => unanswered(no),
         }
     }
@@ -1574,7 +1642,7 @@ impl GraphClient {
             )));
         }
         self.fresh_token().await;
-        let (mut builder, _) = self.request(request.method, &url);
+        let (mut builder, carried) = self.request(request.method, &url);
         for (name, value) in &request.headers {
             builder = builder.header(name.as_str(), value.as_str());
         }
@@ -1582,9 +1650,15 @@ impl GraphClient {
             .body(request.body)
             .map_err(|error| NoAnswer::Unsendable(error.to_string()))?;
         let response = self.dispatch(&url, request).await?;
+        let contract = response
+            .headers()
+            .get(CONTRACT_HEADER)
+            .and_then(|value: &HeaderValue| value.to_str().ok());
+        self.note_answer(&url, &carried, response.status(), contract);
         Ok(ForwardResponse {
             status: response.status(),
             headers: response.headers().clone(),
+            token_replaced: carried != self.token(),
             body: response.into_body(),
         })
     }
@@ -2017,13 +2091,18 @@ fn refusal(raw: &RawResponse) -> ReadError {
     }
 }
 
+/// A 401's `Bearer` challenge, which says whether it refused the token the request carried.
+fn unauthorized_challenge(raw: &RawResponse) -> Option<Box<Challenge>> {
+    (raw.status == StatusCode::UNAUTHORIZED)
+        .then(|| Challenge::bearer(&raw.headers))
+        .flatten()
+        .map(Box::new)
+}
+
 /// A refusal's summary: its body, and a 401's challenge.
 fn summary(raw: &RawResponse) -> ApiErrorSummary {
     let status = raw.status;
-    let challenge = (status == StatusCode::UNAUTHORIZED)
-        .then(|| Challenge::bearer(&raw.headers))
-        .flatten()
-        .map(Box::new);
+    let challenge = unauthorized_challenge(raw);
     match serde_json::from_slice::<ErrorOutput>(&raw.body) {
         Ok(error) => ApiErrorSummary {
             status: status.as_u16(),
@@ -2090,6 +2169,8 @@ pub fn judge_write<'a>(
             Some(DispositionEffects::None) => Answered::Refused(ApiError {
                 status: status.as_u16(),
                 body,
+                challenge: None,
+                token_replaced: false,
             }),
             Some(DispositionEffects::Unknown | DispositionEffects::Partial) => Answered::Unknown {
                 reason: format!(
@@ -2134,7 +2215,10 @@ fn classify_write<T: DeserializeOwned>(raw: RawResponse) -> WriteOutcome<T> {
                 reason: format!("the success response could not be read: {error}"),
             },
         },
-        Answered::Refused(error) => WriteOutcome::Refused(error),
+        Answered::Refused(error) => WriteOutcome::Refused(ApiError {
+            challenge: unauthorized_challenge(&raw),
+            ..error
+        }),
         Answered::Unknown { reason } => WriteOutcome::Unknown { reason },
     }
 }
@@ -3261,6 +3345,113 @@ mod tests {
             6,
             "the retired client sent nothing"
         );
+    }
+
+    /// The one more try after a refusal ends when the server takes a request of a graph's own
+    /// routes with the token held: a success or a 403, under the contract header, by a read or
+    /// the agent's forward alike. The server-level listing, an answer without the contract
+    /// header (from something in between) and a 404 (a path the server may not check the token
+    /// on) end nothing.
+    #[test]
+    fn a_request_taken_ends_the_one_more_try() {
+        let answering = |status: u16, contract: bool| {
+            client(FakeHttpClient::create(move |_| async move {
+                let mut response = Response::builder().status(status);
+                if contract {
+                    response = response.header(CONTRACT_HEADER, CONTRACT);
+                }
+                Ok(response.body(AsyncBody::from(r#"{"graphs":[]}"#)).unwrap())
+            }))
+        };
+        let forwarded = |client: &GraphClient, path: &str| {
+            client.note_refusal_asked(Some(7));
+            let request = ForwardRequest {
+                method: Method::GET,
+                path_and_query: path.into(),
+                headers: Vec::new(),
+                body: AsyncBody::empty(),
+            };
+            block_on(client.forward(request)).ok();
+            client.refusal_asked().is_none()
+        };
+        assert!(forwarded(&answering(200, true), "graphs/g/schema"));
+        assert!(forwarded(&answering(403, true), "graphs/g/schema"));
+        assert!(!forwarded(&answering(200, true), "graphs"), "the listing");
+        assert!(
+            !forwarded(&answering(200, false), "graphs/g/schema"),
+            "without the contract header"
+        );
+        assert!(!forwarded(&answering(404, true), "graphs/g/nope"), "a 404");
+        // A success to a token replaced while the request was out took the old token, not the
+        // one held.
+        let held: Arc<std::sync::OnceLock<GraphClient>> = Arc::default();
+        let replacing = held.clone();
+        let replaced = client(FakeHttpClient::create(move |_| {
+            if let Some(client) = replacing.get() {
+                client.set_token(Some("t2".into()));
+            }
+            async move {
+                Ok(Response::builder()
+                    .status(200)
+                    .header(CONTRACT_HEADER, CONTRACT)
+                    .body(AsyncBody::from("{}"))
+                    .unwrap())
+            }
+        }));
+        held.set(replaced.clone()).ok();
+        assert!(
+            !forwarded(&replaced, "graphs/g/schema"),
+            "a token replaced in flight"
+        );
+        // A read, through the same door.
+        let read = answering(200, true);
+        read.note_refusal_asked(Some(7));
+        block_on(read.graphs()).ok();
+        assert!(read.refusal_asked().is_some(), "the listing, read");
+        block_on(read.schema("g")).ok();
+        assert!(read.refusal_asked().is_none(), "a graph's read");
+    }
+
+    /// A 401 to a token replaced while the request was out says so, for a write and a forwarded
+    /// request alike: it says nothing of the token held now, which is not asked about.
+    #[test]
+    fn a_401_to_a_token_replaced_meanwhile_says_so() {
+        let held: Arc<std::sync::OnceLock<GraphClient>> = Arc::default();
+        let replacing = held.clone();
+        let http = FakeHttpClient::create(move |_| {
+            // The token is replaced while the request is out.
+            if let Some(client) = replacing.get() {
+                client.set_token(Some("t2".into()));
+            }
+            async move {
+                Ok(Response::builder()
+                    .status(401)
+                    .header(CONTRACT_HEADER, CONTRACT)
+                    .header("www-authenticate", r#"Bearer error="invalid_token""#)
+                    .body(AsyncBody::from(
+                        r#"{"error":"unauthorized","code":"unauthorized","disposition":{"execution":"not_started","effects":"none","action":"fix"}}"#,
+                    ))
+                    .unwrap())
+            }
+        });
+        let client = client(http);
+        held.set(client.clone()).ok();
+        assert!(matches!(
+            block_on(client.mutate("g", &ChangeRequest::default(), None)),
+            WriteOutcome::Refused(ApiError {
+                status: 401,
+                token_replaced: true,
+                ..
+            })
+        ));
+        client.set_token(Some("t".into()));
+        let request = ForwardRequest {
+            method: Method::GET,
+            path_and_query: "graphs/g/schema".into(),
+            headers: Vec::new(),
+            body: AsyncBody::empty(),
+        };
+        assert!(block_on(client.forward(request)).is_ok_and(|response| response.token_replaced));
     }
 
     /// A write whose connection the server refused was never sent, and says so: nothing was

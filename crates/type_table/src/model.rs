@@ -1626,6 +1626,8 @@ mod tests {
     fn refused(status: u16, precondition: bool) -> WriteOutcome<ChangeOutput> {
         WriteOutcome::Refused(ApiError {
             status,
+            challenge: None,
+            token_replaced: false,
             body: ErrorOutput {
                 error: "policy denied".into(),
                 precondition_failure: precondition.then(|| PreconditionFailureOutput {

@@ -12,7 +12,7 @@ use graph_store::cli_config::{self, Platform};
 use graph_store::sign_in::{Kept, SignIn, left_in_keychain};
 use graph_store::{
     Connection, ConnectionEvent, ConnectionRegistry, ConnectionState, ConnectionWatch,
-    GraphListing, ServerSource,
+    GraphListing, HeldRefusal, ServerSource,
 };
 use studio_ui::ds::{self, MenuRow, size, space};
 use studio_workspace::ModalView;
@@ -985,18 +985,18 @@ fn state_status(c: &Connection) -> String {
             },
             ConnectionState::Unauthorized,
         ) if c.holds_sign_in() => {
-            return if c.token_unanswered {
-                format!("{why} You stay signed in at {service}; Studio asks again.")
-            } else if c.token_not_received() {
-                format!(
+            return match c.held_refusal() {
+                HeldRefusal::NotAnswering => {
+                    format!("{why} You stay signed in at {service}; Studio asks again.")
+                }
+                HeldRefusal::NotReceived => format!(
                     "{why} You stay signed in at {service}; the server received no token: \
                      something between them may drop it."
-                )
-            } else {
-                format!(
+                ),
+                HeldRefusal::NotAdmitted => format!(
                     "{why} You stay signed in at {service}, as an account this server may not \
                      admit."
-                )
+                ),
             };
         }
         (SignIn::Offered { service, why }, ConnectionState::Unauthorized) => {
@@ -1018,30 +1018,27 @@ fn state_status(c: &Connection) -> String {
         (SignIn::Unavailable(why), ConnectionState::Unauthorized) => {
             return format!("This server asks for a sign-in Studio cannot make. {why}");
         }
-        // The sign-in's service did not answer: the sign-in stands, and is asked again.
-        (SignIn::SignedIn { service, .. }, ConnectionState::Unauthorized) if c.token_unanswered => {
-            let why = c.token_unread.as_deref().unwrap_or_default();
-            return format!("{why} You stay signed in at {service}; Studio asks again.");
-        }
-        // A 401 that refused no token: the one sent never arrived.
-        (SignIn::SignedIn { service, .. }, ConnectionState::Unauthorized)
-            if c.token_not_received() =>
-        {
-            return format!(
-                "The server received no token, though Studio sent the one signed in at \
-                 {service}: something between them may drop it."
-            );
-        }
         (
             SignIn::SignedIn {
                 service, account, ..
             },
             ConnectionState::Unauthorized,
         ) => {
-            return format!(
-                "The server refused {account}, signed in at {service}: it may not admit this \
-                 account."
-            );
+            return match c.held_refusal() {
+                // The sign-in stands, and is asked again.
+                HeldRefusal::NotAnswering => {
+                    let why = c.token_unread.as_deref().unwrap_or_default();
+                    format!("{why} You stay signed in at {service}; Studio asks again.")
+                }
+                HeldRefusal::NotReceived => format!(
+                    "The server received no token, though Studio sent the one signed in at \
+                     {service}: something between them may drop it."
+                ),
+                HeldRefusal::NotAdmitted => format!(
+                    "The server refused {account}, signed in at {service}: it may not admit \
+                     this account."
+                ),
+            };
         }
         (SignIn::SignedIn { service, account }, ConnectionState::Ready) => {
             return signed_in_status(account, service, &c.keychain());
