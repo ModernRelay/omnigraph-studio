@@ -3588,7 +3588,8 @@ async fn fold_pages(
         match next {
             Some(next) if complete && fold.raw_changes() < REVIEW_CHANGE_CAP => token = Some(next),
             Some(_) => return Ok((fold, true)),
-            None => return Ok((fold, false)),
+            // A last page the cap cut is partial too, as the feed's fold says it.
+            None => return Ok((fold, !complete)),
         }
     }
 }
@@ -4285,6 +4286,44 @@ pub(crate) mod tests {
             mark_of(&change("p2", json!({"name": "Ada"}))),
             "another entity"
         );
+    }
+
+    /// A last page of changes past the cap is said partial, as the feed's fold says it: the cap
+    /// left changes out whether or not the server named a page after it. Before, the diff's
+    /// fold said such a review whole.
+    #[gpui::test]
+    async fn a_last_page_past_the_cap_is_partial(cx: &mut gpui::TestAppContext) {
+        let mut acx = cx.to_async();
+        let cause: ChangeCauseOutput = serde_json::from_value(json!({
+            "graph_commit_id": "c1", "authored_branch": "feature", "authored_at": 0
+        }))
+        .unwrap();
+        let change: graph_client::api::EntityChangeOutput = serde_json::from_value(json!({
+            "kind": "node", "type": { "id": "Person", "name": "Person" }, "id": "p", "op": "update"
+        }))
+        .unwrap();
+        let this = WeakEntity::<ReviewView>::new_invalid();
+        let (fold, partial) = fold_pages(
+            &this,
+            &mut acx,
+            async |_: Option<String>, _: u32, _: &mut AsyncApp| {
+                let changes = (0..=REVIEW_CHANGE_CAP)
+                    .map(|i| graph_client::api::EntityChangeOutput {
+                        id: format!("p{i}"),
+                        ..change.clone()
+                    })
+                    .collect();
+                let block = ChangeBlockOutput {
+                    cause: cause.clone(),
+                    changes,
+                };
+                Ok((block, None))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(fold.raw_changes(), REVIEW_CHANGE_CAP);
+        assert!(partial, "the cap left a change out");
     }
 
     /// A review behind another tab whose read is out when the token changes lets that read go:
