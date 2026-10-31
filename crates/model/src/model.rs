@@ -22,6 +22,10 @@ const TITLE: &str = "Omnigraph Studio";
 /// The most of an answer body that is read: a schema-bound answer is small, and a body past
 /// this is an error whatever it holds.
 const MAX_ANSWER_BYTES: usize = 256 * 1024;
+/// The model list's cap, larger than a call's answer (a few megabytes of descriptions), and
+/// its time: a request that hangs gives up, as a call does.
+const MAX_LIST_BYTES: usize = 16 * 1024 * 1024;
+const LIST_TIME: Duration = Duration::from_secs(30);
 
 /// Which model setting a task uses: fast answers of a line or two, or careful ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,20 +289,34 @@ impl Client {
         let request = HttpRequest::get(self.models_endpoint.as_ref())
             .body(AsyncBody::default())
             .map_err(|error| Error::Network(error.to_string()))?;
-        let mut response = self
-            .http
-            .send(request)
-            .await
-            .map_err(|error| Error::Network(error.to_string()))?;
-        let mut bytes = Vec::new();
-        response
-            .body_mut()
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(|error| Error::Network(error.to_string()))?;
-        if !response.status().is_success() {
+        let http = self.http.clone();
+        let work = async move {
+            let mut response = http
+                .send(request)
+                .await
+                .map_err(|error| Error::Network(error.to_string()))?;
+            let mut bytes = Vec::new();
+            response
+                .body_mut()
+                .take(MAX_LIST_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|error| Error::Network(error.to_string()))?;
+            Ok::<_, Error>((response.status(), bytes))
+        };
+        let timer = smol::Timer::after(LIST_TIME);
+        let (status, bytes) = match futures::future::select(Box::pin(work), timer).await {
+            futures::future::Either::Left((answer, _)) => answer?,
+            futures::future::Either::Right(_) => return Err(Error::Timeout),
+        };
+        if bytes.len() > MAX_LIST_BYTES {
+            return Err(Error::NotInSchema(
+                "the model list is too long to read".into(),
+            ));
+        }
+        if !status.is_success() {
             return Err(Error::Refused(
-                response.status().as_u16(),
+                status.as_u16(),
                 refusal(&String::from_utf8_lossy(&bytes)),
             ));
         }
@@ -556,6 +574,18 @@ mod tests {
         .unwrap();
         assert_eq!(cut.choices[0].finish_reason.as_deref(), Some("length"));
         assert!(cut.choices[0].message.content.is_none());
+    }
+
+    /// A model list longer than its cap is refused without reading past it. Before, it was read
+    /// whole, however long, with no time limit.
+    #[test]
+    fn a_model_list_past_its_cap_is_refused() {
+        let long: &'static str = Box::leak(" ".repeat(MAX_LIST_BYTES + 1).into_boxed_str());
+        let (client, _) = client_with(200, long);
+        assert!(matches!(
+            smol::block_on(client.list_models()),
+            Err(Error::NotInSchema(reason)) if reason.contains("too long")
+        ));
     }
 
     /// The model list keeps the models that take a schema, without batch or free variants,
