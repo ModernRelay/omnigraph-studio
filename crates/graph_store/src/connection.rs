@@ -670,6 +670,17 @@ impl Connection {
         {
             return;
         }
+        // A token past its end (one the source could not renew, as after a wake before the
+        // network) was refused for that: the source is asked for its renewal, whose answer
+        // replaces it quietly, not as a refusal of the account that every graph reads everything
+        // again after. An ask under way gives it already.
+        if self.token_from_source && self.client.holds_ended_token() {
+            if !self.next_token_coming() {
+                self.client.note_refusal_asked(Some(generation));
+                self.ask_for_token(Ask::Renewal, cx);
+            }
+            return;
+        }
         self.client.note_refusal_asked(Some(generation));
         if let Some(source) = &self.token_source {
             source.note_refused();
@@ -862,8 +873,11 @@ impl Connection {
         // could not be reached). Nothing read with the last one is read again. A token after a
         // refusal, or while a 401 stands, is a new credential, tried at once, and what was
         // refused is read again; so is a Refresh's, as the person asked to read again.
+        // A 401 standing is a probe's (`refusal`); an ended token kept while its source could not
+        // answer leaves the connection unauthorized with none, and its next is its renewal.
+        let unauthorized = self.state == ConnectionState::Unauthorized && self.refusal.is_some();
         let renewal = !refused
-            && self.state != ConnectionState::Unauthorized
+            && !unauthorized
             && ask != Ask::Again
             && self.token_from_source
             && self.has_token()
@@ -900,7 +914,10 @@ impl Connection {
             cx.emit(ConnectionEvent::CredentialChanged);
         }
         let unread_changed = self.token_unread.take().is_some();
-        if connecting || (changed && self.state != ConnectionState::Idle) {
+        // A renewal of an ended token kept while unauthorized connects again, which makes the
+        // connection ready with it.
+        let renewed_unauthorized = renewal && self.state == ConnectionState::Unauthorized;
+        if connecting || (changed && self.state != ConnectionState::Idle) || renewed_unauthorized {
             self.token_fresh = true;
             self.connect(cx);
         } else if renewal || unread_changed {
@@ -4584,6 +4601,53 @@ mod tests {
             first,
             "the next token renewed the ended one"
         );
+    }
+
+    /// A request refused for the ended token kept while its source could not answer (the server
+    /// back before the source, after a wake) asks the source for its renewal: the answer
+    /// replaces it quietly and the connection is ready again, the credential unchanged. Before,
+    /// the 401 counted as a refusal of the account, and its answer was a new credential under
+    /// which every graph read everything again.
+    #[gpui::test]
+    async fn a_refusal_of_an_ended_token_asks_for_its_renewal(cx: &mut TestAppContext) {
+        let source = Arc::new(Scripted::default());
+        let (connection, _, _) = sourced(source.clone(), cx);
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        cx.run_until_parked();
+        let asked = || source.asked.load(Ordering::SeqCst);
+        let held = |cx: &mut TestAppContext| {
+            connection.read_with(cx, |connection, _| {
+                (
+                    connection.client.credential_changes(),
+                    connection.client.token_serial(),
+                )
+            })
+        };
+        let (first, serial) = held(cx);
+        // The token ends and its renewal cannot be had now: it stays held.
+        *source.answers.lock().unwrap() = vec![None];
+        connection.update(cx, |connection, cx| {
+            connection
+                .client
+                .set_token_ends(Some(SystemTime::now() - Duration::from_secs(1)));
+            connection.ask_for_token(Ask::Renewal, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(asked(), 2);
+        connection.read_with(cx, |connection, _| {
+            assert_eq!(connection.state, ConnectionState::Unauthorized);
+            assert!(connection.has_token());
+        });
+        // A graph's request is refused for it: its renewal is asked for, and given.
+        connection.update(cx, |connection, cx| connection.request_refused(cx));
+        cx.run_until_parked();
+        assert_eq!(asked(), 3, "the renewal asked for");
+        let (credential, renewed) = held(cx);
+        assert_eq!(credential, first, "the renewal is no new credential");
+        assert_ne!(renewed, serial, "the ended token replaced");
+        connection.read_with(cx, |connection, _| {
+            assert_eq!(connection.state, ConnectionState::Ready)
+        });
     }
 
     /// A Cancel of the connect a new token source started (a change to the CLI target) keeps
