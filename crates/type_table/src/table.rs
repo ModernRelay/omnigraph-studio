@@ -6875,7 +6875,9 @@ impl TypeTable {
         };
         let text = self.filter_editor.read(cx).text(cx);
         let list = draft.op == FilterOp::In;
-        let source = self.suggestion_source(&draft.property, draft.op);
+        let source = suggest::completes(&text, list)
+            .then(|| self.suggestion_source(&draft.property, draft.op))
+            .flatten();
         let typed = !suggest::needle(&text, list).is_empty();
         let schema = self.schema.clone();
         let snapshot = self.paging.pinned.clone();

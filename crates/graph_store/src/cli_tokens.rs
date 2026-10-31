@@ -829,6 +829,14 @@ impl CliTokenSource {
                 )));
             }
         };
+        // Read to its bound (a token's most and its newline) and closed there, an answer longer
+        // than a token fills it without the newline, the CLI stopped by its next write: said as
+        // too long, whichever way it ended.
+        if ran.stdout.len() > MAX_TOKEN_BYTES && ran.stdout.last() != Some(&b'\n') {
+            return Err(NoToken::lasting(format!(
+                "the Omnigraph CLI's answer to {asked} is longer than a token"
+            )));
+        }
         if !ran.status.success() {
             // What it printed is never shown: it may be part of a token.
             return Err(NoToken::lasting(format!(
@@ -2219,6 +2227,16 @@ exit 64
             "{moved}"
         );
         assert!(!moved.contains("secret-moving-token"));
+
+        // An answer longer than a token is read to its bound and said as too long, not as
+        // something else the closed pipe made of it.
+        cli.server("huge", "https://store.example.com/");
+        cli.write("token-huge", &"a".repeat(4 * MAX_TOKEN_BYTES));
+        let huge =
+            token_of(&cli.source("huge", "https://store.example.com/", CliCredential::Store))
+                .unwrap_err();
+        assert!(!huge.passing, "a token too long is an answer");
+        assert!(huge.why.contains("is longer than a token"), "{}", huge.why);
     }
 
     /// A managed target's token is the data credential the CLI exchanges from its login, asked
@@ -2489,11 +2507,12 @@ echo token
         let ran = smol::block_on(run_once(
             std::process::Command::new(&leaving),
             None,
-            Duration::from_secs(10),
+            Duration::from_secs(90),
             1024,
         ))
         .unwrap_or_else(|_| panic!("the command's own answer"));
-        // Far under the background program's minute, with room for a first run's scan.
+        // Far under the background program's minute, which a run waiting for it would last
+        // within its timeout, with room for a first run's scan.
         assert!(
             started.elapsed() < Duration::from_secs(30),
             "{:?}",

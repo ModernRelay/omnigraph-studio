@@ -67,6 +67,12 @@ pub fn from_node_rows(rows: &serde_json::Value) -> Vec<Suggestion> {
         .collect()
 }
 
+/// Whether suggestions complete the field: always, but for a list typed as JSON (a list pasted
+/// as it is copied), which a pick would rewrite as items, its JSON lost.
+pub fn completes(text: &str, list: bool) -> bool {
+    !list || !text.trim_start().starts_with('[')
+}
+
 /// The part of the field a suggestion completes: all of it, or for a list (`in`) its last item
 /// as typed so far, read as [`list_items`] reads one: unquoted, a doubled quote standing for
 /// one, and a quote not closed yet allowed.
@@ -235,6 +241,18 @@ mod tests {
             ["active", "inactive"]
         );
         assert!(from_values(&values(), "zzz", false).is_empty());
+    }
+
+    /// A list pasted as JSON is not completed: a pick would rewrite it as items. Before, a
+    /// pick in `["Founder", "Sm` wrote `["Founder"` back as a quoted item.
+    #[test]
+    fn a_list_typed_as_json_is_not_completed() {
+        assert!(!completes(r#"["Founder", "Sm"#, true));
+        assert!(completes(r#"Founder, "Sm"#, true));
+        assert!(
+            completes("[draft", false),
+            "a single value is completed whatever it holds"
+        );
     }
 
     #[test]
