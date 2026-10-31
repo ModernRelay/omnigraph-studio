@@ -18,7 +18,6 @@ members = [
     "crates/query_editor",
     "crates/review",
     "crates/history",
-    "crates/inspectors",
     "crates/agent_panel",
     "crates/studio_update",
     "crates/oauth_client",
@@ -65,7 +64,6 @@ graph_canvas = { path = "crates/graph_canvas" }
 query_editor = { path = "crates/query_editor" }
 review = { path = "crates/review" }
 history = { path = "crates/history" }
-inspectors = { path = "crates/inspectors" }
 agent_panel = { path = "crates/agent_panel" }
 
 # Zed, one release tag for every crate (docs/zed-pin.md). GPL-3.0-or-later and Apache-2.0.

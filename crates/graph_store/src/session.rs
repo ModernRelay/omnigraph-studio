@@ -17,12 +17,12 @@ use gq_language::{BuiltQuery, RelationshipGroup, SchemaModel, builder};
 use graph_client::api::{
     AccessAction, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchMergeOutput,
     BranchMergeRequest, ChangeFeedOutput, ChangeOutput, ChangeRequest, CommitKind, CommitOutput,
-    DiffOutput, EntityKind, GraphListResponse, InvokeStoredQueryRequest, MergeBaseOutput,
-    QueryCatalogEntry, QueryRequest, ReadOutput, ReadTargetOutput, ReadinessOutput, SnapshotOutput,
+    DiffOutput, EntityKind, InvokeStoredQueryRequest, MergeBaseOutput, QueryCatalogEntry,
+    QueryRequest, ReadOutput, ReadTargetOutput, SnapshotOutput,
 };
 use graph_client::{
     ApiErrorSummary, BlobAt, BlobCell, BlobMeta, CommitChanges, FeedAt, GraphClient, ReadError,
-    ServerHealth, WriteOutcome,
+    WriteOutcome,
 };
 use serde_json::Value;
 
@@ -326,15 +326,6 @@ impl BranchStart {
             from_commit,
         }
     }
-}
-
-/// The server as the storage inspector shows it ([`GraphSession::server_state`]): each read's
-/// own answer, so one failing leaves the others.
-pub struct ServerState {
-    pub health: Result<ServerHealth, ReadError>,
-    pub readiness: Result<ReadinessOutput, ReadError>,
-    pub graphs: Result<GraphListResponse, ReadError>,
-    pub snapshot: Result<SnapshotOutput, ReadError>,
 }
 
 /// A read at a commit: the commit, the query text and its parameters, and the schema epoch it
@@ -2569,14 +2560,6 @@ impl GraphSession {
         self.counts_stale.as_deref()
     }
 
-    /// The storage snapshot the counts were read from, when it is `branch`'s.
-    pub fn snapshot_of(&self, branch: &str) -> Option<Arc<SnapshotOutput>> {
-        self.snapshot
-            .loaded()
-            .filter(|snapshot| snapshot.graph_branch == branch)
-            .cloned()
-    }
-
     /// Reads `branch`'s head now, and resolves once the session holds what it answered, or no
     /// read could be sent: a Refresh reads at the newest head, which the next poll would only
     /// find later, and a view pinned at it still compares the heads after it.
@@ -3516,41 +3499,6 @@ impl GraphSession {
             },
             cx,
         )
-    }
-
-    /// The server's health and readiness, the graphs it serves, and `branch`'s snapshot: what
-    /// the storage inspector shows, read together.
-    pub fn server_state(&mut self, branch: &str, cx: &mut Context<Self>) -> Task<ServerState> {
-        let client = self.client(cx);
-        // Each is a read of its own, counted and noted as one.
-        let health = {
-            let client = client.clone();
-            self.counted_read(async move { client.health().await }, cx)
-        };
-        let readiness = {
-            let client = client.clone();
-            self.counted_read(async move { client.readiness().await }, cx)
-        };
-        let graphs = self.counted_read(async move { client.graphs().await }, cx);
-        let snapshot = self.branch_snapshot(branch, cx);
-        cx.background_spawn(async move {
-            ServerState {
-                health: health.await,
-                readiness: readiness.await,
-                graphs: graphs.await,
-                snapshot: snapshot.await,
-            }
-        })
-    }
-
-    /// `branch`'s storage snapshot: its tables, versions and row counts.
-    pub fn branch_snapshot(
-        &mut self,
-        branch: &str,
-        cx: &mut Context<Self>,
-    ) -> Task<Result<SnapshotOutput, ReadError>> {
-        let (client, graph, branch) = (self.client(cx), self.graph_id.clone(), branch.to_owned());
-        self.counted_read(async move { client.snapshot(&graph, &branch).await }, cx)
     }
 
     /// How many neighbours `id` has through `group`, at `snapshot` (the branch head when
@@ -6738,7 +6686,7 @@ mod tests {
         assert_eq!((reads_of("main"), reads_of("feature")), (3, 4));
     }
 
-    /// The reads the history, the commit view, the review and the storage inspector ask for
+    /// The reads the history, the commit view and the review ask for
     /// go through the session, so they count as running while they run and stop counting
     /// when dropped.
     #[gpui::test]
@@ -6749,12 +6697,7 @@ mod tests {
             let path = request.uri().path().to_owned();
             let held = seen.clone();
             async move {
-                let feature = path.ends_with("/changes")
-                    || path.ends_with("/healthz")
-                    || path.ends_with("/readyz")
-                    || path.ends_with("/snapshot")
-                    || path == "/graphs";
-                if feature {
+                if path.ends_with("/changes") {
                     // A read that never answers, held until dropped.
                     held.fetch_add(1, Ordering::SeqCst);
                     futures::future::pending::<()>().await;
@@ -6784,17 +6727,16 @@ mod tests {
             (
                 session.commit_changes("c1", None, 10, cx),
                 session.changes("main", Some("beginning".into()), None, 10, cx),
-                session.server_state("main", cx),
             )
         });
         cx.run_until_parked();
         assert_eq!(
             held.load(Ordering::SeqCst) - held_before,
-            6,
-            "two change reads and four server reads"
+            2,
+            "two change reads"
         );
         session.read_with(cx, |session, _| {
-            assert_eq!(session.reads_in_flight, before + 6)
+            assert_eq!(session.reads_in_flight, before + 2)
         });
         drop(reads);
         cx.run_until_parked();

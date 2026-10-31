@@ -124,7 +124,7 @@ seconds, to run day to day); `script/bundle-linux` builds a tarball with a `.des
   the graph through Studio; the agent writes only to a branch Studio creates for it, and never
   receives the token.
 - **Shell.** Command palette (⌘K), go to type or node (⌘P), split panes, several windows
-  restored on launch, the schema's `.pg` source, a storage inspector, and `omnigraph-studio://`
+  restored on launch, the schema's `.pg` source, and `omnigraph-studio://`
   links that open a graph, node or query without running anything. `?` lists every binding.
 - **Settings and shortcuts.** A settings tab (⌘,) generated from the settings schema, with
   per-graph values. `settings.json` and `keymap.json` (Zed's keymap format, over Studio's
@@ -165,7 +165,7 @@ depend on each other.
 | Layer | Crates |
 |---|---|
 | 6 | `studio`: the binary, menus, windows, deep links |
-| 5 | `type_table`, `relationship_tree`, `graph_canvas`, `query_editor`, `review`, `history`, `inspectors`, `agent_panel`, `command_palette` |
+| 5 | `type_table`, `relationship_tree`, `graph_canvas`, `query_editor`, `review`, `history`, `agent_panel`, `command_palette` |
 | 4 | `studio_workspace`: panes, tabs, docks, modals, toasts |
 | 3 | `graph_store`: connections, graph sessions, snapshot pins, exploration |
 | 2 | `graph_client` (HTTP, no GPUI), `gq_language` (compiler wrapper, no GPUI), `studio_ui` |

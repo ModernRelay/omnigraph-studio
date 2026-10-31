@@ -22,7 +22,7 @@ other: what two features share moves down a layer.
 | 3 | `studio_update` | The updater (spec 017): checks Studio's own releases, downloads, verifies and installs an update. The only requests not to an Omnigraph server or the sign-in service it names | `gpui`, `studio_settings`, `http_client`, `minisign-verify` |
 | 4 | `studio_workspace` | The window frame: panes, tabs, docks, panels, status bar, modal and toast layers | `gpui`, `ui`, `studio_ui`, `studio_actions`, `studio_settings` |
 | 4 | `change_cards` | The entity cards a review and a commit's view share: an entity's card, its relationship lines, a run's header, how many lines a card shows | `gpui`, `ui`, `studio_ui`, `graph_store`, `gq_language` |
-| 5 | `command_palette`, `type_table`, `relationship_tree`, `graph_canvas`, `query_editor`, `review`, `history`, `inspectors`, `agent_panel` | One surface each | layers 0–4 |
+| 5 | `command_palette`, `type_table`, `relationship_tree`, `graph_canvas`, `query_editor`, `review`, `history`, `agent_panel` | One surface each | layers 0–4 |
 | 6 | `studio` | The binary: initialises every crate in order, menus, windows, single instance, URL scheme | everything |
 
 `studio_workspace` is forked and trimmed from Zed's `workspace`, without projects,
@@ -40,7 +40,7 @@ view (layer 5) ──reads──▶ entity in graph_store ──calls──▶ g
 - Views never call `graph_client` directly. They read entities and dispatch actions. The
   session's client is private to `graph_store`, so every read goes through a session method
   that counts it while it runs and notes what it says about the server (the history's and the
-  review's change pages, the storage inspector's server state among them). The one client
+  review's change pages among them). The one client
   another crate holds is the agent gateway's (`GraphSession::gateway_client`), which forwards
   the agent CLI's own requests inside its sandbox.
 - `graph_client` sends through Zed's `HttpClient` (the `reqwest_client` that `graph_store::init`

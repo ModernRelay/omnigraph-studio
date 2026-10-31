@@ -4884,20 +4884,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "inspectors"
-version = "0.2.2"
-dependencies = [
- "gpui",
- "graph_client",
- "graph_store",
- "serde_json",
- "studio_actions",
- "studio_ui",
- "studio_workspace",
- "ui",
-]
-
-[[package]]
 name = "interpolate_name"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9719,7 +9705,6 @@ dependencies = [
  "graph_store",
  "history",
  "image",
- "inspectors",
  "libc",
  "log",
  "menu",

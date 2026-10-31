@@ -50,7 +50,6 @@ pub fn init(cx: &mut App) {
     query_editor::init(cx);
     review::init(cx);
     history::init(cx);
-    inspectors::init(cx);
     agent_panel::init(cx);
 
     studio_workspace::register_item_kind(cx, "design-system", |_, workspace, window, cx| {
@@ -1126,7 +1125,6 @@ mod start_tests {
             query_editor::init(cx);
             review::init(cx);
             history::init(cx);
-            inspectors::init(cx);
             agent_panel::init(cx);
         });
         let (_workspace, cx) = cx.add_window_view(Workspace::new);
