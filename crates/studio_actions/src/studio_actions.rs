@@ -400,6 +400,11 @@ pub mod table {
             FilterBySelection,
             /// Remove every filter from the table.
             ClearFilters,
+            /// Filter the table from a sentence, which a model turns into filters (spec 019).
+            FilterInWords,
+            /// Fill the selected column's cells from other columns, with a model's suggestions
+            /// to apply (spec 019).
+            FillColumn,
         ]
     );
 }
@@ -565,6 +570,8 @@ pub mod review {
             EditChange,
             /// Merge the reviewed branch.
             Merge,
+            /// Summarize the branch's changes with a model, for the reviewer (spec 019).
+            Summarize,
         ]
     );
 }

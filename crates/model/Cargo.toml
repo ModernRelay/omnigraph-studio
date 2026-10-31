@@ -1,0 +1,24 @@
+[package]
+name = "model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/model.rs"
+
+[dependencies]
+futures = { workspace = true }
+http_client = { workspace = true }
+log = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+smol = { workspace = true }
+
+[dev-dependencies]
+http_client = { workspace = true, features = ["test-support"] }
+
+[lints]
+workspace = true

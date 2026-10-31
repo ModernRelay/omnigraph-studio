@@ -8,6 +8,7 @@
 //! crates attach to it with `cx.observe_new::<Workspace>` and `Workspace::register_action`.
 
 mod item;
+pub mod models;
 mod pane;
 mod panels;
 mod persistence;

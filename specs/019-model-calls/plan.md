@@ -1,6 +1,6 @@
 # 019: Model calls through OpenRouter
 
-Status: draft · 2026-10-29
+Status: built 2026-10-30; the three uses wait for a live check with a key
 
 ## Problem
 
@@ -160,12 +160,20 @@ pub struct Answer<T> {
     pub elapsed: Duration,
 }
 
-pub enum Error { NoKey, Refused(u16, String), NotInSchema(String), TooLarge, Timeout, Cancelled, Network(String) }
+pub enum Error { NoKey, Refused(u16, String), NotInSchema(String), TooLarge, Timeout, Network(String) }
 
 impl Client {
-    pub fn call<T: DeserializeOwned + JsonSchema>(&self, request: Request<'_>, cancel: Cancel) -> impl Future<Output = Result<Answer<T>, Error>>;
+    /// Dropping the future ends the call.
+    pub async fn call<T: DeserializeOwned>(&self, model: &str, key: &str, request: Request<'_>) -> Result<Answer<T>, Error>;
+    pub async fn list_models(&self) -> Result<Vec<ModelChoice>, Error>;
 }
 ```
+
+The crate holds no key and reads no setting: the caller gives the model and the key with each
+call. `studio_workspace::models::Models`, one per app, is what views call: it reads the key
+from the keychain, names the model for a task's tier from the settings, caches the model list, and runs each call off the main thread as a `Task` whose drop
+ends the call. A schema is a `serde_json::Value` the feature builds (its enums come from the
+graph's schema, not a Rust type).
 
 - `call` builds the body: the instructions as the system message, the input as the user
   message, `response_format` with the task's schema under `strict: true`, `max_tokens` from the
@@ -193,14 +201,18 @@ A **Models** section:
 |---|---|---|
 | `models.fast` | `anthropic/claude-haiku-5.5` | model picker |
 | `models.careful` | `anthropic/claude-sonnet-5.5` | model picker |
-| `models.data_leaves_for` | `[]` | read-only list of the tasks allowed so far |
+| `models.key_stored` | `false` | **OpenRouter key**: whether the keychain holds one; a masked field, Store, Test, Remove |
 
-and one row, **OpenRouter key**, that stores to the keychain and shows "Stored" or "None". A
-second row, **Provider keys**, explains BYOK in one line ("Your own Anthropic, OpenAI or Google
-key, set in your OpenRouter workspace, is used for that provider's models and billed to that
-account") with a button that opens `https://openrouter.ai/settings/integrations`. Studio holds
-no provider key: OpenRouter is the one place they live, and a request never carries one. The
-model picker lists `GET /api/v1/models` filtered to `structured_outputs`, as "name · $in/$out
+The key row writes the key to the keychain and shows "Stored" or "None"; `key_stored` only
+mirrors that, so the row reads right at start, and the key itself is never in the file.
+**Test** makes the smallest call there is with the stored key and the fast model (the word
+"ping", a one-field schema) and says "Connected: {model} answered in {s} s" or why not
+(`Models::test_connection`). The row's description names what each task sends, and explains
+BYOK in one line ("Your own Anthropic, OpenAI or Google key, set in
+your OpenRouter workspace, is used for that provider's models and billed to that account")
+and a **Provider keys…** button opens `https://openrouter.ai/settings/integrations`. Studio
+holds no provider key: OpenRouter is the one place they live, and a request never carries one.
+The model picker lists `GET /api/v1/models` filtered to `structured_outputs`, as "name · $in/$out
 per million", read once a day and kept in the data directory; without a key or network it holds
 the two defaults. The section's description: "Studio sends a task's input to OpenRouter and the
 model it names. Each task says what it sends before its first call. Nothing is sent without a
@@ -209,51 +221,60 @@ key."
 The defaults are the measured ones: Haiku was right on every filter at 1.5–2.8 s, Sonnet wrote
 the best summary. Gemini Flash Lite is a cheaper fast choice the picker offers.
 
-### Consent, once per task
+### What is sent is said once, in Settings
 
-The first call of a task in a graph shows, in the control's place, "{sends}. Send to
-{model}? [Send] [Not now]". Send adds the task name to `models.data_leaves_for` and runs the
-call; Not now leaves the control as it was. The list is global: a task allowed once is allowed
-for every graph, since what it sends is the same kind of data. Clearing the list in Settings
-asks again. The agent panel's writes already leave the machine through the agent's own model,
-so this is the same promise made the same way.
+No call asks first. The key row's description names what each task sends, each control's
+tooltip says the same for its task and the model it goes to, and storing a key is the consent:
+nothing is sent without one. (A first draft asked once per task, in the control's place, and
+kept the allowed tasks in a setting; it was dropped on 2026-10-30 as a step in the way of a
+filter box, since the key is the person's own and the settings row already says what leaves.)
 
 ### First uses
 
-**Table filter from a sentence** (`type_table`). The table's filter bar gets a text field,
-"Filter in words…" (`studio_table::FilterInWords`, ⌘⇧F; the pill bar's + menu offers it). Enter
-calls `table-filter` (Fast; 8 KB in, 300 tokens out, 10 s) with the type's property names and
+**Table filter from a sentence** (`type_table`). The table's toolbar holds a search field,
+"Filter in words…", always shown, before the control chips: a pill on the chips' height
+(`ds::pill_field`) with the model's mark where the search field has its glass, its spinner while a call is out,
+and its red line when one failed, with why in its tooltip (`studio_table::FilterInWords`,
+⌘⇧F, puts the cursor in it). Enter calls `table-filter` (Fast; 8 KB in, 300 tokens out, 10 s) with the type's property names and
 value types, its enums' values, its relationship keys (`relationship_key`), the 16 operators
 with one line each on what they take, today's date, and the sentence. The schema is built per
 type: `property` an enum of the type's keys, `op` an enum of the operators, `value` a list of
 strings. The answer's filters go through `builder::build`'s checks; any it refuses is dropped
-and the bar says "Could not use: {property}". The rest become pills as if added by hand, so
+and the bar says "Could not use: {property}". Relationships filter too: `has_any` and
+`has_none` as they are, and `related_to`, which the model answers with the related record's
+name as the sentence says it ("events Aaron attended"), goes through the node search the
+filter's own value field uses (`suggest::search_nodes`, the first match taken), so the pill
+shows the record and the query gets its id; a name no record matches is dropped and named. The rest become pills as if added by hand, so
 they are seen and removable, and the table reads as it does for any filter. A second sentence
 replaces the filters the first made and keeps ones added by hand. Measured: 1.5–2.8 s on
-Haiku with every answer right; the field shows its spinner meanwhile and Escape cancels.
+Haiku with every answer right; Escape leaves the field and clears what it said.
+The Fill button's tooltip and the Summarize button's name what goes out and to which model.
 
 **Branch summary** (`review`). A **Summarize** button beside the review's sentence
-(`studio_review::Summarize`, no default binding) calls `branch-summary` (Careful; 64 KB in,
+(`studio_review::Summarize`, ⌘⇧M) calls `branch-summary` (Careful; 64 KB in,
 1,200 tokens out, 60 s) with the branch name, the target, and the changes condensed as the
 review groups them: per type, the count by operation, then each change as its operation, id,
 title (the `name`, `title` or `subject` property, cut at 80 characters) and, for an update, the
 names of the properties that changed, at most 25 per type with "… and N more". No values go:
-a title is a value, so this is what the consent names. The answer is `{headline, points[],
+a title is a value, so this is what the settings row and the tooltip name. The answer is `{headline, points[],
 needs_attention[]}`, shown as a card under the sentence with the model's name and "Sent {n}
 records' titles", kept with the review until the head moves. Measured: 9.5 s on Sonnet,
 which counted every type, named the three edits to existing records and spotted duplicate
 emails; 2.5 s on Flash Lite, thin. A review over the byte cap sends its first 25 changes per
 type and says so.
 
-**Fill a column** (`type_table`, after spec 014's editing). A column header's menu gets
-**Fill from…** (`studio_table::FillColumn`): the person picks the source columns and writes
-one line ("the city from the address"). Each row is one `column-fill` call (Fast; 4 KB in,
+**Fill a column** (`type_table`, after spec 014's editing). The bulk bar, which already holds
+the selected rows and a property to set, gets **Fill with a model…** (`studio_table::FillColumn`, ⌘⇧L):
+a row under it names the target, offers the source columns (every other scalar column, each
+one a toggle) and takes one line ("the city from the address"). Each row is one `column-fill` call (Fast; 4 KB in,
 200 tokens out, 10 s) with the target property's type and enum values, the source cells, and
 the instruction; the answer is `{value: string | null, sure: bool}`. Rows run eight at a time
-over the selected rows, at most 500 (IX), each answer shown in its cell as a suggestion (the
-draft style of spec 014) with unsure ones marked; **Apply** writes the accepted ones as one
-batch on the session's branch, as a paste would, and Escape discards the rest. A cell the
-person edited meanwhile is skipped.
+over the selected rows, at most 500 (IX), each sure answer put on its cell as a draft (spec 014), which the drafts bar saves as one
+commit or discards; an unsure answer is counted and left empty rather than marked, since a
+draft the person did not mean to keep is worse than a cell to fill by hand. A cell holding a
+draft or an edit, one whose value moved while its call was out, and one the answer is the
+same for or does not fit are skipped and counted. Closing the row stops the fill; the drafts
+made stay.
 
 ### What a later use needs
 
@@ -280,12 +301,12 @@ A call is never retried. The model list is read at most once a day.
 |---|---|---|
 | OpenRouter is the one provider | Anthropic and OpenAI directly; a provider per key; the agent's login | One key, one request shape and one model picker cover every vendor; routing options give the data policy per call. Direct Anthropic was 0.7 s faster for the same model, not enough for two code paths. The agents' logins cannot make API calls |
 | A provider's own key goes through OpenRouter's BYOK, set in its workspace | Provider keys in Studio's settings, sent per request; Studio registering them through the management API | BYOK is not per request, so Studio holding a provider key would gain nothing; registering keys needs a management key and makes Studio a key manager. One link to the integrations page does it, and the provider's own data policies still apply |
-| Named models by tier, not a router | `openrouter/auto`; `typesafe/jev-router` | Auto was right on every filter but 3–5 s against Haiku's 1.5–2.8 s, and neither router says what it will cost or which model will see the data before the call; a named model is what the consent line names |
+| Named models by tier, not a router | `openrouter/auto`; `typesafe/jev-router` | Auto was right on every filter but 3–5 s against Haiku's 1.5–2.8 s, and neither router says what it will cost or which model will see the data before the call; a named model is what the settings row and the tooltips name |
 | Jev for yes-or-no gates, later, not for the first uses | Jev as the filter or summary engine; Jev picking the table for a sentence | Jev answers typed questions with probabilities, not generated structures: it cannot write a filter or a summary. It was certain and right on read-versus-write, but unsure across 100 types. A gate such as "does this sentence ask for a change" before a filter, or routing a sentence to filter versus query, is its shape, under $0.0001 a call |
 | A schema on every call, parsed in Studio | Prompt for JSON and parse; the agent panel | Without `response_format` both agents misnamed fields every time; with it, every answer parsed. The parse in Studio covers providers that only hint |
 | No headless-CLI fallback | `claude -p --json-schema` or `codex exec --output-schema` without a key | Both are 4–6 s a call and `claude -p` costs 2.6¢ each; a feature that is sometimes five times slower is a worse feature than one that asks for a key |
 | The key lives in the keychain | A `0600` file as the CLI's tokens; settings.json | Spec 016 already keeps its secret there with GPUI's credentials calls; a file would be the first secret file of Studio's own |
-| Consent once per task, named by what it sends | A global switch; a dialog per call | A per-call dialog is VII's loudness; a global switch cannot say what each task sends |
+| No confirmation before a call; the settings row and each control's tooltip say what is sent | A confirmation once per task, kept in a setting (the first draft); a dialog per call | A confirmation in a filter box is a step in the way of every first use, and storing the key is already the person's choice; VI is met by saying what each task sends where the key is set and on each control |
 | Models per tier, not per task | A model per task | Two choices are explainable; a task names its tier and the picker names the price |
 | Answers are proposals in the view's own controls | Apply filters silently; write filled cells at once | III: the person's accept is the write; a filter pill can be removed, a suggested cell discarded |
 | Titles but no values in a summary | Whole changes; ids only | Ids alone gave no summary worth reading; titles gave Sonnet enough to name the invoice amounts and the duplicates |
@@ -306,6 +327,8 @@ A call is never retried. The model list is read at most once a day.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-30 | The crate sends the schema under strict with the provider policy, parses the answer as the task's type, and tells its errors apart | `model` `a_call_sends_the_schema_and_parses_the_answer`, `errors_are_told_apart`, `the_model_list_keeps_schema_models_with_prices` (a fake HTTP client) | Pass |
+| 2026-10-30 | A sentence's answer becomes filters the type takes, and a branch condenses to titles and changed property names without values | `type_table` `words::tests::an_answer_becomes_filters_the_type_takes`, `fill::tests::a_rows_input_names_the_target_and_its_sources`; `review` `summary::tests::the_input_holds_titles_and_changed_property_names_but_no_values` | Pass. The live calls were not run from the app yet: no key is stored in it |
 | 2026-10-29 | Direct schema-bound calls answer filters in 1–3 s and agent routes in 4–6 s; ACP without a schema does not keep the shape | Eight requests on `Event`, graded; `claude -p`, `codex exec`, warm ACP sessions of both agents, OpenRouter with four models, Anthropic direct (scratchpad `nlfilter/`, scripts `run.sh`, `direct.py`, `acp_turns.py`, `grade.py`) | As in the table above. Haiku, Flash Lite and the CLIs 8/8; nano 5/8; ACP 0/5 with the wrong field names |
 | 2026-10-29 | The Auto Router is right but slower than a named model; Jev is certain on read-versus-write and unsure on a 100-way type choice | `direct.py` with `openrouter/auto`; `jev.py` (six sentences, a Choice over the schema's node types and a Noul) | Auto 8/8 at 3–5 s via Azure; Jev 0.4–6 s, Noul right 6/6 (0.98 vs ≤ 0.04), Choice 4/6 |
 | 2026-10-29 | A condensed 294-change branch summarizes well in ~10 s | `direct_summary.py` on Sonnet and Flash Lite; `claude -p` Sonnet; `codex exec` Astra | Sonnet 9.5 s and best; Astra 15 s; `claude -p` 28 s at 7.3¢; Flash Lite 2.5 s but generic |

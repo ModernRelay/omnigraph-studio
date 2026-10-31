@@ -7,6 +7,7 @@ mod branches;
 mod conflicts;
 mod edit;
 mod scope_menu;
+mod summary;
 mod view;
 
 use gpui::{App, AppContext as _};

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use editor::{Editor, EditorEvent};
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, Global, HighlightStyle, Render,
-    SharedString, StyledText, Subscription, WeakEntity, Window,
+    SharedString, StyledText, Subscription, Task, WeakEntity, Window,
 };
 use gq_language::SchemaModel;
 use graph_store::{GraphSession, SessionEvent};
@@ -21,6 +21,7 @@ use serde_json::Value;
 use studio_settings::{FieldKind, Scope, SettingField, SettingsValues, StudioSettings, TypeNaming};
 use studio_ui::ds::{self, Dotted as _, space};
 use studio_ui::menu::ContextMenu;
+use studio_workspace::models::{KeyState, Models};
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace, WorkspaceEvent};
 use theme::ThemeRegistry;
 use ui::prelude::*;
@@ -38,6 +39,13 @@ pub struct SettingsView {
     scope: Scope,
     /// A field for each text setting, made with the tab.
     text_inputs: Vec<TextInput>,
+    /// The OpenRouter key being typed (spec 019): stored in the keychain on Store, never shown
+    /// again.
+    key_editor: Entity<Editor>,
+    /// What the last Store, Remove or Test said.
+    key_notice: Option<String>,
+    /// The connection test under way (spec 019).
+    key_test: Option<Task<()>>,
     /// The settings as values, read again when they change rather than at every frame.
     values: SettingsValues,
     /// The window's graph changing, which the tab follows.
@@ -169,6 +177,16 @@ impl SettingsView {
                 shown: String::new(),
             });
         }
+        let key_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("sk-or-…", window, cx);
+            editor.set_text_style_refinement(ds::field_text(cx));
+            editor.set_masked(true, cx);
+            editor
+        });
+        if let Some(models) = Models::try_global(cx) {
+            subscriptions.push(cx.observe(&models, |_, _, cx| cx.notify()));
+        }
         let mut this = Self {
             search,
             section: None,
@@ -176,6 +194,9 @@ impl SettingsView {
             session: None,
             scope: Scope::All,
             text_inputs,
+            key_editor,
+            key_notice: None,
+            key_test: None,
             values: StudioSettings::get(cx).values(),
             _workspace_subscription: None,
             _session_subscription: None,
@@ -370,6 +391,139 @@ impl SettingsView {
     }
 
     /// Text field `index`'s control: the field, which Enter writes.
+    /// The OpenRouter key row (spec 019): whether the keychain holds one, a field to store
+    /// one, Remove, and where provider keys are set.
+    fn key_control(&self, cx: &mut Context<Self>) -> AnyElement {
+        let state = Models::try_global(cx).map(|models| models.read(cx).key_state());
+        let (status, color) = match state {
+            Some(KeyState::Stored) => ("Stored", Color::Success),
+            Some(KeyState::Reading) => ("Reading the keychain…", Color::Muted),
+            Some(KeyState::None) | None => ("None", Color::Muted),
+        };
+        let stored = state == Some(KeyState::Stored);
+        let typing = !self.key_editor.read(cx).text(cx).trim().is_empty();
+        v_flex()
+            .items_end()
+            .gap(px(space::XS))
+            .child(
+                h_flex()
+                    .gap(px(space::SM))
+                    .items_center()
+                    .child(ds::text::muted(status).color(color))
+                    .child(
+                        ds::field_frame(false, cx)
+                            .key_context("SettingsField")
+                            .w(px(ds::size::FIELD))
+                            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                                this.store_key(window, cx)
+                            }))
+                            .child(ds::field_input(self.key_editor.clone())),
+                    )
+                    .child(
+                        ds::button("store-key", "Store").disabled(!typing).on_click(
+                            cx.listener(|this, _, window, cx| this.store_key(window, cx)),
+                        ),
+                    )
+                    .when(stored, |row| {
+                        row.child(
+                            ds::button("test-key", "Test")
+                                .disabled(self.key_test.is_some())
+                                .tooltip(Tooltip::text(
+                                    "Ask the fast model for one word, with this key",
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| this.test_key(cx))),
+                        )
+                        .child(
+                            ds::button("remove-key", "Remove")
+                                .on_click(cx.listener(|this, _, _, cx| this.remove_key(cx))),
+                        )
+                    }),
+            )
+            .child(
+                h_flex()
+                    .gap(px(space::SM))
+                    .items_center()
+                    .children(self.key_notice.clone().map(ds::text::muted))
+                    .child(
+                        ds::button("provider-keys", "Provider keys…")
+                            .style(ButtonStyle::Subtle)
+                            .tooltip(Tooltip::text(
+                                "Your own provider keys live in your OpenRouter workspace, \
+                                 never in Studio",
+                            ))
+                            .on_click(|_, _, cx| {
+                                cx.open_url("https://openrouter.ai/settings/integrations")
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn store_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let key = self.key_editor.read(cx).text(cx);
+        if key.trim().is_empty() {
+            return;
+        }
+        self.key_editor
+            .update(cx, |editor, cx| editor.clear(window, cx));
+        self.put_key(key, cx);
+    }
+
+    /// The smallest call there is, with the stored key and the fast model: says the model and
+    /// the time, or why it failed.
+    fn test_key(&mut self, cx: &mut Context<Self>) {
+        let Some(models) = Models::try_global(cx) else {
+            return;
+        };
+        let call = models.read(cx).test_connection(cx);
+        self.key_notice = Some("Testing…".to_owned());
+        self.key_test = Some(cx.spawn(async move |this, cx| {
+            let answer = call.await;
+            this.update(cx, |this, cx| {
+                this.key_notice = Some(match answer {
+                    Ok(answer) => format!(
+                        "Connected: {} answered in {:.1} s.",
+                        answer.model,
+                        answer.elapsed.as_secs_f32()
+                    ),
+                    Err(error) => format!("Not connected: {error}"),
+                });
+                this.key_test = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn remove_key(&mut self, cx: &mut Context<Self>) {
+        self.put_key(String::new(), cx);
+    }
+
+    fn put_key(&mut self, key: String, cx: &mut Context<Self>) {
+        let Some(models) = Models::try_global(cx) else {
+            return;
+        };
+        let removing = key.trim().is_empty();
+        let written = models.update(cx, |models, cx| models.set_key(key, cx));
+        cx.spawn(async move |this, cx| {
+            let result = written.await;
+            this.update(cx, |this, cx| {
+                this.key_notice = Some(match (result, removing) {
+                    (Ok(()), false) => "Stored in the keychain.".to_owned(),
+                    (Ok(()), true) => "Removed.".to_owned(),
+                    (Err(error), false) => {
+                        format!("Kept for this run; the keychain did not keep it: {error}")
+                    }
+                    (Err(error), true) => format!("The keychain did not remove it: {error}"),
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn text_control(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         ds::field_frame(false, cx)
             .key_context("SettingsField")
@@ -485,6 +639,24 @@ fn dropdown(target: &Target, current: Value, options: Options) -> AnyElement {
         })
         .anchor(gpui::Anchor::TopRight)
         .into_any_element()
+}
+
+/// A model picker (spec 019): the models OpenRouter lists that take a schema, with their
+/// prices, and the one set when the list does not hold it.
+fn model_control(target: &Target, values: &SettingsValues, cx: &App) -> AnyElement {
+    let current = values.value_in(&target.scope, target.field).clone();
+    let mut options: Vec<(SharedString, Value)> = Models::try_global(cx)
+        .map(|models| models.read(cx).choices())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|choice| (SharedString::from(choice.label()), Value::from(choice.id)))
+        .collect();
+    if let Some(id) = current.as_str()
+        && !options.iter().any(|(_, value)| value == &current)
+    {
+        options.insert(0, (SharedString::from(id.to_owned()), current.clone()));
+    }
+    dropdown(target, current, Rc::from(options))
 }
 
 /// The choice of the property that names a type's nodes, as the canvas and the table offer it.
@@ -870,9 +1042,15 @@ impl Render for SettingsView {
                                 .text_inputs
                                 .iter()
                                 .position(|input| std::ptr::eq(input.field, field));
-                            let control = match text_input {
-                                Some(index) => self.text_control(index, cx),
-                                None => control(&target, values, fonts.as_ref(), cx),
+                            let control = match (text_input, &field.kind) {
+                                (Some(index), _) => self.text_control(index, cx),
+                                (None, FieldKind::Custom(kind)) if kind == "openrouter-key" => {
+                                    self.key_control(cx)
+                                }
+                                (None, FieldKind::Custom(kind)) if kind == "model" => {
+                                    model_control(&target, values, cx)
+                                }
+                                _ => control(&target, values, fonts.as_ref(), cx),
                             };
                             let row = ds::setting_row(
                                 target.id("row"),

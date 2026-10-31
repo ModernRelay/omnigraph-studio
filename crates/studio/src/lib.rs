@@ -37,6 +37,8 @@ pub fn init(cx: &mut App) {
     studio_theme::init_themes(cx);
     editor::init(cx);
     graph_store::init(cx);
+    // After `graph_store`, whose HTTP client it sends through (spec 019).
+    studio_workspace::models::Models::init(cx);
     // After `graph_store`, whose HTTP client it sends through (spec 017).
     studio_update::init(cx);
     keymaps::load(cx);
