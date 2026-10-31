@@ -119,14 +119,6 @@ impl Challenge {
         self.param("error") == Some("invalid_token")
     }
 
-    /// Whether a 401 whose challenge is `challenge` refused the token its request carried: as
-    /// the challenge says, or, from a server that sends none (an older one), whether one was
-    /// `sent`. One that refused none though a token was sent means it never arrived (a proxy
-    /// dropped it); with none sent, the server asks for one.
-    pub fn refuses(challenge: Option<&Challenge>, sent: bool) -> bool {
-        challenge.map_or(sent, Challenge::token_refused)
-    }
-
     /// Where the server's protected-resource metadata is, when it takes OAuth sign-in.
     pub fn resource_metadata(&self) -> Option<&str> {
         self.param("resource_metadata")
@@ -229,8 +221,8 @@ impl Challenge {
 }
 
 /// What a 401 says of the token its request carried, judged from its `Bearer` challenge and
-/// whether the request carried one ([`Challenge::refuses`]). A read's, a write's and the agent's
-/// 401 are judged, and said, alike.
+/// whether the request carried one ([`Self::judge`]). A read's, a write's, the agent's and a
+/// probe's 401 are judged, and said, alike.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unauthorized {
     /// The server refused the token it received: it may have lapsed, or not admit this account.
@@ -244,9 +236,11 @@ pub enum Unauthorized {
 
 impl Unauthorized {
     /// The judgement of a 401 whose challenge is `challenge`, to a request that carried a token
-    /// when `sent`.
+    /// when `sent`: refused as the challenge says, or, from a server that sends none (an older
+    /// one), whenever one was sent. One that refused none though a token was sent means it never
+    /// arrived; with none sent, the server asks for one.
     pub fn judge(challenge: Option<&Challenge>, sent: bool) -> Self {
-        if Challenge::refuses(challenge, sent) {
+        if challenge.map_or(sent, Challenge::token_refused) {
             Self::TokenRefused
         } else if sent {
             Self::TokenNotReceived

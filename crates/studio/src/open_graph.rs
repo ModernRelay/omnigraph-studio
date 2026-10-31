@@ -1054,13 +1054,11 @@ fn state_status(c: &Connection) -> String {
             format!("The Omnigraph CLI gave no token for this server: {reason}")
         }
         // As a read or a write says it.
-        (ConnectionState::Unauthorized, None) if c.token_not_received() => {
-            Unauthorized::TokenNotReceived.reason().into()
-        }
-        (ConnectionState::Unauthorized, None) if !c.refused_with_token => {
-            Unauthorized::TokenNeeded.reason().into()
-        }
-        (ConnectionState::Unauthorized, None) => Unauthorized::TokenRefused.reason().into(),
+        (ConnectionState::Unauthorized, None) => c
+            .refusal
+            .unwrap_or(Unauthorized::TokenNeeded)
+            .reason()
+            .into(),
         (state, _) => state.label(),
     }
 }
@@ -1350,7 +1348,7 @@ mod tests {
         for connection in [&alpha, &beta] {
             connection.update(cx, |connection, _| {
                 connection.state = ConnectionState::Unauthorized;
-                connection.refused_with_token = true;
+                connection.refusal = Some(Unauthorized::TokenRefused);
             });
         }
         let (modal, cx) = dialog(vec![alpha.clone(), beta.clone()], cx);
@@ -1421,7 +1419,7 @@ mod tests {
         let refused = server(&["one"], cx);
         refused.update(cx, |connection, _| {
             connection.state = ConnectionState::Unauthorized;
-            connection.refused_with_token = true;
+            connection.refusal = Some(Unauthorized::TokenRefused);
         });
         let (modal, cx) = dialog(vec![refused.clone()], cx);
         let reaches_token = |cx: &mut VisualTestContext| {
@@ -1429,12 +1427,16 @@ mod tests {
         };
         assert!(reaches_token(cx));
         // A token that never arrived: one typed would be dropped the same way.
-        refused.update(cx, |connection, _| connection.refused_with_token = false);
+        refused.update(cx, |connection, _| {
+            connection.refusal = Some(Unauthorized::TokenNotReceived)
+        });
         assert!(
             !reaches_token(cx),
             "a token that never arrived hides the field"
         );
-        refused.update(cx, |connection, _| connection.refused_with_token = true);
+        refused.update(cx, |connection, _| {
+            connection.refusal = Some(Unauthorized::TokenRefused)
+        });
         refused.update(cx, |connection, _| connection.hold_sign_in_for_tests());
         assert!(!reaches_token(cx), "a sign-in under way hides the field");
     }
@@ -1455,7 +1457,7 @@ mod tests {
                 connection.state = state;
                 connection.sign_in = sign_in;
                 connection.token_unread = unread.map(str::to_owned);
-                connection.refused_with_token = true;
+                connection.refusal = Some(Unauthorized::TokenRefused);
                 line_actions(connection)
             })
         };
@@ -1490,7 +1492,7 @@ mod tests {
             connection.state = ConnectionState::Unauthorized;
             connection.sign_in = signed_in();
             connection.token_unread = None;
-            connection.refused_with_token = false;
+            connection.refusal = Some(Unauthorized::TokenNotReceived);
             line_actions(connection)
         });
         assert_eq!(not_received, [LineAction::SignOut, LineAction::Retry]);
@@ -1569,7 +1571,7 @@ mod tests {
         let said = |state: ConnectionState, sign_in: SignIn, cx: &mut TestAppContext| {
             connection.update(cx, |connection, _| {
                 connection.state = state;
-                connection.refused_with_token = true;
+                connection.refusal = Some(Unauthorized::TokenRefused);
                 connection.sign_in = sign_in;
                 (server_status(connection), connection.label())
             })
@@ -1653,7 +1655,7 @@ mod tests {
         // A token that never arrived reads so, not as an account the server does not admit.
         let not_received = connection.update(cx, |connection, _| {
             connection.state = ConnectionState::Unauthorized;
-            connection.refused_with_token = false;
+            connection.refusal = Some(Unauthorized::TokenNotReceived);
             connection.sign_in = signed_in();
             (server_status(connection), connection.label())
         });
@@ -1715,26 +1717,23 @@ mod tests {
     fn a_server_sent_no_token_is_said_to_ask_for_one(cx: &mut TestAppContext) {
         let connection = server(&[], cx);
         connection.update(cx, |connection, cx| connection.set_token(None, cx));
-        let said = |refused_with_token: bool, cx: &mut TestAppContext| {
+        let said = |refusal: Unauthorized, cx: &mut TestAppContext| {
             connection.update(cx, |connection, _| {
                 connection.state = ConnectionState::Unauthorized;
-                connection.refused_with_token = refused_with_token;
+                connection.refusal = Some(refusal);
                 (server_status(connection), connection.label())
             })
         };
         assert_eq!(
-            said(false, cx),
+            said(Unauthorized::TokenNeeded, cx),
             (
                 "This server asks for a token; none is configured for it.".to_owned(),
                 "Asks for a token".to_owned()
             )
         );
         // One sent that never arrived, as a proxy drops it.
-        connection.update(cx, |connection, cx| {
-            connection.set_token(Some("typed".into()), cx)
-        });
         assert_eq!(
-            said(false, cx),
+            said(Unauthorized::TokenNotReceived, cx),
             (
                 "The server received no token, though Studio sent one: something between them \
                  may drop it."
@@ -1742,9 +1741,8 @@ mod tests {
                 "Token not received".to_owned()
             )
         );
-        connection.update(cx, |connection, cx| connection.set_token(None, cx));
         assert_eq!(
-            said(true, cx),
+            said(Unauthorized::TokenRefused, cx),
             (
                 "The server refused the token.".to_owned(),
                 "Token refused".to_owned()
@@ -1754,7 +1752,7 @@ mod tests {
             connection.token_unread = Some("No credential is configured for 'cloud'".into());
         });
         assert_eq!(
-            said(false, cx),
+            said(Unauthorized::TokenNeeded, cx),
             (
                 "The Omnigraph CLI gave no token for this server: No credential is configured \
                  for 'cloud'"
@@ -1820,7 +1818,7 @@ mod tests {
         };
         connection.update(cx, |connection, cx| {
             connection.set_token(Some("typed".into()), cx);
-            connection.refused_with_token = true;
+            connection.refusal = Some(Unauthorized::TokenRefused);
         });
         assert!(!gave_none(None, cx), "a refused token");
         connection.update(cx, |connection, cx| connection.set_token(None, cx));
