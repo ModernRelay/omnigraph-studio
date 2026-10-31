@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 use futures::channel::oneshot;
 use gpui::{Context, EventEmitter, Task};
 use graph_client::api::{GraphInfo, HealthOutput};
-use graph_client::{Challenge, GraphClient, ReadError};
+use graph_client::{Challenge, GraphClient, ReadError, Unauthorized};
 use http_client::HttpClient;
 use oauth_client::TokenError;
 use studio_settings::StudioSettings;
@@ -60,7 +60,7 @@ pub enum ConnectionState {
         served: Option<String>,
     },
     /// The server answered 401: the token sent was refused, the one sent never arrived, or none
-    /// was sent ([`Connection::refused_with_token`] and [`Connection::has_token`] say which).
+    /// was sent ([`Connection::refusal`] says which).
     /// Also a server whose token source gave none ([`Connection::token_unread`] says why), which
     /// is asked nothing without one.
     Unauthorized,
@@ -166,12 +166,11 @@ pub struct Connection {
     /// [`Self::token_unread`] says why, a sign-in stands, and the next health check connects
     /// again, which asks again.
     pub token_unanswered: bool,
-    /// Whether the server refused the token of the request it answered with 401
-    /// ([`ConnectionState::Unauthorized`]): its challenge says `error="invalid_token"`, or, from
-    /// a server that sends no challenge, the request carried one. Otherwise the server asks for
-    /// a token rather than refusing one: none was sent, or the one sent never arrived (a proxy
-    /// that drops it), as [`Connection::has_token`] tells.
-    pub refused_with_token: bool,
+    /// What the 401 to the connect's probe or to the graph list said of the token it sent
+    /// ([`ConnectionState::Unauthorized`]), judged as every request's is ([`Unauthorized`]):
+    /// refused, never received (a proxy that drops it), or none sent. `None` while no such 401
+    /// stands, as when the source gave no token ([`Self::token_unread`]).
+    pub refusal: Option<Unauthorized>,
     /// The token held is the one the current source last gave: an ask that fails for a reason
     /// that may pass leaves it in use while it lives ([`Self::keeps_token`]).
     token_from_source: bool,
@@ -187,7 +186,7 @@ pub struct Connection {
     /// connect is ready.
     asked_after_refusal: bool,
     /// The token ([`GraphClient::token_serial`]) a 401 to the connect's probe or to the graph
-    /// list refused ([`Connection::refused`], [`Connection::refused_with_token`]): while it is
+    /// list refused ([`Connection::refused`], [`Connection::refusal`]): while it is
     /// held, the next is a new credential whatever asks for it, a connect from that state
     /// included, as a transport change starts, and a failure to give one does not keep it. A
     /// probe the server answers clears it.
@@ -439,7 +438,9 @@ impl Connection {
             (ConnectionState::Unauthorized, None) if self.token_not_received() => {
                 "Token not received".into()
             }
-            (ConnectionState::Unauthorized, None) if !self.refused_with_token => {
+            (ConnectionState::Unauthorized, None)
+                if self.refusal != Some(Unauthorized::TokenRefused) =>
+            {
                 "Asks for a token".into()
             }
             (state, _) => state.label(),
@@ -461,7 +462,7 @@ impl Connection {
             graphs: GraphListing::Unknown,
             token_unread: None,
             token_unanswered: false,
-            refused_with_token: false,
+            refusal: None,
             token_from_source: false,
             token_source: None,
             token_given: false,
@@ -648,7 +649,7 @@ impl Connection {
 
     /// A request of one of the server's graphs (a read, a write, the agent's through its
     /// gateway) was answered 401 refusing the source's token it carried
-    /// ([`graph_client::Challenge::refuses`]; one that refused none, the token never arriving,
+    /// ([`Unauthorized::TokenRefused`]; one that refused none, the token never arriving,
     /// is not told here): the token may have lapsed (a managed data token lives an hour), with `/healthz`, which
     /// asks for none, still answering. The source is told ([`TokenSource::note_refused`]), then
     /// asked again, once for the token held: a renewed token replaces it and what was read is
@@ -1001,7 +1002,7 @@ impl Connection {
         }
         if connecting || self.state != ConnectionState::Idle {
             self._connect = None;
-            self.refused_with_token = false;
+            self.refusal = None;
             self.state = ConnectionState::Unauthorized;
             self.schedule_health_check(cx);
         }
@@ -1284,8 +1285,8 @@ impl Connection {
         self.token_source.is_some() && !self.token_given
     }
 
-    /// Takes the state a failed read left, noting for a 401 whether the server refused the
-    /// token sent ([`Self::refused_with_token`]). A token from the source that the server
+    /// Takes the state a failed read left, noting what a 401 said of the token sent
+    /// ([`Self::refusal`]). A token from the source that the server
     /// refused is asked for once more: a rotated one connects again, the same one stays
     /// refused, and a probe's 401 asks nothing again until a connect is ready,
     /// [`Self::refresh_token`] (the person's Refresh, or a change to the CLI) or a new source. A
@@ -1311,8 +1312,10 @@ impl Connection {
             }
         }
         if failed.state == ConnectionState::Unauthorized {
-            self.refused_with_token = Challenge::refuses(failed.challenge.as_deref(), token_sent);
-            if self.refused_with_token {
+            let refusal = Unauthorized::judge(failed.challenge.as_deref(), token_sent);
+            self.refusal = Some(refusal);
+            let refused = refusal == Unauthorized::TokenRefused;
+            if refused {
                 self.probe_refused = Some(self.client.token_serial());
             }
             // A refused token is not renewed: the ask below is the one more try, and a token
@@ -1321,7 +1324,7 @@ impl Connection {
             self.renewal_missed = false;
             // A 401 that refused no token (one that never arrived, as a proxy drops it) asks
             // nothing: the next token would fare no better.
-            if self.refused_with_token && !self.asked_after_refusal && self.asks_token_source() {
+            if refused && !self.asked_after_refusal && self.asks_token_source() {
                 self.asked_after_refusal = true;
                 if let Some(source) = &self.token_source {
                     source.note_refused();
@@ -1831,10 +1834,7 @@ impl Connection {
     /// between them dropped it, say), so a token typed would be dropped the same way.
     pub fn token_not_received(&self) -> bool {
         self.state == ConnectionState::Unauthorized
-            && !self.refused_with_token
-            && self.has_token()
-            // An ended token kept while its source could not answer was not sent and lost.
-            && self.token_unread.is_none()
+            && self.refusal == Some(Unauthorized::TokenNotReceived)
     }
 
     /// Holds a sign-in under way, as a test's state.
@@ -2269,7 +2269,7 @@ enum Probe {
 }
 
 /// A read that left the connection unusable: the state it leaves, and a 401's challenge, which
-/// says whether it refused the token sent ([`Challenge::refuses`]) and where the server's
+/// says whether it refused the token sent ([`Unauthorized::judge`]) and where the server's
 /// sign-in details are (`resource_metadata`), when it offers a sign-in. `None` from a server
 /// that sends none.
 struct Failed {
@@ -2745,18 +2745,20 @@ mod tests {
         let said = |cx: &mut TestAppContext| {
             connection.read_with(cx, |connection, _| {
                 assert_eq!(connection.state, ConnectionState::Unauthorized);
-                (connection.refused_with_token, connection.label())
+                (connection.refusal, connection.label())
             })
         };
-        assert_eq!(said(cx), (false, "Asks for a token".to_owned()));
+        let needed = Some(Unauthorized::TokenNeeded);
+        assert_eq!(said(cx), (needed, "Asks for a token".to_owned()));
         connection.update(cx, |connection, cx| {
             connection.set_token(Some("typed".into()), cx)
         });
         cx.run_until_parked();
-        assert_eq!(said(cx), (true, "Token refused".to_owned()));
+        let refused = Some(Unauthorized::TokenRefused);
+        assert_eq!(said(cx), (refused, "Token refused".to_owned()));
         connection.update(cx, |connection, cx| connection.set_token(None, cx));
         cx.run_until_parked();
-        assert_eq!(said(cx), (false, "Asks for a token".to_owned()));
+        assert_eq!(said(cx), (needed, "Asks for a token".to_owned()));
     }
 
     /// A graph list that could not be read is read again when something next shows the server,
@@ -3748,7 +3750,7 @@ mod tests {
         *source.answers.lock().unwrap() = vec![None];
         connection.update(cx, |connection, cx| {
             connection.state = ConnectionState::Unauthorized;
-            connection.refused_with_token = true;
+            connection.refusal = Some(Unauthorized::TokenRefused);
             connection.probe_refused = Some(connection.client().token_serial());
             connection.refresh_token(cx);
         });
