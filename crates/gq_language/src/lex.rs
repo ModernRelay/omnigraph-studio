@@ -362,7 +362,11 @@ impl Statement {
 
 /// The declarations of a source and its settings prefix.
 pub fn outline(source: &str) -> Outline {
-    let tokens = tokenize(source);
+    outline_of(source, &tokenize(source))
+}
+
+/// [`outline`] from `source`'s tokens, [`tokenize`]d once by a caller that reads them too.
+pub fn outline_of(source: &str, tokens: &[Token]) -> Outline {
     let text = |t: &Token| &source[t.range.clone()];
     let mut outline = Outline::default();
 
@@ -542,10 +546,11 @@ impl Outline {
     }
 }
 
-/// Whether text typed at `offset` goes into a comment or a string: inside one, or at the end of
-/// one still open. A line comment runs to the end of its line, so its end is inside it.
-pub fn in_comment_or_string(source: &str, offset: usize) -> bool {
-    tokenize(source).into_iter().any(|token| {
+/// Whether text typed at `offset` of `source`, whose `tokens` these are, goes into a comment or
+/// a string: inside one, or at the end of one still open. A line comment runs to the end of its
+/// line, so its end is inside it.
+pub fn in_comment_or_string(source: &str, tokens: &[Token], offset: usize) -> bool {
+    tokens.iter().any(|token| {
         let text = &source[token.range.clone()];
         let open = match token.kind {
             TokenKind::Comment => {
@@ -584,15 +589,16 @@ pub fn looks_like_mutation(source: &str) -> bool {
     })
 }
 
-/// The byte range to underline for a problem reported at `byte`: the token there, or one
-/// character when no token starts or covers it.
-pub fn problem_range(source: &str, byte: usize) -> Range<usize> {
+/// The byte range to underline for a problem reported at `byte`: the token there among
+/// `tokens` (`source`'s, [`tokenize`]d once for all its problems), or one character when no
+/// token starts or covers it.
+pub fn problem_range(source: &str, tokens: &[Token], byte: usize) -> Range<usize> {
     let byte = byte.min(source.len());
-    if let Some(token) = tokenize(source)
-        .into_iter()
-        .find(|t| t.range.start <= byte && byte < t.range.end)
-    {
-        return token.range;
+    // `source`'s tokens, made once for all its problems, in order and apart: the one holding
+    // `byte` is found by halving.
+    let at = tokens.partition_point(|t| t.range.end <= byte);
+    if let Some(token) = tokens.get(at).filter(|t| t.range.start <= byte) {
+        return token.range.clone();
     }
     let start = source.floor_char_boundary(byte);
     let end = source[start..]
@@ -824,7 +830,7 @@ mod tests {
     /// typed after a closed one, it does not.
     #[test]
     fn comments_and_strings_hold_what_is_typed_in_them() {
-        let at_end = |source: &str| in_comment_or_string(source, source.len());
+        let at_end = |source: &str| in_comment_or_string(source, &tokenize(source), source.len());
         assert!(at_end("// see the docs."));
         assert!(at_end("query q() {} // group by company"));
         assert!(at_end("/* open"));
@@ -835,12 +841,16 @@ mod tests {
         assert!(!at_end("query q() { match { $p: Person { name: \"Ada\""));
         assert!(!at_end("query q() { match { $p: Pe"));
         let source = "// note\nquery";
-        assert!(in_comment_or_string(source, 3));
+        assert!(in_comment_or_string(source, &tokenize(source), 3));
         assert!(
-            !in_comment_or_string(source, 0),
+            !in_comment_or_string(source, &tokenize(source), 0),
             "before the comment starts"
         );
-        assert!(!in_comment_or_string(source, source.len()));
+        assert!(!in_comment_or_string(
+            source,
+            &tokenize(source),
+            source.len()
+        ));
     }
 
     #[test]
@@ -909,9 +919,18 @@ mod tests {
     fn problems_underline_a_token() {
         let source = "query q() { match { $p: Person } return { $p.nope } }";
         let at = source.find("nope").unwrap();
-        assert_eq!(&source[problem_range(source, at)], "nope");
-        assert_eq!(&source[problem_range(source, source.len())], "}");
-        assert_eq!(problem_range(source, at + 4), at + 4..at + 5);
+        assert_eq!(
+            &source[problem_range(source, &tokenize(source), at)],
+            "nope"
+        );
+        assert_eq!(
+            &source[problem_range(source, &tokenize(source), source.len())],
+            "}"
+        );
+        assert_eq!(
+            problem_range(source, &tokenize(source), at + 4),
+            at + 4..at + 5
+        );
     }
 
     /// A statement starts at the first word after the settings prefix, as `outline` reads it:

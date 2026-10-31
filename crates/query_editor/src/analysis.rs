@@ -70,6 +70,8 @@ impl Analysis {
             );
             checked_alone.push(declaration);
         }
+        // Made once for every problem's underline, rather than once each.
+        let tokens = gq_language::tokenize(&text);
         let mut problems: Vec<(Diagnostic, Option<Range<usize>>)> = checked
             .diagnostics
             .into_iter()
@@ -79,7 +81,7 @@ impl Analysis {
                     .byte
                     .map(|b| b as usize)
                     .or_else(|| locate(&text, &outline, &diagnostic));
-                let range = byte.map(|byte| gq_language::problem_range(&text, byte));
+                let range = byte.map(|byte| gq_language::problem_range(&text, &tokens, byte));
                 (diagnostic, range)
             })
             .filter(|(diagnostic, range)| {
@@ -100,7 +102,7 @@ impl Analysis {
                 .map(|diagnostic| {
                     let range = diagnostic
                         .byte
-                        .map(|byte| gq_language::problem_range(&text, byte as usize));
+                        .map(|byte| gq_language::problem_range(&text, &tokens, byte as usize));
                     (diagnostic, range)
                 }),
         );
@@ -196,7 +198,10 @@ fn placed(
         .map(|(range, with)| Some((moved(range.start)?..moved(range.end)?, with)))
         .collect::<Option<Vec<_>>>()
         .unwrap_or_default();
-    let range = at.map(|at| gq_language::problem_range(&text[..end], at));
+    let range = at.map(|at| {
+        let prefix = &text[..end];
+        gq_language::problem_range(prefix, &gq_language::tokenize(prefix), at)
+    });
     Some((diagnostic, range))
 }
 

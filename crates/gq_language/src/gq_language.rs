@@ -18,8 +18,8 @@ pub use builder::{BuildError, BuiltQuery, Filter, FilterOp, PageStart, Sort, exa
 pub use check::{Diagnostic, QueryCheck, QueryInfo, ResultColumn, check, duplicate_names};
 pub use complete::{Completion, completions, hover};
 pub use lex::{
-    Declaration, Outline, Statement, Token, TokenKind, looks_like_mutation, outline, problem_range,
-    tokenize,
+    Declaration, Outline, Statement, Token, TokenKind, looks_like_mutation, outline, outline_of,
+    problem_range, tokenize,
 };
 pub use params::param_value;
 pub use parts::{PartKind, QueryPart, operator_parts, query_parts};
