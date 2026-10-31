@@ -6,15 +6,18 @@
 //! taking its token from the CLI's `credentials export`, which gives one only on a Unix system:
 //! elsewhere (Windows) a target that takes a token is refused, with why ([`Platform`]). A
 //! `direct` target is refused: Studio never opens storage or starts a server. A `managed` cluster
-//! with a data endpoint lands on that endpoint, its token the data credential the CLI exchanges
-//! from the person's `omnigraph login` ([`CliCredential::Managed`]): an interim until Studio's own
-//! sign-in (spec 016; Omnigraph RFC 1017, A2). An address is one server: of the targets on
+//! with a data endpoint lands on that endpoint. Where the cluster offers a sign-in, Studio signs
+//! in itself; elsewhere its token is the data credential the CLI exchanges from the person's
+//! `omnigraph login` ([`CliCredential::Managed`]), an interim (spec 016; Omnigraph RFC 1017, A2).
+//! An address is one server: of the targets on
 //! one endpoint, Studio connects as the first by name and names the others, each an identity of
 //! its own, as alternatives it does not connect as (`target list --json` does not say which
 //! target is the default). The CLI's aliases are not read: the CLI has no command that lists
 //! them. Studio lists the targets again when the operator file, a token file a target names, or
 //! the CLI where Studio looks for it changes ([`stamp`]); it never writes or parses the file. A
-//! listing is one turn at the CLI, and one command once the CLI is known: `target list --json`.
+//! listing is one turn at the CLI, and once the CLI is known `target list --json`, then for each
+//! managed target's profile `credentials status --profile NAME --json`, which reads no secret
+//! either and says the organization the profile is in.
 //! A target's own certificate authority (`transport.tls.ca`) is read with the listing, as the CLI
 //! reads it ([`CliRoots`]), and watched like a token file.
 
@@ -104,9 +107,15 @@ pub enum CliCredential {
     Helper { timeout: Duration },
     /// A managed target's cluster data token, which the CLI holds for `profile`: the one it has
     /// cached while that still holds, else a new one from the profile's credential (for a
-    /// profile that signs in, the person's `omnigraph login`). An interim until Studio signs in
-    /// itself (spec 016): Studio acts as the CLI's principal, not as a client of its own.
-    Managed { profile: String },
+    /// profile that signs in, the person's `omnigraph login`). Used only where the cluster
+    /// offers no sign-in of its own (spec 016): with it Studio acts as the CLI's principal, not
+    /// as a client of its own. `organization` is the one the profile names, as `credentials
+    /// status --profile` reports it, which a sign-in to the cluster must be in; `None` when it
+    /// names none or the CLI would not say, and the server checks it alone.
+    Managed {
+        profile: String,
+        organization: Option<String>,
+    },
 }
 
 /// Whether the system Studio runs on lets the Omnigraph CLI give it a token. Every command Studio
@@ -248,6 +257,7 @@ pub async fn read_targets(
     match cli_tokens::list_targets(&cli, &turn).await {
         Ok(targets) => {
             let mut read = servers_from(&targets, platform);
+            name_organizations(&mut read, &cli, &turn).await;
             read.watched.insert(0, (config, config_stamp));
             read
         }
@@ -259,6 +269,46 @@ pub async fn read_targets(
                 cli.version
             ))
         },
+    }
+}
+
+/// Names on each managed server of `read` the organization its profile names, as the CLI
+/// reports it (`credentials status --profile NAME --json`, once per profile, in the listing's
+/// turn): a sign-in to the cluster must be in it (spec 016). A profile whose organization the
+/// CLI would not say is a notice, and a sign-in to its clusters is checked by the server alone.
+async fn name_organizations(
+    read: &mut CliTargets,
+    cli: &cli_tokens::FoundCli,
+    turn: &cli_tokens::Held,
+) {
+    let Some(servers) = read.servers.as_mut() else {
+        return;
+    };
+    let mut named: Vec<(String, Option<String>)> = Vec::new();
+    for server in servers.iter_mut() {
+        let CliAuth::Token(CliCredential::Managed {
+            profile,
+            organization,
+        }) = &mut server.auth
+        else {
+            continue;
+        };
+        if let Some((_, known)) = named.iter().find(|(read, _)| read == profile) {
+            organization.clone_from(known);
+            continue;
+        }
+        let found = match cli_tokens::profile_organization(cli, turn, profile).await {
+            Ok(found) => found,
+            Err(why) => {
+                read.errors.push(format!(
+                    "Studio could not read which organization CLI profile '{profile}' is in \
+                     ({why}), so a sign-in to its clusters is checked by the server alone"
+                ));
+                None
+            }
+        };
+        organization.clone_from(&found);
+        named.push((profile.clone(), found));
     }
 }
 
@@ -460,7 +510,11 @@ fn land(
             };
             (
                 endpoint,
-                CliAuth::Token(CliCredential::Managed { profile }),
+                // Its organization is read with the listing ([`name_organizations`]).
+                CliAuth::Token(CliCredential::Managed {
+                    profile,
+                    organization: None,
+                }),
                 None,
                 default_graph,
             )

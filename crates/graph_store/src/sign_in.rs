@@ -2,8 +2,10 @@
 //! the keychain that keeps a refresh token, and the token source that refreshes from it.
 //!
 //! A connection signs in only to a server whose 401 offers it (`resource_metadata`) and for which
-//! it holds no other credential: a CLI target with `auth: anonymous`. The browser opens only when
-//! the person chooses Sign in; a kept sign-in is refreshed without asking.
+//! it holds no other credential: a CLI target with `auth: anonymous`, or a managed one, whose CLI
+//! login is held back until the server's 401 says it offers no sign-in, and is then used instead.
+//! The browser opens only when the person chooses Sign in; a kept sign-in is refreshed without
+//! asking.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -338,6 +340,9 @@ pub struct Service {
     pub resource: ProtectedResource,
     pub server: AuthorizationServer,
     pub client_id: String,
+    /// The organization the target names, which a token's `org_id` must equal: a managed
+    /// target's profile's; `None` for a target that names none, and the server checks it alone.
+    pub organization: Option<String>,
     pub(crate) clients: Clients,
 }
 
@@ -371,7 +376,7 @@ impl Service {
             issuer: &self.server.issuer,
             resource: &self.resource.resource,
             client_id: &self.client_id,
-            organization: None,
+            organization: self.organization.as_deref(),
         }
     }
 
@@ -386,11 +391,12 @@ impl Service {
 }
 
 /// Reads and checks the server's sign-in details, its sign-in service's, and which client ID
-/// Studio uses there.
+/// Studio uses there; a token from it must be in `organization` when the target names one.
 pub(crate) async fn discover(
     clients: Clients,
     metadata_url: String,
     identities: ClientIdentities,
+    organization: Option<String>,
 ) -> Result<Service, Refusal> {
     let resource = oauth_client::protected_resource(&clients, &metadata_url).await?;
     let server = oauth_client::authorization_server(&clients, &resource.issuer).await?;
@@ -399,6 +405,7 @@ pub(crate) async fn discover(
         resource,
         server,
         client_id,
+        organization,
         clients,
     })
 }
@@ -1118,6 +1125,9 @@ mod tests {
         issued: u32,
         /// The server refuses every token, as one that does not admit the account.
         admits_nobody: bool,
+        /// The server's 401 names no sign-in details, as a managed cluster's does before its
+        /// sign-in is enabled.
+        offers_no_sign_in: bool,
         /// How long each access token lives.
         lives: u64,
         /// The sign-in service gives no refresh token.
@@ -1160,6 +1170,7 @@ mod tests {
                 issued: Default::default(),
                 lives: 300,
                 admits_nobody: Default::default(),
+                offers_no_sign_in: Default::default(),
                 no_refresh: Default::default(),
                 issuer: Default::default(),
                 hold_metadata: Default::default(),
@@ -1283,18 +1294,23 @@ mod tests {
         bearer: Option<String>,
         body: String,
     ) -> (u16, Vec<(&'static str, String)>, Value) {
+        let offers = !served.offers_no_sign_in;
         let challenge = |refused: bool| {
             let error = if refused {
                 r#"error="invalid_token", "#
             } else {
                 ""
             };
-            vec![(
-                "www-authenticate",
+            let value = if offers {
                 format!(
                     r#"Bearer {error}resource_metadata="{SERVER}/.well-known/oauth-protected-resource/mcp""#
-                ),
-            )]
+                )
+            } else {
+                format!("Bearer {}", error.trim_end_matches(", "))
+                    .trim_end()
+                    .to_owned()
+            };
+            vec![("www-authenticate", value)]
         };
         let issuer = served.issuer();
         let issued_at = url::Url::parse(&issuer).unwrap();
@@ -3674,7 +3690,7 @@ mod tests {
         let clients = Clients::new(url::Url::parse(SERVER).unwrap(), http.clone(), http);
         let identities = identities();
         let metadata = format!("{SERVER}/.well-known/oauth-protected-resource/mcp");
-        smol::block_on(discover(clients, metadata, identities)).unwrap()
+        smol::block_on(discover(clients, metadata, identities, None)).unwrap()
     }
 
     /// A delete is done when the next launch would read nothing at the key: macOS and Windows
@@ -4370,6 +4386,177 @@ mod tests {
         assert_eq!(state, ConnectionState::Unauthorized);
         assert_eq!(offer, SignIn::NotOffered);
         assert_eq!(label, "Token refused");
+    }
+
+    /// A managed target's CLI login, as the CLI gives it: the data token it exchanges for the
+    /// profile `work-profile`, which is in `organization`. Counts its asks.
+    #[derive(Default)]
+    struct Login {
+        organization: Option<String>,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TokenSource for Login {
+        fn token(&self, _: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, NoToken>> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            futures::future::ready(Ok(Token::typed("from-the-cli".into()))).boxed()
+        }
+
+        fn login_profile(&self) -> Option<String> {
+            Some("work-profile".into())
+        }
+
+        fn organization(&self) -> Option<String> {
+            self.organization.clone()
+        }
+    }
+
+    impl Login {
+        fn in_organization(organization: &str) -> Arc<Self> {
+            Arc::new(Self {
+                organization: Some(organization.into()),
+                ..Self::default()
+            })
+        }
+
+        fn asked(&self) -> usize {
+            self.asked.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A connection to the managed target `work`, whose CLI login is `login`.
+    fn managed(
+        served: &Arc<Mutex<Served>>,
+        keychain: Arc<MemoryKeychain>,
+        login: Arc<Login>,
+        cx: &mut TestAppContext,
+    ) -> Entity<Connection> {
+        let connection = connection(served, keychain, cx);
+        connection.update(cx, |c, _| {
+            *c = std::mem::replace(
+                c,
+                Connection::new(c.server.clone(), None, fake(served.clone())).unwrap(),
+            )
+            .with_token_source(Some(login));
+        });
+        connection
+    }
+
+    /// A managed cluster that offers a sign-in is signed in to as any server that offers one
+    /// (spec 016, When Studio signs in): its first request carries no token, and the CLI's login
+    /// is never asked, as Studio is a client of its own there. A kept sign-in is refreshed.
+    #[gpui::test]
+    async fn a_managed_target_signs_in_where_its_cluster_offers_it(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served::default()));
+        let login = Login::in_organization("org_1");
+        let connection = managed(&served, kept_at_launch(&served), login.clone(), cx);
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the refresh", |cx| {
+            sign_in_state(&connection, cx).0 == ConnectionState::Ready
+        });
+        assert_eq!(login.asked(), 0, "the CLI's login is not asked");
+        assert_eq!(cx.opened_url(), None);
+        connection.read_with(cx, |c, _| {
+            assert!(c.holds_sign_in());
+            assert_eq!(
+                c.login_profile(),
+                None,
+                "the connection is no CLI profile's"
+            );
+        });
+        assert!(served.lock().unwrap().refused.is_empty());
+
+        // With nothing kept, the cluster asks for a sign-in, and still not the CLI's login.
+        let served = Arc::new(Mutex::new(Served::default()));
+        let login = Login::in_organization("org_1");
+        let connection = managed(&served, Arc::default(), login.clone(), cx);
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the offer", |cx| {
+            matches!(sign_in_state(&connection, cx).1, SignIn::Offered { .. })
+        });
+        assert_eq!(sign_in_state(&connection, cx).2, "Sign in needed");
+        assert_eq!(login.asked(), 0);
+    }
+
+    /// A managed cluster whose 401 offers no sign-in is reached with the CLI's login, the interim
+    /// before clusters offer one (spec 016): its token is asked for once the server's answer says
+    /// so, and from then on at once, without a request that carries none.
+    #[gpui::test]
+    async fn a_managed_target_uses_the_clis_login_where_its_cluster_offers_no_sign_in(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served {
+            offers_no_sign_in: true,
+            accepted: HashSet::from(["from-the-cli".to_owned()]),
+            ..Served::default()
+        }));
+        let login = Login::in_organization("org_1");
+        let connection = managed(&served, Arc::default(), login.clone(), cx);
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the connect", |cx| {
+            sign_in_state(&connection, cx).0 == ConnectionState::Ready
+        });
+        assert_eq!(login.asked(), 1);
+        let (_, offer, _) = sign_in_state(&connection, cx);
+        assert_eq!(offer, SignIn::NotOffered);
+        assert_eq!(
+            connection.read_with(cx, |c, _| c.login_profile()),
+            Some("work-profile".into())
+        );
+        let lists = |served: &Arc<Mutex<Served>>| {
+            served
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .filter(|request| request.ends_with("/graphs"))
+                .count()
+        };
+        assert_eq!(
+            lists(&served),
+            2,
+            "one without a token, then one with the CLI's"
+        );
+
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the second connect", |cx| {
+            sign_in_state(&connection, cx).0 == ConnectionState::Ready
+        });
+        assert_eq!(login.asked(), 2);
+        assert_eq!(lists(&served), 3, "the CLI's token is asked for first now");
+    }
+
+    /// A sign-in to a managed target is in the organization its CLI profile names: a token for
+    /// another is refused before it is used, and said.
+    #[gpui::test]
+    async fn a_sign_in_to_a_managed_target_must_be_in_its_organization(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served::default()));
+        let login = Login::in_organization("org_2");
+        let connection = managed(&served, kept_at_launch(&served), login.clone(), cx);
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the refused refresh", |cx| {
+            matches!(
+                sign_in_state(&connection, cx).1,
+                SignIn::Offered { why: Some(_), .. }
+            )
+        });
+        let (state, offer, _) = sign_in_state(&connection, cx);
+        assert_eq!(state, ConnectionState::Unauthorized);
+        let SignIn::Offered { why: Some(why), .. } = offer else {
+            unreachable!()
+        };
+        assert!(
+            why.contains("The sign-in was for org_1, and this target is in org_2."),
+            "{why}"
+        );
+        assert_eq!(login.asked(), 0);
+        assert!(
+            served.lock().unwrap().refused.is_empty(),
+            "the token was never sent"
+        );
     }
 
     /// One request as a browser sends it, without following a redirect: the `location` of a

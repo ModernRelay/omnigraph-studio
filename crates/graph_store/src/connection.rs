@@ -203,6 +203,16 @@ pub struct Connection {
     /// What Studio needs to sign in to a server that asks; `None` for a connection that never
     /// signs in (the environment's server, tests).
     sign_in_context: Option<SignInContext>,
+    /// A managed target's CLI login, held back until the server's 401 says whether it offers a
+    /// sign-in of its own (spec 016, When Studio signs in): one that does is signed in to, and
+    /// this is dropped; one that offers none takes this as its token source.
+    standby: Option<Arc<dyn TokenSource>>,
+    /// The server's 401 offered no sign-in while a managed target's CLI login was held back, so
+    /// that login is the token source from then on ([`Self::standby`]).
+    offers_no_sign_in: bool,
+    /// The organization a sign-in to the server must be in: the one a managed target's profile
+    /// names ([`TokenSource::organization`]).
+    organization: Option<String>,
     /// The sign-in service the server's 401 named, once read and checked; none again after a
     /// sign-in failed, as what it named may be what failed.
     service: Option<Service>,
@@ -438,6 +448,9 @@ impl Connection {
             check_missed: false,
             sign_in: SignIn::NotOffered,
             sign_in_context: None,
+            standby: None,
+            offers_no_sign_in: false,
+            organization: None,
             service: None,
             sign_in_details: None,
             oauth: None,
@@ -462,8 +475,24 @@ impl Connection {
     /// ([`Connection::refresh_token`]). A server with a source is sent nothing without a token
     /// from it.
     pub(crate) fn with_token_source(mut self, source: Option<Arc<dyn TokenSource>>) -> Self {
-        self.token_source = source;
+        self.token_source = self.hold_back(source);
         self
+    }
+
+    /// The source to take for `source`: none while it is a managed target's CLI login and the
+    /// server has not said that it offers no sign-in, which is then held back as the standby
+    /// ([`Self::standby`]). Notes the organization a sign-in must be in.
+    fn hold_back(&mut self, source: Option<Arc<dyn TokenSource>>) -> Option<Arc<dyn TokenSource>> {
+        self.organization = source.as_ref().and_then(|source| source.organization());
+        let login = source
+            .as_ref()
+            .is_some_and(|source| source.login_profile().is_some());
+        if login && !self.offers_no_sign_in {
+            self.standby = source;
+            return None;
+        }
+        self.standby = None;
+        source
     }
 
     /// A connection whose token source never answers, so connecting it sends nothing: for the
@@ -494,7 +523,19 @@ impl Connection {
         source: Option<Arc<dyn TokenSource>>,
         cx: &mut Context<Self>,
     ) {
-        // An anonymous target signed in keeps its sign-in: the CLI names no credential for it.
+        let organization = self.organization.clone();
+        let source = self.hold_back(source);
+        // A sign-in held, or a sign-in service read, for another organization than the target's
+        // now is not the target's: its tokens were checked against the other.
+        if self.organization != organization {
+            if self.oauth.is_some() {
+                self.drop_sign_in(cx);
+            } else {
+                self.service = None;
+            }
+        }
+        // An anonymous target signed in keeps its sign-in: the CLI names no credential for it,
+        // and a managed one's login stays held back.
         if source.is_none() && self.oauth.is_some() {
             return;
         }
@@ -1205,6 +1246,24 @@ impl Connection {
     /// graph read's 401 has its own bound ([`Self::read_refused`]). One the server did not
     /// refuse is not asked about.
     fn refused(&mut self, failed: Failed, token_sent: bool, cx: &mut Context<Self>) {
+        // A managed target's CLI login was held back for this answer: a server that offers a
+        // sign-in is signed in to, and its login dropped; one that offers none, or one Studio
+        // cannot sign in to here, takes the login and connects with it.
+        if failed.state == ConnectionState::Unauthorized && !token_sent && self.standby.is_some() {
+            let offers = failed
+                .challenge
+                .as_deref()
+                .and_then(Challenge::resource_metadata)
+                .is_some();
+            if offers && self.sign_in_context.is_some() {
+                self.standby = None;
+            } else {
+                self.offers_no_sign_in = true;
+                let login = self.standby.take();
+                self.take_token_from(login, cx);
+                return;
+            }
+        }
         if failed.state == ConnectionState::Unauthorized {
             self.refused_with_token = Challenge::refuses(failed.challenge.as_deref(), token_sent);
             if self.refused_with_token {
@@ -1266,6 +1325,7 @@ impl Connection {
             context.elsewhere.clone(),
         );
         let target = self.server.name.clone();
+        let organization = self.organization.clone();
         self.signing_in = Some(SigningIn::new(cx.spawn(async move |this, cx| {
             let found = cx
                 .background_executor()
@@ -1273,6 +1333,7 @@ impl Connection {
                     clients,
                     metadata,
                     context.identities.clone(),
+                    organization,
                 ))
                 .await;
             let kept = match &found {
@@ -1615,10 +1676,16 @@ impl Connection {
             self.client.transport(),
             context.elsewhere.clone(),
         );
+        let organization = self.organization.clone();
         self.signing_in = Some(SigningIn::new(cx.spawn(async move |this, cx| {
             let found = cx
                 .background_executor()
-                .spawn(sign_in::discover(clients, details, context.identities))
+                .spawn(sign_in::discover(
+                    clients,
+                    details,
+                    context.identities,
+                    organization,
+                ))
                 .await;
             this.update(cx, |this, cx| {
                 // The held sign-in the service ended meanwhile, and why, said should the next

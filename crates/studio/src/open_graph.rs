@@ -1093,7 +1093,8 @@ fn retries_on_select(c: &Connection) -> bool {
 /// would make the target one that takes a token, which Studio there refuses
 /// ([`Platform::exports_tokens`]): a CLI server the dialog lists there is an anonymous target,
 /// and the token typed is the only one Studio can use for it. For a managed cluster reached on
-/// the CLI's login, it first says where that cluster's token comes from.
+/// the CLI's login, which offers no sign-in of its own, it first says where that cluster's token
+/// comes from.
 fn token_tooltip(c: &Connection, platform: Platform) -> String {
     tooltip_for(
         &c.server.source,
@@ -1118,7 +1119,7 @@ fn tooltip_for(
              Studio keeps it in memory and asks the CLI again when the server refuses it; the CLI \
              gives the same token while it holds and a new one once it lapses. A token typed \
              here is used until Studio quits or asks the CLI for this target's token again. \
-             Studio's own sign-in will replace this."
+             This cluster offers no sign-in of its own; one that does is signed in to instead."
         );
     }
     match source {

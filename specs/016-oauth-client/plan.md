@@ -5,9 +5,11 @@ Status: implemented for a CLI server target with `auth: anonymous` whose server 
 v0.14.0 (`script/dev-sign-in`). Studio's client ID is its metadata document,
 `https://www.omnigraph.dev/oauth/studio-client-metadata.json` (ModernRelay/brand#26), and the
 managed control plane's AuthKit takes it on any loopback port (2026-10-29). A managed target
-still reaches its cluster on the CLI's login (spec 003, since 2026-10-25) until the managed
-control plane's other prerequisites below are met ·
-2026-10-29
+signs in the same way where its cluster's 401 offers a sign-in, in the organization its CLI
+profile names, and elsewhere reaches its cluster on the CLI's login (spec 003), as every
+production cluster requires until the managed control plane enables its sign-in (built
+2026-10-30) ·
+2026-10-30
 
 ## Problem
 
@@ -94,9 +96,22 @@ Studio holds no static credential for it:
 |---|---|
 | CLI server target with a `token` or `exec` provider | The CLI's exported token (spec 003). A refused one is said as refused; Studio does not swap in OAuth. |
 | CLI server target with `auth: anonymous` | None; if the server's challenge offers OAuth, "Sign in" is offered (built 2026-10-26). |
-| CLI managed target with a data `endpoint` | OAuth once the managed control plane offers it and registers Studio; until then the CLI's login (spec 003). |
+| CLI managed target with a data `endpoint` | The cluster's own sign-in where its 401 offers one, in the organization the target's profile names; elsewhere the CLI's login (spec 003). Built 2026-10-30. |
 | CLI managed target without an `endpoint` | Refused: "This managed target has no data endpoint." |
 | Direct target | Refused (spec 003). |
+
+A managed target's CLI login is held back until the cluster's first 401 answers: Studio sends
+that first request without a token. A 401 that names `resource_metadata` is a cluster that signs
+people in itself, so the login is dropped and the connection signs in as an anonymous target's
+does, the keychain's sign-in refreshed without asking. A 401 that names none (a cluster whose
+sign-in the managed control plane has not enabled) takes the login as the connection's token
+source, asked for at once from then on: such a cluster costs one request without a token per
+connection. A connection that cannot sign in (one with no sign-in context) takes the login too.
+The organization a managed target's sign-in must be in is the one its profile names, which
+`omnigraph credentials status --profile NAME --json` reports as `owner.organization_id` without a
+secret or a service; it is read once per profile with the target listing. A profile whose
+organization the CLI will not say is a notice, and its clusters' sign-ins are checked by the
+server alone.
 
 Studio keeps no server list of its own (RFC #1017, "Changes by repository"): every server is a
 CLI target, and a target names one identity, so two targets on one endpoint are two accounts.
@@ -410,7 +425,10 @@ same way.
 
 - **The managed control plane**:
   - enable and qualify a standard OAuth resource profile on managed servers, so they run with
-    OIDC identity trust (which also admits the resource's host for MCP);
+    OIDC identity trust (which also admits the resource's host for MCP). Enabled on staging
+    (2026-10-29: its cluster's 401 names the resource's metadata and its AuthKit takes Studio's
+    client ID); not yet in production, where it applies only to clusters created after it is
+    enabled;
   - register Studio as a public client with loopback redirects, or accept its Client ID
     Metadata Document. Done (2026-10-29): its AuthKit takes metadata documents;
   - name each managed cluster's resource on its own data host, `https://<data host>/mcp`, and
@@ -444,9 +462,10 @@ same way.
 
 ## Deferred
 
-- A managed target's sign-in, once the managed control plane offers it and registers Studio: its
-  organization check (`org_id` against the profile's `organization_id`) and the end of the CLI
-  login interim.
+- A managed target on Windows: it is refused there because the CLI's login needs a pipe
+  (`credentials export`), though a cluster that offers a sign-in would need no CLI token.
+- Which organization a person in several signs in to (open question 4): a token for another than
+  the target's is refused and said, but nothing yet asks the sign-in service for the right one.
 - A refused write's message after sign-in ("Signed out before the change was sent; nothing was
   written"): a 401 to a write is said as any refusal today.
 - Whether managed agents use the CLI's relay or are OAuth clients themselves (RFC #1017, A3;
@@ -539,6 +558,7 @@ same way.
 | 2026-10-30 | A closing review of the whole change | `graph_store` `sign_in::tests::an_ask_under_way_when_the_sign_in_ends_gives_nobody_its_token` (new; a sign-out and a rename), `a_sign_in_taken_while_the_one_it_replaces_is_asked_keeps_its_token` (new) and `a_sign_in_ended_while_two_asks_wait_on_it_is_said_once` (new; the fake service can hold refreshes alone). Each fails when its change of source skips the door (checked); the door's own ending of asks fails six tests without it | It found that `take_token_from`, ending the old source's asks itself, left the checks that an answer comes from the source in use (in the ask, and in what is asked) without a test: the two that claimed them reached them through `take_token_from`, and passed with either removed (checked). The checks still mattered: a sign-out, a rename, a sign-in taken and a sign-in the service ended changed the source without ending its asks. Taken, as the shape with less to keep in step: every change of source goes through one door that ends the old source's asks, so an ask under way is always the current source's, and the checks and the source kept with each ask are gone. Without the door, a sign-out's or a rename's ask answered after it was still taken; a sign-in taken while the one it replaced was asked after a refusal had its own token taken for that answer, so a read refused under it asked nothing; and a sign-in the service ended while two asks waited on it was said twice, the second time as the CLI giving no token. The rule for a token that never arrived, written out wherever it was used (the status label and the dialog's line, with a sign-in held and without, whether a token is asked for, and Retry), is one `Connection::token_not_received`; a later review found the sign-in branches still writing it out, and they read it too. `take_token_from`'s doc said it always asked the new source at once and that dropping the source connected again; it now says when. Discovery's `fetch_object`, with one caller, is inlined. Left: the last test catches a missing door only when the connect's answer comes second, as the fake service's shared refresh wakes them; when the ask after the refusal answers first, `no_token` drops the connect itself, and the outcome is the same |
 | 2026-10-30 | A legacy pass over the files the change touches | `graph_store` `connection::tests` (the probe's failure keeps its challenge; the test that gave it a refusal by hand gives a bare `Bearer` challenge). The workspace's tests pass unchanged | It found no unused function, field, variant or helper. Taken: whether a 401 refused the token sent was decided in two places, the probe's (`token_refused.unwrap_or(token_sent)`) and a graph read's (`is_none_or(token_refused)`, then the token held), the split an earlier row records a defect from; `Challenge::refuses` decides it for both, and the probe's failure keeps its challenge rather than two answers taken from it. Docs in connection.rs, cli_tokens.rs and registry.rs, and the rules of specs 003 and 016, said what the code no longer does: a 401 to an OAuth token refreshing whatever it refused, the source asked after any 401, a renewal always quiet, and a typed token standing until Refresh alone. The token endpoint's last busy arm could not match a server error, which two arms before it took; one arm, decided by `failed_for_now` and the error, keeps the same words. Left: a window's reads that failed under a 401 that refused no token stay failed, each with its own Try again, after the connection's Retry, as after any read the network failed; a sign-in's refresh no longer reads them again, since it would send its token the same way |
 | 2026-10-30 | A review of the rules' wording | `graph_store` `connection::tests::the_ask_after_a_probes_refusal_is_the_reads_one_more_try` (new). Fails without its fix (checked) | Stating how often a source is asked after 401s found the code asymmetric: the ask after a probe's 401 counted as the graph reads' one more try only when it changed the token, so a source that gave the refused token back was asked again by the next read's 401, one more CLI export or refresh for a token already asked about. Any ask after a refusal is now that one more try, and specs 003 and 016 state the one rule. The same rounds corrected the tooltips, which said a typed token lasts until Studio quits where the CLI is asked again over it, and the docs that still stated the old rules |
+| 2026-10-30 | A managed target signs in where its cluster offers it, in its profile's organization, and uses the CLI's login elsewhere | `graph_store` `sign_in::tests`: `a_managed_target_signs_in_where_its_cluster_offers_it`, `a_managed_target_uses_the_clis_login_where_its_cluster_offers_no_sign_in`, `a_sign_in_to_a_managed_target_must_be_in_its_organization`; `cli_tokens::tests`: `the_targets_are_listed_as_the_cli_describes_them` (extended), `a_managed_profile_the_cli_cannot_describe_is_said` (new). Live: `omnigraph credentials status --profile managed-og --json` (CLI `0.14.1-edge+1755782`); `GET /graphs` without a token on the production `modernrelay-og-cluster` and on the staging cluster | Pass. A kept sign-in is refreshed with the CLI's login never asked, and with none kept the cluster asks for a sign-in; a cluster whose 401 names no sign-in gets one request without a token, then the CLI's, and the CLI's at once on the next connect; a token in another organization is refused before it is sent. The CLI reports `owner.organization_id` with no secret read. Production answers `Bearer` alone, so it is reached on the CLI's login; staging names `resource_metadata` |
 
 ## Corrections
 
