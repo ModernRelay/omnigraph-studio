@@ -4,7 +4,7 @@
 
 use std::ops::Range;
 
-use gq_language::{Diagnostic, Outline, QueryInfo, SchemaModel};
+use gq_language::{Diagnostic, Outline, QueryInfo, SchemaModel, Token};
 
 #[derive(Debug, Clone, Default)]
 pub struct Analysis {
@@ -44,6 +44,7 @@ impl Analysis {
         let mut queries = Vec::new();
         let mut own_problems = Vec::new();
         let mut checked_alone: Vec<&gq_language::Declaration> = Vec::new();
+        let mut lines = Lines::default();
         for (index, declaration) in outline.declarations.iter().enumerate() {
             if let Some(query) = checked
                 .queries
@@ -55,12 +56,13 @@ impl Analysis {
             }
             let own_text = outline.runnable_text(&text, declaration);
             let own = gq_language::check(schema, &own_text);
-            let own_outline = gq_language::outline(&own_text);
+            let own_tokens = gq_language::tokenize(&own_text);
+            let own_outline = gq_language::outline_of(&own_text, &own_tokens);
             own_problems.extend(own.diagnostics.into_iter().filter_map(|diagnostic| {
                 placed(
                     diagnostic,
-                    &text,
-                    (&own_text, &own_outline),
+                    (&text, &tokens, &mut lines),
+                    (&own_text, &own_tokens, &own_outline),
                     outline.prefix.end,
                     &declaration.range,
                 )
@@ -80,7 +82,7 @@ impl Analysis {
                 let byte = diagnostic
                     .byte
                     .map(|b| b as usize)
-                    .or_else(|| locate(&text, &outline, &diagnostic));
+                    .or_else(|| locate(&text, &tokens, &outline, &diagnostic));
                 let range = byte.map(|byte| gq_language::problem_range(&text, &tokens, byte));
                 (diagnostic, range)
             })
@@ -151,43 +153,64 @@ impl Analysis {
     }
 }
 
+/// Where each line of a text starts, found on first use and then shared by every problem placed
+/// in it.
+#[derive(Default)]
+struct Lines(Option<Vec<usize>>);
+
+impl Lines {
+    /// The line and column, from one, of byte `at` in `text`.
+    fn of(&mut self, text: &str, at: usize) -> (u32, u32) {
+        let starts = self.0.get_or_insert_with(|| {
+            std::iter::once(0)
+                .chain(text.match_indices('\n').map(|(at, _)| at + 1))
+                .collect()
+        });
+        let line = starts.partition_point(|start| *start <= at);
+        let column = text[starts[line - 1]..at].chars().count();
+        (line as u32, column as u32 + 1)
+    }
+}
+
+/// The tokens of `tokens` (a text's, in order) that lie in `range`, whose ends are token
+/// boundaries: the tokens of that slice of the text, at their places in the whole.
+fn tokens_in<'a>(tokens: &'a [Token], range: &Range<usize>) -> &'a [Token] {
+    let start = tokens.partition_point(|token| token.range.start < range.start);
+    let end = tokens.partition_point(|token| token.range.end <= range.end);
+    &tokens[start..end.max(start)]
+}
+
 /// A problem a declaration's own check found, moved from that check's text (`own`: the
-/// settings prefix, `prefix` bytes, then the declaration) to where the declaration is in
-/// `text`. One in the prefix is the whole text's check's to report. A problem at the end of
-/// the declaration is placed on its last word, not on the declaration after it.
+/// settings prefix, `prefix` bytes, then the declaration, with its tokens and outline) to
+/// where the declaration is in `text` (`whole`: with its tokens, and its lines as found so
+/// far). One in the prefix is the whole text's check's to report. A problem at the end of the
+/// declaration is placed on its last word, not on the declaration after it.
 fn placed(
     mut diagnostic: Diagnostic,
-    text: &str,
-    own: (&str, &Outline),
+    whole: (&str, &[Token], &mut Lines),
+    own: (&str, &[Token], &Outline),
     prefix: usize,
     declaration: &Range<usize>,
 ) -> Option<(Diagnostic, Option<Range<usize>>)> {
+    let (text, tokens, lines) = whole;
     // Its last word: an unclosed declaration runs on to the next, over blank lines and any
     // comment above it.
-    let end = gq_language::tokenize(&text[declaration.clone()])
+    let end = tokens_in(tokens, declaration)
         .iter()
         .rev()
         .find(|token| token.kind != gq_language::TokenKind::Comment)
-        .map_or(declaration.start, |token| {
-            declaration.start + token.range.end
-        });
+        .map_or(declaration.start, |token| token.range.end);
     let moved = |at: usize| (at >= prefix).then(|| (declaration.start + at - prefix).min(end));
     let at = match diagnostic.byte {
         Some(byte) => {
             let at = moved(byte as usize)?;
-            let before = &text[..at];
+            let (line, column) = lines.of(text, at);
             diagnostic.byte = Some(at as u32);
-            diagnostic.line = Some(before.matches('\n').count() as u32 + 1);
-            diagnostic.column = Some(
-                before
-                    .rsplit('\n')
-                    .next()
-                    .map_or(0, |line| line.chars().count()) as u32
-                    + 1,
-            );
+            diagnostic.line = Some(line);
+            diagnostic.column = Some(column);
             Some(at)
         }
-        None => match locate(own.0, own.1, &diagnostic) {
+        None => match locate(own.0, own.1, own.2, &diagnostic) {
             Some(at) => Some(moved(at)?),
             None => None,
         },
@@ -198,21 +221,25 @@ fn placed(
         .map(|(range, with)| Some((moved(range.start)?..moved(range.end)?, with)))
         .collect::<Option<Vec<_>>>()
         .unwrap_or_default();
-    let range = at.map(|at| {
-        let prefix = &text[..end];
-        gq_language::problem_range(prefix, &gq_language::tokenize(prefix), at)
-    });
+    // Underlined within the text up to its last word, whose tokens are the whole text's up to
+    // there: `end` is a token's end.
+    let range =
+        at.map(|at| gq_language::problem_range(&text[..end], tokens_in(tokens, &(0..end)), at));
     Some((diagnostic, range))
 }
 
 /// Where a type error without a position probably is: the last name the message quotes
 /// (`` type `Person` has no property `nmae` ``) that appears as a token in the declaration the
-/// error names. Only an underline hint; the message stays the authority.
-fn locate(text: &str, outline: &Outline, diagnostic: &Diagnostic) -> Option<usize> {
+/// error names (`text`'s, with its tokens and outline). Only an underline hint; the message
+/// stays the authority.
+fn locate(
+    text: &str,
+    tokens: &[Token],
+    outline: &Outline,
+    diagnostic: &Diagnostic,
+) -> Option<usize> {
     let name = diagnostic.query.as_deref()?;
     let declaration = outline.declarations.iter().find(|d| d.name == name)?;
-    let body = &text[declaration.range.clone()];
-    let tokens = gq_language::tokenize(body);
     let quoted: Vec<&str> = diagnostic
         .message
         .split('`')
@@ -220,11 +247,12 @@ fn locate(text: &str, outline: &Outline, diagnostic: &Diagnostic) -> Option<usiz
         .step_by(2)
         .filter(|quoted| !quoted.is_empty())
         .collect();
+    let tokens = tokens_in(tokens, &declaration.range);
     quoted.into_iter().rev().find_map(|quoted| {
         tokens
             .iter()
-            .find(|token| &body[token.range.clone()] == quoted)
-            .map(|token| declaration.range.start + token.range.start)
+            .find(|token| &text[token.range.clone()] == quoted)
+            .map(|token| token.range.start)
     })
 }
 
@@ -268,6 +296,18 @@ mod tests {
         assert_eq!(at.len(), 2, "{:?}", analysis.problems);
         assert!(at[0] < text.find("query q").unwrap(), "{at:?}");
         assert_eq!(at[1], text.find("nope").unwrap());
+
+        // A problem its own check found is placed by line and column in the whole text, the
+        // column counted in characters.
+        let text = "query people() { match { $p: Person } return { $p.name } }\n\n// é\n\
+            query broken() { match { $p: Person { name: \"é\" } } return { $p.naem\n";
+        let analysis = Analysis::new(&schema, text.to_owned());
+        assert_eq!(analysis.problems.len(), 1, "{:?}", analysis.problems);
+        let (problem, range) = &analysis.problems[0];
+        let end = text.find("naem").unwrap() + "naem".len();
+        assert_eq!(problem.byte, Some(end as u32), "at its last word");
+        assert_eq!((problem.line, problem.column), (Some(4), Some(69)));
+        assert!(range.as_ref().is_some_and(|range| range.end == end));
     }
 
     /// A read copied and changed to a delete keeps the read's name: each declaration is still
