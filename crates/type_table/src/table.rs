@@ -7121,11 +7121,7 @@ impl TypeTable {
             .key_context("FilterWords")
             .w(px(studio_ui::ds::size::FIELD_WIDE))
             .tooltip(Tooltip::text(about))
-            .child(
-                Icon::new(IconName::ZedAssistant)
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted),
-            )
+            .child(studio_ui::ds::icon::meta(IconName::ZedAssistant))
             .child(studio_ui::ds::field_input(self.words_editor.clone()))
             .when(running, |field| field.child(studio_ui::ds::spinner()))
             .into_any_element()
