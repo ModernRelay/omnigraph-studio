@@ -2917,7 +2917,10 @@ exit 64
         assert_eq!(lists.load(std::sync::atomic::Ordering::SeqCst), listed);
         stale.read_with(cx, |connection, _| {
             assert_eq!(connection.state, ConnectionState::Unauthorized);
-            assert!(connection.refused_with_token);
+            assert_eq!(
+                connection.refusal,
+                Some(graph_client::Unauthorized::TokenRefused)
+            );
             assert_eq!(connection.label(), "Token refused");
         });
         stale.update(cx, |connection, cx| connection.refresh_token(cx));
@@ -2967,7 +2970,7 @@ exit 64
         assert_eq!(lists.load(std::sync::atomic::Ordering::SeqCst), 0);
         connection.read_with(cx, |connection, _| {
             assert_eq!(connection.state, ConnectionState::Unauthorized);
-            assert!(!connection.refused_with_token);
+            assert_eq!(connection.refusal, None, "no 401 stands: nothing was sent");
             assert!(!connection.token_unanswered);
             assert_eq!(connection.token_unread.as_deref(), Some(reason));
             assert_eq!(connection.label(), "No token from the CLI");
@@ -3075,7 +3078,10 @@ exit 64
         cx.run_until_parked();
         connection.read_with(cx, |connection, _| {
             assert_eq!(connection.state, ConnectionState::Unauthorized);
-            assert!(!connection.refused_with_token);
+            assert_eq!(
+                connection.refusal,
+                Some(graph_client::Unauthorized::TokenNeeded)
+            );
             assert_eq!(connection.label(), "Asks for a token");
         });
     }
