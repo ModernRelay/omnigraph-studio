@@ -73,6 +73,10 @@ pub struct ConnectionRegistry {
     notices: Vec<String>,
     http: Arc<dyn HttpClient>,
     transported: TransportHttp,
+    /// The client made for each transport a CLI connection uses, which every target naming it
+    /// shares: made once, off the main thread, however many targets name it (two endpoints
+    /// behind one company certificate authority).
+    transport_clients: Vec<(CliTransport, Arc<dyn HttpClient>)>,
     token_sources: TokenSources,
     lister: Lister,
     /// Whether the CLI gives Studio a token here: the system Studio runs on, but in a test. Where
@@ -422,6 +426,7 @@ impl ConnectionRegistry {
             notices: Vec::new(),
             http,
             transported: Arc::new(move |_| Ok(same.clone())),
+            transport_clients: Vec::new(),
             token_sources: Arc::new(|_| None),
             lister: Arc::new(list_with_the_cli),
             platform: Platform::CURRENT,
@@ -594,31 +599,44 @@ impl ConnectionRegistry {
         }
     }
 
-    /// The transports the CLI connections hold, and what makes a client for another, for a
+    /// The transports a client is made for already, and what makes a client for another, for a
     /// listing to prepare off the main thread ([`prepare_transports`]).
     fn transport_maker(&self) -> (Vec<CliTransport>, TransportHttp) {
         let held = self
-            .cli_kept
-            .values()
-            .map(|kept| kept.transport.clone())
+            .transport_clients
+            .iter()
+            .map(|(transport, _)| transport.clone())
             .collect();
         (held, self.transported.clone())
     }
 
-    /// The client for `transport`: the one prepared beside the listing, else made here (a
-    /// listing applied without preparing, as in tests).
+    /// The client for `transport`: the one made for it already, which every target naming it
+    /// shares, else the one prepared beside the listing, else made here (a listing applied
+    /// without preparing, as in tests).
     fn transport_http(
-        &self,
+        &mut self,
         transport: &CliTransport,
         prepared: &mut Prepared,
     ) -> Result<Arc<dyn HttpClient>, String> {
         if *transport == CliTransport::default() {
             return Ok(self.http.clone());
         }
-        match prepared.iter().position(|(made, _)| made == transport) {
+        if let Some((_, http)) = self
+            .transport_clients
+            .iter()
+            .find(|(made, _)| made == transport)
+        {
+            return Ok(http.clone());
+        }
+        let made = match prepared.iter().position(|(made, _)| made == transport) {
             Some(at) => prepared.swap_remove(at).1,
             None => (self.transported)(transport).map_err(|error| error.to_string()),
+        };
+        if let Ok(http) = &made {
+            self.transport_clients
+                .push((transport.clone(), http.clone()));
         }
+        made
     }
 
     /// Brings the CLI's servers in line with the targets the CLI lists, and says whether
@@ -790,6 +808,10 @@ impl ConnectionRegistry {
                 )),
             }
         }
+        // A client no CLI connection uses any more goes.
+        let kept = &self.cli_kept;
+        self.transport_clients
+            .retain(|(transport, _)| kept.values().any(|kept| kept.transport == *transport));
         let notices_changed = self.keep_notices(errors);
         changed || notices_changed
     }
@@ -1428,6 +1450,17 @@ mod tests {
         assert!(apply(&registry, files(vec![rooted.clone()]), cx));
         assert_eq!(made.load(Ordering::SeqCst), 3);
         assert_eq!(find(&registry, "new", cx).unwrap(), moved);
+        // Another endpoint behind the same certificate authority shares its client: none is
+        // made for it, as one made on the main thread would stall the window.
+        let mut beside = server("staging", "http://c.test", "beside");
+        beside.transport = rooted.transport.clone();
+        assert!(apply(&registry, files(vec![rooted.clone(), beside]), cx));
+        assert!(find(&registry, "staging", cx).is_some());
+        assert_eq!(
+            made.load(Ordering::SeqCst),
+            3,
+            "one client for the shared transport"
+        );
 
         // A transport Studio cannot use retires the connection, said once, and lists no server.
         registry.update(cx, |registry, _| {
