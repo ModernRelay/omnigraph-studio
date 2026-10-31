@@ -1689,7 +1689,8 @@ pub fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Butto
 /// Work under way that the person waits on (a search, a run, rows being read): a small turning
 /// circle, muted, beside or in place of what it will fill. It turns once in two seconds, every
 /// spinner in step, redrawing its view at most [`motion::AMBIENT_FPS`] times a second (Zed's
-/// `with_rotate_animation` redraws at every frame for as long as the work runs).
+/// `with_rotate_animation` redraws at every frame for as long as the work runs); it stands
+/// still where the system asks for reduced motion, as GPUI's animations do.
 pub fn spinner() -> impl IntoElement {
     Spinner
 }
@@ -2668,25 +2669,6 @@ pub fn key_hints() -> Div {
 
 /// A bordered block of code or a command, as Delta draws edits and commands in a thread.
 pub fn code_block(code: impl Into<SharedString>, cx: &App) -> Div {
-    code_frame(cx).child(code.into())
-}
-
-/// [`code_block`] with syntax colours: each range takes the theme's style of that name
-/// ("keyword", "string", …), as the editor colours the same text.
-pub fn code_block_highlighted(
-    code: impl Into<SharedString>,
-    highlights: impl IntoIterator<Item = (std::ops::Range<usize>, &'static str)>,
-    cx: &App,
-) -> Div {
-    let syntax = cx.theme().syntax();
-    let highlights: Vec<_> = highlights
-        .into_iter()
-        .filter_map(|(range, name)| Some((range, syntax.style_for_name(name)?)))
-        .collect();
-    code_frame(cx).child(gpui::StyledText::new(code.into()).with_highlights(highlights))
-}
-
-fn code_frame(cx: &App) -> Div {
     let block = div()
         .w_full()
         .px(px(space::LG))
@@ -2702,6 +2684,7 @@ fn code_frame(cx: &App) -> Div {
         .font_buffer(cx)
         .text_xs()
         .text_color(cx.theme().colors().text)
+        .child(code.into())
 }
 
 /// A group of [`field`]s: rows close together, so the group reads as one block.
@@ -3547,6 +3530,35 @@ pub fn composer_controls() -> Div {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A spinner turns, drawing its view again a few times a second, and stands still where
+    /// the system asks for reduced motion, drawing it no more: GPUI's animations hold to it, and
+    /// this holds the spinner to it should one be drawn otherwise.
+    #[gpui::test]
+    fn the_spinner_stands_still_under_reduced_motion(cx: &mut gpui::TestAppContext) {
+        struct Spinning(std::rc::Rc<std::cell::Cell<usize>>);
+        impl Render for Spinning {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.0.set(self.0.get() + 1);
+                div().child(spinner())
+            }
+        }
+        cx.update(studio_theme::init_test);
+        let drawn_again = |reduce: bool, cx: &mut gpui::TestAppContext| {
+            cx.update(|cx| cx.set_reduce_motion(reduce));
+            let drawn = std::rc::Rc::new(std::cell::Cell::new(0));
+            let counted = drawn.clone();
+            let (_, cx): (_, &mut gpui::VisualTestContext) =
+                cx.add_window_view(move |_, _| Spinning(counted));
+            cx.run_until_parked();
+            let first = drawn.get();
+            cx.executor().advance_clock(Duration::from_secs(1));
+            cx.run_until_parked();
+            drawn.get() - first
+        };
+        assert!(drawn_again(false, cx) > 0, "it turns");
+        assert_eq!(drawn_again(true, cx), 0, "it stands still");
+    }
 
     /// A glass sheet or toast keeps the light style's warm white in a light theme, and takes the
     /// dark theme's own surface in a dark one: near-white there would put light text on light.
