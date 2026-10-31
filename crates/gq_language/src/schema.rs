@@ -36,6 +36,8 @@ pub struct Property {
     pub list: bool,
     pub enum_values: Option<Vec<String>>,
     pub is_key: bool,
+    /// Declared `@index`: the engine's full-text `search` works on it.
+    pub indexed: bool,
 }
 
 impl Property {
@@ -477,6 +479,13 @@ fn property(shape: &PropertyShape, keys: &[String]) -> Property {
             .property_constraints
             .iter()
             .any(|c| matches!(c, PropertyConstraintShape::Key));
+    // A one-column `@index` on free text is a full-text index, and a key declares one too
+    // (the compiler's T27).
+    let indexed = is_key
+        || shape
+            .property_constraints
+            .iter()
+            .any(|c| matches!(c, PropertyConstraintShape::Index));
     Property {
         name: shape.name.clone(),
         kind,
@@ -485,6 +494,7 @@ fn property(shape: &PropertyShape, keys: &[String]) -> Property {
         list: *list,
         enum_values: enum_values.clone(),
         is_key,
+        indexed,
     }
 }
 

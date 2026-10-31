@@ -824,6 +824,8 @@ pub fn row_matches(filters: &[Filter], values: &Map<String, Value>) -> bool {
         match filter.op {
             _ if filter.property == gq_language::builder::ID_FILTER => true,
             FilterOp::HasAny | FilterOp::HasNone | FilterOp::RelatedTo => true,
+            // A neighbour's property is not in the row either.
+            _ if filter.property.contains('.') => true,
             FilterOp::IsEmpty => value.is_null(),
             FilterOp::IsNotEmpty => !value.is_null(),
             _ if value.is_null() => false,
@@ -834,6 +836,21 @@ pub fn row_matches(filters: &[Filter], values: &Map<String, Value>) -> bool {
             FilterOp::Contains => match (value, &filter.value) {
                 (Value::String(text), Value::String(part)) => text.contains(part.as_str()),
                 (Value::Array(items), wanted) => items.iter().any(|v| same_value(v, wanted)),
+                _ => false,
+            },
+            FilterOp::StartsWith => match (value, &filter.value) {
+                (Value::String(text), Value::String(start)) => text.starts_with(start.as_str()),
+                _ => false,
+            },
+            // The engine's full-text search, near enough: every word of the query somewhere in
+            // the text, whatever the case.
+            FilterOp::Search => match (value, &filter.value) {
+                (Value::String(text), Value::String(words)) => {
+                    let text = text.to_lowercase();
+                    words
+                        .split_whitespace()
+                        .all(|word| text.contains(&word.to_lowercase()))
+                }
                 _ => false,
             },
             FilterOp::Eq => same_value(value, &filter.value),
@@ -865,6 +882,18 @@ pub fn row_matches(filters: &[Filter], values: &Map<String, Value>) -> bool {
 /// A filter as its pill's parts: the field, the test and the value it compares with, if any,
 /// as it reads: `title is Engineer`, `email is empty`, `has worksAt →`.
 pub fn filter_parts(filter: &Filter) -> (String, String, Option<String>) {
+    // A neighbour's property is named by the traversal and the property: `attended name
+    // contains Aaron`; the pill's icon shows the direction.
+    if let Some((relationship, property)) = filter.property.split_once('.')
+        && let Some((_, edge)) = gq_language::builder::parse_relationship_key(relationship)
+    {
+        let value = filter.op.takes_value().then(|| edit_text(&filter.value));
+        return (
+            format!("{} {property}", gq_language::traversal_name(edge)),
+            filter.op.label().to_owned(),
+            value,
+        );
+    }
     // A relationship is named by its traversal; the pill's icon shows its direction.
     if let Some((_, edge)) = gq_language::builder::parse_relationship_key(&filter.property) {
         let relationship = gq_language::traversal_name(edge);
@@ -1877,6 +1906,7 @@ mod tests {
                 list: false,
                 enum_values: None,
                 is_key: false,
+                indexed: false,
             };
             relative_value(Some(&property), &Value::String(text.into()), now)
         };

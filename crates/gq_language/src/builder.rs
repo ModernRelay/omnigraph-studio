@@ -165,6 +165,10 @@ pub enum FilterOp {
     Gt,
     Ge,
     Contains,
+    /// `$n.p starts_with $f`.
+    StartsWith,
+    /// The engine's full-text filter, `search($n.p, $f)`: the words, in any order and form.
+    Search,
     /// Membership in a list of values (`$n.p in $f`).
     In,
     IsEmpty,
@@ -183,7 +187,7 @@ pub enum FilterOp {
 
 impl FilterOp {
     /// Every operator, for [`FilterOp::from_key`].
-    const ALL: [FilterOp; 16] = [
+    const ALL: [FilterOp; 18] = [
         FilterOp::Eq,
         FilterOp::Ne,
         FilterOp::Lt,
@@ -191,6 +195,8 @@ impl FilterOp {
         FilterOp::Gt,
         FilterOp::Ge,
         FilterOp::Contains,
+        FilterOp::StartsWith,
+        FilterOp::Search,
         FilterOp::In,
         FilterOp::IsEmpty,
         FilterOp::IsNotEmpty,
@@ -212,6 +218,8 @@ impl FilterOp {
             FilterOp::Gt => "gt",
             FilterOp::Ge => "ge",
             FilterOp::Contains => "contains",
+            FilterOp::StartsWith => "starts_with",
+            FilterOp::Search => "search",
             FilterOp::In => "in",
             FilterOp::IsEmpty => "is_empty",
             FilterOp::IsNotEmpty => "is_not_empty",
@@ -237,6 +245,8 @@ impl FilterOp {
             FilterOp::Gt => "greater than",
             FilterOp::Ge => "at least",
             FilterOp::Contains => "contains",
+            FilterOp::StartsWith => "starts with",
+            FilterOp::Search => "matches words",
             FilterOp::In => "is one of",
             FilterOp::IsEmpty => "is empty",
             FilterOp::IsNotEmpty => "is not empty",
@@ -291,7 +301,18 @@ impl FilterOp {
         } else {
             match property.kind {
                 ScalarKind::Text if property.enum_values.is_none() => {
-                    vec![FilterOp::Eq, FilterOp::Ne, FilterOp::Contains, FilterOp::In]
+                    let mut ops = vec![
+                        FilterOp::Eq,
+                        FilterOp::Ne,
+                        FilterOp::Contains,
+                        FilterOp::StartsWith,
+                    ];
+                    // `search` needs the property's full-text index (the compiler's T27).
+                    if property.indexed {
+                        ops.push(FilterOp::Search);
+                    }
+                    ops.push(FilterOp::In);
+                    ops
                 }
                 ScalarKind::Text => vec![FilterOp::Eq, FilterOp::Ne, FilterOp::In],
                 ScalarKind::Bool => vec![FilterOp::Eq, FilterOp::Ne],
@@ -755,6 +776,9 @@ fn property_clause(
                 };
             }
             let param = params.add(&format!("f{i}"), &ty, filter.value.clone());
+            if op == FilterOp::Search {
+                return format!("search({target}, {param})");
+            }
             let operator = match op {
                 FilterOp::Eq => "=",
                 FilterOp::Ne => "!=",
@@ -763,8 +787,10 @@ fn property_clause(
                 FilterOp::Gt => ">",
                 FilterOp::Ge => ">=",
                 FilterOp::Contains => "contains",
+                FilterOp::StartsWith => "starts_with",
                 FilterOp::In => "in",
-                FilterOp::Today
+                FilterOp::Search
+                | FilterOp::Today
                 | FilterOp::ThisWeek
                 | FilterOp::Last30Days
                 | FilterOp::IsEmpty
@@ -2917,6 +2943,68 @@ mod tests {
             update_rows(&schema, "Person", &key),
             Err(BuildError::NotEditable(_))
         ));
+    }
+
+    /// A text property filters by its start and, where it is indexed, by the engine's full-text
+    /// search; either reaches a neighbour's property through a relationship key.
+    #[test]
+    fn text_filters_start_with_search_and_reach_neighbours() {
+        let schema = SchemaModel::parse(
+            "node Person {\n  slug: String @key\n  name: String @index\n  bio: String?\n}\n\
+             edge Knows: Person -> Person @card(0..)\n",
+        )
+        .unwrap();
+        let person = schema.node("Person").unwrap();
+        let name = person.properties.iter().find(|p| p.name == "name").unwrap();
+        let bio = person.properties.iter().find(|p| p.name == "bio").unwrap();
+        assert!(FilterOp::for_property(name).contains(&FilterOp::Search));
+        assert!(
+            !FilterOp::for_property(bio).contains(&FilterOp::Search),
+            "no index"
+        );
+        let starts = Filter {
+            property: "name".into(),
+            op: FilterOp::StartsWith,
+            value: json!("Al"),
+        };
+        let words = Filter {
+            property: "name".into(),
+            op: FilterOp::Search,
+            value: json!("ada lovelace"),
+        };
+        let query = node_page(
+            &schema,
+            "Person",
+            &[starts, words],
+            None,
+            &PageStart::First,
+            10,
+        )
+        .unwrap();
+        assert_compiles_in(&schema, &query);
+        assert!(
+            query.text.contains("$n.name starts_with $f0"),
+            "{}",
+            query.text
+        );
+        assert!(
+            query.text.contains("search($n.name, $f1)"),
+            "{}",
+            query.text
+        );
+        let neighbour = Filter {
+            property: "out:Knows.name".into(),
+            op: FilterOp::Search,
+            value: json!("ada"),
+        };
+        let query =
+            node_page(&schema, "Person", &[neighbour], None, &PageStart::First, 10).unwrap();
+        assert_compiles_in(&schema, &query);
+        assert!(
+            query.text.contains("search($r0.name, $f0)"),
+            "{}",
+            query.text
+        );
     }
 
     #[test]

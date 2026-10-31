@@ -8,7 +8,7 @@ use gq_language::builder::{Filter, FilterOp};
 use gq_language::schema::Property;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use studio_workspace::models::{ModelTask, Tier};
+use studio_workspace::models::{Limits, ModelTask, Tier};
 
 use crate::model::parse_filter_value;
 
@@ -16,7 +16,12 @@ pub static TASK: ModelTask = ModelTask {
     name: "table-filter",
     sends: "The type's property names, its enum values and your sentence",
     tier: Tier::Fast,
-    limits: Tier::Fast.limits(),
+    // A wide type with many relationships describes itself in more than the tier's cap; the
+    // call is still one short answer.
+    limits: Limits {
+        input_bytes: 32 * 1024,
+        ..Tier::Fast.limits()
+    },
 };
 
 pub const INSTRUCTIONS: &str = "Turn the request into filters on a table of rows of one type. \
@@ -72,40 +77,77 @@ pub fn schema(choices: &[Choice]) -> Value {
 /// sentence.
 pub fn input(type_name: &str, choices: &[Choice], today: &str, sentence: &str) -> String {
     let mut text = format!("Table: rows of type {type_name}. Today is {today}.\n\nKeys:\n");
-    for choice in choices {
+    // The type's own properties, one line each; then each relationship on one line with the
+    // related type's properties after it, so a wide graph stays within the task's cap.
+    for choice in choices
+        .iter()
+        .filter(|c| c.property.is_some() && !c.key.contains('.'))
+    {
+        let property = choice.property.as_ref().expect("filtered");
         let ops: Vec<&str> = choice.ops.iter().map(|op| op.key()).collect();
-        match &choice.property {
-            Some(property) => {
-                let mut kind = property.base_type.clone();
-                if property.list {
-                    kind = format!("list of {kind}");
-                }
-                if property.nullable {
-                    kind.push_str(", optional");
-                }
-                text.push_str(&format!("- {}: {kind}", choice.key));
-                if let Some(values) = &property.enum_values {
-                    text.push_str(&format!("; one of {}", values.join(", ")));
-                }
-            }
-            None => {
-                text.push_str(&format!("- {}: relationship, {}", choice.key, choice.label));
-                if let Some(other) = &choice.other_type {
-                    text.push_str(&format!("; related_to names the {other}"));
-                }
-            }
+        text.push_str(&format!(
+            "- {}: {}; operators {}\n",
+            choice.key,
+            kind_of(property),
+            ops.join(", ")
+        ));
+    }
+    for relationship in choices.iter().filter(|c| c.property.is_none()) {
+        let ops: Vec<&str> = relationship.ops.iter().map(|op| op.key()).collect();
+        text.push_str(&format!(
+            "- {} ({}): operators {}",
+            relationship.key,
+            relationship.label,
+            ops.join(", ")
+        ));
+        let prefix = format!("{}.", relationship.key);
+        let nested: Vec<String> = choices
+            .iter()
+            .filter(|c| c.key.starts_with(&prefix))
+            .filter_map(|c| {
+                let property = c.property.as_ref()?;
+                Some(format!("{} {}", property.name, kind_of(property)))
+            })
+            .collect();
+        if !nested.is_empty() {
+            text.push_str(&format!(
+                "; or test the related record's property as {prefix}<property>, with that \
+                 property's operators: {}",
+                nested.join(", ")
+            ));
         }
-        text.push_str(&format!("; operators {}\n", ops.join(", ")));
+        text.push('\n');
     }
     text.push_str(
         "\nOperators: eq, ne, lt, le, gt, ge compare one value; contains matches text or a \
-         list member; in takes several values; is_empty and is_not_empty, today, this_week \
-         and last_30_days take no value; has_any and has_none take no value and test a \
-         relationship; related_to takes one value, the related record's name as the request \
-         says it.\n\nRequest: ",
+         list member; starts_with and search (the words, in any order) match text; in takes \
+         several values; is_empty and is_not_empty, today, this_week and last_30_days take no \
+         value; has_any and has_none take no value and test a relationship; a key with a dot \
+         tests the related records' property, which is how to filter by a related record's \
+         name or kind; related_to takes one value, the related record's name, only for one \
+         exact record.\n\nRequest: ",
     );
     text.push_str(sentence.trim());
     text
+}
+
+/// A property's kind in a few words: `String`, `list of String`, `enum(a, b, …)`.
+fn kind_of(property: &Property) -> String {
+    const ENUM_VALUES_SHOWN: usize = 12;
+    let base = match &property.enum_values {
+        Some(values) if values.len() > ENUM_VALUES_SHOWN => format!(
+            "enum({}, … {} more)",
+            values[..ENUM_VALUES_SHOWN].join(", "),
+            values.len() - ENUM_VALUES_SHOWN
+        ),
+        Some(values) => format!("enum({})", values.join(", ")),
+        None => property.base_type.clone(),
+    };
+    if property.list {
+        format!("list of {base}")
+    } else {
+        base
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,6 +225,7 @@ mod tests {
             list: false,
             enum_values: values.map(|values| values.iter().map(|v| (*v).to_owned()).collect()),
             is_key: false,
+            indexed: false,
         }
     }
 
@@ -268,10 +311,16 @@ mod tests {
             ]
         );
         let text = input("Event", &choices, "2026-10-29", " dinners last month ");
-        assert!(text.contains("- kind: String, optional; one of dinner, trip; operators eq"));
-        assert!(text.contains(
-            "- out:Attended: relationship, attended Person; related_to names the Person;"
-        ));
+        assert!(
+            text.contains("- kind: enum(dinner, trip); operators eq"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "- out:Attended (attended Person): operators has_any, has_none, related_to"
+            ),
+            "{text}"
+        );
         assert!(text.ends_with("Request: dinners last month"));
     }
 }

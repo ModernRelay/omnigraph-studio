@@ -6683,12 +6683,35 @@ impl TypeTable {
 
     /// The icon of a filter key: the property's kind, or the relationship's direction.
     fn key_icon(&self, key: &str) -> IconName {
-        if let Some((direction, _)) = builder::parse_relationship_key(key) {
+        if let Some((direction, _)) =
+            builder::parse_relationship_key(key.split('.').next().unwrap_or(key))
+        {
             return direction_icon(direction);
         }
         self.filterable()
             .find(|p| p.name == key)
             .map_or(IconName::CaseSensitive, property_icon)
+    }
+
+    /// The property a filter key tests: the table's own, or a neighbour's through a
+    /// relationship key (`out:Attended.name`). None for a relationship itself.
+    fn property_for_key(&self, key: &str) -> Option<Property> {
+        if let Some((relationship, property)) = key.split_once('.') {
+            let (direction, edge) = builder::parse_relationship_key(relationship)?;
+            let schema = self.schema.as_ref()?;
+            let group = schema
+                .relationships_of(&self.type_name)
+                .iter()
+                .find(|group| group.direction == direction && group.edge == edge)?;
+            return schema
+                .node(&group.other_type)?
+                .properties
+                .iter()
+                .find(|p| p.name == property)
+                .filter(|p| !FilterOp::for_property(p).is_empty())
+                .cloned();
+        }
+        self.filterable().find(|p| p.name == key).cloned()
     }
 
     /// What a filter can test: each filterable property, then (in a node table) each
@@ -6709,7 +6732,21 @@ impl TypeTable {
                     gq_language::traversal_name(&group.edge),
                     group.other_type
                 );
-                choices.push((key, label, direction_icon(group.direction)));
+                choices.push((key.clone(), label.clone(), direction_icon(group.direction)));
+                // Then the neighbour's own properties, a nested search each: "attended Person
+                // · name".
+                if let Some(other) = schema.node(&group.other_type) {
+                    for property in &other.properties {
+                        if property.is_key || FilterOp::for_property(property).is_empty() {
+                            continue;
+                        }
+                        choices.push((
+                            builder::neighbour_property_key(group, &property.name),
+                            format!("{label} · {}", property.name),
+                            direction_icon(group.direction),
+                        ));
+                    }
+                }
             }
         }
         choices
@@ -6720,9 +6757,8 @@ impl TypeTable {
         if builder::parse_relationship_key(key).is_some() {
             return FilterOp::for_relationship();
         }
-        self.filterable()
-            .find(|p| p.name == key)
-            .map(FilterOp::for_property)
+        self.property_for_key(key)
+            .map(|property| FilterOp::for_property(&property))
             .unwrap_or_default()
     }
 
@@ -6779,7 +6815,7 @@ impl TypeTable {
                 .find(|group| builder::relationship_key(group) == key)?;
             return Some(SuggestSource::Nodes(group.other_type.clone()));
         }
-        let property = self.filterable().find(|p| p.name == key)?;
+        let property = self.property_for_key(key)?;
         if let Some(values) = &property.enum_values {
             return Some(SuggestSource::Values(values.clone()));
         }
@@ -6930,7 +6966,7 @@ impl TypeTable {
                 _ => Ok(Value::Null),
             }
         } else {
-            let Some(property) = self.filterable().find(|p| p.name == key).cloned() else {
+            let Some(property) = self.property_for_key(&key) else {
                 return;
             };
             if op == FilterOp::In {
@@ -6976,7 +7012,7 @@ impl TypeTable {
             .into_iter()
             .map(|(key, label, _)| words::Choice {
                 ops: self.ops_for(&key),
-                property: self.filterable().find(|p| p.name == key).cloned(),
+                property: self.property_for_key(&key),
                 other_type: self.related_type(&key),
                 key,
                 label,
@@ -9480,6 +9516,8 @@ fn filter_placeholder(op: FilterOp) -> &'static str {
     match op {
         FilterOp::In => "Values, separated by commas",
         FilterOp::RelatedTo => "Name or id",
+        FilterOp::StartsWith => "Start of the value",
+        FilterOp::Search => "Words, in any order",
         _ => "Value",
     }
 }

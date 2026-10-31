@@ -235,16 +235,18 @@ filter box, since the key is the person's own and the settings row already says 
 "Filter in words…", always shown, before the control chips: a pill on the chips' height
 (`ds::pill_field`) with the model's mark where the search field has its glass, its spinner while a call is out,
 and its red line when one failed, with why in its tooltip (`studio_table::FilterInWords`,
-⌘⇧F, puts the cursor in it). Enter calls `table-filter` (Fast; 8 KB in, 300 tokens out, 10 s) with the type's property names and
+⌘⇧F, puts the cursor in it). Enter calls `table-filter` (Fast; 32 KB in, since a wide type with many relationships describes itself in more than 8 KB; 300 tokens out, 10 s) with the type's property names and
 value types, its enums' values, its relationship keys (`relationship_key`), the 16 operators
 with one line each on what they take, today's date, and the sentence. The schema is built per
 type: `property` an enum of the type's keys, `op` an enum of the operators, `value` a list of
 strings. The answer's filters go through `builder::build`'s checks; any it refuses is dropped
 and the bar says "Could not use: {property}". Relationships filter too: `has_any` and
-`has_none` as they are, and `related_to`, which the model answers with the related record's
-name as the sentence says it ("events Aaron attended"), goes through the node search the
-filter's own value field uses (`suggest::search_nodes`, the first match taken), so the pill
-shows the record and the query gets its id; a name no record matches is dropped and named. The rest become pills as if added by hand, so
+`has_none` as they are; a neighbour's property (`out:Attended.name contains "Aaron"`, spec
+004), which the prompt names as the way to filter by a related record's name or kind, so
+"events Aaron attended" matches every Aaron as a nested search; and `related_to` for one
+exact record, whose name goes through the node search the filter's own value field uses
+(`suggest::search_nodes`, the first match taken), so the pill shows the record and the query
+gets its id; a name no record matches is dropped and named. The rest become pills as if added by hand, so
 they are seen and removable, and the table reads as it does for any filter. A second sentence
 replaces the filters the first made and keeps ones added by hand. Measured: 1.5–2.8 s on
 Haiku with every answer right; Escape leaves the field and clears what it said.
@@ -287,7 +289,7 @@ name to the settings description's list. It never calls OpenRouter itself.
 
 | | Fast | Careful |
 |---|---|---|
-| Input | ≤ 8 KB (`column-fill` 4 KB) | ≤ 64 KB |
+| Input | ≤ 8 KB (`table-filter` 32 KB, `column-fill` 4 KB) | ≤ 64 KB |
 | Output | ≤ 300 tokens (`column-fill` 200) | ≤ 1,200 tokens |
 | Time | 10 s | 60 s |
 | In flight per control | 1 | 1 |

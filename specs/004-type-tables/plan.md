@@ -231,14 +231,25 @@ stay put), IX (paged, virtualized).
 
 ### Filters and views
 
-- Filter chips per column: equals, not equals, greater or less, contains, in list, is empty, is
-  not empty; dates as Today, This week, Last 30 days, or a range, through `now()`. A preset
+- Filter chips per column: equals, not equals, greater or less, contains, starts with, in
+  list, is empty, is not empty; dates as Today, This week, Last 30 days, or a range, through
+  `now()`. Free text with a full-text index (`@index`, or a key) also offers "matches words",
+  the engine's `search($n.p, $q)`: the words in any order and form, which the compiler refuses
+  on a property without the index (T27), so the operator is offered only where it holds
+  (since 2026-10-31). A preset
   holds no value of its own: a row edited, inserted or deleted is judged here against the days
   it stands for now, as the engine is asked (since 2026-10-21; before, every row was dimmed
   after an edit and counted as not matching).
 - Relationship filters: "has any", "has none", "related to …" through `exists { }`, `not { }`,
   and a bound endpoint. Measure "has none" on a large type before shipping it (it was too
   slow on an older engine).
+- A neighbour's property, a nested search: after each relationship the menu lists the other
+  type's filterable properties ("attended Person · name", key `out:Attended.name`), with that
+  property's own operators and offers, through `exists { $r: Person  $n attended $r  $r.name
+  contains $f }` (`builder::neighbour_property_clause`, which grouping already used). The pill
+  reads "attended name contains Aaron" with the direction's arrow. This is how "events Aaron
+  attended" filters when several records are called Aaron: all of them, where "related to"
+  binds one record (since 2026-10-31).
 - The value field offers what it can take: an enum's values (or `true` and `false`), narrowed
   as text is typed with matches at the start first, and for "related to" the other type's
   nodes, searched on the server by id or label (`builder::node_search`, 8 at a time, at the
@@ -484,6 +495,7 @@ kept answers.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-31 | A filter tests a neighbour's property, text starts-with, and full-text search where the property is indexed | `gq_language` `text_filters_start_with_search_and_reach_neighbours` (a schema with `name: String @index` and `bio` without: Search offered for one, not the other; `starts_with`, `search()` and `search($r0.name …)` through `out:Knows.name` type-check), `every_offered_filter_op_compiles`; live on the personal graph with the CLI: `starts_with`, `search($p.name, …)` and an `or` group answer, `fuzzy` answers loosely; `cargo test -p type_table` | Pass. `fuzzy()` and `or` groups are not offered yet |
 | 2026-10-29 | A table's rows do not paint as one scene layer | `type_table` `instrument_a_frame_of_a_full_table` (ignored, `instrument:`; 200 rows of 20 text columns, a frame with the grid replayed from its cache, the mean of 600), three runs each with the grid wrapped in `Window::paint_layer` and without; GPUI's `Scene` batching read at Zed v1.23.2 | Without, 9.72, 9.64 and 9.61 ms a frame; with, 8.86, 8.85 and 8.78 (two columns: 3.25 against 3.08). Inside a layer every quad takes one draw order and skips the bounds-tree search, but at one order GPUI draws every shadow before every quad, so a ring drawn as a shadow (the design system's, an unchecked row's checkbox) goes under the cursor row's fill, and every shadowed piece put in a cell later would too. Not adopted: the rows keep the bounds tree, and the instrument stays for the next frame-cost change |
 | 2026-10-29 | Rows are picked by checkbox; the bar comes with the first and deletes | `type_table` `checkboxes_pick_rows_and_the_header_selects_all` (drawn and clicked: the select-all picks both rows, a row's box takes the first out and leaves a dash and the cursor where it was, one row has the bar, the select-all picks the rest and then takes all out); the workspace suite; the relaunched app's Claim table | Pass. Before, rows were picked only by ⌘-click and ⇧-click on a cell, which nothing on screen told, and the bar waited for a second row |
 | 2026-10-29 | A table not drawn reads no rows | `type_table` `a_table_not_drawn_reads_no_rows` (a table in a window that draws a blank root, then the branch moved: no page read; another drawn: rows read); every other table test, each drawn in its window | Pass. Before, every table restored behind another tab read its first page at start, and again at every branch or schema move; it now lets go of what it showed at once and reads when next drawn. A sort, a filter or Refresh, all asked in view, still read at once |
