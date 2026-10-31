@@ -15,7 +15,7 @@ use gpui::{
 };
 use gq_language::{Property, SchemaModel};
 use graph_store::{EntityKind, GraphSession, SessionEvent};
-use studio_actions::graph::{BrowseType, OpenOntology, OpenSchema, OpenType};
+use studio_actions::graph::{OpenOntology, OpenSchema, OpenType};
 use studio_actions::ontology::{Back, Open, SelectNext, SelectPrevious, ShowDomains};
 use studio_ui::ds::{self, size, space};
 use studio_workspace::{Item, ItemEvent, SavedItem};
@@ -1011,7 +1011,7 @@ impl OntologyPage {
                     ))
                 })
         });
-        let (browse, table, source) = (name.clone(), name.clone(), name.clone());
+        let (table, source) = (name.clone(), name.clone());
         ds::card(cx)
             .w(px(width))
             .flex_none()
@@ -1046,16 +1046,6 @@ impl OntologyPage {
                                     filter_id: None,
                                     via: None,
                                     preview: false,
-                                }),
-                                cx,
-                            )
-                        },
-                    ))
-                    .child(ds::row_button("browse-rows", "Browse rows").on_click(
-                        move |_, window, cx| {
-                            window.dispatch_action(
-                                Box::new(BrowseType {
-                                    type_name: browse.clone(),
                                 }),
                                 cx,
                             )

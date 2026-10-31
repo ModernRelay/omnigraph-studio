@@ -442,9 +442,8 @@ its open section.
   and an edge type may share a name (since 2026-10-21; before, it took the edge). More than
   20,000 picked relationships, past what Undo puts back in one commit, are confirmed by typing
   `delete N`, with no Undo (since 2026-10-21).
-- An edit open when the table moves to another branch (a link, a toast's follow-up), when its
-  tab closes, or when the Nodes panel lets its table go, is kept as the cell's draft on the
-  branch it was typed on, as leaving the cell keeps it; a tab holding such an edit asks before
+- An edit open when the table moves to another branch (a link, a toast's follow-up), or when its
+  tab closes, is kept as the cell's draft on the branch it was typed on, as leaving the cell keeps it; a tab holding such an edit asks before
   it closes (since 2026-10-21; before, the text was lost).
 - Every editing surface shows `write · <branch>`. A 403 shows "Your token cannot change
   <branch>" and keeps the draft.

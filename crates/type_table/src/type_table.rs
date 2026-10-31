@@ -11,7 +11,6 @@ mod fill;
 mod grouping;
 mod model;
 mod node_page;
-mod nodes_panel;
 mod offers;
 mod pdf;
 mod peek;
@@ -29,7 +28,7 @@ use gq_language::{Filter, FilterOp};
 use graph_store::GraphSession;
 use serde_json::Value;
 use studio_actions::graph::{
-    BrowseType, OpenBlob, OpenNode, OpenNodePage, OpenTextEditor, OpenType, PeekNode, UndoDelete,
+    OpenBlob, OpenNode, OpenNodePage, OpenTextEditor, OpenType, PeekNode, UndoDelete,
 };
 use studio_workspace::{PanelPosition, ToastKind, Workspace};
 use ui::IconName;
@@ -42,8 +41,7 @@ use text_editor::TextEditor;
 use types_list::TypesList;
 
 /// Registers this surface: the tabs it restores (a type's table, a node's page, a Blob, a long
-/// text), and with every new workspace the left dock's Graph panel, the bottom dock's Nodes
-/// panel, and the actions that open what it shows (`OpenType`, `OpenNode`, `OpenNodePage`,
+/// text), and with every new workspace the left dock's Graph panel and the actions that open what it shows (`OpenType`, `OpenNode`, `OpenNodePage`,
 /// `PeekNode`, `OpenBlob`, `OpenTextEditor`, `UndoDelete`). Its keys are in `assets/keymaps/`
 /// (`TypeTable`, `TypeTable && editing`).
 pub fn init(cx: &mut App) {
@@ -180,29 +178,6 @@ pub fn init(cx: &mut App) {
             if let (Some(table), Some(filter)) = (table, filter) {
                 table.update(cx, |table, cx| table.show_only(filter, cx));
             }
-        });
-        // The Nodes panel in the bottom dock, and browsing a type in it.
-        let workspace_handle = cx.entity().downgrade();
-        let current = workspace.session().cloned();
-        let nodes =
-            cx.new(|cx| nodes_panel::NodesPanel::new(workspace_handle, current, window, cx));
-        workspace.add_panel(
-            PanelPosition::Bottom,
-            nodes_panel::NODES_PANEL,
-            "Nodes",
-            IconName::Table,
-            nodes.clone().into(),
-            cx,
-        );
-        let focused = nodes.clone();
-        workspace.set_panel_focus(
-            nodes_panel::NODES_PANEL,
-            move |cx| focused.read(cx).focus(cx),
-            cx,
-        );
-        workspace.register_action(move |workspace, action: &BrowseType, window, cx| {
-            nodes.update(cx, |panel, cx| panel.browse(&action.type_name, window, cx));
-            workspace.activate_panel(nodes_panel::NODES_PANEL, cx);
         });
         workspace.register_action(|workspace, action: &PeekNode, _window, cx| {
             peek_node(

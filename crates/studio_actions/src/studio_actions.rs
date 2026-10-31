@@ -217,13 +217,6 @@ pub mod graph {
         pub links: Vec<(usize, usize)>,
     }
 
-    /// Browse a type's rows in the Nodes panel, in the bottom dock.
-    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
-    #[action(namespace = studio_graph)]
-    pub struct BrowseType {
-        pub type_name: String,
-    }
-
     /// Open a Blob value in a tab of its own, read at a commit or the branch head.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph)]

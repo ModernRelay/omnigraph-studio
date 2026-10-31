@@ -713,6 +713,7 @@ impl Item for TypeTable {
 }
 
 impl TypeTable {
+    #[cfg(test)]
     pub fn new(
         workspace: WeakEntity<Workspace>,
         session: Entity<GraphSession>,
@@ -896,8 +897,7 @@ impl TypeTable {
             #[cfg(test)]
             reads_sent_again: 0,
         };
-        // The tab closes, or the Nodes panel lets the table go: an edit open is kept as its
-        // cell's draft, as leaving the cell keeps it.
+        // The tab closes: an edit open is kept as its cell's draft, as leaving the cell keeps it.
         cx.on_release(|this: &mut Self, cx| {
             if let Some(editing) = this.editing.take() {
                 this.keep_edit_on(&this.branch, editing, cx);
@@ -908,10 +908,6 @@ impl TypeTable {
         this.sync_drafts(cx);
         this.load_schema(cx);
         this
-    }
-
-    pub fn type_name(&self) -> &str {
-        &self.type_name
     }
 
     // ---- session ----
@@ -13136,7 +13132,7 @@ mod tests {
     }
 
     /// An edit open that changes its cell is unsaved work, so closing the tab asks first; let
-    /// go (its tab closed, or the Nodes panel's table replaced), the table keeps what was typed
+    /// go (its tab closed), the table keeps what was typed
     /// as the cell's draft.
     #[gpui::test]
     async fn a_table_let_go_keeps_its_open_edit_as_a_draft(cx: &mut TestAppContext) {

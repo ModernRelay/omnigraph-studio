@@ -88,7 +88,7 @@ a 412 reopens the draft.
 - Each column's header is its panel's own (title and buttons); the first holds the traffic
   lights. There is no title bar.
 - Left dock: Graph (types and relationships with counts), Explore, Queries, Branches,
-  Conversations. Right dock: inspector. Bottom dock: Nodes, History, Activity.
+  Conversations. Right dock: inspector. Bottom dock: History, Activity.
 - Center: panes of items (type table, canvas, query editor, review, commit); each pane's tab
   strip starts with its own Back and Forward.
 - Status bar, after Zed's: the sidebar toggle, every panel's button (the left dock's at the

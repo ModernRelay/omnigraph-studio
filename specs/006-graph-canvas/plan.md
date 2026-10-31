@@ -77,7 +77,7 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   - **A type in focus** (a click on any type): its card in the middle, with its count, what
     the schema says it is (its `@description`, else its `@instruction`; `NodeType::about`;
     five lines, the rest behind More), its properties (an enumeration's values below its
-    name, on as many lines as they need), and Open table, Browse rows and Schema; its domain
+    name, on as many lines as they need), and Open table and Schema; its domain
     is in the header's path. The relationships that reach it stand on the left, those it
     reaches on the right (one to itself once, on the right), each side titled with how many
     it holds, each a row of the type at the other end and the relationship's name: the type
@@ -305,7 +305,7 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   is. Off when the system asks for reduced motion (and in offscreen snapshots).
 - **Starting a walk (2026-10-12).** The canvas, before a node is chosen, says how to start:
   Search nodes (⌘P, which roots the exploration at the node picked) or G on a row in any table
-  (`studio_table::ExploreRow`, also in the Nodes panel, and in its footer hints). The
+  (`studio_table::ExploreRow`, and in its footer hints). The
   inspector's node header has an Explore button. Until 2026-10-20 the canvas was also the
   ontology, a face chosen with a segmented switch and saved with the tab (`"ontology": bool`,
   now ignored); its top left now says what is drawn (the walk's root and its nodes, or the
