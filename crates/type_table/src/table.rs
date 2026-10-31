@@ -8259,8 +8259,10 @@ impl TypeTable {
                     this.blob_tasks.remove(&key);
                     this.blobs.remove(&key.0, &key.1);
                 }
+                // One pass over the queue, however many leave it.
+                let leaving: HashSet<&(String, String)> = waiting_gone.iter().collect();
+                this.blob_queue.retain(|waiting| !leaving.contains(waiting));
                 for key in &waiting_gone {
-                    this.blob_queue.retain(|waiting| waiting != key);
                     if matches!(this.blobs.get(&key.0, &key.1), Some(Loadable::Loading)) {
                         this.blobs.remove(&key.0, &key.1);
                     }

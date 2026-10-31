@@ -451,14 +451,6 @@ fn revert_checks(
 
 /// Whether two schemas group and draw the cards alike: the same text, naming each type's nodes
 /// by the same property. A schema read again with the same text is the same one.
-fn same_schema(a: Option<&Arc<SchemaModel>>, b: Option<&Arc<SchemaModel>>) -> bool {
-    match (a, b) {
-        (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a.same_as(b),
-        (None, None) => true,
-        _ => false,
-    }
-}
-
 pub struct ReviewView {
     session: Entity<GraphSession>,
     branch: String,
@@ -837,7 +829,7 @@ impl ReviewView {
         let schema = self.session.read(cx).schema_model();
         let shows_head = self.shows_head();
         let Some(data) = &self.data else { return };
-        if same_schema(data.schema.as_ref(), schema.as_ref()) {
+        if SchemaModel::same_held(data.schema.as_ref(), schema.as_ref()) {
             // Grouped as the session's schema groups: a regroup under way is for one since gone.
             self._regroup_task = None;
             return;
@@ -5836,7 +5828,10 @@ pub(crate) mod tests {
         cx.run_until_parked();
         let grouped_with = |view: &ReviewView| view.data.as_ref().unwrap().schema.clone();
         view.read_with(cx, |view, _| {
-            assert!(same_schema(grouped_with(view).as_ref(), Some(&loaded)));
+            assert!(SchemaModel::same_held(
+                grouped_with(view).as_ref(),
+                Some(&loaded)
+            ));
             let data = view.data.as_ref().unwrap();
             assert_eq!(data.groups, EntityGroups::new(&data.folded, Some(&*loaded)));
         });
@@ -5853,7 +5848,10 @@ pub(crate) mod tests {
             "the schema held, not compiled again"
         );
         view.read_with(cx, |view, _| {
-            assert!(same_schema(grouped_with(view).as_ref(), Some(&again)));
+            assert!(SchemaModel::same_held(
+                grouped_with(view).as_ref(),
+                Some(&again)
+            ));
             assert!(
                 Arc::ptr_eq(&grouped_with(view).unwrap(), &grouped),
                 "not grouped again"
