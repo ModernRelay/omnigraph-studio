@@ -46,26 +46,10 @@ fn scalar_or_list(name: &str, type_name: &str, text: &str) -> Result<Value, Stri
 }
 
 /// A list is JSON (`["a", "b"]`) or comma-separated items (`a, b`), quoted as a cell's are
-/// when one holds a comma (`"Smith, John", x`).
+/// when one holds a comma (`"Smith, John", x`), read as a cell reads one
+/// ([`crate::input::list_texts`]).
 fn list(name: &str, item_type: &str, text: &str) -> Result<Value, String> {
-    let trimmed = text.trim();
-    if trimmed.starts_with('[') {
-        let value: Value = serde_json::from_str(trimmed)
-            .map_err(|error| format!("${name} is not a JSON list: {error}"))?;
-        let Value::Array(items) = value else {
-            return Err(format!("${name} must be a list"));
-        };
-        return items
-            .into_iter()
-            .map(|item| match item {
-                Value::String(s) => scalar(name, item_type, &s),
-                Value::Null => Err(format!("${name} cannot hold a null item")),
-                other => scalar(name, item_type, &other.to_string()),
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(Value::Array);
-    }
-    crate::input::list_items(trimmed)
+    crate::input::list_texts(text)
         .map_err(|error| format!("${name}: {error}"))?
         .iter()
         .map(|item| scalar(name, item_type, item))

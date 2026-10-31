@@ -75,9 +75,32 @@ pub fn edit_text(value: &Value) -> String {
 /// How an empty list is written.
 const EMPTY_LIST: &str = "[]";
 
+/// The items of a list as typed, each as text for its type to read: JSON (`["a", "b"]`, as a
+/// list is copied) when it starts with `[`, else [`list_items`]. A cell, a form field and a list
+/// parameter read one alike.
+pub fn list_texts(text: &str) -> Result<Vec<String>, String> {
+    let trimmed = text.trim();
+    if !trimmed.starts_with('[') {
+        return list_items(trimmed);
+    }
+    let value: Value =
+        serde_json::from_str(trimmed).map_err(|error| format!("Not a JSON list: {error}"))?;
+    let Value::Array(items) = value else {
+        return Err("Not a list".into());
+    };
+    items
+        .into_iter()
+        .map(|item| match item {
+            Value::String(text) => Ok(text),
+            Value::Null => Err("A list cannot hold an empty item".into()),
+            other => Ok(other.to_string()),
+        })
+        .collect()
+}
+
 /// The items of a list as typed: separated by commas, each trimmed unless quoted; a quoted item
 /// keeps its text, a doubled quote standing for one. Items left empty between commas are
-/// dropped. A cell, a list parameter and a list filter read one alike.
+/// dropped. A list filter reads one so, and [`list_texts`] reads text that is not JSON so.
 pub fn list_items(text: &str) -> Result<Vec<String>, String> {
     let mut items = Vec::new();
     let mut chars = text.chars().peekable();
@@ -365,15 +388,12 @@ pub fn parse_input(property: &Property, text: &str) -> Result<Value, String> {
         };
     }
     if property.list {
-        if text.trim() == EMPTY_LIST {
-            return Ok(Value::Array(Vec::new()));
-        }
         let element = Property {
             list: false,
             nullable: false,
             ..property.clone()
         };
-        return list_items(text)?
+        return list_texts(text)?
             .iter()
             .map(|item| parse_scalar(&element, item))
             .collect::<Result<Vec<_>, _>>()
@@ -403,7 +423,8 @@ mod tests {
 
     /// A list reads back as it was written: an item holding a comma or a quote, an empty one,
     /// one starting with `[`, and the empty list itself, apart from no value. A list parameter
-    /// reads the same text back, though it takes text starting with `[` for JSON.
+    /// reads the same text back, and both take a list as it is copied, in JSON. Before, a cell
+    /// refused the JSON a parameter took.
     #[test]
     fn a_list_reads_back_as_it_was_written() {
         let tags = Property {
@@ -438,6 +459,9 @@ mod tests {
         );
         // Typed by hand: spaces around unquoted items go, empty ones are dropped.
         assert_eq!(parse_input(&tags, " a ,, b ,"), Ok(json!(["a", "b"])));
+        // Pasted as it is copied, in JSON.
+        assert_eq!(parse_input(&tags, r#"["a", "b"]"#), Ok(json!(["a", "b"])));
+        assert!(parse_input(&tags, r#"["a", null]"#).is_err());
         assert!(parse_input(&tags, "\"open").is_err());
         assert!(parse_input(&tags, "\"a\" b").is_err());
         // A list that must hold one is emptied by clearing it.
