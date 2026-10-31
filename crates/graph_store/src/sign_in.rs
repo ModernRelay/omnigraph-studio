@@ -1085,7 +1085,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::connection::{Connection, ConnectionState, ServerEntry, ServerSource};
+    use crate::connection::{
+        Connection, ConnectionState, PromptAction, ServerEntry, ServerSource, SignInPrompt,
+    };
 
     const SERVER: &str = "https://graphs.test";
     const RESOURCE: &str = "https://graphs.test/mcp";
@@ -1581,6 +1583,17 @@ mod tests {
         assert_eq!(label, "Sign in needed");
         // Nothing opened a browser on its own.
         assert_eq!(cx.opened_url(), None);
+        // The window's tabs say who asks and where the sign-in is, and offer it, in place of the
+        // refused reads' 401s.
+        let prompt = |cx: &mut TestAppContext| connection.read_with(cx, |c, _| c.sign_in_prompt());
+        assert_eq!(
+            prompt(cx),
+            Some(SignInPrompt {
+                server: "work".into(),
+                says: "work asks you to sign in at id.test.".into(),
+                offers: Some(PromptAction::SignIn),
+            })
+        );
 
         connection.update(cx, |c, cx| c.sign_in(cx));
         assert_eq!(
@@ -1589,10 +1602,19 @@ mod tests {
                 service: "id.test".into()
             }
         );
+        assert_eq!(
+            prompt(cx),
+            Some(SignInPrompt {
+                server: "work".into(),
+                says: "Finish signing in at id.test in your browser.".into(),
+                offers: Some(PromptAction::Cancel),
+            })
+        );
         let browser = approve(&served, &cx.opened_url().unwrap());
         until(cx, "the sign-in", |cx| {
             sign_in_state(&connection, cx).0 == ConnectionState::Ready
         });
+        assert_eq!(prompt(cx), None, "signed in, the tabs read again");
         assert!(
             browser
                 .join()
@@ -1626,6 +1648,10 @@ mod tests {
                 service: "id.test".into(),
                 why: None
             }
+        );
+        assert_eq!(
+            prompt(cx).and_then(|prompt| prompt.offers),
+            Some(PromptAction::SignIn)
         );
 
         // Signed in again, then as another account whose grant gives no refresh token: the

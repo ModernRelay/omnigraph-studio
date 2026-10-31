@@ -894,6 +894,12 @@ impl Focusable for AgentPanel {
 }
 
 impl Item for AgentPanel {
+    /// A conversation is the agent's, kept on this machine: its requests to the server say
+    /// their own refusals, and the conversation stays readable while a sign-in is asked for.
+    fn reads_graph(&self) -> bool {
+        false
+    }
+
     /// The conversation's title, as the sidebar lists it.
     fn tab_title(&self, cx: &App) -> SharedString {
         self.session_id

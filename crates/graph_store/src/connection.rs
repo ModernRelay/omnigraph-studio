@@ -102,6 +102,26 @@ pub enum GraphListing {
     Failed(String),
 }
 
+/// What a window says while its server asks for a sign-in nobody holds, and what it offers
+/// ([`Connection::sign_in_prompt`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignInPrompt {
+    /// The server's name, as the window names it.
+    pub server: String,
+    /// The sentence: who asks, where the sign-in is, or why Studio cannot make it.
+    pub says: String,
+    pub offers: Option<PromptAction>,
+}
+
+/// The one action a sign-in prompt offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptAction {
+    /// Opens the sign-in service in the browser ([`Connection::sign_in`]).
+    SignIn,
+    /// Ends the sign-in waiting for the browser ([`Connection::cancel_sign_in`]).
+    Cancel,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionEvent {
     StateChanged,
@@ -1803,6 +1823,49 @@ impl Connection {
     /// would replace stays held until that one is taken.
     pub fn holds_sign_in(&self) -> bool {
         self.oauth.is_some()
+    }
+
+    /// What a window shows in place of the server's content while the server asks for a sign-in
+    /// that nobody holds (spec 016, What the person sees): its reads are refused until the person
+    /// signs in, so a refused read's 401 says nothing they can act on. `None` while a sign-in is
+    /// held (its own states are the chip's), or the server asks none. Said as the Open dialog
+    /// says it, with the server's name.
+    pub fn sign_in_prompt(&self) -> Option<SignInPrompt> {
+        if self.state != ConnectionState::Unauthorized || self.holds_sign_in() {
+            return None;
+        }
+        let server = &self.server.name;
+        let (says, offers) = match &self.sign_in {
+            SignIn::Offered { service, why } => (
+                match why {
+                    Some(why) => format!("{why} The sign-in is at {service}."),
+                    None => format!("{server} asks you to sign in at {service}."),
+                },
+                Some(PromptAction::SignIn),
+            ),
+            SignIn::Reading => (
+                format!("{server} asks you to sign in. Studio is reading how."),
+                None,
+            ),
+            SignIn::Waiting { service } => (
+                format!("Finish signing in at {service} in your browser."),
+                Some(PromptAction::Cancel),
+            ),
+            SignIn::Finishing { service } => (format!("Finishing the sign-in at {service}."), None),
+            SignIn::Unavailable(why) => (
+                format!("{server} asks for a sign-in Studio cannot make. {why}"),
+                None,
+            ),
+            SignIn::NotOffered if self.sign_in_under_way() => {
+                ("Studio is finishing a sign-in.".to_owned(), None)
+            }
+            SignIn::NotOffered | SignIn::SignedIn { .. } => return None,
+        };
+        Some(SignInPrompt {
+            server: server.clone(),
+            says,
+            offers,
+        })
     }
 
     /// What the keychain holds for the target, which the next launch reads: the sign-in held
