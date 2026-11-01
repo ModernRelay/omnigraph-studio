@@ -1202,26 +1202,21 @@ impl GraphSession {
                 let first = self.unavailable.is_none();
                 self.unavailable = Some(error.message.clone());
                 if first || self._recheck.is_none() {
-                    let wait = self.recheck_after;
-                    self.recheck_after = (wait * 2).min(RECHECK_CAP);
-                    self._recheck = Some(cx.spawn(async move |this, cx| {
-                        cx.background_executor().timer(wait).await;
-                        this.update(cx, |this, cx| {
-                            this._recheck = None;
-                            if this.shown {
-                                this.recheck_available(cx);
-                            } else {
-                                this.recheck_owed = true;
-                            }
-                        })
-                        .ok();
-                    }));
+                    self.recheck_later(cx);
                 }
                 if first {
                     cx.emit(SessionEvent::AvailabilityChanged);
                 }
             }
-            Err(ReadError::Transport(_)) => {}
+            // While the graph is unavailable nothing else asks after it (head checks wait for
+            // the mark to clear), so a recheck the network did not carry, a server still
+            // restarting, asks again later as a 503 does. Before, the mark then stood until a
+            // view happened to read or the person refreshed.
+            Err(ReadError::Transport(_)) => {
+                if self.unavailable.is_some() && self._recheck.is_none() {
+                    self.recheck_later(cx);
+                }
+            }
             Err(ReadError::Refused(error)) if error.status == 401 => {
                 self.read_refused = true;
                 if error.unauthorized == Some(Unauthorized::TokenRefused) {
@@ -1253,6 +1248,25 @@ impl GraphSession {
     /// go: the schema, the branch list, the type counts and the stored-query catalog (once
     /// wanted) held stay shown while they are read, and stay if the graph still cannot answer;
     /// what was never read is read.
+    /// Asks after the graph's availability again once the wait has passed, the next wait twice
+    /// as long, up to [`RECHECK_CAP`]: now when a window shows it, else when one does.
+    fn recheck_later(&mut self, cx: &mut Context<Self>) {
+        let wait = self.recheck_after;
+        self.recheck_after = (wait * 2).min(RECHECK_CAP);
+        self._recheck = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            this.update(cx, |this, cx| {
+                this._recheck = None;
+                if this.shown {
+                    this.recheck_available(cx);
+                } else {
+                    this.recheck_owed = true;
+                }
+            })
+            .ok();
+        }));
+    }
+
     fn recheck_available(&mut self, cx: &mut Context<Self>) {
         if matches!(self.schema, Loadable::Loaded(_)) {
             self.recheck_schema(None, cx);
@@ -1269,6 +1283,10 @@ impl GraphSession {
     /// Reloads the schema, the branch list, the type counts and the stored queries (once a view
     /// wanted them), and reads the server's graph list again if it could not be read before.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        // Commits land unseen on a branch no view watches, so a Refresh lets go of every
+        // branch's head commit, and a list showing one reads it again. Before, such a head
+        // stood until the branch was made, deleted or watched, whatever was refreshed.
+        self.head_commits.clear();
         self.reload_schema(cx);
         self.reload_branches(cx);
         self.reload_counts(cx);
@@ -1687,8 +1705,10 @@ impl GraphSession {
                         return;
                     }
                 };
-                // A name the server lists again was made again since it was deleted.
-                this.gone_branches.retain(|branch| !result.contains(branch));
+                // A name the server lists again was made again since it was deleted. As a set:
+                // the list may hold thousands of branches, and each deleted name is looked up.
+                let listed: HashSet<&String> = result.iter().collect();
+                this.gone_branches.retain(|branch| !listed.contains(branch));
                 // The first list changes nothing read before it: lists asked for meanwhile
                 // (main's, as the window opens) stay, rather than being read twice.
                 if this.branches_read {
@@ -2523,13 +2543,36 @@ impl GraphSession {
     fn connection_state_changed(&mut self, cx: &mut Context<Self>) {
         let ready = self.connection.read(cx).state == ConnectionState::Ready;
         let was_ready = std::mem::replace(&mut self.connection_ready, ready);
-        if ready
-            && !was_ready
-            && self.read_refused
-            && self.client(cx).credential_changes() == self.credential
-        {
+        if !ready || was_ready {
+            return;
+        }
+        if self.read_refused && self.client(cx).credential_changes() == self.credential {
             self.read_refused = false;
             self.read_again_for_credential(cx);
+        } else {
+            self.read_failed_again(cx);
+        }
+    }
+
+    /// Reads again, once the connection is ready again, what a read the network did not carry
+    /// left failed: the schema, the branch list, the counts, and the stored queries a view
+    /// wants. Before, each stood failed until its own Try again or a Refresh, though the
+    /// connection was back. A parked graph reads them when shown.
+    fn read_failed_again(&mut self, cx: &mut Context<Self>) {
+        if !self.opened || !self.shown {
+            return;
+        }
+        if matches!(self.schema, Loadable::Failed(_)) {
+            self.reload_schema(cx);
+        }
+        if matches!(self.branches, Loadable::Failed(_)) {
+            self.reload_branches(cx);
+        }
+        if matches!(self.snapshot, Loadable::Failed(_)) || self.counts_stale.is_some() {
+            self.reload_counts(cx);
+        }
+        if self.stored_queries_wanted && matches!(self.stored_queries, Loadable::Failed(_)) {
+            self.reload_stored_queries(cx);
         }
     }
 
@@ -4410,19 +4453,23 @@ mod tests {
         ));
     }
 
+    /// A graph that answers 503 is unavailable until it answers again, asked after with a
+    /// growing wait; a recheck the network does not carry (the server still restarting) asks
+    /// again later too. Before, that recheck left the mark standing with nothing to ask again.
     #[gpui::test]
     async fn a_graph_that_answers_503_is_unavailable_until_it_answers_again(
         cx: &mut TestAppContext,
     ) {
-        let ready = Arc::new(AtomicBool::new(false));
-        let flag = ready.clone();
+        // 0: 503; 1: no answer at all; 2: the graph's answers.
+        let phase = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let flag = phase.clone();
         let http = FakeHttpClient::create(move |_request| {
-            let ready = flag.load(Ordering::SeqCst);
+            let phase = flag.load(Ordering::SeqCst);
             async move {
-                let (status, body) = if ready {
-                    (200, r#"{"branches":["main"]}"#)
-                } else {
-                    (503, r#"{"error":"graph knowledge is loading"}"#)
+                let (status, body) = match phase {
+                    0 => (503, r#"{"error":"graph knowledge is loading"}"#),
+                    1 => anyhow::bail!("connection refused"),
+                    _ => (200, r#"{"branches":["main"]}"#),
                 };
                 Ok(Response::builder()
                     .status(status)
@@ -4448,9 +4495,19 @@ mod tests {
             )
         });
 
+        // The recheck after the first wait gets no answer: the mark stands, and is asked
+        // after again once the next wait has passed.
+        phase.store(1, Ordering::SeqCst);
+        cx.executor().advance_clock(RECHECK_FIRST);
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| {
+            assert!(session.unavailable.is_some());
+            assert!(session._recheck.is_some(), "asked after again");
+        });
+
         // Nothing is asked again before the wait; after it, the answer clears the mark.
-        ready.store(true, Ordering::SeqCst);
-        cx.executor().advance_clock(RECHECK_FIRST / 2);
+        phase.store(2, Ordering::SeqCst);
+        cx.executor().advance_clock(RECHECK_FIRST);
         cx.run_until_parked();
         session.read_with(cx, |session, _| assert!(session.unavailable.is_some()));
         cx.executor().advance_clock(RECHECK_FIRST);
@@ -6798,6 +6855,20 @@ mod tests {
         read.await.unwrap();
         assert_eq!(reads_of("feature"), 3);
 
+        // A Refresh reads every head again: commits may have landed on feature unseen, as
+        // nothing watches it.
+        session.update(cx, |session, cx| session.reload(cx));
+        cx.run_until_parked();
+        for branch in ["main", "feature"] {
+            let read = session.update(cx, |session, cx| session.head_commit(branch, false, cx));
+            read.await.unwrap();
+        }
+        assert_eq!(
+            (reads_of("main"), reads_of("feature")),
+            (4, 4),
+            "a Refresh reads an unwatched head again"
+        );
+
         // Studio made or deleted feature: its head is read again, main's is not, whatever the
         // branch list shows (deleted and made again under its name, it has another history).
         session.update(cx, |session, cx| {
@@ -6808,7 +6879,7 @@ mod tests {
             let read = session.update(cx, |session, cx| session.head_commit(branch, false, cx));
             read.await.unwrap();
         }
-        assert_eq!((reads_of("main"), reads_of("feature")), (3, 4));
+        assert_eq!((reads_of("main"), reads_of("feature")), (4, 5));
     }
 
     /// The reads the history, the commit view and the review ask for
@@ -7790,6 +7861,71 @@ mod tests {
             assert_eq!(connection.state, ConnectionState::Ready)
         });
         assert!(schema_loaded(cx), "read again once the connection is ready");
+    }
+
+    /// Reads the network did not carry while it was down are read again once the connection
+    /// is ready again: a graph opened during a blip shows its schema when the network is back.
+    /// Before, only reads refused for a token were read again, and these stood failed until
+    /// their own Try again or a Refresh.
+    #[gpui::test]
+    async fn reads_the_network_lost_are_read_again_once_the_connection_is_ready(
+        cx: &mut TestAppContext,
+    ) {
+        /// Gives `t1` whenever asked.
+        struct Same;
+        impl TokenSource for Same {
+            fn token(
+                &self,
+                _: Arc<AtomicBool>,
+            ) -> futures::future::BoxFuture<'static, Result<Token, NoToken>> {
+                async { Ok(Token::new("t1")) }.boxed()
+            }
+        }
+        let (served, _) = answers_alone(Arc::new(std::sync::Mutex::new("t1")));
+        let down = Arc::new(AtomicBool::new(true));
+        let gate = down.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let served = served.clone();
+            let down = gate.load(Ordering::SeqCst);
+            async move {
+                if down {
+                    anyhow::bail!("connection refused");
+                }
+                served.send(request).await
+            }
+        });
+        let server = ServerEntry {
+            name: "personal".into(),
+            url: "https://graph.test".into(),
+            source: ServerSource::Cli,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| {
+            Connection::new(server, None, http)
+                .unwrap()
+                .with_token_source(Some(Arc::new(Same)))
+        });
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        let session =
+            cx.update(|cx| open_session(connection.clone(), "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        let schema_loaded = |cx: &mut TestAppContext| {
+            session.read_with(cx, |session, _| {
+                matches!(session.schema, Loadable::Loaded(_))
+            })
+        };
+        assert!(!schema_loaded(cx), "no answer while the network is down");
+
+        down.store(false, Ordering::SeqCst);
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        cx.run_until_parked();
+        connection.read_with(cx, |connection, _| {
+            assert_eq!(connection.state, ConnectionState::Ready)
+        });
+        assert!(schema_loaded(cx), "read again once the connection is ready");
+        session.read_with(cx, |session, _| {
+            assert!(matches!(session.branches, Loadable::Loaded(_)));
+        });
     }
 
     /// A write refused for its token asks the source again, as a read does (spec 016, 401 and

@@ -22,7 +22,7 @@
 //! ([`Absent`]).
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use graph_client::api::CommitOutput;
 
@@ -40,6 +40,9 @@ pub struct HistoryRead {
     /// Merged-in commits not had, and why: drawn as stubs, and not asked for again while a
     /// commit read names them.
     missing: HashMap<String, Absent>,
+    /// How many times the commits were drawn, for a test of what a walk costs.
+    #[cfg(test)]
+    draws: usize,
 }
 
 /// Why a merged-in commit History asked for is not drawn.
@@ -141,18 +144,31 @@ impl HistoryRead {
         } else {
             Absent::Unlisted
         };
-        // Each pass answers every id wanted, so the passes end.
-        loop {
-            let wanted = self.draw().wanted;
-            if wanted.is_empty() {
-                return;
+        // One walk from the ids the commits drawn want, on through those each commit taken
+        // names, as `draw` follows them: a commit held back names none. Before, each level of a
+        // merged chain was taken by drawing again, sorting every commit once per level.
+        let own: HashSet<String> = self.own.iter().map(|c| c.graph_commit_id.clone()).collect();
+        let mut queue: VecDeque<String> = self.draw().wanted.into();
+        while let Some(id) = queue.pop_front() {
+            if own.contains(&id) || self.merged.contains_key(&id) || self.missing.contains_key(&id)
+            {
+                continue;
             }
-            for id in wanted {
-                match listed.get(&id) {
-                    Some(commit) => self.merged_read(id, Some(commit.clone())),
-                    None => {
-                        self.missing.insert(id, absent);
+            match listed.get(&id) {
+                Some(commit) => {
+                    if self.shows(commit) {
+                        queue.extend(
+                            commit
+                                .parent_commit_id
+                                .iter()
+                                .chain(&commit.merged_parent_commit_id)
+                                .cloned(),
+                        );
                     }
+                    self.merged_read(id, Some(commit.clone()));
+                }
+                None => {
+                    self.missing.insert(id, absent);
                 }
             }
         }
@@ -177,6 +193,10 @@ impl HistoryRead {
     /// read reaches any more (the first page read again, without the pages that named them)
     /// are let go, so what is kept is bounded by what is drawn.
     pub fn draw(&mut self) -> Drawn {
+        #[cfg(test)]
+        {
+            self.draws += 1;
+        }
         let mut seen: HashSet<&str> = self
             .own
             .iter()
@@ -445,6 +465,29 @@ mod tests {
         assert_eq!(read.merged_held(), 3, "b1 is kept, held back");
         assert_eq!(read.absent("gone"), Some(Absent::NotListed), "says why");
         assert_eq!(read.absent("b3"), None);
+
+        // A long merged chain is answered in one walk: the commits drawn once, not once per
+        // level of the chain.
+        let mut read = HistoryRead::default();
+        read.first_page(
+            vec![
+                commit("m2", 10_000, Some("m1"), Some("b299")),
+                commit("m1", 10, None, None),
+            ],
+            true,
+            false,
+        );
+        let listed: HashMap<String, CommitOutput> = (0..300)
+            .map(|n| {
+                let parent = (n > 0).then(|| format!("b{}", n - 1));
+                commit(&format!("b{n}"), 20 + n as i64, parent.as_deref(), None)
+            })
+            .map(|c| (c.graph_commit_id.clone(), c))
+            .collect();
+        let draws = read.draws;
+        read.take_from(&listed, true);
+        assert_eq!(read.draws - draws, 1, "one draw for the whole chain");
+        assert_eq!(read.draw().commits.len(), 302);
     }
 
     /// While some branch's page could not be read, an id the pages read do not hold may be on

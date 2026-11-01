@@ -74,18 +74,14 @@ pub fn input(target: &Property, sources: &[(String, Value)], instruction: &str) 
             Value::String(text) => text.clone(),
             other => other.to_string(),
         };
-        text.push_str(&format!("- {name}: {}\n", cut_chars(&shown, VALUE_CHARS)));
+        text.push_str(&format!(
+            "- {name}: {}\n",
+            studio_ui::text::cut(&shown, VALUE_CHARS)
+        ));
     }
     text.push_str("\nInstruction: ");
     text.push_str(instruction.trim());
     text
-}
-
-fn cut_chars(text: &str, chars: usize) -> &str {
-    match text.char_indices().nth(chars) {
-        Some((at, _)) => &text[..at],
-        None => text,
-    }
 }
 
 #[cfg(test)]
@@ -105,7 +101,7 @@ mod tests {
             list: false,
             enum_values: None,
             is_key: false,
-            indexed: false,
+            full_text: false,
         };
         let text = input(
             &target,
@@ -121,6 +117,11 @@ mod tests {
         assert!(text.starts_with("Property to fill: city (String)."));
         assert!(text.contains("- address: 12 Rue Oberkampf, 75011 Paris\n- country: (empty)\n"));
         assert!(text.ends_with("Instruction: the city from the address"));
+        // A long value is cut as the interface cuts text, marked, and an accented letter whole.
+        let long = "e\u{301}".repeat(VALUE_CHARS + 10);
+        let text = input(&target, &[("notes".into(), Value::from(long))], "the city");
+        let shown = format!("- notes: {}…\n", "e\u{301}".repeat(VALUE_CHARS - 1));
+        assert!(text.contains(&shown), "{text}");
         assert_eq!(
             serde_json::from_str::<Answer>(r#"{"value":"Paris","sure":true}"#).unwrap(),
             Answer {

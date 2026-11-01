@@ -73,6 +73,10 @@ pub struct ConnectionRegistry {
     notices: Vec<String>,
     http: Arc<dyn HttpClient>,
     transported: TransportHttp,
+    /// The client made for each transport a CLI connection uses, which every target naming it
+    /// shares: made once, off the main thread, however many targets name it (two endpoints
+    /// behind one company certificate authority).
+    transport_clients: Vec<(CliTransport, Arc<dyn HttpClient>)>,
     token_sources: TokenSources,
     lister: Lister,
     /// Whether the CLI gives Studio a token here: the system Studio runs on, but in a test. Where
@@ -199,19 +203,15 @@ pub(crate) fn transport_client(transport: &CliTransport) -> anyhow::Result<Arc<d
     )))
 }
 
-/// The clients the transports of `targets` need that `held` does not hold already, made off the
-/// main thread: one that trusts the system's roots too reads them from the system's store,
-/// which can take a while. A failure is kept as its message, said when the target is applied.
-fn prepare_transports(
-    targets: &CliTargets,
-    held: &[CliTransport],
-    make: &TransportHttp,
-) -> Prepared {
+/// The clients the transports of `targets` need, made off the main thread: one that trusts the
+/// system's roots too reads them from the system's store, which can take a while. Those made
+/// for a transport already are made again: another listing applied before this one may let
+/// that client go. A failure is kept as its message, said when the target is applied.
+fn prepare_transports(targets: &CliTargets, make: &TransportHttp) -> Prepared {
     let mut prepared: Prepared = Vec::new();
     for server in targets.servers.iter().flatten() {
         let transport = &server.transport;
         if *transport == CliTransport::default()
-            || held.contains(transport)
             || prepared.iter().any(|(made, _)| made == transport)
         {
             continue;
@@ -422,6 +422,7 @@ impl ConnectionRegistry {
             notices: Vec::new(),
             http,
             transported: Arc::new(move |_| Ok(same.clone())),
+            transport_clients: Vec::new(),
             token_sources: Arc::new(|_| None),
             lister: Arc::new(list_with_the_cli),
             platform: Platform::CURRENT,
@@ -550,7 +551,7 @@ impl ConnectionRegistry {
                 if !listing && !listed_files && !cli_moved {
                     continue;
                 }
-                let Ok((held, make)) = this.update(cx, |this, _| this.transport_maker()) else {
+                let Ok(prepare) = this.update(cx, |this, _| this.transport_preparer()) else {
                     break;
                 };
                 let lister = lister.clone();
@@ -559,7 +560,7 @@ impl ConnectionRegistry {
                     .background_executor()
                     .spawn(async move {
                         let targets = lister(dir, places, platform).await;
-                        let prepared = prepare_transports(&targets, &held, &make);
+                        let prepared = prepare(&targets);
                         (targets, prepared)
                     })
                     .await;
@@ -594,31 +595,42 @@ impl ConnectionRegistry {
         }
     }
 
-    /// The transports the CLI connections hold, and what makes a client for another, for a
-    /// listing to prepare off the main thread ([`prepare_transports`]).
-    fn transport_maker(&self) -> (Vec<CliTransport>, TransportHttp) {
-        let held = self
-            .cli_kept
-            .values()
-            .map(|kept| kept.transport.clone())
-            .collect();
-        (held, self.transported.clone())
+    /// What prepares the clients a listing's targets need, off the main thread
+    /// ([`prepare_transports`]).
+    fn transport_preparer(&self) -> impl FnOnce(&CliTargets) -> Prepared + Send + use<> {
+        let make = self.transported.clone();
+        move |targets| prepare_transports(targets, &make)
     }
 
-    /// The client for `transport`: the one prepared beside the listing, else made here (a
-    /// listing applied without preparing, as in tests).
+    /// The client for `transport`: the one made for it already, which every target naming it
+    /// shares, else the one prepared beside the listing, else made here (a listing applied
+    /// without preparing, as in tests).
     fn transport_http(
-        &self,
+        &mut self,
         transport: &CliTransport,
-        prepared: &mut Prepared,
+        prepared: &Prepared,
     ) -> Result<Arc<dyn HttpClient>, String> {
         if *transport == CliTransport::default() {
             return Ok(self.http.clone());
         }
-        match prepared.iter().position(|(made, _)| made == transport) {
-            Some(at) => prepared.swap_remove(at).1,
-            None => (self.transported)(transport).map_err(|error| error.to_string()),
+        if let Some((_, http)) = self
+            .transport_clients
+            .iter()
+            .find(|(made, _)| made == transport)
+        {
+            return Ok(http.clone());
         }
+        // Read, not taken: another target naming a transport that could not be made gets the
+        // same refusal rather than making it again here.
+        let made = match prepared.iter().find(|(made, _)| made == transport) {
+            Some((_, made)) => made.clone(),
+            None => (self.transported)(transport).map_err(|error| error.to_string()),
+        };
+        if let Ok(http) = &made {
+            self.transport_clients
+                .push((transport.clone(), http.clone()));
+        }
+        made
     }
 
     /// Brings the CLI's servers in line with the targets the CLI lists, and says whether
@@ -636,7 +648,7 @@ impl ConnectionRegistry {
     fn apply_cli_targets(
         &mut self,
         targets: CliTargets,
-        mut prepared: Prepared,
+        prepared: Prepared,
         cx: &mut Context<Self>,
     ) -> bool {
         let CliTargets {
@@ -706,7 +718,7 @@ impl ConnectionRegistry {
                     .get(&url)
                     .is_some_and(|held| held.transport != server.transport);
                 if moved {
-                    match self.transport_http(&server.transport, &mut prepared) {
+                    match self.transport_http(&server.transport, &prepared) {
                         Ok(http) => connection
                             .update(cx, |connection, cx| connection.replace_http(http, cx)),
                         Err(error) => {
@@ -763,7 +775,7 @@ impl ConnectionRegistry {
                 source: ServerSource::Cli,
                 known_graphs: graphs,
             };
-            let http = match self.transport_http(&server.transport, &mut prepared) {
+            let http = match self.transport_http(&server.transport, &prepared) {
                 Ok(http) => http,
                 Err(error) => {
                     errors.push(format!(
@@ -790,6 +802,10 @@ impl ConnectionRegistry {
                 )),
             }
         }
+        // A client no CLI connection uses any more goes.
+        let kept = &self.cli_kept;
+        self.transport_clients
+            .retain(|(transport, _)| kept.values().any(|kept| kept.transport == *transport));
         let notices_changed = self.keep_notices(errors);
         changed || notices_changed
     }
@@ -873,7 +889,7 @@ impl ConnectionRegistry {
         let dir = self.operator_dir.clone();
         let places = self.cli_places.clone();
         let lister = self.lister.clone();
-        let (held, make) = self.transport_maker();
+        let prepare = self.transport_preparer();
         cx.spawn(async move |this, cx| {
             let (added, targets, prepared) = {
                 let (name, url) = (name.clone(), url.clone());
@@ -882,7 +898,7 @@ impl ConnectionRegistry {
                         let added =
                             cli_tokens::add_server_target(&places, &name, &url, token).await;
                         let targets = lister(dir, places, platform).await;
-                        let prepared = prepare_transports(&targets, &held, &make);
+                        let prepared = prepare(&targets);
                         (added, targets, prepared)
                     })
                     .await
@@ -1088,6 +1104,79 @@ mod tests {
         registry.update(cx, |registry, cx| {
             registry.apply_cli_targets(files, Vec::new(), cx)
         })
+    }
+
+    /// Two targets naming one transport whose client could not be made off the main thread
+    /// are both refused with why, and the client is not made again here for the second. Before,
+    /// the first took the prepared failure, and the second made the client on the main thread.
+    #[gpui::test]
+    async fn a_transport_that_could_not_be_made_is_not_made_again_here(cx: &mut TestAppContext) {
+        let (http, _) = answering();
+        let registry = cx.new(|_| ConnectionRegistry::empty(http, None));
+        let made = Arc::new(AtomicUsize::new(0));
+        let counted = made.clone();
+        registry.update(cx, |registry, _| {
+            registry.transported = Arc::new(move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::anyhow!("not a certificate"))
+            });
+        });
+        let mut prod = server("prod", "http://a.test", "1");
+        prod.transport.proxy = Some("http://proxy.test:8080".into());
+        let mut staging = server("staging", "http://b.test", "1");
+        staging.transport = prod.transport.clone();
+        let prepared = vec![(prod.transport.clone(), Err("not a certificate".to_owned()))];
+        registry.update(cx, |registry, cx| {
+            registry.apply_cli_targets(files(vec![prod, staging]), prepared, cx)
+        });
+        assert_eq!(
+            made.load(Ordering::SeqCst),
+            0,
+            "none made on the main thread"
+        );
+        registry.read_with(cx, |registry, _| {
+            let refused = registry
+                .notices()
+                .iter()
+                .filter(|notice| notice.contains("not a certificate"))
+                .count();
+            assert_eq!(refused, 2, "{:?}", registry.notices());
+        });
+
+        // Two listings that overlap: the one applied first lets go of a client the other's
+        // targets name, which that one prepared all the same, so it is not made here either.
+        let (client, _) = answering();
+        let made = Arc::new(AtomicUsize::new(0));
+        let counted = made.clone();
+        registry.update(cx, |registry, _| {
+            registry.transported = Arc::new(move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(client.clone())
+            });
+        });
+        let mut dev = server("dev", "http://c.test", "1");
+        dev.transport.proxy = Some("http://proxy.test:9090".into());
+        let listed = || files(vec![dev.clone()]);
+        let prepare = |cx: &mut TestAppContext| {
+            registry.read_with(cx, |registry, _| registry.transport_preparer())(&listed())
+        };
+        let first = prepare(cx);
+        registry.update(cx, |registry, cx| {
+            registry.apply_cli_targets(listed(), first, cx)
+        });
+        let overlapping = prepare(cx);
+        registry.update(cx, |registry, cx| {
+            registry.apply_cli_targets(files(Vec::new()), Vec::new(), cx)
+        });
+        let before = made.load(Ordering::SeqCst);
+        registry.update(cx, |registry, cx| {
+            registry.apply_cli_targets(listed(), overlapping, cx)
+        });
+        assert_eq!(
+            made.load(Ordering::SeqCst),
+            before,
+            "none made on the main thread"
+        );
     }
 
     fn find(
@@ -1428,6 +1517,17 @@ mod tests {
         assert!(apply(&registry, files(vec![rooted.clone()]), cx));
         assert_eq!(made.load(Ordering::SeqCst), 3);
         assert_eq!(find(&registry, "new", cx).unwrap(), moved);
+        // Another endpoint behind the same certificate authority shares its client: none is
+        // made for it, as one made on the main thread would stall the window.
+        let mut beside = server("staging", "http://c.test", "beside");
+        beside.transport = rooted.transport.clone();
+        assert!(apply(&registry, files(vec![rooted.clone(), beside]), cx));
+        assert!(find(&registry, "staging", cx).is_some());
+        assert_eq!(
+            made.load(Ordering::SeqCst),
+            3,
+            "one client for the shared transport"
+        );
 
         // A transport Studio cannot use retires the connection, said once, and lists no server.
         registry.update(cx, |registry, _| {
@@ -1796,6 +1896,37 @@ mod tests {
         cx.executor().advance_clock(OPERATOR_POLL);
         cx.run_until_parked();
         assert_eq!(listing.asked(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A listing the CLI was too busy to make is made again at the next check, though there is
+    /// no operator file. Before, the file was kept unstamped, which a file that is not there
+    /// matches, so the busy notice stood until something else changed.
+    #[gpui::test]
+    async fn a_listing_the_cli_was_too_busy_for_is_made_at_the_next_check(cx: &mut TestAppContext) {
+        let (http, _) = answering();
+        let listing = HeldListing::default();
+        let dir = std::env::temp_dir().join(format!("studio-busy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = cli_config::config_path(&dir);
+        assert!(!config.exists(), "no operator file");
+        listing
+            .next()
+            .send(cli_config::unlisted(&config, "the CLI was busy".into()))
+            .ok();
+        let registry = cx.new(|cx| {
+            let mut registry = ConnectionRegistry::empty(http, Some(dir.clone()));
+            registry.lister = listing.lister();
+            registry.start_listing(cx);
+            registry
+        });
+        cx.run_until_parked();
+        assert_eq!(listing.asked(), 1);
+        listing.next().send(CliTargets::default()).ok();
+        cx.executor().advance_clock(OPERATOR_POLL);
+        cx.run_until_parked();
+        assert_eq!(listing.asked(), 2, "listed again at the next check");
+        registry.read_with(cx, |registry, _| assert!(registry.notices().is_empty()));
         std::fs::remove_dir_all(&dir).ok();
     }
 

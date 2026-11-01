@@ -36,8 +36,11 @@ pub struct Property {
     pub list: bool,
     pub enum_values: Option<Vec<String>>,
     pub is_key: bool,
-    /// Declared `@index`: the engine's full-text `search` works on it.
-    pub indexed: bool,
+    /// Has a full-text index as the compiler reads the schema
+    /// (`NodeType::has_full_text_index`: a one-column `@index` or `@key` on free text), which
+    /// the engine's `search` needs (the compiler's T27). Never an edge's: text search runs on
+    /// node properties only.
+    pub full_text: bool,
 }
 
 impl Property {
@@ -222,8 +225,15 @@ impl SchemaModel {
             .iter()
             .map(|node| {
                 let keys = key_members(&node.constraints);
-                let mut properties: Vec<Property> =
-                    node.properties.iter().map(|p| property(p, &keys)).collect();
+                let compiled = catalog.node_types.get(&node.name);
+                let mut properties: Vec<Property> = node
+                    .properties
+                    .iter()
+                    .map(|p| {
+                        let full_text = compiled.is_some_and(|t| t.has_full_text_index(&p.name));
+                        property(p, &keys, full_text)
+                    })
+                    .collect();
                 in_declared_order(&file, &node.name, &mut properties);
                 // The node's id is its key's value only when the key is one property.
                 let composite = composite_members(&node.constraints);
@@ -245,8 +255,11 @@ impl SchemaModel {
             .iter()
             .map(|edge| {
                 let keys = key_members(&edge.constraints);
-                let mut properties: Vec<Property> =
-                    edge.properties.iter().map(|p| property(p, &keys)).collect();
+                let mut properties: Vec<Property> = edge
+                    .properties
+                    .iter()
+                    .map(|p| property(p, &keys, false))
+                    .collect();
                 in_declared_order(&file, &edge.name, &mut properties);
                 EdgeType {
                     name: edge.name.clone(),
@@ -355,9 +368,6 @@ fn groups_of(edges: &[EdgeType], node_type: &str) -> Vec<RelationshipGroup> {
     outgoing.chain(incoming).collect()
 }
 
-/// The compiled shape lists properties by name; tables and forms show them as the `.pg` file
-/// declares them. Properties a type inherits from an interface follow its own, in the
-/// interface's order.
 /// The annotations a node or edge type is declared with.
 fn declared<'a>(file: &'a SchemaFile, type_name: &str) -> Option<&'a [Annotation]> {
     file.declarations.iter().find_map(|decl| match decl {
@@ -379,6 +389,9 @@ fn about(annotations: &[Annotation]) -> Option<String> {
     })
 }
 
+/// The compiled shape lists properties by name; tables and forms show them as the `.pg` file
+/// declares them. Properties a type inherits from an interface follow its own, in the
+/// interface's order.
 fn in_declared_order(file: &SchemaFile, type_name: &str, properties: &mut [Property]) {
     let mut declared: Vec<&str> = Vec::new();
     let mut interfaces: Vec<&str> = Vec::new();
@@ -462,7 +475,7 @@ fn composite_members(constraints: &[Constraint]) -> Vec<String> {
         .collect()
 }
 
-fn property(shape: &PropertyShape, keys: &[String]) -> Property {
+fn property(shape: &PropertyShape, keys: &[String], full_text: bool) -> Property {
     let PropType {
         scalar,
         nullable,
@@ -489,13 +502,6 @@ fn property(shape: &PropertyShape, keys: &[String]) -> Property {
             .property_constraints
             .iter()
             .any(|c| matches!(c, PropertyConstraintShape::Key));
-    // A one-column `@index` on free text is a full-text index, and a key declares one too
-    // (the compiler's T27).
-    let indexed = is_key
-        || shape
-            .property_constraints
-            .iter()
-            .any(|c| matches!(c, PropertyConstraintShape::Index));
     Property {
         name: shape.name.clone(),
         kind,
@@ -504,7 +510,7 @@ fn property(shape: &PropertyShape, keys: &[String]) -> Property {
         list: *list,
         enum_values: enum_values.clone(),
         is_key,
-        indexed,
+        full_text,
     }
 }
 

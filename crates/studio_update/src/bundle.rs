@@ -103,15 +103,24 @@ pub(crate) async fn get_over_https(
 }
 
 /// Whether `url` may be fetched: over HTTPS, or at a loopback address (a test's server),
-/// which nothing on the network can change on the way.
+/// which nothing on the network can change on the way. Read as the request reads it, so the
+/// host judged is the one asked: a user name before it (`http://127.0.0.1:1@elsewhere/`) names
+/// another host behind a loopback address's spelling, and is refused.
 fn over_https_or_loopback(url: &str) -> bool {
-    url.starts_with("https://")
-        || ["http://127.0.0.1", "http://localhost", "http://[::1]"]
-            .iter()
-            .any(|host| {
-                url.strip_prefix(host)
-                    .is_some_and(|rest| rest.is_empty() || rest.starts_with([':', '/']))
-            })
+    let Ok(uri) = url.parse::<http_client::Uri>() else {
+        return false;
+    };
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    if authority.as_str().contains('@') {
+        return false;
+    }
+    match uri.scheme_str() {
+        Some("https") => true,
+        Some("http") => matches!(authority.host(), "127.0.0.1" | "localhost" | "[::1]"),
+        _ => false,
+    }
 }
 
 /// The whole file at `url`, refused past `limit` bytes whether the host says its length or
@@ -280,15 +289,25 @@ mod tests {
             let bytes = block_on(fetch(redirecting(to), "https://x/u", 1024, progress)).unwrap();
             assert_eq!(bytes, b"file", "{to}");
         }
-        let (_, progress) = heard();
-        let error = block_on(fetch(
-            redirecting("http://files/f"),
-            "https://x/u",
-            1024,
-            progress,
-        ))
-        .unwrap_err();
-        assert!(error.to_string().contains("not HTTPS"), "{error}");
+        // Plain HTTP elsewhere, or behind a loopback address's spelling as a user name, is
+        // refused. Before, `http://127.0.0.1:1@files/f` passed as a loopback address and went
+        // to `files` over plain HTTP.
+        for to in [
+            "http://files/f",
+            "http://127.0.0.1:1@files/f",
+            "http://localhost@files/f",
+        ] {
+            let (_, progress) = heard();
+            let error =
+                block_on(fetch(redirecting(to), "https://x/u", 1024, progress)).unwrap_err();
+            assert!(error.to_string().contains("not HTTPS"), "{to}: {error}");
+        }
+        assert!(over_https_or_loopback(
+            "http://127.0.0.1:8787/manifest.json"
+        ));
+        assert!(over_https_or_loopback("http://[::1]/f"));
+        assert!(!over_https_or_loopback("http://localhost.files/f"));
+        assert!(!over_https_or_loopback("https://user@files/f"));
     }
 
     #[test]

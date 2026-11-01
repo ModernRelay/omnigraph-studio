@@ -31,26 +31,6 @@ pub enum TokenKind {
     Punctuation,
 }
 
-impl TokenKind {
-    /// The theme's syntax style a token takes, by the names Zed's themes define; `None` for
-    /// plain text. A read-only view of a query, which holds no buffer to parse (the agent
-    /// panel's query cards), is coloured by it; the query editor colours from its syntax tree.
-    pub fn syntax_name(self) -> Option<&'static str> {
-        Some(match self {
-            TokenKind::Keyword => "keyword",
-            TokenKind::Variable => "variable",
-            TokenKind::Type => "type",
-            TokenKind::Property => "property",
-            TokenKind::Annotation => "attribute",
-            TokenKind::QueryName => "function",
-            TokenKind::String => "string",
-            TokenKind::Number => "number",
-            TokenKind::Comment => "comment",
-            TokenKind::Identifier | TokenKind::Punctuation => return None,
-        })
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Token {
     pub kind: TokenKind,

@@ -315,7 +315,7 @@ impl FilterOp {
                         FilterOp::StartsWith,
                     ];
                     // `search` needs the property's full-text index (the compiler's T27).
-                    if property.indexed {
+                    if property.full_text {
                         ops.push(FilterOp::Search);
                     }
                     ops.push(FilterOp::In);
@@ -361,9 +361,10 @@ impl FilterOp {
 pub const ID_FILTER: &str = "@id";
 /// The filter key of a GQ condition ([`FilterOp::Expr`]): no property is named so.
 pub const WHERE_FILTER: &str = "@where";
-/// The row's variable a condition names in a node table, and in an edge table, whose ends are
-/// `$a` and `$b`.
+/// The row's variable in a node table's queries, which a condition names: the queries of its
+/// rows bind it, and the filter in words and the condition field speak of it.
 pub const NODE_VAR: &str = "$n";
+/// The row's variable in an edge table's queries, whose ends are `$a` and `$b`.
 pub const EDGE_VAR: &str = "$e";
 
 /// The filter key of a relationship group: `out:WorksAt`, `in:Knows`.
@@ -1021,7 +1022,7 @@ fn node_page_reading(
     let limit = if empty { 0 } else { limit };
     let mut params = Params::new();
     let (keyset, order) = keyset("n", &node.name, &node.properties, sort, start, &mut params)?;
-    let mut clauses = vec![format!("$n: {}", node.name)];
+    let mut clauses = vec![format!("{NODE_VAR}: {}", node.name)];
     clauses.extend(keyset);
     clauses.extend(filter_clauses(
         schema,
@@ -1055,6 +1056,13 @@ fn node_page_reading(
     })
 }
 
+/// The count a query returning `count(…) as n` answers ([`node_count`], [`edge_count`]). The
+/// engine answers one row even when nothing matches (`{"n": 0}`), so an answer of no row, or a
+/// row without `n`, is no count, for the caller to say so rather than take it for none.
+pub fn count_of(rows: &Value) -> Option<i64> {
+    rows.as_array()?.first()?.get("n")?.as_i64()
+}
+
 /// How many rows of a node type match the filters.
 pub fn node_count(
     schema: &SchemaModel,
@@ -1063,7 +1071,7 @@ pub fn node_count(
 ) -> Result<BuiltQuery, BuildError> {
     let node = node(schema, type_name)?;
     let mut params = Params::new();
-    let mut clauses = vec![format!("$n: {}", node.name)];
+    let mut clauses = vec![format!("{NODE_VAR}: {}", node.name)];
     clauses.extend(filter_clauses(
         schema,
         &node.name,
@@ -1238,6 +1246,19 @@ fn hop<'a>(
     )
 }
 
+/// The traversal a relationship key names, from `near` (the row) to `far` (the related record),
+/// written as a query writes it: `$n attended $r`, or `$r knows $n` for an incoming key, the
+/// edge quoted where its name is a reserved word.
+pub fn relationship_traversal(key: &str, near: &str, far: &str) -> Option<String> {
+    let (direction, edge) = parse_relationship_key(key)?;
+    Some(oriented(
+        direction,
+        near,
+        &crate::schema::traversal_token(edge),
+        far,
+    ))
+}
+
 /// A traversal from `near` to `far` along `edge` (its token, with any `$e:` binding), written
 /// in the edge's own direction.
 fn oriented(direction: Direction, near: &str, edge: &str, far: &str) -> String {
@@ -1283,7 +1304,7 @@ pub fn edge_page_without(
     let (keyset, order) = keyset("e", &edge.name, &edge.properties, sort, start, &mut params)?;
     let mut clauses = vec![
         format!("$a: {}", edge.from),
-        format!("$a $e:{} $b", edge.traversal()),
+        format!("$a {EDGE_VAR}:{} $b", edge.traversal()),
     ];
     clauses.extend(keyset);
     clauses.extend(filter_clauses(
@@ -1336,7 +1357,7 @@ pub fn edge_count(
     let mut params = Params::new();
     let mut clauses = vec![
         format!("$a: {}", edge.from),
-        format!("$a $e:{} $b", edge.traversal()),
+        format!("$a {EDGE_VAR}:{} $b", edge.traversal()),
     ];
     clauses.extend(filter_clauses(
         schema,
@@ -1379,7 +1400,7 @@ pub fn value_counts(
             "$e.@id",
             vec![
                 format!("$a: {}", edge.from),
-                format!("$a $e:{} $b", edge.traversal()),
+                format!("$a {EDGE_VAR}:{} $b", edge.traversal()),
             ],
             edge.properties.as_slice(),
             edge.name.clone(),
@@ -1443,7 +1464,7 @@ pub fn neighbour_counts(
     let (_, other_type, hop) = hop(edge, direction, "$n", "$g");
     let other = self::node(schema, other_type)?;
     let mut params = Params::new();
-    let mut clauses = vec![format!("$n: {}", node.name)];
+    let mut clauses = vec![format!("{NODE_VAR}: {}", node.name)];
     clauses.extend(filter_clauses(
         schema,
         &node.name,
@@ -1511,7 +1532,7 @@ pub fn neighbour_value_counts(
             property: property_name.to_owned(),
         })?;
     let mut params = Params::new();
-    let mut clauses = vec![format!("$n: {}", node.name)];
+    let mut clauses = vec![format!("{NODE_VAR}: {}", node.name)];
     clauses.extend(filter_clauses(
         schema,
         &node.name,
@@ -1575,7 +1596,7 @@ pub fn endpoint_value_counts(
     let mut params = Params::new();
     let mut clauses = vec![
         format!("$a: {}", edge.from),
-        format!("$a $e:{} $b", edge.traversal()),
+        format!("$a {EDGE_VAR}:{} $b", edge.traversal()),
     ];
     clauses.extend(filter_clauses(
         schema,
@@ -3045,6 +3066,31 @@ mod tests {
             "{}",
             query.text
         );
+
+        // Words are offered where the compiler takes `search`: a one-column index, declared on
+        // the property or the type, and a lone key ([`every_offered_filter_op_compiles`] holds
+        // the other half, on a composite key's members and an edge's properties).
+        let schema = indexes();
+        let searchable = |name: &str| {
+            let property = schema.node("Doc").unwrap().property(name).unwrap();
+            FilterOp::for_property(property).contains(&FilterOp::Search)
+        };
+        assert!(searchable("title") && searchable("summary"));
+        assert!(!searchable("code") && !searchable("body"));
+        let tag = schema.node("Tag").unwrap().property("slug").unwrap();
+        assert!(FilterOp::for_property(tag).contains(&FilterOp::Search));
+    }
+
+    /// Every kind of full-text declaration the compiler reads: a composite key, an index on the
+    /// type and on a property, a lone key, and an index on an edge's property.
+    fn indexes() -> SchemaModel {
+        SchemaModel::parse(
+            "node Doc {\n  code: String\n  lang: String\n  title: String\n  \
+             summary: String @index\n  body: String?\n  @key(code, lang)\n  @index(title)\n}\n\
+             node Tag {\n  slug: String @key\n}\n\
+             edge Cites: Doc -> Doc @card(0..) {\n  note: String @index\n}\n",
+        )
+        .unwrap()
     }
 
     /// A condition is spliced in as written, in parentheses, beside the pills' clauses, and the
@@ -3078,6 +3124,18 @@ mod tests {
                 .contains("($n.name starts_with \"A\" or $n.name contains \"z\")"),
             "{}",
             query.text
+        );
+        // The row a condition names is the one the query binds, spelled in one place.
+        assert!(
+            query.text.contains(&format!("{NODE_VAR}: Person")),
+            "{}",
+            query.text
+        );
+        let edges = edge_page(&schema, "WorksAt", &[], None, &PageStart::First, 10).unwrap();
+        assert!(
+            edges.text.contains(&format!("{EDGE_VAR}:worksAt")),
+            "{}",
+            edges.text
         );
         // A block stands as a clause of its own: the grammar takes none inside an expression.
         let block = Filter {
@@ -3116,6 +3174,39 @@ mod tests {
             node_page(&schema, "Person", &[empty], None, &PageStart::First, 10),
             Err(BuildError::EmptyCondition)
         ));
+
+        // A block names a relationship in the edge's own direction, as the sentence filter's
+        // input gives it ([`relationship_traversal`]): the compiler orients a traversal by its
+        // ends' types, so on an edge between two types either order reads the same, but on one
+        // from a type to itself `$n knows $r` is always outgoing, and an incoming key must say
+        // `$r knows $n`. Before, the input gave the row first for both, so a condition on an
+        // incoming same-type relationship matched the other way round.
+        assert_eq!(
+            relationship_traversal("out:Knows", "$n", "$r").as_deref(),
+            Some("$n knows $r")
+        );
+        assert_eq!(
+            relationship_traversal("in:Knows", "$n", "$r").as_deref(),
+            Some("$r knows $n")
+        );
+        let incoming = relationship_traversal("in:WorksAt", "$n", "$r").unwrap();
+        assert_eq!(incoming, "$r worksAt $n");
+        let block = Filter {
+            property: WHERE_FILTER.into(),
+            op: FilterOp::Expr,
+            value: json!(format!(
+                "exists {{ $r: Person  {incoming}  $r.name = \"Ada\" }}"
+            )),
+        };
+        assert_compiles(
+            &node_page(&schema, "Company", &[block], None, &PageStart::First, 10).unwrap(),
+        );
+        // An edge named by a reserved word is quoted, as a query spells it.
+        assert_eq!(
+            relationship_traversal("out:In", "$n", "$r").as_deref(),
+            Some("$n \"in\" $r")
+        );
+        assert_eq!(relationship_traversal("name", "$n", "$r"), None);
     }
 
     #[test]
@@ -3589,31 +3680,51 @@ mod tests {
         assert_compiles(&node_count(&schema, "Person", &filters).unwrap());
     }
 
+    /// Every operator a node's or an edge's property offers compiles, on the dev schema and on
+    /// one with every kind of full-text declaration. Before, "matches words" was offered on a
+    /// composite key's members and on an edge's indexed property, and failed the compiler's
+    /// T27 and its edge-property refusal.
     #[test]
     fn every_offered_filter_op_compiles() {
-        let schema = dev();
-        for node in &schema.nodes {
-            for property in node.properties.iter().filter(|p| p.projectable()) {
-                for op in FilterOp::for_property(property) {
-                    let value = match property.kind {
-                        crate::ScalarKind::Integer => json!(1),
-                        crate::ScalarKind::Float => json!(1.5),
-                        crate::ScalarKind::Bool => json!(true),
-                        crate::ScalarKind::Date => json!("2020-01-01"),
-                        _ => json!("x"),
-                    };
-                    let filters = [Filter {
-                        property: property.name.clone(),
-                        op,
-                        value,
-                    }];
-                    assert_compiles(
-                        &node_page(&schema, &node.name, &filters, None, &PageStart::First, 10)
-                            .unwrap(),
-                    );
+        let filter = |property: &crate::schema::Property, op| {
+            let value = match property.kind {
+                crate::ScalarKind::Integer => json!(1),
+                crate::ScalarKind::Float => json!(1.5),
+                crate::ScalarKind::Bool => json!(true),
+                crate::ScalarKind::Date => json!("2020-01-01"),
+                _ => json!("x"),
+            };
+            [Filter {
+                property: property.name.clone(),
+                op,
+                value,
+            }]
+        };
+        for schema in [dev(), indexes()] {
+            for node in &schema.nodes {
+                for property in node.properties.iter().filter(|p| p.projectable()) {
+                    for op in FilterOp::for_property(property) {
+                        let filters = filter(property, op);
+                        let page =
+                            node_page(&schema, &node.name, &filters, None, &PageStart::First, 10)
+                                .unwrap();
+                        assert_compiles_in(&schema, &page);
+                    }
+                }
+            }
+            for edge in &schema.edges {
+                for property in edge.properties.iter().filter(|p| p.projectable()) {
+                    for op in FilterOp::for_property(property) {
+                        let filters = filter(property, op);
+                        let page =
+                            edge_page(&schema, &edge.name, &filters, None, &PageStart::First, 10)
+                                .unwrap();
+                        assert_compiles_in(&schema, &page);
+                    }
                 }
             }
         }
+        let schema = dev();
         let name = schema.node("Person").unwrap().property("name").unwrap();
         assert!(!FilterOp::for_property(name).contains(&FilterOp::IsEmpty));
     }

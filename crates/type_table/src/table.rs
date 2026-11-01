@@ -28,7 +28,9 @@ use gq_language::{
 use graph_client::api::ReadOutput;
 use graph_client::{BlobCell, BlobMeta, HistoricalGap, PropertyThen, ReadError};
 use graph_store::scope::{ReadScope, ScopeSince};
-use graph_store::{DraftEntry, DraftKey, GraphSession, Loadable, SessionEvent};
+use graph_store::{
+    ChangeFold, DraftEntry, DraftKey, GraphSession, Loadable, NetChange, SessionEvent,
+};
 use serde_json::Value;
 use studio_actions::blob::{ChooseFile, ClearValue};
 use studio_actions::table::{
@@ -52,6 +54,7 @@ use ui::{
 };
 
 use crate::blob_write::{self, Binding, BlobChange, BlobEdit, BlobWritten};
+use crate::branch_diff::{BranchDiff, TARGET};
 use crate::dialogs::{
     DeleteRowModal, DeleteTarget, InsertEdgeModal, InsertRowModal, SaveViewModal,
 };
@@ -60,7 +63,7 @@ use crate::grouping::{GROUP_LIMIT, Grouping, Line, Lines, SECTION_FIRST_PAGE};
 use crate::model::{
     ColumnLayout, ColumnRole, ColumnSpec, Notice, Paging, RELATION_CHIPS_SHOWN,
     RELATION_SAMPLE_BUDGET, Row, SaveResult, TableKind, Tone, changed_elsewhere, chips_that_fit,
-    count_of, display_value, edge_columns, edge_rows, edit_text, edited, field_rows, filter_parts,
+    display_value, edge_columns, edge_rows, edit_text, edited, field_rows, filter_parts,
     insert_position, node_columns, node_rows, parse_filter_list, parse_filter_value, parse_input,
     preset_range, published, reads_as_markdown, relation_sample, row_matches,
 };
@@ -187,6 +190,8 @@ struct RowLook {
     dimmed: bool,
     cursor: bool,
     header: bool,
+    /// How the branch changed the row against its target (spec 004, "Reading on a branch").
+    change: Option<NetChange>,
 }
 
 /// How long scrolling must pause before the drawn rows' Blob cells are read.
@@ -271,6 +276,191 @@ impl BulkDraft {
     fn saving(&self) -> bool {
         self.sending.is_some()
     }
+}
+
+/// How many changes a table's diff folds before it stops (spec 004, "Reading on a branch"):
+/// the review's cap, so a table and its review agree on what is partial.
+const DIFF_CHANGE_CAP: usize = graph_store::REVIEW_CHANGE_CAP;
+/// How many changes one page of the diff asks for.
+const DIFF_PAGE: usize = 8_192;
+
+/// The colour a kind of change is drawn in, as review draws it.
+fn change_color(net: NetChange) -> Color {
+    match net {
+        NetChange::Added => Color::Created,
+        NetChange::Changed => Color::Modified,
+        NetChange::Removed => Color::Deleted,
+    }
+}
+
+/// What the branch changed in the table's rows, against its target (spec 004, "Reading on a
+/// branch"): read as the net diff from the merge base, once the table is drawn on a branch
+/// other than the target, and again when the rows are read at another commit or the table's
+/// own write moves its pin. Added and changed rows are washed in their kind's colour with a
+/// bar in the gutter, a changed row's changed cells marked, and the rows the branch removed
+/// are shown first, struck through, as what a diff shows before what came.
+impl TypeTable {
+    /// Reads the branch's diff against the target, when there is one to read.
+    fn read_diff(&mut self, cx: &mut Context<Self>) {
+        self.diff_task = None;
+        if self.branch == TARGET || self.at_commit.is_some() || self.schema.is_none() {
+            self.diff = None;
+            return;
+        }
+        let branch = self.branch.clone();
+        let session = self.session.clone();
+        let (kind, type_name) = (self.entity_kind(), self.type_name.clone());
+        self.diff_task = Some(cx.spawn(async move |this, cx| {
+            let folded = read_branch_diff(&session, &branch, cx).await;
+            let diff = cx
+                .background_executor()
+                .spawn(
+                    async move { folded.map(|folded| BranchDiff::of(&folded, kind, &type_name)) },
+                )
+                .await;
+            this.update(cx, |this, cx| {
+                // The branch moved on, or the rows are being read at another commit: a read
+                // started then replaces this one.
+                if this.branch != branch || this.diff_owed {
+                    return;
+                }
+                this.diff = diff.map(Arc::new);
+                this.place_removed(cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Puts the rows the branch removed before the rows read, once both are in, where they are
+    /// not shown already. Grouped, a removed row is in no section, so none shows.
+    fn place_removed(&mut self, cx: &mut Context<Self>) {
+        let Some(diff) = self.diff.clone() else {
+            return;
+        };
+        if self.grouping.is_some()
+            || !matches!(self.first_page, Loadable::Loaded(()))
+            || diff.removed().is_empty()
+        {
+            return;
+        }
+        let shown: HashSet<&str> = self.rows.iter().map(|row| row.id.as_str()).collect();
+        let placed: Vec<Row> = diff
+            .removed()
+            .iter()
+            .filter(|row| !shown.contains(row.id.as_str()))
+            .cloned()
+            .collect();
+        if placed.is_empty() {
+            return;
+        }
+        // The cursor stays on its row, which moves down by the rows put before it.
+        if let Some(cursor) = &mut self.cursor {
+            cursor.row += placed.len();
+        }
+        self.placed_here
+            .extend(placed.iter().map(|row| row.id.clone()));
+        self.rows.splice(0..0, placed);
+        self.lines_moved();
+        cx.notify();
+    }
+
+    /// How the branch changed the row `id`, if it did.
+    fn row_change(&self, id: &str) -> Option<NetChange> {
+        self.diff.as_ref()?.mark(id).map(|mark| mark.net)
+    }
+
+    /// The row `id` is one the branch removed: shown for what it was, on the branch no more.
+    fn is_removed(&self, id: &str) -> bool {
+        self.row_change(id) == Some(NetChange::Removed)
+    }
+
+    /// The branch changed the value the cell holds.
+    fn cell_changed(&self, id: &str, column: &str) -> bool {
+        self.diff
+            .as_ref()
+            .and_then(|diff| diff.mark(id))
+            .is_some_and(|mark| mark.changed.contains(column))
+    }
+
+    /// The toolbar's count of what the branch changed in the type, "+3 ~2 −1" in the kinds'
+    /// colours, after the row count; nothing on the target or while the branch changed nothing.
+    fn render_diff_counts(&self) -> Option<AnyElement> {
+        let (added, changed, removed) = self.diff.as_ref()?.counts();
+        if added + changed + removed == 0 {
+            return None;
+        }
+        let tooltip = format!(
+            "On {} against {TARGET}: {} added, {} changed, {} removed",
+            self.branch,
+            plural(added, "row", "rows"),
+            plural(changed, "row", "rows"),
+            plural(removed, "row", "rows"),
+        );
+        let count = |n: usize, sign: &str, color: Color| {
+            (n > 0).then(|| {
+                studio_ui::ds::text::meta(format!("{sign}{n}"))
+                    .color(color)
+                    .into_any_element()
+            })
+        };
+        Some(
+            h_flex()
+                .id("diff-counts")
+                .gap(px(space::SM))
+                .tooltip(Tooltip::text(tooltip))
+                .children(count(added, "+", Color::Created))
+                .children(count(changed, "~", Color::Modified))
+                .children(count(removed, "−", Color::Deleted))
+                .into_any_element(),
+        )
+    }
+}
+
+/// The net changes from `branch`'s merge base with the target to its head, folded, up to
+/// [`DIFF_CHANGE_CAP`]; `None` when they cannot be read, as a table shows its rows either way.
+async fn read_branch_diff(
+    session: &Entity<GraphSession>,
+    branch: &str,
+    cx: &mut gpui::AsyncApp,
+) -> Option<graph_store::FoldedChanges> {
+    let base = session
+        .update(cx, |session, cx| session.merge_base(branch, TARGET, cx))
+        .await
+        .ok()?;
+    let (from, to) = (base.merge_base.graph_commit_id, base.source_commit_id);
+    let mut fold = ChangeFold::new();
+    if from == to {
+        return Some(fold.finish());
+    }
+    let cause = graph_client::api::ChangeCauseOutput {
+        graph_commit_id: to.clone(),
+        authored_branch: branch.to_owned(),
+        authored_at: 0,
+        parent_commit_id: None,
+        merged_parent_commit_id: None,
+        actor_id: None,
+    };
+    let mut token: Option<String> = None;
+    loop {
+        let limit = DIFF_PAGE.min(DIFF_CHANGE_CAP - fold.raw_changes()).max(1) as u32;
+        let page = session
+            .update(cx, |session, cx| {
+                session.diff(&from, &to, token.take(), limit, cx)
+            })
+            .await
+            .ok()?;
+        let block = graph_client::api::ChangeBlockOutput {
+            cause: cause.clone(),
+            changes: page.changes,
+        };
+        let complete = fold.add_block_capped(block, DIFF_CHANGE_CAP);
+        match page.next_page_token {
+            Some(next) if complete && fold.raw_changes() < DIFF_CHANGE_CAP => token = Some(next),
+            _ => break,
+        }
+    }
+    Some(fold.finish())
 }
 
 /// The hover group of a grid row, for the actions its cells show under the pointer.
@@ -403,12 +593,87 @@ fn relation_samples(rows: &Value) -> Vec<(String, String, Option<String>)> {
         .collect()
 }
 
-/// What the Group menu offers for a table's columns: its submenus, and every choice by key and
-/// how it reads.
+/// What the Group and Filter menus offer for a table's columns, built once with them
+/// ([`TypeTable::build_menu_choices`]): the toolbar draws both on every render, and a type with
+/// dozens of relationships offers thousands of choices through its neighbours' properties.
 #[derive(Default)]
-struct GroupingChoices {
-    menus: Rc<Vec<GroupMenu>>,
-    choices: Rc<Vec<(String, String)>>,
+struct MenuChoices {
+    /// The Group menu's submenus.
+    group_menus: Rc<Vec<GroupMenu>>,
+    /// Every grouping by key and how it reads.
+    groups: Rc<Vec<(String, String)>>,
+    /// Every filter key, how it reads and its icon ([`TypeTable::filter_choices`]).
+    filters: Rc<Vec<(String, String, IconName)>>,
+    /// The Filter menu's entries over [`Self::filters`].
+    filter_menu: Rc<Vec<FilterMenuEntry>>,
+}
+
+/// An entry of the Filter menu, by its place in the table's filter choices: a key, or a
+/// relationship whose neighbours' properties open in a submenu of their own. A type reached
+/// by hundreds of relationships lists only those, not every neighbour property after each.
+#[derive(Debug, Clone, PartialEq)]
+enum FilterMenuEntry {
+    Key(usize),
+    Relationship {
+        key: usize,
+        /// The type at its other end, which the submenu's properties belong to.
+        other_type: String,
+        properties: Range<usize>,
+    },
+}
+
+/// A Filter menu entry that sets the filter being written to `key`.
+fn filter_key_entry(
+    table: &WeakEntity<TypeTable>,
+    key: String,
+    label: String,
+    icon: IconName,
+) -> ContextMenuEntry {
+    let table = table.clone();
+    ContextMenuEntry::new(label)
+        .icon(icon)
+        .icon_color(Color::Muted)
+        .handler(move |window, cx| {
+            table
+                .update(cx, |this, cx| {
+                    this.set_draft_property(key.clone(), window, cx)
+                })
+                .ok();
+        })
+}
+
+/// The Filter menu over `choices` (in [`TypeTable::filter_choices`]' order: each relationship
+/// followed by its neighbours' properties), each relationship naming its other end through
+/// `other_type`.
+fn filter_menu(
+    choices: &[(String, String, IconName)],
+    other_type: impl Fn(&str) -> Option<String>,
+) -> Vec<FilterMenuEntry> {
+    let mut entries = Vec::new();
+    let mut at = 0;
+    while at < choices.len() {
+        let key = &choices[at].0;
+        if builder::parse_relationship_key(key).is_none() {
+            entries.push(FilterMenuEntry::Key(at));
+            at += 1;
+            continue;
+        }
+        let prefix = format!("{key}.");
+        let end = choices[at + 1..]
+            .iter()
+            .position(|(nested, _, _)| !nested.starts_with(&prefix))
+            .map_or(choices.len(), |offset| at + 1 + offset);
+        entries.push(match other_type(key) {
+            Some(other_type) if end > at + 1 => FilterMenuEntry::Relationship {
+                key: at,
+                other_type,
+                properties: at + 1..end,
+            },
+            _ => FilterMenuEntry::Key(at),
+        });
+        at = end;
+    }
+    entries
 }
 
 /// A submenu of the Group menu (see [`TypeTable::group_menus`]).
@@ -588,7 +853,7 @@ pub struct TypeTable {
     /// then. Rows are read without them.
     absent: HashMap<String, PropertyThen>,
     /// What the Group menu offers for these columns: its submenus and every choice.
-    grouping_choices: GroupingChoices,
+    menu_choices: MenuChoices,
     /// What each cell shows, by row id and column, made the first time it is drawn: a text
     /// value is read as markdown to show its first line, too slow to do for every cell every
     /// frame. A cell set, or rows read again, are made again.
@@ -627,6 +892,12 @@ pub struct TypeTable {
     /// The rows are read when the table is next drawn ([`Self::owe_reload`]): a table behind
     /// another tab reads nothing when it is restored, nor when the branch or the schema moves.
     rows_owed: bool,
+    /// What the branch changed in this type's rows against its target, once read
+    /// ([`Self::read_diff`]); `None` on the target, at a commit, and until the read lands.
+    diff: Option<Arc<BranchDiff>>,
+    /// The diff is read when the table is next drawn, as the rows are.
+    diff_owed: bool,
+    diff_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     /// How often the table drew, for the test that moving through the offers draws it and
     /// leaves the grid alone.
@@ -921,7 +1192,7 @@ impl TypeTable {
             frame_line_range: None,
             frame_due: false,
             absent: HashMap::new(),
-            grouping_choices: Default::default(),
+            menu_choices: Default::default(),
             cell_text: RefCell::new(HashMap::new()),
             peek: None,
             newer: false,
@@ -939,6 +1210,9 @@ impl TypeTable {
             total_task: None,
             count_shift: None,
             rows_owed: false,
+            diff: None,
+            diff_owed: true,
+            diff_task: None,
             _subscriptions: subscriptions,
             #[cfg(test)]
             renders: 0,
@@ -1083,7 +1357,7 @@ impl TypeTable {
             self.missing = true;
             self.schema = Some(schema);
             self.all_columns.clear();
-            self.grouping_choices = Default::default();
+            self.menu_choices = Default::default();
             self.columns.clear();
             self.rows.clear();
             self.placed_here.clear();
@@ -1093,16 +1367,37 @@ impl TypeTable {
         };
         self.missing = false;
         let names: HashSet<&str> = columns.iter().map(|c| c.key.as_str()).collect();
-        // A filter stays while its column, or its relationship, is still in the schema.
-        self.filters
-            .retain(|f| match builder::parse_relationship_key(&f.property) {
-                Some((_, edge)) => schema.edge(edge).is_some(),
-                None => f.property == builder::ID_FILTER || names.contains(f.property.as_str()),
-            });
+        // A filter stays while what it tests is still in the schema: its column, its
+        // relationship, or the neighbours' property it reaches through one. A condition stays
+        // whatever it names: the next read judges it against this schema, and says why it
+        // cannot run.
+        let type_name = self.type_name.clone();
+        self.filters.retain(|f| {
+            if f.op == FilterOp::Expr || f.property == builder::ID_FILTER {
+                return true;
+            }
+            match builder::parse_group_key(&f.property) {
+                builder::GroupKey::Relationship(_, edge) => schema.edge(edge).is_some(),
+                builder::GroupKey::NeighbourProperty {
+                    direction,
+                    edge,
+                    property,
+                } => schema.relationships_of(&type_name).iter().any(|group| {
+                    group.direction == direction
+                        && group.edge == edge
+                        && schema
+                            .node(&group.other_type)
+                            .is_some_and(|other| other.property(property).is_some())
+                }),
+                builder::GroupKey::Property(_) | builder::GroupKey::EndpointProperty { .. } => {
+                    names.contains(f.property.as_str())
+                }
+            }
+        });
         self.all_columns = columns;
         self.show_columns(cx);
         self.schema = Some(schema);
-        self.build_grouping_choices();
+        self.build_menu_choices();
         // An order or a grouping asked for before the schema was read, or on a property this
         // schema no longer has, stays only where the schema allows it.
         if self
@@ -1399,8 +1694,8 @@ impl TypeTable {
     fn apply_view(&mut self, view: &studio_settings::SavedView, cx: &mut Context<Self>) {
         let known: HashSet<String> = self
             .filter_choices()
-            .into_iter()
-            .map(|(key, _, _)| key)
+            .iter()
+            .map(|(key, _, _)| key.clone())
             .collect();
         self.filters = view
             .filters
@@ -1460,6 +1755,9 @@ impl TypeTable {
         let Some(id) = self.rows.get(row).map(|r| r.id.clone()) else {
             return;
         };
+        if self.is_removed(&id) {
+            return;
+        }
         match self.selection_anchor.filter(|_| range) {
             Some(anchor) => {
                 let between: Vec<usize> = match &self.grouping {
@@ -1467,7 +1765,9 @@ impl TypeTable {
                     None => (anchor.min(row)..=anchor.max(row).min(self.rows.len() - 1)).collect(),
                 };
                 for ix in between {
-                    if let Some(picked) = self.rows.get(ix) {
+                    if let Some(picked) = self.rows.get(ix)
+                        && !self.is_removed(&picked.id)
+                    {
                         self.selection.insert(picked.id.clone());
                     }
                 }
@@ -2922,6 +3222,10 @@ impl TypeTable {
             self.paging.pinned = self.at_commit.clone();
             self.count_shift = None;
             self.newer = false;
+            // What the branch changed is read again with the rows.
+            self.diff = None;
+            self.diff_task = None;
+            self.diff_owed = true;
             cx.emit(ItemEvent::UpdateTab);
         }
         // An edit open over the rows read before is kept as its cell's draft, as leaving the
@@ -3054,6 +3358,7 @@ impl TypeTable {
         let behind = self.paging.advance_for_own_commit(parent, commit);
         if self.paging.pinned != before {
             self.own_writes += 1;
+            self.diff_owed = true;
         }
         behind
     }
@@ -3128,22 +3433,25 @@ impl TypeTable {
     /// What the rows can be grouped by: each groupable property, then what each submenu of
     /// [`Self::group_menus`] offers. Key and how the choice reads.
     fn group_choices(&self) -> Rc<Vec<(String, String)>> {
-        self.grouping_choices.choices.clone()
+        self.menu_choices.groups.clone()
     }
 
     /// The Group menu's submenus, as [`Self::build_group_menus`] built them for these columns.
     fn group_menus(&self) -> Rc<Vec<GroupMenu>> {
-        self.grouping_choices.menus.clone()
+        self.menu_choices.group_menus.clone()
     }
 
-    /// Builds what the Group menu offers, once the columns are known: the toolbar draws it on
-    /// every render, and a type with dozens of relationships offers thousands of choices.
-    fn build_grouping_choices(&mut self) {
-        let menus = self.build_group_menus();
-        let choices = self.build_group_choices(&menus);
-        self.grouping_choices = GroupingChoices {
-            menus: Rc::new(menus),
-            choices: Rc::new(choices),
+    /// Builds what the Group and Filter menus offer, once the columns are known.
+    fn build_menu_choices(&mut self) {
+        let group_menus = self.build_group_menus();
+        let groups = self.build_group_choices(&group_menus);
+        let filters = self.build_filter_choices();
+        let filter_menu = filter_menu(&filters, |key| self.related_type(key));
+        self.menu_choices = MenuChoices {
+            group_menus: Rc::new(group_menus),
+            groups: Rc::new(groups),
+            filters: Rc::new(filters),
+            filter_menu: Rc::new(filter_menu),
         };
     }
 
@@ -3408,8 +3716,9 @@ impl TypeTable {
         if self.grouping.as_ref().map(|g| g.generation) != Some(generation) {
             return;
         }
-        let none =
-            none.map(|read| read.map(|output| count_of(&output.rows).unwrap_or(0).max(0) as u64));
+        let none = none.map(|read| {
+            read.map(|output| builder::count_of(&output.rows).unwrap_or(0).max(0) as u64)
+        });
         let result = match (result, none) {
             (Ok(output), Some(Ok(none))) => Ok((output, Some(none))),
             (Ok(output), None) => Ok((output, None)),
@@ -3853,6 +4162,7 @@ impl TypeTable {
                         if !counted {
                             self.load_counts(cx);
                         }
+                        self.place_removed(cx);
                     }
                     None => self.loading_more = false,
                 }
@@ -3943,6 +4253,9 @@ impl TypeTable {
         }
         cx.defer_in(window, |this, window, cx| {
             this.frame_due = false;
+            if std::mem::take(&mut this.diff_owed) {
+                this.read_diff(cx);
+            }
             if let Some(lines) = this.frame_line_range.take() {
                 this.want_row_relations(lines.clone(), window, cx);
                 this.want_blob_metas(lines.clone(), cx);
@@ -4316,7 +4629,7 @@ impl TypeTable {
             this.update(cx, |this, cx| {
                 let shift = this.count_shift_at(at.as_deref(), filtered);
                 let value = match result {
-                    Ok(output) => match count_of(&output.rows) {
+                    Ok(output) => match builder::count_of(&output.rows) {
                         Some(n) => Loadable::Loaded(n + shift),
                         None => Loadable::Failed("The count came back empty".into()),
                     },
@@ -4846,6 +5159,9 @@ impl TypeTable {
         let Some(row) = self.rows.get(row) else {
             return;
         };
+        if self.is_removed(&row.id) {
+            return;
+        }
         let subject = match self.kind {
             TableKind::Node => PeekSubject::Node {
                 type_name: self.type_name.clone(),
@@ -5076,6 +5392,10 @@ impl TypeTable {
         let Some(row) = self.rows.get(cursor.row) else {
             return;
         };
+        // A row the branch removed is not on it: nothing to edit, nothing to open.
+        if self.is_removed(&row.id) {
+            return;
+        }
         let key = (row.id.clone(), column.key.clone());
         if matches!(self.cells.get(&key), Some(CellState::Saving { .. })) {
             return;
@@ -6836,7 +7156,17 @@ impl TypeTable {
 
     /// What a filter can test: each filterable property, then (in a node table) each
     /// relationship group, as `(key, label, icon)`.
-    fn filter_choices(&self) -> Vec<(String, String, IconName)> {
+    fn filter_choices(&self) -> Rc<Vec<(String, String, IconName)>> {
+        self.menu_choices.filters.clone()
+    }
+
+    /// The Filter menu's entries over [`Self::filter_choices`].
+    fn filter_menu(&self) -> Rc<Vec<FilterMenuEntry>> {
+        self.menu_choices.filter_menu.clone()
+    }
+
+    /// Builds [`Self::filter_choices`] for these columns ([`Self::build_menu_choices`]).
+    fn build_filter_choices(&self) -> Vec<(String, String, IconName)> {
         let mut choices: Vec<(String, String, IconName)> = self
             .filterable()
             .map(|p| (p.name.clone(), p.name.clone(), property_icon(p)))
@@ -7222,15 +7552,72 @@ impl TypeTable {
     }
 
     /// The keys the filter menu offers, with their operators and properties, for the model.
+    /// What a sentence may order, group and show the rows by: the properties that can order
+    /// the table, what the Group menu offers, and the columns.
+    fn view_choices(&self) -> words::ViewChoices {
+        words::ViewChoices {
+            sorts: self
+                .all_columns
+                .iter()
+                .filter_map(ColumnSpec::property)
+                .filter(|property| Sort::allowed(property))
+                .map(|property| property.name.clone())
+                .collect(),
+            groups: self
+                .group_choices()
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect(),
+            columns: self
+                .all_columns
+                .iter()
+                .map(|column| column.key.clone())
+                .collect(),
+        }
+    }
+
+    /// Takes a sentence's order, grouping and columns ([`words::view`], checked against
+    /// [`Self::view_choices`]): each it sets replaces the table's, the columns as a saved view's
+    /// do, those named shown in the order named and the rest hidden. The caller reads the table
+    /// again.
+    fn apply_words_view(&mut self, view: words::View, cx: &mut Context<Self>) {
+        if let Some(sort) = view.sort {
+            self.sort = Some(sort);
+        }
+        if let Some(key) = view.group_by
+            && self.grouping.as_ref().map(|grouping| &grouping.property) != Some(&key)
+        {
+            self.grouping = Some(Grouping::new(key));
+        }
+        if let Some(shown) = view.columns {
+            // The pinned column always shows, first, as when a column is hidden by hand.
+            let pinned = self.all_columns.first().map(|column| column.key.clone());
+            let hidden = self
+                .all_columns
+                .iter()
+                .map(|column| column.key.clone())
+                .filter(|key| !shown.contains(key) && Some(key) != pinned.as_ref())
+                .collect();
+            let order = shown
+                .into_iter()
+                .filter(|key| Some(key) != pinned.as_ref())
+                .collect();
+            let widths = std::mem::take(&mut self.layout.widths);
+            self.layout = ColumnLayout::new(hidden, order);
+            self.layout.widths = widths;
+            self.show_columns(cx);
+        }
+    }
+
     fn words_choices(&self) -> Vec<words::Choice> {
         self.filter_choices()
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|(key, label, _)| words::Choice {
                 ops: self.ops_for(&key),
                 property: self.property_for_key(&key),
                 other_type: self.related_type(&key),
-                traversal: builder::parse_relationship_key(&key)
-                    .map(|(_, edge)| gq_language::traversal_name(edge)),
+                traversal: builder::relationship_traversal(&key, builder::NODE_VAR, "$r"),
                 key,
                 label,
             })
@@ -7264,12 +7651,13 @@ impl TypeTable {
 
     fn start_words(&mut self, models: Entity<Models>, sentence: String, cx: &mut Context<Self>) {
         let choices = self.words_choices();
+        let offered = self.view_choices();
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let request = ModelRequest {
             task: &words::TASK,
             instructions: words::INSTRUCTIONS,
-            input: words::input(&self.type_name, &choices, &today, &sentence),
-            schema: words::schema(&choices),
+            input: words::input(&self.type_name, &choices, &offered, &today, &sentence),
+            schema: words::schema(&choices, &offered),
         };
         let call = models.read(cx).call::<words::Answer>(request, cx);
         let task = cx.spawn(async move |this, cx| {
@@ -7284,7 +7672,9 @@ impl TypeTable {
                     return;
                 }
             };
-            let (mut filters, mut refused) = words::filters(answer.value, &choices);
+            let (view, mut refused) = words::view(&answer.value, &offered);
+            let (mut filters, filters_refused) = words::filters(answer.value, &choices);
+            refused.extend(filters_refused);
             // A `related_to` names a record; the name becomes its id through the node search
             // the filter's own value field uses, the first match taken, and the pill shows it.
             let mut labels: Vec<(String, String)> = Vec::new();
@@ -7362,6 +7752,9 @@ impl TypeTable {
                 this.filters.retain(|filter| !made.contains(filter));
                 this.words_made = filters.clone();
                 this.filters.extend(filters);
+                // What the sentence says of the order, the grouping and the columns replaces
+                // the table's; what it does not say stays as it is.
+                this.apply_words_view(view, cx);
                 let note =
                     (!refused.is_empty()).then(|| format!("Could not use: {}", refused.join("; ")));
                 this.words = WordsState::Typing(note);
@@ -7514,6 +7907,7 @@ impl TypeTable {
                     .when_some(count_error, |d, error| d.tooltip(Tooltip::text(error)))
                     .child(studio_ui::ds::text::muted(count)),
             )
+            .children(self.render_diff_counts())
             // Where edits go is the branch the status bar names; the table says only when it
             // cannot edit, the credential's refusal included.
             .when(read_only || refused.is_some(), |d| {
@@ -7651,6 +8045,7 @@ impl TypeTable {
         if let Some(draft) = &self.filter_draft {
             let table = cx.entity().downgrade();
             let choices = self.filter_choices();
+            let entries = self.filter_menu();
             let chosen = choices
                 .iter()
                 .find(|(key, _, _)| *key == draft.property)
@@ -7691,33 +8086,74 @@ impl TypeTable {
                         .menu(move |window, cx| {
                             let table = property_table.clone();
                             let choices = choices.clone();
+                            let entries = entries.clone();
                             Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                                 let mut relationships = false;
-                                for (key, label, icon) in choices {
+                                for entry in entries.iter() {
+                                    let at = match entry {
+                                        FilterMenuEntry::Key(at)
+                                        | FilterMenuEntry::Relationship { key: at, .. } => *at,
+                                    };
+                                    let (key, label, icon) = &choices[at];
                                     if !relationships
-                                        && builder::parse_relationship_key(&key).is_some()
+                                        && builder::parse_relationship_key(key).is_some()
                                     {
                                         relationships = true;
                                         menu = menu.separator().header("Relationships");
                                     }
-                                    let table = table.clone();
-                                    let name = key.clone();
-                                    menu = menu.item(
-                                        ContextMenuEntry::new(label)
-                                            .icon(icon)
-                                            .icon_color(Color::Muted)
-                                            .handler(move |window, cx| {
-                                                table
-                                                    .update(cx, |this, cx| {
-                                                        this.set_draft_property(
-                                                            name.clone(),
-                                                            window,
-                                                            cx,
-                                                        )
-                                                    })
-                                                    .ok();
-                                            }),
-                                    );
+                                    match entry {
+                                        FilterMenuEntry::Key(_) => {
+                                            menu = menu.item(filter_key_entry(
+                                                &table,
+                                                key.clone(),
+                                                label.clone(),
+                                                *icon,
+                                            ));
+                                        }
+                                        // The neighbours' properties open beside it, as the
+                                        // Group menu's do; the relationship itself comes first.
+                                        FilterMenuEntry::Relationship {
+                                            other_type,
+                                            properties,
+                                            ..
+                                        } => {
+                                            let (table, choices) = (table.clone(), choices.clone());
+                                            let (key, label, icon) =
+                                                (key.clone(), label.clone(), *icon);
+                                            let (other_type, properties) =
+                                                (other_type.clone(), properties.clone());
+                                            menu = menu.submenu_with_colored_icon(
+                                                label.clone(),
+                                                icon,
+                                                Color::Muted,
+                                                move |mut menu, _, _| {
+                                                    menu = menu
+                                                        .item(filter_key_entry(
+                                                            &table,
+                                                            key.clone(),
+                                                            label.clone(),
+                                                            icon,
+                                                        ))
+                                                        .separator()
+                                                        .header(format!("{other_type}'s property"));
+                                                    for (nested, _, _) in
+                                                        &choices[properties.clone()]
+                                                    {
+                                                        let name = nested
+                                                            .rsplit_once('.')
+                                                            .map_or(nested.as_str(), |(_, p)| p);
+                                                        menu = menu.item(filter_key_entry(
+                                                            &table,
+                                                            nested.clone(),
+                                                            name.to_owned(),
+                                                            icon,
+                                                        ));
+                                                    }
+                                                    menu
+                                                },
+                                            );
+                                        }
+                                    }
                                 }
                                 menu
                             }))
@@ -8125,6 +8561,9 @@ impl TypeTable {
                     .max_w(content_width)
                     .group(ROW_GROUP)
                     .when(look.header, |row| row.bg(header_bg))
+                    .when_some(look.change, |row, net| {
+                        row.bg(studio_ui::ds::surface::wash(change_color(net), cx))
+                    })
                     .when(look.picked, |row| row.bg(picked_bg))
                     .when(look.cursor, |row| row.bg(selected_bg))
                     .when(look.dimmed, |row| {
@@ -8490,6 +8929,7 @@ impl TypeTable {
                     dimmed: data.dimmed,
                     cursor: cursor == Some(row),
                     header: false,
+                    change: self.row_change(&data.id),
                 },
             );
         }
@@ -9202,7 +9642,21 @@ impl TypeTable {
                     .relative()
                     .w_full()
                     .child(self.render_cell(ix, 0, row, window, cx))
-                    .child(self.render_row_check(ix, &row.id, cx))
+                    .when_some(self.row_change(&row.id), |cell, net| {
+                        // The gutter's bar says the kind, as a diff's does.
+                        cell.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .bottom_0()
+                                .w(px(studio_ui::ds::size::ACCENT_LINE))
+                                .bg(change_color(net).color(cx)),
+                        )
+                    })
+                    .when(!self.is_removed(&row.id), |cell| {
+                        cell.child(self.render_row_check(ix, &row.id, cx))
+                    })
                     .into_any_element(),
                 GridPlace::Column(col) => self.render_cell(ix, col, row, window, cx),
                 GridPlace::Gap(_) => div().into_any_element(),
@@ -9270,7 +9724,11 @@ impl TypeTable {
     fn all_check_state(&self) -> ToggleState {
         if self.selection.is_empty() {
             ToggleState::Unselected
-        } else if self.rows.iter().all(|row| self.selection.contains(&row.id)) {
+        } else if self
+            .rows
+            .iter()
+            .all(|row| self.selection.contains(&row.id) || self.is_removed(&row.id))
+        {
             ToggleState::Selected
         } else {
             ToggleState::Indeterminate
@@ -9283,8 +9741,13 @@ impl TypeTable {
             self.clear_selection(cx);
             return;
         }
-        self.selection
-            .extend(self.rows.iter().map(|row| row.id.clone()));
+        let kept: Vec<String> = self
+            .rows
+            .iter()
+            .filter(|row| !self.is_removed(&row.id))
+            .map(|row| row.id.clone())
+            .collect();
+        self.selection.extend(kept);
         self.selection_anchor = None;
         self.bulk.notice = None;
         cx.notify();
@@ -9407,7 +9870,12 @@ impl TypeTable {
             .when(col + 1 < self.columns.len(), |d| {
                 d.border_r_1().border_color(divider)
             })
-            .when(column.align_right, |d| d.justify_end());
+            .when(column.align_right, |d| d.justify_end())
+            // The cells the branch changed, on a stronger tint of the row's wash.
+            .when(self.cell_changed(&row.id, &column.key), |d| {
+                d.bg(studio_ui::ds::surface::mark(Color::Modified, cx))
+            });
+        let removed = self.is_removed(&row.id);
         // The cursor and the editor are drawn as a ring over the cell, so no cell changes size.
         let ring = || {
             div()
@@ -9444,6 +9912,8 @@ impl TypeTable {
         let place = (ix * self.columns.len() + col) as u64;
         let text_color = if value.is_null() {
             Color::Disabled
+        } else if removed {
+            Color::Deleted
         } else {
             Color::Default
         };
@@ -9487,6 +9957,9 @@ impl TypeTable {
             _ => {
                 // One line in the cell's room, never measured: most cells are this.
                 let mut text = studio_ui::cell_text(shown, cx).color(text_color.color(cx));
+                if removed {
+                    text = text.struck();
+                }
                 if numeric {
                     text = text.buffer_font(cx).align_end();
                 }
@@ -10099,6 +10572,107 @@ mod tests {
         });
     }
 
+    /// On a branch, the rows the branch removed show first, struck through and not for
+    /// picking or editing, and the rows it added or changed are marked, a changed row by its
+    /// changed cells; on main nothing is read for it, and back on main the marks go.
+    #[gpui::test]
+    async fn a_branch_shows_what_it_changed_in_the_rows(cx: &mut TestAppContext) {
+        use serde_json::json;
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let rows = json!([
+            {"n": {"@id": "p1", "slug": "p1", "name": "Ada"}},
+            {"n": {"@id": "p2", "slug": "p2", "name": "Grace"}},
+        ]);
+        let person = json!({ "id": "Person", "name": "Person" });
+        let changes = json!([
+            { "kind": "node", "type": person, "id": "p1", "op": "insert",
+              "before": null, "after": { "properties": { "slug": "p1", "name": "Ada" } } },
+            { "kind": "node", "type": person, "id": "p2", "op": "update",
+              "before": { "properties": { "slug": "p2", "name": "Grace H" } },
+              "after": { "properties": { "slug": "p2", "name": "Grace" } } },
+            { "kind": "node", "type": person, "id": "p3", "op": "delete",
+              "before": { "properties": { "slug": "p3", "name": "Linus" } }, "after": null },
+        ]);
+        let (session, route) =
+            crate::test_support::session_with_branch_diff(PEOPLE, rows, changes, cx);
+        cx.run_until_parked();
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session.clone(),
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let ids = |table: &TypeTable| -> Vec<String> {
+            table.rows.iter().map(|row| row.id.clone()).collect()
+        };
+        table.read_with(cx, |table, _| {
+            assert_eq!(ids(table), ["p1", "p2"]);
+            assert!(table.diff.is_none(), "main is the target: no diff");
+        });
+        assert!(
+            route.reads.lock().unwrap().is_empty(),
+            "nothing read on main"
+        );
+
+        session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        cx.run_until_parked();
+        {
+            let reads = route.reads.lock().unwrap();
+            assert!(
+                reads.iter().any(|path| path.ends_with("/merge-base")),
+                "{reads:?}"
+            );
+            assert!(
+                reads.iter().any(|path| path.ends_with("/diff")),
+                "{reads:?}"
+            );
+        }
+        table.read_with(cx, |table, _| {
+            assert_eq!(ids(table), ["p3", "p1", "p2"], "the removed row first");
+            assert_eq!(table.row_change("p1"), Some(NetChange::Added));
+            assert_eq!(table.row_change("p2"), Some(NetChange::Changed));
+            assert!(table.cell_changed("p2", "name"));
+            assert!(!table.cell_changed("p2", "slug"));
+            assert!(table.is_removed("p3"));
+            assert_eq!(table.rows[0].value("name"), "Linus");
+            assert!(table.render_diff_counts().is_some());
+        });
+        table.update(cx, |table, cx| table.toggle_all_rows(cx));
+        table.read_with(cx, |table, _| {
+            let picked: Vec<&str> = table.selection.iter().map(String::as_str).collect();
+            assert_eq!(picked, ["p1", "p2"], "a removed row is not picked");
+            assert_eq!(table.all_check_state(), ToggleState::Selected);
+        });
+        table.update_in(cx, |table, window, cx| {
+            table.clear_selection(cx);
+            let col = table.columns.iter().position(|c| c.key == "name").unwrap();
+            table.start_edit(Cursor { row: 0, col }, window, cx);
+            assert!(table.editing.is_none(), "a removed row has no cell to edit");
+            assert!(table.peek.is_none(), "nor a page to open");
+            table.pick_rows(0, false, cx);
+            assert!(table.selection.is_empty());
+        });
+
+        session.update(cx, |session, cx| session.set_branch("main".into(), cx));
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(
+                ids(table),
+                ["p1", "p2"],
+                "back on main the removed row goes"
+            );
+            assert!(table.diff.is_none());
+        });
+    }
+
     /// Another writer's commit that changed none of the types the table reads moves its pin to
     /// the head without reading again; one that wrote its type offers Refresh (spec 015).
     /// A table's Tree holds what it shows: the selected rows, or its rows under the filters. Its
@@ -10242,16 +10816,138 @@ mod tests {
         });
     }
 
+    /// A sentence's order, grouping and columns are taken as a saved view's are: the columns it
+    /// names shown in the order named, the rest hidden. What it does not set stays as it was.
+    #[gpui::test]
+    async fn a_sentence_sets_the_order_grouping_and_columns(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let schema = "node Person {\n  slug: String @key\n  name: String\n  email: String?\n}\n";
+        let session = session(schema, cx);
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        table.update(cx, |table, cx| {
+            let offered = table.view_choices();
+            assert!(offered.sorts.contains(&"name".to_owned()), "{offered:?}");
+            assert!(offered.groups.contains(&"name".to_owned()), "{offered:?}");
+            assert_eq!(offered.columns, ["slug", "name", "email"]);
+            let by_name = Sort {
+                property: "name".into(),
+                descending: true,
+            };
+            table.apply_words_view(
+                words::View {
+                    sort: Some(by_name.clone()),
+                    group_by: Some("name".into()),
+                    columns: Some(vec!["email".into()]),
+                },
+                cx,
+            );
+            assert_eq!(table.sort, Some(by_name.clone()));
+            assert_eq!(
+                table
+                    .grouping
+                    .as_ref()
+                    .map(|grouping| grouping.property.as_str()),
+                Some("name")
+            );
+            let shown = |table: &TypeTable| -> Vec<String> {
+                table.columns.iter().map(|c| c.key.clone()).collect()
+            };
+            assert_eq!(table.layout.hidden, ["name"]);
+            assert_eq!(shown(table), ["slug", "email"], "the pinned key stays");
+
+            table.apply_words_view(
+                words::View {
+                    columns: Some(vec!["email".into(), "name".into()]),
+                    ..words::View::default()
+                },
+                cx,
+            );
+            assert_eq!(
+                shown(table),
+                ["slug", "email", "name"],
+                "in the order named"
+            );
+            assert_eq!(table.sort, Some(by_name), "an order not said stays");
+        });
+    }
+
+    /// The Filter menu lists each relationship once, with its neighbours' properties in a
+    /// submenu of it; a relationship without any is a plain entry. Before, every neighbour
+    /// property followed its relationship in the one menu: 1,122 entries for the personal
+    /// graph's Person, every one drawn at each frame the menu was open.
+    /// The condition field's hint names the row the queries bind ([`builder::NODE_VAR`]).
+    #[test]
+    fn the_condition_hint_names_the_row_variable() {
+        assert!(
+            filter_placeholder(FilterOp::Expr)
+                .starts_with(&format!("GQ on {}, ", builder::NODE_VAR))
+        );
+    }
+
+    #[test]
+    fn the_filter_menu_nests_each_relationships_neighbour_properties() {
+        let choice = |key: &str| (key.to_owned(), key.to_owned(), IconName::CaseSensitive);
+        let choices = [
+            choice("name"),
+            choice("out:Knows"),
+            choice("out:Knows.name"),
+            choice("out:Knows.email"),
+            choice("in:Likes"),
+            choice("out:Owns"),
+            choice("out:Owns.title"),
+            choice(builder::WHERE_FILTER),
+        ];
+        let other = |key: &str| match key {
+            "out:Owns" => Some("Project".to_owned()),
+            _ => Some("Person".to_owned()),
+        };
+        assert_eq!(
+            filter_menu(&choices, other),
+            [
+                FilterMenuEntry::Key(0),
+                FilterMenuEntry::Relationship {
+                    key: 1,
+                    other_type: "Person".into(),
+                    properties: 2..4,
+                },
+                FilterMenuEntry::Key(4),
+                FilterMenuEntry::Relationship {
+                    key: 5,
+                    other_type: "Project".into(),
+                    properties: 6..7,
+                },
+                FilterMenuEntry::Key(7),
+            ]
+        );
+    }
+
     /// Another writer's schema change, seen at a head move, leaves the table as it was read and
-    /// offers Refresh; Refresh reads it under the new schema (constitution II).
+    /// offers Refresh; Refresh reads it under the new schema (constitution II), keeping every
+    /// filter the new schema still has what to test for, and every condition. Before, a filter
+    /// on a neighbour's property and a condition were dropped there, their keys being neither a
+    /// column nor a relationship.
     #[gpui::test]
     async fn a_schema_changed_elsewhere_waits_for_refresh(cx: &mut TestAppContext) {
         cx.update(|cx| {
             studio_theme::init_test(cx);
             editor::init(cx);
         });
+        let base = format!("{PEOPLE}edge Knows: Person -> Person @card(0..)\n");
         let (session, writer) = session_followed(
-            PEOPLE,
+            &base,
             |request| {
                 if request["name"] == "studio_head" {
                     return serde_json::json!([]);
@@ -10274,7 +10970,32 @@ mod tests {
             )
         });
         cx.run_until_parked();
-        let grown = format!("{PEOPLE}node Note {{\n  slug: String @key\n}}\n");
+        // A filter on a column, on a relationship, and on a neighbour's property: each stays
+        // under a schema that still has what it tests.
+        let filters = vec![
+            Filter {
+                property: "name".into(),
+                op: FilterOp::Contains,
+                value: serde_json::json!("a"),
+            },
+            Filter {
+                property: "out:Knows".into(),
+                op: FilterOp::HasAny,
+                value: Value::Null,
+            },
+            Filter {
+                property: "out:Knows.name".into(),
+                op: FilterOp::Contains,
+                value: serde_json::json!("Ada"),
+            },
+            Filter {
+                property: builder::WHERE_FILTER.into(),
+                op: FilterOp::Expr,
+                value: serde_json::json!("$n.name = \"Ada\""),
+            },
+        ];
+        table.update(cx, |table, _| table.filters = filters.clone());
+        let grown = format!("{base}node Note {{\n  slug: String @key\n}}\n");
         writer.set_schema(&grown);
         writer.commit("c2", vec![changed("node", "Note", "n1", None)]);
         session.update(cx, |session, cx| session.check_heads(cx));
@@ -10287,7 +11008,7 @@ mod tests {
                 Some("c1"),
                 "and their commit"
             );
-            assert_eq!(&*table.schema.as_ref().unwrap().source, PEOPLE);
+            assert_eq!(&*table.schema.as_ref().unwrap().source, base.as_str());
         });
 
         table.update_in(cx, |table, window, cx| table.refresh(window, cx));
@@ -10296,6 +11017,45 @@ mod tests {
             assert!(!table.newer);
             assert_eq!(&*table.schema.as_ref().unwrap().source, grown.as_str());
             assert_eq!(table.rows.len(), 2);
+            assert_eq!(table.filters, filters, "every filter still holds");
+            let knows = table
+                .filter_choices()
+                .iter()
+                .position(|(key, _, _)| key == "out:Knows")
+                .unwrap();
+            assert!(
+                table
+                    .filter_menu()
+                    .contains(&FilterMenuEntry::Relationship {
+                        key: knows,
+                        other_type: "Person".into(),
+                        properties: knows + 1..knows + 2,
+                    }),
+                "the neighbours' name in a submenu"
+            );
+        });
+
+        // A schema without the name: the filters on it, the table's and the neighbours', go;
+        // the relationship's and the condition stay.
+        let unnamed = "node Person {\n  slug: String @key\n}\n\
+                       edge Knows: Person -> Person @card(0..)\n";
+        writer.set_schema(unnamed);
+        writer.commit("c3", vec![changed("node", "Person", "p1", None)]);
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        table.update_in(cx, |table, window, cx| table.refresh(window, cx));
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(&*table.schema.as_ref().unwrap().source, unnamed);
+            assert_eq!(table.filters, [filters[1].clone(), filters[3].clone()]);
+            // The menus follow the schema: no name to offer, the relationship a plain entry.
+            let choices = table.filter_choices();
+            assert!(!choices.iter().any(|(key, _, _)| key.ends_with("name")));
+            let knows = choices
+                .iter()
+                .position(|(key, _, _)| key == "out:Knows")
+                .unwrap();
+            assert!(table.filter_menu().contains(&FilterMenuEntry::Key(knows)));
         });
     }
 
@@ -11312,7 +12072,7 @@ mod tests {
             // As before the session's schema was read.
             table.schema = None;
             table.all_columns.clear();
-            table.grouping_choices = Default::default();
+            table.menu_choices = Default::default();
             table.set_sort(
                 Some(Sort {
                     property: "name".into(),

@@ -6,6 +6,7 @@
 mod blob;
 mod blob_view;
 mod blob_write;
+mod branch_diff;
 mod dialogs;
 mod fill;
 mod grouping;

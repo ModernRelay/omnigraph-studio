@@ -477,6 +477,7 @@ pub(crate) fn session_with_access(
         blobs: blobs.clone(),
         access: Some(access),
         served: None,
+        diff: None,
     };
     let session = serve_blobs(
         schema,
@@ -754,6 +755,42 @@ struct Routes {
     blobs: Arc<Blobs>,
     access: Option<Value>,
     served: Option<Arc<Served>>,
+    diff: Option<Arc<BranchDiffRoute>>,
+}
+
+/// What the server answers for a branch's diff against main: `branches/merge-base` names
+/// `c0` as the base, `c1` as the branch's head and main's, and `/diff` answers `changes`
+/// (`EntityChangeOutput`s) on one page. Every read of either is noted by its path.
+#[derive(Default)]
+pub(crate) struct BranchDiffRoute {
+    changes: Value,
+    pub(crate) reads: Mutex<Vec<String>>,
+}
+
+/// As [`session_reading`], with the branch's diff against main answered by `changes`.
+pub(crate) fn session_with_branch_diff(
+    schema: &str,
+    rows: Value,
+    changes: Value,
+    cx: &mut TestAppContext,
+) -> (Entity<GraphSession>, Arc<BranchDiffRoute>) {
+    let route = Arc::new(BranchDiffRoute {
+        changes,
+        reads: Mutex::new(Vec::new()),
+    });
+    let routes = Routes {
+        diff: Some(route.clone()),
+        ..Routes::default()
+    };
+    let session = serve_blobs(
+        schema,
+        Arc::new(move |_| rows.clone()),
+        always(200, committed("c2", "c1")),
+        None,
+        routes,
+        cx,
+    );
+    (session, route)
 }
 
 fn serve_blobs(
@@ -770,11 +807,12 @@ fn serve_blobs(
         blobs,
         access,
         served,
+        diff,
     } = routes;
     let http = FakeHttpClient::create(move |request| {
         let (schema, rows, writes) = (schema.clone(), rows.clone(), writes.clone());
         let (writer, blobs, access) = (writer.clone(), blobs.clone(), access.clone());
-        let served = served.clone();
+        let (served, diff) = (served.clone(), diff.clone());
         async move {
             let path = request.uri().path().to_owned();
             let query = request.uri().query().unwrap_or_default().to_owned();
@@ -919,6 +957,30 @@ fn serve_blobs(
                 writes(&body)
             } else if let Some(access) = access.filter(|_| path.ends_with("/access")) {
                 (200, access)
+            } else if let Some(diff) = diff
+                .as_ref()
+                .filter(|_| path.ends_with("/merge-base") || path.ends_with("/diff"))
+            {
+                diff.reads.lock().unwrap().push(path.clone());
+                if path.ends_with("/merge-base") {
+                    let commit = |id: &str| json!({ "graph_commit_id": id, "graph_manifest_version": 1, "kind": "published", "created_at": 0 });
+                    (
+                        200,
+                        json!({
+                            "merge_base": commit("c0"),
+                            "source": "fix", "source_commit_id": "c1",
+                            "target": "main", "target_commit_id": "c1",
+                        }),
+                    )
+                } else {
+                    (
+                        200,
+                        json!({
+                            "from_commit_id": "c0", "to_commit_id": "c1",
+                            "changes": diff.changes.clone(),
+                        }),
+                    )
+                }
             } else {
                 // A second branch, for views that follow the window to another one.
                 (200, json!({ "branches": ["main", "fix"] }))
