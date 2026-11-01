@@ -416,7 +416,7 @@ pub(crate) async fn find_cli(programs: &[PathBuf], turn: &Held) -> Result<FoundC
 
 /// [`find_cli`], whose failure may pass when a program's probe did not end: a CLI just
 /// replaced can be slow to start its first run.
-async fn found_cli(programs: &[PathBuf], turn: &Held) -> Result<FoundCli, NoToken> {
+pub(crate) async fn found_cli(programs: &[PathBuf], turn: &Held) -> Result<FoundCli, NoToken> {
     let mut unfit: Vec<String> = Vec::new();
     let mut passing = false;
     for program in installed(programs) {
@@ -542,13 +542,16 @@ async fn probe_now(program: &Path, turn: &Held) -> Result<FoundCli, Unfit> {
 }
 
 /// The targets `target list --json` names: each name with its entry as the CLI describes it.
+/// A failure passes when the CLI did not answer in time or could not be run.
 pub(crate) async fn list_targets(
     cli: &FoundCli,
     turn: &Held,
-) -> Result<serde_json::Map<String, Value>, String> {
+) -> Result<serde_json::Map<String, Value>, NoToken> {
     match json_answer(cli, turn, &[], &["target", "list", "--json"]).await? {
         Value::Object(targets) => Ok(targets),
-        _ => Err("`omnigraph target list --json` did not answer an object of targets".to_owned()),
+        _ => Err(NoToken::lasting(
+            "`omnigraph target list --json` did not answer an object of targets".to_owned(),
+        )),
     }
 }
 
@@ -1990,6 +1993,28 @@ exit 64
                 && refused.errors[0].contains("upgrade-from-the-old-format"),
             "{:?}",
             refused.errors
+        );
+        // A refusal lasts: the targets are listed again when the operator file changes.
+        let config = home.join("config.yaml");
+        let stamped = crate::cli_config::stamp(std::slice::from_ref(&config))
+            .pop()
+            .flatten();
+        assert_eq!(refused.watched, [(config.clone(), stamped)]);
+
+        // A CLI that could not be run may run at the next check, which lists the targets again.
+        let unrunnable = cli.dir.join("unrunnable");
+        std::fs::write(&unrunnable, "#!/nonexistent/interpreter\n").unwrap();
+        std::fs::set_permissions(&unrunnable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let passing = smol::block_on(read_targets(Some(&home), &[unrunnable], Platform::Unix));
+        assert_eq!(passing.servers, None);
+        assert!(
+            passing.errors[0].contains("could not be run"),
+            "{:?}",
+            passing.errors
+        );
+        assert_eq!(
+            passing.watched,
+            crate::cli_config::unlisted(&config, String::new()).watched
         );
     }
 

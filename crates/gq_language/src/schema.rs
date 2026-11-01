@@ -355,9 +355,6 @@ fn groups_of(edges: &[EdgeType], node_type: &str) -> Vec<RelationshipGroup> {
     outgoing.chain(incoming).collect()
 }
 
-/// The compiled shape lists properties by name; tables and forms show them as the `.pg` file
-/// declares them. Properties a type inherits from an interface follow its own, in the
-/// interface's order.
 /// The annotations a node or edge type is declared with.
 fn declared<'a>(file: &'a SchemaFile, type_name: &str) -> Option<&'a [Annotation]> {
     file.declarations.iter().find_map(|decl| match decl {
@@ -379,6 +376,9 @@ fn about(annotations: &[Annotation]) -> Option<String> {
     })
 }
 
+/// The compiled shape lists properties by name; tables and forms show them as the `.pg` file
+/// declares them. Properties a type inherits from an interface follow its own, in the
+/// interface's order.
 fn in_declared_order(file: &SchemaFile, type_name: &str, properties: &mut [Property]) {
     let mut declared: Vec<&str> = Vec::new();
     let mut interfaces: Vec<&str> = Vec::new();
