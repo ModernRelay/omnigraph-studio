@@ -7106,6 +7106,63 @@ impl TypeTable {
     }
 
     /// The keys the filter menu offers, with their operators and properties, for the model.
+    /// What a sentence may order, group and show the rows by: the properties that can order
+    /// the table, what the Group menu offers, and the columns.
+    fn view_choices(&self) -> words::ViewChoices {
+        words::ViewChoices {
+            sorts: self
+                .all_columns
+                .iter()
+                .filter_map(ColumnSpec::property)
+                .filter(|property| Sort::allowed(property))
+                .map(|property| property.name.clone())
+                .collect(),
+            groups: self
+                .group_choices()
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect(),
+            columns: self
+                .all_columns
+                .iter()
+                .map(|column| column.key.clone())
+                .collect(),
+        }
+    }
+
+    /// Takes a sentence's order, grouping and columns ([`words::view`], checked against
+    /// [`Self::view_choices`]): each it sets replaces the table's, the columns as a saved view's
+    /// do, those named shown in the order named and the rest hidden. The caller reads the table
+    /// again.
+    fn apply_words_view(&mut self, view: words::View, cx: &mut Context<Self>) {
+        if let Some(sort) = view.sort {
+            self.sort = Some(sort);
+        }
+        if let Some(key) = view.group_by
+            && self.grouping.as_ref().map(|grouping| &grouping.property) != Some(&key)
+        {
+            self.grouping = Some(Grouping::new(key));
+        }
+        if let Some(shown) = view.columns {
+            // The pinned column always shows, first, as when a column is hidden by hand.
+            let pinned = self.all_columns.first().map(|column| column.key.clone());
+            let hidden = self
+                .all_columns
+                .iter()
+                .map(|column| column.key.clone())
+                .filter(|key| !shown.contains(key) && Some(key) != pinned.as_ref())
+                .collect();
+            let order = shown
+                .into_iter()
+                .filter(|key| Some(key) != pinned.as_ref())
+                .collect();
+            let widths = std::mem::take(&mut self.layout.widths);
+            self.layout = ColumnLayout::new(hidden, order);
+            self.layout.widths = widths;
+            self.show_columns(cx);
+        }
+    }
+
     fn words_choices(&self) -> Vec<words::Choice> {
         self.filter_choices()
             .into_iter()
@@ -7147,12 +7204,13 @@ impl TypeTable {
 
     fn start_words(&mut self, models: Entity<Models>, sentence: String, cx: &mut Context<Self>) {
         let choices = self.words_choices();
+        let offered = self.view_choices();
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let request = ModelRequest {
             task: &words::TASK,
             instructions: words::INSTRUCTIONS,
-            input: words::input(&self.type_name, &choices, &today, &sentence),
-            schema: words::schema(&choices),
+            input: words::input(&self.type_name, &choices, &offered, &today, &sentence),
+            schema: words::schema(&choices, &offered),
         };
         let call = models.read(cx).call::<words::Answer>(request, cx);
         let task = cx.spawn(async move |this, cx| {
@@ -7167,7 +7225,9 @@ impl TypeTable {
                     return;
                 }
             };
-            let (mut filters, mut refused) = words::filters(answer.value, &choices);
+            let (view, mut refused) = words::view(&answer.value, &offered);
+            let (mut filters, filters_refused) = words::filters(answer.value, &choices);
+            refused.extend(filters_refused);
             // A `related_to` names a record; the name becomes its id through the node search
             // the filter's own value field uses, the first match taken, and the pill shows it.
             let mut labels: Vec<(String, String)> = Vec::new();
@@ -7245,6 +7305,9 @@ impl TypeTable {
                 this.filters.retain(|filter| !made.contains(filter));
                 this.words_made = filters.clone();
                 this.filters.extend(filters);
+                // What the sentence says of the order, the grouping and the columns replaces
+                // the table's; what it does not say stays as it is.
+                this.apply_words_view(view, cx);
                 let note =
                     (!refused.is_empty()).then(|| format!("Could not use: {}", refused.join("; ")));
                 this.words = WordsState::Typing(note);
@@ -10045,6 +10108,74 @@ mod tests {
         table.read_with(cx, |table, _| {
             assert_eq!(table.paging.pinned.as_deref(), Some("c2"));
             assert!(table.newer, "a person changed");
+        });
+    }
+
+    /// A sentence's order, grouping and columns are taken as a saved view's are: the columns it
+    /// names shown in the order named, the rest hidden. What it does not set stays as it was.
+    #[gpui::test]
+    async fn a_sentence_sets_the_order_grouping_and_columns(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let schema = "node Person {\n  slug: String @key\n  name: String\n  email: String?\n}\n";
+        let session = session(schema, cx);
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        table.update(cx, |table, cx| {
+            let offered = table.view_choices();
+            assert!(offered.sorts.contains(&"name".to_owned()), "{offered:?}");
+            assert!(offered.groups.contains(&"name".to_owned()), "{offered:?}");
+            assert_eq!(offered.columns, ["slug", "name", "email"]);
+            let by_name = Sort {
+                property: "name".into(),
+                descending: true,
+            };
+            table.apply_words_view(
+                words::View {
+                    sort: Some(by_name.clone()),
+                    group_by: Some("name".into()),
+                    columns: Some(vec!["email".into()]),
+                },
+                cx,
+            );
+            assert_eq!(table.sort, Some(by_name.clone()));
+            assert_eq!(
+                table
+                    .grouping
+                    .as_ref()
+                    .map(|grouping| grouping.property.as_str()),
+                Some("name")
+            );
+            let shown = |table: &TypeTable| -> Vec<String> {
+                table.columns.iter().map(|c| c.key.clone()).collect()
+            };
+            assert_eq!(table.layout.hidden, ["name"]);
+            assert_eq!(shown(table), ["slug", "email"], "the pinned key stays");
+
+            table.apply_words_view(
+                words::View {
+                    columns: Some(vec!["email".into(), "name".into()]),
+                    ..words::View::default()
+                },
+                cx,
+            );
+            assert_eq!(
+                shown(table),
+                ["slug", "email", "name"],
+                "in the order named"
+            );
+            assert_eq!(table.sort, Some(by_name), "an order not said stays");
         });
     }
 

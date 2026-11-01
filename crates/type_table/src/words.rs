@@ -4,7 +4,7 @@
 //! back goes through the same keys, operators and value parsing a filter typed by hand does;
 //! one the type cannot take is dropped and named.
 
-use gq_language::builder::{Filter, FilterOp};
+use gq_language::builder::{Filter, FilterOp, Sort};
 use gq_language::schema::Property;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -17,9 +17,10 @@ pub static TASK: ModelTask = ModelTask {
     sends: "The type's property names, its enum values and your sentence",
     tier: Tier::Fast,
     // A wide type with many relationships describes itself in more than the tier's cap; the
-    // call is still one short answer.
+    // call is still one short answer. The personal graph's widest type, Artifact, with its
+    // order, grouping and columns, comes to about 33 KB.
     limits: Limits {
-        input_bytes: 32 * 1024,
+        input_bytes: 48 * 1024,
         ..Tier::Fast.limits()
     },
 };
@@ -31,7 +32,9 @@ other operator takes one value. Prefer an enum's exact value. Filters are joined
 When the request needs or, not, a count, two tests on one related record or more than one \
 hop, put that part in `predicate` as a GQ condition on the row variable $n and leave it out \
 of the filters; otherwise predicate is null. When the request names nothing the table has, \
-answer with no filters and a null predicate.";
+answer with no filters and a null predicate. Set `sort`, `group_by` and `columns` only when \
+the request asks how the rows are ordered or grouped or which columns show; leave each empty \
+otherwise.";
 
 /// A key the table's filter menu offers: a property, or a relationship key.
 #[derive(Debug, Clone)]
@@ -49,8 +52,29 @@ pub struct Choice {
     pub traversal: Option<String>,
 }
 
-/// The answer's shape: filters whose property and operator are each one of the keys offered.
-pub fn schema(choices: &[Choice]) -> Value {
+/// What a sentence may set beside its filters, as the table offers it: the properties that can
+/// order the rows, the keys that can group them, and the columns, each by its key.
+#[derive(Debug, Clone, Default)]
+pub struct ViewChoices {
+    pub sorts: Vec<String>,
+    pub groups: Vec<String>,
+    pub columns: Vec<String>,
+}
+
+/// What an answer sets beside its filters; `None` leaves that part of the table as it is.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct View {
+    pub sort: Option<Sort>,
+    pub group_by: Option<String>,
+    /// The columns to show, in the order asked.
+    pub columns: Option<Vec<String>>,
+}
+
+/// The answer's shape: filters whose property and operator are each one of the keys offered,
+/// and the order, grouping and columns `view` offers, each a list the answer leaves empty to
+/// keep the table's own. Each is a list, as a strict schema has no optional field; one whose
+/// choices are none is left out, as an enum of none is no schema.
+pub fn schema(choices: &[Choice], view: &ViewChoices) -> Value {
     let keys: Vec<&str> = choices.iter().map(|choice| choice.key.as_str()).collect();
     let mut ops: Vec<&str> = choices
         .iter()
@@ -58,7 +82,7 @@ pub fn schema(choices: &[Choice]) -> Value {
         .collect();
     ops.sort_unstable();
     ops.dedup();
-    json!({
+    let mut shape = json!({
         "type": "object",
         "properties": {
             "filters": {
@@ -81,12 +105,65 @@ pub fn schema(choices: &[Choice]) -> Value {
         },
         "required": ["filters", "predicate"],
         "additionalProperties": false,
-    })
+    });
+    let mut add = |name: &str, field: Value| {
+        shape["properties"][name] = field;
+        if let Some(required) = shape["required"].as_array_mut() {
+            required.push(json!(name));
+        }
+    };
+    if !view.sorts.is_empty() {
+        add(
+            "sort",
+            json!({
+                "type": "array",
+                "description": "At most one order; empty keeps the table's.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "property": {"type": "string", "enum": view.sorts},
+                        "descending": {"type": "boolean"},
+                    },
+                    "required": ["property", "descending"],
+                    "additionalProperties": false,
+                },
+            }),
+        );
+    }
+    // A key, not an enum: a type reached by many relationships groups by thousands of keys,
+    // each checked when the answer comes back ([`view`]).
+    if !view.groups.is_empty() {
+        add(
+            "group_by",
+            json!({
+                "type": "array",
+                "description": "At most one key to group the rows by; empty keeps the table's.",
+                "items": {"type": "string"},
+            }),
+        );
+    }
+    if !view.columns.is_empty() {
+        add(
+            "columns",
+            json!({
+                "type": "array",
+                "description": "The columns to show, in order; empty keeps the table's.",
+                "items": {"type": "string", "enum": view.columns},
+            }),
+        );
+    }
+    shape
 }
 
 /// What the model is told: the type, each key with its kind, values and operators, and the
 /// sentence.
-pub fn input(type_name: &str, choices: &[Choice], today: &str, sentence: &str) -> String {
+pub fn input(
+    type_name: &str,
+    choices: &[Choice],
+    view: &ViewChoices,
+    today: &str,
+    sentence: &str,
+) -> String {
     let mut text = format!("Table: rows of type {type_name}. Today is {today}.\n\nKeys:\n");
     // The type's own properties, one line each; then each relationship on a line of its own,
     // their operators said once for all; then each related type's properties once, however
@@ -149,6 +226,32 @@ pub fn input(type_name: &str, choices: &[Choice], today: &str, sentence: &str) -
             related.push((other, nested));
         }
     }
+    // What may order, group and show: the keys are those above, so only the order's and the
+    // grouping's own properties are named again.
+    if !view.sorts.is_empty() {
+        text.push_str(&format!(
+            "\nOrder (`sort`) by one of: {}; descending for the largest, latest or last first.\n",
+            view.sorts.join(", ")
+        ));
+    }
+    if !view.groups.is_empty() {
+        let own: Vec<&str> = view
+            .groups
+            .iter()
+            .map(String::as_str)
+            .filter(|key| !key.contains(':'))
+            .collect();
+        text.push_str(&format!(
+            "Group (`group_by`) by one of: {}; a relationship key, by each related record; or a \
+             relationship key, a dot and a related record's property.\n",
+            own.join(", ")
+        ));
+    }
+    if !view.columns.is_empty() {
+        text.push_str(
+            "Columns (`columns`): the property and relationship keys above to show, in order.\n",
+        );
+    }
     let mut listed = String::new();
     if !related.is_empty() {
         listed.push_str("\nProperties of related types:\n");
@@ -210,6 +313,69 @@ pub struct Answer {
     /// A GQ condition for what the filters cannot say; the table judges it with the compiler.
     #[serde(default)]
     pub predicate: Option<String>,
+    /// The rows' order, at most one; none keeps the table's.
+    #[serde(default)]
+    pub sort: Vec<SortItem>,
+    /// What the rows are grouped by, at most one; none keeps the table's.
+    #[serde(default)]
+    pub group_by: Vec<String>,
+    /// The columns to show, in order; none keeps the table's.
+    #[serde(default)]
+    pub columns: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SortItem {
+    pub property: String,
+    pub descending: bool,
+}
+
+/// What the answer sets beside its filters, each checked against what the table offers, and
+/// what it could not use, each with why. Past the first order or grouping, the rest is said.
+pub fn view(answer: &Answer, offered: &ViewChoices) -> (View, Vec<String>) {
+    let mut refused = Vec::new();
+    let sort = answer.sort.first().and_then(|item| {
+        if offered.sorts.contains(&item.property) {
+            Some(Sort {
+                property: item.property.clone(),
+                descending: item.descending,
+            })
+        } else {
+            refused.push(format!("the rows cannot be ordered by {}", item.property));
+            None
+        }
+    });
+    if answer.sort.len() > 1 {
+        refused.push("the rows take one order".to_owned());
+    }
+    let group_by = answer.group_by.first().and_then(|key| {
+        if offered.groups.contains(key) {
+            Some(key.clone())
+        } else {
+            refused.push(format!("the rows cannot be grouped by {key}"));
+            None
+        }
+    });
+    if answer.group_by.len() > 1 {
+        refused.push("the rows take one grouping".to_owned());
+    }
+    let mut columns: Vec<String> = Vec::new();
+    for key in &answer.columns {
+        if !offered.columns.contains(key) {
+            refused.push(format!("{key} is not a column"));
+        } else if !columns.contains(key) {
+            columns.push(key.clone());
+        }
+    }
+    let columns = (!columns.is_empty()).then_some(columns);
+    (
+        View {
+            sort,
+            group_by,
+            columns,
+        },
+        refused,
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -331,13 +497,16 @@ mod tests {
     #[test]
     fn an_answer_becomes_filters_the_type_takes() {
         let choices = choices();
-        let schema = schema(&choices);
+        let schema = schema(&choices, &ViewChoices::default());
         assert_eq!(
             schema["properties"]["filters"]["items"]["properties"]["property"]["enum"],
             json!(["kind", "date", "out:Attended"])
         );
         let answer = Answer {
             predicate: Some(" $n.kind = \"dinner\" or $n.kind = \"party\" ".into()),
+            sort: Vec::new(),
+            group_by: Vec::new(),
+            columns: Vec::new(),
             filters: vec![
                 Item {
                     property: "kind".into(),
@@ -385,7 +554,13 @@ mod tests {
                 "kind cannot be tested with gt"
             ]
         );
-        let text = input("Event", &choices, "2026-10-29", " dinners last month ");
+        let text = input(
+            "Event",
+            &choices,
+            &ViewChoices::default(),
+            "2026-10-29",
+            " dinners last month ",
+        );
         assert!(
             text.contains("- kind: enum(dinner, trip); operators eq"),
             "{text}"
@@ -401,6 +576,87 @@ mod tests {
             "{text}"
         );
         assert!(text.ends_with("Request: dinners last month"));
+    }
+
+    /// A sentence may set the order, the grouping and the columns beside its filters, each
+    /// checked against what the table offers: one it cannot take is named, not kept, and none
+    /// keeps the table's own. The schema offers each the table has choices for.
+    #[test]
+    fn an_answer_sets_the_order_grouping_and_columns_the_table_offers() {
+        let offered = ViewChoices {
+            sorts: vec!["date".into(), "kind".into()],
+            groups: vec![
+                "kind".into(),
+                "out:Attended".into(),
+                "out:Attended.role".into(),
+            ],
+            columns: vec!["kind".into(), "date".into(), "out:Attended".into()],
+        };
+        let answer: Answer = serde_json::from_value(json!({
+            "filters": [],
+            "predicate": null,
+            "sort": [{"property": "date", "descending": true}],
+            "group_by": ["out:Attended.role"],
+            "columns": ["date", "kind", "date", "nope"],
+        }))
+        .unwrap();
+        let (set, refused) = view(&answer, &offered);
+        assert_eq!(
+            set,
+            View {
+                sort: Some(Sort {
+                    property: "date".into(),
+                    descending: true,
+                }),
+                group_by: Some("out:Attended.role".into()),
+                columns: Some(vec!["date".into(), "kind".into()]),
+            }
+        );
+        assert_eq!(refused, ["nope is not a column"]);
+
+        let answer: Answer = serde_json::from_value(json!({
+            "filters": [],
+            "predicate": null,
+            "sort": [{"property": "name", "descending": false}],
+        }))
+        .unwrap();
+        let (set, refused) = view(&answer, &offered);
+        assert_eq!(set, View::default(), "none taken keeps the table's");
+        assert_eq!(refused, ["the rows cannot be ordered by name"]);
+
+        let shape = schema(&choices(), &offered);
+        assert_eq!(
+            shape["properties"]["sort"]["items"]["properties"]["property"]["enum"],
+            json!(["date", "kind"])
+        );
+        assert_eq!(
+            shape["properties"]["columns"]["items"]["enum"],
+            json!(["kind", "date", "out:Attended"])
+        );
+        assert_eq!(
+            shape["required"],
+            json!(["filters", "predicate", "sort", "group_by", "columns"])
+        );
+        let bare = schema(&choices(), &ViewChoices::default());
+        assert_eq!(bare["required"], json!(["filters", "predicate"]));
+        assert!(bare["properties"].get("sort").is_none());
+
+        let text = input(
+            "Event",
+            &choices(),
+            &offered,
+            "2026-10-29",
+            "latest dinners by role",
+        );
+        assert!(
+            text.contains("Order (`sort`) by one of: date, kind;"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Group (`group_by`) by one of: kind;"),
+            "{text}"
+        );
+        assert!(text.contains("Columns (`columns`)"), "{text}");
     }
 
     /// A related type's properties are said once, however many relationships reach it, and a
@@ -436,7 +692,13 @@ mod tests {
             }
             choices.push(nested(key, "role", &["host", "guest"]));
         }
-        let text = input("Event", &choices, "2026-10-29", "dinners Ada hosted");
+        let text = input(
+            "Event",
+            &choices,
+            &ViewChoices::default(),
+            "2026-10-29",
+            "dinners Ada hosted",
+        );
         assert_eq!(
             text.matches("- Person: role enum(host, guest)\n").count(),
             1,
@@ -455,7 +717,13 @@ mod tests {
             wide.push(relationship(&key, &format!("Type{n:03}")));
             wide.push(nested(&key, "status", &values));
         }
-        let text = input("Event", &wide, "2026-10-29", "dinners Ada hosted");
+        let text = input(
+            "Event",
+            &wide,
+            &ViewChoices::default(),
+            "2026-10-29",
+            "dinners Ada hosted",
+        );
         assert!(
             text.len() <= TASK.limits.input_bytes,
             "{} bytes",
