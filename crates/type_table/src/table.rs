@@ -7281,7 +7281,7 @@ impl TypeTable {
                 ops: self.ops_for(&key),
                 property: self.property_for_key(&key),
                 other_type: self.related_type(&key),
-                traversal: builder::relationship_traversal(&key, "$n", "$r"),
+                traversal: builder::relationship_traversal(&key, builder::NODE_VAR, "$r"),
                 key,
                 label,
             })
@@ -10336,6 +10336,15 @@ mod tests {
     /// submenu of it; a relationship without any is a plain entry. Before, every neighbour
     /// property followed its relationship in the one menu: 1,122 entries for the personal
     /// graph's Person, every one drawn at each frame the menu was open.
+    /// The condition field's hint names the row the queries bind ([`builder::NODE_VAR`]).
+    #[test]
+    fn the_condition_hint_names_the_row_variable() {
+        assert!(
+            filter_placeholder(FilterOp::Expr)
+                .starts_with(&format!("GQ on {}, ", builder::NODE_VAR))
+        );
+    }
+
     #[test]
     fn the_filter_menu_nests_each_relationships_neighbour_properties() {
         let choice = |key: &str| (key.to_owned(), key.to_owned(), IconName::CaseSensitive);
