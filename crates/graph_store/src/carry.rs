@@ -457,16 +457,8 @@ pub(crate) mod tests {
         })
     }
 
-    pub(crate) fn node(ty: &str, id: &str) -> Value {
-        json!({
-            "kind": "node",
-            "type": { "id": ty, "name": ty },
-            "id": id,
-            "op": "update",
-            "before": { "properties": {} },
-            "after": { "properties": {} },
-        })
-    }
+    /// One update to a node, as the change feed reports it.
+    pub(crate) use crate::test_server::node_change as node;
 
     pub(crate) fn edge(ty: &str, id: &str, from: &str, to: &str) -> Value {
         json!({

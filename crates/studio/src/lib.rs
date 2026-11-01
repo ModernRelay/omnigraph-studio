@@ -826,10 +826,13 @@ pub(crate) fn tell(cx: &mut App, kind: ToastKind, message: String) {
             })
             .ok();
         }
+        // A window opened to say it asks for a graph, as an empty one does: the message may
+        // point at "Open a graph".
         None => {
             cx.open_window(window_options(None, cx), move |window, cx| {
                 let workspace = new_workspace(window, cx);
                 workspace.update(cx, |workspace, cx| workspace.show_toast(kind, message, cx));
+                ask_for_graph(&workspace, window, cx);
                 workspace
             })
             .ok();
@@ -1012,6 +1015,25 @@ mod start_tests {
             "omnigraph-studio://graph?server=http://unknown.test&graph=g",
             cx,
         );
+    }
+
+    /// A link refused while no window is open (on macOS Studio runs on with none) opens a window
+    /// that says why and asks for a graph. Before, the new window showed the refusal alone, and
+    /// it pointed at "Open a graph", which was not there.
+    #[gpui::test]
+    fn a_link_refused_with_no_window_asks_for_a_graph(cx: &mut TestAppContext) {
+        let _studio = studio_with_servers(cx);
+        cx.update(|cx| open_link("omnigraph-studio://connect?code=abc", cx));
+        cx.run_until_parked();
+        let windows = cx.update(|cx| cx.windows());
+        assert_eq!(windows.len(), 1);
+        let workspace = windows[0].downcast::<Workspace>().unwrap();
+        workspace
+            .update(cx, |workspace, _, _| {
+                assert!(workspace.has_modal(), "the dialog");
+                assert_eq!(workspace.toast_messages().len(), 1, "the refusal is said");
+            })
+            .unwrap();
     }
 
     /// `link` opens Studio, whose one window would ask for a graph, and is refused.

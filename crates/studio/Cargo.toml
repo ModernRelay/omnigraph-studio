@@ -76,6 +76,8 @@ harness = false
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 graph_store = { workspace = true, features = ["test-support"] }
+# A model service that never answers, for the settings' key test.
+http_client = { workspace = true }
 studio_settings = { workspace = true, features = ["test-support"] }
 studio_theme = { workspace = true, features = ["test-support"] }
 studio_workspace = { workspace = true, features = ["test-support"] }

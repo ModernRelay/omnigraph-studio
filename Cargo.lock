@@ -9710,6 +9710,7 @@ dependencies = [
  "graph_client",
  "graph_store",
  "history",
+ "http_client",
  "image",
  "libc",
  "log",

@@ -298,7 +298,17 @@ pub fn explore_scene(
                     continue;
                 }
                 let arrow = key.group.direction.arrow();
-                let count_value = count.loaded().copied();
+                // Searched (the Explore tree's "Find among"), the hub's neighbours are the
+                // matches alone: counted once all are read, else unknown. The relationship's
+                // count would offer "+K more" that no page brings.
+                let count_value = match state.searches.contains_key(key) {
+                    true => state
+                        .neighbours
+                        .get(key)
+                        .filter(|list| list.exhausted)
+                        .map(|list| list.rows.len() as u64),
+                    false => count.loaded().copied(),
+                };
                 let label = match count_value {
                     Some(count) => format!("{arrow} {} · {count}", key.group.edge),
                     None => format!("{arrow} {} · …", key.group.edge),
@@ -701,6 +711,42 @@ mod tests {
                 .iter()
                 .any(|n| matches!(n.kind, SceneKind::More { .. }))
         );
+    }
+
+    /// A hub the Explore tree searched holds the matches alone: it counts them once all are
+    /// read, and offers no "+K more" of the relationship's other neighbours, which no page
+    /// brings. Before, it showed the relationship's count beside three matches.
+    #[test]
+    fn a_searched_hub_counts_its_matches() {
+        let (schema, mut state) = exploration();
+        let knows = schema
+            .relationships_of("Person")
+            .iter()
+            .find(|g| g.edge == "Knows" && g.direction == Direction::Outgoing)
+            .cloned()
+            .unwrap();
+        let ada_knows = GroupKey::new(person("ada"), knows);
+        state.searches.insert(ada_knows.clone(), "p1".into());
+        let matches = NeighbourList {
+            rows: ["p10", "p11", "p12"]
+                .iter()
+                .map(|id| Neighbour {
+                    node: person(id),
+                    label: None,
+                    edge: Vec::new(),
+                })
+                .collect(),
+            exhausted: true,
+            ..Default::default()
+        };
+        state.neighbours.insert(ada_knows.clone(), matches);
+        let scene = explore_scene(&state.entries(&schema), &state, &HashMap::new(), NODE_CAP);
+        let hub = scene.index_of(&SceneId::Hub(ada_knows.clone())).unwrap();
+        assert!(matches!(
+            scene.nodes[hub].kind,
+            SceneKind::Hub { count: Some(3), .. }
+        ));
+        assert!(scene.index_of(&SceneId::More(ada_knows)).is_none());
     }
 
     /// p05, reached from Ada and from p00, is one chip, open while either path is: closing it
