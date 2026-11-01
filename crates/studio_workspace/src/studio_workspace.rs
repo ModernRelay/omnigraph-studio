@@ -2863,42 +2863,34 @@ impl Workspace {
     fn render_sidebar(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let panel = studio_ui::ds::surface::chrome(cx);
         let hairline = studio_ui::ds::surface::rule(cx);
-        // What can be listed, in words, one row each (spec 020). The active one's own buttons
-        // (new, filter) sit at its end.
-        let nav = v_flex()
-            .id("sidebar-nav")
-            .flex_none()
-            .py(px(studio_ui::ds::space::XS))
+        // The column's header is its panel's own, as a Zed panel draws its header: the panel's
+        // title and its buttons. Panels are switched, and the sidebar shown and hidden, from
+        // the status bar.
+        let header = self
+            .strip("sidebar-header", HEADER_HEIGHT, cx)
+            .pl(px(studio_ui::ds::space::EDGE))
+            .pr(px(studio_ui::ds::space::SM))
+            .gap(px(studio_ui::ds::space::XS))
             .when(!studio_ui::ds::is_glass(cx), |d| {
                 d.border_b_1().border_color(hairline)
             })
-            .children(self.left.panels.iter().enumerate().map(|(index, panel)| {
-                let lit = index == self.left.active;
-                let id = panel.id.to_string();
-                let tooltip_id = id.clone();
-                let title = panel.title.clone();
-                studio_ui::ds::SidebarRow::new(("sidebar-nav", index), panel.title.clone())
-                    .icon(panel.icon)
-                    .selected(lit)
-                    .when_some(panel.actions.clone().filter(|_| lit), |row, actions| {
-                        row.end(actions)
-                    })
-                    .tooltip_fn(move |_, cx| {
+            .children(self.left.active_panel().map(dock_title))
+            .child(
+                IconButton::new("search", IconName::MagnifyingGlass)
+                    .tooltip(|_, cx| {
                         Tooltip::for_action(
-                            title.clone(),
-                            &studio_actions::workspace::ActivatePanel {
-                                id: tooltip_id.clone(),
-                            },
+                            "Search types, queries and commands",
+                            &studio_actions::workspace::ToggleCommandPalette,
                             cx,
                         )
                     })
-                    .on_click(move |_, window, cx| {
+                    .on_click(|_, window, cx| {
                         window.dispatch_action(
-                            Box::new(studio_actions::workspace::ActivatePanel { id: id.clone() }),
+                            Box::new(studio_actions::workspace::ToggleCommandPalette),
                             cx,
                         )
-                    })
-            }));
+                    }),
+            );
         // The content scrolls in its cached host.
         let body = v_flex().id("sidebar-panel").flex_1().min_h_0().children(
             self.left
@@ -2919,7 +2911,7 @@ impl Workspace {
             .w(px(width))
             .h_full()
             .flex_none()
-            .child(nav)
+            .child(header)
             .child(body)
             .child(resize_handle(PanelPosition::Left))
     }
@@ -2948,33 +2940,12 @@ impl Workspace {
                 Some(room) => strip.child(div().w(px(room)).flex_none()),
                 None => strip.pl(px(studio_ui::ds::space::SM)),
             })
-            .when(shown && !self.left.panels.is_empty(), |bar| {
-                bar.child(self.render_sidebar_toggle())
-                    .child(studio_ui::ds::divider_v(cx))
-            })
             .child(self.render_graph_switcher(cx))
             .children(self.render_branch(cx))
             .children(environment.map(|environment| self.render_environment(environment, cx)))
             .child(div().flex_1())
-            .child(
-                IconButton::new("search", IconName::MagnifyingGlass)
-                    .tooltip(|_, cx| {
-                        Tooltip::for_action(
-                            "Search types, queries and commands",
-                            &studio_actions::workspace::ToggleCommandPalette,
-                            cx,
-                        )
-                    })
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(
-                            Box::new(studio_actions::workspace::ToggleCommandPalette),
-                            cx,
-                        )
-                    }),
-            )
             .when(shown, |bar| {
-                bar.child(studio_ui::ds::divider_v(cx))
-                    .child(self.render_panel_buttons(PanelPosition::Bottom, cx))
+                bar.child(self.render_panel_buttons(PanelPosition::Bottom, cx))
                     .child(
                         IconButton::new("toggle-inspector", IconName::Info)
                             .toggle_state(inspector_lit)
@@ -3057,8 +3028,8 @@ impl Workspace {
             })
     }
 
-    /// The top bar's first button, as Zed's sidebar toggle: shows or hides the sidebar, its icon
-    /// drawn as the sidebar is.
+    /// The status bar's first button, as Zed's sidebar toggle: shows or hides the sidebar, its
+    /// icon drawn as the sidebar is.
     fn render_sidebar_toggle(&self) -> impl IntoElement {
         let open = self.left.open;
         IconButton::new(
@@ -3108,8 +3079,14 @@ impl Workspace {
                 let tooltip_id = id.clone();
                 let workspace = workspace.clone();
                 let this = cx.entity().downgrade();
-                // In the top bar: its menu opens below.
-                let (anchor, attach) = (gpui::Anchor::TopRight, gpui::Anchor::BottomRight);
+                // The sidebar's are in the status bar, whose menus open above; the others are in
+                // the top bar, whose menus open below.
+                let (anchor, attach) = match position {
+                    PanelPosition::Left => (gpui::Anchor::BottomLeft, gpui::Anchor::TopLeft),
+                    PanelPosition::Bottom | PanelPosition::Right => {
+                        (gpui::Anchor::TopRight, gpui::Anchor::BottomRight)
+                    }
+                };
                 let button_id = id.clone();
                 // As Zed's panel buttons: the right-click menu moves the panel to another dock,
                 // and no tooltip covers it while it is open.
@@ -4070,6 +4047,8 @@ impl Workspace {
         let hairline = studio_ui::ds::surface::rule(cx);
         let mut status = status.unwrap_or_default();
         let keys = std::mem::take(&mut status.keys);
+        let has_start = !status.start.is_empty();
+        let shown = self.session.is_some();
         let running = self.session.as_ref().and_then(|session| {
             let s = session.read(cx);
             match (s.reads_in_flight, s.writes_in_flight) {
@@ -4086,6 +4065,12 @@ impl Workspace {
             .gap(px(studio_ui::ds::space::XS))
             .items_center()
             .overflow_hidden()
+            .when(shown && !self.left.panels.is_empty(), |bar| {
+                bar.child(self.render_sidebar_toggle())
+                    .child(studio_ui::ds::divider_v(cx))
+                    .child(self.render_panel_buttons(PanelPosition::Left, cx))
+                    .when(has_start, |bar| bar.child(studio_ui::ds::divider_v(cx)))
+            })
             .children(status.start);
         let has_end = !status.end.is_empty();
         let performance = self.render_performance();
