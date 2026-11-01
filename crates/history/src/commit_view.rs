@@ -978,6 +978,8 @@ impl Render for CommitView {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
