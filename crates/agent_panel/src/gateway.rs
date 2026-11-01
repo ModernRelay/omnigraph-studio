@@ -419,26 +419,27 @@ async fn handle(
     drop(json);
     match verdict {
         Verdict::Refuse(message) => answer(stream, 403, "forbidden", &message).await,
-        Verdict::Read => {
+        Verdict::Read | Verdict::ReadWith(_) => {
+            let body = match verdict {
+                Verdict::ReadWith(body) => Some(serde_json::to_vec(&body).unwrap_or_default()),
+                _ => None,
+            };
             let method = request.method.clone();
-            let response = forward(
-                &shared.client,
-                &shared.events,
-                forward_request(request, None),
+            let request = forward_request(request, body);
+            // A read the CLI stops waiting for (its shell's two-minute timeout) is dropped with
+            // its server request, which would otherwise hold this connection's place, proved,
+            // until the server answered.
+            let response = smol::future::or(
+                async { Some(forward(&shared.client, &shared.events, request).await) },
+                async {
+                    closed(reader).await;
+                    None
+                },
             )
             .await;
-            stream_back(stream, &method, response).await;
-        }
-        Verdict::ReadWith(body) => {
-            let body = serde_json::to_vec(&body).unwrap_or_default();
-            let method = request.method.clone();
-            let response = forward(
-                &shared.client,
-                &shared.events,
-                forward_request(request, Some(body)),
-            )
-            .await;
-            stream_back(stream, &method, response).await;
+            if let Some(response) = response {
+                stream_back(stream, &method, response).await;
+            }
         }
         Verdict::Write(write) => {
             // A target already retired sends nothing: the agent is told so at once, as a read
@@ -473,12 +474,8 @@ async fn handle(
             // a write approved then would land with the agent told it failed. A closed
             // connection while waiting ends the write unsent, and so does the end of a process
             // the CLI was started under, since whoever ran it no longer waits.
-            let gone = async {
-                let mut byte = [0u8; 1];
-                while matches!(reader.read(&mut byte).await, Ok(1..)) {}
-            };
             let (gone, stopped) = (
-                futures::FutureExt::fuse(gone),
+                futures::FutureExt::fuse(closed(reader)),
                 futures::FutureExt::fuse(starters.ended()),
             );
             futures::pin_mut!(gone, stopped);
@@ -549,6 +546,12 @@ async fn handle(
             }
         }
     }
+}
+
+/// Ends when the CLI closes its side of the connection: it sends nothing after its request.
+async fn closed(reader: &mut (impl AsyncRead + Unpin)) {
+    let mut byte = [0u8; 1];
+    while matches!(reader.read(&mut byte).await, Ok(1..)) {}
 }
 
 /// The person's decision on a write, as the gateway waits for it. Dropped with an approval it
@@ -987,6 +990,9 @@ async fn read_request(
             if length > MAX_BODY {
                 return Err(too_large());
             }
+            // Held at its length from the start: grown as it arrives, a body would take up to
+            // twice its size.
+            rest.reserve_exact(length.saturating_sub(rest.len()));
             while rest.len() < length {
                 let read = stream
                     .read(&mut chunk)
@@ -1073,8 +1079,27 @@ async fn read_chunked(
         if size > MAX_BODY - body.len() {
             return Err(too_large());
         }
-        // The data and its CRLF; a zero size ends the body after the trailer's CRLF.
-        while pending.len() < size + 2 {
+        // The data goes straight into the body, as it arrives: gathered first, a large chunk
+        // would be held twice.
+        let buffered = size.min(pending.len());
+        body.extend_from_slice(&pending[..buffered]);
+        pending.drain(..buffered);
+        let mut left = size - buffered;
+        while left > 0 {
+            let read = stream
+                .read(&mut chunk)
+                .await
+                .map_err(|_| ReadFailure::Gone)?;
+            if read == 0 {
+                return Err(ReadFailure::Gone);
+            }
+            let data = read.min(left);
+            body.extend_from_slice(&chunk[..data]);
+            pending.extend_from_slice(&chunk[data..read]);
+            left -= data;
+        }
+        // Its CRLF; a zero size ends the body after the trailer's CRLF.
+        while pending.len() < 2 {
             let read = stream
                 .read(&mut chunk)
                 .await
@@ -1087,8 +1112,7 @@ async fn read_chunked(
         if size == 0 {
             return Ok(body);
         }
-        body.extend_from_slice(&pending[..size]);
-        pending.drain(..size + 2);
+        pending.drain(..2);
     }
 }
 
@@ -2049,6 +2073,100 @@ mod tests {
             );
             assert!(!raw.ends_with("0\r\n\r\n"), "no end of the stream: {raw}");
         });
+    }
+
+    /// A read the CLI stops waiting for (its shell's timeout) is dropped with its server
+    /// request: it would otherwise hold its connection's place, proved, until the server
+    /// answered.
+    #[test]
+    fn a_read_the_cli_gave_up_on_is_dropped_with_its_server_request() {
+        /// Says when the server's handling of the request is dropped.
+        struct Dropped(Option<oneshot::Sender<()>>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                if let Some(dropped) = self.0.take() {
+                    dropped.send(()).ok();
+                }
+            }
+        }
+        smol::block_on(async {
+            let (arrived_tx, arrived) = oneshot::channel::<()>();
+            let (dropped_tx, dropped) = oneshot::channel::<()>();
+            let gates = Arc::new(Mutex::new(Some((arrived_tx, dropped_tx))));
+            let http = FakeHttpClient::create(move |_request| {
+                let gates = gates.clone();
+                async move {
+                    let (arrived, dropped) = gates.lock().unwrap().take().unwrap();
+                    let _held = Dropped(Some(dropped));
+                    arrived.send(()).ok();
+                    futures::future::pending().await
+                }
+            });
+            let client =
+                GraphClient::new("http://127.0.0.1:8787", Some("person-token".into()), http)
+                    .unwrap();
+            let mut gateway = Gateway::bind().unwrap();
+            let (cli, token) = (Cli::of(&gateway), gateway.token.clone());
+            let (events_tx, _events) = mpsc::unbounded();
+            let _serve = smol::spawn(gateway.serve(client, sandbox(), events_tx));
+            let mut stream = cli.connect().await.unwrap();
+            let read = post(
+                "/graphs/knowledge/query",
+                &token,
+                Some(CONTRACT),
+                r#"{"query":"q","branch":"main"}"#,
+            );
+            stream.write_all(read.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+            arrived.await.unwrap();
+            drop(stream);
+            let dropped = smol::future::or(async { dropped.await.is_ok() }, async {
+                smol::Timer::after(Duration::from_secs(30)).await;
+                false
+            })
+            .await;
+            assert!(dropped, "the server request outlived the CLI's connection");
+        });
+    }
+
+    /// A reader that gives at most `step` bytes a read.
+    struct Trickle {
+        data: Vec<u8>,
+        step: usize,
+    }
+
+    impl AsyncRead for Trickle {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buffer: &mut [u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let given = buffer.len().min(self.step).min(self.data.len());
+            buffer[..given].copy_from_slice(&self.data[..given]);
+            self.data.drain(..given);
+            std::task::Poll::Ready(Ok(given))
+        }
+    }
+
+    /// A chunked body decodes the same however its bytes arrive: a chunk's data split across
+    /// reads, its CRLF apart from it, the next size line in the same read as the data, and part
+    /// of it read with the head.
+    #[test]
+    fn a_chunked_body_decodes_however_its_bytes_arrive() {
+        let framed = b"5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\n\r\n";
+        for step in [1, 2, 3, 7, 8, 8 * 1024] {
+            for with_head in [0, 4, 9] {
+                let mut stream = Trickle {
+                    data: framed[with_head..].to_vec(),
+                    step,
+                };
+                let body = smol::block_on(read_chunked(&mut stream, framed[..with_head].to_vec()));
+                assert!(
+                    matches!(&body, Ok(body) if body == b"hello world"),
+                    "step {step}, {with_head} bytes with the head"
+                );
+            }
+        }
     }
 
     /// A connection that gives a request's line and headers in its first read, then as much body

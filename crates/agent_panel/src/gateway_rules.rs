@@ -42,9 +42,10 @@ pub enum WriteKind {
 pub struct WriteSummary {
     pub kind: WriteKind,
     pub summary: String,
-    /// The query text, for a mutation.
+    /// The query text, for a mutation, as its card shows it ([`shown_query`]).
     pub query: Option<String>,
-    pub params: Option<Map<String, Value>>,
+    /// Its parameters, each name with its value as its card shows it ([`shown_params`]).
+    pub params: Vec<(String, String)>,
     /// Whether the write creates the agent's branch.
     pub creates_branch: Creates,
 }
@@ -149,15 +150,12 @@ fn graph_route(request: &Incoming<'_>, sandbox: &Sandbox, graph: &str, rest: &[&
             if !on_agent_branch(branch) {
                 return Verdict::Refuse(branch_refusal(sandbox));
             }
-            let query = json_str(request.json, "query").map(str::to_owned);
+            let query = json_str(request.json, "query");
             let name = json_str(request.json, "name");
             // A mutation held as an unpublished commit or an unattached snapshot does not move
             // the agent's branch: Studio lists such commits nowhere, and publishing one is the
             // person's.
-            if query
-                .as_deref()
-                .is_some_and(|query| held_off_the_branch(query, name))
-            {
+            if query.is_some_and(|query| held_off_the_branch(query, name)) {
                 return Verdict::Refuse(
                     "Studio: a mutation written `as commit` or `as unattached branch` is held as a \
                      commit no branch shows, and is not forwarded; leave the clause out to write \
@@ -171,12 +169,8 @@ fn graph_route(request: &Incoming<'_>, sandbox: &Sandbox, graph: &str, rest: &[&
                     Some(name) => format!("Mutation {name}"),
                     None => "Mutation".into(),
                 },
-                query,
-                params: request
-                    .json
-                    .and_then(|json| json.get("params"))
-                    .and_then(Value::as_object)
-                    .cloned(),
+                query: query.map(shown_query),
+                params: shown_params(request.json),
                 creates_branch: Creates::Never,
             })
         }
@@ -211,7 +205,7 @@ fn graph_route(request: &Incoming<'_>, sandbox: &Sandbox, graph: &str, rest: &[&
                 // The server merges a load whose mode is left out, so the card says it.
                 summary: format!("Load ({}) into {}", mode.unwrap_or("merge"), sandbox.branch),
                 query: None,
-                params: None,
+                params: Vec::new(),
                 creates_branch: if from.is_some() {
                     Creates::IfMissing
                 } else {
@@ -235,7 +229,7 @@ fn graph_route(request: &Incoming<'_>, sandbox: &Sandbox, graph: &str, rest: &[&
                 },
                 summary: format!("{} Blob {cell}", if clear { "Clear" } else { "Set" }),
                 query: None,
-                params: None,
+                params: Vec::new(),
                 creates_branch: Creates::Never,
             })
         }
@@ -259,7 +253,7 @@ fn graph_route(request: &Incoming<'_>, sandbox: &Sandbox, graph: &str, rest: &[&
                 kind: WriteKind::BranchCreate,
                 summary: format!("Create {} from {}", sandbox.branch, sandbox.base),
                 query: None,
-                params: None,
+                params: Vec::new(),
                 creates_branch: Creates::Always,
             })
         }
@@ -274,7 +268,7 @@ fn graph_route(request: &Incoming<'_>, sandbox: &Sandbox, graph: &str, rest: &[&
                 kind: WriteKind::BranchDelete,
                 summary: format!("Delete {}", sandbox.branch),
                 query: None,
-                params: None,
+                params: Vec::new(),
                 creates_branch: Creates::Never,
             })
         }
@@ -312,7 +306,7 @@ fn graph_route(request: &Incoming<'_>, sandbox: &Sandbox, graph: &str, rest: &[&
                     sandbox.branch
                 ),
                 query: None,
-                params: None,
+                params: Vec::new(),
                 creates_branch: Creates::Never,
             })
         }
@@ -324,11 +318,7 @@ fn graph_route(request: &Incoming<'_>, sandbox: &Sandbox, graph: &str, rest: &[&
                     kind: WriteKind::StoredQuery,
                     summary: format!("Stored query {}", decode(name)),
                     query: None,
-                    params: request
-                        .json
-                        .and_then(|json| json.get("params"))
-                        .and_then(Value::as_object)
-                        .cloned(),
+                    params: shown_params(request.json),
                     creates_branch: Creates::Never,
                 });
             }
@@ -424,6 +414,38 @@ fn held_off_the_branch(query: &str, name: Option<&str>) -> bool {
     })
 }
 
+/// The most of a write's query its card shows.
+const SHOWN_QUERY_CHARS: usize = 20_000;
+/// The most of one parameter's value its card shows, on one line.
+const SHOWN_VALUE_CHARS: usize = 300;
+
+/// A write's query as its card shows it: its start, when it is long. A mutation may carry as
+/// much as a request body, which the card would otherwise copy and lay out on every frame.
+fn shown_query(query: &str) -> String {
+    studio_ui::text::cut(query, SHOWN_QUERY_CHARS)
+}
+
+/// A write's parameters as its card shows them: each name, with its value as text cut to what
+/// one line shows.
+fn shown_params(json: Option<&Value>) -> Vec<(String, String)> {
+    let Some(params) = json
+        .and_then(|json| json.get("params"))
+        .and_then(Value::as_object)
+    else {
+        return Vec::new();
+    };
+    params
+        .iter()
+        .map(|(name, value)| {
+            let text = match value {
+                Value::String(text) => studio_ui::text::cut(text, SHOWN_VALUE_CHARS),
+                other => studio_ui::text::cut(&other.to_string(), SHOWN_VALUE_CHARS),
+            };
+            (name.clone(), text)
+        })
+        .collect()
+}
+
 fn json_str<'a>(json: Option<&'a Value>, key: &str) -> Option<&'a str> {
     json?.get(key)?.as_str()
 }
@@ -511,6 +533,38 @@ mod tests {
         };
         assert_eq!(summary.kind, WriteKind::Mutate);
         assert_eq!(summary.query.as_deref(), Some("query m() { … }"));
+        // What the card shows of a large write is cut once, here: a mutation may carry as much
+        // as a request body, which the card would copy and lay out on every frame.
+        let long = "x".repeat(4 * SHOWN_QUERY_CHARS);
+        let write = verdict(
+            "POST",
+            "/graphs/knowledge/mutate",
+            &[],
+            Some(json!({
+                "query": long,
+                "branch": AGENT,
+                "params": {"body": long, "ids": [1, 2, 3], "n": 7},
+            })),
+        );
+        let Verdict::Write(summary) = write else {
+            panic!("{write:?}")
+        };
+        let query = summary.query.unwrap();
+        assert_eq!(query.chars().count(), SHOWN_QUERY_CHARS);
+        assert!(query.ends_with('…'));
+        let params: Vec<(&str, usize, bool)> = summary
+            .params
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.chars().count(), value.ends_with('…')))
+            .collect();
+        assert_eq!(
+            params,
+            [
+                ("body", SHOWN_VALUE_CHARS, true),
+                ("ids", 7, false),
+                ("n", 1, false)
+            ]
+        );
 
         assert!(refused(&verdict(
             "POST",
