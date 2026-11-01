@@ -18,11 +18,12 @@ use graph_store::{
 };
 use studio_actions::graph::{CreateBranchAt, OpenCommit, OpenQueryAt, OpenType};
 use studio_actions::history::{LoadMoreChanges, NewBranchHere};
+use studio_ui::ds::Tipped;
 use studio_ui::menu::ContextMenu;
 use studio_ui::{now_micros, relative_time, short_commit_id, utc_date_time};
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
 use ui::prelude::*;
-use ui::{KeyBinding, PopoverMenu, Tooltip};
+use ui::{KeyBinding, PopoverMenu};
 
 /// Changes read before asking the person to load more (constitution IX).
 const CAP: usize = 5_000;
@@ -488,7 +489,7 @@ impl CommitView {
             div()
                 .id(name)
                 .cursor_pointer()
-                .tooltip(Tooltip::text(tooltip))
+                .tip(studio_ui::ds::tooltip(tooltip))
                 .on_click(move |_, window, cx| {
                     window.dispatch_action(
                         Box::new(OpenCommit {
@@ -509,7 +510,7 @@ impl CommitView {
             facts.push(
                 div()
                     .id("commit-when")
-                    .tooltip(Tooltip::text(utc_date_time(at)))
+                    .tip(studio_ui::ds::tooltip(utc_date_time(at)))
                     .child(studio_ui::ds::meta(
                         IconName::Clock,
                         relative_time(at, now_micros()),
@@ -560,7 +561,7 @@ impl CommitView {
                 div()
                     .id("commit-title")
                     .cursor_pointer()
-                    .tooltip(Tooltip::text(format!("{full_id}\nClick to copy")))
+                    .tip(studio_ui::ds::tooltip(format!("{full_id}\nClick to copy")))
                     .on_click(move |_, _, cx| {
                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(full_id.clone()))
                     })
@@ -590,7 +591,7 @@ impl CommitView {
                         studio_ui::ds::button("open-table-at-button", "Table")
                             .style(ButtonStyle::Subtle)
                             .start_icon(Icon::new(IconName::Table))
-                            .tooltip(Tooltip::text(
+                            .tip(studio_ui::ds::tooltip(
                                 "Open a type's table as it was at this commit",
                             )),
                     )
@@ -634,7 +635,9 @@ impl CommitView {
                 studio_ui::ds::button("query-at", "Query")
                     .style(ButtonStyle::Subtle)
                     .start_icon(Icon::new(IconName::FileCode))
-                    .tooltip(Tooltip::text("Open a query that reads this commit"))
+                    .tip(studio_ui::ds::tooltip(
+                        "Open a query that reads this commit",
+                    ))
                     .on_click(move |_, window, cx| {
                         window.dispatch_action(
                             Box::new(OpenQueryAt {
@@ -650,14 +653,14 @@ impl CommitView {
                     studio_ui::ds::button("branch-here", "Branch")
                         .style(ButtonStyle::Subtle)
                         .start_icon(Icon::new(IconName::GitBranch))
-                        .tooltip(move |_, cx| {
-                            Tooltip::with_meta_in(
+                        .tip_fn(move |_, cx| {
+                            studio_ui::ds::tooltip_for_action_in(
                                 "Start a new branch at this commit",
-                                Some(&NewBranchHere),
-                                cli.clone(),
+                                &NewBranchHere,
                                 &focus,
-                                cx,
                             )
+                            .meta(cli.clone())
+                            .into_view(cx)
                         })
                         .on_click(move |_, window, cx| new_branch_at(&commit, window, cx)),
                 )

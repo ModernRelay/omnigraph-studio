@@ -33,6 +33,7 @@ use studio_actions::review::{
 use studio_actions::workspace::Refresh;
 use studio_actions::{ViewKind, ViewLink};
 use studio_settings::{ReviewLayout, StudioSettings};
+use studio_ui::ds::Tipped;
 use studio_ui::ds::{radii, space};
 use studio_ui::{
     ChangeKind, RelationshipLine, TextFolds, change_counts, group_digits, short_commit_id,
@@ -41,7 +42,7 @@ use studio_ui::{
 use studio_workspace::models::{Error as ModelError, Models, Request as ModelRequest};
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace, workspace_for};
 use ui::prelude::*;
-use ui::{KeyBinding, PopoverMenu, Severity, Tooltip};
+use ui::{KeyBinding, PopoverMenu, Severity};
 
 use crate::conflicts::{conflict_wording, resolution_hint};
 use crate::scope_menu::ScopeMenu;
@@ -2361,11 +2362,16 @@ impl ReviewView {
             Some(id) => format!("Commit {}", short_commit_id(id)),
         };
         let view = cx.entity().downgrade();
+        // The toolbar's controls are chips, as a table's are (spec 002, "Control chips").
         let scope_menu = PopoverMenu::new("review-scope")
             .trigger(
-                studio_ui::ds::button("review-scope-button", scope_label)
-                    .style(ButtonStyle::Outlined)
-                    .end_icon(Icon::new(IconName::ChevronDown)),
+                studio_ui::ds::chip_button(
+                    "review-scope-button",
+                    IconName::GitCommit,
+                    scope_label,
+                    None,
+                )
+                .end_icon(Icon::new(IconName::ChevronDown)),
             )
             // A branch can hold thousands of commits since its fork: the menu shares the
             // review's list and draws, and labels, only the rows in view.
@@ -2381,10 +2387,12 @@ impl ReviewView {
             |id: &'static str, label: &'static str, this: ReviewLayout, tip: &'static str| {
                 let focus = focus.clone();
                 studio_ui::ds::segment(id, label, layout == this, cx)
-                    .tooltip(move |_, cx| Tooltip::for_action_in(tip, &SwitchLayout, &focus, cx))
+                    .tip_fn(move |_, cx| {
+                        studio_ui::ds::tooltip_for_action_in_view(tip, &SwitchLayout, &focus, cx)
+                    })
                     .on_click(cx.listener(move |view, _, _, cx| view.set_layout(this, cx)))
             };
-        let layouts = studio_ui::ds::segmented(cx)
+        let layouts = studio_ui::ds::segmented_track(cx)
             .child(segment(
                 "layout-feed",
                 "Feed",
@@ -2416,7 +2424,7 @@ impl ReviewView {
                     facts.push(
                         div()
                             .id("review-fork")
-                            .tooltip(Tooltip::text(fork_tooltip))
+                            .tip(studio_ui::ds::tooltip(fork_tooltip))
                             .child(studio_ui::ds::meta_code(
                                 IconName::GitBranch,
                                 format!("{} at {}", self.target, short_commit_id(fork)),
@@ -2453,7 +2461,10 @@ impl ReviewView {
                                     .gap(px(space::CONTROLS))
                                     .items_center()
                                     .child(search)
-                                    .child(scope_menu)
+                                    .child(studio_ui::ds::control_chip(
+                                        "review-scope-chip",
+                                        scope_menu,
+                                    ))
                                     .when(ready, |row| row.child(self.render_summarize_button(cx)))
                                     .child(layouts),
                             ),
@@ -2494,7 +2505,7 @@ impl ReviewView {
         }
         let refresh = |id: &'static str, cx: &mut Context<Self>| {
             studio_ui::ds::button(id, "Refresh")
-                .tooltip(refresh_tooltip(
+                .tip_fn(refresh_tooltip(
                     "Read the review again at the branch's head",
                     &self.focus_handle,
                 ))
@@ -2550,7 +2561,7 @@ impl ReviewView {
                 button.key_binding(KeyBinding::for_action_in(&Merge, &focus, cx))
             })
             .disabled(!mergeable || merge_refused.is_some())
-            .tooltip({
+            .tip_fn({
                 let cli = format!(
                     "omnigraph branch merge {} --into {}{}",
                     self.branch,
@@ -2566,7 +2577,7 @@ impl ReviewView {
                     .clone()
                     .or_else(|| self.merge_blocked(cx))
                     .unwrap_or_else(|| "Merge after checking the branch has not moved".to_owned());
-                move |_, cx| Tooltip::with_meta(title.clone(), None, cli.clone(), cx)
+                move |_, cx| studio_ui::ds::tooltip_with_meta(title.clone(), None, cli.clone(), cx)
             })
             .on_click(cx.listener(|this, _, _, cx| this.merge(cx)));
 
@@ -2648,7 +2659,7 @@ impl ReviewView {
                             cx,
                         )
                         .when_some(delete_refused, |checkbox, reason| {
-                            checkbox.tooltip(Tooltip::text(reason))
+                            checkbox.tip(studio_ui::ds::tooltip(reason))
                         })
                         .when(deletable, |checkbox| {
                             checkbox.on_click(cx.listener(|this, _, _, cx| {
@@ -2684,12 +2695,10 @@ impl ReviewView {
             SummaryState::Done { .. } => "Summarize again",
             _ => "Summarize",
         };
-        studio_ui::ds::button("summarize", label)
-            .style(ButtonStyle::Subtle)
-            .start_icon(Icon::new(IconName::ZedAssistant))
+        let button = studio_ui::ds::chip_button("summarize", IconName::ZedAssistant, label, None)
             .disabled(running)
-            .tooltip(|_, cx| {
-                Tooltip::with_meta(
+            .tip_fn(|_, cx| {
+                studio_ui::ds::tooltip_with_meta(
                     "A model's summary of the branch, for the reviewer",
                     Some(&Summarize),
                     format!(
@@ -2700,8 +2709,8 @@ impl ReviewView {
                     cx,
                 )
             })
-            .on_click(cx.listener(|this, _, _, cx| this.summarize(cx)))
-            .into_any_element()
+            .on_click(cx.listener(|this, _, _, cx| this.summarize(cx)));
+        studio_ui::ds::control_chip("summarize-chip", button).into_any_element()
     }
 
     fn render_ai_summary(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -2830,7 +2839,7 @@ impl ReviewView {
                 ),
                 Some(
                     studio_ui::ds::button("refresh-moved", "Refresh")
-                        .tooltip(refresh_tooltip(
+                        .tip_fn(refresh_tooltip(
                             "Read the review again at the branch's head",
                             &self.focus_handle,
                         ))
@@ -3558,9 +3567,9 @@ impl ReviewView {
                         .style(ButtonStyle::Subtle)
                         .visible_on_hover(hover.clone())
                         .disabled(blocked.is_some() || done)
-                        .tooltip(move |_, cx| match &blocked {
-                            Some(reason) => Tooltip::simple(reason.clone(), cx),
-                            None => Tooltip::with_meta(
+                        .tip_fn(move |_, cx| match &blocked {
+                            Some(reason) => studio_ui::ds::tooltip_view(reason.clone(), cx),
+                            None => studio_ui::ds::tooltip_with_meta(
                                 if moved_from.is_some() {
                                     "Move this relationship back"
                                 } else {
@@ -3645,10 +3654,10 @@ impl ReviewView {
         .style(ButtonStyle::Outlined)
         .toggle_state(reviewed)
         .start_icon(Icon::new(IconName::Check))
-        .tooltip({
+        .tip_fn({
             let focus = focus.clone();
             move |_, cx| {
-                Tooltip::for_action_in(
+                studio_ui::ds::tooltip_for_action_in_view(
                     "Mark this change reviewed and go to the next",
                     &AcceptAndNext,
                     &focus,
@@ -3671,9 +3680,9 @@ impl ReviewView {
                         .style(ButtonStyle::Outlined)
                         .start_icon(Icon::new(IconName::Pencil))
                         .disabled(done || refused.is_some())
-                        .tooltip(move |_, cx| match &refused {
-                            Some(reason) => Tooltip::simple(reason.clone(), cx),
-                            None => Tooltip::for_action_in(
+                        .tip_fn(move |_, cx| match &refused {
+                            Some(reason) => studio_ui::ds::tooltip_view(reason.clone(), cx),
+                            None => studio_ui::ds::tooltip_for_action_in_view(
                                 format!("Change what {branch} holds now"),
                                 &EditChange,
                                 &focus,
@@ -3692,9 +3701,9 @@ impl ReviewView {
                     .style(ButtonStyle::Outlined)
                     .start_icon(Icon::new(IconName::Undo))
                     .disabled(blocked.is_some() || done)
-                    .tooltip(move |_, cx| match &blocked {
-                        Some(reason) => Tooltip::simple(reason.clone(), cx),
-                        None => Tooltip::with_meta(
+                    .tip_fn(move |_, cx| match &blocked {
+                        Some(reason) => studio_ui::ds::tooltip_view(reason.clone(), cx),
+                        None => studio_ui::ds::tooltip_with_meta(
                             "Restore the value before this branch changed it",
                             Some(&RevertAndNext),
                             format!("Writes to {branch}, bound to the reviewed head"),
@@ -4886,7 +4895,7 @@ fn refresh_tooltip(
     focus: &FocusHandle,
 ) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + use<> {
     let focus = focus.clone();
-    move |_, cx| Tooltip::for_action_in(title, &Refresh, &focus, cx)
+    move |_, cx| studio_ui::ds::tooltip_for_action_in_view(title, &Refresh, &focus, cx)
 }
 
 /// Opens the review of `branch` against `target`. A merge starts there, from a head the person

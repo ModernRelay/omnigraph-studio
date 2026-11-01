@@ -200,6 +200,13 @@ fn icon_button_icon_size(size: ButtonSize) -> IconSize {
 type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 type TooltipBuilder = Box<dyn Fn(&mut Window, &mut App) -> AnyView + 'static>;
 
+/// A button's tooltip: what it says, or a builder from state; anchored under the button either
+/// way (`crate::tooltip`).
+enum Tip {
+    Content(ds::TipContent),
+    Builder(TooltipBuilder),
+}
+
 /// What every button has: its id, look, size, state and handlers.
 struct Base {
     id: ElementId,
@@ -210,7 +217,7 @@ struct Base {
     selected: bool,
     width: Option<DefiniteLength>,
     on_click: Option<ClickHandler>,
-    tooltip: Option<TooltipBuilder>,
+    tooltip: Option<Tip>,
     tab_index: Option<isize>,
     focus_handle: Option<FocusHandle>,
     cursor_style: CursorStyle,
@@ -285,8 +292,39 @@ impl Base {
                     })
             })
             .when_some(self.tooltip, |this, tooltip| {
-                this.tooltip(move |window, cx| tooltip(window, cx))
+                let anchor = ds::Anchor::new();
+                // The recorder is placed against the button, so the button is positioned.
+                let this = this.relative();
+                match tooltip {
+                    Tip::Content(content) => this.tooltip(anchor.builder(content)),
+                    Tip::Builder(build) => this.tooltip(anchor.builder_fn(build)),
+                }
+                .child(anchor.element())
             })
+    }
+}
+
+impl ds::Tipped for Button {
+    fn tip(mut self, content: ds::TipContent) -> Self {
+        self.base.tooltip = Some(Tip::Content(content));
+        self
+    }
+
+    fn tip_fn(mut self, build: impl Fn(&mut Window, &mut App) -> AnyView + 'static) -> Self {
+        self.base.tooltip = Some(Tip::Builder(Box::new(build)));
+        self
+    }
+}
+
+impl ds::Tipped for IconButton {
+    fn tip(mut self, content: ds::TipContent) -> Self {
+        self.base.tooltip = Some(Tip::Content(content));
+        self
+    }
+
+    fn tip_fn(mut self, build: impl Fn(&mut Window, &mut App) -> AnyView + 'static) -> Self {
+        self.base.tooltip = Some(Tip::Builder(Box::new(build)));
+        self
     }
 }
 
@@ -423,7 +461,7 @@ impl ButtonCommon for Button {
     }
 
     fn tooltip(mut self, tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static) -> Self {
-        self.base.tooltip = Some(Box::new(tooltip));
+        self.base.tooltip = Some(Tip::Builder(Box::new(tooltip)));
         self
     }
 
@@ -615,7 +653,7 @@ impl ButtonCommon for IconButton {
     }
 
     fn tooltip(mut self, tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static) -> Self {
-        self.base.tooltip = Some(Box::new(tooltip));
+        self.base.tooltip = Some(Tip::Builder(Box::new(tooltip)));
         self
     }
 

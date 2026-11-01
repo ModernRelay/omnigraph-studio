@@ -18,9 +18,9 @@ use graph_store::{EntityKind, GraphSession, SessionEvent};
 use studio_actions::graph::{OpenSource, OpenType};
 use studio_actions::ontology::{Back, Open, SelectNext, SelectPrevious, ShowDomains};
 use studio_actions::{ViewKind, ViewLink};
+use studio_ui::ds::Tipped;
 use studio_ui::ds::{self, size, space};
 use studio_workspace::{Item, ItemEvent, SavedItem};
-use ui::Tooltip;
 use ui::prelude::*;
 
 use crate::domains::{self, Domains};
@@ -727,10 +727,10 @@ impl OntologyPage {
                     .end(ds::sidebar_count(self.count(&name, cx).unwrap_or_default()))
                     .selected(self.pointed == Some(Pointed::Type(ty)))
                     .muted(self.dimmed(ty, lit))
-                    .tooltip(format!(
+                    .tip(ds::tooltip(format!(
                         "{name} · related to {}",
                         studio_ui::plural(related, "type", "types")
-                    ))
+                    )))
                     .on_click(cx.listener(move |this, _, _, cx| this.focus_on(&target, cx))),
             )
             .into_any_element()
@@ -879,7 +879,7 @@ impl OntologyPage {
                         })
                         // At the widest card the name may be cut: the tooltip has it whole.
                         .when(2. * half >= MAP_CARD_MAX, |card| {
-                            card.tooltip(Tooltip::text(name.clone()))
+                            card.tip(studio_ui::ds::tooltip(name.clone()))
                         })
                         .child(ds::type_dot(&name))
                         .child(
@@ -1158,7 +1158,7 @@ impl OntologyPage {
                                     row.child(ty).child(relationship)
                                 }
                             })
-                            .tooltip(Tooltip::text(tooltip))
+                            .tip(studio_ui::ds::tooltip(tooltip))
                             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                                 this.point_at(Pointed::Line(side, at), *hovered, cx)
                             }))
@@ -1280,7 +1280,7 @@ impl OntologyPage {
                     let place = view.index.get(focus).map(|ty| view.place(*ty));
                     bar.child(
                         ds::icon_button("ontology-back", IconName::ArrowLeft)
-                            .tooltip(Tooltip::text("Back"))
+                            .tip(studio_ui::ds::tooltip("Back"))
                             .on_click(cx.listener(|this, _, _, cx| this.go_back(cx))),
                     )
                     .child(

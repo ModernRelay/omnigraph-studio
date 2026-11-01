@@ -12,8 +12,8 @@ use gpui::{
 use graph_store::{GraphSession, Loadable, SessionEvent};
 use studio_actions::graph::{NewQuery, OpenQueryFile, OpenStoredQuery};
 use studio_actions::queries::{OpenSelected, SelectNext, SelectPrevious};
+use studio_ui::ds::Tipped;
 use studio_workspace::{ToastKind, Workspace, WorkspaceEvent};
-use ui::Tooltip;
 use ui::prelude::*;
 
 use crate::SavedQueriesChanged;
@@ -329,7 +329,7 @@ impl QueriesPanel {
                     .icon(IconName::FileCode)
                     .end(ds::sidebar_count(when))
                     .selected(selected)
-                    .tooltip(path.display().to_string())
+                    .tip(ds::tooltip(path.display().to_string()))
                     .on_click(self.click(ix, cx))
                     .into_any_element()
             }
@@ -337,7 +337,7 @@ impl QueriesPanel {
                 let session = self.session.clone();
                 let refresh = studio_ui::ds::row_icon_button("stored-refresh", IconName::RotateCw)
                     .icon_color(Color::Muted)
-                    .tooltip(Tooltip::text("Read the stored queries again"))
+                    .tip(studio_ui::ds::tooltip("Read the stored queries again"))
                     .on_click(move |_, _, cx| {
                         if let Some(session) = &session {
                             session.update(cx, |session, cx| session.reload_stored_queries(cx));
@@ -373,7 +373,7 @@ impl QueriesPanel {
                     .icon(IconName::Server)
                     .when(mutation, |row| row.end(ds::sidebar_count("writes")))
                     .selected(selected)
-                    .tooltip(tooltip)
+                    .tip(ds::tooltip(tooltip))
                     .on_click(self.click(ix, cx))
                     .into_any_element()
             }
@@ -493,13 +493,19 @@ impl Render for QueriesActions {
             .gap(px(studio_ui::ds::space::XXS))
             .child(
                 button("queries-new", IconName::Plus)
-                    .tooltip(|_, cx| Tooltip::for_action("New query", &NewQuery, cx))
+                    .tip_fn(|_, cx| {
+                        studio_ui::ds::tooltip_for_action_view("New query", &NewQuery, cx)
+                    })
                     .on_click(|_, window, cx| window.dispatch_action(Box::new(NewQuery), cx)),
             )
             .child(
                 button("queries-open", IconName::FolderOpen)
-                    .tooltip(|_, cx| {
-                        Tooltip::for_action("Open a .gq file", &OpenQueryFile::default(), cx)
+                    .tip_fn(|_, cx| {
+                        studio_ui::ds::tooltip_for_action_view(
+                            "Open a .gq file",
+                            &OpenQueryFile::default(),
+                            cx,
+                        )
                     })
                     .on_click(|_, window, cx| {
                         window.dispatch_action(Box::new(OpenQueryFile::default()), cx)
@@ -507,7 +513,7 @@ impl Render for QueriesActions {
             )
             .children(folder.map(|folder| {
                 button("queries-reveal", IconName::Folder)
-                    .tooltip(Tooltip::text("Show this graph's queries folder"))
+                    .tip(studio_ui::ds::tooltip("Show this graph's queries folder"))
                     .on_click(move |_, window, cx| {
                         let workspace =
                             studio_workspace::workspace_for(window).map(|w| w.downgrade());

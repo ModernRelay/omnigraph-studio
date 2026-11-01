@@ -6,8 +6,8 @@
 //! The workspace draws the dim and places the card a quarter of the way down the free space
 //! (`studio_workspace`'s modal layer); a modal draws only its card.
 
+use crate::ds::Tipped;
 use gpui::{AnyElement, App, ClickEvent, Div, ElementId, SharedString, Window};
-use ui::Tooltip;
 use ui::prelude::*;
 
 use crate::button::{Button, Variant};
@@ -101,7 +101,7 @@ impl RenderOnce for ModalHeader {
                     .children(self.meta)
                     .children(self.on_close.map(|on_close| {
                         crate::ds::sheet_close_button("modal-close")
-                            .tooltip(Tooltip::text("Close"))
+                            .tip(crate::ds::tooltip("Close"))
                             .disabled(self.close_disabled)
                             .on_click(on_close)
                     })),

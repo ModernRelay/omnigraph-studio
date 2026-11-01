@@ -19,11 +19,12 @@ use graph_store::{GraphSession, HeadWatch, NetChange, SessionEvent};
 use studio_actions::history::{NewBranchHere, NextMatch, PreviousMatch};
 use studio_actions::workspace::Refresh;
 use studio_actions::{ViewKind, ViewLink};
+use studio_ui::ds::Tipped;
 use studio_ui::menu::ContextMenu;
 use studio_ui::{change_counts, group_digits, now_micros, relative_time, short_commit_id};
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
-use ui::{Tooltip, right_click_menu};
+use ui::right_click_menu;
 
 use crate::commit_view::{branch_start, new_branch_at, open_listed};
 use crate::lanes::{Graph, GraphCommit, assign_lanes};
@@ -1706,14 +1707,14 @@ impl HistoryView {
                                     div()
                                         .id(("merge", ix))
                                         // A stub says why its merged commits are not drawn.
-                                        .tooltip(move |_, cx| match &unnamed {
-                                            Some(why) => Tooltip::with_meta(
+                                        .tip_fn(move |_, cx| match &unnamed {
+                                            Some(why) => studio_ui::ds::tooltip_with_meta(
                                                 title.clone(),
                                                 None,
                                                 why.clone(),
                                                 cx,
                                             ),
-                                            None => Tooltip::simple(title.clone(), cx),
+                                            None => studio_ui::ds::tooltip_view(title.clone(), cx),
                                         })
                                         .child(studio_ui::ds::icon::meta(IconName::PullRequest)),
                                 )
@@ -2106,7 +2107,7 @@ impl Render for HistoryView {
                             .debug_selector(|| "history-read-again-failed".into())
                             .min_w_0()
                             .overflow_hidden()
-                            .tooltip(Tooltip::text(format!(
+                            .tip(studio_ui::ds::tooltip(format!(
                                 "{}. The commits shown are as read before.",
                                 studio_ui::clause(error.as_ref())
                             )))
@@ -2119,7 +2120,7 @@ impl Render for HistoryView {
                     .child(
                         studio_ui::ds::button("retry-history", "Try again")
                             .style(ButtonStyle::Subtle)
-                            .tooltip(Tooltip::text(
+                            .tip(studio_ui::ds::tooltip(
                                 "Read the branch's newest commits again; the commits read stay \
                                  below them",
                             ))
@@ -2131,7 +2132,13 @@ impl Render for HistoryView {
             .child(
                 studio_ui::ds::icon_button("refresh-history", IconName::RotateCw)
                     .icon_color(Color::Muted)
-                    .tooltip(|_, cx| Tooltip::for_action("Read the history again", &Refresh, cx))
+                    .tip_fn(|_, cx| {
+                        studio_ui::ds::tooltip_for_action_view(
+                            "Read the history again",
+                            &Refresh,
+                            cx,
+                        )
+                    })
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             );
         let body = match &self.state {

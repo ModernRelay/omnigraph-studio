@@ -8,6 +8,7 @@ use graph_store::{
     GraphSession, HeldAs, Loadable, MergeSettled, OutcomeEntry, OutcomeKind, SessionEvent,
 };
 use studio_actions::graph::OpenHistory;
+use studio_ui::ds::Tipped;
 use studio_workspace::{Workspace, WorkspaceEvent};
 use ui::prelude::*;
 
@@ -306,7 +307,7 @@ fn open_history_button(
                 .variant(studio_ui::ds::Variant::Ghost)
                 .disabled(disabled)
                 .when_some(refusal, |button, refusal| {
-                    button.tooltip(ui::Tooltip::text(refusal))
+                    button.tip(studio_ui::ds::tooltip(refusal))
                 })
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.open_history(branch.clone(), window, cx)
@@ -340,7 +341,7 @@ fn activity_row(index: usize, entry: &OutcomeEntry) -> studio_ui::ds::ActivityRo
         row = row.place(preposition, IconName::GitBranch, branch);
     }
     match said.tooltip {
-        Some(tooltip) => row.tooltip(tooltip),
+        Some(tooltip) => row.tip(studio_ui::ds::tooltip(tooltip)),
         None => row,
     }
 }

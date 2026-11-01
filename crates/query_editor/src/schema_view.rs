@@ -10,9 +10,10 @@ use gpui::{App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, S
 use graph_store::{GraphSession, Loadable, SessionEvent};
 use studio_actions::graph::OpenMap;
 use studio_actions::{ViewKind, ViewLink};
+use studio_ui::ds::Tipped;
 use studio_workspace::{Item, ItemEvent, SavedItem};
+use ui::TintColor;
 use ui::prelude::*;
-use ui::{TintColor, Tooltip};
 
 use crate::syntax::{Syntax, language};
 
@@ -213,7 +214,7 @@ impl Render for SchemaView {
                         .child(
                             studio_ui::ds::button("newer-schema", "Newer schema · Refresh")
                                 .style(ButtonStyle::Tinted(TintColor::Accent))
-                                .tooltip(Tooltip::text(
+                                .tip(studio_ui::ds::tooltip(
                                     "The schema changed elsewhere; show the one the graph has now",
                                 ))
                                 .on_click(

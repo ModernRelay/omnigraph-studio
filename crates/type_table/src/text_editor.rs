@@ -17,8 +17,8 @@ use graph_store::{DraftEntry, DraftKey, GraphSession, Loadable, SessionEvent};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use serde_json::{Value, json};
 use studio_actions::node::SaveText;
+use studio_ui::ds::Tipped;
 use studio_workspace::{Item, ItemEvent, SavedItem};
-use ui::Tooltip;
 use ui::prelude::*;
 
 use crate::model::{Notice, SaveResult, Tone, edited, node_label, node_rows};
@@ -490,7 +490,7 @@ impl TextEditor {
                     .child(
                         studio_ui::ds::button("text-theirs", "Use theirs")
                             .style(ButtonStyle::Subtle)
-                            .tooltip(Tooltip::text(
+                            .tip(studio_ui::ds::tooltip(
                                 "Replace your text with the value as it is now",
                             ))
                             .on_click(
@@ -500,7 +500,7 @@ impl TextEditor {
                     .child(
                         studio_ui::ds::button("text-mine", "Keep mine")
                             .style(ButtonStyle::Subtle)
-                            .tooltip(Tooltip::text(
+                            .tip(studio_ui::ds::tooltip(
                                 "Keep your text; the next save replaces the value as it is now",
                             ))
                             .on_click(
@@ -549,7 +549,7 @@ impl TextEditor {
                             cx,
                         ))
                     })
-                    .tooltip(Tooltip::text(refused.unwrap_or_else(|| {
+                    .tip(studio_ui::ds::tooltip(refused.unwrap_or_else(|| {
                         format!("Write to {branch}, bound to the value it was read at")
                     })))
                     .on_click(cx.listener(|this, _, window, cx| this.save(&SaveText, window, cx))),

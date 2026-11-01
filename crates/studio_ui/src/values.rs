@@ -2,8 +2,8 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::ds::Tipped;
 use gpui::{App, ClipboardItem, ElementId, SharedString, Window};
-use ui::Tooltip;
 use ui::prelude::*;
 
 /// A value as plain text: a string as it is, nothing for null, anything else as JSON (a list is
@@ -191,7 +191,7 @@ impl RenderOnce for CopyableValue {
         let Some(value) = self.value else {
             return h_flex()
                 .id(self.id)
-                .tooltip(Tooltip::text("Not reported by this server"))
+                .tip(crate::ds::tooltip("Not reported by this server"))
                 .child(crate::ds::text::body("—").color(Color::Disabled))
                 .into_any_element();
         };
@@ -213,7 +213,7 @@ impl RenderOnce for CopyableValue {
             .child(
                 crate::ds::row_icon_button(self.id, IconName::Copy)
                     .visible_on_hover(group)
-                    .tooltip(Tooltip::text("Copy"))
+                    .tip(crate::ds::tooltip("Copy"))
                     .on_click(move |_, _, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(value.to_string()))
                     }),

@@ -192,7 +192,7 @@ pub(crate) fn clear_refusal(
 /// What a Choose File button's tooltip says: where the file goes, its key, and the CLI command
 /// that does the same.
 pub(crate) fn upload_tooltip(cell: &BlobCell, branch: &str, cx: &mut App) -> gpui::AnyView {
-    ui::Tooltip::with_meta(
+    studio_ui::ds::tooltip_with_meta(
         format!(
             "Choose File… to store in {} on {branch}, or drop one here",
             cell.property
@@ -208,7 +208,7 @@ pub(crate) fn upload_tooltip(cell: &BlobCell, branch: &str, cx: &mut App) -> gpu
 
 /// What a Clear button's tooltip says.
 pub(crate) fn clear_tooltip(cell: &BlobCell, branch: &str, cx: &mut App) -> gpui::AnyView {
-    ui::Tooltip::with_meta(
+    studio_ui::ds::tooltip_with_meta(
         format!(
             "Clear {} on {branch}: it holds no value then",
             cell.property

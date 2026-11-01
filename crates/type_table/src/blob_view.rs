@@ -22,8 +22,8 @@ use serde_json::json;
 use studio_actions::blob::{ChooseFile, ClearValue};
 use studio_actions::canvas::{ActualSize, FitToWindow, ZoomIn, ZoomOut};
 use studio_ui::ds;
+use studio_ui::ds::Tipped;
 use studio_workspace::{Item, ItemEvent, ItemStatus, KeyHint, SavedItem};
-use ui::Tooltip;
 use ui::prelude::*;
 
 use crate::blob::{
@@ -803,7 +803,7 @@ impl BlobView {
                 let again = again.as_ref().map(|(change, now)| {
                     ds::button("blob-write-again", blob_write::again_label(change, now))
                         .style(ButtonStyle::Subtle)
-                        .tooltip(Tooltip::text(format!(
+                        .tip(studio_ui::ds::tooltip(format!(
                             "Write it over what {} holds now, on {}",
                             self.cell.property, self.branch
                         )))
@@ -819,7 +819,7 @@ impl BlobView {
         let tooltip = move |refusal: Option<String>, clear: bool| {
             let (cell, branch) = (cell.clone(), branch.clone());
             move |_: &mut Window, cx: &mut App| match &refusal {
-                Some(reason) => Tooltip::simple(reason.clone(), cx),
+                Some(reason) => studio_ui::ds::tooltip_view(reason.clone(), cx),
                 None if clear => blob_write::clear_tooltip(&cell, &branch, cx),
                 None => blob_write::upload_tooltip(&cell, &branch, cx),
             }
@@ -831,7 +831,7 @@ impl BlobView {
                 .style(ButtonStyle::Subtle)
                 .color(Color::Muted)
                 .disabled(upload_refusal.is_some() || saving)
-                .tooltip(tooltip(upload_refusal, false))
+                .tip_fn(tooltip(upload_refusal, false))
                 .on_click(cx.listener(|this, _, _, cx| this.choose_file(cx)))
                 .into_any_element(),
         );
@@ -840,7 +840,7 @@ impl BlobView {
                 .style(ButtonStyle::Subtle)
                 .color(Color::Muted)
                 .disabled(clear_refusal.is_some() || saving)
-                .tooltip(tooltip(clear_refusal, true))
+                .tip_fn(tooltip(clear_refusal, true))
                 .on_click(cx.listener(|this, _, _, cx| this.clear(cx)))
                 .into_any_element(),
         );
@@ -1261,10 +1261,12 @@ impl Item for BlobView {
                     .child(
                         ds::icon_button("zoom-out", IconName::Dash)
                             .icon_color(Color::Muted)
-                            .tooltip({
+                            .tip_fn({
                                 let focus = focus.clone();
                                 move |_, cx| {
-                                    Tooltip::for_action_in("Zoom out", &ZoomOut, &focus, cx)
+                                    studio_ui::ds::tooltip_for_action_in_view(
+                                        "Zoom out", &ZoomOut, &focus, cx,
+                                    )
                                 }
                             })
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -1275,10 +1277,15 @@ impl Item for BlobView {
                         ds::button("zoom-actual", percent)
                             .style(ButtonStyle::Subtle)
                             .color(Color::Muted)
-                            .tooltip({
+                            .tip_fn({
                                 let focus = focus.clone();
                                 move |_, cx| {
-                                    Tooltip::for_action_in("Actual size", &ActualSize, &focus, cx)
+                                    studio_ui::ds::tooltip_for_action_in_view(
+                                        "Actual size",
+                                        &ActualSize,
+                                        &focus,
+                                        cx,
+                                    )
                                 }
                             })
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -1288,9 +1295,13 @@ impl Item for BlobView {
                     .child(
                         ds::icon_button("zoom-in", IconName::Plus)
                             .icon_color(Color::Muted)
-                            .tooltip({
+                            .tip_fn({
                                 let focus = focus.clone();
-                                move |_, cx| Tooltip::for_action_in("Zoom in", &ZoomIn, &focus, cx)
+                                move |_, cx| {
+                                    studio_ui::ds::tooltip_for_action_in_view(
+                                        "Zoom in", &ZoomIn, &focus, cx,
+                                    )
+                                }
                             })
                             .on_click(
                                 cx.listener(|this, _, window, cx| {
@@ -1303,8 +1314,13 @@ impl Item for BlobView {
                             .style(ButtonStyle::Subtle)
                             .color(Color::Muted)
                             .toggle_state(self.zoom == Zoom::Fit)
-                            .tooltip(move |_, cx| {
-                                Tooltip::for_action_in("Fit to the tab", &FitToWindow, &focus, cx)
+                            .tip_fn(move |_, cx| {
+                                studio_ui::ds::tooltip_for_action_in_view(
+                                    "Fit to the tab",
+                                    &FitToWindow,
+                                    &focus,
+                                    cx,
+                                )
                             })
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.fit(&FitToWindow, window, cx)
@@ -1321,7 +1337,10 @@ impl Item for BlobView {
                     ds::button("show-saved", "Show in Finder")
                         .style(ButtonStyle::Subtle)
                         .color(Color::Muted)
-                        .tooltip(Tooltip::text(format!("Saved to {}", path.display())))
+                        .tip(studio_ui::ds::tooltip(format!(
+                            "Saved to {}",
+                            path.display()
+                        )))
                         .on_click(move |_, _, cx| cx.reveal_path(&path))
                         .into_any_element(),
                 );
@@ -1336,7 +1355,7 @@ impl Item for BlobView {
                 ds::button("save-blob-file", "Save…")
                     .style(ButtonStyle::Subtle)
                     .color(Color::Muted)
-                    .tooltip(Tooltip::text("Save the whole value to a file"))
+                    .tip(studio_ui::ds::tooltip("Save the whole value to a file"))
                     .on_click(cx.listener(|this, _, _, cx| this.save(cx)))
                     .into_any_element(),
             );
@@ -1344,7 +1363,7 @@ impl Item for BlobView {
                 ds::button("open-blob-elsewhere", "Open in default app")
                     .style(ButtonStyle::Subtle)
                     .color(Color::Muted)
-                    .tooltip(Tooltip::text(
+                    .tip(studio_ui::ds::tooltip(
                         "Hand it to the application the system uses for its kind",
                     ))
                     .on_click(cx.listener(|this, _, _, cx| this.open_elsewhere(cx)))
@@ -1469,9 +1488,7 @@ impl Render for BlobView {
                         state.child(
                             ds::button("choose-blob-empty", "Choose File…")
                                 .style(ButtonStyle::Outlined)
-                                .tooltip(move |_, cx| {
-                                    blob_write::upload_tooltip(&cell, &branch, cx)
-                                })
+                                .tip_fn(move |_, cx| blob_write::upload_tooltip(&cell, &branch, cx))
                                 .on_click(cx.listener(|this, _, _, cx| this.choose_file(cx))),
                         )
                     })

@@ -19,13 +19,14 @@ use gq_language::SchemaModel;
 use graph_store::{GraphSession, SessionEvent};
 use serde_json::Value;
 use studio_settings::{FieldKind, Scope, SettingField, SettingsValues, StudioSettings, TypeNaming};
+use studio_ui::ds::Tipped;
 use studio_ui::ds::{self, Dotted as _, space};
 use studio_ui::menu::ContextMenu;
 use studio_workspace::models::{KeyState, Models};
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace, WorkspaceEvent};
 use theme::ThemeRegistry;
 use ui::prelude::*;
-use ui::{PopoverMenu, Severity, Tooltip};
+use ui::{PopoverMenu, Severity};
 
 pub struct SettingsView {
     search: Entity<Editor>,
@@ -435,7 +436,7 @@ impl SettingsView {
                         row.child(
                             ds::button("test-key", "Test")
                                 .disabled(self.key_test.is_some())
-                                .tooltip(Tooltip::text(
+                                .tip(studio_ui::ds::tooltip(
                                     "Ask the fast model for one word, with this key",
                                 ))
                                 .on_click(cx.listener(|this, _, _, cx| this.test_key(cx))),
@@ -454,7 +455,7 @@ impl SettingsView {
                     .child(
                         ds::button("provider-keys", "Provider keys…")
                             .style(ButtonStyle::Subtle)
-                            .tooltip(Tooltip::text(
+                            .tip(studio_ui::ds::tooltip(
                                 "Your own provider keys live in your OpenRouter workspace, \
                                  never in Studio",
                             ))
@@ -805,7 +806,7 @@ fn control(
                 segments = segments.child(
                     ds::segment(target.id(&choice.value), choice.label.clone(), selected, cx)
                         .when_some(choice.description.clone(), |segment, description| {
-                            segment.tooltip(Tooltip::text(description))
+                            segment.tip(studio_ui::ds::tooltip(description))
                         })
                         .on_click(move |_, _, cx| choice_target.set(value.clone(), cx)),
                 );
@@ -881,14 +882,14 @@ impl SettingsView {
             ds::segmented(cx)
                 .child(
                     ds::segment("scope-all", "All graphs", all, cx)
-                        .tooltip(Tooltip::text("Settings for every graph"))
+                        .tip(studio_ui::ds::tooltip("Settings for every graph"))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.set_scope(Scope::All, window, cx)
                         })),
                 )
                 .child(
                     ds::segment("scope-graph", name.clone(), !all, cx)
-                        .tooltip(Tooltip::text(format!(
+                        .tip(studio_ui::ds::tooltip(format!(
                             "Values for {name} only, over those for all graphs"
                         )))
                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -1122,7 +1123,7 @@ impl Render for SettingsView {
                             .child(ds::search_field(self.search.clone(), cx).w(px(ds::size::FIELD)))
                             .child(
                                 studio_ui::ds::icon_button("reveal-settings", IconName::Folder)
-                                    .tooltip(Tooltip::text(format!(
+                                    .tip(studio_ui::ds::tooltip(format!(
                                         "Show settings.json · {}",
                                         path.display()
                                     )))
@@ -1130,7 +1131,7 @@ impl Render for SettingsView {
                             )
                             .child(
                                 studio_ui::ds::icon_button("reveal-keymap", IconName::Keyboard)
-                                    .tooltip(Tooltip::text(format!(
+                                    .tip(studio_ui::ds::tooltip(format!(
                                         "Show keymap.json, your shortcuts · {}",
                                         studio_settings::keymap_path().display()
                                     )))

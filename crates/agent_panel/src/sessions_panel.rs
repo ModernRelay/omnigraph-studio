@@ -23,10 +23,11 @@ use studio_actions::agent::{NewConversation, OpenAgent, OpenConversation};
 use studio_settings::StudioSettings;
 use studio_ui::ds;
 use studio_ui::ds::Prose as _;
+use studio_ui::ds::Tipped;
 use studio_ui::menu::ContextMenu;
 use studio_workspace::{ToastKind, Workspace, WorkspaceEvent};
 use ui::prelude::*;
-use ui::{PopoverMenu, Tooltip, right_click_menu};
+use ui::{PopoverMenu, right_click_menu};
 
 use crate::connection::{self, AgentConnection};
 use crate::host::AgentLaunch;
@@ -554,7 +555,7 @@ fn conversation_row(
             },
         )
         .icon_color(Color::Muted)
-        .tooltip(Tooltip::text(if pinned { "Unpin" } else { "Pin" }))
+        .tip(studio_ui::ds::tooltip(if pinned { "Unpin" } else { "Pin" }))
         .on_click(move |_, _, cx| {
             store.update(cx, |store, cx| store.set_pinned(&id, !pinned, cx));
         })
@@ -570,7 +571,7 @@ fn conversation_row(
             },
         )
         .icon_color(Color::Muted)
-        .tooltip(Tooltip::text(if archived {
+        .tip(studio_ui::ds::tooltip(if archived {
             "Restore to the list"
         } else {
             "Archive (the agent keeps the conversation)"
@@ -592,7 +593,7 @@ fn conversation_row(
             .when(!record.archived, |row| row.child(pin))
             .child(archive),
     )
-    .tooltip(about)
+    .tip(ds::tooltip(about))
     .on_click(move |_, window, cx| {
         window.dispatch_action(
             Box::new(OpenConversation {
@@ -881,7 +882,7 @@ impl Render for SessionsActions {
                 ds::row_icon_button("search-conversations", IconName::Filter)
                     .icon_color(Color::Muted)
                     .toggle_state(searching)
-                    .tooltip(Tooltip::text("Filter conversations"))
+                    .tip(studio_ui::ds::tooltip("Filter conversations"))
                     .on_click(move |_, window, cx| {
                         panel
                             .update(cx, |panel, cx| panel.toggle_search(window, cx))
@@ -895,7 +896,7 @@ impl Render for SessionsActions {
                         .trigger(
                             ds::row_icon_button("conversations-more-button", IconName::Ellipsis)
                                 .icon_color(Color::Muted)
-                                .tooltip(Tooltip::text("More")),
+                                .tip(studio_ui::ds::tooltip("More")),
                         )
                         .menu(move |window, cx| {
                             let panel = panel.clone();
@@ -911,7 +912,7 @@ impl Render for SessionsActions {
             .child(
                 ds::row_icon_button("new-conversation", IconName::Plus)
                     .icon_color(Color::Muted)
-                    .tooltip(Tooltip::text("New conversation"))
+                    .tip(studio_ui::ds::tooltip("New conversation"))
                     .on_click(|_, window, cx| {
                         window.dispatch_action(Box::new(NewConversation), cx)
                     }),

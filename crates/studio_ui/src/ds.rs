@@ -17,12 +17,16 @@ use gpui::{
 };
 use studio_settings::{StudioSettings, WindowStyle};
 use ui::prelude::*;
-use ui::{Tooltip, rems_from_px};
+use ui::rems_from_px;
 
 pub use crate::button::{Button, IconButton, Shape, Variant};
 pub use crate::menu::{MenuRow, menu_header, menu_separator, menu_surface};
 pub use crate::modal::{
     ModalHeader, action_button, cancel_button, modal, modal_body, modal_footer, write_target,
+};
+pub use crate::tooltip::{
+    Anchor, TipContent, Tipped, tooltip, tooltip_for_action, tooltip_for_action_in,
+    tooltip_for_action_in_view, tooltip_for_action_view, tooltip_view, tooltip_with_meta,
 };
 
 // ---- tokens ----
@@ -233,6 +237,13 @@ pub mod size {
     pub const RESIZE_HANDLE: f32 = 6.;
     /// The column of an empty state's actions.
     pub const STATE_ACTIONS: f32 = 240.;
+    /// The widest a tooltip grows before its text wraps: Zed's `max_w_72`.
+    pub const TOOLTIP_WIDTH: f32 = 288.;
+    /// A one-line tooltip's height, which decides whether one fits below its control.
+    pub const TOOLTIP_HEIGHT: f32 = 28.;
+    /// How far Zed's own tooltip view sets itself from the pointer (`pl_2`, `pt_2p5`), pulled
+    /// back when Studio anchors one of them.
+    pub const ZED_TOOLTIP_INSET: (f32, f32) = (8., 10.);
     /// A disclosure chevron (`IconSize::XSmall`).
     pub const DISCLOSURE: f32 = 12.;
     /// A status or type dot.
@@ -1305,7 +1316,7 @@ pub struct SidebarRow {
     selected: bool,
     /// On its panel's margin rather than inset from the panel's edge ([`SidebarRow::flush`]).
     flush: bool,
-    tooltip: Option<TooltipBuilder>,
+    tooltip: Option<RowTip>,
     on_click: Option<ClickHandler>,
 }
 
@@ -1369,25 +1380,29 @@ impl SidebarRow {
         self
     }
 
-    pub fn tooltip(mut self, tooltip: impl Into<SharedString>) -> Self {
-        let tooltip: SharedString = tooltip.into();
-        self.tooltip = Some(Box::new(Tooltip::text(tooltip)));
-        self
-    }
-
-    pub fn tooltip_fn(
-        mut self,
-        tooltip: impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static,
-    ) -> Self {
-        self.tooltip = Some(Box::new(tooltip));
-        self
-    }
-
     pub fn on_click(
         mut self,
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.on_click = Some(Box::new(handler));
+        self
+    }
+}
+
+/// A sidebar row's tooltip: what it says, or a builder from state (`crate::tooltip`).
+enum RowTip {
+    Content(TipContent),
+    Builder(TooltipBuilder),
+}
+
+impl Tipped for SidebarRow {
+    fn tip(mut self, content: TipContent) -> Self {
+        self.tooltip = Some(RowTip::Content(content));
+        self
+    }
+
+    fn tip_fn(mut self, build: impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static) -> Self {
+        self.tooltip = Some(RowTip::Builder(Box::new(build)));
         self
     }
 }
@@ -1421,7 +1436,10 @@ impl RenderOnce for SidebarRow {
             .when(!self.selected, |row| {
                 row.hover(move |style| style.bg(hover_bg))
             })
-            .when_some(self.tooltip, |row, tooltip| row.tooltip(tooltip))
+            .when_some(self.tooltip, |row, tooltip| match tooltip {
+                RowTip::Content(content) => row.tip(content),
+                RowTip::Builder(build) => row.tip_fn(build),
+            })
             .children(self.start.map(icon_slot))
             .child(
                 Label::new(self.label)
@@ -1489,7 +1507,7 @@ pub fn sidebar_placeholder(
         .px(px(space::SM))
         .gap(px(space::MD))
         .items_center()
-        .tooltip(Tooltip::text(tooltip))
+        .tip(crate::ds::tooltip(tooltip))
         .child(icon_slot(
             Icon::new(icon).size(IconSize::Small).color(Color::Disabled),
         ))
@@ -1878,7 +1896,7 @@ pub fn filter_pill(
         .child(pill_rule(cx))
         .child(pill_end(
             pill_button("remove", IconName::Close, Color::Muted, cx)
-                .tooltip(Tooltip::text("Remove this filter"))
+                .tip(crate::ds::tooltip("Remove this filter"))
                 .on_click(on_remove),
         ))
 }
@@ -1995,7 +2013,7 @@ impl RenderOnce for ControlChip {
                 chip.child(pill_rule(cx)).child(pill_end(
                     pill_button("clear", IconName::Close, Color::Muted, cx)
                         .debug_selector(|| "chip-clear".into())
-                        .tooltip(Tooltip::text(tooltip))
+                        .tip(crate::ds::tooltip(tooltip))
                         .on_click(move |event, window, cx| on_clear(event, window, cx)),
                 ))
             },
@@ -2363,6 +2381,24 @@ pub fn segmented(_cx: &App) -> Div {
     h_flex().flex_none().gap(px(space::XXS))
 }
 
+/// A [`segmented`] control in a toolbar: its segments in a sunken track as tall as a field
+/// ([`size::CONTROL`]), 3 px inside its edge and rounded concentrically around them
+/// (`Radii::bar`), so a strip of views and a layout switch sit level with the field and the
+/// chips beside them. Bare [`segmented`] is for tabs inside a panel, which have no neighbours
+/// to line up with.
+pub fn segmented_track(cx: &App) -> Div {
+    let gap = (size::CONTROL - size::BAR_BUTTON) / 2.;
+    segmented(cx)
+        .h(px(size::CONTROL))
+        // The border is part of the gap.
+        .px(px(gap - size::HAIRLINE))
+        .items_center()
+        .rounded(px(radii(cx).bar()))
+        .bg(surface::sunken(cx))
+        .border_1()
+        .border_color(gpui::transparent_black())
+}
+
 /// One option of a [`segmented`] control: a bar button's height, so a floating bar holds it.
 /// The selected one is raised, as interfaces.dev's chips: the solid fill and `shadow-custom`
 /// ([`elevation::custom`]), its label in ink; the others are their muted label until hovered.
@@ -2432,7 +2468,7 @@ pub fn setting_row(
                         .when_some(reset, |title, reset| {
                             title.child(
                                 row_icon_button("reset", IconName::Undo)
-                                    .tooltip(Tooltip::text("Reset to default"))
+                                    .tip(crate::ds::tooltip("Reset to default"))
                                     .on_click(reset),
                             )
                         }),
@@ -3045,7 +3081,7 @@ pub struct ActivityRow {
     place_icon: Option<IconName>,
     place: Option<SharedString>,
     when: SharedString,
-    tooltip: Option<SharedString>,
+    tooltip: Option<RowTip>,
     action: Option<AnyElement>,
 }
 
@@ -3101,9 +3137,16 @@ impl ActivityRow {
         self.place = Some(place.into());
         self
     }
+}
 
-    pub fn tooltip(mut self, tooltip: impl Into<SharedString>) -> Self {
-        self.tooltip = Some(tooltip.into());
+impl Tipped for ActivityRow {
+    fn tip(mut self, content: TipContent) -> Self {
+        self.tooltip = Some(RowTip::Content(content));
+        self
+    }
+
+    fn tip_fn(mut self, build: impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static) -> Self {
+        self.tooltip = Some(RowTip::Builder(Box::new(build)));
         self
     }
 }
@@ -3144,7 +3187,10 @@ impl RenderOnce for ActivityRow {
         let row = row_rule(row, cx);
         div()
             .id(self.id)
-            .when_some(self.tooltip, |d, tooltip| d.tooltip(Tooltip::text(tooltip)))
+            .when_some(self.tooltip, |d, tooltip| match tooltip {
+                RowTip::Content(content) => d.tip(content),
+                RowTip::Builder(build) => d.tip_fn(build),
+            })
             .child(row)
     }
 }

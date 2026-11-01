@@ -18,11 +18,12 @@ use graph_store::{AccessAction, AccessScope, BranchStart, GraphSession, SessionE
 use studio_actions::graph::{
     CreateBranch, CreateBranchAt, DeleteBranch, OpenBranch, OpenBranchHistory, ReviewBranch,
 };
+use studio_ui::ds::Tipped;
 use studio_ui::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::{ds, now_micros, relative_time, short_commit_id};
 use studio_workspace::{Workspace, WorkspaceEvent};
 use ui::prelude::*;
-use ui::{Tooltip, right_click_menu};
+use ui::right_click_menu;
 
 use crate::view::{open_review, open_review_with};
 use studio_workspace::ModalView;
@@ -234,7 +235,7 @@ impl BranchList {
                                 let name = name.clone();
                                 end.child(
                                     studio_ui::ds::row_button(("switch", index), "Switch")
-                                        .tooltip(Tooltip::text("Read and edit this branch"))
+                                        .tip(studio_ui::ds::tooltip("Read and edit this branch"))
                                         .on_click(move |_, _, cx| {
                                             cx.stop_propagation();
                                             if let Some(session) = &session {
@@ -251,7 +252,7 @@ impl BranchList {
                         .selected(lit)
                         .end(end);
                     let row = match tooltip {
-                        Some(tooltip) => row.tooltip(tooltip),
+                        Some(tooltip) => row.tip(studio_ui::ds::tooltip(tooltip)),
                         None => row,
                     };
                     row.on_click({
@@ -370,8 +371,8 @@ impl BranchList {
         studio_ui::ds::SidebarRow::new("new-branch", "New branch…")
             .muted(true)
             .icon(IconName::Plus)
-            .tooltip_fn(move |_, cx| {
-                Tooltip::with_meta(
+            .tip_fn(move |_, cx| {
+                studio_ui::ds::tooltip_with_meta(
                     format!("New branch from {current}"),
                     Some(&CreateBranch),
                     format!("omnigraph branch create <name> --from {current}"),
@@ -769,7 +770,9 @@ impl Render for CreateBranchModal {
                         )
                         .disabled(self.running || refused)
                         .when(refused, |button| {
-                            button.tooltip(Tooltip::text("A branch cannot start at this commit"))
+                            button.tip(studio_ui::ds::tooltip(
+                                "A branch cannot start at this commit",
+                            ))
                         })
                         .on_click(cx.listener(|this, _, _, cx| this.create(cx))),
                     ),
@@ -1032,8 +1035,13 @@ impl Render for DeleteBranchModal {
                         )
                         .variant(ds::Variant::Destructive)
                         .disabled(!confirmed || self.running)
-                        .tooltip(move |_, cx| {
-                            Tooltip::with_meta("Delete the branch", None, cli.clone(), cx)
+                        .tip_fn(move |_, cx| {
+                            studio_ui::ds::tooltip_with_meta(
+                                "Delete the branch",
+                                None,
+                                cli.clone(),
+                                cx,
+                            )
                         })
                         .on_click(cx.listener(|this, _, _, cx| this.delete(cx))),
                     ),

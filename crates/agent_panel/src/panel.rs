@@ -26,11 +26,12 @@ use studio_actions::agent::{Allow, AllowAlways, ClearQueue, Reject, Restart, Sen
 use studio_actions::graph::ReviewBranch;
 use studio_settings::{AgentSettings, StudioSettings};
 use studio_ui::ds;
+use studio_ui::ds::Tipped;
 use studio_ui::ds::{Dotted as _, Prose as _};
 use studio_ui::menu::ContextMenu;
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
 use ui::prelude::*;
-use ui::{CircularProgress, KeyBinding, PopoverMenu, Severity, Tooltip};
+use ui::{CircularProgress, KeyBinding, PopoverMenu, Severity};
 
 use crate::cli_home::{self, CliHome};
 use crate::gateway::{Gateway, GatewayEvent, OnOutcome, Seen};
@@ -2560,9 +2561,11 @@ fn option_picker(
             .color(Color::Muted)
             .disabled(option.pending)
             .start_icon(icon)
-            .tooltip(move |_, cx| match &meta {
-                Some(meta) => Tooltip::with_meta(title.clone(), None, meta.clone(), cx),
-                None => Tooltip::simple(title.clone(), cx),
+            .tip_fn(move |_, cx| match &meta {
+                Some(meta) => {
+                    studio_ui::ds::tooltip_with_meta(title.clone(), None, meta.clone(), cx)
+                }
+                None => studio_ui::ds::tooltip_view(title.clone(), cx),
             }),
         )
         .menu(move |window, cx| {
@@ -3012,11 +3015,11 @@ impl AgentPanel {
         ) && self.has_draft;
         let send_or_stop = if running {
             ds::composer_button("stop", IconName::Stop, false, cx)
-                .tooltip(|_, cx| Tooltip::for_action("Stop", &Stop, cx))
+                .tip_fn(|_, cx| studio_ui::ds::tooltip_for_action_view("Stop", &Stop, cx))
                 .on_click(cx.listener(|this, _, window, cx| this.stop(&Stop, window, cx)))
         } else {
             ds::composer_button("send", IconName::Send, can_send, cx)
-                .tooltip(|_, cx| Tooltip::for_action("Send", &Send, cx))
+                .tip_fn(|_, cx| studio_ui::ds::tooltip_for_action_view("Send", &Send, cx))
                 .on_click(cx.listener(|this, _, window, cx| this.send(&Send, window, cx)))
         };
         let mut end = Vec::new();
@@ -3041,7 +3044,13 @@ impl AgentPanel {
             end.push(
                 ds::icon_button("restart", IconName::RotateCw)
                     .icon_color(Color::Muted)
-                    .tooltip(|_, cx| Tooltip::for_action("Start the agent again", &Restart, cx))
+                    .tip_fn(|_, cx| {
+                        studio_ui::ds::tooltip_for_action_view(
+                            "Start the agent again",
+                            &Restart,
+                            cx,
+                        )
+                    })
                     .on_click(cx.listener(|this, _, window, cx| this.restart(&Restart, window, cx)))
                     .into_any_element(),
             );
@@ -3085,7 +3094,7 @@ impl AgentPanel {
                             .child(
                                 div()
                                     .id("agent-info")
-                                    .tooltip(Tooltip::text(
+                                    .tip(studio_ui::ds::tooltip(
                                         "Studio runs the agent on this computer over the Agent \
                                          Client Protocol and gives it tools for this graph. It \
                                          never sees your token, and its changes land on a branch \
@@ -3116,7 +3125,7 @@ impl AgentPanel {
                             .full_width()
                             .style(ButtonStyle::Outlined)
                             .start_icon(Icon::new(IconName::ZedAssistant))
-                            .tooltip(Tooltip::text(format!(
+                            .tip(studio_ui::ds::tooltip(format!(
                                 "Runs {shown}; npx downloads it the first time you send a message"
                             )))
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -3142,7 +3151,7 @@ impl AgentPanel {
                             )
                             .child(
                                 studio_ui::ds::icon_button("use-custom", IconName::ArrowRight)
-                                    .tooltip(Tooltip::text("Use this command"))
+                                    .tip(studio_ui::ds::tooltip("Use this command"))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         let text = this.custom_command.read(cx).text(cx);
                                         let command: Vec<String> =
@@ -3267,7 +3276,7 @@ impl AgentPanel {
             .child(
                 ds::row_icon_button(("copy-reply", index), IconName::Copy)
                     .icon_color(Color::Muted)
-                    .tooltip(Tooltip::text("Copy the reply"))
+                    .tip(studio_ui::ds::tooltip("Copy the reply"))
                     .on_click(move |_, _, cx| {
                         if let Some(panel) = panel.upgrade() {
                             let reply = panel.read(cx).turn_reply(index);
@@ -3686,7 +3695,7 @@ impl AgentPanel {
                 h_flex()
                     .id(("tool", index))
                     .gap(px(ds::space::XS))
-                    .tooltip(Tooltip::text(title.clone()))
+                    .tip(studio_ui::ds::tooltip(title.clone()))
                     .child(
                         studio_ui::ds::text::body(if failed {
                             format!("{title} failed")
@@ -3760,7 +3769,7 @@ impl AgentPanel {
             .child(
                 div()
                     .id(("card-branch", index))
-                    .tooltip(Tooltip::text(match &card.creates_from {
+                    .tip(studio_ui::ds::tooltip(match &card.creates_from {
                         Some(base) => format!(
                             "Runs on {}, which Studio creates from {base} first",
                             card.branch
@@ -3911,7 +3920,7 @@ impl AgentPanel {
                         h_flex()
                             .id(("outcome", index))
                             .gap(px(ds::space::XS))
-                            .when_some(tooltip, |d, tooltip| d.tooltip(Tooltip::text(tooltip)))
+                            .when_some(tooltip, |d, tooltip| d.tip(studio_ui::ds::tooltip(tooltip)))
                             .child(match icon {
                                 Some(icon) => studio_ui::ds::icon::meta(icon)
                                     .color(color)
@@ -3975,8 +3984,13 @@ impl AgentPanel {
                     .trigger(
                         ds::icon_button("more-options-button", IconName::Ellipsis)
                             .icon_color(Color::Muted)
-                            .tooltip(move |_, cx| {
-                                Tooltip::with_meta("More options", None, summary.clone(), cx)
+                            .tip_fn(move |_, cx| {
+                                studio_ui::ds::tooltip_with_meta(
+                                    "More options",
+                                    None,
+                                    summary.clone(),
+                                    cx,
+                                )
                             }),
                     )
                     .menu(move |window, cx| {
@@ -4029,7 +4043,7 @@ impl AgentPanel {
                                         .child(studio_ui::ds::dot(dot))
                                         .child(studio_ui::ds::text::muted(agent_name)),
                                 )
-                                .tooltip(Tooltip::text(about)),
+                                .tip(studio_ui::ds::tooltip(about)),
                         )
                         .menu(move |window, cx| {
                             let (agent_menu, panel) = (agent_menu.clone(), panel.clone());
@@ -4078,7 +4092,9 @@ impl AgentPanel {
                         },
                     ),
                 )
-                .tooltip(move |_, cx| Tooltip::with_meta(title.clone(), None, meta.clone(), cx))
+                .tip_fn(move |_, cx| {
+                    studio_ui::ds::tooltip_with_meta(title.clone(), None, meta.clone(), cx)
+                })
                 .into_any_element(),
         )
     }
@@ -4100,26 +4116,30 @@ impl AgentPanel {
             summary.push_str(" · paused until you send");
         }
         let focus = self.focus_handle.clone();
-        let header = h_flex()
-            .h(px(ds::size::ROW))
-            .px(px(ds::space::MD))
-            .gap(px(ds::space::SM))
-            .items_center()
-            .child(ds::text::meta(summary))
-            .child(div().flex_1())
-            .child(
-                ds::button("clear-queue", "Clear all")
-                    .style(ButtonStyle::Subtle)
-                    .color(Color::Muted)
-                    .tooltip(move |_, cx| {
-                        Tooltip::for_action_in("Drop the queued messages", &ClearQueue, &focus, cx)
-                    })
-                    .on_click(
-                        cx.listener(|this, _, window, cx| {
+        let header =
+            h_flex()
+                .h(px(ds::size::ROW))
+                .px(px(ds::space::MD))
+                .gap(px(ds::space::SM))
+                .items_center()
+                .child(ds::text::meta(summary))
+                .child(div().flex_1())
+                .child(
+                    ds::button("clear-queue", "Clear all")
+                        .style(ButtonStyle::Subtle)
+                        .color(Color::Muted)
+                        .tip_fn(move |_, cx| {
+                            studio_ui::ds::tooltip_for_action_in_view(
+                                "Drop the queued messages",
+                                &ClearQueue,
+                                &focus,
+                                cx,
+                            )
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| {
                             this.clear_queue(&ClearQueue, window, cx)
-                        }),
-                    ),
-            );
+                        })),
+                );
         let border = ds::surface::rule(cx);
         let rows: Vec<AnyElement> = self
             .queue
@@ -4139,7 +4159,7 @@ impl AgentPanel {
                     .items_center()
                     .border_t_1()
                     .dotted(cx)
-                    .tooltip(Tooltip::text(entry.text.clone()))
+                    .tip(studio_ui::ds::tooltip(entry.text.clone()))
                     .child(studio_ui::ds::dot(if next {
                         Color::Accent
                     } else {
@@ -4161,7 +4181,7 @@ impl AgentPanel {
                             .child(
                                 ds::row_icon_button(("remove-queued", id), IconName::Trash)
                                     .icon_color(Color::Muted)
-                                    .tooltip(Tooltip::text("Remove from the queue"))
+                                    .tip(studio_ui::ds::tooltip("Remove from the queue"))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.queue.take(id);
                                         cx.notify();
@@ -4170,7 +4190,7 @@ impl AgentPanel {
                             .child(
                                 ds::row_icon_button(("edit-queued", id), IconName::Pencil)
                                     .icon_color(Color::Muted)
-                                    .tooltip(Tooltip::text("Edit in the composer"))
+                                    .tip(studio_ui::ds::tooltip("Edit in the composer"))
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.edit_queued(id, window, cx)
                                     })),
@@ -4186,7 +4206,7 @@ impl AgentPanel {
                                     } else {
                                         ButtonStyle::Subtle
                                     })
-                                    .tooltip(Tooltip::text(
+                                    .tip(studio_ui::ds::tooltip(
                                         "Stop the agent's turn and send this at once",
                                     ))
                                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -4240,7 +4260,7 @@ impl AgentPanel {
                         line.child(
                             div()
                                 .id("agent-changes")
-                                .tooltip(Tooltip::text(
+                                .tip(studio_ui::ds::tooltip(
                                     "Changes the agent committed on its branch since this \
                                      conversation opened",
                                 ))

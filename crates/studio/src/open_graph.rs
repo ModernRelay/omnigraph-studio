@@ -15,6 +15,7 @@ use graph_store::{
     Connection, ConnectionEvent, ConnectionRegistry, ConnectionState, ConnectionWatch,
     GraphListing, HeldRefusal, ServerSource,
 };
+use studio_ui::ds::Tipped;
 use studio_ui::ds::{self, MenuRow, size, space};
 use studio_workspace::ModalView;
 use studio_workspace::{Workspace, connection_color};
@@ -685,7 +686,7 @@ impl OpenGraphModal {
                         .child(
                             studio_ui::ds::button("update-token", "Update token")
                                 .style(ButtonStyle::Filled)
-                                .tooltip(ui::Tooltip::text(token_tooltip))
+                                .tip(studio_ui::ds::tooltip(token_tooltip))
                                 .on_click(
                                     cx.listener(|this, _, window, cx| {
                                         this.update_token(window, cx)
@@ -780,7 +781,7 @@ impl OpenGraphModal {
                         .opacity(studio_ui::ds::opacity::DIMMED)
                         .cursor_not_allowed()
                         .child(studio_ui::ds::text::muted("Not available on Windows"))
-                        .tooltip(ui::Tooltip::text(reason)),
+                        .tip(studio_ui::ds::tooltip(reason)),
                 )
                 .into_any_element(),
         };
@@ -893,7 +894,7 @@ fn line_button(
             })),
         LineAction::SignIn { service } => studio_ui::ds::button("sign-in", "Sign in")
             .style(ButtonStyle::Filled)
-            .tooltip(ui::Tooltip::text(format!(
+            .tip(studio_ui::ds::tooltip(format!(
                 "Opens {service} in your browser to sign in to this server."
             )))
             .on_click(cx.listener(move |_, _, _, cx| selected.update(cx, |c, cx| c.sign_in(cx)))),
@@ -915,7 +916,7 @@ fn sign_out_button(selected: &Entity<Connection>, cx: &mut Context<OpenGraphModa
     let selected = selected.clone();
     studio_ui::ds::button("sign-out", "Sign out")
         .style(ButtonStyle::Subtle)
-        .tooltip(ui::Tooltip::text(
+        .tip(studio_ui::ds::tooltip(
             "Forgets this sign-in, and asks the sign-in service to end it where it can.",
         ))
         .on_click(cx.listener(move |_, _, _, cx| selected.update(cx, |c, cx| c.sign_out(cx))))

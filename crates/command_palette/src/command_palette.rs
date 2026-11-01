@@ -33,6 +33,7 @@ use studio_actions::agent::Ask;
 use studio_actions::graph::{OpenNode, OpenQueryFile, OpenStoredQuery, OpenType};
 use studio_actions::palette::{AskAgent, ShowScope};
 use studio_actions::workspace::{GoTo, ShowKeyBindings, SwitchBranch, ToggleCommandPalette};
+use studio_ui::ds::Tipped;
 use studio_ui::ds::{InsetEdge, KeyCaps, MenuRow, elevation, radii, size, space, surface};
 use studio_workspace::{ToastKind, Workspace};
 use ui::HighlightedLabel;
@@ -1458,8 +1459,13 @@ impl Render for CommandPalette {
                         scope == current,
                         cx,
                     )
-                    .tooltip(move |_, cx| {
-                        ui::Tooltip::for_action_in(scope.title(), &ShowScope { index }, &focus, cx)
+                    .tip_fn(move |_, cx| {
+                        studio_ui::ds::tooltip_for_action_in_view(
+                            scope.title(),
+                            &ShowScope { index },
+                            &focus,
+                            cx,
+                        )
                     })
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.set_scope(scope, window, cx)),
@@ -1518,7 +1524,7 @@ impl Render for CommandPalette {
                                     .id("palette-searching")
                                     .debug_selector(|| "palette-searching".into())
                                     .child(studio_ui::ds::spinner())
-                                    .tooltip(ui::Tooltip::text("Searching nodes on the server")),
+                                    .tip(studio_ui::ds::tooltip("Searching nodes on the server")),
                             )
                         }),
                 ),

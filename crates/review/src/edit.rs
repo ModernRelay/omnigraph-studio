@@ -12,6 +12,7 @@ use gq_language::Property;
 use gq_language::input::{edit_text, same_value, typed};
 use serde_json::Value;
 use studio_ui::ds;
+use studio_ui::ds::Tipped;
 use ui::prelude::*;
 
 use crate::view::ReviewView;
@@ -164,7 +165,7 @@ impl Render for EditModal {
                     )
                     .child(
                         ds::action_button("save-edit", "Save")
-                            .tooltip(ui::Tooltip::text(format!(
+                            .tip(studio_ui::ds::tooltip(format!(
                                 "Writes the changed fields to {}, bound to the reviewed head",
                                 self.branch
                             )))

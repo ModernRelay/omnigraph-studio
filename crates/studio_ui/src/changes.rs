@@ -4,6 +4,7 @@
 
 use std::rc::Rc;
 
+use crate::ds::Tipped;
 use crate::ds::{radii, space};
 use gpui::{AnyElement, App, ClickEvent, Div, ElementId, SharedString, Window};
 use serde_json::Value;
@@ -554,7 +555,9 @@ fn piece_words(pieces: &[Piece], side: Option<PieceKind>, cx: &App) -> Vec<AnyEl
         }
         let label = crate::ds::text::body(piece.text.clone()).color(color);
         words.push(if own {
+            // The tint reaches past the word's letters, as a highlighter does.
             div()
+                .px(px(space::XS))
                 .rounded(px(crate::ds::radii(cx).xs))
                 .bg(crate::ds::surface::mark(color, cx))
                 .child(label)
@@ -922,7 +925,7 @@ impl RenderOnce for ChangeCard {
             .child(
                 div()
                     .id("change-kind")
-                    .tooltip(ui::Tooltip::text(kind.label()))
+                    .tip(crate::ds::tooltip(kind.label()))
                     .child(crate::ds::text::body(kind.symbol()).color(kind.color())),
             );
         line = match &self.endpoints {
@@ -1164,7 +1167,7 @@ impl RenderOnce for RelationshipLine {
                     .id("relationship-kind")
                     .w(px(space::MD))
                     .flex_none()
-                    .tooltip(ui::Tooltip::text(tooltip))
+                    .tip(crate::ds::tooltip(tooltip))
                     .child(symbol),
             )
             .child(

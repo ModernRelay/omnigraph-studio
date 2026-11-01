@@ -45,9 +45,10 @@ use studio_actions::workspace::{
 use studio_actions::{ViewKind, ViewLink};
 use studio_settings::{BottomDockLayout, ServerEnvironment, StudioSettings};
 use studio_ui::ds::IconButton;
+use studio_ui::ds::Tipped;
 use studio_ui::menu::{ContextMenu, ContextMenuEntry, ContextMenuItem};
 use ui::prelude::*;
-use ui::{ButtonLike, PopoverMenu, Tooltip, right_click_menu};
+use ui::{ButtonLike, PopoverMenu, right_click_menu};
 
 use item::ItemHandle;
 pub use item::{Item, ItemEvent, ItemStatus, KeyHint};
@@ -440,7 +441,7 @@ pub fn view_strip(views: Vec<ViewLink>, cx: &App) -> Option<AnyElement> {
         return None;
     }
     Some(
-        studio_ui::ds::segmented(cx)
+        studio_ui::ds::segmented_track(cx)
             .children(views.into_iter().enumerate().map(|(index, link)| {
                 let segment =
                     studio_ui::ds::segment(("view", index), link.kind.label(), link.current, cx);
@@ -448,12 +449,12 @@ pub fn view_strip(views: Vec<ViewLink>, cx: &App) -> Option<AnyElement> {
                     Some(reason) => segment
                         .opacity(studio_ui::ds::opacity::DIMMED)
                         .cursor_default()
-                        .tooltip(Tooltip::text(reason))
+                        .tip(studio_ui::ds::tooltip(reason))
                         .into_any_element(),
                     None if link.current => segment.into_any_element(),
                     None => segment
                         .when_some(link.says, |segment, says| {
-                            segment.tooltip(Tooltip::text(says))
+                            segment.tip(studio_ui::ds::tooltip(says))
                         })
                         .on_click(move |event: &ClickEvent, window, cx| {
                             window.dispatch_action(
@@ -768,7 +769,7 @@ impl Workspace {
             div()
                 .id("status-performance")
                 .flex_none()
-                .tooltip(Tooltip::text(tooltip))
+                .tip(studio_ui::ds::tooltip(tooltip))
                 .child(
                     studio_ui::ds::text::meta(parts.join(" · "))
                         .color(if busy { Color::Warning } else { Color::Muted })
@@ -2880,8 +2881,8 @@ impl Workspace {
             .children(self.left.active_panel().map(dock_title))
             .child(
                 IconButton::new("search", IconName::MagnifyingGlass)
-                    .tooltip(|_, cx| {
-                        Tooltip::for_action(
+                    .tip_fn(|_, cx| {
+                        studio_ui::ds::tooltip_for_action_view(
                             "Search types, queries and commands",
                             &studio_actions::workspace::ToggleCommandPalette,
                             cx,
@@ -2952,8 +2953,8 @@ impl Workspace {
                     .child(
                         IconButton::new("toggle-inspector", IconName::Info)
                             .toggle_state(inspector_lit)
-                            .tooltip(move |_, cx| {
-                                Tooltip::for_action(
+                            .tip_fn(move |_, cx| {
+                                studio_ui::ds::tooltip_for_action_view(
                                     if inspector_lit {
                                         "Hide inspector"
                                     } else {
@@ -3001,11 +3002,13 @@ impl Workspace {
         PopoverMenu::new("environment-menu")
             .anchor(gpui::Anchor::TopLeft)
             .attach(gpui::Anchor::BottomLeft)
-            .trigger_with_tooltip(
+            .trigger(
                 studio_ui::ds::bar_button("environment", label)
                     .style(ButtonStyle::Subtle)
-                    .color(color),
-                Tooltip::text("What this server is, which this bar marks"),
+                    .color(color)
+                    .tip(studio_ui::ds::tooltip(
+                        "What this server is, which this bar marks",
+                    )),
             )
             .menu(move |window, cx| {
                 let url = url.clone();
@@ -3043,8 +3046,8 @@ impl Workspace {
                 IconName::ThreadsSidebarLeftClosed
             },
         )
-        .tooltip(move |_, cx| {
-            Tooltip::for_action(
+        .tip_fn(move |_, cx| {
+            studio_ui::ds::tooltip_for_action_view(
                 if open { "Hide sidebar" } else { "Show sidebar" },
                 &ToggleSidebar,
                 cx,
@@ -3107,15 +3110,15 @@ impl Workspace {
                         )
                         .toggle_state(lit)
                         .when(!menu_open, |button| {
-                            button.tooltip(move |_, cx| {
+                            button.tip_fn(move |_, cx| {
                                 if lit {
-                                    Tooltip::for_action(
+                                    studio_ui::ds::tooltip_for_action_view(
                                         hide_label,
                                         toggle_action(position).as_ref(),
                                         cx,
                                     )
                                 } else {
-                                    Tooltip::for_action(
+                                    studio_ui::ds::tooltip_for_action_view(
                                         title.clone(),
                                         &studio_actions::workspace::ActivatePanel {
                                             id: tooltip_id.to_string(),
@@ -3398,7 +3401,7 @@ impl Workspace {
             );
         }
         let trigger = ButtonLike::new("graph-switcher")
-            .tooltip(Tooltip::text(tooltip))
+            .tip(studio_ui::ds::tooltip(tooltip))
             .child(
                 h_flex()
                     .px(px(studio_ui::ds::space::XS))
@@ -3540,7 +3543,7 @@ impl Workspace {
                         IconName::Pin,
                     )
                     .icon_color(Color::Muted)
-                    .tooltip(Tooltip::text("Unpin"))
+                    .tip(studio_ui::ds::tooltip("Unpin"))
                     .on_click(
                         cx.listener(move |this, _, _, cx| this.toggle_pin(pane_id, index, cx)),
                     )
@@ -3552,7 +3555,9 @@ impl Workspace {
                     // On hover only, the active tab's too, as Zed's `show_close_button: hover`:
                     // its slot stays, so the title sits evenly between the tab's edges.
                     .visible_on_hover(group.clone())
-                    .tooltip(|_, cx| Tooltip::for_action("Close", &CloseActiveItem, cx))
+                    .tip_fn(|_, cx| {
+                        studio_ui::ds::tooltip_for_action_view("Close", &CloseActiveItem, cx)
+                    })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.close_in(pane_id, index, window, cx)
                     }))
@@ -3703,11 +3708,11 @@ impl Workspace {
                 icon,
             )
             .disabled(!enabled)
-            .tooltip(move |_, cx| {
+            .tip_fn(move |_, cx| {
                 if back {
-                    Tooltip::for_action(label, &GoBack, cx)
+                    studio_ui::ds::tooltip_for_action_view(label, &GoBack, cx)
                 } else {
-                    Tooltip::for_action(label, &GoForward, cx)
+                    studio_ui::ds::tooltip_for_action_view(label, &GoForward, cx)
                 }
             })
             .on_click(
@@ -3747,7 +3752,7 @@ impl Workspace {
         let zoomed = self.zoomed == Some(Zoomed::Pane(pane_id));
         let menu_button = |id: &'static str, icon: IconName, tooltip: &'static str| {
             IconButton::new(SharedString::from(format!("{id}-{pane_id}")), icon)
-                .tooltip(Tooltip::text(tooltip))
+                .tip(studio_ui::ds::tooltip(tooltip))
         };
         h_flex()
             .h_full()
@@ -3799,8 +3804,8 @@ impl Workspace {
                         )
                         .toggle_state(zoomed)
                         .selected_icon(IconName::Minimize)
-                        .tooltip(move |_, cx| {
-                            Tooltip::for_action(
+                        .tip_fn(move |_, cx| {
+                            studio_ui::ds::tooltip_for_action_view(
                                 if zoomed { "Zoom out" } else { "Zoom in" },
                                 &ToggleZoom,
                                 cx,
@@ -4106,9 +4111,9 @@ impl Workspace {
                     PopoverMenu::new("keys-panel")
                         .anchor(gpui::Anchor::BottomRight)
                         .attach(gpui::Anchor::TopRight)
-                        .trigger_with_tooltip(
-                            IconButton::new("keys", IconName::Keyboard),
-                            Tooltip::text("Keys for this tab"),
+                        .trigger(
+                            IconButton::new("keys", IconName::Keyboard)
+                                .tip(studio_ui::ds::tooltip("Keys for this tab")),
                         )
                         // Zed's context menu: each key is an entry that runs it, its binding
                         // read in the tab's own context.
@@ -4186,7 +4191,7 @@ impl Workspace {
                         .trigger(
                             studio_ui::ds::bar_button("branch", branch.clone())
                                 .style(ButtonStyle::Subtle)
-                                .tooltip(Tooltip::text(branch_tooltip))
+                                .tip(studio_ui::ds::tooltip(branch_tooltip))
                                 .start_icon(Icon::new(IconName::GitBranch))
                                 .end_icon(Icon::new(IconName::ChevronUpDown)),
                         )
@@ -4242,8 +4247,8 @@ impl Workspace {
                             .id("branch-read-only")
                             .debug_selector(|| "branch-read-only".into())
                             .flex_none()
-                            .tooltip(move |_, cx| {
-                                Tooltip::with_meta(
+                            .tip_fn(move |_, cx| {
+                                studio_ui::ds::tooltip_with_meta(
                                     reason.clone(),
                                     None,
                                     "Edits here are off; switch to a branch it may change",
@@ -4377,11 +4382,11 @@ impl Workspace {
                     )
                     // ⇧⎋ ends any zoom but zooms the active pane, not this dock, so only "Zoom
                     // out" shows it.
-                    .tooltip(move |_, cx| {
+                    .tip_fn(move |_, cx| {
                         if zoomed {
-                            Tooltip::for_action("Zoom out", &ToggleZoom, cx)
+                            studio_ui::ds::tooltip_for_action_view("Zoom out", &ToggleZoom, cx)
                         } else {
-                            Tooltip::simple("Zoom in", cx)
+                            studio_ui::ds::tooltip_view("Zoom in", cx)
                         }
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -4394,8 +4399,12 @@ impl Workspace {
                 SharedString::from(format!("hide-dock-{position:?}")),
                 IconName::Close,
             )
-            .tooltip(move |_, cx| {
-                Tooltip::for_action(hide_label, toggle_action(position).as_ref(), cx)
+            .tip_fn(move |_, cx| {
+                studio_ui::ds::tooltip_for_action_view(
+                    hide_label,
+                    toggle_action(position).as_ref(),
+                    cx,
+                )
             })
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.set_dock_open(position, false, window, cx)

@@ -6,6 +6,7 @@ use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, Hsla, Render, SharedString, Window,
 };
 use studio_actions::agent::{Allow, AllowAlways, OpenAgent, Reject};
+use studio_ui::ds::Tipped;
 use studio_ui::ds::{
     self, ActivityRow, Dotted as _, SidebarRow, radii, size, space, surface, text,
 };
@@ -200,7 +201,7 @@ impl Render for DesignGallery {
                         .map(|(index, (icon, title))| {
                             studio_ui::ds::icon_button(("g-dock-tab", index), icon)
                                 .toggle_state(index == 0)
-                                .tooltip(ui::Tooltip::text(title))
+                                .tip(studio_ui::ds::tooltip(title))
                         }),
                     ),
             )

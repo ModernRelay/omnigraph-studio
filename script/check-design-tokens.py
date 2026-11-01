@@ -37,6 +37,9 @@ every surface and nothing drifts. This refuses, outside the design system and te
 - a border wider than a hairline written as a GPUI utility (`.border_l_2()`): views take
   `ds::size::ACCENT_LINE` or `DRAG_LINE`;
 - a turning icon (`.with_rotate_animation(..)`): work under way is `ds::spinner()`;
+- a tooltip at the pointer (`ui::Tooltip`, `.tooltip(..)`): a control takes `.tip(ds::tooltip(..))`,
+  `ds::tooltip_for_action` or `tooltip_for_action_in`, and one built from state `.tip_fn(..)` with
+  their `*_view` forms, so it draws under the control (`crate::tooltip`);
 - any icon or type size named in a view (`IconSize::XSmall`, `LabelSize::Small`,
   `ui::TextSize::Small.rems(cx)`, `.text_ui_sm(cx)`): icons take `ds::icon::lead` or `meta`,
   labels a `ds::text` role, and other text `ds::text::plain_size`, `body_size` or
@@ -57,6 +60,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SYSTEM = {
     "crates/studio_ui/src/ds.rs",
     "crates/studio_ui/src/button.rs",
+    "crates/studio_ui/src/tooltip.rs",
     "crates/studio_ui/src/modal.rs",
     "crates/studio_ui/src/menu.rs",
 }
@@ -91,6 +95,8 @@ RULES = [
     ("icon size outside ds::icon", re.compile(r"\bIconSize::[A-Z]")),
     ("border wider than a hairline", re.compile(r"\.border_([tblrxy]_)?([2-9]|[1-9][0-9])\(\)")),
     ("spinner outside ds::spinner", re.compile(r"\.with_rotate_animation\(")),
+    ("tooltip at the pointer", re.compile(
+        r"\bTooltip::(text|simple|new|for_action|for_action_in|for_action_title|for_action_title_in|with_meta|element)\(|\.tooltip\(")),
     ("type size outside ds::text",
      re.compile(r"\b(TextSize|LabelSize)::[A-Z]|\.text_ui(_xs|_sm|_lg)?\(")),
 ]

@@ -35,6 +35,7 @@ use studio_actions::query::{
     SaveAs, SelectNextColumn, SelectPreviousColumn, ToggleResultsFocus,
 };
 use studio_actions::workspace::Refresh;
+use studio_ui::ds::Tipped;
 use studio_ui::ds::{Dotted as _, space};
 use studio_ui::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::{
@@ -44,7 +45,7 @@ use studio_ui::{
 };
 use studio_workspace::{Item, ItemEvent, ItemStatus, KeyHint, SavedItem};
 use ui::prelude::*;
-use ui::{KeyBinding, PopoverMenu, Tooltip};
+use ui::{KeyBinding, PopoverMenu};
 
 use crate::analysis::Analysis;
 use crate::completion::GqCompletionProvider;
@@ -1192,7 +1193,7 @@ impl QueryEditor {
                         IconName::GitBranch
                     }))
                     .end_icon(Icon::new(IconName::ChevronDown))
-                    .tooltip(Tooltip::text(match &pinned {
+                    .tip(studio_ui::ds::tooltip(match &pinned {
                         Some(commit) => {
                             format!("Reads run at commit {commit}; writes are refused")
                         }
@@ -3266,7 +3267,9 @@ impl QueryEditor {
                     div()
                         .id("read-rows")
                         .when_some(rows.commit.clone(), |fact, commit| {
-                            fact.tooltip(Tooltip::text(format!("Read at graph commit {commit}")))
+                            fact.tip(studio_ui::ds::tooltip(format!(
+                                "Read at graph commit {commit}"
+                            )))
                         })
                         .child(ds::meta(IconName::Hash, rows_label(rows.row_count)))
                         .into_any_element(),
@@ -3304,8 +3307,8 @@ impl QueryEditor {
                             .start_icon(Icon::new(IconName::ArrowRight))
                             .key_binding(KeyBinding::for_action_in(&NextPage, &focus, cx))
                             .disabled(self.writing)
-                            .tooltip(move |_window, cx| {
-                                Tooltip::for_action_in(
+                            .tip_fn(move |_window, cx| {
+                                studio_ui::ds::tooltip_for_action_in_view(
                                     "Read the changes after this page",
                                     &NextPage,
                                     &focus,
@@ -3346,7 +3349,7 @@ impl QueryEditor {
                         ds::button("result-tree", "Tree")
                             .style(ButtonStyle::Subtle)
                             .start_icon(Icon::new(IconName::ListTree))
-                            .tooltip(Tooltip::text(format!(
+                            .tip(studio_ui::ds::tooltip(format!(
                                 "Show the result's {} as a tree",
                                 studio_ui::plural(graph.0.len(), "node", "nodes")
                             )))
@@ -3362,7 +3365,7 @@ impl QueryEditor {
                             ds::button("result-graph", "Graph")
                                 .style(ButtonStyle::Subtle)
                                 .start_icon(Icon::new(IconName::GitGraph))
-                                .tooltip(Tooltip::text(format!(
+                                .tip(studio_ui::ds::tooltip(format!(
                                     "Draw the result's {} nodes, linking those in the same row",
                                     graph.0.len()
                                 )))
@@ -3401,7 +3404,9 @@ impl QueryEditor {
                     div()
                         .id("plan-of")
                         .when_some(plan.commit.clone(), |fact, commit| {
-                            fact.tooltip(Tooltip::text(format!("Planned at graph commit {commit}")))
+                            fact.tip(studio_ui::ds::tooltip(format!(
+                                "Planned at graph commit {commit}"
+                            )))
                         })
                         .child(ds::meta(
                             IconName::ListTree,
@@ -3492,7 +3497,7 @@ impl QueryEditor {
                     .min_w_0()
                     .gap(px(space::INLINE))
                     .items_center()
-                    .tooltip(Tooltip::text(tip))
+                    .tip(studio_ui::ds::tooltip(tip))
                     .child(studio_ui::ds::icon::lead(icon))
                     .child(studio_ui::ds::text::title(title).single_line().truncate())
                     .children(kind.map(studio_ui::ds::text::muted))
@@ -3509,8 +3514,8 @@ impl QueryEditor {
                     studio_ui::ds::button("newer-rows", "Newer data · Refresh")
                         .style(ButtonStyle::Tinted(ui::TintColor::Accent))
                         .disabled(busy)
-                        .tooltip(move |_window, cx| {
-                            Tooltip::for_action_in(
+                        .tip_fn(move |_window, cx| {
+                            studio_ui::ds::tooltip_for_action_in_view(
                                 "The branch moved since these rows were read; read them again",
                                 &Refresh,
                                 &focus,
@@ -3528,10 +3533,10 @@ impl QueryEditor {
                     studio_ui::ds::button("explain", "Explain")
                         .start_icon(Icon::new(IconName::ListTree))
                         .key_binding(KeyBinding::for_action_in(&Explain, &focus, cx))
-                        .tooltip({
+                        .tip_fn({
                             let focus = focus.clone();
                             move |_window, cx| {
-                                Tooltip::for_action_in(
+                                studio_ui::ds::tooltip_for_action_in_view(
                                     "Show the plan of the query under the cursor",
                                     &Explain,
                                     &focus,
@@ -3550,13 +3555,21 @@ impl QueryEditor {
                     .start_icon(Icon::new(IconName::PlayFilled))
                     .key_binding(KeyBinding::for_action_in(&Run, &focus, cx))
                     .disabled(busy)
-                    .tooltip({
+                    .tip_fn({
                         let focus = focus.clone();
                         move |_window, cx| {
                             if busy {
-                                Tooltip::simple("A write is in flight; wait for its outcome.", cx)
+                                studio_ui::ds::tooltip_view(
+                                    "A write is in flight; wait for its outcome.",
+                                    cx,
+                                )
                             } else {
-                                Tooltip::for_action_in(run_tip.clone(), &Run, &focus, cx)
+                                studio_ui::ds::tooltip_for_action_in_view(
+                                    run_tip.clone(),
+                                    &Run,
+                                    &focus,
+                                    cx,
+                                )
                             }
                         }
                     })
@@ -3641,7 +3654,7 @@ impl QueryEditor {
                     .when(self.selected_problem == Some(index), |row| {
                         row.bg(selected_bg)
                     })
-                    .tooltip(Tooltip::text(tip))
+                    .tip(studio_ui::ds::tooltip(tip))
                     .child(studio_ui::ds::icon::meta(IconName::XCircle).color(Color::Error))
                     .child(
                         div()
@@ -3675,8 +3688,8 @@ impl QueryEditor {
                                         &ApplyFix, &focus, cx,
                                     ))
                                 })
-                                .tooltip(move |_window, cx| {
-                                    Tooltip::for_action_in(
+                                .tip_fn(move |_window, cx| {
+                                    studio_ui::ds::tooltip_for_action_in_view(
                                         "Apply the compiler's suggested edit",
                                         &ApplyFix,
                                         &focus,
@@ -3961,7 +3974,7 @@ impl QueryEditor {
                         .gap(px(space::XS))
                         .child(
                             ds::button("take-disk-text", "Use the file's text")
-                                .tooltip(Tooltip::text(
+                                .tip(studio_ui::ds::tooltip(
                                     "Replace the draft with what the file holds now (⌘Z brings \
                                      the draft back)",
                                 ))
@@ -4474,7 +4487,7 @@ impl QueryEditor {
                         .child(studio_ui::ds::text::body(node.clone()))
                         .child(render_facts(facts))
                         .when(!facts.is_empty(), |d| {
-                            d.tooltip(Tooltip::text(facts_tooltip(facts)))
+                            d.tip(studio_ui::ds::tooltip(facts_tooltip(facts)))
                         })
                         .into_any_element(),
                     PlanItem::Note { name, value } => h_flex()
@@ -4490,7 +4503,7 @@ impl QueryEditor {
                                 .single_line()
                                 .truncate(),
                         )
-                        .tooltip(Tooltip::text(value.clone()))
+                        .tip(studio_ui::ds::tooltip(value.clone()))
                         .into_any_element(),
                 };
                 Some(element)
@@ -4540,7 +4553,7 @@ impl QueryEditor {
                                 short_commit_id(commit),
                                 cx,
                             ))
-                            .tooltip(Tooltip::text(format!("{what} {commit}")))
+                            .tip(studio_ui::ds::tooltip(format!("{what} {commit}")))
                             .into_any_element(),
                     );
                 }
@@ -4667,7 +4680,7 @@ impl QueryEditor {
                                 )
                                 .start_icon(Icon::new(IconName::ArrowRight))
                                 .disabled(at.is_none())
-                                .tooltip(Tooltip::text(tip))
+                                .tip(studio_ui::ds::tooltip(tip))
                                 .on_click(cx.listener(
                                     move |this, _, window, cx| {
                                         if let Some(at) = at {
@@ -4687,7 +4700,7 @@ impl QueryEditor {
                                         studio_ui::ds::row_button("apply-server-fix", "Apply")
                                             .style(ButtonStyle::Tinted(ui::TintColor::Accent))
                                             .disabled(!can_apply)
-                                            .tooltip(Tooltip::text(match (can_apply, review) {
+                                            .tip(studio_ui::ds::tooltip(match (can_apply, review) {
                                                 (false, _) if applied => {
                                                     "Applied; run the query again"
                                                 }
@@ -4795,7 +4808,7 @@ fn diff_sides(page: &ReadPageOutput) -> Option<AnyElement> {
                 IconName::GitCommit,
                 format!("{} → {}", short_commit_id(from), short_commit_id(to)),
             ))
-            .tooltip(Tooltip::text(tip))
+            .tip(studio_ui::ds::tooltip(tip))
             .into_any_element(),
     )
 }

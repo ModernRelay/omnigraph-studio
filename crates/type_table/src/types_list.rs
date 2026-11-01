@@ -11,8 +11,8 @@ use gq_language::SchemaModel;
 use graph_store::{GraphSession, Loadable, SessionEvent};
 use studio_actions::Thing;
 use studio_actions::graph::{OpenMap, OpenType};
+use studio_ui::ds::Tipped;
 use studio_workspace::{Workspace, WorkspaceEvent};
-use ui::Tooltip;
 use ui::prelude::*;
 
 /// One row of the sidebar's list.
@@ -182,8 +182,8 @@ impl TypesList {
             Row::Schema => studio_ui::ds::SidebarRow::new("schema", "Schema")
                 .icon(IconName::Code)
                 .selected(self.frame_active == Some(Thing::Schema))
-                .tooltip_fn(|_, cx| {
-                    Tooltip::for_action(
+                .tip_fn(|_, cx| {
+                    studio_ui::ds::tooltip_for_action_view(
                         "The graph's types and how they relate",
                         &OpenMap::default(),
                         cx,
@@ -237,7 +237,7 @@ impl TypesList {
                     .end(studio_ui::ds::sidebar_count(count))
                     .muted(*is_edge)
                     .selected(selected)
-                    .tooltip(tooltip)
+                    .tip(studio_ui::ds::tooltip(tooltip))
                     .on_click(move |event, window, cx| {
                         let mut action = action.clone();
                         action.preview = event.click_count() < 2;

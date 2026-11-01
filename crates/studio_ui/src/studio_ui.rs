@@ -22,6 +22,7 @@ mod overlay_slot;
 mod resize;
 pub mod rows;
 pub mod text;
+mod tooltip;
 mod values;
 
 pub use cell_text::{CellText, cell_text};

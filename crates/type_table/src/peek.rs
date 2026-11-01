@@ -27,10 +27,11 @@ use serde_json::{Map, Value};
 use studio_actions::graph::{OpenBlob, OpenNodePage, PeekNode};
 use studio_actions::node::{CancelField, ExpandField, SaveField, SaveNodeDrafts};
 use studio_actions::table::{SelectNextSuggestion, SelectPreviousSuggestion};
+use studio_ui::ds::Tipped;
 use studio_ui::ds::space;
 use studio_ui::menu::ContextMenu;
 use ui::prelude::*;
-use ui::{PopoverMenu, ToggleState, Tooltip};
+use ui::{PopoverMenu, ToggleState};
 
 use crate::blob::{
     IMAGE_MAX, KIND_PREFIX, PREVIEW_PREFIX, Preview, bytes_wanted, preview, read_range,
@@ -1758,7 +1759,7 @@ impl NodePeek {
                                 blob_write::again_label(change, now),
                             )
                             .style(ButtonStyle::Subtle)
-                            .tooltip(Tooltip::text(format!(
+                            .tip(studio_ui::ds::tooltip(format!(
                                 "Write it over what {} holds now, on {}",
                                 slot.property, self.branch
                             )))
@@ -1837,59 +1838,63 @@ impl NodePeek {
                     _ => None,
                 };
                 let managed = matches!(slot.meta, Loadable::Loaded(BlobMeta::Managed { .. }));
-                let save: Option<AnyElement> =
-                    match &slot.save {
-                        Some(SaveState::Saving { done, of }) => Some(
-                            studio_ui::ds::text::meta(format!(
-                                "Saving {}%",
-                                (*done * 100).checked_div(*of).unwrap_or(100)
-                            ))
-                            .into_any_element(),
-                        ),
-                        Some(SaveState::Saved(path)) => {
-                            let path = path.clone();
-                            Some(
-                                studio_ui::ds::button(("show-saved", index), "Show in Finder")
+                let save: Option<AnyElement> = match &slot.save {
+                    Some(SaveState::Saving { done, of }) => Some(
+                        studio_ui::ds::text::meta(format!(
+                            "Saving {}%",
+                            (*done * 100).checked_div(*of).unwrap_or(100)
+                        ))
+                        .into_any_element(),
+                    ),
+                    Some(SaveState::Saved(path)) => {
+                        let path = path.clone();
+                        Some(
+                            studio_ui::ds::button(("show-saved", index), "Show in Finder")
+                                .style(ButtonStyle::Subtle)
+                                .color(Color::Muted)
+                                .tip(studio_ui::ds::tooltip(format!(
+                                    "Saved to {}",
+                                    path.display()
+                                )))
+                                .on_click(move |_, _, cx| cx.reveal_path(&path))
+                                .into_any_element(),
+                        )
+                    }
+                    Some(SaveState::Failed(error)) => {
+                        Some(studio_ui::ds::text::error_note(error.clone()).into_any_element())
+                    }
+                    None if managed => Some(
+                        h_flex()
+                            .gap(px(space::XXS))
+                            .child({
+                                let open = self.open_blob_action(&slot.property);
+                                studio_ui::ds::button(("open-blob", index), "Open")
                                     .style(ButtonStyle::Subtle)
                                     .color(Color::Muted)
-                                    .tooltip(Tooltip::text(format!("Saved to {}", path.display())))
-                                    .on_click(move |_, _, cx| cx.reveal_path(&path))
-                                    .into_any_element(),
-                            )
-                        }
-                        Some(SaveState::Failed(error)) => {
-                            Some(studio_ui::ds::text::error_note(error.clone()).into_any_element())
-                        }
-                        None if managed => Some(
-                            h_flex()
-                                .gap(px(space::XXS))
-                                .child({
-                                    let open = self.open_blob_action(&slot.property);
-                                    studio_ui::ds::button(("open-blob", index), "Open")
-                                        .style(ButtonStyle::Subtle)
-                                        .color(Color::Muted)
-                                        .tooltip(Tooltip::text("Show the whole value in a tab"))
-                                        .on_click(move |_, window, cx| {
-                                            window.dispatch_action(Box::new(open.clone()), cx)
-                                        })
-                                })
-                                .child({
-                                    let refused = self.save_refusal(index);
-                                    studio_ui::ds::button(("save-blob", index), "Save…")
-                                        .style(ButtonStyle::Subtle)
-                                        .color(Color::Muted)
-                                        .disabled(refused.is_some())
-                                        .tooltip(Tooltip::text(
-                                            refused.unwrap_or("Save the whole value to a file"),
-                                        ))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                    .tip(studio_ui::ds::tooltip("Show the whole value in a tab"))
+                                    .on_click(move |_, window, cx| {
+                                        window.dispatch_action(Box::new(open.clone()), cx)
+                                    })
+                            })
+                            .child({
+                                let refused = self.save_refusal(index);
+                                studio_ui::ds::button(("save-blob", index), "Save…")
+                                    .style(ButtonStyle::Subtle)
+                                    .color(Color::Muted)
+                                    .disabled(refused.is_some())
+                                    .tip(studio_ui::ds::tooltip(
+                                        refused.unwrap_or("Save the whole value to a file"),
+                                    ))
+                                    .on_click(
+                                        cx.listener(move |this, _, _, cx| {
                                             this.save_blob(index, cx)
-                                        }))
-                                })
-                                .into_any_element(),
-                        ),
-                        None => None,
-                    };
+                                        }),
+                                    )
+                            })
+                            .into_any_element(),
+                    ),
+                    None => None,
+                };
                 let slot_view = v_flex()
                     .id(("peek-blob", index))
                     .gap(px(space::XS))
@@ -1967,7 +1972,7 @@ impl NodePeek {
         let tooltip = move |refusal: Option<String>, clear: bool| {
             let (cell, branch) = (cell.clone(), branch.clone());
             move |_: &mut Window, cx: &mut App| match &refusal {
-                Some(reason) => Tooltip::simple(reason.clone(), cx),
+                Some(reason) => studio_ui::ds::tooltip_view(reason.clone(), cx),
                 None if clear => blob_write::clear_tooltip(&cell, &branch, cx),
                 None => blob_write::upload_tooltip(&cell, &branch, cx),
             }
@@ -1980,7 +1985,7 @@ impl NodePeek {
                     .icon_color(Color::Muted)
                     .aria_label("Choose File…")
                     .disabled(upload_refusal.is_some() || saving)
-                    .tooltip(tooltip(upload_refusal, false))
+                    .tip_fn(tooltip(upload_refusal, false))
                     .on_click(cx.listener(move |this, _, _, cx| this.choose_blob_file(index, cx))),
             )
             .child(
@@ -1988,7 +1993,7 @@ impl NodePeek {
                     .icon_color(Color::Muted)
                     .aria_label("Clear")
                     .disabled(clear_refusal.is_some() || saving)
-                    .tooltip(tooltip(clear_refusal, true))
+                    .tip_fn(tooltip(clear_refusal, true))
                     .on_click(cx.listener(move |this, _, _, cx| this.clear_blob(&property, cx))),
             )
             .into_any_element()
@@ -3835,9 +3840,9 @@ impl NodePeek {
                     )
                     .style(ButtonStyle::Filled)
                     .disabled(self.saving_drafts || refused.is_some())
-                    .tooltip(move |_, cx| match &refused {
-                        Some(reason) => Tooltip::simple(reason.clone(), cx),
-                        None => Tooltip::for_action(
+                    .tip_fn(move |_, cx| match &refused {
+                        Some(reason) => studio_ui::ds::tooltip_view(reason.clone(), cx),
+                        None => studio_ui::ds::tooltip_for_action_view(
                             format!("One commit to {branch}"),
                             &SaveNodeDrafts,
                             cx,
@@ -4177,7 +4182,7 @@ impl NodePeek {
             .child(studio_ui::ds::icon::meta(property_icon(property)))
             .child(
                 studio_ui::ds::fold(("peek-fold", index), name.to_owned(), open)
-                    .tooltip(Tooltip::text(if open { "Fold" } else { "Unfold" }))
+                    .tip(studio_ui::ds::tooltip(if open { "Fold" } else { "Unfold" }))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         if !this.folded.remove(&fold_name) {
@@ -4226,7 +4231,7 @@ impl NodePeek {
             .when(!state.editing, |row| row.hover(move |s| s.bg(hover)))
             .when(state.opens_editor || !editable, |row| row.cursor_pointer())
             .when_some(state.tooltip.clone(), |row, tooltip| {
-                row.tooltip(Tooltip::text(tooltip))
+                row.tip(studio_ui::ds::tooltip(tooltip))
             })
             .on_click(cx.listener(move |this, _, window, cx| {
                 if let Some(property) = edit_property.clone() {
@@ -4269,7 +4274,7 @@ impl NodePeek {
                         )
                         .icon_color(Color::Muted)
                         .visible_on_hover(group.clone())
-                        .tooltip(Tooltip::text("Open in the editor"))
+                        .tip(studio_ui::ds::tooltip("Open in the editor"))
                         .on_click(cx.listener(
                             move |this, _, window, cx| {
                                 cx.stop_propagation();
@@ -4286,7 +4291,7 @@ impl NodePeek {
                     .child(
                         div()
                             .id(("peek-saving", index))
-                            .tooltip(Tooltip::text("Saving…"))
+                            .tip(studio_ui::ds::tooltip("Saving…"))
                             .child(studio_ui::ds::dot(Color::Warning)),
                     )
                     .into_any_element(),
@@ -4460,7 +4465,7 @@ impl NodePeek {
                 IconName::Close,
             )
             .icon_color(Color::Muted)
-            .tooltip(Tooltip::text("Set to none"))
+            .tip(studio_ui::ds::tooltip("Set to none"))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.edits.remove(&property.name);
                 this.write_value(
@@ -4504,8 +4509,12 @@ impl NodePeek {
                             IconName::Maximize,
                         )
                         .icon_color(Color::Muted)
-                        .tooltip(|_, cx| {
-                            Tooltip::for_action("Open in the editor", &ExpandField, cx)
+                        .tip_fn(|_, cx| {
+                            studio_ui::ds::tooltip_for_action_view(
+                                "Open in the editor",
+                                &ExpandField,
+                                cx,
+                            )
                         })
                         .on_click(
                             cx.listener(move |this, _, window, cx| this.expand(&name, window, cx)),
@@ -4566,7 +4575,7 @@ impl NodePeek {
             .count();
         let open = self.show_empty;
         studio_ui::ds::fold_row("peek-empty-groups", "Empty", open, cx)
-            .tooltip(Tooltip::text(if open {
+            .tip(studio_ui::ds::tooltip(if open {
                 "Hide the relationships with none"
             } else {
                 "Show the relationships with none, to add one"
@@ -4613,7 +4622,7 @@ impl NodePeek {
         let header = studio_ui::ds::fold_row(("peek-group", index), title, group.expanded, cx)
             .group(header_group)
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(index, cx)))
-            .when_some(failed, |d, error| d.tooltip(Tooltip::text(error)))
+            .when_some(failed, |d, error| d.tip(studio_ui::ds::tooltip(error)))
             .when(self.edge_writes.contains(&index), |header| {
                 header.child(studio_ui::ds::dot(Color::Warning))
             })
@@ -4679,7 +4688,7 @@ impl NodePeek {
             .icon_color(Color::Muted)
             .when(!self.page, |button| button.visible_on_hover(header))
             .disabled(refused.is_some())
-            .tooltip(Tooltip::text(tooltip))
+            .tip(studio_ui::ds::tooltip(tooltip))
             .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
                 if required.is_empty() {
@@ -4778,7 +4787,7 @@ impl NodePeek {
             )
             .style(ButtonStyle::Tinted(ui::TintColor::Error))
             .disabled(self.edge_write_refusal(index).is_some())
-            .tooltip(Tooltip::text(format!(
+            .tip(studio_ui::ds::tooltip(format!(
                 "Remove this {edge}; both nodes stay"
             )))
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -4792,7 +4801,7 @@ impl NodePeek {
             .or_else(|| self.edge_write_refusal(index));
         studio_ui::ds::value_remove(SharedString::from(format!("peek-remove-{index}-{n}")))
             .disabled(refused.is_some())
-            .tooltip(Tooltip::text(
+            .tip(studio_ui::ds::tooltip(
                 refused.unwrap_or_else(|| format!("Remove this {edge}")),
             ))
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -4838,7 +4847,9 @@ impl NodePeek {
                         // The peek shows the first few; the page lists them all.
                         let open = self.open_page_action();
                         row.end(studio_ui::ds::text::meta("Open page"))
-                            .tooltip("Open the node's page to see them all")
+                            .tip(studio_ui::ds::tooltip(
+                                "Open the node's page to see them all",
+                            ))
                             .on_click(move |_, window, cx| {
                                 if let Some(open) = open.clone() {
                                     window.dispatch_action(Box::new(open), cx)
@@ -4860,7 +4871,10 @@ impl NodePeek {
                         )
                         .flush()
                         .start(studio_ui::type_mark(&other, &label, cx))
-                        .tooltip(format!("Peek {} · ⌘-click opens its page", neighbour.id))
+                        .tip(studio_ui::ds::tooltip(format!(
+                            "Peek {} · ⌘-click opens its page",
+                            neighbour.id
+                        )))
                         .on_click(move |event, window, cx| {
                             if event.modifiers().platform {
                                 window.dispatch_action(Box::new(page.clone()), cx)
@@ -4908,7 +4922,7 @@ impl NodePeek {
                                 .id(label)
                                 .hover(move |s| s.bg(hover))
                                 .cursor_pointer()
-                                .tooltip(Tooltip::text(format!(
+                                .tip(studio_ui::ds::tooltip(format!(
                                     "Peek {id} · {ty} · ⌘-click opens its page"
                                 )))
                                 .on_click(move |event, window, cx| {
@@ -5368,7 +5382,7 @@ impl NodePeek {
                     .children(open_page.map(|open| {
                         studio_ui::ds::icon_button("peek-open-page", IconName::ArrowUpRight)
                             .icon_color(Color::Muted)
-                            .tooltip(Tooltip::text("Open the node's page"))
+                            .tip(studio_ui::ds::tooltip("Open the node's page"))
                             .on_click(move |_, window, cx| {
                                 window.dispatch_action(Box::new(open.clone()), cx)
                             })
@@ -5386,7 +5400,7 @@ impl NodePeek {
                                 .start_icon(
                                     Icon::new(IconName::Crosshair),
                                 )
-                                .tooltip(Tooltip::text("Walk the graph from this node"))
+                                .tip(studio_ui::ds::tooltip("Walk the graph from this node"))
                                 .on_click(move |_, window, cx| {
                                     window.dispatch_action(Box::new(explore.clone()), cx)
                                 }),
@@ -5410,7 +5424,7 @@ impl NodePeek {
                     .children(at.map(|commit| {
                         div()
                             .id("peek-commit")
-                            .tooltip(Tooltip::text(format!("Read at commit {commit}")))
+                            .tip(studio_ui::ds::tooltip(format!("Read at commit {commit}")))
                             .child(studio_ui::ds::meta_code(
                                 IconName::GitCommit,
                                 studio_ui::short_commit_id(&commit),
@@ -5422,7 +5436,7 @@ impl NodePeek {
                         meta.child(
                             studio_ui::ds::row_button("peek-newer", "Newer data · Refresh")
                                 .style(ButtonStyle::Tinted(ui::TintColor::Accent))
-                                .tooltip(Tooltip::text(
+                                .tip(studio_ui::ds::tooltip(
                                     "The branch moved since this was read. Refresh reads it at the head.",
                                 ))
                                 .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),

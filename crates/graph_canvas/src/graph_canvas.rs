@@ -43,9 +43,9 @@ use studio_actions::graph::{
 };
 use studio_actions::{ViewKind, ViewLink};
 use studio_settings::StudioSettings;
+use studio_ui::ds::Tipped;
 use studio_ui::ds::space;
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
-use ui::Tooltip;
 use ui::prelude::*;
 
 use layout::{LayoutKind, LayoutNode, Vec2};
@@ -2446,7 +2446,7 @@ impl GraphCanvas {
                         d.child(
                             panel("canvas-newer").child(
                                 studio_ui::ds::bar_button("canvas-refresh", "Newer data · Refresh")
-                                    .tooltip(Tooltip::text(
+                                    .tip(studio_ui::ds::tooltip(
                                         "The branch moved since this exploration was read",
                                     ))
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -2465,8 +2465,8 @@ impl GraphCanvas {
                             .when(!self.pinned.is_empty(), |panel| {
                                 panel.child(
                                     studio_ui::ds::icon_button("reset-layout", IconName::RotateCcw)
-                                        .tooltip(|_window, cx| {
-                                            Tooltip::for_action(
+                                        .tip_fn(|_window, cx| {
+                                            studio_ui::ds::tooltip_for_action_view(
                                                 "Reset the layout: forget the nodes you placed",
                                                 &ResetLayout,
                                                 cx,
@@ -2479,8 +2479,10 @@ impl GraphCanvas {
                             })
                             .child(
                                 studio_ui::ds::icon_button("zoom-out", IconName::Dash)
-                                    .tooltip(|_window, cx| {
-                                        Tooltip::for_action("Zoom out", &ZoomOut, cx)
+                                    .tip_fn(|_window, cx| {
+                                        studio_ui::ds::tooltip_for_action_view(
+                                            "Zoom out", &ZoomOut, cx,
+                                        )
                                     })
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.zoom_out(&ZoomOut, window, cx)
@@ -2488,8 +2490,12 @@ impl GraphCanvas {
                             )
                             .child(
                                 studio_ui::ds::bar_button("zoom-fit", "Fit")
-                                    .tooltip(|_window, cx| {
-                                        Tooltip::for_action("Fit to window", &FitToWindow, cx)
+                                    .tip_fn(|_window, cx| {
+                                        studio_ui::ds::tooltip_for_action_view(
+                                            "Fit to window",
+                                            &FitToWindow,
+                                            cx,
+                                        )
                                     })
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.fit_to_window(&FitToWindow, window, cx)
@@ -2497,8 +2503,10 @@ impl GraphCanvas {
                             )
                             .child(
                                 studio_ui::ds::icon_button("zoom-in", IconName::Plus)
-                                    .tooltip(|_window, cx| {
-                                        Tooltip::for_action("Zoom in", &ZoomIn, cx)
+                                    .tip_fn(|_window, cx| {
+                                        studio_ui::ds::tooltip_for_action_view(
+                                            "Zoom in", &ZoomIn, cx,
+                                        )
                                     })
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.zoom_in(&ZoomIn, window, cx)

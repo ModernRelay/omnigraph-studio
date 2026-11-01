@@ -41,6 +41,7 @@ use studio_actions::table::{
 };
 use studio_actions::{ViewKind, ViewLink};
 use studio_ui::ds::Button;
+use studio_ui::ds::Tipped;
 use studio_ui::ds::space;
 use studio_ui::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::plural;
@@ -50,7 +51,6 @@ use studio_workspace::{Item, ItemEvent, ItemStatus, KeyHint, SavedItem, ToastKin
 use ui::prelude::*;
 use ui::{
     ColumnWidthConfig, PopoverMenu, PopoverMenuHandle, Table, TableInteractionState, TintColor,
-    Tooltip,
 };
 
 use crate::blob_write::{self, Binding, BlobChange, BlobEdit, BlobWritten};
@@ -408,7 +408,7 @@ impl TypeTable {
             h_flex()
                 .id("diff-counts")
                 .gap(px(space::SM))
-                .tooltip(Tooltip::text(tooltip))
+                .tip(studio_ui::ds::tooltip(tooltip))
                 .children(count(added, "+", Color::Created))
                 .children(count(changed, "~", Color::Modified))
                 .children(count(removed, "−", Color::Deleted))
@@ -2043,7 +2043,7 @@ impl TypeTable {
                 studio_ui::ds::button("bulk-property-button", "Set a property ▾")
                     .style(ButtonStyle::Outlined)
                     .disabled(true)
-                    .tooltip(Tooltip::text(reason)),
+                    .tip(studio_ui::ds::tooltip(reason)),
             );
         } else {
             bar = bar
@@ -2100,7 +2100,7 @@ impl TypeTable {
                         )
                         .style(ButtonStyle::Tinted(TintColor::Accent))
                         .disabled(saving)
-                        .tooltip(Tooltip::text(format!(
+                        .tip(studio_ui::ds::tooltip(format!(
                             "One commit to {}; each row is bound to the value it shows",
                             self.branch
                         )))
@@ -2113,8 +2113,8 @@ impl TypeTable {
             bar = bar.child(
                 studio_ui::ds::button("bulk-fill", "Fill with a model…")
                     .style(ButtonStyle::Outlined)
-                    .tooltip(|_, cx| {
-                        Tooltip::for_action(
+                    .tip_fn(|_, cx| {
+                        studio_ui::ds::tooltip_for_action_view(
                             "Suggest each selected row's value from its other columns",
                             &FillColumn,
                             cx,
@@ -2129,9 +2129,9 @@ impl TypeTable {
             studio_ui::ds::button("bulk-delete", "Delete…")
                 .style(ButtonStyle::Outlined)
                 .disabled(delete_refused.is_some())
-                .tooltip(Tooltip::text(delete_refused.unwrap_or_else(|| {
-                    format!("Delete the {} selected", plural(count, "row", "rows"))
-                })))
+                .tip(studio_ui::ds::tooltip(delete_refused.unwrap_or_else(
+                    || format!("Delete the {} selected", plural(count, "row", "rows")),
+                )))
                 .on_click(
                     cx.listener(|this, _, window, cx| this.on_delete(&DeleteRow, window, cx)),
                 ),
@@ -2144,7 +2144,7 @@ impl TypeTable {
             .child(
                 studio_ui::ds::button("bulk-clear", "Clear")
                     .style(ButtonStyle::Subtle)
-                    .tooltip(Tooltip::text("Clear the selection (Esc)"))
+                    .tip(studio_ui::ds::tooltip("Clear the selection (Esc)"))
                     .on_click(cx.listener(|this, _, _, cx| this.clear_selection(cx))),
             );
         let fill_row = self
@@ -2492,7 +2492,7 @@ impl TypeTable {
                         format!("Fill {}", studio_ui::plural(count, "row", "rows")),
                     )
                     .style(ButtonStyle::Tinted(TintColor::Accent))
-                    .tooltip(Tooltip::text(format!(
+                    .tip(studio_ui::ds::tooltip(format!(
                         "{} go to {}. Each answer lands as the cell's draft; save the drafts \
                          to write them",
                         fill::TASK.sends,
@@ -2698,7 +2698,7 @@ impl TypeTable {
                 )
                 .disabled(self.all_columns.len() < 2)
                 .when(!open, |button| {
-                    button.tooltip(Tooltip::text(
+                    button.tip(studio_ui::ds::tooltip(
                         "Show or hide columns · drag a column's header to move it",
                     ))
                 }),
@@ -2789,7 +2789,7 @@ impl TypeTable {
                 )
                 .disabled(choices.is_empty())
                 .when(!open, |button| {
-                    button.tooltip(Tooltip::text(
+                    button.tip(studio_ui::ds::tooltip(
                         "Group the rows by a property, a relationship or a property of a neighbour",
                     ))
                 }),
@@ -2938,7 +2938,7 @@ impl TypeTable {
                 studio_ui::ds::chip_button("sort", IconName::ChevronUpDown, "Sort", current_label)
                     .disabled(choices.is_empty())
                     .when(!open, |button| {
-                        button.tooltip(Tooltip::text(
+                        button.tip(studio_ui::ds::tooltip(
                             "Order the rows by a property · a column's header orders by it too",
                         ))
                     }),
@@ -3019,7 +3019,7 @@ impl TypeTable {
                     active.clone().map(SharedString::from),
                 )
                 .when(!open, |button| {
-                    button.tooltip(Tooltip::text(
+                    button.tip(studio_ui::ds::tooltip(
                         "Saved filters, order, grouping and columns for this type",
                     ))
                 }),
@@ -6619,9 +6619,9 @@ impl TypeTable {
                     studio_ui::ds::bar_button("drafts-save", "Save as one commit")
                         .style(ButtonStyle::Tinted(TintColor::Accent))
                         .disabled(refused.is_some())
-                        .tooltip(move |_, cx| match &refused {
-                            Some(reason) => Tooltip::simple(reason.clone(), cx),
-                            None => Tooltip::for_action_in(
+                        .tip_fn(move |_, cx| match &refused {
+                            Some(reason) => studio_ui::ds::tooltip_view(reason.clone(), cx),
+                            None => studio_ui::ds::tooltip_for_action_in_view(
                                 save_tooltip.clone(),
                                 &SaveDrafts,
                                 &focus,
@@ -7784,7 +7784,7 @@ impl TypeTable {
         studio_ui::ds::pill_field("filter-words", failed, cx)
             .key_context("FilterWords")
             .w(px(studio_ui::ds::size::FIELD_WIDE))
-            .tooltip(Tooltip::text(about))
+            .tip(studio_ui::ds::tooltip(about))
             .child(studio_ui::ds::icon::meta(IconName::ZedAssistant))
             .child(studio_ui::ds::field_input(self.words_editor.clone()))
             .when(running, |field| field.child(studio_ui::ds::spinner()))
@@ -7904,7 +7904,7 @@ impl TypeTable {
             .child(
                 div()
                     .id("row-count")
-                    .when_some(count_error, |d, error| d.tooltip(Tooltip::text(error)))
+                    .when_some(count_error, |d, error| d.tip(studio_ui::ds::tooltip(error)))
                     .child(studio_ui::ds::text::muted(count)),
             )
             .children(self.render_diff_counts())
@@ -7914,7 +7914,7 @@ impl TypeTable {
                 d.child(
                     div()
                         .id("write-target")
-                        .tooltip(Tooltip::text(target_tooltip))
+                        .tip(studio_ui::ds::tooltip(target_tooltip))
                         .child(match &self.at_commit {
                             Some(commit) => studio_ui::ds::meta_code(
                                 IconName::GitCommit,
@@ -7935,8 +7935,12 @@ impl TypeTable {
                 d.child(
                     studio_ui::ds::button("newer-data", "Newer data · Refresh")
                         .style(ButtonStyle::Tinted(TintColor::Accent))
-                        .tooltip(|_, cx| {
-                            Tooltip::for_action("Read the branch head again", &RefreshTable, cx)
+                        .tip_fn(|_, cx| {
+                            studio_ui::ds::tooltip_for_action_view(
+                                "Read the branch head again",
+                                &RefreshTable,
+                                cx,
+                            )
                         })
                         .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
                 )
@@ -7963,7 +7967,13 @@ impl TypeTable {
                                     studio_ui::group_count(self.filters.len() as i64).into()
                                 }),
                             )
-                            .tooltip(|_, cx| Tooltip::for_action("Add a filter", &AddFilter, cx))
+                            .tip_fn(|_, cx| {
+                                studio_ui::ds::tooltip_for_action_view(
+                                    "Add a filter",
+                                    &AddFilter,
+                                    cx,
+                                )
+                            })
                             .on_click(
                                 cx.listener(|this, _, window, cx| {
                                     this.open_filter_draft(window, cx)
@@ -7981,10 +7991,16 @@ impl TypeTable {
                         "insert-row-chip",
                         studio_ui::ds::chip_button("insert-row", IconName::Plus, "Row", None)
                             .disabled(pinned || refused.is_some())
-                            .tooltip(move |_, cx| match &refused {
-                                _ if pinned => Tooltip::simple("Read-only at an older commit", cx),
-                                Some(reason) => Tooltip::simple(reason.clone(), cx),
-                                None => Tooltip::for_action("Add a row", &InsertRow, cx),
+                            .tip_fn(move |_, cx| match &refused {
+                                _ if pinned => {
+                                    studio_ui::ds::tooltip_view("Read-only at an older commit", cx)
+                                }
+                                Some(reason) => studio_ui::ds::tooltip_view(reason.clone(), cx),
+                                None => studio_ui::ds::tooltip_for_action_view(
+                                    "Add a row",
+                                    &InsertRow,
+                                    cx,
+                                ),
                             })
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.on_insert(&InsertRow, window, cx)
@@ -7992,7 +8008,9 @@ impl TypeTable {
                     ))
                     .child(
                         studio_ui::ds::icon_button("refresh-table", IconName::RotateCw)
-                            .tooltip(|_, cx| Tooltip::for_action("Refresh", &RefreshTable, cx))
+                            .tip_fn(|_, cx| {
+                                studio_ui::ds::tooltip_for_action_view("Refresh", &RefreshTable, cx)
+                            })
                             .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
                     ),
             )
@@ -8036,7 +8054,7 @@ impl TypeTable {
                     cx,
                 )
                 .cursor_pointer()
-                .tooltip(Tooltip::text("Edit this filter"))
+                .tip(studio_ui::ds::tooltip("Edit this filter"))
                 .on_click(
                     cx.listener(move |this, _, window, cx| this.edit_filter(index, window, cx)),
                 ),
@@ -8224,7 +8242,7 @@ impl TypeTable {
                                 Color::Accent,
                                 cx,
                             )
-                            .tooltip(Tooltip::text("Add this filter (↵)"))
+                            .tip(studio_ui::ds::tooltip("Add this filter (↵)"))
                             .on_click(cx.listener(
                                 |this, _, window, cx| this.apply_filter_draft(window, cx),
                             )),
@@ -8236,7 +8254,7 @@ impl TypeTable {
                                 Color::Muted,
                                 cx,
                             )
-                            .tooltip(Tooltip::text("Discard this filter (Esc)"))
+                            .tip(studio_ui::ds::tooltip("Discard this filter (Esc)"))
                             .on_click(cx.listener(
                                 |this, _, window, cx| this.cancel_filter_draft(window, cx),
                             )),
@@ -8251,7 +8269,13 @@ impl TypeTable {
             bar = bar.child(div().flex_1()).child(
                 studio_ui::ds::button("clear-filters", "Clear all")
                     .style(ButtonStyle::Subtle)
-                    .tooltip(|_, cx| Tooltip::for_action("Remove every filter", &ClearFilters, cx))
+                    .tip_fn(|_, cx| {
+                        studio_ui::ds::tooltip_for_action_view(
+                            "Remove every filter",
+                            &ClearFilters,
+                            cx,
+                        )
+                    })
                     .on_click(cx.listener(|this, _, _, cx| this.clear_filters(cx))),
             );
         }
@@ -8467,7 +8491,7 @@ impl TypeTable {
                     group,
                     studio_ui::ds::header_fill_opaque(sortable.is_some(), cx),
                     studio_ui::ds::cell_action(("column-menu", index), IconName::Ellipsis)
-                        .tooltip(Tooltip::text("Column menu"))
+                        .tip(studio_ui::ds::tooltip("Column menu"))
                         .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                             this.open_header_menu(menu_key.clone(), event.position(), window, cx)
                         })),
@@ -8509,7 +8533,7 @@ impl TypeTable {
                             .hover(move |style| style.bg(hover_bg))
                             // Not over the header's own menu, which opens under the pointer.
                             .when(!menu_open, |header| {
-                                header.tooltip(Tooltip::text(format!(
+                                header.tip(studio_ui::ds::tooltip(format!(
                                     "{next} · rows without a value come last"
                                 )))
                             })
@@ -8800,7 +8824,7 @@ impl TypeTable {
                 studio_ui::ds::text::meta(studio_ui::group_count(section.count as i64))
                     .single_line(),
             )
-            .when_some(id, |header, id| header.tooltip(Tooltip::text(id)))
+            .when_some(id, |header, id| header.tip(studio_ui::ds::tooltip(id)))
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_section(index, cx)))
             .into_any_element();
         self.line_cells(first)
@@ -8821,7 +8845,7 @@ impl TypeTable {
                 .child(
                     div()
                         .id(("section-error", index))
-                        .tooltip(Tooltip::text(error.clone()))
+                        .tip(studio_ui::ds::tooltip(error.clone()))
                         .child(studio_ui::ds::text::error_note("Not read")),
                 )
                 .child(
@@ -9480,7 +9504,7 @@ impl TypeTable {
                 let (table, row_id, key) = (cx.weak_entity(), row.id.clone(), key.to_owned());
                 return div()
                     .id(ElementId::NamedInteger("relation".into(), id))
-                    .tooltip(move |_, cx| {
+                    .tip_fn(move |_, cx| {
                         let error = table.upgrade().and_then(|table| {
                             let table = table.read(cx);
                             match &table.relations.get(&row_id, &key)?.count {
@@ -9488,7 +9512,7 @@ impl TypeTable {
                                 Ok(_) => None,
                             }
                         });
-                        Tooltip::simple(error.unwrap_or_default(), cx)
+                        studio_ui::ds::tooltip_view(error.unwrap_or_default(), cx)
                     })
                     .child(studio_ui::ds::text::body("?").color(Color::Warning))
                     .into_any_element();
@@ -9515,12 +9539,12 @@ impl TypeTable {
             .w_full()
             .min_w_0()
             .gap(px(space::XS))
-            .tooltip(move |_, cx| {
+            .tip_fn(move |_, cx| {
                 let other = table.upgrade().and_then(|table| {
                     let group = table.read(cx).columns.get(col)?.relationship()?;
                     Some(group.other_type.clone())
                 });
-                Tooltip::simple(
+                studio_ui::ds::tooltip_view(
                     format!(
                         "{} {} · click to open them",
                         studio_ui::group_count(count),
@@ -9599,14 +9623,14 @@ impl TypeTable {
                         _ => None,
                     }
                 });
-                Tooltip::simple(text.unwrap_or_default(), cx)
+                studio_ui::ds::tooltip_view(text.unwrap_or_default(), cx)
             }
         });
         h_flex()
             .id(ElementId::NamedInteger("blob".into(), id))
             .min_w_0()
             .gap(px(space::XS))
-            .when_some(tooltip, |cell, tooltip| cell.tooltip(tooltip))
+            .when_some(tooltip, |cell, tooltip| cell.tip_fn(tooltip))
             .child(
                 studio_ui::ds::text::body(text)
                     .color(color)
@@ -9708,7 +9732,7 @@ impl TypeTable {
             .top(px(
                 (studio_ui::HEADER_HEIGHT - studio_ui::ds::size::CHECK) / 2.
             ))
-            .tooltip(Tooltip::text(tooltip))
+            .tip(studio_ui::ds::tooltip(tooltip))
             .on_mouse_down(MouseButton::Left, |_, window, cx| {
                 window.prevent_default();
                 cx.stop_propagation();
@@ -10048,11 +10072,11 @@ impl TypeTable {
             cell = cell.child(ring());
         }
         if row.dimmed && col == 0 {
-            cell = cell.tooltip(Tooltip::text(
+            cell = cell.tip(studio_ui::ds::tooltip(
                 "No longer matches the filters or its group. It leaves when the list is read again.",
             ));
         } else if let Some(tooltip) = tooltip {
-            cell = cell.tooltip(Tooltip::text(tooltip));
+            cell = cell.tip(studio_ui::ds::tooltip(tooltip));
         }
         // The key's cell ends in the row's Peek while the row is hovered, as the reference
         // table's cells end in their action.
@@ -10060,9 +10084,11 @@ impl TypeTable {
             div().ml_auto().flex_none().child(
                 studio_ui::ds::cell_action(("peek-row", ix), IconName::Eye)
                     .visible_on_hover(ROW_GROUP)
-                    .tooltip({
+                    .tip_fn({
                         let focus = self.focus_handle.clone();
-                        move |_, cx| Tooltip::for_action_in("Peek", &PeekRow, &focus, cx)
+                        move |_, cx| {
+                            studio_ui::ds::tooltip_for_action_in_view("Peek", &PeekRow, &focus, cx)
+                        }
                     })
                     .on_click(cx.listener(move |this, _, window, cx| this.peek_at(ix, window, cx))),
             )
@@ -10140,7 +10166,7 @@ impl TypeTable {
                 studio_ui::ds::row_button("retry-more", "Retry")
                     .style(ButtonStyle::Subtle)
                     .start_icon(Icon::new(IconName::Warning))
-                    .tooltip(Tooltip::text(format!(
+                    .tip(studio_ui::ds::tooltip(format!(
                         "The next page could not be read: {error}"
                     )))
                     .on_click(cx.listener(|this, _, _, cx| {
