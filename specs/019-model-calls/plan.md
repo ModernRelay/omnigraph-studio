@@ -235,7 +235,7 @@ filter box, since the key is the person's own and the settings row already says 
 "Filter in words…", always shown, before the control chips: a pill on the chips' height
 (`ds::pill_field`) with the model's mark where the search field has its glass, its spinner while a call is out,
 and its red line when one failed, with why in its tooltip (`studio_table::FilterInWords`,
-⌘⇧F, puts the cursor in it). Enter calls `table-filter` (Fast; 32 KB in, since a wide type with many relationships describes itself in more than 8 KB; 300 tokens out, 10 s; each related type's properties are said once, and left out, with a line saying so, when they would pass the cap) with the type's property names and
+⌘⇧F, puts the cursor in it). Enter calls `table-filter` (Fast; 48 KB in, since a wide type with many relationships describes itself in more than 8 KB, the personal graph's Artifact in about 33 KB; 300 tokens out, 10 s; each related type's properties are said once, and left out, with a line saying so, when they would pass the cap) with the type's property names and
 value types, its enums' values, its relationship keys (`relationship_key`), what each operator
 takes, today's date, and the sentence. The schema is built per
 type: `property` an enum of the type's keys, `op` an enum of the operators, `value` a list of
@@ -254,7 +254,11 @@ relationship as GQ in the edge's own direction from the row `$n` to the related 
 short grammar; the table makes it a condition filter (spec
 004) only when the compiler accepts it, else the note names the diagnostic. The rest become pills as if added by hand, so
 they are seen and removable, and the table reads as it does for any filter. A second sentence
-replaces the filters the first made and keeps ones added by hand. Measured: 1.5–2.8 s on
+replaces the filters the first made and keeps ones added by hand. The answer may also set the
+order, the grouping and the shown columns (`sort`, `group_by`, `columns`), each a list the
+model leaves empty to keep the table's own and each checked against what the table offers
+(`words::view`): the columns are taken as a saved view's are, the pinned key column always
+shown, and what a sentence does not set stays as it was. Measured: 1.5–2.8 s on
 Haiku with every answer right; Escape leaves the field and clears what it said.
 The Fill button's tooltip and the Summarize button's name what goes out and to which model.
 
@@ -295,7 +299,7 @@ name to the settings description's list. It never calls OpenRouter itself.
 
 | | Fast | Careful |
 |---|---|---|
-| Input | ≤ 8 KB (`table-filter` 32 KB, `column-fill` 4 KB) | ≤ 64 KB |
+| Input | ≤ 8 KB (`table-filter` 48 KB, `column-fill` 4 KB) | ≤ 64 KB |
 | Output | ≤ 300 tokens (`column-fill` 200) | ≤ 1,200 tokens |
 | Time | 10 s | 60 s |
 | In flight per control | 1 | 1 |
@@ -335,6 +339,7 @@ A call is never retried. The model list is read at most once a day.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-01 | A sentence also sets the order, the grouping and the columns | `type_table` `words::tests::an_answer_sets_the_order_grouping_and_columns_the_table_offers` (taken where offered, refused and named otherwise, none keeps the table's; the schema offers each the table has choices for), `table::tests::a_sentence_sets_the_order_grouping_and_columns` (the pinned key stays, the rest in the order named, what is not said stays). Each fails with its check undone (checked); the uncommitted instrument over the personal graph's schema measured the input | Pass. With these lines Artifact's input is 33,104 B, so the cap rises from 32 to 48 KiB, still under the Careful tier's 64 |
 | 2026-11-01 | A predicate names an incoming relationship in its own direction | `gq_language` `a_condition_is_spliced_in_and_judged_by_the_compiler` (extended: `out:Knows` is `$n knows $r`, `in:Knows` `$r knows $n`, a reserved-word edge quoted, and an incoming block compiles), `type_table` `words::tests` (the input shows the oriented GQ). The builder test fails with every key oriented outgoing (checked); the throwaway instrument over the personal graph's schema measured the input after the merge with the condition filter | Fixed. The input gave `$n <traversal> $r` for every relationship. The compiler orients a traversal by its ends' types, so that read right between two types, but on an edge from a type to itself it always reads outgoing: a predicate on an incoming same-type relationship matched the other way round. The edge was also not quoted where its name is a reserved word. Each relationship line now shows its GQ and the related type in place of the label, which keeps Artifact at 32,647 B and Person at 26,706 B, under the 32 KiB cap |
 | 2026-10-31 | The sentence filter's input fits the cap on the personal graph's widest types | `type_table` `the_input_says_each_related_type_once_and_fits_the_cap` (a related type reached twice is described once; 400 relationships leave the related types' properties out, say so, and stay within the cap); an uncommitted instrument over the personal graph's schema (100 node types, 549 edge types) | Before: Person 50,383 B and Artifact 48,303 B, over the 32 KiB cap, so the call was refused on both. After: 25,452 B and 31,393 B, every type within the cap and none leaving related properties out. Each relationship repeated the relationship operators and the related type's properties; both are now said once |
 | 2026-10-30 | The crate sends the schema under strict with the provider policy, parses the answer as the task's type, and tells its errors apart | `model` `a_call_sends_the_schema_and_parses_the_answer`, `errors_are_told_apart`, `the_model_list_keeps_schema_models_with_prices` (a fake HTTP client) | Pass |
