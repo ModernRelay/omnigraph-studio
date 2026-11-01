@@ -4,7 +4,7 @@
 //! back goes through the same keys, operators and value parsing a filter typed by hand does;
 //! one the type cannot take is dropped and named.
 
-use gq_language::builder::{Filter, FilterOp, Sort};
+use gq_language::builder::{Filter, FilterOp, NODE_VAR, Sort};
 use gq_language::schema::Property;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -188,8 +188,8 @@ pub fn input(
         .unwrap_or_default();
     if !relationships.is_empty() {
         text.push_str(&format!(
-            "\nRelationships, each with operators {}, its GQ in a predicate from the row $n to \
-             the related record $r, and the related type; `key.<property>` tests the related \
+            "\nRelationships, each with operators {}, its GQ in a predicate from the row {NODE_VAR} \
+             to the related record $r, and the related type; `key.<property>` tests the related \
              record's property, with that property's operators:\n",
             op_keys(&common)
         ));
@@ -266,7 +266,7 @@ pub fn input(
          value; has_any and has_none take no value and test a relationship; a key with a dot \
          tests the related records' property, which is how to filter by a related record's \
          name or kind; related_to takes one value, the related record's name, only for one \
-         exact record.\n\nGQ for `predicate`, on the row $n: a property is $n.<key>; compare \
+         exact record.\n\nGQ for `predicate`, on the row {NODE_VAR}: a property is {NODE_VAR}.<key>; compare \
          with =, !=, <, <=, >, >=, contains, starts_with, in [..]; `is null`; combine with and, \
          or, not, and parentheses. Or, as the whole predicate, one block on a related record: \
          `exists {{ $r: <Type>  <its GQ>  $r.<property> = \"x\"  $r.<other> > 3 }}` or \
@@ -553,6 +553,10 @@ mod tests {
                 "mood is not a key of this type",
                 "kind cannot be tested with gt"
             ]
+        );
+        assert!(
+            INSTRUCTIONS.contains(&format!("the row variable {NODE_VAR} ")),
+            "the instructions name the row the queries bind"
         );
         let text = input(
             "Event",

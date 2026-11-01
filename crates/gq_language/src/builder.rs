@@ -361,9 +361,10 @@ impl FilterOp {
 pub const ID_FILTER: &str = "@id";
 /// The filter key of a GQ condition ([`FilterOp::Expr`]): no property is named so.
 pub const WHERE_FILTER: &str = "@where";
-/// The row's variable a condition names in a node table, and in an edge table, whose ends are
-/// `$a` and `$b`.
+/// The row's variable in a node table's queries, which a condition names: the queries of its
+/// rows bind it, and the filter in words and the condition field speak of it.
 pub const NODE_VAR: &str = "$n";
+/// The row's variable in an edge table's queries, whose ends are `$a` and `$b`.
 pub const EDGE_VAR: &str = "$e";
 
 /// The filter key of a relationship group: `out:WorksAt`, `in:Knows`.
@@ -1021,7 +1022,7 @@ fn node_page_reading(
     let limit = if empty { 0 } else { limit };
     let mut params = Params::new();
     let (keyset, order) = keyset("n", &node.name, &node.properties, sort, start, &mut params)?;
-    let mut clauses = vec![format!("$n: {}", node.name)];
+    let mut clauses = vec![format!("{NODE_VAR}: {}", node.name)];
     clauses.extend(keyset);
     clauses.extend(filter_clauses(
         schema,
@@ -1070,7 +1071,7 @@ pub fn node_count(
 ) -> Result<BuiltQuery, BuildError> {
     let node = node(schema, type_name)?;
     let mut params = Params::new();
-    let mut clauses = vec![format!("$n: {}", node.name)];
+    let mut clauses = vec![format!("{NODE_VAR}: {}", node.name)];
     clauses.extend(filter_clauses(
         schema,
         &node.name,
@@ -1303,7 +1304,7 @@ pub fn edge_page_without(
     let (keyset, order) = keyset("e", &edge.name, &edge.properties, sort, start, &mut params)?;
     let mut clauses = vec![
         format!("$a: {}", edge.from),
-        format!("$a $e:{} $b", edge.traversal()),
+        format!("$a {EDGE_VAR}:{} $b", edge.traversal()),
     ];
     clauses.extend(keyset);
     clauses.extend(filter_clauses(
@@ -1356,7 +1357,7 @@ pub fn edge_count(
     let mut params = Params::new();
     let mut clauses = vec![
         format!("$a: {}", edge.from),
-        format!("$a $e:{} $b", edge.traversal()),
+        format!("$a {EDGE_VAR}:{} $b", edge.traversal()),
     ];
     clauses.extend(filter_clauses(
         schema,
@@ -1399,7 +1400,7 @@ pub fn value_counts(
             "$e.@id",
             vec![
                 format!("$a: {}", edge.from),
-                format!("$a $e:{} $b", edge.traversal()),
+                format!("$a {EDGE_VAR}:{} $b", edge.traversal()),
             ],
             edge.properties.as_slice(),
             edge.name.clone(),
@@ -1463,7 +1464,7 @@ pub fn neighbour_counts(
     let (_, other_type, hop) = hop(edge, direction, "$n", "$g");
     let other = self::node(schema, other_type)?;
     let mut params = Params::new();
-    let mut clauses = vec![format!("$n: {}", node.name)];
+    let mut clauses = vec![format!("{NODE_VAR}: {}", node.name)];
     clauses.extend(filter_clauses(
         schema,
         &node.name,
@@ -1531,7 +1532,7 @@ pub fn neighbour_value_counts(
             property: property_name.to_owned(),
         })?;
     let mut params = Params::new();
-    let mut clauses = vec![format!("$n: {}", node.name)];
+    let mut clauses = vec![format!("{NODE_VAR}: {}", node.name)];
     clauses.extend(filter_clauses(
         schema,
         &node.name,
@@ -1595,7 +1596,7 @@ pub fn endpoint_value_counts(
     let mut params = Params::new();
     let mut clauses = vec![
         format!("$a: {}", edge.from),
-        format!("$a $e:{} $b", edge.traversal()),
+        format!("$a {EDGE_VAR}:{} $b", edge.traversal()),
     ];
     clauses.extend(filter_clauses(
         schema,
@@ -3123,6 +3124,18 @@ mod tests {
                 .contains("($n.name starts_with \"A\" or $n.name contains \"z\")"),
             "{}",
             query.text
+        );
+        // The row a condition names is the one the query binds, spelled in one place.
+        assert!(
+            query.text.contains(&format!("{NODE_VAR}: Person")),
+            "{}",
+            query.text
+        );
+        let edges = edge_page(&schema, "WorksAt", &[], None, &PageStart::First, 10).unwrap();
+        assert!(
+            edges.text.contains(&format!("{EDGE_VAR}:worksAt")),
+            "{}",
+            edges.text
         );
         // A block stands as a clause of its own: the grammar takes none inside an expression.
         let block = Filter {
