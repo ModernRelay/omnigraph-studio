@@ -36,6 +36,8 @@ pub struct Property {
     pub list: bool,
     pub enum_values: Option<Vec<String>>,
     pub is_key: bool,
+    /// Declared `@index`: the engine's full-text `search` works on it.
+    pub indexed: bool,
 }
 
 impl Property {
@@ -308,6 +310,16 @@ impl SchemaModel {
                 .eq(other.nodes.iter().map(NodeType::label_property))
     }
 
+    /// [`Self::same_as`] for two schemas a view may hold, either absent: none is the same as
+    /// none, and the same model is the same without comparing it.
+    pub fn same_held(a: Option<&std::sync::Arc<Self>>, b: Option<&std::sync::Arc<Self>>) -> bool {
+        match (a, b) {
+            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b) || a.same_as(b),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
     pub fn edge(&self, name: &str) -> Option<&EdgeType> {
         self.edges.get(*self.edge_index.get(name)?)
     }
@@ -477,6 +489,13 @@ fn property(shape: &PropertyShape, keys: &[String]) -> Property {
             .property_constraints
             .iter()
             .any(|c| matches!(c, PropertyConstraintShape::Key));
+    // A one-column `@index` on free text is a full-text index, and a key declares one too
+    // (the compiler's T27).
+    let indexed = is_key
+        || shape
+            .property_constraints
+            .iter()
+            .any(|c| matches!(c, PropertyConstraintShape::Index));
     Property {
         name: shape.name.clone(),
         kind,
@@ -485,6 +504,7 @@ fn property(shape: &PropertyShape, keys: &[String]) -> Property {
         list: *list,
         enum_values: enum_values.clone(),
         is_key,
+        indexed,
     }
 }
 

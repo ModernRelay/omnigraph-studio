@@ -82,6 +82,26 @@ pub enum WindowStyle {
     Glass,
 }
 
+/// How a review lays out a branch's changes (spec 008).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewLayout {
+    /// One sentence per type changed, its entities in a table under it.
+    #[default]
+    Feed,
+    /// The changes listed beside one record at a time.
+    Split,
+}
+
+impl ReviewLayout {
+    pub fn other(self) -> Self {
+        match self {
+            Self::Feed => Self::Split,
+            Self::Split => Self::Feed,
+        }
+    }
+}
+
 /// Where the bottom panel spans, as Zed's `bottom_dock_layout`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -159,6 +179,10 @@ pub struct StudioOptions {
         extend("x-section" = "Browsing", "x-step" = 500, "x-per-graph" = true)
     )]
     pub canvas_max_nodes: u32,
+    /// How a review lays out a branch's changes: a feed of the types changed, or the changes
+    /// listed beside one record at a time.
+    #[schemars(title = "Review layout", extend("x-section" = "Browsing"))]
+    pub review_layout: ReviewLayout,
     /// Seconds between checks that the server still answers.
     #[schemars(
         title = "Health check interval",
@@ -185,6 +209,7 @@ impl Default for StudioOptions {
             type_table_page_size: 100,
             tree_page_size: 50,
             canvas_max_nodes: 2000,
+            review_layout: ReviewLayout::default(),
             health_check_seconds: 30,
             show_performance: false,
             auto_update: true,

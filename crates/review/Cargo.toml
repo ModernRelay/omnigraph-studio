@@ -17,6 +17,7 @@ editor = { workspace = true }
 futures = { workspace = true }
 menu = { workspace = true }
 studio_ui = { workspace = true }
+studio_settings = { workspace = true }
 change_cards = { workspace = true }
 studio_actions = { workspace = true }
 studio_workspace = { workspace = true }

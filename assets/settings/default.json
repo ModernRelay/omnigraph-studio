@@ -16,6 +16,7 @@
     "type_table_page_size": 100,
     "tree_page_size": 50,
     "canvas_max_nodes": 2000,
+    "review_layout": "feed",
     "health_check_seconds": 30,
     "show_performance": false,
     "auto_update": true

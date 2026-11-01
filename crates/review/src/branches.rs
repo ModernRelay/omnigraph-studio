@@ -595,7 +595,7 @@ impl CreateBranchModal {
                                 Some(start_refusal_notice(refusal, &error.body.error).into())
                         }
                         None => {
-                            this.error = Some(format!("Not created: {}", error.body.error).into())
+                            this.error = Some(format!("Not created: {}", error.reason()).into())
                         }
                     },
                     WriteOutcome::NotSent { reason } => {
@@ -897,7 +897,7 @@ impl DeleteBranchModal {
                     match outcome {
                         WriteOutcome::Committed(_) => cx.emit(DismissEvent),
                         WriteOutcome::Refused(error) => {
-                            this.error = Some(format!("Not deleted: {}", error.body.error).into())
+                            this.error = Some(format!("Not deleted: {}", error.reason()).into())
                         }
                         WriteOutcome::NotSent { reason } => {
                             this.error = Some(format!("Not deleted: {reason}").into())

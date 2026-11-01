@@ -572,6 +572,10 @@ pub mod review {
             Merge,
             /// Summarize the branch's changes with a model, for the reviewer (spec 019).
             Summarize,
+            /// Unfold the selected change to what it holds, or fold it back to its line.
+            ToggleChange,
+            /// Switch the review between its feed of types and one record at a time.
+            SwitchLayout,
         ]
     );
 }

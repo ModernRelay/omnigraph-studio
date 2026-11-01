@@ -109,6 +109,9 @@ struct FilterDraft {
     property: String,
     op: FilterOp,
     error: Option<String>,
+    /// The applied filter this draft edits, taken out of the bar while it is open: put back
+    /// when the draft is cancelled, replaced when it is applied.
+    replacing: Option<Filter>,
     /// What the value field offers for its text, the one ↵ picks, and the node search under way.
     offers: Offers,
     /// The text `offers` answers; while it differs from the field, a node search is out.
@@ -6432,9 +6435,7 @@ impl TypeTable {
             return;
         }
         if self.filter_draft.is_some() {
-            self.filter_draft = None;
-            window.focus(&self.focus_handle, cx);
-            cx.notify();
+            self.cancel_filter_draft(window, cx);
             return;
         }
         // Esc ends the edit; a draft the cell held stays, as it was before the edit.
@@ -6683,12 +6684,38 @@ impl TypeTable {
 
     /// The icon of a filter key: the property's kind, or the relationship's direction.
     fn key_icon(&self, key: &str) -> IconName {
-        if let Some((direction, _)) = builder::parse_relationship_key(key) {
+        if key == builder::WHERE_FILTER {
+            return IconName::Code;
+        }
+        if let Some((direction, _)) =
+            builder::parse_relationship_key(key.split('.').next().unwrap_or(key))
+        {
             return direction_icon(direction);
         }
         self.filterable()
             .find(|p| p.name == key)
             .map_or(IconName::CaseSensitive, property_icon)
+    }
+
+    /// The property a filter key tests: the table's own, or a neighbour's through a
+    /// relationship key (`out:Attended.name`). None for a relationship itself.
+    fn property_for_key(&self, key: &str) -> Option<Property> {
+        if let Some((relationship, property)) = key.split_once('.') {
+            let (direction, edge) = builder::parse_relationship_key(relationship)?;
+            let schema = self.schema.as_ref()?;
+            let group = schema
+                .relationships_of(&self.type_name)
+                .iter()
+                .find(|group| group.direction == direction && group.edge == edge)?;
+            return schema
+                .node(&group.other_type)?
+                .properties
+                .iter()
+                .find(|p| p.name == property)
+                .filter(|p| !FilterOp::for_property(p).is_empty())
+                .cloned();
+        }
+        self.filterable().find(|p| p.name == key).cloned()
     }
 
     /// What a filter can test: each filterable property, then (in a node table) each
@@ -6709,20 +6736,72 @@ impl TypeTable {
                     gq_language::traversal_name(&group.edge),
                     group.other_type
                 );
-                choices.push((key, label, direction_icon(group.direction)));
+                choices.push((key.clone(), label.clone(), direction_icon(group.direction)));
+                // Then the neighbour's own properties, a nested search each: "attended Person
+                // · name".
+                if let Some(other) = schema.node(&group.other_type) {
+                    for property in &other.properties {
+                        if property.is_key || FilterOp::for_property(property).is_empty() {
+                            continue;
+                        }
+                        choices.push((
+                            builder::neighbour_property_key(group, &property.name),
+                            format!("{label} · {}", property.name),
+                            direction_icon(group.direction),
+                        ));
+                    }
+                }
             }
+            // Anything the pills cannot say, as GQ on the row (spec 004, "Condition").
+            choices.push((
+                builder::WHERE_FILTER.to_owned(),
+                "Condition (GQ)".to_owned(),
+                IconName::Code,
+            ));
         }
         choices
     }
 
+    /// Judges a condition as the compiler would before a read: the page query with the
+    /// condition in it type-checks against the schema, or the first diagnostic says why not.
+    fn check_condition(&self, text: &str) -> Result<(), String> {
+        let Some(schema) = &self.schema else {
+            return Err("The schema is not loaded yet.".to_owned());
+        };
+        let filter = Filter {
+            property: builder::WHERE_FILTER.to_owned(),
+            op: FilterOp::Expr,
+            value: Value::String(text.to_owned()),
+        };
+        let query = builder::node_page(
+            schema,
+            &self.type_name,
+            &[filter],
+            None,
+            &PageStart::First,
+            1,
+        )
+        .map_err(|error| error.to_string())?;
+        let checked = gq_language::check(schema, &query.text);
+        match checked.diagnostics.first() {
+            None => Ok(()),
+            Some(diagnostic) => Err(match &diagnostic.fix {
+                Some(fix) => format!("{} ({fix})", diagnostic.message),
+                None => diagnostic.message.clone(),
+            }),
+        }
+    }
+
     /// The tests offered for a filter key.
     fn ops_for(&self, key: &str) -> Vec<FilterOp> {
+        if key == builder::WHERE_FILTER {
+            return vec![FilterOp::Expr];
+        }
         if builder::parse_relationship_key(key).is_some() {
             return FilterOp::for_relationship();
         }
-        self.filterable()
-            .find(|p| p.name == key)
-            .map(FilterOp::for_property)
+        self.property_for_key(key)
+            .map(|property| FilterOp::for_property(&property))
             .unwrap_or_default()
     }
 
@@ -6749,6 +6828,7 @@ impl TypeTable {
             property: name,
             op,
             error: None,
+            replacing: None,
             offers: Offers::default(),
             // An empty field answers itself; text put in it is searched for.
             answers: Some(String::new()),
@@ -6779,7 +6859,7 @@ impl TypeTable {
                 .find(|group| builder::relationship_key(group) == key)?;
             return Some(SuggestSource::Nodes(group.other_type.clone()));
         }
-        let property = self.filterable().find(|p| p.name == key)?;
+        let property = self.property_for_key(key)?;
         if let Some(values) = &property.enum_values {
             return Some(SuggestSource::Values(values.clone()));
         }
@@ -6901,6 +6981,51 @@ impl TypeTable {
         }
     }
 
+    /// A click on a pill: the filter comes out of the bar into the draft, its key, test and
+    /// value as they were, to change and apply again or put back with Esc.
+    fn edit_filter(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.filters.len() {
+            return;
+        }
+        // A draft already open goes back first, so nothing is lost.
+        self.cancel_filter_draft(window, cx);
+        let filter = self.filters.remove(index);
+        self.set_draft_property(filter.property.clone(), window, cx);
+        let Some(draft) = &mut self.filter_draft else {
+            self.filters.insert(index, filter);
+            return;
+        };
+        draft.op = filter.op;
+        let text = if filter.op.takes_value() {
+            edit_text(&filter.value)
+        } else {
+            String::new()
+        };
+        draft.replacing = Some(filter);
+        let op = draft.op;
+        self.filter_editor.update(cx, |editor, cx| {
+            editor.set_text(text, window, cx);
+            editor.set_placeholder_text(filter_placeholder(op), window, cx);
+            let end = editor.buffer().read(cx).read(cx).len();
+            editor.change_selections(Default::default(), window, cx, |s| {
+                s.select_ranges(vec![end..end])
+            });
+        });
+        self.refresh_suggestions(cx);
+        cx.notify();
+    }
+
+    /// Closes the draft; a filter it was editing goes back where it was.
+    fn cancel_filter_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(draft) = self.filter_draft.take() {
+            if let Some(filter) = draft.replacing {
+                self.filters.push(filter);
+            }
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
+        }
+    }
+
     fn set_draft_op(&mut self, op: FilterOp, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(draft) = &mut self.filter_draft {
             draft.op = op;
@@ -6923,14 +7048,22 @@ impl TypeTable {
         let key = draft.property.clone();
         let op = draft.op;
         let text = self.filter_editor.read(cx).text(cx);
-        let parsed = if op.is_relationship() {
+        let parsed = if op == FilterOp::Expr {
+            let text = text.trim();
+            if text.is_empty() {
+                Err("Enter a condition".to_owned())
+            } else {
+                self.check_condition(text)
+                    .map(|()| Value::String(text.to_owned()))
+            }
+        } else if op.is_relationship() {
             match op {
                 FilterOp::RelatedTo if text.trim().is_empty() => Err("Enter a node id".to_owned()),
                 FilterOp::RelatedTo => Ok(Value::String(text.trim().to_owned())),
                 _ => Ok(Value::Null),
             }
         } else {
-            let Some(property) = self.filterable().find(|p| p.name == key).cloned() else {
+            let Some(property) = self.property_for_key(&key) else {
                 return;
             };
             if op == FilterOp::In {
@@ -6976,8 +7109,10 @@ impl TypeTable {
             .into_iter()
             .map(|(key, label, _)| words::Choice {
                 ops: self.ops_for(&key),
-                property: self.filterable().find(|p| p.name == key).cloned(),
+                property: self.property_for_key(&key),
                 other_type: self.related_type(&key),
+                traversal: builder::parse_relationship_key(&key)
+                    .map(|(_, edge)| gq_language::traversal_name(edge)),
                 key,
                 label,
             })
@@ -7084,6 +7219,24 @@ impl TypeTable {
                 }
             }
             filters.retain(|filter| filter.op != FilterOp::RelatedTo || !filter.value.is_null());
+            // A condition the model wrote is judged as a typed one is: by the compiler, before
+            // any read; one it refuses is dropped and the diagnostic named.
+            let mut judged = Vec::with_capacity(filters.len());
+            for filter in filters {
+                if filter.op == FilterOp::Expr {
+                    let text = filter.value.as_str().unwrap_or_default().to_owned();
+                    match this
+                        .read_with(cx, |this, _| this.check_condition(&text))
+                        .unwrap_or_else(|_| Err("The table was closed.".to_owned()))
+                    {
+                        Ok(()) => judged.push(filter),
+                        Err(why) => refused.push(format!("condition: {why}")),
+                    }
+                } else {
+                    judged.push(filter);
+                }
+            }
+            let filters = judged;
             this.update(cx, |this, cx| {
                 this.node_labels.extend(labels);
                 // The last sentence's filters go; ones added by hand stay.
@@ -7359,15 +7512,22 @@ impl TypeTable {
             {
                 value = Some(label.clone());
             }
-            bar = bar.child(studio_ui::ds::filter_pill(
-                ("filter", index),
-                self.key_icon(&filter.property),
-                field,
-                test,
-                value.map(Into::into),
-                cx.listener(move |this, _, _, cx| this.remove_filter(index, cx)),
-                cx,
-            ));
+            bar = bar.child(
+                studio_ui::ds::filter_pill(
+                    ("filter", index),
+                    self.key_icon(&filter.property),
+                    field,
+                    test,
+                    value.map(Into::into),
+                    cx.listener(move |this, _, _, cx| this.remove_filter(index, cx)),
+                    cx,
+                )
+                .cursor_pointer()
+                .tooltip(Tooltip::text("Edit this filter"))
+                .on_click(
+                    cx.listener(move |this, _, window, cx| this.edit_filter(index, window, cx)),
+                ),
+            );
         }
         if let Some(draft) = &self.filter_draft {
             let table = cx.entity().downgrade();
@@ -7523,11 +7683,7 @@ impl TypeTable {
                             )
                             .tooltip(Tooltip::text("Discard this filter (Esc)"))
                             .on_click(cx.listener(
-                                |this, _, window, cx| {
-                                    this.filter_draft = None;
-                                    window.focus(&this.focus_handle, cx);
-                                    cx.notify();
-                                },
+                                |this, _, window, cx| this.cancel_filter_draft(window, cx),
                             )),
                         ),
                 );
@@ -8259,8 +8415,10 @@ impl TypeTable {
                     this.blob_tasks.remove(&key);
                     this.blobs.remove(&key.0, &key.1);
                 }
+                // One pass over the queue, however many leave it.
+                let leaving: HashSet<&(String, String)> = waiting_gone.iter().collect();
+                this.blob_queue.retain(|waiting| !leaving.contains(waiting));
                 for key in &waiting_gone {
-                    this.blob_queue.retain(|waiting| waiting != key);
                     if matches!(this.blobs.get(&key.0, &key.1), Some(Loadable::Loading)) {
                         this.blobs.remove(&key.0, &key.1);
                     }
@@ -9476,6 +9634,9 @@ fn filter_placeholder(op: FilterOp) -> &'static str {
     match op {
         FilterOp::In => "Values, separated by commas",
         FilterOp::RelatedTo => "Name or id",
+        FilterOp::StartsWith => "Start of the value",
+        FilterOp::Search => "Words, in any order",
+        FilterOp::Expr => "GQ on $n, for example $n.kind = \"dinner\" or $n.kind = \"party\"",
         _ => "Value",
     }
 }

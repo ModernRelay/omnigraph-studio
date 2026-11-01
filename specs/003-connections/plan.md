@@ -208,9 +208,10 @@ dialog by keyboard), X (capabilities from the served document).
      the token never arriving, asks nothing); on the person's Refresh, not when a graph is first
      shown, whose first reads use the connect's token (since 2026-10-22; before, opening a graph
      asked twice and dropped a token typed in); when the target's entry or token file changes;
-     and when a CLI is installed, upgraded or removed. After an ask after a refusal, a graph
-     read's 401 asks nothing until a read is taken or the credential changes otherwise (a
-     renewal's or a Refresh's token, a new transport); after a probe's ask, a probe's 401 asks
+     and when a CLI is installed, upgraded or removed. After an ask after a refusal, a 401 to
+     any request of the graph (a read, a write, the agent's through its gateway) asks nothing
+     until the server takes a request of a graph with the token held or the credential changes otherwise
+     (a renewal's or a Refresh's token, a new transport); after a probe's ask, a probe's 401 asks
      nothing until a connect is ready, the token is asked for anew (Refresh, a change to the CLI)
      or a new source is taken (since 2026-10-30; before, a read's 401 asked again when the
      probe's ask gave the refused token back). The secure store

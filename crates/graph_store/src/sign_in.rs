@@ -2177,7 +2177,7 @@ mod tests {
                     .count()
             };
             served.lock().unwrap().hold_token = true;
-            connection.update(cx, |c, cx| c.read_refused(cx));
+            connection.update(cx, |c, cx| c.request_refused(cx));
             until(cx, "the refresh the 401 asked for", |_| refreshes() == 2);
             connection.update(cx, |c, cx| {
                 if rename {
@@ -2216,7 +2216,7 @@ mod tests {
             sign_in_state(&connection, cx).0 == ConnectionState::Ready
         });
         served.lock().unwrap().hold_refresh = true;
-        connection.update(cx, |c, cx| c.read_refused(cx));
+        connection.update(cx, |c, cx| c.request_refused(cx));
         until(cx, "the refresh the 401 asked for", |_| {
             served
                 .lock()
@@ -2246,7 +2246,7 @@ mod tests {
                 || !matches!(sign_in, SignIn::SignedIn { .. })
                 || connection.read_with(cx, |c, _| c.client().credential_changes()) != changes
         });
-        connection.update(cx, |c, cx| c.read_refused(cx));
+        connection.update(cx, |c, cx| c.request_refused(cx));
         until(cx, "the new sign-in asked after the refusal", |_| {
             served
                 .lock()
@@ -2886,7 +2886,7 @@ mod tests {
                 .count()
         };
         // The ask after a refused read starts the refresh; a connect's ask joins it.
-        connection.update(cx, |c, cx| c.read_refused(cx));
+        connection.update(cx, |c, cx| c.request_refused(cx));
         until(cx, "the refresh after the refusal", |_| refreshes() == 2);
         connection.update(cx, |c, cx| c.connect(cx));
         cx.run_until_parked();
@@ -3434,7 +3434,7 @@ mod tests {
         connection.update(cx, |c, cx| c.sign_in(cx));
         assert_eq!(sign_in_state(&connection, cx).1, SignIn::Reading);
         served.lock().unwrap().refresh.clear();
-        connection.update(cx, |c, cx| c.read_refused(cx));
+        connection.update(cx, |c, cx| c.request_refused(cx));
         until(cx, "the one held ended", |cx| {
             !connection.read_with(cx, |c, _| c.holds_sign_in())
         });

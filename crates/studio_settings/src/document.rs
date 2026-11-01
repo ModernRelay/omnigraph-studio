@@ -1,6 +1,6 @@
 //! `settings.json` as text the person owns (spec 002). Reading accepts comments and trailing
 //! commas, applies every value that fits, and reports each one that does not and each key that
-//! does nothing. Writing edits the text in place: only the settings that changed are rewritten,
+//! does nothing, unless Studio once had it ([`RETIRED`]). Writing edits the text in place: only the settings that changed are rewritten,
 //! a list entry by entry, a setting put back to its default is removed, and comments, order,
 //! every other key and every value set aside stay.
 
@@ -26,6 +26,31 @@ enum Step {
 
 /// The most values the reader sets aside in one file before it gives up on the file.
 const MOST_PROBLEMS: usize = 100;
+
+/// Settings Studio once had, by their keys from the document's root, and all that is under them.
+/// A person's file may still name them, and nothing they could do there is worth an error at
+/// every start, so they are not reported. Their text stays, as any other key's.
+const RETIRED: [&[&str]; 8] = [
+    &["agent", "command"],
+    &["agent", "env"],
+    &["agent", "ask_before_writes"],
+    &["models"],
+    &["panels"],
+    &["studio", "window_style"],
+    &["studio", "corner_radius"],
+    &["studio", "bottom_dock_layout"],
+];
+
+/// Whether a key that does nothing is, or is under, a setting Studio once had.
+fn is_retired(steps: &[Step]) -> bool {
+    RETIRED.iter().any(|retired| {
+        steps.len() >= retired.len()
+            && retired
+                .iter()
+                .zip(steps)
+                .all(|(key, step)| matches!(step, Step::Key(found) if found == key))
+    })
+}
 
 /// Reads a settings document. A value that does not fit, a number outside its setting's range
 /// among them, is set aside and its setting takes the default; the problem is reported with
@@ -62,10 +87,12 @@ fn read_setting_aside(text: &str) -> Result<(Reading, Vec<Vec<Step>>), String> {
         };
         match attempt {
             Ok(settings) => {
-                problems.extend(ignored.into_iter().map(|steps| {
-                    let (line, at) = locate(text, &steps);
-                    (line, format!("{at} is not a setting, so it does nothing."))
-                }));
+                problems.extend(ignored.into_iter().filter(|steps| !is_retired(steps)).map(
+                    |steps| {
+                        let (line, at) = locate(text, &steps);
+                        (line, format!("{at} is not a setting, so it does nothing."))
+                    },
+                ));
                 problems.sort_by_key(|(line, _)| *line);
                 let problems = problems.into_iter().map(|(_, problem)| problem).collect();
                 return Ok((Reading { settings, problems }, aside));
@@ -707,6 +734,41 @@ fn remove_in_text(text: &mut String, path: &[String]) {
 mod tests {
     use super::*;
     use crate::{GraphOverrides, SavedView, ThemeMode};
+
+    /// A key under a setting Studio once had says nothing, and stays in the text; a key beside
+    /// one is still told, as `agent.omnigraph_cli` is.
+    #[test]
+    fn a_retired_setting_is_not_a_problem_and_its_text_stays() {
+        let text = "{\n  \"models\": {\"gone\": 1},\n  \"panels\": {\"nodes\": {\"gone\": 1}},\n  \
+                    \"agent\": {\"gone\": 1}\n}";
+        let reading = read(text).unwrap();
+        assert_eq!(
+            reading.problems,
+            ["`agent.gone` (line 4) is not a setting, so it does nothing."]
+        );
+        let written = edited(text, |settings| settings.ui_font_size = 17.);
+        assert!(written.contains("\"ui_font_size\": 17"), "{written}");
+        for kept in [
+            "\"models\": {\"gone\": 1}",
+            "\"panels\": {\"nodes\": {\"gone\": 1}}",
+        ] {
+            assert!(written.contains(kept), "{written}");
+        }
+    }
+
+    #[test]
+    fn a_retired_setting_is_matched_whole_from_the_root() {
+        let keys = |keys: &[&str]| -> Vec<Step> {
+            keys.iter().map(|key| Step::Key((*key).into())).collect()
+        };
+        assert!(is_retired(&keys(&["studio", "window_style"])));
+        assert!(is_retired(&keys(&["models", "fast"])));
+        assert!(is_retired(&keys(&["agent", "env", "PATH"])));
+        assert!(!is_retired(&keys(&["studio"])));
+        assert!(!is_retired(&keys(&["studio", "window_styles"])));
+        assert!(!is_retired(&keys(&["agent", "omnigraph_cli"])));
+        assert!(!is_retired(&keys(&["graphs", "models"])));
+    }
 
     fn edited(text: &str, f: impl FnOnce(&mut StudioSettings)) -> String {
         let old = read(text).unwrap().settings;

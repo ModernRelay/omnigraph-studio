@@ -211,8 +211,9 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   "Dropped commit <id>" for statements, which report no counts; "Nothing changed" for no
   commit. Refused ("Nothing was written", with the server's diagnostic), not sent ("Not sent:"
   and why, "Nothing was written.", when the connection is retired (its target gone, or a
-  transport Studio cannot use), the server refused the connection, or the request could not be
-  made; the run reads "Not sent · nothing written") or unknown ("Check History before
+  transport Studio cannot use), no connection to the server opened (refused, a name that does
+  not resolve, a failed TLS handshake or proxy tunnel, a connect timeout), or the request could
+  not be made; the run reads "Not sent · nothing written") or unknown ("Check History before
   trying again") as before. The text is the draft and is never cleared.
   Closing the tab does not cancel a write in flight; the session logs its outcome.
 - Parameters of the query under the cursor get an input each; values are typed by

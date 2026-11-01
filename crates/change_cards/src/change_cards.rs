@@ -132,16 +132,33 @@ fn change_card(
     id: impl Into<ElementId>,
 ) -> ChangeCard {
     let change = &folded.changes[ix];
-    let mut card =
-        ChangeCard::new(id, kind_of(change.net()), change.id.clone()).rows(rows.get(ix, || {
-            let mut rows = moved_end_rows(change);
-            rows.extend(property_rows(change, schema));
-            rows
-        }));
+    let mut card = ChangeCard::new(id, kind_of(change.net()), change.id.clone())
+        .rows(change_rows(folded, ix, schema, rows));
     if let Some((from, to)) = change.endpoints() {
         card = card.endpoints(from, to);
     }
     card
+}
+
+/// Change `ix`'s property rows, made once ([`CardRows`]): its changed properties, after the
+/// ends a lone relationship moved.
+pub fn change_rows(
+    folded: &FoldedChanges,
+    ix: usize,
+    schema: Option<&SchemaModel>,
+    rows: &CardRows,
+) -> Rc<[PropertyRow]> {
+    let change = &folded.changes[ix];
+    rows.get(ix, || {
+        let mut rows = moved_end_rows(change);
+        rows.extend(property_rows(change, schema));
+        rows
+    })
+}
+
+/// What a change did to its entity, as a card says it.
+pub fn kind_of_change(change: &FoldedChange) -> ChangeKind {
+    kind_of(change.net())
 }
 
 /// A lone relationship's rows for the ends it moved, `from` and `to`, each its old end against

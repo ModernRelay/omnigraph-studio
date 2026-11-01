@@ -44,6 +44,11 @@ pub struct Models {
     key_state: KeyState,
     /// The models the picker offers, newest read first.
     choices: Vec<ModelChoice>,
+    /// When the list was read (seconds since the epoch), 0 for never: kept rather than read
+    /// from disk again on the main thread at every key change.
+    read_at: u64,
+    /// The list's refresh under way: a key changed again meanwhile starts no second one.
+    _refreshing: Option<Task<()>>,
 }
 
 /// The cached model list: when it was read, and what.
@@ -91,6 +96,8 @@ impl Models {
                 KeyState::None
             },
             choices: Vec::new(),
+            read_at: 0,
+            _refreshing: None,
         });
         cx.set_global(GlobalModels(models.clone()));
         models
@@ -120,8 +127,8 @@ impl Models {
             .ok();
         })
         .detach();
-        let choices = read_cached_list()
-            .map(|list| list.models)
+        let (read_at, choices) = read_cached_list()
+            .map(|list| (list.read_at, list.models))
             .unwrap_or_default();
         let mut this = Self {
             client,
@@ -129,6 +136,8 @@ impl Models {
             key: None,
             key_state: KeyState::Reading,
             choices,
+            read_at,
+            _refreshing: None,
         };
         this.refresh_list_if_stale(cx);
         this
@@ -253,13 +262,12 @@ impl Models {
     }
 
     fn refresh_list_if_stale(&mut self, cx: &mut Context<Self>) {
-        let fresh = read_cached_list()
-            .is_some_and(|list| now_secs().saturating_sub(list.read_at) < LIST_AGE.as_secs());
-        if fresh && !self.choices.is_empty() {
+        let fresh = now_secs().saturating_sub(self.read_at) < LIST_AGE.as_secs();
+        if (fresh && !self.choices.is_empty()) || self._refreshing.is_some() {
             return;
         }
         let client = self.client.clone();
-        cx.spawn(async move |this, cx| {
+        self._refreshing = Some(cx.spawn(async move |this, cx| {
             let models = cx
                 .background_spawn(async move { client.list_models().await })
                 .await;
@@ -278,14 +286,18 @@ impl Models {
                     }
                     this.update(cx, |this, cx| {
                         this.choices = models;
+                        this.read_at = cached.read_at;
+                        this._refreshing = None;
                         cx.notify();
                     })
                     .ok();
                 }
-                Err(error) => log::info!("the model list was not read: {error}"),
+                Err(error) => {
+                    log::info!("the model list was not read: {error}");
+                    this.update(cx, |this, _| this._refreshing = None).ok();
+                }
             }
-        })
-        .detach();
+        }));
     }
 }
 

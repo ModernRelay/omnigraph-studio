@@ -391,7 +391,7 @@ fn held_off_the_branch(query: &str, name: Option<&str>) -> bool {
     use gq_language::TokenKind;
     let tokens = gq_language::tokenize(query);
     let mut declarations: Vec<std::ops::Range<usize>> = Vec::new();
-    let outline = gq_language::outline(query).declarations;
+    let outline = gq_language::outline_of(query, &tokens).declarations;
     let named = outline
         .iter()
         .any(|declaration| Some(declaration.name.as_str()) == name);
@@ -544,13 +544,14 @@ mod tests {
                 Some(json!({"query": query, "name": name, "branch": AGENT})),
             )
         };
-        for held in [
+        let held_cases = [
             "query add($n: String) as commit { insert Person { name: $n } }",
             "query add() @description(\"one\") as /* held */ commit {\n insert Person { name: \"a\" }\n}",
             "query add() as unattached branch { insert Person { name: \"a\" } }",
             "query add($b: String) as unattached branch on $b { insert Person { name: \"a\" } }",
             "set x = 1;\nquery add() as unattached branch on \"01J\" { delete Person where name = \"a\" }",
-        ] {
+        ];
+        for held in held_cases {
             let refusal = mutation(held, None);
             assert!(
                 matches!(&refusal, Verdict::Refuse(text) if text.contains("as commit")),
@@ -563,17 +564,39 @@ mod tests {
         assert!(refused(&mutation(two, None)), "unnamed, either may run");
         assert!(refused(&mutation(two, Some("missing"))));
         // The words elsewhere than the head are not the clause.
-        for written in [
+        let written_cases = [
             "query keep() { insert Person { name: \"as commit\" } }",
             "// as commit\nquery keep() { insert Person { name: \"a\" } }",
             "query keep() /* as commit */ { insert Person { name: \"a\" } }",
-        ] {
+        ];
+        for written in written_cases {
             assert!(
                 matches!(mutation(written, None), Verdict::Write(_)),
                 "{written}"
             );
         }
         assert!(matches!(mutation(two, Some("keep")), Verdict::Write(_)));
+        // The compiler reads the clause too (`declared_write`, from its parse). The gateway reads
+        // tokens alone, so text the compiler cannot parse is not let through unread; wherever the
+        // compiler finds the clause the gateway refuses, and where neither does, both let the
+        // write through.
+        use gq_language::check::{Publication, declared_write};
+        let mut compiler_held = 0;
+        for held in held_cases {
+            if declared_write(held, "add").publication != Publication::Branch {
+                compiler_held += 1;
+                assert!(held_off_the_branch(held, Some("add")), "{held}");
+            }
+        }
+        assert!(compiler_held >= 3, "the compiler parses most of them");
+        for written in written_cases {
+            assert_eq!(
+                declared_write(written, "keep").publication,
+                Publication::Branch,
+                "{written}"
+            );
+            assert!(!held_off_the_branch(written, Some("keep")), "{written}");
+        }
     }
 
     #[test]

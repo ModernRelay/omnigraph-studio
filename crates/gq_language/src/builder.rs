@@ -165,6 +165,10 @@ pub enum FilterOp {
     Gt,
     Ge,
     Contains,
+    /// `$n.p starts_with $f`.
+    StartsWith,
+    /// The engine's full-text filter, `search($n.p, $f)`: the words, in any order and form.
+    Search,
     /// Membership in a list of values (`$n.p in $f`).
     In,
     IsEmpty,
@@ -179,11 +183,15 @@ pub enum FilterOp {
     HasNone,
     /// Joined to the node whose id is the value.
     RelatedTo,
+    /// A GQ condition written by hand or by a model, on the row's variable (`$n` in a node
+    /// table), spliced into the match block in parentheses: `or`, `not`, a count, a further
+    /// hop, anything the grammar has and the pills do not. Its key is [`WHERE_FILTER`].
+    Expr,
 }
 
 impl FilterOp {
     /// Every operator, for [`FilterOp::from_key`].
-    const ALL: [FilterOp; 16] = [
+    const ALL: [FilterOp; 19] = [
         FilterOp::Eq,
         FilterOp::Ne,
         FilterOp::Lt,
@@ -191,6 +199,8 @@ impl FilterOp {
         FilterOp::Gt,
         FilterOp::Ge,
         FilterOp::Contains,
+        FilterOp::StartsWith,
+        FilterOp::Search,
         FilterOp::In,
         FilterOp::IsEmpty,
         FilterOp::IsNotEmpty,
@@ -200,6 +210,7 @@ impl FilterOp {
         FilterOp::HasAny,
         FilterOp::HasNone,
         FilterOp::RelatedTo,
+        FilterOp::Expr,
     ];
 
     /// A stable name, for saved views.
@@ -212,6 +223,8 @@ impl FilterOp {
             FilterOp::Gt => "gt",
             FilterOp::Ge => "ge",
             FilterOp::Contains => "contains",
+            FilterOp::StartsWith => "starts_with",
+            FilterOp::Search => "search",
             FilterOp::In => "in",
             FilterOp::IsEmpty => "is_empty",
             FilterOp::IsNotEmpty => "is_not_empty",
@@ -221,6 +234,7 @@ impl FilterOp {
             FilterOp::HasAny => "has_any",
             FilterOp::HasNone => "has_none",
             FilterOp::RelatedTo => "related_to",
+            FilterOp::Expr => "expr",
         }
     }
 
@@ -237,6 +251,8 @@ impl FilterOp {
             FilterOp::Gt => "greater than",
             FilterOp::Ge => "at least",
             FilterOp::Contains => "contains",
+            FilterOp::StartsWith => "starts with",
+            FilterOp::Search => "matches words",
             FilterOp::In => "is one of",
             FilterOp::IsEmpty => "is empty",
             FilterOp::IsNotEmpty => "is not empty",
@@ -246,6 +262,7 @@ impl FilterOp {
             FilterOp::HasAny => "has any",
             FilterOp::HasNone => "has none",
             FilterOp::RelatedTo => "is related to",
+            FilterOp::Expr => "where",
         }
     }
 
@@ -291,7 +308,18 @@ impl FilterOp {
         } else {
             match property.kind {
                 ScalarKind::Text if property.enum_values.is_none() => {
-                    vec![FilterOp::Eq, FilterOp::Ne, FilterOp::Contains, FilterOp::In]
+                    let mut ops = vec![
+                        FilterOp::Eq,
+                        FilterOp::Ne,
+                        FilterOp::Contains,
+                        FilterOp::StartsWith,
+                    ];
+                    // `search` needs the property's full-text index (the compiler's T27).
+                    if property.indexed {
+                        ops.push(FilterOp::Search);
+                    }
+                    ops.push(FilterOp::In);
+                    ops
                 }
                 ScalarKind::Text => vec![FilterOp::Eq, FilterOp::Ne, FilterOp::In],
                 ScalarKind::Bool => vec![FilterOp::Eq, FilterOp::Ne],
@@ -331,6 +359,12 @@ impl FilterOp {
 
 /// The filter key that matches a node by its `@id`.
 pub const ID_FILTER: &str = "@id";
+/// The filter key of a GQ condition ([`FilterOp::Expr`]): no property is named so.
+pub const WHERE_FILTER: &str = "@where";
+/// The row's variable a condition names in a node table, and in an edge table, whose ends are
+/// `$a` and `$b`.
+pub const NODE_VAR: &str = "$n";
+pub const EDGE_VAR: &str = "$e";
 
 /// The filter key of a relationship group: `out:WorksAt`, `in:Knows`.
 pub fn relationship_key(group: &RelationshipGroup) -> String {
@@ -563,6 +597,8 @@ pub enum BuildError {
     Unbindable(String),
     /// An insert with no value: GQ's insert names at least one.
     NoValues(String),
+    /// A condition filter with no text.
+    EmptyCondition,
 }
 
 impl std::fmt::Display for BuildError {
@@ -583,6 +619,7 @@ impl std::fmt::Display for BuildError {
             BuildError::NoValues(type_name) => {
                 write!(f, "Enter at least one value for the new {type_name}")
             }
+            BuildError::EmptyCondition => write!(f, "Enter a condition"),
         }
     }
 }
@@ -637,6 +674,10 @@ fn filter_clauses(
 ) -> Result<Vec<String>, BuildError> {
     let mut clauses = Vec::new();
     for (i, filter) in filters.iter().enumerate() {
+        if filter.op == FilterOp::Expr {
+            clauses.push(expression_clause(filter)?);
+            continue;
+        }
         if filter.op.is_relationship() {
             clauses.push(relationship_clause(schema, var, i, filter, params)?);
             continue;
@@ -755,6 +796,9 @@ fn property_clause(
                 };
             }
             let param = params.add(&format!("f{i}"), &ty, filter.value.clone());
+            if op == FilterOp::Search {
+                return format!("search({target}, {param})");
+            }
             let operator = match op {
                 FilterOp::Eq => "=",
                 FilterOp::Ne => "!=",
@@ -763,19 +807,41 @@ fn property_clause(
                 FilterOp::Gt => ">",
                 FilterOp::Ge => ">=",
                 FilterOp::Contains => "contains",
+                FilterOp::StartsWith => "starts_with",
                 FilterOp::In => "in",
-                FilterOp::Today
+                FilterOp::Search
+                | FilterOp::Today
                 | FilterOp::ThisWeek
                 | FilterOp::Last30Days
                 | FilterOp::IsEmpty
                 | FilterOp::IsNotEmpty
                 | FilterOp::HasAny
                 | FilterOp::HasNone
-                | FilterOp::RelatedTo => unreachable!(),
+                | FilterOp::RelatedTo
+                | FilterOp::Expr => unreachable!(),
             };
             format!("{target} {operator} {param}")
         }
     }
+}
+
+/// A condition as written: an expression in parentheses, so its `or` binds inside it, or a
+/// block (`exists { … }`, `not { … }`), which the grammar takes only as a clause of its own,
+/// never inside an expression. The compiler checks it against the schema before any read
+/// ([`crate::check`]); the builder only refuses an empty one.
+fn expression_clause(filter: &Filter) -> Result<String, BuildError> {
+    let text = filter.value.as_str().map(str::trim).unwrap_or_default();
+    if text.is_empty() {
+        return Err(BuildError::EmptyCondition);
+    }
+    let block = ["exists {", "exists{", "not {", "not{"]
+        .iter()
+        .any(|start| text.starts_with(start));
+    Ok(if block {
+        text.to_owned()
+    } else {
+        format!("({text})")
+    })
 }
 
 /// A relationship filter as a correlated block: `exists { $r0: Company  $n worksAt $r0 }`, or
@@ -2916,6 +2982,139 @@ mod tests {
         assert!(matches!(
             update_rows(&schema, "Person", &key),
             Err(BuildError::NotEditable(_))
+        ));
+    }
+
+    /// A text property filters by its start and, where it is indexed, by the engine's full-text
+    /// search; either reaches a neighbour's property through a relationship key.
+    #[test]
+    fn text_filters_start_with_search_and_reach_neighbours() {
+        let schema = SchemaModel::parse(
+            "node Person {\n  slug: String @key\n  name: String @index\n  bio: String?\n}\n\
+             edge Knows: Person -> Person @card(0..)\n",
+        )
+        .unwrap();
+        let person = schema.node("Person").unwrap();
+        let name = person.properties.iter().find(|p| p.name == "name").unwrap();
+        let bio = person.properties.iter().find(|p| p.name == "bio").unwrap();
+        assert!(FilterOp::for_property(name).contains(&FilterOp::Search));
+        assert!(
+            !FilterOp::for_property(bio).contains(&FilterOp::Search),
+            "no index"
+        );
+        let starts = Filter {
+            property: "name".into(),
+            op: FilterOp::StartsWith,
+            value: json!("Al"),
+        };
+        let words = Filter {
+            property: "name".into(),
+            op: FilterOp::Search,
+            value: json!("ada lovelace"),
+        };
+        let query = node_page(
+            &schema,
+            "Person",
+            &[starts, words],
+            None,
+            &PageStart::First,
+            10,
+        )
+        .unwrap();
+        assert_compiles_in(&schema, &query);
+        assert!(
+            query.text.contains("$n.name starts_with $f0"),
+            "{}",
+            query.text
+        );
+        assert!(
+            query.text.contains("search($n.name, $f1)"),
+            "{}",
+            query.text
+        );
+        let neighbour = Filter {
+            property: "out:Knows.name".into(),
+            op: FilterOp::Search,
+            value: json!("ada"),
+        };
+        let query =
+            node_page(&schema, "Person", &[neighbour], None, &PageStart::First, 10).unwrap();
+        assert_compiles_in(&schema, &query);
+        assert!(
+            query.text.contains("search($r0.name, $f0)"),
+            "{}",
+            query.text
+        );
+    }
+
+    /// A condition is spliced in as written, in parentheses, beside the pills' clauses, and the
+    /// compiler judges it: a sound one type-checks, a wrong one is a diagnostic, not a read.
+    #[test]
+    fn a_condition_is_spliced_in_and_judged_by_the_compiler() {
+        let schema = dev();
+        let named = Filter {
+            property: "name".into(),
+            op: FilterOp::Contains,
+            value: json!("a"),
+        };
+        let condition = Filter {
+            property: WHERE_FILTER.into(),
+            op: FilterOp::Expr,
+            value: json!("$n.name starts_with \"A\" or $n.name contains \"z\""),
+        };
+        let query = node_page(
+            &schema,
+            "Person",
+            &[named.clone(), condition],
+            None,
+            &PageStart::First,
+            10,
+        )
+        .unwrap();
+        assert_compiles(&query);
+        assert!(
+            query
+                .text
+                .contains("($n.name starts_with \"A\" or $n.name contains \"z\")"),
+            "{}",
+            query.text
+        );
+        // A block stands as a clause of its own: the grammar takes none inside an expression.
+        let block = Filter {
+            property: WHERE_FILTER.into(),
+            op: FilterOp::Expr,
+            value: json!("not { $r: Company  $n worksAt $r  $r.name = \"Acme\" }"),
+        };
+        let query = node_page(&schema, "Person", &[block], None, &PageStart::First, 10).unwrap();
+        assert_compiles(&query);
+        assert!(
+            query.text.contains("\n    not { $r: Company"),
+            "{}",
+            query.text
+        );
+        let wrong = Filter {
+            property: WHERE_FILTER.into(),
+            op: FilterOp::Expr,
+            value: json!("$n.nope = 1"),
+        };
+        let query = node_page(
+            &schema,
+            "Person",
+            &[named, wrong],
+            None,
+            &PageStart::First,
+            10,
+        )
+        .unwrap();
+        assert!(!check(&schema, &query.text).diagnostics.is_empty());
+        let empty = Filter {
+            property: WHERE_FILTER.into(),
+            op: FilterOp::Expr,
+            value: json!("  "),
+        };
+        assert!(matches!(
+            node_page(&schema, "Person", &[empty], None, &PageStart::First, 10),
+            Err(BuildError::EmptyCondition)
         ));
     }
 
