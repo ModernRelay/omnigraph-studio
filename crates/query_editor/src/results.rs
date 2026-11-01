@@ -641,8 +641,9 @@ pub fn is_branch_diff(source: &str) -> bool {
 /// The words of the `branch diff` statement `source` holds after its settings prefix, or
 /// `None` when it holds another.
 fn diff_tokens(source: &str) -> Option<Vec<gq_language::Token>> {
-    let prefix = gq_language::outline(source).prefix.end;
-    let tokens: Vec<gq_language::Token> = gq_language::tokenize(source)
+    let tokens = gq_language::tokenize(source);
+    let prefix = gq_language::outline_of(source, &tokens).prefix.end;
+    let tokens: Vec<gq_language::Token> = tokens
         .into_iter()
         .filter(|t| t.range.start >= prefix && t.kind != TokenKind::Comment)
         .collect();

@@ -391,7 +391,7 @@ fn held_off_the_branch(query: &str, name: Option<&str>) -> bool {
     use gq_language::TokenKind;
     let tokens = gq_language::tokenize(query);
     let mut declarations: Vec<std::ops::Range<usize>> = Vec::new();
-    let outline = gq_language::outline(query).declarations;
+    let outline = gq_language::outline_of(query, &tokens).declarations;
     let named = outline
         .iter()
         .any(|declaration| Some(declaration.name.as_str()) == name);

@@ -8,7 +8,7 @@
 
 use std::ops::Range;
 
-use crate::lex::{KEYWORDS, TokenKind, in_comment_or_string, outline, tokenize};
+use crate::lex::{KEYWORDS, TokenKind, in_comment_or_string, outline_of, tokenize};
 use crate::schema::{SchemaModel, traversal_name};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,14 +43,16 @@ pub fn completions(schema: &SchemaModel, source: &str, offset: usize) -> (usize,
     };
     // A comment or a string is prose: nothing is offered there, so ↵ (which confirms a shown
     // completion) ends the line instead of putting a type name in it.
-    if in_comment_or_string(source, offset) {
+    // The source's tokens, read for that and for its outline.
+    let tokens = tokenize(source);
+    if in_comment_or_string(source, &tokens, offset) {
         return (start, Vec::new());
     }
     let prefix = &source[start..offset];
     let lower = prefix.to_lowercase();
     let matches = |label: &str| label.to_lowercase().starts_with(&lower);
 
-    let declaration = outline(source)
+    let declaration = outline_of(source, &tokens)
         .declaration_at(offset)
         .map(|d| d.range.clone())
         .unwrap_or(0..source.len());
@@ -336,7 +338,7 @@ pub fn hover(schema: &SchemaModel, source: &str, offset: usize) -> Option<(Range
         .position(|t| t.range.start <= offset && offset < t.range.end)?;
     let token = &tokens[index];
     let word = &source[token.range.clone()];
-    let declaration = outline(source)
+    let declaration = outline_of(source, &tokens)
         .declaration_at(offset)
         .map(|d| d.range.clone())
         .unwrap_or(0..source.len());
