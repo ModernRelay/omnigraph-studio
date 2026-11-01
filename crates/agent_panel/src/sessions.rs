@@ -737,6 +737,34 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A directory of the test's own, named at random: no other test shares it, nor a later
+    /// run given the same process id. The store writes on Studio's write thread, so a write
+    /// still out when a test ended could leave its file in a directory named by process id,
+    /// for a later run to load: its records then counted twice. Removed once the writes asked
+    /// for have landed.
+    struct Scratch(tempfile::TempDir);
+
+    impl Scratch {
+        fn new() -> Self {
+            Self(
+                tempfile::Builder::new()
+                    .prefix("studio-agent-")
+                    .tempdir()
+                    .unwrap(),
+            )
+        }
+
+        fn path(&self) -> PathBuf {
+            self.0.path().to_path_buf()
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            studio_settings::writes_done();
+        }
+    }
+
     fn record(session: &str, graph: &str, agent: &str, minutes_ago: i64) -> SessionRecord {
         let at = Utc::now() - chrono::Duration::minutes(minutes_ago);
         SessionRecord {
@@ -759,7 +787,8 @@ mod tests {
     /// since, and its old ids keep none of its state.
     #[gpui::test]
     fn a_rebound_conversation_is_found_by_its_old_id(cx: &mut gpui::TestAppContext) {
-        let path = std::env::temp_dir().join(format!("studio-rebind-{}.json", std::process::id()));
+        let scratch = Scratch::new();
+        let path = scratch.path().join("sessions.json");
         let sessions = cx.new(|_| AgentSessions::load(path.clone()));
         sessions.update(cx, |sessions, cx| {
             sessions.upsert(record("a", "server/crm", "claude", 0), cx);
@@ -773,7 +802,6 @@ mod tests {
             sessions.rebind("gone", "d".into(), cx);
             assert_eq!(sessions.current("gone"), "gone");
         });
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -842,8 +870,8 @@ mod tests {
 
     #[gpui::test]
     fn conversations_are_kept_per_graph_newest_first(cx: &mut gpui::TestAppContext) {
-        let dir =
-            std::env::temp_dir().join(format!("studio-agent-sessions-{}", std::process::id()));
+        let scratch = Scratch::new();
+        let dir = scratch.path();
         let path = dir.join("sessions.json");
         let store = cx.new(|_| AgentSessions::load(path.clone()));
         store.update(cx, |store, cx| {
@@ -932,14 +960,14 @@ mod tests {
             assert!(!store.get("same-a").unwrap().branch_created, "deleted");
         });
         studio_settings::writes_done();
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A conversation the agent could not load, replaced by a new one on its branch, is one
     /// record under the new session, not two on one branch.
     #[gpui::test]
     fn a_conversation_the_agent_could_not_load_follows_the_new_one(cx: &mut gpui::TestAppContext) {
-        let dir = std::env::temp_dir().join(format!("studio-agent-rebind-{}", std::process::id()));
+        let scratch = Scratch::new();
+        let dir = scratch.path();
         let store = cx.new(|_| AgentSessions::load(dir.join("sessions.json")));
         store.update(cx, |store, cx| {
             store.upsert(record("old", "server/crm", "claude", 5), cx);
@@ -959,7 +987,6 @@ mod tests {
             assert_eq!(records.len(), 1);
             assert_eq!(records[0].branch, "agent/old", "the branch it had");
         });
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A file that does not parse as this build writes it is set aside whole, renamed beside
@@ -968,9 +995,8 @@ mod tests {
     /// read whole.
     #[test]
     fn a_file_that_does_not_parse_is_set_aside_whole() {
-        let dir = std::env::temp_dir().join(format!("studio-agent-records-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
+        let scratch = Scratch::new();
+        let dir = scratch.path();
         let path = dir.join("sessions.json");
         let now = Utc::now();
         let record = SessionRecord {
@@ -1070,7 +1096,6 @@ mod tests {
                 assert!(notice.contains("another build of Studio"), "{notice}");
             }
         }
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A conversations file set aside is told once: the index holds the notice from its load
@@ -1079,9 +1104,8 @@ mod tests {
     /// list and nothing said so, nor where the file went.
     #[gpui::test]
     fn a_file_set_aside_is_told_once(cx: &mut gpui::TestAppContext) {
-        let dir = std::env::temp_dir().join(format!("studio-agent-told-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
+        let scratch = Scratch::new();
+        let dir = scratch.path();
         let path = dir.join("sessions.json");
         let mut legacy = serde_json::to_value(record("a", "server/crm", "claude", 0)).unwrap();
         legacy
@@ -1119,7 +1143,6 @@ mod tests {
         let held = AgentSessions::load(path.clone());
         assert_eq!(held.notice, None);
         assert_eq!(held.not_saved(), Some(path.as_path()));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Keeps `path` from being set aside, as another program holding it open without letting
@@ -1143,7 +1166,8 @@ mod tests {
     /// so.
     #[gpui::test]
     fn a_file_that_could_not_be_read_is_never_written_over(cx: &mut gpui::TestAppContext) {
-        let dir = std::env::temp_dir().join(format!("studio-agent-unread-{}", std::process::id()));
+        let scratch = Scratch::new();
+        let dir = scratch.path();
         let fresh = || {
             std::fs::remove_dir_all(&dir).ok();
             std::fs::create_dir_all(&dir).unwrap();
@@ -1192,16 +1216,14 @@ mod tests {
                 assert_eq!(store.not_saved(), Some(path.as_path()));
             });
         }
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The person's option choices are kept the same way: a preferences file that could not be
     /// read and cannot be set aside is not written over.
     #[test]
     fn a_preferences_file_that_could_not_be_read_is_never_written_over() {
-        let dir = std::env::temp_dir().join(format!("studio-agent-prefs-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
+        let scratch = Scratch::new();
+        let dir = scratch.path();
         let path = dir.join("preferences.json");
         let claude = vec!["claude-code-acp".to_owned()];
         for held in [&b"{\"a\": \xff}"[..], b"[1, 2]"] {
@@ -1216,7 +1238,6 @@ mod tests {
             assert_eq!(std::fs::read(&path).unwrap(), held, "written over");
             assert_eq!(preferences.of(&claude).get("model"), Some(&json!("opus")));
         }
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// On Windows another program can hold the file open without letting it be renamed, or
@@ -1227,7 +1248,8 @@ mod tests {
     fn a_file_another_program_holds_is_never_written_over(cx: &mut gpui::TestAppContext) {
         use std::os::windows::fs::OpenOptionsExt as _;
         use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
-        let dir = std::env::temp_dir().join(format!("studio-agent-held-{}", std::process::id()));
+        let scratch = Scratch::new();
+        let dir = scratch.path();
         let path = dir.join("sessions.json");
         let held = serde_json::to_vec(&json!({ "version": VERSION + 1, "sessions": [] })).unwrap();
         // Readable but not to be renamed, then not even readable.
@@ -1251,7 +1273,6 @@ mod tests {
                 assert_eq!(store.not_saved(), Some(path.as_path()));
             });
         }
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1264,8 +1285,8 @@ mod tests {
 
     #[test]
     fn option_choices_are_kept_per_agent_and_the_latest_wins() {
-        let dir =
-            std::env::temp_dir().join(format!("studio-agent-preferences-{}", std::process::id()));
+        let scratch = Scratch::new();
+        let dir = scratch.path();
         let path = dir.join("preferences.json");
         let claude = vec!["claude-code-acp".to_owned()];
         let other = vec!["other-agent".to_owned()];
@@ -1292,14 +1313,14 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// An agent's models are kept for the menu to list while another agent runs, and are never
     /// among the options set on its next session.
     #[test]
     fn an_agents_models_are_kept_apart_from_its_options() {
-        let dir = std::env::temp_dir().join(format!("studio-agent-models-{}", std::process::id()));
+        let scratch = Scratch::new();
+        let dir = scratch.path();
         let path = dir.join("preferences.json");
         let codex = vec!["codex-acp".to_owned()];
         let kept = |path: &Path| Preferences {
@@ -1322,6 +1343,5 @@ mod tests {
         );
         let options = preferences.options(&codex);
         assert_eq!(options.keys().collect::<Vec<_>>(), ["model"]);
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

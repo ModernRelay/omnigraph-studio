@@ -66,6 +66,8 @@ serde_norway = { workspace = true }
 # A conversation tab drawn in a test window: Studio's settings and theme held in memory.
 studio_settings = { workspace = true, features = ["test-support"] }
 studio_theme = { workspace = true, features = ["test-support"] }
+# A directory of each test's own, named at random, for the conversations it keeps.
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
