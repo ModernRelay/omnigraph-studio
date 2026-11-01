@@ -26,7 +26,8 @@ mod values;
 
 pub use cell_text::{CellText, cell_text};
 pub use changes::{
-    ChangeCard, ChangeKind, PropertyRow, RelationshipLine, change_counts, change_group_header,
+    ChangeCard, ChangeKind, PropertyRow, RelationshipLine, TextFolds, change_counts,
+    change_group_header, property_body, property_row,
 };
 pub use grid_places::{GridPlace, columns_in_view, grid_places, scrolled_within};
 pub use overlay_slot::{OverlaySlot, OverlaySlotElement};

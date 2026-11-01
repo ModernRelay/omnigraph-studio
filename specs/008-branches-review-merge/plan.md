@@ -82,16 +82,51 @@ place), X (designed on 0.13; the better routes are deferred).
 - Search: a field narrows the cards to those whose own change or a relationship on them has an
   id, type, relationship end, or before or after value containing the text; J/K move among
   the cards it leaves.
-- Header: one sentence ("17 entities and 22 relationships changed in 3 commits by act-alice"),
-  then per-type counts (+ added, ~ changed, − removed).
-- Body: one scroll of entity cards (`graph_store::EntityGroups`) in two sections: changes to
-  what the target has (changed, removed, or unchanged with relationships that changed), then
-  what the branch added. Inside a section, cards run by type under one header counting what the
-  run shows. A card is one node: its changed properties, before and after (a removed one stays
-  as a real, searchable row), then the relationship changes that came with it. A changed list
-  shows the elements it gained and lost and how many it kept; a changed text of eight words or
-  more shows its changed words with three words of context on each side, the rest as "…",
-  punctuation compared as its own mark (texts over 200 words show before → after).
+- Header, as the commit view's (since 2026-10-31, after Tower's branch diff and diffs.com;
+  before, the title line held a refresh button, a delete checkbox and Merge, then the scope
+  and search, then the sentence and Summarize, then the fork and head, then per-type counts,
+  then every banner): a kicker row ("Review" in meta, the search, the scope, Summarize and
+  the layout choice Feed | Split (`ds::segmented`) at its end), the heading "branch → target",
+  and a `ds::meta_row` of facts: the sentence ("17 entities and 22 relationships changed in 3
+  commits by act-alice") and the fork ("main at 8F6WX93", the full wording in its tooltip).
+  The head is not repeated: the notices name it when it moved. What qualifies the review (a
+  partial read, capped commits, heads that moved, what the merge did) is a `ds::callout` strip
+  under the header, not a boxed banner in the flow. The merge is a strip under the changes:
+  what a merge would do now with its mark (a check, a warning and Show conflicts, a spinner),
+  the "Delete the branch after merging" checkbox and the filled "Merge into <target>". The
+  branch's name is in the heading and nowhere else in the view's own words.
+- Two layouts (`studio.review_layout`, remembered; ⇧⌘V `studio_review::SwitchLayout` or the
+  header's segments):
+  - **Feed**: one row per run of one type (`graph_store::EntityGroups` runs, in two sections:
+    changes to what the target has, then what the branch added), read as a sentence with a
+    status dot of its kind: "1 changed in Task · 2 h ago", "2 added to Email · with 3
+    relationships", the right edge giving the commits and when; a run of two or more
+    entities names the properties they touched ("waiting_on, brief"), a run of one leaves
+    that to its entity's row. The row folds
+    its entities away and back (`collapsed_runs`). Under an open row its entities sit in an
+    inset table, hairline-framed and drawn row by row: a chevron, the name (a relationship's
+    ends), what changed in a few words ("brief, status changed · 2 relationships"), its state
+    (a fix's, "1 of 3 not reviewed", "Reviewed", dimmed) and its id. An entity unfolds in
+    place (a click, Space; `expanded`; the selected one unfolds as J and K reach it, and the
+    first opens with the review) to its property rows, its relationship lines and, last, its
+    actions as outlined buttons: Mark reviewed, Edit, Revert.
+  - **Split**: the changes as a list on the left (300 px: the type with its counts as a group
+    label, each entity a row with a dot of its kind, muted with a check once reviewed), and
+    on the right the selected one as a record: the type and kind, the name as a heading, its
+    id, the actions, then its property rows and relationships (which say what changed), ending in
+    "Reviewed, next" (⌘Y). J and K step through the list.
+- A property row is its name in a column, then its body (`studio_ui::property_row`,
+  `TextFolds`): a short change reads before → after on one line (the old value struck
+  through, muted); a text (over 72 characters, or with line breaks) reads line by line, a
+  line over 160 characters sentence by sentence: the lines that changed as a "−" line against
+  a "+" line, each on a faint tint of its colour, the words that side lost or gained on a
+  stronger tint when the pair is under 200 words each, one unchanged line kept beside each
+  change and the rest folded to "2,318 unchanged characters", which opens the whole text
+  ("Show the changes only" folds it back; `whole_texts`). Texts over 600 lines, or the same
+  words spaced otherwise, show the two texts whole. A changed list shows the elements it
+  gained and lost and how many it kept. An added or removed entity shows its values, cut past
+  2,000 characters with "Show the whole text · 3,553 more characters"; a removed one stays as
+  a real, searchable row.
 - A relationship change is on one card, its home: the end the branch added, else an end it
   changed or removed, else its source, which then stands unchanged for its relationships.
   There it is counted, reviewed and reverted. When the other end has a card too, the
@@ -111,7 +146,8 @@ place), X (designed on 0.13; the better routes are deferred).
   run's header's. Cards are hairline frames on the document, values in the UI font.
 - Act in place: Revert (restore the before image), Edit, Mark reviewed (every change on the
   card; the card turns hollow but stays, and says how many are not reviewed when some are).
-  Each relationship line has its own Revert, shown on hover. Keys: J/K between cards, ↵ edit,
+  Each relationship line has its own Revert, shown on hover. Keys: J/K between changes, Space
+  unfolds the selected one or folds it back (the feed), ⇧⌘V switches the layout, ↵ edit,
   ⌘Y accept the card and go to the next, ⌥⌘Z revert the selected change (the card's own, or
   the relationship line clicked) and go to the next, ⌘R read the review again as its refresh
   button and every banner's Refresh do, each of which shows the key (since 2026-10-21).
@@ -154,15 +190,15 @@ place), X (designed on 0.13; the better routes are deferred).
   still equals the reviewed head. It merges only a review on screen, with no fix out: never
   while the review is being read (a head nobody has seen), and never from the branch list or
   the menu, which open the review instead.
-- "Delete <branch>", beside the button and on by default, deletes the branch once the merge
+- "Delete the branch after merging", beside the button and on by default, deletes the branch once the merge
   lands (`delete_branch`): the server reports the deletion on the answer and never undoes the
   merge for it, and the outcome says "Deleted <branch>." or why it was not. A session on the
   deleted branch moves to the target. Not offered for `main`.
 - Before anyone merges, a review of the whole branch asks what a merge would do now with a
   dry run (`dry_run` on `POST /branches/merge`, E8): the server reads both branches, takes no
-  write gate and writes nothing. A clean merge reads beside the fork, "merges cleanly as a
-  fast-forward"; conflicts show in a banner with Show conflicts, the same list a merge's 409
-  gives. A dry run that cannot be read says nothing; Merge stays available either way, since
+  write gate and writes nothing. A clean merge reads in the merge strip, "Merges cleanly
+  into main as a fast-forward"; conflicts read there with Show conflicts, the same list a
+  merge's 409 gives. A dry run that cannot be read says nothing; Merge stays available either way, since
   the merge itself decides.
 - Outcome shown plainly: fast-forwarded, merged (with commit), already up to date. A merge or a
   fix never sent (its connection retired, no connection to the server opened, or the request
@@ -261,6 +297,7 @@ place), X (designed on 0.13; the better routes are deferred).
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-31 | The review reads as a feed of types or one record at a time, with a two-line header and long text folded to what changed | `studio_ui` `a_text_shows_its_changed_lines_and_folds_the_rest` (lines, sentences, word pairs, folds, spacing), `cargo test -p review -p change_cards -p studio_settings`, clippy `-D warnings`; offscreen snapshots of `apple-jose-address-reply-20261030` against main in both layouts, judged against the HTML mock the layouts were chosen from (Feed and Split of three; Ledger dropped) | Pass; see the snapshots in the session. A first version of the day (flat foldable rows, whole − and + texts, the old header) was judged crowded and rebuilt from a blank page |
 | 2026-10-26 | The review says when the server is slow and when Studio stopped waiting | `graph_client` `a_timeout_says_whether_the_server_was_reached` (reqwest's chains at `zed-reqwest` `33bc764` and `hyper-util` 0.1.17: a request's `operation timed out`, a connection's under `client error (Connect)`); `review` `a_slow_review_says_the_server_is_still_working` (the feed's page held past `SLOW_READ`, then answered, then read again), `a_review_that_timed_out_says_the_server_was_still_working` (the feed's page failing as a timed-out request does) | Before, a slow review showed "Reading what feature changed…" and nothing else, then "The review could not be read: Could not reach the server: the request timed out", though the server had taken the request. Now, after 10 s, "On a large graph this can take a few minutes." under the header and "The server is still working out the changes…" in the body, gone once the review is read; a page not answered reads "The server was still working out the changes after 5 minutes, and Studio stopped waiting." with Refresh; a connection that did not open reads "the connection timed out". Not yet seen in the running app against the personal graph |
 | 2026-10-26 | Reads of changes wait five minutes; every other read one | The hosted personal graph (server `0.14.1-edge+7711e4a`, a read-only token), timed from the person's Mac over HTTPS on 2026-10-25: merge base 3.0 to 5.7 s; the feed from the fork of `review-commercial-profile-20261019` (9 commits, 366 changes) 54.4 s as one page; `GET /diff` merge base to head, 350 changes, 60.3 s cold and 37 to 43 s warm; the same with `type=Artifact` (about 100,000 rows, changed by 3 of the branch's commits) 47.6 s, any other single type 7.9 to 9.6 s; head to head, zero changes, head named by commit id, 12.7 to 13.6 s; one commit's changes 4.5 to 17.7 s, about 13 s for a one-change commit on the branch. `graph_client` `a_read_of_changes_waits_longer_than_other_reads` (each request's `RequestTimeout`) | Before, every read timed out at 60 s, so a review's feed or diff page failed about as often as it was read, and more often cold. Now the feed, a diff, a commit's changes and the dry run wait 300 s, and the twelve other reads the test makes 60 s. A read that times out is still not sent again by itself |
 | 2026-10-26 | Naming the branch on a merged-in review's diff cannot keep the review exact without a second read | Omnigraph `7711e4a`: `crates/omnigraph/src/db/omnigraph.rs` `prepare_diff` (a continuation's `sides` digest must equal the request's) and `reopen_diff_continuation` (a continuation classifies its sides again and reaches only the token's commits); `crates/omnigraph-server/src/handlers.rs` `server_diff` ("The first page resolves both sides to exact commits and names them") | Not built (Decisions). A first page asked `to=feature` names the commit it resolved, but every later page must name `feature` too, and a head other than the pinned one is caught only by asking the first page again by commit id |
