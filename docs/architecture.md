@@ -85,15 +85,15 @@ a 412 reopens the draft.
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- Top bar (spec 020): the traffic lights, the sidebar toggle, the connection chip, graph and branch,
-  what the server is, search, and the Activity and inspector toggles.
-- Left dock: labeled rows for Data (the schema, node types and edge types with counts), Queries,
-  Branches and Conversations, over the active one's list. Right dock: the inspector, one per tab.
-  Bottom dock: Activity.
+- Top bar (spec 020): the traffic lights, the connection chip, graph and branch, what the server is,
+  and the Activity and inspector toggles.
+- Each column's header is its panel's own (title and buttons).
+- Left dock: Data (the schema, node types and edge types with counts), Queries, Branches,
+  Conversations. Right dock: the inspector, one per tab. Bottom dock: Activity.
 - Center: panes of tabs, each one view of one thing (type table, page, tree, canvas, map, source,
   query editor, review, history, commit), with a view strip to its thing's other views. Each pane's
   tab strip starts with its own Back and Forward.
-- Status bar, after Zed's: the
+- Status bar, after Zed's: the sidebar toggle, the left dock's panel buttons, the
   tab's few facts, running work, a keyboard button listing the tab's keys, and memory and CPU when
   `studio.show_performance` is on. A button's right-click menu moves its panel to another dock
   (`panels.<id>.dock` in the settings); `studio.bottom_dock_layout` says where the bottom dock

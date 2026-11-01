@@ -146,7 +146,7 @@ Every interaction answers four questions, and each answer has one home.
 |---|---|---|---|
 | **Which?** | Server, graph, branch | Top bar | The person, rarely |
 | **What?** | Schema, type, node, query, branch | Left sidebar | The person, constantly |
-| **How?** | Table, Tree, Canvas, Map | The view strip, which opens a tab | The person |
+| **How?** | Table, Tree, Canvas, Page, Map | The view strip, which opens a tab | The person |
 | **Where?** | Region: center, right, bottom | Fixed by the rule below | Nobody |
 | | Pane: this one or beside it | Same pane by default | The person |
 
@@ -178,6 +178,21 @@ are rules, not five new Rust types.
 | **Tab identity** | The key that decides whether an open tab is reused | Subject, view and read context; for a captured set, also its contents |
 | **Shared walk** | The expansion, selection and commit behind a Tree and a Canvas | One per session, root and read context. Refreshes together |
 
+### What each view holds
+
+Each view answers one question, and holds only what can answer it.
+
+| View | Question | Holds |
+|---|---|---|
+| Table | Which of these? | A set |
+| Tree | What are these connected to? | A set, or one node |
+| Canvas | What's around this one? | One node |
+| Page | What is this one? | One node |
+
+If a view can't hold what the tab has, it narrows to the selected node. With nothing selected it's
+disabled, with the reason. So the strip follows the subject: a set has `Table · Tree · Canvas` and a
+node has `Page · Tree · Canvas`. Canvas never draws a set or the whole graph; Map is the overview.
+
 ### Objects and their views
 
 The first view is what a pick opens.
@@ -185,11 +200,10 @@ The first view is what a pick opens.
 | What | Listed in | Opens as | View strip |
 |---|---|---|---|
 | Schema | Data | Map | Map · Source |
-| Node type | Data | Table | Table · Tree · Canvas |
+| Node type, or a set of its rows | Data | Table | Table · Tree · Canvas |
 | Edge type | Data | Table | None |
 | Node | Nowhere; reached from a row, a link or ⌘P | Page | Page · Tree · Canvas |
-| Captured set | Nowhere; opened from a table | Canvas | Table · Canvas |
-| Query | Queries | Editor with results | None; results keep their Canvas button |
+| Query | Queries | Editor with results | None; results offer Tree, and Graph when they link |
 | Branch | Branches | Review (`main`: History) | Review · History (`main`: Review disabled) |
 | Commit | History | Its changes | None |
 
@@ -212,8 +226,8 @@ EDGE TYPES
 - One click previews and a double click keeps, as types do today.
 - A row is lit while the active tab shows that thing, in any view. Schema stays lit on Map and on
   Source.
-- The panel's title becomes Data. Data, Queries and Branches become labeled navigation at the top
-  of the sidebar, not icons in the status bar. Keys: ⌘⇧1, ⌘⇧2, ⌘⇧3.
+- The panel's title becomes Data. Panels are switched from the status bar's icons, as before, and
+  also by ⌘⇧1, ⌘⇧2, ⌘⇧3.
 
 ### The view strip
 
@@ -221,12 +235,13 @@ A view strip is a row of links to the current thing's views. It's a list of sibl
 inside the tab.
 
 ```
-Person ×   Tree: Ada ×
-Page · [Tree] · Canvas          Ada › Knows › Acme
+Person ×   Tree: Person, Berlin ×
+Table · [Tree] · Canvas
 ```
 
 **Where:** the first thing in the tab's toolbar, drawn with `ds::segmented`. Canvas, Ontology,
-Schema and the node page gain a `ds::toolbar` to hold it. A thing with one view shows no strip.
+Schema and the node page gain a `ds::toolbar` to hold it. A thing with one view shows no strip. Each
+link's tooltip says what it will open: "Walk from Radia Knuth", "Show the 5 selected rows".
 
 **Behavior:**
 
@@ -253,44 +268,53 @@ Schema and the node page gain a `ds::toolbar` to hold it. A thing with one view 
 
 **What each view starts from:**
 
-| From | View | Starts from | If it can't |
+| From | View | Opens | If it can't |
 |---|---|---|---|
-| Table | Tree | The cursor's node | Disabled with no row: "Select a row to see its relationships" |
-| Table | Canvas | One selected row: that node. Several: those rows. None: the rows loaded under the current filter | Disabled with no rows: "No rows to draw" |
-| Tree, Canvas on a node | Page | The selected node, else the root | Always available |
+| Table | Tree | The selected rows; with none, the rows under the filters, read a page at a time | Disabled with no rows: "No rows to show" |
+| Table | Canvas | A walk from the row under the cursor; rows ticked don't change that | Disabled with no row: "Select a row to walk from it" |
+| Tree of a set | Table | The type's table: its open tab as it stands, or a new one with these filters | Always available |
+| Tree of a set | Canvas | A walk from the selected node, or from the node a selected relationship belongs to | Disabled with none: "Select a node to walk from it" |
+| Tree of one node | Canvas | The same walk | Always available |
+| Tree of one node, Canvas | Page | The selected node, else the root | Always available |
+| Canvas | Tree | The same walk | Always available |
 | Page | Tree, Canvas | This node | Always available |
-| Captured set | Table | See [Captured sets](#captured-sets) | Always available |
 | Map | Source | The selected type's definition, else the top of the file | Always available |
 | Source | Map | The whole map | Always available |
-| Query results | Canvas | The result's nodes (today's button, one tab per showing) | Disabled with no nodes: "These results have no nodes" |
+| Query results | Tree | The result's nodes | No button without nodes |
+| Query results | Graph | A picture of the nodes that share a row | No button without links |
 
 Everywhere a node is focused, ↵ opens its Page and `G` opens its Canvas.
 
-### Worked example
+### Scenarios
 
-1. Click **Person**. A Person table opens as a preview.
-2. Filter to Berlin and put the cursor on Ada. The inspector shows Ada.
-3. Click **Canvas**. The Person table is kept, and a new tab, "Canvas: Person, Berlin", draws those
-   rows. Its toolbar reads "From Person, Berlin · 200 of 230,000 loaded".
-4. Press Back. The table is exactly as you left it, with its filter, cursor and drafts.
-5. Press **⌥** and click **Tree**. "Tree: Ada" opens beside the table.
-6. In the tree, expand Knows and select Acme. The inspector shows Acme, because the Tree tab is
-   active. Click the table and the inspector returns to Ada.
-7. Press ↵ on Acme. Acme's page opens, with `Page · Tree · Canvas`.
+| You want to | You do | What happens |
+|---|---|---|
+| See what's around someone | Filter Person, select Ada, click **Canvas** | A walk from Ada; Back returns to the filtered table |
+| Check Canvas with nothing selected | Open a table, look at **Canvas** | Disabled: "Select a row to walk from it" |
+| Compare connections across a set | Filter to Berlin, click **Tree** | "Tree: Person, Berlin": rows closed, paged with "Show more" |
+| Work with a handful | Tick 5 rows, click **Tree** | Exactly those 5 |
+| Tick 5 rows but click **Canvas** | The same | A walk from the row under the cursor, named in the tooltip |
+| Go from the set to one person | In that Tree, select Grace, click **Canvas** | A walk from Grace; the Tree stays open |
+| Go back to the set | In that Tree, click **Table** | The source table |
+| See one walk both ways | Tree on Ada, click **Canvas** | The same walk: what's open stays open |
+| Read everything about one record | ⌘↵ on a row, or ⌘P and a name | Its Page, with `Page · Tree · Canvas` |
+| Re-centre on another node | "Canvas from here" | A new tab; Back returns |
+| See the whole graph | Click **Schema** | The Map of types: Canvas never tries to draw all the data |
+| Look at an old commit | Open a view from a held tab | Every view stays at that commit |
 
 ### Walks
 
 Zed lets two tabs share one buffer: they have the same text and separate cursors. Studio does the
 same with a walk.
 
-**One walk per session, root and read context.** `Exploration::for_session` becomes a lookup on all
-three, in the same weak registry. Each tab holds its walk strongly, so closing every tab on a walk
-ends it.
+**One walk per session, root and read context.** `Exploration::for_walk` looks up all three, in a
+weak registry. Each tab holds its walk strongly, so closing every tab on a walk ends it.
 
 | Tab | Key |
 |---|---|
 | Tree at head | `tree:<graph>:<type>:<id>` |
 | Tree held | `tree:<graph>:<type>:<id>@<commit>` |
+| Tree of a set | `tree-set:<graph>:<hash of type, commit, filters and listed nodes>` |
 | Canvas at head | `canvas:<graph>:<type>:<id>` |
 | Canvas held | `canvas:<graph>:<type>:<id>@<commit>` |
 
@@ -324,36 +348,32 @@ gains `at_commit`, and a new `ShowNodeInTree` carries it too.
 - `OpenCanvas` with no thing behind it goes away. Canvas always starts from a node or a set, so no
   blank canvas exists.
 
-### Captured sets
+### A set in Tree
 
-A set drawn on Canvas uses today's results canvas, so it doesn't walk and isn't restored after a
-restart. `G` on a node there opens that node's Canvas.
+A Tree of a set holds its rows under an anchor that's never drawn, so each row is a path of its own
+and everything below a row works as in any walk. It's one walk with one commit, shared with no other
+tab.
 
-**Identity.** The tab's key is a hash of the type, read context, filter and captured IDs, replacing
-the sequence number for sets from a table.
+- **What it reads.** Rows under filters are read as `builder::node_page`, keyset-paged with the tree's
+  page size, so the set is the whole filter and never "200 of 230,000 loaded". Rows ticked are listed
+  in the action with their names, and read nothing.
+- **What it costs closed.** The page alone: a closed row reads nothing until it opens.
+- **Identity.** The key is a hash of the type, commit, filters and listed nodes.
 
 | Then | Result |
 |---|---|
-| Click Canvas again, with the same filter and rows | Activates the open tab |
-| Change the filter from Berlin to London, then click Canvas | A new tab for London. Berlin stays as it was, unless it's an untouched preview |
-| Change the selected rows, then click Canvas | A new tab, by the same rule |
-| Change the filter, and don't click Canvas | The Berlin tab doesn't change. It's a copy, not a following view |
-
-**Provenance.** `ShowResultsOnCanvas` gains the source type, filter and `at_commit`. The canvas keeps
-them and shows them: "From Person, Berlin · 200 of 230,000 loaded". A set larger than the cap shows
-the existing "Too many nodes to draw" and its way out, in line with article IX.
+| Click Tree again, with the same filter | Activates the open tab |
+| Change the filter from Berlin to London, then click Tree | A new tab for London. Berlin stays as it was, unless it's an untouched preview |
+| Change the filter and don't click Tree | The Berlin tab doesn't change. It's its own set, not a following view |
 
 **The Table link.** Studio allows one head table per type, so a separate Berlin table can't exist
-beside a London one.
+beside a London one. The link activates the open table as it stands, even if it now shows London; if
+it has closed, a new one opens with the filters.
 
-| Source tab | Table link |
-|---|---|
-| Open, in any state | Activates it, even if it now shows London. The canvas still says Berlin |
-| Closed | Opens the type's table with the captured filter, which needs a `filters` field on `OpenType`. Selected rows aren't restored |
-
-**Following a node.** A node on a set Canvas opens in the set's read context. If the set came from a
-held table, the destination is held at that commit. If it came from a head table, the destination
-reads the current branch's head, and says so if the node isn't there.
+**Query results.** Tree shows the result's nodes as a listed set. **Graph** draws the nodes that share
+a row, and exists only when some do: a one-column result links nothing, and a set with no links is
+just a grid. It's the one picture of more than one node, kept because it shows how a result connects,
+and named Graph because it isn't a Canvas: it doesn't walk, and clicking a node opens its Page.
 
 ### Saved Canvas layouts
 
@@ -400,7 +420,8 @@ fn view_action(&self, kind: ViewKind, cx: &App) -> Option<Box<dyn Action>>;
 ```
 
 - `Thing`, `ViewKind` and `ViewLink` live in `studio_actions`, so the layer rule holds.
-- `ViewLink` holds a kind, whether it's the current view, and an optional reason it's disabled.
+- `ViewLink` holds a kind, whether it's the current view, an optional reason it's disabled, and what
+  it will open in words.
 - Tabs build the actions themselves, so feature crates still don't depend on each other. Existing
   actions cover most links: `OpenType`, `OpenNodePage`, `ShowNodeOnCanvas`, `ShowResultsOnCanvas`.
 - `OpenViewAt { index, beside }` is what the strip and the keys dispatch.
@@ -471,6 +492,8 @@ A restored session mustn't lose tabs, lose work or show errors.
 | Plan PR 15: move `schema_view` into `graph_canvas` | Removed | Sibling tabs can stay in their crates |
 | Plan PR 16: an `Item::inspector()` hook | The workspace remembers each tab's inspector | Peeks can be requested from other crates, and no new `Item` method is needed |
 | Conversation: a switcher inside the tab | Dropped | See Decisions |
+| First build: a table's rows drawn on Canvas | Rows go to Tree; Canvas takes one node | Rows have no relationships loaded, so Canvas drew a grid of unconnected chips |
+| First build: labeled navigation rows in the sidebar | The status bar's icons, as before | The requester's call: the selector was not the problem |
 
 The rest of the plan's rule stands: pick behavior, one History, double click means keep, the top
 bar, environment marking and the message ladder.
@@ -488,12 +511,15 @@ bar, environment marking and the message ladder.
 | Each tab copies positions at opening | All Canvas tabs share live positions | Moving a node in one tab mustn't move it in another (article V) |
 | The workspace remembers each tab's inspector | A shared selection descriptor that rebuilds the inspector; an `Item::inspector()` hook | The view already holds values, commit and saving state, which a descriptor would have to carry through the layers |
 | Keep reusing tabs across panes, and define Back per pane | Reuse only in the current pane (Zed's preview does); record the origin for a return | Studio assumes a key is unique in the window, so per-pane reuse would allow two Person tables. Recording origins adds state for little gain, since the source pane stays on screen. Deliberate deviation |
-| A captured set's identity is its contents | A new tab each time; reuse and replace the contents | Reopening the same set shouldn't pile up tabs, and a changed filter mustn't overwrite earlier work |
-| The Table link goes to the source tab | A separate table for the captured set | Studio allows one head table per type |
-| An untouched preview Canvas can be replaced | Never replace a set Canvas | It holds no work and reopens from the same set, and otherwise each filter change adds a tab |
+| A view holds only what can answer its question | Every view takes any subject | Canvas of unconnected rows answers nothing. Tree of a set does what a set needs |
+| Tree of a set keeps its filter and pages | A copy of the loaded rows | The whole filter, at one commit, with nothing partial to explain |
+| Rows ticked stay listed | Rewrite them as a filter | They're exactly what was picked, read or not |
+| A set's identity is what it reads | A new tab each time; reuse and replace the contents | Reopening the same set shouldn't pile up tabs, and a changed filter mustn't overwrite earlier work |
+| The Table link goes to the source table | A separate table for the set | Studio allows one head table per type |
+| Graph only for results that link | Keep Canvas for every result; drop the picture | A result's links are the one picture a table can't give |
+| An untouched preview tree can be replaced | Never replace a set's tree | It holds no work and reopens from the same set, and otherwise each filter change adds a tab |
 | Keep the source tab when a view opens | Let the preview slot take it | The filter and drafts would vanish |
 | Disabled with a reason, not hidden | Hide what doesn't apply, as Zed's toolbar does | Article VI, and the strip stays still. Zed hides whole items; this hides nothing inside a strip |
-| Labeled navigation | Zed's icon-only panel buttons | Zed's users already know a file tree; the audit found Studio's unlabeled rail fails. Deliberate deviation |
 | No movable panels | Zed's `set_position` | A fixed region is what makes a result predictable. Deliberate deviation |
 | Keep Tree in the center | Zed's Outline pattern, a side panel that follows | The person's direction. ⌥-click gives the same arrangement when wanted |
 | Keys by strip position | One letter per view | `cmd-alt-t` is taken, and the digits are free on all three platforms. A digit's view varies by thing, but the strip shows it |
@@ -510,9 +536,9 @@ The cuts that are already done aren't repeated here.
 | 4 | Sidebar: things only, Data panel, new headings; Map and Source reachable from Schema | Item 3 |
 | 5 | `Item::views`, `ds` view strip, `OpenAs*` actions and keys; keep-on-open rules; read context on the opening actions | Item 4 |
 | 6 | One walk per session, root and read context; Tree becomes a tab; saved positions move to the store; Explore panel and the shared Canvas go | Item 5, and the tree baseline (plan PR 9) |
-| 7 | Captured sets: identity, provenance and the Table link | Item 5 |
+| 7 | Tree of a set, paged; Canvas of one node; Graph for results that link | Item 5 |
 | 8 | One History; pick and double-click rules everywhere | Item 5 |
-| 9 | Top bar and labeled navigation | Real Linux and Windows builds checked first |
+| 9 | Top bar | Real Linux and Windows builds checked first |
 | 10 | Environment marking; message ladder; copy sweep | Item 9 |
 
 Tree performance work (plan PRs 9, 10 and 12) continues as planned, with one thing to recheck: more
@@ -550,11 +576,11 @@ Canvas after a changed filter.
 - **Pane navigation:** Back and Forward after opening in the same pane, reusing a tab in another pane
   and opening beside, including a source tab closed since. The source's filter, cursor and drafts
   survive whenever it stays open.
-- **Captured sets:**
-  - Reopening an unchanged set activates its tab.
-  - A changed filter or selection never overwrites an earlier canvas that has work in it.
-  - The Table link behaves as defined after its source changes and after it closes.
-  - Partial sets stay labeled as partial, and following a node keeps the read context.
+- **Sets in Tree:**
+  - Rows open closed and read nothing below; the page is all that's read.
+  - Ticked rows are exactly the set; another filter, list or commit is another tab; a tree comes back
+    from what it saves.
+  - Canvas waits for a selected node and walks from that one; Table goes back with the filters.
 - **Bounds:** a set over the cap shows the honest exit.
 - **Saved state:**
   - A fixture restores an old `workspaces/*.json` with each row of the saved-tabs table, with no
@@ -567,7 +593,6 @@ Canvas after a changed filter.
 
 | What | Why it waits |
 |---|---|
-| **Several roots in one walk.** A set on Canvas that walks and restores; Tree showing rows as collapsed roots | `ExploreState.root` is single, and changing it reaches the shared read model. Wait until the test shows people need it |
 | **Following views.** A Canvas beside a table that tracks its selection or filter, like Zed's Follow mode | Needs item 3 first; the copy at opening may be enough |
 | **Saved canvases.** A canvas that collects nodes across types and appears in the sidebar as its own thing | No usage data shows the need. Today's shared Canvas is the nearest thing to it, and this spec removes it, so check this in the test |
 | **⌘K.** What it lists, and whether it splits as Zed's does (`file_finder`, `command_palette`, `tab_switcher`, `outline`) | Set aside by the person for now. Its row test should match this spec's sidebar test |
@@ -602,6 +627,7 @@ No engine changes are needed, so nothing goes in `docs/deferred-engine-changes.m
 | 2026-11-01 | The rules hold in the code | `cargo test --workspace`: 1,173 passed, 0 failed, and the keymap test (`crates/studio/tests/keymaps.rs`, its own harness); clippy `-D warnings`, fmt, `cargo deny`, layers, brand, design tokens, release files all pass | New tests: each tab keeps its inspector; opening a view keeps its source; beside opens one pane and reuses it; a disabled view does not open; every sidebar row is a thing; a held walk stays at its commit; a hidden tree makes no rows; a captured set is known by what it holds; an environment goes by address; every destination has a key |
 | 2026-11-01 | The frame and views draw as designed | Offscreen snapshots on `script/dev-server`: sidebar, table with its strip, Map, a set on Canvas, Tree beside a table, Branches with History | As designed. Clicks ran through the snapshot tool; the running app was not driven by hand |
 | 2026-11-01 | An old session upgrades without loss | A real saved `workspaces/*.json` with a root-less `canvas` tab and `explore` and `history` panels, restored twice by the snapshot tool | The tab went, its positions stayed in `canvas_positions` through both restarts, and the panels fell back to `types` and `activity`, with the table tab intact |
+| 2026-11-01 | Tree holds a set and Canvas one node, on real reads | `relationship_tree` `a_set_opens_closed_and_canvas_takes_the_selected_node`, `listed_nodes_are_the_set_and_a_set_is_known_by_what_it_holds`; `type_table` `tree_holds_the_tables_rows_and_canvas_the_row_under_the_cursor`; `graph_store` `a_set_is_paged_and_its_rows_open_on_their_own`; offscreen snapshots on `script/dev-server` | Person filtered to Founder opened as "Tree: Person, Founder", rows closed, a row opened to its relationships with counts; selecting Edsger Hamilton, Canvas opened a walk from that one node with both tabs kept |
 | | The top bar is right on Linux and Windows | Real builds | **Not run.** Compiled by CI only; whether those platforms draw window controls in it is unknown |
 | | The rule improves prediction | Prediction test | **Not run. No users have seen any of this** |
 | | Two walks perform acceptably | Tree baseline | **Not run** |
@@ -621,6 +647,11 @@ The first four record changes to the draft before it was built.
   do. Back now means this pane's previous tab.
 - 2026-11-01 · Built with the prediction test not run, at the requester's call. The spec's gate on
   items 3 to 9 was passed over, so its stop condition can still undo this work.
+- 2026-11-01 · A table's rows drawn on Canvas were a grid of unconnected chips. The requester's rule
+  replaced it: Tree holds sets, Canvas one node, and the captured-set code went. Several roots in a
+  walk moved from Deferred to the core of Tree.
+- 2026-11-01 · The sidebar's labeled navigation rows were reverted at the requester's call: the
+  status bar's icons were not the problem. The ⌘⇧ keys stayed.
 - 2026-11-01 · Item actions take `views` and `view_action`, not one `views` holding actions: the strip
   asks at every draw, and a set's action copies every loaded row.
 - 2026-11-01 · A key is not strictly unique in the window, since a split copies its tab, so the
@@ -634,5 +665,6 @@ The first four record changes to the draft before it was built.
 | Scope in confirmations | Table dialogs, branch delete and the query confirm bar name server, graph and branch. The review's field edit names only the branch, and merge has no dialog to name it in |
 | `write · <branch>` | Field editors say it; there is no standing chip in the status bar |
 | Sidebar lighting | Data and Branches light from `thing`; Queries keeps its own |
+| Tree of a set | Follows the table's filter but not its sort: rows come by `@id`. A cursor row past the first page is not selected until its page arrives |
 | Cuts not in this branch | The agent panel (`refactor/remove-agent-panel`) and AI calls, so Conversations is still a sidebar row |
 | Also still there | `Exploration::reroot` and `back_to` and the breadcrumb state, which no view calls now; panel moving; `window_style` |

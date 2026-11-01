@@ -102,8 +102,9 @@ The sidebar lists things, a tab is one view of one thing, and everything around 
 The top says which server, graph and branch; the left lists what there is; the center shows it; the
 right describes what is selected there; the bottom reports what ran.
 
-*In practice:* a sidebar row names a thing, never a view. A view is a tab, opened from the view strip
-of the tab it comes from, which stays. A view opened from a tab holding a commit holds that commit. A
+*In practice:* a sidebar row names a thing, never a view. A view holds only what can answer its
+question: Table a set, Tree a set or one node, Canvas and Page one node. A view is a tab, opened from
+the view strip of the tab it comes from, which stays. A view opened from a tab holding a commit holds that commit. A
 new "how" control is a tab if it has state, selection or reads of its own, and a toggle only if it
 redraws the same state. Plan: `specs/020-ui-unification/plan.md`.
 
