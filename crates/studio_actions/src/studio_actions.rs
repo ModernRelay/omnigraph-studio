@@ -117,7 +117,7 @@ pub mod workspace {
             /// again.
             CloseGraph,
             /// Open the design system gallery: every token and component in the current window
-            /// style.
+            /// style. Debug builds only.
             OpenDesignSystem,
         ]
     );
