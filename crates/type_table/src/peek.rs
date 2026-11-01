@@ -5345,6 +5345,7 @@ impl NodePeek {
         let page = self.page;
         // The peek opens the node's page; the page is it.
         let open_page = (!page).then(|| self.open_page_action()).flatten();
+        let at_commit = self.held_commit();
         let has_properties = self
             .schema
             .as_ref()
@@ -5375,9 +5376,11 @@ impl NodePeek {
                         let explore = studio_actions::graph::ShowNodeOnCanvas {
                             type_name: type_name.clone(),
                             id: id.clone(),
+                            at_commit: at_commit.clone(),
+                            preview: true,
                         };
                         header.child(
-                            studio_ui::ds::button("peek-explore", "Explore")
+                            studio_ui::ds::button("peek-canvas", "Canvas")
                                 .style(ButtonStyle::Subtle)
                                 .start_icon(
                                     Icon::new(IconName::Crosshair),

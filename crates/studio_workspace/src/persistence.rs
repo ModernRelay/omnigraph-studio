@@ -51,6 +51,10 @@ pub struct SavedWorkspace {
     pub left_size: Option<f32>,
     pub right_size: Option<f32>,
     pub bottom_size: Option<f32>,
+    /// Where the person placed nodes and relationship pills on the canvas this graph had before
+    /// canvases each had a root: a new canvas starts from these (spec 020).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub canvas_positions: std::collections::BTreeMap<String, [f32; 2]>,
 }
 
 /// Opens a remembered tab of one kind.
@@ -659,6 +663,7 @@ mod tests {
                 SavedPane::default(),
             ],
             layout: Some(layout),
+            canvas_positions: [("n:Person:p1".to_owned(), [12., 34.])].into(),
             active_pane: 1,
             sidebar_open: true,
             inspector_open: false,

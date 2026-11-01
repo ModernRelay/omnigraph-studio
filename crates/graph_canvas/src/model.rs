@@ -69,6 +69,7 @@ pub struct Scene {
 }
 
 impl Scene {
+    #[cfg(test)]
     pub fn index_of(&self, id: &SceneId) -> Option<usize> {
         self.nodes.iter().position(|node| node.id == *id)
     }

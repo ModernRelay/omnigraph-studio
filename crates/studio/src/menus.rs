@@ -4,8 +4,7 @@
 use gpui::{App, Menu, MenuItem, OsAction, SystemMenuType};
 use studio_actions::agent::OpenAgent;
 use studio_actions::graph::{
-    CreateBranch, NewQuery, OpenCanvas, OpenHistory, OpenMap, OpenQueryFile, OpenSource,
-    ReviewBranch,
+    CreateBranch, NewQuery, OpenHistory, OpenMap, OpenQueryFile, OpenSource, ReviewBranch,
 };
 use studio_actions::query::{Save, SaveAs};
 use studio_actions::update::{CheckForUpdates, RestartToUpdate};
@@ -90,7 +89,6 @@ pub fn set(cx: &mut App) {
             MenuItem::action("History", OpenHistory),
             MenuItem::action("Map", OpenMap::default()),
             MenuItem::action("Source", OpenSource::default()),
-            MenuItem::action("Canvas", OpenCanvas),
             MenuItem::action("Agent", OpenAgent),
             MenuItem::separator(),
             MenuItem::action("Create Branch…", CreateBranch),

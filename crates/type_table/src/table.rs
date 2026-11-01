@@ -6495,6 +6495,8 @@ impl TypeTable {
             Box::new(studio_actions::graph::ShowNodeOnCanvas {
                 type_name: self.type_name.clone(),
                 id,
+                at_commit: self.at_commit.clone(),
+                preview: true,
             }),
             cx,
         );

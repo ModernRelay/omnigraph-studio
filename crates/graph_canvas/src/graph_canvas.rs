@@ -38,7 +38,8 @@ use studio_actions::canvas::{
     WalkForward, ZoomIn, ZoomOut,
 };
 use studio_actions::graph::{
-    OpenCanvas, OpenMap, OpenNode, OpenType, PeekNode, ShowNodeOnCanvas, ShowResultsOnCanvas,
+    OpenMap, OpenNodePage, OpenType, PeekNode, ShowNodeInTree, ShowNodeOnCanvas,
+    ShowResultsOnCanvas,
 };
 use studio_settings::StudioSettings;
 use studio_ui::ds::space;
@@ -72,8 +73,24 @@ pub fn init(cx: &mut App) {
     );
     studio_workspace::register_item_kind(cx, "canvas", |data, workspace, window, cx| {
         let pinned = pins_from_json(data);
-        if let Some(canvas) = open_canvas(workspace, window, cx) {
-            canvas.update(cx, |canvas, cx| canvas.restore_pins(pinned, cx));
+        let root = data
+            .get("type_name")
+            .and_then(serde_json::Value::as_str)
+            .zip(data.get("id").and_then(serde_json::Value::as_str))
+            .map(|(type_name, id)| NodeRef::new(type_name, id));
+        match root {
+            Some(root) => {
+                let at_commit = data
+                    .get("at_commit")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                if let Some(canvas) = open_canvas(workspace, root, at_commit, false, window, cx) {
+                    canvas.update(cx, |canvas, cx| canvas.restore_pins(pinned, cx));
+                }
+            }
+            // A canvas from before each had a root: no tab to come back as, but where the person
+            // placed things stays, for each new canvas on this graph (spec 020).
+            None => adopt_positions(workspace, pinned, cx),
         }
     });
     cx.observe_new(|workspace: &mut Workspace, window, _cx| {
@@ -93,17 +110,21 @@ pub fn init(cx: &mut App) {
                 move |_, cx| GraphCanvas::with_results(session, &action, cx),
             );
         });
-        workspace.register_action(|workspace, _: &OpenCanvas, window, cx| {
-            open_canvas(workspace, window, cx);
-        });
         workspace.register_action(|workspace, action: &OpenMap, window, cx| {
             open_ontology(workspace, action.preview, window, cx);
         });
         workspace.register_action(|workspace, action: &ShowNodeOnCanvas, window, cx| {
-            if let Some(canvas) = open_canvas(workspace, window, cx) {
-                let node = NodeRef::new(action.type_name.clone(), action.id.clone());
-                canvas.update(cx, |canvas, cx| canvas.show_node(node, cx));
-            }
+            // The tab it was opened from stays (spec 020).
+            workspace.keep_active_tab(cx);
+            let node = NodeRef::new(action.type_name.clone(), action.id.clone());
+            open_canvas(
+                workspace,
+                node,
+                action.at_commit.clone(),
+                action.preview,
+                window,
+                cx,
+            );
         });
     })
     .detach();
@@ -124,16 +145,41 @@ fn open_ontology(
 
 fn open_canvas(
     workspace: &mut Workspace,
+    root: NodeRef,
+    at_commit: Option<String>,
+    preview: bool,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Option<Entity<GraphCanvas>> {
     let session = workspace.session()?.clone();
-    let key = canvas_key(&session.read(cx).graph_id);
-    workspace.open_item::<GraphCanvas>(key, window, cx, |_window, cx| GraphCanvas::new(session, cx))
+    let key = canvas_key(&session.read(cx).graph_id, &root, at_commit.as_deref());
+    workspace.open_item_with::<GraphCanvas>(key, preview, window, cx, |_window, cx| {
+        GraphCanvas::new(session, root, at_commit, cx)
+    })
 }
 
-fn canvas_key(graph_id: &str) -> SharedString {
-    format!("canvas:{graph_id}").into()
+/// Keeps a saved root-less canvas's placed nodes on the graph's session.
+fn adopt_positions(
+    workspace: &mut Workspace,
+    pinned: HashMap<String, Vec2>,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(session) = workspace.session().cloned() else {
+        return;
+    };
+    session.update(cx, |session, _| {
+        for (key, at) in pinned {
+            session.canvas_positions.insert(key, [at.x, at.y]);
+        }
+    });
+}
+
+fn canvas_key(graph_id: &str, root: &NodeRef, at_commit: Option<&str>) -> SharedString {
+    let key = format!("canvas:{graph_id}:{}:{}", root.type_name, root.id);
+    match at_commit {
+        Some(commit) => format!("{key}@{commit}").into(),
+        None => key.into(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,10 +336,12 @@ fn pins_to_json(pinned: &HashMap<String, Vec2>) -> serde_json::Value {
     serde_json::json!({ "pinned": map })
 }
 
-/// The canvas tab of one graph.
+/// A canvas tab: a walk from one node, or a query's result nodes.
 pub(crate) struct GraphCanvas {
     session: Entity<GraphSession>,
     exploration: Entity<Exploration>,
+    /// The node the walk starts from and the commit it is held at; none on a results canvas.
+    walk: Option<(NodeRef, Option<String>)>,
     /// Set for a canvas of query results; such a canvas never shows the exploration.
     results: Option<(usize, Arc<ResultsData>)>,
     focus_handle: FocusHandle,
@@ -388,11 +436,30 @@ impl Focusable for GraphCanvas {
 }
 
 impl Item for GraphCanvas {
-    fn tab_title(&self, _cx: &App) -> SharedString {
-        match &self.results {
-            Some((_, results)) => results.title.clone().into(),
-            None => "Canvas".into(),
+    fn tab_title(&self, cx: &App) -> SharedString {
+        if let Some((_, results)) = &self.results {
+            return results.title.clone().into();
         }
+        let Some((root, at_commit)) = &self.walk else {
+            return "Canvas".into();
+        };
+        let state = self.exploration.read(cx).state();
+        let name = state.label(root).unwrap_or(&root.id);
+        match at_commit {
+            Some(commit) => {
+                format!("Canvas: {name} @ {}", studio_ui::short_commit_id(commit)).into()
+            }
+            None => format!("Canvas: {name}").into(),
+        }
+    }
+
+    fn thing(&self, _cx: &App) -> Option<studio_actions::Thing> {
+        self.walk
+            .as_ref()
+            .map(|(root, _)| studio_actions::Thing::Node {
+                type_name: root.type_name.clone(),
+                id: root.id.clone(),
+            })
     }
 
     /// The icons of the Graph panel's rows: the canvas is a walk from a node, a query's result
@@ -405,17 +472,27 @@ impl Item for GraphCanvas {
     }
 
     fn dedupe_key(&self, cx: &App) -> Option<SharedString> {
-        Some(match &self.results {
-            Some((seq, _)) => format!("canvas-results:{seq}").into(),
-            None => canvas_key(&self.session.read(cx).graph_id),
-        })
+        match (&self.results, &self.walk) {
+            (Some((seq, _)), _) => Some(format!("canvas-results:{seq}").into()),
+            (None, Some((root, at_commit))) => Some(canvas_key(
+                &self.session.read(cx).graph_id,
+                root,
+                at_commit.as_deref(),
+            )),
+            (None, None) => None,
+        }
     }
 
     /// The exploration canvas comes back after a restart; a results canvas is transient.
     fn serialize(&self, _cx: &App) -> Option<SavedItem> {
-        self.results.is_none().then(|| SavedItem {
+        let (root, at_commit) = self.walk.as_ref()?;
+        let mut data = pins_to_json(&self.pinned);
+        data["type_name"] = root.type_name.clone().into();
+        data["id"] = root.id.clone().into();
+        data["at_commit"] = at_commit.clone().into();
+        Some(SavedItem {
             kind: "canvas".into(),
-            data: pins_to_json(&self.pinned),
+            data,
         })
     }
 
@@ -442,18 +519,41 @@ impl GraphCanvas {
 }
 
 impl GraphCanvas {
-    fn new(session: Entity<GraphSession>, cx: &mut Context<Self>) -> Self {
-        Self::build(session, None, cx)
+    /// A canvas walking from `root`, starting from where the person placed things on the graph's
+    /// canvas of before; a copy, so moving a node here moves it in no other tab (spec 020).
+    fn new(
+        session: Entity<GraphSession>,
+        root: NodeRef,
+        at_commit: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let exploration = Exploration::for_walk(&session, root.clone(), at_commit.clone(), cx);
+        let pinned = session
+            .read(cx)
+            .canvas_positions
+            .iter()
+            .map(|(key, at)| (key.clone(), Vec2::new(at[0], at[1])))
+            .collect();
+        Self::build(
+            session,
+            exploration,
+            Some((root, at_commit)),
+            None,
+            pinned,
+            cx,
+        )
     }
 
     /// The canvas, of `results` when given: built with them, so it lays out only them, not
     /// the exploration first.
     fn build(
         session: Entity<GraphSession>,
+        exploration: Entity<Exploration>,
+        walk: Option<(NodeRef, Option<String>)>,
         results: Option<(usize, Arc<ResultsData>)>,
+        pinned: HashMap<String, Vec2>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let exploration = Exploration::for_session(&session, cx);
         let subscriptions = vec![
             cx.subscribe(&exploration, |this, _, event, cx| match event {
                 // A results canvas draws none of the exploration, and its tab marks no newer
@@ -503,6 +603,7 @@ impl GraphCanvas {
         let mut canvas = Self {
             session,
             exploration,
+            walk,
             results,
             focus_handle: cx.focus_handle(),
             scene: Arc::default(),
@@ -512,7 +613,7 @@ impl GraphCanvas {
             node_count: 0,
             known: HashMap::new(),
             known_root: None,
-            pinned: HashMap::new(),
+            pinned,
             layout_key: None,
             layout_generation: 0,
             layout_task: None,
@@ -575,46 +676,22 @@ impl GraphCanvas {
             nodes,
             links: action.links.clone(),
         });
-        Self::build(session, Some((seq, results)), cx)
+        let exploration = Exploration::unrooted(&session, cx);
+        Self::build(
+            session,
+            exploration,
+            None,
+            Some((seq, results)),
+            HashMap::new(),
+            cx,
+        )
     }
 
-    /// Shows `node`: selects it where the exploration shows it, else roots the exploration
-    /// there; then centers on it.
-    fn show_node(&mut self, node: NodeRef, cx: &mut Context<Self>) {
-        // A results canvas draws none of the walk, which stays as it is.
-        if !self.draws_exploration() {
-            return;
-        }
-        let id = SceneId::Node(node.clone());
-        self.center_on = Some(id.clone());
-        self.selected = Some(id.clone());
-        let shown = self
-            .exploration
-            .update(cx, |exploration, cx| exploration.reveal(node.clone(), cx));
-        // Not shown, the exploration was rooted at it, and that change is laid out
-        // (`ExplorationEvent::Changed`). Shown in the tree but not drawn here (a hub draws some of
-        // its neighbours): rooted at it, it is. Asked of the scene the exploration makes now, not
-        // of the one drawn, which is the one before until its layout comes back; when that scene
-        // has it, it is the one laid out.
-        if !shown {
-            return;
-        }
-        match self.explore_scene(cx) {
-            Some(scene) if scene.index_of(&id).is_some() => self.lay_out_explore(scene, cx),
-            Some(_) => self
-                .exploration
-                .update(cx, |exploration, cx| exploration.root_at(node, cx)),
-            None => self.rebuild(cx),
-        }
-    }
-
-    /// Roots the exploration at `node`, which `path` reaches, keeping what is open below it.
-    fn explore_from(&mut self, path: &ExplorePath, node: NodeRef, cx: &mut Context<Self>) {
-        self.selected = Some(SceneId::Node(node));
-        // The reroot says it changed, which lays it out; the selection shows either way.
-        self.exploration
-            .update(cx, |exploration, cx| exploration.reroot(path, cx));
-        cx.notify();
+    /// The commit this canvas is held at, which what it opens is held at too (spec 020).
+    fn held_at(&self) -> Option<String> {
+        self.walk
+            .as_ref()
+            .and_then(|(_, at_commit)| at_commit.clone())
     }
 
     /// The explorer's scene as the exploration stands, under the node cap; none without a
@@ -1180,9 +1257,10 @@ impl GraphCanvas {
                 }
                 None => {
                     window.dispatch_action(
-                        Box::new(OpenNode {
+                        Box::new(OpenNodePage {
                             type_name: graph_node.type_name,
                             id: graph_node.id,
+                            at_commit: self.held_at(),
                         }),
                         cx,
                     );
@@ -1563,7 +1641,7 @@ impl GraphCanvas {
             Box::new(PeekNode {
                 type_name: node.type_name,
                 id: node.id,
-                at_commit: None,
+                at_commit: self.held_at(),
             }),
             cx,
         );
@@ -1691,6 +1769,7 @@ impl GraphCanvas {
             SceneKind::Node { node, .. } => self.session.read(cx).type_naming(&node.type_name),
             _ => None,
         };
+        let at_commit = self.held_at();
         ContextMenu::build(window, cx, move |mut menu, _, _| {
             let id = node.id.clone();
             match &node.kind {
@@ -1704,9 +1783,10 @@ impl GraphCanvas {
                         .entry(
                             "Open",
                             None,
-                            open_action(OpenNode {
+                            open_action(OpenNodePage {
                                 type_name: type_name.clone(),
                                 id: key.clone(),
+                                at_commit: at_commit.clone(),
                             }),
                         )
                         .when(node.path.is_some(), |menu| {
@@ -1730,36 +1810,32 @@ impl GraphCanvas {
                                 )
                             }
                         })
-                        .entry("Explore from here", None, {
-                            // On the explorer the node is drawn already: showing it would only
-                            // select it.
-                            // The root explores from itself already: shown, it is centred on.
-                            let path = node
-                                .path
-                                .clone()
-                                .filter(|path| exploring && !path.is_root());
-                            let show = open_action(ShowNodeOnCanvas {
+                        .entry(
+                            "Canvas from here",
+                            None,
+                            open_action(ShowNodeOnCanvas {
                                 type_name: type_name.clone(),
                                 id: key.clone(),
-                            });
-                            let this = this.clone();
-                            let graph_node = graph_node.clone();
-                            move |window, cx| match &path {
-                                Some(path) => {
-                                    this.update(cx, |canvas, cx| {
-                                        canvas.explore_from(path, graph_node.clone(), cx)
-                                    })
-                                    .ok();
-                                }
-                                None => show(window, cx),
-                            }
-                        })
+                                at_commit: at_commit.clone(),
+                                preview: true,
+                            }),
+                        )
+                        .entry(
+                            "Tree from here",
+                            None,
+                            open_action(ShowNodeInTree {
+                                type_name: type_name.clone(),
+                                id: key.clone(),
+                                at_commit: at_commit.clone(),
+                                preview: true,
+                            }),
+                        )
                         .entry(
                             "Open in table",
                             None,
                             open_action(OpenType {
                                 type_name,
-                                at_commit: None,
+                                at_commit: at_commit.clone(),
                                 filter_id: Some(key.clone()),
                                 via: None,
                                 preview: false,
@@ -2022,9 +2098,6 @@ impl GraphCanvas {
 
     /// Takes the placed nodes of a restored canvas, and lays out again around them.
     fn restore_pins(&mut self, pinned: HashMap<String, Vec2>, cx: &mut Context<Self>) {
-        if pinned.is_empty() {
-            return;
-        }
         self.pinned = pinned;
         self.fit_pending = true;
         self.rebuild(cx);
@@ -2455,30 +2528,42 @@ impl GraphCanvas {
                             banner.child(
                                 studio_ui::ds::bar_button("canvas-tree", "Show in tree")
                                     .style(ButtonStyle::Outlined)
-                                    .on_click(|_, window, cx| {
-                                        window.dispatch_action(
-                                            Box::new(studio_actions::workspace::ActivatePanel {
-                                                id: "explore".into(),
-                                            }),
-                                            cx,
-                                        )
+                                    .on_click({
+                                        let walk = self.walk.clone();
+                                        move |_, window, cx| {
+                                            let Some((root, at_commit)) = walk.clone() else {
+                                                return;
+                                            };
+                                            window.dispatch_action(
+                                                Box::new(ShowNodeInTree {
+                                                    type_name: root.type_name,
+                                                    id: root.id,
+                                                    at_commit,
+                                                    preview: false,
+                                                }),
+                                                cx,
+                                            )
+                                        }
                                     }),
                             )
                         })
                         .child(
                             studio_ui::ds::bar_button("canvas-table", "Open as table")
                                 .style(ButtonStyle::Filled)
-                                .on_click(move |_, window, cx| {
-                                    window.dispatch_action(
-                                        Box::new(OpenType {
-                                            type_name: type_name.clone(),
-                                            at_commit: None,
-                                            filter_id: None,
-                                            via: None,
-                                            preview: false,
-                                        }),
-                                        cx,
-                                    )
+                                .on_click({
+                                    let at_commit = self.held_at();
+                                    move |_, window, cx| {
+                                        window.dispatch_action(
+                                            Box::new(OpenType {
+                                                type_name: type_name.clone(),
+                                                at_commit: at_commit.clone(),
+                                                filter_id: None,
+                                                via: None,
+                                                preview: false,
+                                            }),
+                                            cx,
+                                        )
+                                    }
                                 }),
                         ),
                 )
@@ -2869,10 +2954,9 @@ mod tests {
             cx,
         );
         cx.run_until_parked();
-        let canvas = cx.new(|cx| GraphCanvas::new(session, cx));
-        let exploration = canvas.read_with(cx, |canvas, _| canvas.exploration.clone());
         let ada = NodeRef::new("Person", "p1");
-        exploration.update(cx, |exploration, cx| exploration.root_at(ada.clone(), cx));
+        let canvas = cx.new(|cx| GraphCanvas::new(session, ada.clone(), None, cx));
+        let exploration = canvas.read_with(cx, |canvas, _| canvas.exploration.clone());
         cx.run_until_parked();
         (canvas, exploration, ada)
     }
@@ -3044,11 +3128,8 @@ mod tests {
             cx,
         );
         cx.run_until_parked();
-        let canvas = cx.new(|cx| GraphCanvas::new(session, cx));
+        let canvas = cx.new(|cx| GraphCanvas::new(session, NodeRef::new("Person", "p1"), None, cx));
         let exploration = canvas.read_with(cx, |canvas, _| canvas.exploration.clone());
-        exploration.update(cx, |exploration, cx| {
-            exploration.root_at(NodeRef::new("Person", "p1"), cx)
-        });
         cx.run_until_parked();
         // Answers that come in together are laid out after a short wait, when the canvas is
         // drawn (here, by hand: it has no window).
@@ -3102,11 +3183,8 @@ mod tests {
             cx,
         );
         cx.run_until_parked();
-        let canvas = cx.new(|cx| GraphCanvas::new(session, cx));
+        let canvas = cx.new(|cx| GraphCanvas::new(session, NodeRef::new("Person", "p1"), None, cx));
         let exploration = canvas.read_with(cx, |canvas, _| canvas.exploration.clone());
-        exploration.update(cx, |exploration, cx| {
-            exploration.root_at(NodeRef::new("Person", "p1"), cx)
-        });
         cx.run_until_parked();
         cx.executor()
             .advance_clock(std::time::Duration::from_secs(1));
@@ -3141,12 +3219,10 @@ mod tests {
         );
     }
 
-    /// Show on canvas of a node the exploration shows selects it there: it does not start the
-    /// exploration again at it.
+    /// A canvas starts from where the person placed things on the graph's old canvas, as its own
+    /// copy, and saves its root with them, so it comes back as the same walk (spec 020).
     #[gpui::test]
-    async fn showing_a_shown_node_keeps_the_exploration(cx: &mut gpui::TestAppContext) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
+    async fn a_canvas_starts_from_the_graphs_saved_positions(cx: &mut gpui::TestAppContext) {
         cx.update(studio_theme::init_test);
         let (session, _served) = graph_store::test_server::followed_session(
             "node Person {\n  slug: String @key\n  name: String\n}\n",
@@ -3154,25 +3230,35 @@ mod tests {
             cx,
         );
         cx.run_until_parked();
-        let canvas = cx.new(|cx| GraphCanvas::new(session, cx));
-        let exploration = canvas.read_with(cx, |canvas, _| canvas.exploration.clone());
-        let ada = NodeRef::new("Person", "p1");
-        exploration.update(cx, |exploration, cx| exploration.root_at(ada.clone(), cx));
-        cx.run_until_parked();
-        let changes = Arc::new(AtomicUsize::new(0));
-        let counted = changes.clone();
-        let _counting = cx.update(|cx| {
-            cx.subscribe(&exploration, move |_, event: &ExplorationEvent, _| {
-                if matches!(event, ExplorationEvent::Changed) {
-                    counted.fetch_add(1, Ordering::SeqCst);
-                }
-            })
+        // As a saved root-less canvas leaves them.
+        let old = serde_json::json!({ "pinned": { "n:Person:p1": [12.0, 34.0] } });
+        let positions = pins_from_json(&old);
+        session.update(cx, |session, _| {
+            for (key, at) in positions {
+                session.canvas_positions.insert(key, [at.x, at.y]);
+            }
         });
-        canvas.update(cx, |canvas, cx| canvas.show_node(ada.clone(), cx));
-        cx.run_until_parked();
-        assert_eq!(changes.load(Ordering::SeqCst), 0, "not rooted again");
-        canvas.read_with(cx, |canvas, _| {
-            assert!(canvas.scene.index_of(&SceneId::Node(ada)).is_some());
+        let ada = NodeRef::new("Person", "p1");
+        let held = Some("c1".to_owned());
+        let canvas = cx.new(|cx| GraphCanvas::new(session.clone(), ada.clone(), held, cx));
+        canvas.update(cx, |canvas, cx| {
+            assert_eq!(canvas.pinned["n:Person:p1"], Vec2::new(12., 34.));
+            canvas.pinned.clear();
+            let saved = Item::serialize(canvas, cx).expect("a walk is saved");
+            assert_eq!(saved.data["type_name"], "Person");
+            assert_eq!(saved.data["id"], "p1");
+            assert_eq!(saved.data["at_commit"], "c1");
+            let key = Item::dedupe_key(canvas, cx).expect("a walk has a key");
+            assert_eq!(
+                key.as_ref(),
+                format!("canvas:{}:Person:p1@c1", canvas.session.read(cx).graph_id)
+            );
+        });
+        session.read_with(cx, |session, _| {
+            assert!(
+                session.canvas_positions.contains_key("n:Person:p1"),
+                "a tab's reset leaves the graph's saved positions alone"
+            );
         });
     }
 }

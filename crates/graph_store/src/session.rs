@@ -631,6 +631,10 @@ pub struct GraphSession {
     pub connection: Entity<Connection>,
     pub graph_id: String,
     pub branch: String,
+    /// Where the person placed nodes and relationship pills on the canvas this graph had before
+    /// canvases each had a root, keyed as the canvas keys them: each new canvas copies these
+    /// (spec 020). Saved with the graph's tabs.
+    pub canvas_positions: std::collections::BTreeMap<String, [f32; 2]>,
     /// How this graph's saved state names its server ([`crate::ServerEntry::saved_key`]),
     /// taken when the session is made: a target renamed while the graph is open keeps the
     /// graph's state where it was until the graph is opened again, under the new name, with
@@ -856,6 +860,7 @@ impl GraphSession {
             connection,
             graph_id,
             branch,
+            canvas_positions: Default::default(),
             server_key,
             schema: Loadable::NotLoaded,
             branches: Loadable::NotLoaded,

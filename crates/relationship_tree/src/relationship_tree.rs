@@ -1,27 +1,17 @@
 //! The relationship tree (spec 005): a node, its relationship groups with counts, the nodes at
-//! the other end, their groups, and so on, as a path tree over the session's shared
-//! [`Exploration`]. It is the left dock's "Explore" panel.
+//! the other end, their groups, and so on, as a path tree over a walk ([`Exploration`]) it shares
+//! with a canvas of the same root. It is a tab, a view of one node (spec 020).
 //!
 //! Layer 5 (`docs/architecture.md`). Plan: `specs/005-relationship-tree/plan.md`.
-//!
-//! Rooting: the tree registers a workspace handler for `OpenNode` that shows the Explore panel,
-//! reveals the node (selects it where the tree already shows it, else roots the tree there and
-//! focuses the tree) and then
-//! calls `cx.propagate()`, so a later handler, such as the inspector's, still runs. GPUI stops
-//! at the first bubble handler that does not propagate, so a feature crate that handles
-//! `OpenNode` before this one and does not propagate should call
-//! `Exploration::for_session(session, cx).update(cx, |e, cx| e.reveal(node, cx))` itself: the
-//! exploration lives in `graph_store`, which every feature crate may use.
 
 mod rows;
 
-use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, EntityId, FocusHandle,
-    Focusable, KeyContext, KeyDownEvent, ListSizingBehavior, Render, ScrollStrategy, Subscription,
+    AnyElement, App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyContext,
+    KeyDownEvent, ListSizingBehavior, Render, ScrollStrategy, Subscription,
     UniformListScrollHandle, Window, uniform_list,
 };
 use gq_language::builder::GroupBy;
@@ -29,8 +19,8 @@ use graph_store::{
     Entry, EntryKind, Exploration, ExplorationEvent, GraphSession, Loadable, NodeRef, SessionEvent,
 };
 use smallvec::SmallVec;
-use studio_actions::graph::{OpenNode, ShowNodeOnCanvas};
 use studio_actions::graph::{OpenType, PeekNode};
+use studio_actions::graph::{ShowNodeInTree, ShowNodeOnCanvas};
 use studio_actions::tree::{
     ClearFilter, Collapse, CollapseAll, Expand, ExpandAll, OpenPage, OpenSelected, OpenTable,
     PeekSelected, RerootHere, SelectNext, SelectPrevious, ShowOnCanvas, ToggleEmptyGroups,
@@ -39,79 +29,85 @@ use studio_actions::workspace::Refresh;
 use studio_ui::ds::space;
 use studio_ui::menu::ContextMenu;
 use studio_ui::type_swatch;
-use studio_workspace::{PanelPosition, Workspace, WorkspaceEvent};
+use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
 use ui::prelude::*;
 use ui::{IndentGuideColors, PopoverMenu, StickyCandidate, Tooltip};
 
 use rows::{RowId, RowTag};
 
-/// The tree's panel id in the left dock.
-const EXPLORE_PANEL: &str = "explore";
 const ROW_HEIGHT: f32 = studio_ui::ds::size::SIDEBAR_ROW;
 const INDENT: f32 = studio_ui::ds::space::LG;
 const LEFT_PAD: f32 = studio_ui::ds::space::MD;
 const DISCLOSURE: f32 = studio_ui::ds::size::DISCLOSURE;
 
-/// Adds the "Explore" panel to every workspace. The tree's keys are in `assets/keymaps/`.
+/// What a tree tab saves and comes back from.
+const TREE_KIND: &str = "tree";
+
+/// Registers the tree's tab and the action that opens it. The tree's keys are in `assets/keymaps/`.
 pub fn init(cx: &mut App) {
-    cx.observe_new(|workspace: &mut Workspace, window, cx| {
-        let Some(window) = window else {
+    studio_workspace::register_item_kind(cx, TREE_KIND, |data, workspace, window, cx| {
+        let node = data
+            .get("type_name")
+            .and_then(serde_json::Value::as_str)
+            .zip(data.get("id").and_then(serde_json::Value::as_str));
+        if let Some((type_name, id)) = node {
+            let at_commit = data
+                .get("at_commit")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            open_tree(
+                workspace,
+                NodeRef::new(type_name, id),
+                at_commit,
+                false,
+                window,
+                cx,
+            );
+        }
+    });
+    cx.observe_new(|workspace: &mut Workspace, window, _cx| {
+        if window.is_none() {
             return;
-        };
-        let handle = cx.entity();
-        let session = workspace.session().cloned();
-        let tree = cx.new(|cx| RelationshipTree::new(&handle, session, window, cx));
-        let view: gpui::AnyView = tree.clone().into();
-        workspace.add_panel(
-            PanelPosition::Left,
-            EXPLORE_PANEL,
-            "Explore",
-            IconName::ListTree,
-            view.clone(),
-            cx,
-        );
-        // The tree is a list that draws only its rows in view, sized from whichever dock it is
-        // in, so the row the keyboard selects scrolls into what shows.
-        workspace.set_panel_scrolls_itself(&view, cx);
-        let actions = cx.new(|cx| ExploreActions::new(&tree, cx));
-        workspace.set_panel_actions(EXPLORE_PANEL, actions.into(), cx);
-        // Shown from its button or its key, the tree takes the keyboard.
-        let focused = tree.clone();
-        workspace.set_panel_focus(EXPLORE_PANEL, move |cx| Some(focused.focus_handle(cx)), cx);
-        workspace.register_action(move |workspace, action: &OpenNode, window, cx| {
-            if let Some(session) = workspace.session().cloned() {
-                workspace.activate_panel(EXPLORE_PANEL, cx);
-                let node = NodeRef::new(action.type_name.clone(), action.id.clone());
-                reveal(&tree, &session, node, window, cx);
-            }
-            cx.propagate();
+        }
+        workspace.register_action(|workspace, action: &ShowNodeInTree, window, cx| {
+            // The tab it was opened from stays (spec 020).
+            workspace.keep_active_tab(cx);
+            open_tree(
+                workspace,
+                NodeRef::new(action.type_name.clone(), action.id.clone()),
+                action.at_commit.clone(),
+                action.preview,
+                window,
+                cx,
+            );
         });
     })
     .detach();
 }
 
-fn reveal(
-    tree: &Entity<RelationshipTree>,
-    session: &Entity<GraphSession>,
+fn tree_key(graph_id: &str, node: &NodeRef, at_commit: Option<&str>) -> SharedString {
+    let key = format!("tree:{graph_id}:{}:{}", node.type_name, node.id);
+    match at_commit {
+        Some(commit) => format!("{key}@{commit}").into(),
+        None => key.into(),
+    }
+}
+
+fn open_tree(
+    workspace: &mut Workspace,
     node: NodeRef,
+    at_commit: Option<String>,
+    preview: bool,
     window: &mut Window,
-    cx: &mut App,
+    cx: &mut Context<Workspace>,
 ) {
-    let exploration = Exploration::for_session(session, cx);
-    // Activated on its own row: it stays there, not on its first place in the tree.
-    let selected = exploration.read(cx).root().is_some_and(|root| {
-        exploration
-            .read(cx)
-            .selection()
-            .is_some_and(|path| path.ends_at_node() && *path.node(root) == node)
-    });
-    if selected {
+    let Some(session) = workspace.session().cloned() else {
         return;
-    }
-    let visible = exploration.update(cx, |exploration, cx| exploration.reveal(node, cx));
-    if !visible {
-        window.focus(&tree.focus_handle(cx), cx);
-    }
+    };
+    let key = tree_key(&session.read(cx).graph_id, &node, at_commit.as_deref());
+    workspace.open_item_with::<RelationshipTree>(key, preview, window, cx, move |_, cx| {
+        RelationshipTree::new(session, node, at_commit, cx)
+    });
 }
 
 #[derive(Clone)]
@@ -159,11 +155,17 @@ fn disclosure(entry: &Entry) -> (bool, bool) {
 }
 
 pub(crate) struct RelationshipTree {
-    exploration: Option<Entity<Exploration>>,
-    /// Each graph the window has open, by its session, with its exploration: the registry
-    /// keeps an exploration only while something holds it, and the tree is what does when no
-    /// canvas is open, so going back to a graph shows its walk as it was.
-    kept: HashMap<EntityId, Entity<Exploration>>,
+    session: Entity<GraphSession>,
+    /// The walk this tab shows, shared with a canvas of the same root and commit. The tab holds
+    /// it: closing every tab on a walk ends it.
+    exploration: Entity<Exploration>,
+    root: NodeRef,
+    /// The commit this tab is held at; none reads the branch head.
+    at_commit: Option<String>,
+    /// The walk changed while the tab was not drawn: rows are made again when it next is.
+    rebuild_owed: bool,
+    /// The walk's selection moved while the tab was not drawn.
+    selection_owed: bool,
     /// The exploration's, shared with it and the canvas: made once per change.
     entries: Arc<Vec<Entry>>,
     /// Whether some relationship group in `entries` has no relationships: worked out with
@@ -180,8 +182,7 @@ pub(crate) struct RelationshipTree {
     hide_empty: bool,
     focus_handle: FocusHandle,
     scroll_handle: UniformListScrollHandle,
-    exploration_subscriptions: Vec<Subscription>,
-    _workspace_subscription: Subscription,
+    _subscriptions: Vec<Subscription>,
     /// The read ahead for the row the pointer rests on, once it has rested, with that row's
     /// path.
     prefetch: Option<(graph_store::ExplorePath, gpui::Task<()>)>,
@@ -195,39 +196,102 @@ impl Focusable for RelationshipTree {
     }
 }
 
+impl EventEmitter<ItemEvent> for RelationshipTree {}
+
+impl Item for RelationshipTree {
+    fn tab_title(&self, cx: &App) -> SharedString {
+        let state = self.exploration.read(cx).state();
+        let name = rows::node_text(state, &self.root);
+        match &self.at_commit {
+            Some(commit) => format!("Tree: {name} @ {}", studio_ui::short_commit_id(commit)).into(),
+            None => format!("Tree: {name}").into(),
+        }
+    }
+
+    fn tab_icon(&self, _cx: &App) -> Option<IconName> {
+        Some(IconName::ListTree)
+    }
+
+    fn dedupe_key(&self, cx: &App) -> Option<SharedString> {
+        Some(tree_key(
+            &self.session.read(cx).graph_id,
+            &self.root,
+            self.at_commit.as_deref(),
+        ))
+    }
+
+    fn thing(&self, _cx: &App) -> Option<studio_actions::Thing> {
+        Some(studio_actions::Thing::Node {
+            type_name: self.root.type_name.clone(),
+            id: self.root.id.clone(),
+        })
+    }
+
+    fn is_stale(&self, cx: &App) -> bool {
+        self.exploration.read(cx).newer_available()
+    }
+
+    fn serialize(&self, _cx: &App) -> Option<SavedItem> {
+        Some(SavedItem {
+            kind: TREE_KIND.into(),
+            data: serde_json::json!({
+                "type_name": self.root.type_name,
+                "id": self.root.id,
+                "at_commit": self.at_commit,
+            }),
+        })
+    }
+}
+
 impl RelationshipTree {
     fn new(
-        workspace: &Entity<Workspace>,
-        session: Option<Entity<GraphSession>>,
-        window: &mut Window,
+        session: Entity<GraphSession>,
+        root: NodeRef,
+        at_commit: Option<String>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let workspace_subscription = cx.subscribe_in(
-            workspace,
-            window,
-            |this, workspace, event: &WorkspaceEvent, window, cx| {
-                if !matches!(event, WorkspaceEvent::SessionChanged) {
-                    return;
+        let exploration = Exploration::for_walk(&session, root.clone(), at_commit.clone(), cx);
+        let subscriptions = vec![
+            cx.subscribe(&exploration, |this, _, event, cx| match event {
+                ExplorationEvent::Changed => {
+                    this._loaded = None;
+                    cx.emit(ItemEvent::UpdateTab);
+                    this.owe_rebuild(cx);
                 }
-                let open: HashSet<EntityId> = workspace
-                    .read(cx)
-                    .open_graphs()
-                    .iter()
-                    .map(|(session, _)| session.entity_id())
-                    .collect();
-                this.kept.retain(|session, _| open.contains(session));
-                let session = workspace.read(cx).session().cloned();
-                // With nothing focused, GPUI dispatches actions from the window's root node,
-                // above the workspace's handlers; give the keyboard a home once a graph opens.
-                if session.is_some() && window.focused(cx).is_none() {
-                    window.focus(&this.focus_handle, cx);
+                // Reads that finish together (a node's counts) are shown in one go.
+                ExplorationEvent::Loaded => {
+                    if this._loaded.is_none() {
+                        this._loaded = Some(cx.spawn(async move |this, cx| {
+                            cx.background_executor()
+                                .timer(std::time::Duration::from_millis(8))
+                                .await;
+                            this.update(cx, |this, cx| {
+                                this._loaded = None;
+                                cx.emit(ItemEvent::UpdateTab);
+                                this.owe_rebuild(cx);
+                            })
+                            .ok();
+                        }));
+                    }
                 }
-                this.set_session(session, cx);
-            },
-        );
+                ExplorationEvent::SelectionChanged => {
+                    this.selection_owed = true;
+                    cx.notify();
+                }
+            }),
+            cx.subscribe(&session, |this, _, event: &SessionEvent, cx| {
+                if *event == SessionEvent::SchemaChanged {
+                    this.owe_rebuild(cx);
+                }
+            }),
+        ];
         let mut tree = Self {
-            exploration: None,
-            kept: HashMap::new(),
+            session,
+            exploration,
+            root,
+            at_commit,
+            rebuild_owed: false,
+            selection_owed: false,
             entries: Arc::default(),
             any_empty: false,
             visible: Vec::new(),
@@ -237,82 +301,25 @@ impl RelationshipTree {
             hide_empty: false,
             focus_handle: cx.focus_handle(),
             scroll_handle: UniformListScrollHandle::new(),
-            exploration_subscriptions: Vec::new(),
-            _workspace_subscription: workspace_subscription,
+            _subscriptions: subscriptions,
             prefetch: None,
             _loaded: None,
         };
-        if session.is_some() && window.focused(cx).is_none() {
-            window.focus(&tree.focus_handle, cx);
-        }
-        tree.set_session(session, cx);
+        tree.rebuild(cx);
+        tree.follow_selection(cx);
         tree
     }
 
-    fn set_session(&mut self, session: Option<Entity<GraphSession>>, cx: &mut Context<Self>) {
-        let exploration = session
-            .as_ref()
-            .map(|session| Exploration::for_session(session, cx));
-        if exploration == self.exploration {
-            return;
-        }
-        // The filter goes with the graph shown, and so do the server searches it asked for and
-        // what was read ahead for the row the pointer rests on.
-        if !self.filter.is_empty() {
-            self.with_exploration(cx, |e, cx| e.clear_searches(cx));
-        }
-        if let Some((path, _)) = self.prefetch.take() {
-            self.with_exploration(cx, |e, cx| e.end_prefetch(&path, cx));
-        }
-        if let (Some(exploration), Some(session)) = (&exploration, &session) {
-            self.kept.insert(session.entity_id(), exploration.clone());
-        }
-        self.exploration_subscriptions.clear();
-        if let (Some(exploration), Some(session)) = (&exploration, &session) {
-            self.exploration_subscriptions
-                .push(cx.subscribe(exploration, |this, _, event, cx| match event {
-                    ExplorationEvent::Changed => {
-                        this._loaded = None;
-                        this.rebuild(cx);
-                    }
-                    // Reads that finish together (a node's counts) are shown in one go.
-                    ExplorationEvent::Loaded => {
-                        if this._loaded.is_none() {
-                            this._loaded = Some(cx.spawn(async move |this, cx| {
-                                cx.background_executor()
-                                    .timer(std::time::Duration::from_millis(8))
-                                    .await;
-                                this.update(cx, |this, cx| {
-                                    this._loaded = None;
-                                    this.rebuild(cx);
-                                })
-                                .ok();
-                            }));
-                        }
-                    }
-                    ExplorationEvent::SelectionChanged => this.follow_selection(cx),
-                }));
-            self.exploration_subscriptions.push(cx.subscribe(
-                session,
-                |this, _, event: &SessionEvent, cx| {
-                    if *event == SessionEvent::SchemaChanged {
-                        this.rebuild(cx);
-                    }
-                },
-            ));
-        }
-        self.exploration = exploration;
-        self.selected = None;
-        self.filter.clear();
-        self.rebuild(cx);
-        self.follow_selection(cx);
+    /// Makes the rows again when the tab is next drawn: a hidden tab makes none at each answer
+    /// (`docs/drawing.md`).
+    fn owe_rebuild(&mut self, cx: &mut Context<Self>) {
+        self.rebuild_owed = true;
+        cx.notify();
     }
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
-        self.entries = match &self.exploration {
-            Some(exploration) => exploration.read(cx).entries(),
-            None => Arc::default(),
-        };
+        self.rebuild_owed = false;
+        self.entries = self.exploration.read(cx).entries();
         self.any_empty = self.entries.iter().any(|entry| {
             matches!(
                 entry.kind,
@@ -329,9 +336,9 @@ impl RelationshipTree {
     /// selected row when the rows it pointed into are gone.
     fn refilter(&mut self, cx: &mut Context<Self>) {
         let previous_row = self.selected_row_index_hint;
-        self.visible = match &self.exploration {
-            Some(exploration) => {
-                let exploration = exploration.read(cx);
+        self.visible = {
+            {
+                let exploration = self.exploration.read(cx);
                 rows::filter(
                     &self.entries,
                     exploration.state(),
@@ -340,7 +347,6 @@ impl RelationshipTree {
                     self.hide_empty,
                 )
             }
-            None => Vec::new(),
         };
         if let Some(selected) = &self.selected
             && rows::find(&self.visible, &self.entries, selected).is_none()
@@ -361,11 +367,7 @@ impl RelationshipTree {
 
     /// Selects the row the exploration's selection points at (a canvas click, a reveal).
     fn follow_selection(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = self
-            .exploration
-            .as_ref()
-            .and_then(|exploration| exploration.read(cx).selection().cloned())
-        else {
+        let Some(path) = self.exploration.read(cx).selection().cloned() else {
             return;
         };
         let row = self.visible.iter().position(|ix| {
@@ -425,8 +427,9 @@ impl RelationshipTree {
         self.selected_row_index_hint = Some(row);
         self.scroll_handle
             .scroll_to_item(row, ScrollStrategy::Nearest);
-        if let (Some(path), Some(exploration)) = (shared, self.exploration.clone()) {
-            exploration.update(cx, |exploration, cx| exploration.select(Some(path), cx));
+        if let Some(path) = shared {
+            self.exploration
+                .update(cx, |exploration, cx| exploration.select(Some(path), cx));
         }
         cx.notify();
     }
@@ -436,9 +439,7 @@ impl RelationshipTree {
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut Exploration, &mut Context<Exploration>),
     ) {
-        if let Some(exploration) = self.exploration.clone() {
-            exploration.update(cx, f);
-        }
+        self.exploration.clone().update(cx, f);
     }
 
     // ---- actions ----
@@ -535,11 +536,11 @@ impl RelationshipTree {
             return;
         };
         match entry.kind {
-            EntryKind::Node { node, .. } => open_node(&node, window, cx),
+            EntryKind::Node { node, .. } => self.open_node(&node, window, cx),
             EntryKind::Field {
                 target: Some(target),
                 ..
-            } => open_node(&target.node, window, cx),
+            } => self.open_node(&target.node, window, cx),
             EntryKind::Group { .. } | EntryKind::Bucket { .. } => {
                 self.with_exploration(cx, |e, cx| e.toggle(&entry.path, cx));
             }
@@ -566,13 +567,33 @@ impl RelationshipTree {
         }
     }
 
-    fn reroot_here(&mut self, _: &RerootHere, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(entry) = self.selected_entry().cloned() else {
+    /// A node's page, at the commit this tree is held at.
+    fn open_node(&self, node: &NodeRef, window: &mut Window, cx: &mut App) {
+        window.dispatch_action(
+            Box::new(studio_actions::graph::OpenNodePage {
+                type_name: node.type_name.clone(),
+                id: node.id.clone(),
+                at_commit: self.at_commit.clone(),
+            }),
+            cx,
+        );
+    }
+
+    /// Walks from the selected node in a tab of its own; Back returns to this one (spec 020).
+    fn reroot_here(&mut self, _: &RerootHere, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(EntryKind::Node { node, .. }) = self.selected_entry().map(|entry| &entry.kind)
+        else {
             return;
         };
-        if let EntryKind::Node { .. } = entry.kind {
-            self.with_exploration(cx, |e, cx| e.reroot(&entry.path, cx));
-        }
+        window.dispatch_action(
+            Box::new(ShowNodeInTree {
+                type_name: node.type_name.clone(),
+                id: node.id.clone(),
+                at_commit: self.at_commit.clone(),
+                preview: true,
+            }),
+            cx,
+        );
     }
 
     /// The node the selected row shows: a node, a cycle back to one, or a field's target.
@@ -595,6 +616,8 @@ impl RelationshipTree {
             Box::new(ShowNodeOnCanvas {
                 type_name: node.type_name,
                 id: node.id,
+                at_commit: self.at_commit.clone(),
+                preview: true,
             }),
             cx,
         );
@@ -608,13 +631,7 @@ impl RelationshipTree {
 
     /// The text a group's neighbours are narrowed to on the server, if any.
     fn group_search(&self, key: &graph_store::GroupKey, cx: &App) -> Option<String> {
-        self.exploration
-            .as_ref()?
-            .read(cx)
-            .state()
-            .searches
-            .get(key)
-            .cloned()
+        self.exploration.read(cx).state().searches.get(key).cloned()
     }
 
     /// Space: the selected node in the inspector, focus staying in the tree.
@@ -626,7 +643,7 @@ impl RelationshipTree {
             Box::new(PeekNode {
                 type_name: node.type_name,
                 id: node.id,
-                at_commit: None,
+                at_commit: self.at_commit.clone(),
             }),
             cx,
         );
@@ -641,7 +658,7 @@ impl RelationshipTree {
                     Box::new(studio_actions::graph::OpenNodePage {
                         type_name: node.type_name.clone(),
                         id: node.id.clone(),
-                        at_commit: None,
+                        at_commit: self.at_commit.clone(),
                     }),
                     cx,
                 );
@@ -656,7 +673,7 @@ impl RelationshipTree {
         let action = match self.selected_entry().map(|entry| &entry.kind) {
             Some(EntryKind::Node { node, .. } | EntryKind::Cycle { node, .. }) => OpenType {
                 type_name: node.type_name.clone(),
-                at_commit: None,
+                at_commit: self.at_commit.clone(),
                 filter_id: Some(node.id.clone()),
                 via: None,
                 preview: false,
@@ -666,7 +683,7 @@ impl RelationshipTree {
                 let back = gq_language::builder::reversed(&key.group, &key.node.type_name);
                 OpenType {
                     type_name: key.group.other_type.clone(),
-                    at_commit: None,
+                    at_commit: self.at_commit.clone(),
                     filter_id: Some(key.node.id.clone()),
                     via: Some(gq_language::builder::relationship_key(&back)),
                     preview: false,
@@ -733,10 +750,7 @@ impl RelationshipTree {
         let focus_border = studio_ui::ds::surface::focus(cx);
         let panel_bg = studio_ui::ds::surface::chrome(cx);
         let entry = &self.entries[self.visible[row]];
-        let Some(exploration) = &self.exploration else {
-            return div().into_any_element();
-        };
-        let state = exploration.read(cx).state();
+        let state = self.exploration.read(cx).state();
 
         let (disclosure, expanded) = disclosure(entry);
         let toggle_path = entry.path.clone();
@@ -868,7 +882,8 @@ impl RelationshipTree {
                     Loadable::Failed(_) => "!".to_owned(),
                     Loadable::NotLoaded | Loadable::Loading => "…".to_owned(),
                 };
-                let grouped_by = exploration
+                let grouped_by = self
+                    .exploration
                     .read(cx)
                     .grouping(&key.group)
                     .map(GroupBy::label);
@@ -919,7 +934,7 @@ impl RelationshipTree {
                     .within
                     .as_ref()
                     .is_none_or(|within| within.value.is_null());
-                let schema = exploration.read(cx).schema();
+                let schema = self.exploration.read(cx).schema();
                 let text = rows::bucket_row_text(key, state, schema.as_deref());
                 h_flex()
                     .min_w_0()
@@ -957,7 +972,7 @@ impl RelationshipTree {
                 } else if let Some(search) = searching {
                     format!("Show more matching “{search}”")
                 } else {
-                    rows::more_label(*shown, *total, exploration.read(cx).page_size(cx))
+                    rows::more_label(*shown, *total, self.exploration.read(cx).page_size(cx))
                 };
                 studio_ui::ds::text::meta(text)
                     .color(Color::Accent)
@@ -1107,7 +1122,7 @@ impl RelationshipTree {
         selected: bool,
         cx: &App,
     ) -> Option<AnyElement> {
-        let exploration = self.exploration.clone()?;
+        let exploration = self.exploration.clone();
         let schema = exploration.read(cx).schema()?;
         if !GroupBy::has_choices(&schema, group) {
             return None;
@@ -1192,20 +1207,55 @@ impl RelationshipTree {
         )
     }
 
+    /// The tab's toolbar: hide relationships with none, and close everything below the root.
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let hide_empty = self.hide_empty;
+        studio_ui::ds::toolbar(cx).child(div().flex_1()).child(
+            studio_ui::ds::toolbar_actions()
+                // The toggle shows only when it changes something: an empty group, or
+                // hiding on.
+                .when(hide_empty || self.any_empty, |row| {
+                    row.child(
+                        studio_ui::ds::row_icon_button(
+                            "toggle-empty-groups",
+                            if hide_empty {
+                                IconName::EyeOff
+                            } else {
+                                IconName::Eye
+                            },
+                        )
+                        .icon_color(Color::Muted)
+                        .toggle_state(hide_empty)
+                        .tooltip(move |_, cx| {
+                            Tooltip::for_action(
+                                if hide_empty {
+                                    "Show relationships with none"
+                                } else {
+                                    "Hide relationships with none"
+                                },
+                                &ToggleEmptyGroups,
+                                cx,
+                            )
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_empty_groups(&ToggleEmptyGroups, window, cx)
+                        })),
+                    )
+                })
+                .child(
+                    studio_ui::ds::row_icon_button("collapse-to-root", IconName::ListCollapse)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Collapse all"))
+                        .on_click(cx.listener(|this, _, _, cx| this.collapse_to_root(cx))),
+                ),
+        )
+    }
+
     fn render_header(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let exploration = self.exploration.as_ref()?;
-        let e = exploration.read(cx);
-        let state = e.state();
+        let e = self.exploration.read(cx);
         let newer = e.newer_available();
-        let breadcrumb: Vec<(usize, String)> = state
-            .breadcrumb
-            .iter()
-            .enumerate()
-            .map(|(index, node)| (index, rows::node_text(state, node)))
-            .collect();
-        state.root.as_ref()?;
         let filter = self.filter.clone();
-        if breadcrumb.is_empty() && !newer && filter.is_empty() {
+        if !newer && filter.is_empty() {
             return None;
         }
         let field = studio_ui::ds::surface::sunken(cx);
@@ -1215,18 +1265,6 @@ impl RelationshipTree {
                 .px(px(space::MD))
                 .pb(px(space::XS))
                 .gap(px(space::XS))
-                .when(!breadcrumb.is_empty(), |d| {
-                    d.child(h_flex().min_w_0().flex_wrap().gap(px(space::XXS)).children(
-                        breadcrumb.into_iter().map(|(index, text)| {
-                            studio_ui::ds::row_button(("crumb", index), format!("{text} ›"))
-                                .style(ButtonStyle::Subtle)
-                                .tooltip(Tooltip::text("Explore from here again"))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.with_exploration(cx, |e, cx| e.back_to(index, cx));
-                                }))
-                        }),
-                    ))
-                })
                 .when(newer, |d| {
                     d.child(
                         studio_ui::ds::row_button("newer", "Newer data · Refresh")
@@ -1292,9 +1330,7 @@ impl RelationshipTree {
             self.with_exploration(cx, |e, cx| e.end_prefetch(path, cx));
             return;
         }
-        let Some(exploration) = self.exploration.clone() else {
-            return;
-        };
+        let exploration = self.exploration.clone();
         let read = path.clone();
         let task = cx.spawn(async move |_, cx| {
             cx.background_executor()
@@ -1377,24 +1413,19 @@ impl RelationshipTree {
     }
 }
 
-fn open_node(node: &NodeRef, window: &mut Window, cx: &mut App) {
-    window.dispatch_action(
-        Box::new(OpenNode {
-            type_name: node.type_name.clone(),
-            id: node.id.clone(),
-        }),
-        cx,
-    );
-}
-
 impl Render for RelationshipTree {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // What the session's events left to read is read once the tree is drawn.
-        if let Some(exploration) = &self.exploration
-            && exploration.read(cx).owes_reads()
-        {
-            let exploration = exploration.clone();
+        if self.exploration.read(cx).owes_reads() {
+            let exploration = self.exploration.clone();
             cx.defer(move |cx| exploration.update(cx, |e, cx| e.read_owed(cx)));
+        }
+        // What the walk's changes left to show is shown once the tab is drawn.
+        if self.rebuild_owed {
+            self.rebuild(cx);
+        }
+        if std::mem::take(&mut self.selection_owed) {
+            self.follow_selection(cx);
         }
         let mut context = KeyContext::new_with_defaults();
         context.add("Tree");
@@ -1429,107 +1460,21 @@ impl Render for RelationshipTree {
             }))
             .on_key_down(cx.listener(Self::key_down));
 
-        let has_root = self
-            .exploration
-            .as_ref()
-            .is_some_and(|exploration| exploration.read(cx).root().is_some());
-        if !has_root || self.entries.is_empty() {
+        let toolbar = self.render_toolbar(cx);
+        if self.entries.is_empty() {
             return root
-                .child(studio_ui::ds::sidebar_placeholder(
-                    "explore-empty",
-                    IconName::ListTree,
-                    "No node",
-                    how_to_explore(cx),
-                ))
+                .child(toolbar)
+                .child(studio_ui::ds::sidebar_note("Reading…"))
                 .into_any_element();
         }
 
-        // The header (a breadcrumb that may wrap, Refresh, the filter) as tall as it is; the
-        // rows take the rest of the dock.
+        // The header (Refresh, the filter) as tall as it is; the rows take the rest of the tab.
         let header = self.render_header(cx);
         let list = self.render_list(window, cx);
-        root.children(header).child(list).into_any_element()
-    }
-}
-
-/// The Explore panel's title-row actions: hide relationships with none, and close everything
-/// below the root.
-pub(crate) struct ExploreActions {
-    tree: gpui::WeakEntity<RelationshipTree>,
-    _observe: Subscription,
-}
-
-impl ExploreActions {
-    fn new(tree: &Entity<RelationshipTree>, cx: &mut Context<Self>) -> Self {
-        Self {
-            tree: tree.downgrade(),
-            _observe: cx.observe(tree, |_, _, cx| cx.notify()),
-        }
-    }
-}
-
-impl Render for ExploreActions {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(tree) = self.tree.upgrade() else {
-            return h_flex();
-        };
-        let (rooted, hide_empty, any_empty) = {
-            let tree = tree.read(cx);
-            (
-                tree.exploration
-                    .as_ref()
-                    .is_some_and(|e| e.read(cx).root().is_some()),
-                tree.hide_empty,
-                tree.any_empty,
-            )
-        };
-        let weak = self.tree.clone();
-        h_flex()
-            .gap(px(space::XXS))
-            // The toggle shows only when it changes something: an empty group, or hiding on.
-            .when(hide_empty || any_empty, |row| {
-                let tree = weak.clone();
-                row.child(
-                    studio_ui::ds::row_icon_button(
-                        "toggle-empty-groups",
-                        if hide_empty {
-                            IconName::EyeOff
-                        } else {
-                            IconName::Eye
-                        },
-                    )
-                    .icon_color(Color::Muted)
-                    .toggle_state(hide_empty)
-                    .tooltip(move |_, cx| {
-                        Tooltip::for_action(
-                            if hide_empty {
-                                "Show relationships with none"
-                            } else {
-                                "Hide relationships with none"
-                            },
-                            &ToggleEmptyGroups,
-                            cx,
-                        )
-                    })
-                    .on_click(move |_, window, cx| {
-                        tree.update(cx, |tree, cx| {
-                            tree.toggle_empty_groups(&ToggleEmptyGroups, window, cx)
-                        })
-                        .ok();
-                    }),
-                )
-            })
-            .when(rooted, |row| {
-                let tree = weak.clone();
-                row.child(
-                    studio_ui::ds::row_icon_button("collapse-to-root", IconName::ListCollapse)
-                        .icon_color(Color::Muted)
-                        .tooltip(Tooltip::text("Collapse all"))
-                        .on_click(move |_, _, cx| {
-                            tree.update(cx, |tree, cx| tree.collapse_to_root(cx)).ok();
-                        }),
-                )
-            })
+        root.child(toolbar)
+            .children(header)
+            .child(list)
+            .into_any_element()
     }
 }
 
@@ -1616,16 +1561,6 @@ impl HoverCard {
 
 /// How to give the tree a node, with the keys the keymap binds: explore a table row, or open a
 /// node from the command palette.
-fn how_to_explore(cx: &App) -> String {
-    let row = studio_ui::shortcut_text(&studio_actions::table::ExploreRow, cx)
-        .map(|keys| format!("Press {keys} on a table row"))
-        .unwrap_or_else(|| "Explore a table row".to_owned());
-    let palette = studio_ui::shortcut_text(&studio_actions::workspace::ToggleCommandPalette, cx)
-        .map(|keys| format!("{keys} and Open Node"))
-        .unwrap_or_else(|| "Open Node in the command palette".to_owned());
-    format!("{row}, or {palette}, to walk its relationships")
-}
-
 #[cfg(test)]
 mod tests {
     use graph_store::test_server::followed_session;
@@ -1672,7 +1607,6 @@ mod tests {
 
     struct Dock {
         tree: Entity<RelationshipTree>,
-        _workspace: Entity<Workspace>,
     }
 
     impl Render for Dock {
@@ -1685,6 +1619,37 @@ mod tests {
                     .child(self.tree.clone()),
             )
         }
+    }
+
+    /// A tab not drawn makes no rows at each answer; what it owes it makes when drawn. Two tabs on
+    /// one root and commit share a walk; another commit is another walk (spec 020).
+    #[gpui::test]
+    async fn a_hidden_tree_makes_no_rows_and_a_walk_is_shared_by_root_and_commit(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(studio_theme::init_test);
+        let (session, _served) = followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\n",
+            |_| serde_json::json!([{ "id": "p1", "label": "Ada", "n": 0 }]),
+            cx,
+        );
+        cx.run_until_parked();
+        let ada = NodeRef::new("Person", "p1");
+        let tree = cx.new(|cx| RelationshipTree::new(session.clone(), ada.clone(), None, cx));
+        let before = tree.read_with(cx, |tree, _| tree.entries.clone());
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(10));
+        cx.run_until_parked();
+        tree.read_with(cx, |tree, cx| {
+            assert!(tree.rebuild_owed, "the answers are owed to the next draw");
+            assert!(Arc::ptr_eq(&tree.entries, &before), "and made no rows");
+            assert!(tree.exploration.read(cx).root().is_some());
+        });
+        let same = cx.update(|cx| Exploration::for_walk(&session, ada.clone(), None, cx));
+        assert_eq!(same, tree.read_with(cx, |tree, _| tree.exploration.clone()));
+        let held = cx.update(|cx| Exploration::for_walk(&session, ada, Some("c0".into()), cx));
+        assert_ne!(held, same);
     }
 
     /// ⌘R where the tree has the keyboard reads it again at the branch head, as its "Newer
@@ -1711,19 +1676,12 @@ mod tests {
         );
         cx.run_until_parked();
         let shown = session.clone();
-        let (dock, cx) = cx.add_window_view(move |window, cx| {
-            let workspace = cx.new(|cx| Workspace::new(window, cx));
-            let tree =
-                cx.new(|cx| RelationshipTree::new(&workspace, Some(shown.clone()), window, cx));
-            Dock {
-                tree,
-                _workspace: workspace,
-            }
+        let (dock, cx) = cx.add_window_view(move |_, cx| Dock {
+            tree: cx.new(|cx| {
+                RelationshipTree::new(shown.clone(), NodeRef::new("Person", "p1"), None, cx)
+            }),
         });
-        let exploration = cx.update(|_, cx| Exploration::for_session(&session, cx));
-        exploration.update(cx, |exploration, cx| {
-            exploration.root_at(NodeRef::new("Person", "p1"), cx)
-        });
+        let exploration = dock.read_with(cx, |dock, cx| dock.tree.read(cx).exploration.clone());
         let settle = |cx: &mut gpui::VisualTestContext| {
             for _ in 0..3 {
                 cx.run_until_parked();
@@ -1778,18 +1736,10 @@ mod tests {
         );
         cx.run_until_parked();
         let shown = session.clone();
-        let (dock, cx) = cx.add_window_view(move |window, cx| {
-            let workspace = cx.new(|cx| Workspace::new(window, cx));
-            let tree =
-                cx.new(|cx| RelationshipTree::new(&workspace, Some(shown.clone()), window, cx));
-            Dock {
-                tree,
-                _workspace: workspace,
-            }
-        });
-        let exploration = cx.update(|_, cx| Exploration::for_session(&session, cx));
-        exploration.update(cx, |exploration, cx| {
-            exploration.root_at(NodeRef::new("Person", "p1"), cx)
+        let (dock, cx) = cx.add_window_view(move |_, cx| Dock {
+            tree: cx.new(|cx| {
+                RelationshipTree::new(shown.clone(), NodeRef::new("Person", "p1"), None, cx)
+            }),
         });
         // The tree draws reads that land together once they all have.
         for _ in 0..3 {

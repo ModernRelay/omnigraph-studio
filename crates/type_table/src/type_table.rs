@@ -190,10 +190,14 @@ pub fn init(cx: &mut App) {
             // A peek asked for shows the inspector, even when its dock was hidden.
             workspace.reveal_inspector(cx);
         });
-        workspace.register_action(|workspace, action: &OpenNode, _window, cx| {
-            peek_node(workspace, &action.type_name, &action.id, None, cx);
-            // The relationship tree reveals the node too (spec 005).
-            cx.propagate();
+        // A node opens in the center, as its page (spec 020); a peek is `PeekNode`.
+        workspace.register_action(|workspace, action: &OpenNode, window, cx| {
+            let page = OpenNodePage {
+                type_name: action.type_name.clone(),
+                id: action.id.clone(),
+                at_commit: None,
+            };
+            open_node_page(workspace, &page, None, window, cx);
         });
         workspace.register_action(|workspace, action: &OpenNodePage, window, cx| {
             open_node_page(workspace, action, None, window, cx);

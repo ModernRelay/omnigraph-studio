@@ -1211,8 +1211,12 @@ pub enum ExplorationEvent {
     SelectionChanged,
 }
 
+/// What makes a walk the walk it is (spec 020): its session, its root, and the commit it is held
+/// at, or none for one that reads the branch head.
+type WalkKey = (EntityId, NodeRef, Option<String>);
+
 #[derive(Default)]
-struct ExplorationRegistry(HashMap<EntityId, WeakEntity<Exploration>>);
+struct ExplorationRegistry(HashMap<WalkKey, WeakEntity<Exploration>>);
 
 impl Global for ExplorationRegistry {}
 
@@ -1278,6 +1282,8 @@ impl DerefMut for Flattened {
 pub struct Exploration {
     session: Entity<GraphSession>,
     state: Flattened,
+    /// The commit the walk is held at (spec 020); none for one that reads the branch head.
+    held: Option<String>,
     pin: Option<String>,
     newer_available: bool,
     generation: u64,
@@ -1328,21 +1334,48 @@ impl Exploration {
     }
 
     /// The exploration of `session`, created on first use.
-    pub fn for_session(session: &Entity<GraphSession>, cx: &mut App) -> Entity<Exploration> {
-        let id = session.entity_id();
+    pub fn for_walk(
+        session: &Entity<GraphSession>,
+        root: NodeRef,
+        at_commit: Option<String>,
+        cx: &mut App,
+    ) -> Entity<Exploration> {
+        let key = (session.entity_id(), root.clone(), at_commit.clone());
         let existing = cx
             .default_global::<ExplorationRegistry>()
             .0
-            .get(&id)
+            .get(&key)
             .and_then(WeakEntity::upgrade);
         if let Some(existing) = existing {
             return existing;
         }
-        let exploration = cx.new(|cx| Exploration::new(session.clone(), cx));
+        let exploration = cx.new(|cx| {
+            let mut exploration = Exploration::new(session.clone(), cx);
+            exploration.held = at_commit;
+            exploration.pin = exploration.held.clone();
+            exploration.root_at(root, cx);
+            exploration
+        });
         let registry = cx.default_global::<ExplorationRegistry>();
         registry.0.retain(|_, weak| weak.upgrade().is_some());
-        registry.0.insert(id, exploration.downgrade());
+        registry.0.insert(key, exploration.downgrade());
         exploration
+    }
+
+    /// A walk with no root, which reads nothing: a results canvas draws none of it.
+    pub fn unrooted(session: &Entity<GraphSession>, cx: &mut App) -> Entity<Exploration> {
+        cx.new(|cx| Exploration::new(session.clone(), cx))
+    }
+
+    /// A rootless walk of its own, for a test to root and read.
+    #[cfg(test)]
+    fn for_session(session: &Entity<GraphSession>, cx: &mut App) -> Entity<Exploration> {
+        Self::unrooted(session, cx)
+    }
+
+    /// The commit this walk is held at: it reads there, read-only, whatever the branch does.
+    pub fn held_at(&self) -> Option<&str> {
+        self.held.as_deref()
     }
 
     fn new(session: Entity<GraphSession>, cx: &mut Context<Self>) -> Self {
@@ -1352,6 +1385,12 @@ impl Exploration {
         });
         let schema = session.read(cx).schema_model();
         let subscription = cx.subscribe(&session, |this, session, event, cx| match event {
+            // A held walk stays at its commit whatever the branch does.
+            SessionEvent::SchemaMoved
+            | SessionEvent::BranchChanged
+            | SessionEvent::HeadMoved { .. }
+            | SessionEvent::ChangesRead { .. }
+                if this.held.is_some() => {}
             SessionEvent::SchemaChanged => {
                 let now = session.read(cx).schema_model();
                 match (&this.schema, &now) {
@@ -1405,6 +1444,7 @@ impl Exploration {
         Self {
             session,
             state: Flattened::default(),
+            held: None,
             pin: None,
             newer_available: false,
             generation: 0,
@@ -1868,7 +1908,7 @@ impl Exploration {
         self.ahead = None;
         self.prune_at = KEPT_READS;
         self.carried.clear();
-        self.pin = None;
+        self.pin = self.held.clone();
         self.newer_available = false;
         self.schema = self.session.read(cx).schema_model();
         let scope = &self.scope;
@@ -3776,5 +3816,51 @@ mod tests {
         assert!(!state.labels.contains_key(&person("zed")));
         assert!(!state.labels.contains_key(&person("far")));
         assert!(state.labels.contains_key(&person("ada")), "the root's");
+    }
+
+    /// A walk is one per session, root and commit, and a held one stays at its commit whatever
+    /// the branch does (spec 020).
+    #[gpui::test]
+    async fn a_held_walk_stays_at_its_commit(cx: &mut gpui::TestAppContext) {
+        let (session, served) = crate::test_server::followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\n",
+            |_| serde_json::json!([{ "id": "p1", "label": "Ada", "n": 0 }]),
+            cx,
+        );
+        cx.run_until_parked();
+        let ada = NodeRef::new("Person", "p1");
+        let head = cx.update(|cx| Exploration::for_walk(&session, ada.clone(), None, cx));
+        let held =
+            cx.update(|cx| Exploration::for_walk(&session, ada.clone(), Some("c0".into()), cx));
+        assert_ne!(head, held);
+        let same = cx.update(|cx| Exploration::for_walk(&session, ada.clone(), None, cx));
+        assert_eq!(head, same);
+        cx.run_until_parked();
+        held.read_with(cx, |held, _| {
+            assert_eq!(held.pin(), Some("c0"));
+            assert_eq!(held.held_at(), Some("c0"));
+            assert_eq!(held.root(), Some(&ada));
+        });
+        served
+            .lock()
+            .unwrap()
+            .commit("c2", vec![crate::test_server::node_change("Person", "p1")]);
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        assert!(head.read_with(cx, |head, _| head.newer_available()));
+        held.read_with(cx, |held, _| {
+            assert!(!held.newer_available(), "a held walk offers nothing newer");
+            assert_eq!(held.pin(), Some("c0"));
+        });
+        held.update(cx, |held, cx| held.refresh(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            held.read_with(cx, |held, _| held.pin().map(str::to_owned))
+                .as_deref(),
+            Some("c0")
+        );
     }
 }

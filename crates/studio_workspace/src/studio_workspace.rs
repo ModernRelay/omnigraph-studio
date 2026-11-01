@@ -756,6 +756,11 @@ impl Workspace {
             left_size: Some(self.left.size),
             right_size: Some(self.right.size),
             bottom_size: Some(self.bottom.size),
+            canvas_positions: self
+                .session
+                .as_ref()
+                .map(|session| session.read(cx).canvas_positions.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -858,6 +863,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.apply_docks(&saved, window.viewport_size());
+        if let Some(session) = &self.session {
+            let positions = saved.canvas_positions.clone();
+            session.update(cx, |session, _| session.canvas_positions = positions);
+        }
         let mut ids = saved.layout.as_ref().map(Member::panes).unwrap_or_default();
         ids.sort_unstable();
         let (layout, panes) = match &saved.layout {
@@ -1627,6 +1636,17 @@ impl Workspace {
         self.pane(self.active_pane)?
             .active_item()
             .map(|item| item.as_ref())
+    }
+
+    /// Keeps the active tab if it is the pane's preview: a view opened from it must not take its
+    /// place (spec 020).
+    pub fn keep_active_tab(&mut self, _cx: &mut Context<Self>) {
+        let pane_id = self.active_pane;
+        if let Some(pane) = self.pane_mut(pane_id)
+            && let Some(active) = pane.active_item().map(|item| item.item_id())
+        {
+            pane.keep(active);
+        }
     }
 
     /// Activates a tab of the active pane.

@@ -171,8 +171,6 @@ pub mod graph {
             ReviewBranch,
             /// Open the commit history.
             OpenHistory,
-            /// Open the canvas: the nodes being explored and their relationships.
-            OpenCanvas,
             /// Create a branch from the current branch.
             CreateBranch,
             /// Delete the current branch.
@@ -341,12 +339,32 @@ pub mod graph {
         pub name: String,
     }
 
-    /// Show one node on the graph canvas.
+    /// Walk a node's relationships on a canvas of its own.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph)]
     pub struct ShowNodeOnCanvas {
         pub type_name: String,
         pub id: String,
+        /// Read at this commit, read-only; `None` reads the branch head.
+        #[serde(default)]
+        pub at_commit: Option<String>,
+        /// Open as the pane's preview tab, which the next preview replaces (spec 002).
+        #[serde(default)]
+        pub preview: bool,
+    }
+
+    /// Walk a node's relationships in a tree of its own.
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct ShowNodeInTree {
+        pub type_name: String,
+        pub id: String,
+        /// Read at this commit, read-only; `None` reads the branch head.
+        #[serde(default)]
+        pub at_commit: Option<String>,
+        /// Open as the pane's preview tab, which the next preview replaces (spec 002).
+        #[serde(default)]
+        pub preview: bool,
     }
 
     /// Open one commit's changes.

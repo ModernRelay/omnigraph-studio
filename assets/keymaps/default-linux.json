@@ -176,8 +176,7 @@
   {
     "bindings": {
       "ctrl-n": "studio_graph::NewQuery",
-      "ctrl-shift-o": "studio_graph::OpenMap",
-      "ctrl-shift-e": "studio_graph::OpenCanvas"
+      "ctrl-shift-o": "studio_graph::OpenMap"
     }
   },
   {
