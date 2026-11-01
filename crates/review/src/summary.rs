@@ -93,7 +93,10 @@ pub fn condense(
             text.push_str(&format!("- {op} {}", change.id));
             if let Some(title) = image.and_then(title_of) {
                 titles += 1;
-                text.push_str(&format!(" \"{}\"", cut_chars(title, TITLE_CHARS)));
+                text.push_str(&format!(
+                    " \"{}\"",
+                    studio_ui::text::cut(title, TITLE_CHARS)
+                ));
             }
             if let (Some(before), Some(after)) = (&change.before, &change.after) {
                 let mut changed: Vec<&String> = after
@@ -130,13 +133,6 @@ fn title_of(image: &graph_client::api::ChangeImageOutput) -> Option<&str> {
         .into_iter()
         .find_map(|key| image.properties.get(key).and_then(Value::as_str))
         .filter(|title| !title.trim().is_empty())
-}
-
-fn cut_chars(text: &str, chars: usize) -> &str {
-    match text.char_indices().nth(chars) {
-        Some((at, _)) => &text[..at],
-        None => text,
-    }
 }
 
 #[cfg(test)]

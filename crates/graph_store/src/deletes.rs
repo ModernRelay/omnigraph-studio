@@ -254,7 +254,7 @@ async fn removed_changes(
     let mut removed: i64 = nodes.iter().map(|(_, ids)| ids.len() as i64).sum();
     for ((sign, _), output) in counts.iter().zip(outputs) {
         let output = output.map_err(|error| error.to_string())?;
-        let n = count_of(&output.rows)
+        let n = gq_language::builder::count_of(&output.rows)
             .ok_or_else(|| "the server's count could not be read".to_owned())?;
         removed += sign * n;
     }
@@ -304,14 +304,6 @@ fn removal_counts(
         }
     }
     Ok(counts)
-}
-
-/// The count a `count(…) as n` read returns; an answer of no row counts none.
-fn count_of(rows: &Value) -> Option<i64> {
-    match rows.as_array()?.first() {
-        Some(row) => row.get("n")?.as_i64(),
-        None => Some(0),
-    }
 }
 
 /// Why Undo could not bring back nodes of `types` with their relationships: an insert cannot
@@ -527,6 +519,9 @@ mod tests {
                         serde_json::json!([{"id": "ada", "label": "Ada"}])
                     } else if text.contains("$m: Badge") && gone.contains("ada") {
                         serde_json::json!([{"id": "b-ada"}])
+                    } else if text.contains("count(") {
+                        // As the engine answers a count that matches nothing: one row.
+                        serde_json::json!([{"n": 0}])
                     } else {
                         serde_json::json!([])
                     };
