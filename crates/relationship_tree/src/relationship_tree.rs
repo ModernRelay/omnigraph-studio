@@ -518,11 +518,17 @@ impl RelationshipTree {
         self.select_loaded_row(cx);
     }
 
-    /// Selects the row a set's tree opened to, once its page has brought it.
+    /// Selects the row a set's tree opened to, once its page has brought it; a row selected
+    /// meanwhile stands, and the one owed is forgotten (constitution V: nothing moves under
+    /// you).
     fn select_loaded_row(&mut self, cx: &mut Context<Self>) {
         let Some(node) = &self.select_on_load else {
             return;
         };
+        if self.selected.is_some() {
+            self.select_on_load = None;
+            return;
+        }
         let row = self.visible.iter().position(|ix| {
             matches!(&self.entries[*ix].kind, EntryKind::Node { node: shown, .. } if shown == node)
         });
@@ -2018,6 +2024,64 @@ mod tests {
     /// A tree of a set holds the type's rows under the filters, each closed: it asks for nothing
     /// below a row until the row opens. Its Canvas waits for a selected node, walks from that one
     /// alone, and its Table goes back with the filters (spec 020).
+    /// The row a set's tree opened to is selected once its page brings it, unless a row was
+    /// selected meanwhile: then the selection stands and the row owed is forgotten.
+    #[gpui::test]
+    async fn a_late_row_never_moves_a_selection_made_since(cx: &mut gpui::TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let (session, _served) = followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\n",
+            |request| {
+                if request["name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("studio_page")
+                {
+                    serde_json::json!([
+                        { "n": { "@id": "p1", "name": "Ada" } },
+                        { "n": { "@id": "p2", "name": "Grace" } },
+                    ])
+                } else {
+                    serde_json::json!([])
+                }
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        let shown = session.clone();
+        let (dock, cx) = cx.add_window_view(move |_, cx| Dock {
+            tree: cx.new(|cx| {
+                RelationshipTree::new(shown.clone(), Subject::Set(person_set(None)), None, cx)
+            }),
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(10));
+        }
+        cx.run_until_parked();
+        let tree = dock.read_with(cx, |dock, _| dock.tree.clone());
+        let grace = NodeRef::new("Person", "p2");
+        tree.update(cx, |tree, cx| {
+            // The page brought the row before anything was selected: it is selected.
+            tree.select_on_load = Some(grace.clone());
+            tree.select_loaded_row(cx);
+            assert!(tree.select_on_load.is_none());
+            let selected = tree.selected.clone().expect("the row opened to");
+            assert_eq!(selected, rows::row_id(&tree.entries[tree.visible[1]]));
+            // A row selected meanwhile stands when the row owed arrives.
+            tree.select_row(0, cx);
+            let ada = tree.selected.clone().expect("a row picked");
+            tree.select_on_load = Some(grace);
+            tree.select_loaded_row(cx);
+            assert_eq!(tree.selected, Some(ada), "the pick stands");
+            assert!(
+                tree.select_on_load.is_none(),
+                "and the row owed is forgotten"
+            );
+        });
+    }
+
     #[gpui::test]
     async fn a_set_opens_closed_and_canvas_takes_the_selected_node(cx: &mut gpui::TestAppContext) {
         use std::sync::Mutex;

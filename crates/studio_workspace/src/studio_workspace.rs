@@ -2359,10 +2359,13 @@ impl Workspace {
     /// Shows or hides the inspector, which says so when nothing is selected: its button is always
     /// there, so it never moves what is beside it (constitution V).
     fn toggle_inspector(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // What the button shows is whether the dock is seen: a dock open with no panel in it
+        // yet (a fresh window's) shows nothing, so the first press shows the inspector.
+        let shown = self.right.visible();
         if self.dock_of(INSPECTOR_PANEL).is_none() {
             self.show_inspector(Some(cx.new(|_| NothingSelected).into()), cx);
         }
-        self.set_dock_open(PanelPosition::Right, !self.right.open, window, cx);
+        self.set_dock_open(PanelPosition::Right, !shown, window, cx);
     }
 
     fn show_inspector(&mut self, view: Option<AnyView>, cx: &mut Context<Self>) {
@@ -6620,6 +6623,32 @@ mod tests {
                 environment_of("https://other.example", cx),
                 ServerEnvironment::Unset
             );
+        });
+    }
+
+    /// The inspector's first press shows it, with "Nothing selected" when nothing is, and the
+    /// next hides it: the dock starts open with no panel, which shows nothing.
+    #[gpui::test]
+    fn the_inspector_shows_on_its_first_press(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            cx.set_global(StudioSettings::default());
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item(window, cx, |_, cx| TabProbe {
+                focus_handle: cx.focus_handle(),
+                name: "first",
+                reads: false,
+            });
+            assert!(!workspace.right.visible(), "nothing to show yet");
+            workspace.toggle_inspector(window, cx);
+            assert!(workspace.right.visible(), "the first press shows it");
+            assert!(workspace.dock_of(INSPECTOR_PANEL).is_some());
+            workspace.toggle_inspector(window, cx);
+            assert!(!workspace.right.visible(), "the next hides it");
+            workspace.toggle_inspector(window, cx);
+            assert!(workspace.right.visible());
         });
     }
 

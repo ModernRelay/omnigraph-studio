@@ -1262,6 +1262,25 @@ impl QueryEditor {
             .collect();
     }
 
+    /// A result's nodes as the set a Tree opens to (spec 020): listed, and held at the tab's
+    /// commit when the tab is, so a view opened from a held tab stays held.
+    fn results_set(
+        &self,
+        title: String,
+        nodes: Vec<studio_actions::graph::ResultNode>,
+    ) -> studio_actions::graph::ShowSetInTree {
+        studio_actions::graph::ShowSetInTree {
+            title,
+            type_name: None,
+            filters: None,
+            nodes: Some(nodes),
+            total: None,
+            at_commit: self.at_commit.clone(),
+            select: None,
+            preview: true,
+        }
+    }
+
     /// Pins reads to a commit and refuses writes, for a query opened from History.
     pub fn pin_to(&mut self, commit: String, cx: &mut Context<Self>) {
         self.at_commit = Some(commit);
@@ -3406,16 +3425,7 @@ impl QueryEditor {
                 if let Some(graph) = rows.graph.clone() {
                     let title = format!("{} · result", rows.label);
                     // Its nodes as a tree, each opening to its relationships.
-                    let set = studio_actions::graph::ShowSetInTree {
-                        title: title.clone(),
-                        type_name: None,
-                        filters: None,
-                        nodes: Some(graph.0.clone()),
-                        total: None,
-                        at_commit: None,
-                        select: None,
-                        preview: true,
-                    };
+                    let set = self.results_set(title.clone(), graph.0.clone());
                     end.push(
                         ds::button("result-tree", "Tree")
                             .style(ButtonStyle::Subtle)
@@ -5403,6 +5413,29 @@ mod tests {
             .unwrap();
             let at = ReadAt::Branch("main".into());
             editor.finish_read(people(), at, Ok(output), Duration::ZERO, None);
+        }
+
+        /// A result's Tree holds its nodes at the tab's commit when the tab is held, so a view
+        /// opened from a held tab stays held (spec 020); at the head it is at the head.
+        #[gpui::test]
+        async fn a_results_tree_keeps_the_tabs_commit(cx: &mut TestAppContext) {
+            init(cx);
+            let session = session(cx);
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(1, session, window, cx));
+            let nodes = vec![studio_actions::graph::ResultNode {
+                type_name: "Person".into(),
+                id: "p1".into(),
+                label: Some("Ada".into()),
+            }];
+            editor.update(cx, |editor, cx| {
+                let set = editor.results_set("people · result".into(), nodes.clone());
+                assert_eq!(set.at_commit, None, "a tab at the head");
+                assert_eq!(set.nodes.as_ref().map(Vec::len), Some(1));
+                editor.pin_to("c1".into(), cx);
+                let set = editor.results_set("people · result".into(), nodes);
+                assert_eq!(set.at_commit.as_deref(), Some("c1"), "a held tab");
+            });
         }
 
         fn widths(editor: &QueryEditor) -> Vec<f32> {
