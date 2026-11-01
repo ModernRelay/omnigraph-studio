@@ -101,8 +101,10 @@ so check line numbers again before building on `main`.
 - Each pane has one preview tab that the next preview replaces (`pane.rs:118-132`), and its own Back
   and Forward history, which skips closed tabs (`pane.rs:51-87`). `navigate` only steps the pane it's
   given (`studio_workspace.rs:1661`).
-- `open_item` finds a key across all panes and activates it there, so a key is unique in the window
-  (`find_key`, `studio_workspace.rs:1448`; `open_item_with`, `:1475-1495`).
+- `open_item` looks for a key in the active pane, then in the others, and activates it where it is
+  (`find_key`, `studio_workspace.rs:1448`; `open_item_with`, `:1475-1495`). A split copies its tab
+  with this turned off, so two panes can hold one key, but opening never makes a second copy.
+- Showing a tab of another pane ends a pane's zoom (`activate_in`).
 - `WorkspaceEvent` has only `SessionChanged` (`studio_workspace.rs:254`). The fork has no toolbar
   items, no status items and no active-item event (a search for `ToolbarItemView`,
   `StatusItemView` and `ActiveItemChanged` under `crates/` finds nothing).
@@ -188,7 +190,7 @@ The first view is what a pick opens.
 | Node | Nowhere; reached from a row, a link or ⌘P | Page | Page · Tree · Canvas |
 | Captured set | Nowhere; opened from a table | Canvas | Table · Canvas |
 | Query | Queries | Editor with results | None; results keep their Canvas button |
-| Branch | Branches | Review (`main`: History) | Review · History |
+| Branch | Branches | Review (`main`: History) | Review · History (`main`: Review disabled) |
 | Commit | History | Its changes | None |
 
 A graph has no tree of nodes, so nodes have no sidebar list. The audit's point stands: following a
@@ -232,7 +234,7 @@ Schema and the node page gain a `ds::toolbar` to hold it. A thing with one view 
 |---|---|
 | Click | Activates that view's tab wherever it's open, and focus moves there; otherwise opens it in this pane as a preview |
 | ⌥-click | Opens it in a pane to the right; an open tab is activated where it is |
-| ⌘⌥1 to ⌘⌥3 | The strip's first, second and third view |
+| ⌘⌥1 to ⌘⌥3 (`ctrl-alt` on Linux and Windows) | The strip's first, second and third view (`OpenViewAt`) |
 | ⌘⌥⇧1 to ⌘⌥⇧3 | The same, in a pane to the right |
 | Back | This pane's previous tab |
 
@@ -259,7 +261,7 @@ Schema and the node page gain a `ds::toolbar` to hold it. A thing with one view 
 | Page | Tree, Canvas | This node | Always available |
 | Captured set | Table | See [Captured sets](#captured-sets) | Always available |
 | Map | Source | The selected type's definition, else the top of the file | Always available |
-| Source | Map | The type under the cursor, else the whole map | Always available |
+| Source | Map | The whole map | Always available |
 | Query results | Canvas | The result's nodes (today's button, one tab per showing) | Disabled with no nodes: "These results have no nodes" |
 
 Everywhere a node is focused, ↵ opens its Page and `G` opens its Canvas.
@@ -338,8 +340,8 @@ the sequence number for sets from a table.
 | Change the filter, and don't click Canvas | The Berlin tab doesn't change. It's a copy, not a following view |
 
 **Provenance.** `ShowResultsOnCanvas` gains the source type, filter and `at_commit`. The canvas keeps
-them and shows them: "From Person, Berlin · 200 of 230,000 loaded". A set larger than the cap reads
-"Showing 2,000 of 230,000 · Filter to narrow", in line with article IX.
+them and shows them: "From Person, Berlin · 200 of 230,000 loaded". A set larger than the cap shows
+the existing "Too many nodes to draw" and its way out, in line with article IX.
 
 **The Table link.** Studio allows one head table per type, so a separate Berlin table can't exist
 beside a London one.
@@ -390,19 +392,21 @@ the edge's properties and endpoints again.
 /// What this tab shows. The sidebar lights its row from this.
 fn thing(&self, cx: &App) -> Option<Thing>;
 
-/// This thing's views, in strip order, each with the action that opens it.
+/// This thing's views, in strip order. Asked at every draw, so it builds no action.
 fn views(&self, cx: &App) -> Vec<ViewLink>;
+
+/// What opens one of them, with the tab's read context, built when it's asked for.
+fn view_action(&self, kind: ViewKind, cx: &App) -> Option<Box<dyn Action>>;
 ```
 
-- `Thing` and `ViewLink` live in `studio_actions`, so the layer rule holds.
-- `ViewLink` holds a kind, an action, and an optional reason it's disabled.
-- Tabs build the actions themselves, with their read context, so feature crates still don't depend
-  on each other. Existing actions cover most links: `OpenType`, `OpenNodePage`, `ShowNodeOnCanvas`,
-  `ShowResultsOnCanvas`.
-- `OpenAsTable`, `OpenAsPage`, `OpenAsTree`, `OpenAsCanvas`, `OpenAsMap` and `OpenAsSource` are new
-  actions, each with `beside: bool` (default false). The workspace handles them by finding the
-  matching link on the active tab, and registers each only while that tab offers it, so the palette
-  stays accurate.
+- `Thing`, `ViewKind` and `ViewLink` live in `studio_actions`, so the layer rule holds.
+- `ViewLink` holds a kind, whether it's the current view, and an optional reason it's disabled.
+- Tabs build the actions themselves, so feature crates still don't depend on each other. Existing
+  actions cover most links: `OpenType`, `OpenNodePage`, `ShowNodeOnCanvas`, `ShowResultsOnCanvas`.
+- `OpenViewAt { index, beside }` is what the strip and the keys dispatch.
+- `OpenAsTable`, `OpenAsPage`, `OpenAsTree`, `OpenAsCanvas`, `OpenAsMap`, `OpenAsSource`,
+  `OpenAsReview` and `OpenAsHistory` name the same thing for the palette. Each is registered only
+  while the active tab offers it, so the palette stays accurate.
 - `opened_by` goes away, since `thing` replaces it.
 - `WorkspaceEvent` gains `ActiveItemChanged`. The sidebar, inspector and top bar follow it. The
   irrefutable `match event` sites, such as `types_list.rs:52`, need updating.
@@ -579,8 +583,6 @@ No engine changes are needed, so nothing goes in `docs/deferred-engine-changes.m
    should decide.
 4. **Do many tabs become a burden?** The preview slot should limit them. Watch this in the test.
 5. **Do Linux and Windows window managers take `ctrl-alt-1` to `3`?** If so, the keys change there.
-6. **What happens when the matching tab is in a pane hidden behind a zoomed one?** The source pane
-   isn't on screen in that case, so activating across panes needs checking.
 
 ## Validation log
 
@@ -596,13 +598,17 @@ No engine changes are needed, so nothing goes in `docs/deferred-engine-changes.m
 | 2026-11-01 | Tab reuse crosses panes, and Back doesn't | Read `studio_workspace.rs:1475-1495`, `:1661`; `pane.rs:51-87` | Confirmed |
 | 2026-11-01 | One head table exists per type | Read `type_table.rs:246` | Confirmed |
 | 2026-11-01 | Digit keys are free | Searched all three keymaps | Confirmed; window managers not checked |
-| | Tree and Canvas selection can be reconciled without changing either view's behavior | Build and tests | **Not run** |
+| 2026-11-01 | Tree and Canvas selection stay in step | Read `ExplorationEvent::SelectionChanged`, which both follow | Confirmed by reading; not exercised with both tabs open |
+| 2026-11-01 | The rules hold in the code | `cargo test --workspace`: 1,173 passed, 0 failed, and the keymap test (`crates/studio/tests/keymaps.rs`, its own harness); clippy `-D warnings`, fmt, `cargo deny`, layers, brand, design tokens, release files all pass | New tests: each tab keeps its inspector; opening a view keeps its source; beside opens one pane and reuses it; a disabled view does not open; every sidebar row is a thing; a held walk stays at its commit; a hidden tree makes no rows; a captured set is known by what it holds; an environment goes by address; every destination has a key |
+| 2026-11-01 | The frame and views draw as designed | Offscreen snapshots on `script/dev-server`: sidebar, table with its strip, Map, a set on Canvas, Tree beside a table, Branches with History | As designed. Clicks ran through the snapshot tool; the running app was not driven by hand |
+| 2026-11-01 | An old session upgrades without loss | A real saved `workspaces/*.json` with a root-less `canvas` tab and `explore` and `history` panels, restored twice by the snapshot tool | The tab went, its positions stayed in `canvas_positions` through both restarts, and the panels fell back to `types` and `activity`, with the table tab intact |
+| | The top bar is right on Linux and Windows | Real builds | **Not run.** Compiled by CI only; whether those platforms draw window controls in it is unknown |
 | | The rule improves prediction | Prediction test | **Not run. No users have seen any of this** |
 | | Two walks perform acceptably | Tree baseline | **Not run** |
 
 ## Corrections
 
-Nothing is built yet, so these record changes to the draft itself.
+The first four record changes to the draft before it was built.
 
 - 2026-11-01 · A source review found five gaps in the first draft: read context through navigation
   and sharing, saved Canvas layouts, the inspector's selection, Back across panes, and the identity
@@ -613,3 +619,20 @@ Nothing is built yet, so these record changes to the draft itself.
   values. The workspace now remembers each tab's inspector.
 - 2026-11-01 · The first draft promised Back to the source tab across panes, which pane history can't
   do. Back now means this pane's previous tab.
+- 2026-11-01 · Built with the prediction test not run, at the requester's call. The spec's gate on
+  items 3 to 9 was passed over, so its stop condition can still undo this work.
+- 2026-11-01 · Item actions take `views` and `view_action`, not one `views` holding actions: the strip
+  asks at every draw, and a set's action copies every loaded row.
+- 2026-11-01 · A key is not strictly unique in the window, since a split copies its tab, so the
+  decision against per-pane reuse rests on opening never making a second copy.
+
+## What this branch leaves open
+
+| What | State |
+|---|---|
+| Message ladder | One notice fixed: the CLI target notice is no longer a red toast that stays, and says it in plain words. `warning_bar` is not promoted to `ds`, the other toast callers are not classified, and the certificate notices are not rewritten |
+| Scope in confirmations | Table dialogs, branch delete and the query confirm bar name server, graph and branch. The review's field edit names only the branch, and merge has no dialog to name it in |
+| `write · <branch>` | Field editors say it; there is no standing chip in the status bar |
+| Sidebar lighting | Data and Branches light from `thing`; Queries keeps its own |
+| Cuts not in this branch | The agent panel (`refactor/remove-agent-panel`) and AI calls, so Conversations is still a sidebar row |
+| Also still there | `Exploration::reroot` and `back_to` and the breadcrumb state, which no view calls now; panel moving; `window_style` |

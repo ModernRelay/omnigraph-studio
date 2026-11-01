@@ -1,8 +1,8 @@
 # Omnigraph Studio constitution
 
-Version 1.2.3 · ratified 2026-10-11 · amended 2026-10-17 (IV: ↵ and Undo for what Studio can
+Version 1.3.0 · ratified 2026-10-11 · amended 2026-10-17 (IV: ↵ and Undo for what Studio can
 put back) · amended 2026-10-18 (IV: ↵ for what loses no data) · amended 2026-10-22 (I: the
-updater's requests) · amended 2026-10-24 (X: Omnigraph `v0.14.0` and later) · amended 2026-10-30 (I: model calls)
+updater's requests) · amended 2026-10-24 (X: Omnigraph `v0.14.0` and later) · amended 2026-10-30 (I: model calls) · amended 2026-11-01 (XIII: one rule for what a pick does)
 
 Omnigraph Studio is a native desktop app for exploring and changing Omnigraph graphs: type
 tables, a relationship tree, a graph canvas, a `.gq` query editor, branches, review, merge and
@@ -95,6 +95,17 @@ No AGPL, SSPL or BSL dependencies. No GPUI Kit or other copy of GPUI: there is e
 Every plan has a validation log. Claims about Zed, GPUI or Omnigraph are checked against source
 at the pinned revisions and cited by path. A performance claim needs a measurement, recorded
 with the machine and the data size.
+
+## XIII. One rule for what a pick does
+
+The sidebar lists things, a tab is one view of one thing, and everything around the tab follows it.
+The top says which server, graph and branch; the left lists what there is; the center shows it; the
+right describes what is selected there; the bottom reports what ran.
+
+*In practice:* a sidebar row names a thing, never a view. A view is a tab, opened from the view strip
+of the tab it comes from, which stays. A view opened from a tab holding a commit holds that commit. A
+new "how" control is a tab if it has state, selection or reads of its own, and a toggle only if it
+redraws the same state. Plan: `specs/020-ui-unification/plan.md`.
 
 ## Governance
 
