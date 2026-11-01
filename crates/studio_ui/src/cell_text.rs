@@ -248,8 +248,9 @@ impl CellText {
     }
 }
 
-/// The start of `text` one line can show ([`SHOWN_CHARS`]), found without reading the rest.
-fn shown_part(text: SharedString) -> SharedString {
+/// The start of `text` one line can show ([`SHOWN_CHARS`]), found without reading the rest: what
+/// a view that keeps a cell's text keeps of it.
+pub fn shown_part(text: SharedString) -> SharedString {
     match text.char_indices().nth(SHOWN_CHARS) {
         Some((end, _)) => text[..end].to_owned().into(),
         None => text,

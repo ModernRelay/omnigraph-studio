@@ -24,7 +24,7 @@ pub mod rows;
 pub mod text;
 mod values;
 
-pub use cell_text::{CellText, cell_text};
+pub use cell_text::{CellText, cell_text, shown_part};
 pub use changes::{
     ChangeCard, ChangeKind, PropertyRow, RelationshipLine, TextFolds, change_counts,
     change_group_header, property_body, property_row,
