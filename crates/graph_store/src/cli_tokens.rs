@@ -2497,14 +2497,16 @@ exit 64
         ));
         assert!(matches!(ran, Err(Unrun::Timeout)));
 
-        // One that refuses and ends without reading it is judged by what it said.
+        // One that refuses and ends without reading it is judged by what it said. The timeout
+        // leaves room for macOS to scan the new script on its first run, which can take
+        // seconds while builds run: at 10 s a loaded machine ran it out.
         let refusing = dir.join("refusing");
         std::fs::write(&refusing, "#!/bin/sh\necho 'lock refused' >&2\nexit 1\n").unwrap();
         std::fs::set_permissions(&refusing, std::fs::Permissions::from_mode(0o755)).unwrap();
         let ran = smol::block_on(run_once(
             std::process::Command::new(&refusing),
             Some(&input),
-            Duration::from_secs(10),
+            Duration::from_secs(90),
             1024,
         ));
         let ran = match ran {
