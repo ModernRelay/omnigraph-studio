@@ -172,6 +172,9 @@ async fn request(
     form: &[(&str, &str)],
     expected: Expected<'_>,
 ) -> Result<Tokens, TokenError> {
+    // A token's life counts from before it was asked for: counted from its answer, a slow one
+    // would be taken to last longer than it does.
+    let asked = SystemTime::now();
     let answer = fetch::post_form(http, &server.token_endpoint, form, TOKEN_TIMEOUT)
         .await
         .map_err(|why| {
@@ -230,7 +233,7 @@ async fn request(
             ))),
         });
     }
-    checked(&body, expected, SystemTime::now()).map_err(|why| TokenError::Unusable {
+    checked(&body, expected, asked).map_err(|why| TokenError::Unusable {
         why,
         refresh_token: refresh_token(&body),
     })

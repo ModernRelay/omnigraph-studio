@@ -2660,11 +2660,12 @@ mod tests {
         connection.read_with(cx, |connection, _| {
             assert_eq!(connection.state, ConnectionState::Ready)
         });
+        // The health checks, a public route's, carry none.
+        let sent = sent.lock().unwrap().clone();
+        assert!(sent.iter().any(Option::is_some), "{sent:?}");
         assert!(
-            sent.lock()
-                .unwrap()
-                .iter()
-                .all(|token| token.as_deref() == Some("Bearer t"))
+            sent.iter().flatten().all(|token| token == "Bearer t"),
+            "{sent:?}"
         );
 
         // A check is scheduled while ready; connecting and cancelling leave none behind.

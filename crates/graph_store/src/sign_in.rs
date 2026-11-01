@@ -1619,7 +1619,7 @@ mod tests {
             browser
                 .join()
                 .unwrap()
-                .contains("Signed in to graphs.test. You can close this tab.")
+                .contains("Omnigraph Studio has the sign-in to graphs.test")
         );
         assert_eq!(
             sign_in_state(&connection, cx).1,

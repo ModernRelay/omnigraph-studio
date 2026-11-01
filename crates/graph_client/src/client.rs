@@ -55,6 +55,10 @@ const ENDED_TOKEN_TELL: Duration = Duration::from_secs(1);
 /// default), so a view that asks for many counts at once queues here rather than being refused
 /// there.
 pub const READ_CONCURRENCY: usize = 8;
+/// How many of those slots reads that may wait past [`READ_TIMEOUT`] (reads of changes) hold at
+/// once. A view can ask for one page of changes per row, each up to [`CHANGE_READ_TIMEOUT`], and
+/// taking every slot they would hold a query or a table's page behind them for minutes.
+const LONG_READ_CONCURRENCY: usize = READ_CONCURRENCY / 2;
 
 /// Why a read failed.
 #[derive(Debug, Clone)]
@@ -652,6 +656,9 @@ pub struct GraphClient {
     retired: Arc<std::sync::OnceLock<String>>,
     /// Shared by every clone, so the bound holds for the whole connection.
     read_slots: Arc<smol::lock::Semaphore>,
+    /// The slots of reads that may wait past [`READ_TIMEOUT`] ([`LONG_READ_CONCURRENCY`]), taken
+    /// before one of `read_slots`. Shared by every clone.
+    long_read_slots: Arc<smol::lock::Semaphore>,
     /// How often the token was replaced by another ([`Self::credential_changes`]), and how often
     /// the server refused a request on each of its graphs with 403, by graph id
     /// ([`Self::refusals`]). Shared by every clone.
@@ -720,6 +727,7 @@ impl GraphClient {
             http: Arc::new(Transport(std::sync::RwLock::new(http))),
             retired: Arc::default(),
             read_slots: Arc::new(smol::lock::Semaphore::new(READ_CONCURRENCY)),
+            long_read_slots: Arc::new(smol::lock::Semaphore::new(LONG_READ_CONCURRENCY)),
             credential_changes: Arc::default(),
             refusals: Arc::default(),
             refusal_asked: Arc::default(),
@@ -826,17 +834,25 @@ impl GraphClient {
             .or_default() += 1;
     }
 
-    /// A request to the server as every one is made: with the contract this build speaks and
-    /// this client's token, following no redirect, and the token it carries. No route answers
-    /// with a redirect to follow; a Blob's external reference answers 302 with a URI Studio
-    /// shows and never fetches.
-    fn request(&self, method: Method, url: &Url) -> (http_client::Builder, Option<Arc<str>>) {
+    /// A request to the server as every one is made: with the contract this build speaks and,
+    /// as `carry` says, this client's token, following no redirect, and the token it carries.
+    /// No route answers with a redirect to follow; a Blob's external reference answers 302 with
+    /// a URI Studio shows and never fetches.
+    fn request(
+        &self,
+        method: Method,
+        url: &Url,
+        carry: Carry,
+    ) -> (http_client::Builder, Option<Arc<str>>) {
         let builder = Request::builder()
             .method(method)
             .uri(url.as_str())
             .header(CONTRACT_HEADER, CONTRACT)
             .follow_redirects(RedirectPolicy::NoFollow);
-        let carried = self.token();
+        let carried = match carry {
+            Carry::Token => self.token(),
+            Carry::Nothing => None,
+        };
         let builder = match &carried {
             Some(token) => builder.header("authorization", format!("Bearer {token}")),
             None => builder,
@@ -1190,12 +1206,14 @@ impl GraphClient {
             headers,
             timeout,
             BodyLimit::First(READ_ANSWER_MAX),
+            Carry::Token,
         )
         .await
     }
 
-    /// A `GET` of a public route (`/healthz`, `/readyz`), which takes no token, so never waits
-    /// for one ([`Self::fresh_token`]).
+    /// A `GET` of a public route (`/healthz`, `/readyz`), which takes no token: none is sent,
+    /// so none is shown to whatever is between Studio and the server at every check, and none
+    /// is waited for ([`Self::fresh_token`]).
     async fn send_public(&self, url: Url) -> Result<RawResponse, String> {
         self.send_now(
             Method::GET,
@@ -1204,6 +1222,7 @@ impl GraphClient {
             &[],
             HEALTH_TIMEOUT,
             BodyLimit::First(READ_ANSWER_MAX),
+            Carry::Nothing,
         )
         .await
         .map_err(String::from)
@@ -1213,6 +1232,7 @@ impl GraphClient {
     /// never read. A caller sending a token waits for a fresh one first ([`Self::fresh_token`]),
     /// once per attempt, and a read again should its token end while it queued for a slot and a
     /// wait can be answered; the public routes take none.
+    #[expect(clippy::too_many_arguments)]
     async fn send_now(
         &self,
         method: Method,
@@ -1221,9 +1241,10 @@ impl GraphClient {
         headers: &[(&str, &str)],
         timeout: Duration,
         limit: BodyLimit,
+        carry: Carry,
     ) -> Result<RawResponse, NoAnswer> {
         let head = method == Method::HEAD;
-        let (builder, carried) = self.request(method, &url);
+        let (builder, carried) = self.request(method, &url, carry);
         let mut builder = builder.timeout(timeout);
         // A body is JSON unless the caller names its type: a Blob put's is raw bytes.
         if body.is_some()
@@ -1317,13 +1338,21 @@ impl GraphClient {
             // or check of a server away serves them all, not a slot's worth in turn.
             let live = self.fresh_token().await;
             let raw = {
-                // Refused at once if the client is retired while the read queues, not when a slot
-                // frees behind reads still under way.
-                let slot = smol::future::or(async { Ok(self.read_slots.acquire().await) }, async {
+                // A read that may wait long queues among those first, so they never hold every
+                // slot. Refused at once if the client is retired while the read queues, not when
+                // a slot frees behind reads still under way.
+                let slots = async {
+                    let long = match timeout > READ_TIMEOUT {
+                        true => Some(self.long_read_slots.acquire().await),
+                        false => None,
+                    };
+                    (long, self.read_slots.acquire().await)
+                };
+                let slot = smol::future::or(async { Ok(slots.await) }, async {
                     Err(self.retired_now().await)
                 })
                 .await;
-                let _slot = slot.map_err(ReadError::Transport)?;
+                let _slots = slot.map_err(ReadError::Transport)?;
                 // A token live when the read queued that ended while it did (a sleep across a long
                 // queue) is waited for again, the slot let go meanwhile, while a holder listens
                 // to answer the wait ([`Self::listening_holder`]); one that cannot give the next
@@ -1338,6 +1367,7 @@ impl GraphClient {
                     headers,
                     timeout,
                     limit,
+                    Carry::Token,
                 )
                 .await
                 .map_err(|no| ReadError::Transport(no.into()))?
@@ -1688,7 +1718,7 @@ impl GraphClient {
             )));
         }
         self.fresh_token().await;
-        let (mut builder, carried) = self.request(request.method, &url);
+        let (mut builder, carried) = self.request(request.method, &url, Carry::Token);
         for (name, value) in &request.headers {
             builder = builder.header(name.as_str(), value.as_str());
         }
@@ -2321,6 +2351,13 @@ fn unanswered<T>(no: NoAnswer) -> WriteOutcome<T> {
 /// The least of an error answer's body a read keeps, whatever it asked for of the value.
 const ERROR_BODY_BYTES: usize = 64 * 1024;
 
+/// Whether a request carries the client's token.
+#[derive(Clone, Copy)]
+enum Carry {
+    Token,
+    /// A public route's, which takes none.
+    Nothing,
+}
 /// How much of a response body is kept.
 #[derive(Debug, Clone, Copy)]
 enum BodyLimit {
@@ -2645,14 +2682,16 @@ mod tests {
     /// call is made once, a conditional write both ways, against a server that records what it
     /// was sent, and each request's path is matched to the contract's paths, a `{…}` standing for
     /// one segment. The agent's forwarded requests are the CLI's own and not counted here.
+    /// Every request carries the token but the public routes', which take none.
     #[test]
     fn every_route_the_client_calls_is_in_the_contract() {
-        let sent: Arc<std::sync::Mutex<Vec<(String, String)>>> = Arc::default();
+        let sent: Arc<std::sync::Mutex<Vec<(String, String, bool)>>> = Arc::default();
         let log = sent.clone();
         let http = FakeHttpClient::create(move |request| {
             log.lock().unwrap().push((
                 request.method().as_str().to_ascii_lowercase(),
                 request.uri().path().to_owned(),
+                request.headers().contains_key("authorization"),
             ));
             async move {
                 Ok(Response::builder()
@@ -2752,7 +2791,9 @@ mod tests {
         };
         let sent = sent.lock().unwrap();
         assert_eq!(sent.len(), 29, "one request per call: {sent:?}");
-        for (method, path) in sent.iter() {
+        for (method, path, carried) in sent.iter() {
+            let public = path.ends_with("/healthz") || path.ends_with("/readyz");
+            assert_eq!(*carried, !public, "{method} {path} and the token");
             assert!(
                 paths
                     .iter()
@@ -4321,6 +4362,67 @@ mod tests {
         let results = block_on(futures::future::join_all(reads));
         assert!(results.iter().all(Result::is_ok));
         assert_eq!(most.load(Ordering::SeqCst), READ_CONCURRENCY);
+    }
+
+    /// Reads of changes, which may each take minutes, hold at most half the connection's read
+    /// slots: a query or a table's page asked for meanwhile goes out at once, not behind them.
+    #[test]
+    fn reads_of_changes_leave_slots_for_other_reads() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let hold = Arc::new(AtomicBool::new(true));
+        let changes: Arc<std::sync::Mutex<usize>> = Arc::default();
+        let (holding, seen) = (hold.clone(), changes.clone());
+        let http = FakeHttpClient::create(move |request| {
+            let (holding, seen) = (holding.clone(), seen.clone());
+            async move {
+                if request.uri().path().ends_with("/changes") {
+                    *seen.lock().unwrap() += 1;
+                    while holding.load(Ordering::SeqCst) {
+                        smol::Timer::after(Duration::from_millis(5)).await;
+                    }
+                }
+                Ok(Response::builder()
+                    .status(200)
+                    .header(CONTRACT_HEADER, CONTRACT)
+                    .body(AsyncBody::from(r#"{"branches":["main"]}"#))
+                    .unwrap())
+            }
+        });
+        let client = client(http);
+        // One page of changes per row of a view, more than the connection has slots.
+        let rows: Vec<_> = (0..READ_CONCURRENCY + 2)
+            .map(|row| {
+                let client = client.clone();
+                std::thread::spawn(move || {
+                    block_on(client.commit_changes("g", &format!("c{row}"), None, 50)).ok();
+                })
+            })
+            .collect();
+        let started = Instant::now();
+        while *changes.lock().unwrap() < LONG_READ_CONCURRENCY {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the reads went out"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (done, finished) = std::sync::mpsc::channel();
+        let other = client.clone();
+        std::thread::spawn(move || {
+            done.send(block_on(other.branches("g")).is_ok()).ok();
+        });
+        let answered = finished.recv_timeout(Duration::from_secs(5));
+        let on_the_wire = *changes.lock().unwrap();
+        hold.store(false, Ordering::SeqCst);
+        for row in rows {
+            row.join().unwrap();
+        }
+        assert_eq!(
+            answered,
+            Ok(true),
+            "the other read waited behind the changes"
+        );
+        assert_eq!(on_the_wire, LONG_READ_CONCURRENCY);
     }
 
     #[test]
