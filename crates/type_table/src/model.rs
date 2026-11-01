@@ -5,7 +5,7 @@
 use std::cmp::Ordering;
 
 use gq_language::builder::edge_property_column;
-use gq_language::input::{compare_values as compare, list_items, parse_scalar, same_value, typed};
+use gq_language::input::{compare_values as compare, list_texts, parse_scalar, same_value, typed};
 pub use gq_language::input::{edit_text, parse_input};
 use gq_language::{
     EdgeType, Filter, FilterOp, NodeType, PageStart, Property, RelationshipGroup, ScalarKind,
@@ -758,15 +758,16 @@ pub fn parse_filter_value(property: &Property, text: &str) -> Result<Value, Stri
     parse_scalar(&element, text)
 }
 
-/// The values of an "is one of" filter, read as a list cell's items are: separated by commas,
-/// one holding a comma quoted (`Founder, "Smith, John"`).
+/// The values of an "is one of" filter, read as a list cell's items are
+/// ([`gq_language::input::list_texts`]): separated by commas, one holding a comma quoted
+/// (`Founder, "Smith, John"`), or a list pasted as it is copied, in JSON.
 pub fn parse_filter_list(property: &Property, text: &str) -> Result<Value, String> {
     let element = Property {
         list: false,
         nullable: false,
         ..property.clone()
     };
-    let values = list_items(text)?
+    let values = list_texts(text)?
         .iter()
         .map(|item| parse_scalar(&element, item))
         .collect::<Result<Vec<_>, _>>()?;
@@ -1842,6 +1843,11 @@ mod tests {
         assert!(parse_filter_list(&prop("Person", "title"), "\"Smith, John").is_err());
         assert!(parse_filter_list(&prop("Person", "born"), "2020-01-01, soon").is_err());
         assert!(parse_filter_list(&prop("Person", "title"), " , ").is_err());
+        // A list pasted as it is copied, as a list cell takes one.
+        assert_eq!(
+            parse_filter_list(&prop("Person", "title"), r#"["Founder", "Smith, John"]"#).unwrap(),
+            serde_json::json!(["Founder", "Smith, John"])
+        );
     }
 
     #[test]

@@ -100,7 +100,8 @@ pub fn list_texts(text: &str) -> Result<Vec<String>, String> {
 
 /// The items of a list as typed: separated by commas, each trimmed unless quoted; a quoted item
 /// keeps its text, a doubled quote standing for one. Items left empty between commas are
-/// dropped. A list filter reads one so, and [`list_texts`] reads text that is not JSON so.
+/// dropped. [`list_texts`] reads text that is not JSON so, and a list filter's suggestions read
+/// the items typed so far so.
 pub fn list_items(text: &str) -> Result<Vec<String>, String> {
     let mut items = Vec::new();
     let mut chars = text.chars().peekable();

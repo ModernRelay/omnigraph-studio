@@ -829,6 +829,14 @@ impl CliTokenSource {
                 )));
             }
         };
+        // Read to its bound (a token's most and its newline) and closed there, an answer longer
+        // than a token fills it without the newline, the CLI stopped by its next write: said as
+        // too long, whichever way it ended.
+        if ran.stdout.len() > MAX_TOKEN_BYTES && ran.stdout.last() != Some(&b'\n') {
+            return Err(NoToken::lasting(format!(
+                "the Omnigraph CLI's answer to {asked} is longer than a token"
+            )));
+        }
         if !ran.status.success() {
             // What it printed is never shown: it may be part of a token.
             return Err(NoToken::lasting(format!(
@@ -1221,6 +1229,17 @@ async fn run_with(
     }
 }
 
+/// Reads `pipe` into `into` up to `bound` bytes, then closes it with the read: a program that
+/// writes more then stops (its next write fails) rather than waiting on a full pipe that stays
+/// open. What was read stays in `into` should the read be given up first.
+async fn read_into(
+    pipe: impl futures::AsyncRead + Unpin,
+    bound: usize,
+    into: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    pipe.take(bound as u64).read_to_end(into).await.map(|_| ())
+}
+
 /// How long a command's pipes are read after it ends: what it wrote is in them by then, and a
 /// program it started that holds them open is not waited for.
 const PIPES_AFTER_EXIT: Duration = Duration::from_millis(250);
@@ -1259,17 +1278,12 @@ async fn run_once(
         return Err(Unrun::Failed("its output could not be read".to_owned()));
     };
     let work = async move {
-        // Each pipe is closed once read to its bound, so a program that writes more stops.
-        let (mut stdout, mut stderr) = (
-            stdout.take(limit as u64),
-            stderr.take(MAX_ANSWER_BYTES as u64),
-        );
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let (written, exited) = {
             let reads = futures::future::join3(
                 write,
-                stdout.read_to_end(&mut out),
-                stderr.read_to_end(&mut err),
+                read_into(stdout, limit, &mut out),
+                read_into(stderr, MAX_ANSWER_BYTES, &mut err),
             )
             .fuse();
             let exit = child.status().fuse();
@@ -2213,6 +2227,16 @@ exit 64
             "{moved}"
         );
         assert!(!moved.contains("secret-moving-token"));
+
+        // An answer longer than a token is read to its bound and said as too long, not as
+        // something else the closed pipe made of it.
+        cli.server("huge", "https://store.example.com/");
+        cli.write("token-huge", &"a".repeat(4 * MAX_TOKEN_BYTES));
+        let huge =
+            token_of(&cli.source("huge", "https://store.example.com/", CliCredential::Store))
+                .unwrap_err();
+        assert!(!huge.passing, "a token too long is an answer");
+        assert!(huge.why.contains("is longer than a token"), "{}", huge.why);
     }
 
     /// A managed target's token is the data credential the CLI exchanges from its login, asked
@@ -2473,7 +2497,7 @@ exit 64
         std::fs::write(
             &leaving,
             "#!/bin/sh
-(sleep 5) &
+(sleep 60) &
 echo token
 ",
         )
@@ -2483,17 +2507,48 @@ echo token
         let ran = smol::block_on(run_once(
             std::process::Command::new(&leaving),
             None,
-            Duration::from_secs(10),
+            Duration::from_secs(90),
             1024,
         ))
         .unwrap_or_else(|_| panic!("the command's own answer"));
+        // Far under the background program's minute, which a run waiting for it would last
+        // within its timeout, with room for a first run's scan.
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < Duration::from_secs(30),
             "{:?}",
             started.elapsed()
         );
         assert!(ran.status.success());
         assert_eq!(String::from_utf8_lossy(&ran.stdout), "token\n");
+
+        // One that writes past its bound is stopped by the pipe closing at it, not left
+        // blocked on a full pipe until the timeout. Before, the pipe stayed open past the
+        // bound, and such a command ran out the timeout.
+        let flooding = dir.join("flooding");
+        std::fs::write(
+            &flooding,
+            "#!/bin/sh\nhead -c 4000000 /dev/zero\necho done >&2\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&flooding, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
+        let ran = smol::block_on(run_once(
+            std::process::Command::new(&flooding),
+            None,
+            Duration::from_secs(60),
+            1024,
+        ));
+        let ran = match ran {
+            Ok(ran) => ran,
+            Err(Unrun::Timeout) => panic!("stopped at its bound, not at the timeout"),
+            Err(Unrun::Failed(error)) => panic!("its own answer, not: {error}"),
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(ran.stdout.len(), 1024, "read to its bound");
         std::fs::remove_dir_all(&dir).ok();
     }
 
