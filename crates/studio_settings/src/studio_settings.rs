@@ -413,6 +413,10 @@ pub struct StudioSettings {
     #[schemars(title = "Density", extend("x-section" = "Appearance"))]
     pub ui_density: Density,
     pub studio: StudioOptions,
+    /// What each server is, by its address. Set from the top bar's environment chip.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[schemars(extend("x-hidden" = true))]
+    pub servers: BTreeMap<String, ServerOverrides>,
     /// The omnigraph program Studio runs to list its servers and read their tokens, and that the
     /// agent runs to reach the graph. Studio tries it first, then each omnigraph on PATH and in
     /// the usual install folders, and runs the first that fits.
@@ -432,6 +436,43 @@ pub struct StudioSettings {
     pub panels: BTreeMap<String, PanelPlacement>,
 }
 
+/// What a server is, which the top bar marks (spec 020). `Unset` says so: a server nobody has
+/// named must not look safe.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerEnvironment {
+    #[default]
+    Unset,
+    Development,
+    Staging,
+    Production,
+}
+
+impl ServerEnvironment {
+    pub const ALL: [Self; 4] = [
+        Self::Production,
+        Self::Staging,
+        Self::Development,
+        Self::Unset,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unset => "Not set",
+            Self::Development => "Development",
+            Self::Staging => "Staging",
+            Self::Production => "Production",
+        }
+    }
+}
+
+/// One server's settings, kept by its address so renaming a target cannot reset them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct ServerOverrides {
+    pub environment: ServerEnvironment,
+}
+
 impl Default for StudioSettings {
     fn default() -> Self {
         Self {
@@ -444,6 +485,7 @@ impl Default for StudioSettings {
             buffer_font_size: 14.,
             ui_density: Density::default(),
             studio: StudioOptions::default(),
+            servers: BTreeMap::new(),
             omnigraph_cli: None,
             agent: AgentSettings::default(),
             models: ModelSettings::default(),

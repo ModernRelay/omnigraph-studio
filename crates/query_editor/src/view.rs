@@ -3845,6 +3845,11 @@ impl QueryEditor {
             Some(typed) => typed.what.clone(),
             None => said,
         };
+        // Two windows can both be on the same branch name: the bar names where this lands.
+        let what = format!(
+            "{} · {what}",
+            self.session.read(cx).write_scope(&pending.branch, cx)
+        );
         // A write Studio cannot put back takes its name typed, in a field before the buttons.
         let typed = pending.typed.as_ref().map(|typed| {
             ds::field_frame(typed.refused, cx)

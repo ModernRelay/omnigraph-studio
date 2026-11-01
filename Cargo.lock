@@ -4102,6 +4102,7 @@ version = "0.2.2"
 dependencies = [
  "chrono",
  "omnigraph-compiler",
+ "serde",
  "serde_json",
 ]
 
@@ -9739,6 +9740,7 @@ dependencies = [
  "gpui",
  "schemars 1.0.4",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

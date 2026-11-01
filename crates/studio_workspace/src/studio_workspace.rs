@@ -43,7 +43,7 @@ use studio_actions::workspace::{
     ToggleSidebar, ToggleZoom,
 };
 use studio_actions::{ViewKind, ViewLink};
-use studio_settings::{BottomDockLayout, StudioSettings};
+use studio_settings::{BottomDockLayout, ServerEnvironment, StudioSettings};
 use studio_ui::ds::IconButton;
 use studio_ui::menu::{ContextMenu, ContextMenuEntry, ContextMenuItem};
 use ui::prelude::*;
@@ -415,14 +415,23 @@ const TAB_END_SLOT: f32 = 14.;
 const ZOOM_INSET: f32 = studio_ui::ds::size::SHEET_GAP;
 /// Room for the window's traffic lights at the left of the first header strip.
 const TRAFFIC_LIGHTS_WIDTH: f32 = 76.;
+/// The traffic lights' offset from the window's left edge.
+const TRAFFIC_LIGHTS_LEFT: f32 = 12.;
 /// The traffic lights' offset from the top of that strip: centers the 16-point buttons in it.
 const TRAFFIC_LIGHTS_TOP: f32 = (HEADER_HEIGHT - 16.) / 2.;
 
 /// Where the traffic lights sit: centered in the top bar. A window opens with them there, so they
 /// do not move on its first draw.
 pub fn traffic_light_position(_glass: bool) -> Point<Pixels> {
-    point(px(12.), px(TRAFFIC_LIGHTS_TOP))
+    point(px(TRAFFIC_LIGHTS_LEFT), px(TRAFFIC_LIGHTS_TOP))
 }
+/// What the server at `url` is, as the settings say, kept by address (spec 020).
+fn environment_of(url: &str, cx: &App) -> ServerEnvironment {
+    cx.try_global::<StudioSettings>()
+        .and_then(|settings| settings.servers.get(url))
+        .map_or(ServerEnvironment::Unset, |server| server.environment)
+}
+
 /// A tab's view strip (spec 020): links to the other views of what it shows, the first thing in
 /// its toolbar. Nothing to choose between draws nothing. A view that cannot open stays, with why,
 /// so the strip does not shift.
@@ -2343,6 +2352,15 @@ impl Workspace {
         cx.emit(WorkspaceEvent::ActiveItemChanged);
     }
 
+    /// Shows or hides the inspector, which says so when nothing is selected: its button is always
+    /// there, so it never moves what is beside it (constitution V).
+    fn toggle_inspector(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dock_of(INSPECTOR_PANEL).is_none() {
+            self.show_inspector(Some(cx.new(|_| NothingSelected).into()), cx);
+        }
+        self.set_dock_open(PanelPosition::Right, !self.right.open, window, cx);
+    }
+
     fn show_inspector(&mut self, view: Option<AnyView>, cx: &mut Context<Self>) {
         match view {
             Some(view) => {
@@ -2556,8 +2574,10 @@ impl Workspace {
     ) {
         let notices = registry.read(cx).notices().to_vec();
         for notice in &notices {
+            // A server Studio could not take from the CLI's configuration stops no work: it is
+            // said once and goes by itself, where a refused connection says so in place.
             if !self.server_notices.contains(notice) {
-                self.show_toast(ToastKind::Error, notice.clone(), cx);
+                self.show_toast(ToastKind::Info, notice.clone(), cx);
             }
         }
         self.server_notices = notices;
@@ -2910,14 +2930,20 @@ impl Workspace {
     fn render_top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let shown = self.session.is_some();
         let hairline = studio_ui::ds::surface::rule(cx);
-        let docks_right = shown && !(self.bottom.panels.is_empty() && self.right.panels.is_empty());
+        let inspector_lit = self.right.visible();
+        let environment = self.server_environment(cx);
         self.strip("top-bar", HEADER_HEIGHT, cx)
             .debug_selector(|| "top-bar".into())
             .pr(px(studio_ui::ds::space::SM))
             .gap(px(studio_ui::ds::space::XS))
             .bg(studio_ui::ds::surface::status_bar(cx))
-            .border_b_1()
-            .border_color(hairline)
+            // Production is marked twice, by this line and the chip: a mode needs both to be seen.
+            .map(|strip| match environment {
+                Some(ServerEnvironment::Production) => strip
+                    .border_b_1()
+                    .border_color(studio_ui::ds::surface::error_border(cx)),
+                _ => strip.border_b_1().border_color(hairline),
+            })
             .map(|strip| match lights_room(self.lights_shown) {
                 Some(room) => strip.child(div().w(px(room)).flex_none()),
                 None => strip.pl(px(studio_ui::ds::space::SM)),
@@ -2928,6 +2954,7 @@ impl Workspace {
             })
             .child(self.render_graph_switcher(cx))
             .children(self.render_branch(cx))
+            .children(environment.map(|environment| self.render_environment(environment, cx)))
             .child(div().flex_1())
             .child(
                 IconButton::new("search", IconName::MagnifyingGlass)
@@ -2945,10 +2972,88 @@ impl Workspace {
                         )
                     }),
             )
-            .when(docks_right, |bar| {
+            .when(shown, |bar| {
                 bar.child(studio_ui::ds::divider_v(cx))
                     .child(self.render_panel_buttons(PanelPosition::Bottom, cx))
-                    .child(self.render_panel_buttons(PanelPosition::Right, cx))
+                    .child(
+                        IconButton::new("toggle-inspector", IconName::Info)
+                            .toggle_state(inspector_lit)
+                            .tooltip(move |_, cx| {
+                                Tooltip::for_action(
+                                    if inspector_lit {
+                                        "Hide inspector"
+                                    } else {
+                                        "Show inspector"
+                                    },
+                                    &ToggleInspector,
+                                    cx,
+                                )
+                            })
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(ToggleInspector), cx)
+                            }),
+                    )
+            })
+    }
+
+    /// What the shown graph's server is, by its address; none without a graph.
+    fn server_environment(&self, cx: &App) -> Option<ServerEnvironment> {
+        let session = self.session.as_ref()?;
+        let url = &session.read(cx).connection.read(cx).server.url;
+        Some(environment_of(url, cx))
+    }
+
+    /// The top bar's mark of what the server is, and the menu that says so. One not set reads as
+    /// not set, so an unconfigured production server never looks safe.
+    fn render_environment(
+        &self,
+        environment: ServerEnvironment,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let url = self
+            .session
+            .as_ref()
+            .map(|session| session.read(cx).connection.read(cx).server.url.clone())
+            .unwrap_or_default();
+        let color = match environment {
+            ServerEnvironment::Production => Color::Error,
+            ServerEnvironment::Staging => Color::Warning,
+            ServerEnvironment::Development | ServerEnvironment::Unset => Color::Muted,
+        };
+        let label = match environment {
+            ServerEnvironment::Unset => "Environment not set",
+            known => known.label(),
+        };
+        PopoverMenu::new("environment-menu")
+            .anchor(gpui::Anchor::TopLeft)
+            .attach(gpui::Anchor::BottomLeft)
+            .trigger_with_tooltip(
+                studio_ui::ds::bar_button("environment", label)
+                    .style(ButtonStyle::Subtle)
+                    .color(color),
+                Tooltip::text("What this server is, which this bar marks"),
+            )
+            .menu(move |window, cx| {
+                let url = url.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    menu = menu.header("This server is");
+                    for choice in ServerEnvironment::ALL {
+                        let url = url.clone();
+                        menu = menu.toggleable_entry(
+                            choice.label(),
+                            choice == environment,
+                            ui::IconPosition::Start,
+                            None,
+                            move |_, cx| {
+                                let url = url.clone();
+                                studio_settings::update(cx, move |settings| {
+                                    settings.servers.entry(url).or_default().environment = choice;
+                                });
+                            },
+                        );
+                    }
+                    menu
+                }))
             })
     }
 
@@ -4845,7 +4950,7 @@ impl Render for Workspace {
                 this.set_dock_open(PanelPosition::Left, !this.left.open, window, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleInspector, window, cx| {
-                this.set_dock_open(PanelPosition::Right, !this.right.open, window, cx)
+                this.toggle_inspector(window, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleActivity, window, cx| {
                 this.set_dock_open(PanelPosition::Bottom, !this.bottom.open, window, cx)
@@ -6494,6 +6599,30 @@ mod tests {
             let pane = workspace.pane(workspace.active_pane).expect("the pane");
             assert_eq!(pane.items.len(), 1);
             assert!(pane.is_preview(0), "and the source stays a preview");
+        });
+    }
+
+    /// A server is marked by its address, so renaming a target cannot reset production to unset,
+    /// and one nobody has named reads as not set.
+    #[gpui::test]
+    fn a_servers_environment_goes_by_its_address(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let mut settings = StudioSettings::default();
+            settings.servers.insert(
+                "https://prod.example".into(),
+                studio_settings::ServerOverrides {
+                    environment: ServerEnvironment::Production,
+                },
+            );
+            cx.set_global(settings);
+            assert_eq!(
+                environment_of("https://prod.example", cx),
+                ServerEnvironment::Production
+            );
+            assert_eq!(
+                environment_of("https://other.example", cx),
+                ServerEnvironment::Unset
+            );
         });
     }
 

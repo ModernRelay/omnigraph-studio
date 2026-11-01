@@ -44,6 +44,7 @@ trait InsertForm: EventEmitter<DismissEvent> + Sized + 'static {
     fn title(&self) -> String;
     /// The branch the insert writes to.
     fn branch(&self) -> &str;
+    fn session(&self) -> &Entity<GraphSession>;
     /// Why nothing can be inserted here (the credential may not write), if so.
     fn blocked(&self) -> Option<&str>;
     /// Inserts what the form holds.
@@ -264,6 +265,10 @@ impl InsertForm for InsertRowModal {
         &self.branch
     }
 
+    fn session(&self) -> &Entity<GraphSession> {
+        &self.session
+    }
+
     fn blocked(&self) -> Option<&str> {
         self.blocked.as_deref()
     }
@@ -457,7 +462,10 @@ fn insert_dialog<V: InsertForm>(
         )
         .child(
             ModalHeader::new(this.title())
-                .meta(write_target(this.branch().to_owned(), cx))
+                .meta(write_target(
+                    this.session().read(cx).write_scope(this.branch(), cx),
+                    cx,
+                ))
                 .close_disabled(saving)
                 .on_close(cx.listener(|this, _, _, cx| this.cancel(cx))),
         )
@@ -547,6 +555,10 @@ impl InsertForm for InsertEdgeModal {
 
     fn branch(&self) -> &str {
         &self.branch
+    }
+
+    fn session(&self) -> &Entity<GraphSession> {
+        &self.session
     }
 
     fn blocked(&self) -> Option<&str> {
@@ -1313,7 +1325,10 @@ impl Render for DeleteRowModal {
             .child(
                 ModalHeader::new(headline)
                     .description(SharedString::from(description))
-                    .meta(write_target(self.branch.clone(), cx))
+                    .meta(write_target(
+                        self.session.read(cx).write_scope(&self.branch, cx),
+                        cx,
+                    ))
                     .close_disabled(saving)
                     .on_close(cx.listener(|this, _, _, cx| this.cancel(cx))),
             )

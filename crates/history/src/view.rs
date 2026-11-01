@@ -51,6 +51,8 @@ const MERGED_RETRY_AFTER: Duration = Duration::from_secs(5);
 
 /// How long scrolling must pause before the drawn rows' change counts are read, and stepping
 /// through commits before the selected one's changes are.
+/// The search field in the toolbar.
+const SEARCH_WIDTH: f32 = 240.;
 const COUNTS_AFTER: Duration = Duration::from_millis(120);
 /// How long typing in the search pauses before the commits are matched.
 const SEARCH_DELAY: Duration = Duration::from_millis(80);
@@ -2062,7 +2064,7 @@ impl Render for HistoryView {
         let count = self.commits.len();
         let counter = self.match_counter();
         let search = studio_ui::ds::search_field(self.search.clone(), cx)
-            .w(px(240.))
+            .w(px(SEARCH_WIDTH))
             .children(counter.map(studio_ui::ds::text::meta));
         let summary = match self.state {
             State::Ready | State::Stale { .. } => summary(

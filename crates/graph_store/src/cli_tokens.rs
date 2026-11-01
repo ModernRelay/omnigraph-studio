@@ -1885,7 +1885,7 @@ exit 64
         assert!(said("disk").contains("opens storage directly"));
         assert!(said("rooted").contains("scope root"));
         assert!(said("control").contains("managed cluster registered without a data endpoint"));
-        assert!(said("stored-too").contains("which Studio reaches as 'stored', the first by name"));
+        assert!(said("stored-too").contains("so Studio connects as 'stored'"));
         assert_eq!(listed.errors.len(), 4, "{:?}", listed.errors);
         let managed: Vec<_> = listed
             .managed

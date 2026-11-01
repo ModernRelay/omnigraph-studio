@@ -684,12 +684,10 @@ fn on_one_address(landed: Vec<CliServer>, errors: &mut Vec<String>) -> Vec<CliSe
         }
         let one = server.alternatives.len() == 1;
         errors.push(format!(
-            "{} {} at {} too, which Studio reaches as '{}', the first by name. Each target is \
-             an identity of its own, and Studio keeps one connection per address, so it does not \
-             connect as {}",
+            "{} {} the same address as '{}', so Studio connects as '{}' and not as {}",
             targets_named(&server.alternatives),
-            if one { "is" } else { "are" },
-            server.url,
+            if one { "uses" } else { "use" },
+            server.name,
             server.name,
             if one { "it" } else { "them" },
         ));

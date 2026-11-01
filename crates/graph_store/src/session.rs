@@ -834,6 +834,13 @@ pub struct GraphSession {
 impl EventEmitter<SessionEvent> for GraphSession {}
 
 impl GraphSession {
+    /// Where a write on `branch` lands, in words: the server, the graph and the branch, which a
+    /// confirmation names whole, since two windows can both be on `main` (spec 020).
+    pub fn write_scope(&self, branch: &str, cx: &App) -> String {
+        let server = self.connection.read(cx).server.name.clone();
+        format!("{server} › {} › {branch}", self.graph_id)
+    }
+
     /// A session on `graph_id` that a window shows: it reads the graph at once.
     pub fn new(
         connection: Entity<Connection>,

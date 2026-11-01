@@ -200,7 +200,7 @@
       "enter": "studio_table::EditCell",
       "space": "studio_table::PeekRow",
       "cmd-enter": "studio_table::OpenRowPage",
-      "g": "studio_table::ExploreRow",
+      "g": "studio_table::ShowRowOnCanvas",
       "cmd-c": "studio_table::CopyCell",
       "cmd-backspace": "studio_table::DeleteRow",
       "cmd-alt-f": "studio_table::FilterBySelection",

@@ -90,7 +90,7 @@ pub mod workspace {
     use schemars::JsonSchema;
     use serde::Deserialize;
 
-    /// Open the active tab's view at this place in its view strip (spec 020).
+    /// Open the active tab's view at this place in its view strip.
     #[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio)]
     pub struct OpenViewAt {
@@ -281,16 +281,16 @@ pub mod graph {
         #[serde(default)]
         pub at_commit: Option<String>,
         /// Filter the table to this node id: the node itself, or with `via`, the nodes related
-        /// to it through that relationship key (`in:WorksAt`) (spec 005).
+        /// to it through that relationship key (`in:WorksAt`).
         #[serde(default)]
         pub filter_id: Option<String>,
         #[serde(default)]
         pub via: Option<String>,
-        /// Open as the pane's preview tab, which the next preview replaces (spec 002).
+        /// Open as the pane's preview tab, which the next preview replaces.
         #[serde(default)]
         pub preview: bool,
         /// Filters a new table opens with, as a table saves them; an open table is left as it
-        /// is, since it may hold other work (spec 020).
+        /// is, since it may hold other work.
         #[serde(default)]
         pub filters: Option<serde_json::Value>,
     }
@@ -299,18 +299,18 @@ pub mod graph {
     #[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph, deprecated_aliases = ["studio_graph::OpenOntology"])]
     pub struct OpenMap {
-        /// Open as the pane's preview tab, which the next preview replaces (spec 002).
+        /// Open as the pane's preview tab, which the next preview replaces.
         #[serde(default)]
         pub preview: bool,
     }
 
-    /// Open the schema's source, read-only; with a type, at its declaration (spec 007).
+    /// Open the schema's source, read-only; with a type, at its declaration.
     #[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph, deprecated_aliases = ["studio_graph::OpenSchema"])]
     pub struct OpenSource {
         #[serde(default)]
         pub type_name: Option<String>,
-        /// Open as the pane's preview tab, which the next preview replaces (spec 002).
+        /// Open as the pane's preview tab, which the next preview replaces.
         #[serde(default)]
         pub preview: bool,
     }
@@ -325,7 +325,7 @@ pub mod graph {
     }
 
     /// Draw a query result's nodes on a canvas of their own, linking the nodes of each row
-    /// (specs 006, 007).
+    ///.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph)]
     pub struct ShowResultsOnCanvas {
@@ -443,7 +443,7 @@ pub mod graph {
         pub path: Option<String>,
     }
 
-    /// Open a query editor that reads one commit, read-only (spec 009).
+    /// Open a query editor that reads one commit, read-only.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph)]
     pub struct OpenQueryAt {
@@ -467,7 +467,7 @@ pub mod graph {
         /// Read at this commit, read-only; `None` reads the branch head.
         #[serde(default)]
         pub at_commit: Option<String>,
-        /// Open as the pane's preview tab, which the next preview replaces (spec 002).
+        /// Open as the pane's preview tab, which the next preview replaces.
         #[serde(default)]
         pub preview: bool,
     }
@@ -481,7 +481,7 @@ pub mod graph {
         /// Read at this commit, read-only; `None` reads the branch head.
         #[serde(default)]
         pub at_commit: Option<String>,
-        /// Open as the pane's preview tab, which the next preview replaces (spec 002).
+        /// Open as the pane's preview tab, which the next preview replaces.
         #[serde(default)]
         pub preview: bool,
     }
@@ -492,7 +492,7 @@ pub mod graph {
     #[action(namespace = studio_graph)]
     pub struct OpenBranch {
         pub branch: String,
-        /// Open as the pane's preview tab, which the next preview replaces (spec 002).
+        /// Open as the pane's preview tab, which the next preview replaces.
         #[serde(default)]
         pub preview: bool,
     }
@@ -502,7 +502,7 @@ pub mod graph {
     #[action(namespace = studio_graph)]
     pub struct OpenBranchHistory {
         pub branch: String,
-        /// Open as the pane's preview tab, which the next preview replaces (spec 002).
+        /// Open as the pane's preview tab, which the next preview replaces.
         #[serde(default)]
         pub preview: bool,
     }
@@ -512,13 +512,13 @@ pub mod graph {
     #[action(namespace = studio_graph)]
     pub struct OpenCommit {
         pub commit_id: String,
-        /// Open as the pane's preview tab, which the next preview replaces (spec 002).
+        /// Open as the pane's preview tab, which the next preview replaces.
         #[serde(default)]
         pub preview: bool,
     }
 
     /// Create a branch that starts at a published commit, with that commit's data and history
-    /// (specs 008, 009).
+    ///.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph)]
     pub struct CreateBranchAt {
@@ -527,7 +527,12 @@ pub mod graph {
 }
 
 pub mod table {
-    use gpui::actions;
+    use gpui::{Action, actions};
+
+    /// Walk from the row under the cursor, on a canvas of its own.
+    #[derive(Clone, Debug, Default, PartialEq, Action)]
+    #[action(namespace = studio_table, deprecated_aliases = ["studio_table::ExploreRow"])]
+    pub struct ShowRowOnCanvas;
 
     actions!(
         studio_table,
@@ -558,8 +563,6 @@ pub mod table {
             PeekRow,
             /// Open the selected row's node as a page.
             OpenRowPage,
-            /// Explore the graph from the row under the cursor, on the canvas.
-            ExploreRow,
             /// Read the table again: from the branch head, or at the commit it is held at.
             RefreshTable,
             /// Add a row.
@@ -574,10 +577,10 @@ pub mod table {
             FilterBySelection,
             /// Remove every filter from the table.
             ClearFilters,
-            /// Filter the table from a sentence, which a model turns into filters (spec 019).
+            /// Filter the table from a sentence, which a model turns into filters.
             FilterInWords,
             /// Fill the selected column's cells from other columns, with a model's suggestions
-            /// to apply (spec 019).
+            /// to apply.
             FillColumn,
         ]
     );
@@ -744,7 +747,7 @@ pub mod review {
             EditChange,
             /// Merge the reviewed branch.
             Merge,
-            /// Summarize the branch's changes with a model, for the reviewer (spec 019).
+            /// Summarize the branch's changes with a model, for the reviewer.
             Summarize,
             /// Unfold the selected change to what it holds, or fold it back to its line.
             ToggleChange,

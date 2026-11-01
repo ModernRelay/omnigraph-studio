@@ -32,10 +32,10 @@ use graph_store::{DraftEntry, DraftKey, GraphSession, Loadable, SessionEvent};
 use serde_json::Value;
 use studio_actions::blob::{ChooseFile, ClearValue};
 use studio_actions::table::{
-    AddFilter, Cancel, ClearFilters, ConfirmEdit, CopyCell, DeleteRow, EditCell, ExploreRow,
-    FillColumn, FilterBySelection, FilterInWords, InsertRow, MoveDown, MoveLeft, MoveRight, MoveUp,
+    AddFilter, Cancel, ClearFilters, ConfirmEdit, CopyCell, DeleteRow, EditCell, FillColumn,
+    FilterBySelection, FilterInWords, InsertRow, MoveDown, MoveLeft, MoveRight, MoveUp,
     OpenRowPage, PeekRow, RefreshTable, SaveDrafts, SelectNextSuggestion, SelectPreviousSuggestion,
-    StageEdit,
+    ShowRowOnCanvas, StageEdit,
 };
 use studio_actions::{ViewKind, ViewLink};
 use studio_ui::ds::Button;
@@ -6587,7 +6587,7 @@ impl TypeTable {
         })
     }
 
-    fn on_explore(&mut self, _: &ExploreRow, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_explore(&mut self, _: &ShowRowOnCanvas, window: &mut Window, cx: &mut Context<Self>) {
         if self.kind != TableKind::Node {
             return;
         }
@@ -9696,7 +9696,7 @@ impl TypeTable {
                     key("Edit", &EditCell),
                     key("Peek", &PeekRow),
                     key("Open page", &OpenRowPage),
-                    key("Explore", &ExploreRow),
+                    key("Canvas", &ShowRowOnCanvas),
                     key("Copy", &CopyCell),
                     key("Filter by this value", &FilterBySelection),
                     key("New row", &InsertRow),
@@ -13008,7 +13008,7 @@ mod tests {
             [
                 "Peek",
                 "Open page",
-                "Explore",
+                "Canvas",
                 "Copy",
                 "Filter by this value",
                 "Refresh"

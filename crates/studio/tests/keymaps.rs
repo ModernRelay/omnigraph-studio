@@ -104,6 +104,8 @@ fn main() {
     println!("test every_keymap_binding_names_a_studio_action ... ok");
     every_action_has_a_key_or_is_palette_only(&mut cx);
     println!("test every_action_has_a_key_or_is_palette_only ... ok");
+    every_destination_has_a_key();
+    println!("test every_destination_has_a_key ... ok");
     the_persons_keymap_wins_and_is_read_again(&mut cx, &keymap);
     println!("test the_persons_keymap_wins_and_is_read_again ... ok");
     std::fs::remove_dir_all(&data).ok();
@@ -163,9 +165,13 @@ fn every_keymap_binding_names_a_studio_action(cx: &mut HeadlessAppContext) {
 fn every_action_has_a_key_or_is_palette_only(cx: &mut HeadlessAppContext) {
     // An action without arguments has no schema; one with only optional fields has one.
     let actions: Vec<&str> = cx.update(|cx| {
+        // An old name kept for people's own keymaps is not an action of its own.
+        let renamed = cx.deprecated_actions_to_preferred_actions();
         cx.action_schemas(&mut schemars::SchemaGenerator::default())
             .into_iter()
-            .filter(|(name, schema)| name.starts_with("studio") && schema.is_none())
+            .filter(|(name, schema)| {
+                name.starts_with("studio") && schema.is_none() && !renamed.contains_key(name)
+            })
             .map(|(name, _)| name)
             .collect()
     });
@@ -191,6 +197,37 @@ fn every_action_has_a_key_or_is_palette_only(cx: &mut HeadlessAppContext) {
                     "has no key"
                 }
             );
+        }
+    }
+}
+
+/// Every place the sidebar lists has a key, and so does each place in a tab's view strip, beside
+/// and in place, on every platform (spec 020).
+fn every_destination_has_a_key() {
+    for (platform, content) in KEYMAPS {
+        let blocks: Vec<serde_json::Value> = serde_json::from_str(content).unwrap();
+        let bound: Vec<&serde_json::Value> = blocks
+            .iter()
+            .filter_map(|block| block["bindings"].as_object())
+            .flat_map(|bindings| bindings.values())
+            .collect();
+        for panel in ["types", "queries", "branches"] {
+            assert!(
+                bound
+                    .iter()
+                    .any(|action| action[0] == "studio::ActivatePanel" && action[1]["id"] == panel),
+                "{platform}: the {panel} panel has no key"
+            );
+        }
+        for index in 0..3 {
+            for beside in [false, true] {
+                assert!(
+                    bound.iter().any(|action| action[0] == "studio::OpenViewAt"
+                        && action[1]["index"] == index
+                        && (action[1]["beside"] == true) == beside),
+                    "{platform}: view {index} (beside: {beside}) has no key"
+                );
+            }
         }
     }
 }

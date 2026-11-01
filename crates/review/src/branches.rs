@@ -1000,6 +1000,10 @@ impl Render for DeleteBranchModal {
             .child(
                 ds::ModalHeader::new(format!("Delete {branch}?"))
                     .description(SharedString::from(what))
+                    .meta(ds::write_target(
+                        self.session.read(cx).write_scope(branch, cx),
+                        cx,
+                    ))
                     .close_disabled(running)
                     .on_close(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
             )

@@ -2414,28 +2414,6 @@ impl GraphCanvas {
         .size_full()
     }
 
-    /// The explorer before any node: how to start, as one action and one key.
-    fn render_explore_start(&self, cx: &mut Context<Self>) -> AnyElement {
-        studio_ui::ds::empty_state(IconName::Crosshair, "Explore from a node")
-            .child(
-                // An empty state's action is an outline button, as every empty state's is.
-                studio_ui::ds::button("explore-search", "Search nodes")
-                    .style(ButtonStyle::Outlined)
-                    .start_icon(Icon::new(IconName::MagnifyingGlass))
-                    .key_binding(ui::KeyBinding::for_action(
-                        &studio_actions::workspace::GoTo,
-                        cx,
-                    ))
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(studio_actions::workspace::GoTo), cx)
-                    }),
-            )
-            .child(studio_ui::ds::text::muted(
-                "or press G on a row in any table",
-            ))
-            .into_any_element()
-    }
-
     /// The caption, bottom left: what is drawn, and what a click does.
     fn render_caption(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // What a click does; the summary at the top says what is drawn.
@@ -2817,11 +2795,6 @@ impl Render for GraphCanvas {
                 studio_ui::ds::error_state("The schema could not be read", message)
                     .into_any_element(),
             ),
-            Loadable::Loaded(_)
-                if self.mode() == Mode::Explore && self.exploration.read(cx).root().is_none() =>
-            {
-                Some(self.render_explore_start(cx))
-            }
             Loadable::Loaded(_) if self.scene.nodes.is_empty() => Some(
                 match self.mode() {
                     Mode::Explore => studio_ui::ds::loading_state("Laying out…"),

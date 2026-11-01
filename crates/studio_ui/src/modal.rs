@@ -144,9 +144,10 @@ pub fn action_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -
     Button::new(id, label).variant(Variant::Primary)
 }
 
-/// The branch a modal writes to, beside its title: a quiet pill.
-pub fn write_target(branch: impl Into<SharedString>, cx: &App) -> Div {
-    let branch: SharedString = branch.into();
+/// Where a modal writes, beside its title: a quiet pill naming the server, graph and branch
+/// (`GraphSession::write_scope`).
+pub fn write_target(scope: impl Into<SharedString>, cx: &App) -> Div {
+    let branch: SharedString = scope.into();
     h_flex()
         .flex_none()
         .h(px(size::TAG))
