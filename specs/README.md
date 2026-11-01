@@ -50,6 +50,7 @@ Add tasks, contracts or data-model files only for large features.
 | 017 | [Studio updates itself](017-auto-update/plan.md) | built; installing waits on signing |
 | 018 | [Telemetry, with consent](018-telemetry/plan.md) | draft |
 | 019 | [Model calls through OpenRouter](019-model-calls/plan.md) | built; live check with a key pending |
+| 020 | [UI/UX unification](020-ui-unification/plan.md) | in progress |
 
 Each plan's first line holds its full status. 012 is not scheduled: it records every Omnigraph change Studio would use, what Studio does
 without it, and which plan waits on it. Each feature plan's Deferred section names its IDs.
