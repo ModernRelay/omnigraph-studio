@@ -43,7 +43,9 @@ pub struct Choice {
     pub property: Option<Property>,
     /// For a relationship key, the type at its other end, whose records `related_to` names.
     pub other_type: Option<String>,
-    /// For a relationship key, its GQ traversal (`attended`), for a predicate.
+    /// For a relationship key, the GQ that names it in a predicate's block, from the row `$n`
+    /// to the related record `$r`: `$n attended $r`, or `$r knows $n` for an incoming key
+    /// ([`gq_language::builder::relationship_traversal`]).
     pub traversal: Option<String>,
 }
 
@@ -86,30 +88,54 @@ pub fn schema(choices: &[Choice]) -> Value {
 /// sentence.
 pub fn input(type_name: &str, choices: &[Choice], today: &str, sentence: &str) -> String {
     let mut text = format!("Table: rows of type {type_name}. Today is {today}.\n\nKeys:\n");
-    // The type's own properties, one line each; then each relationship on one line with the
-    // related type's properties after it, so a wide graph stays within the task's cap.
+    // The type's own properties, one line each; then each relationship on a line of its own,
+    // their operators said once for all; then each related type's properties once, however
+    // many relationships reach it. A wide type is reached by hundreds of relationships, and
+    // repeating either for each would pass the task's cap.
     for choice in choices
         .iter()
         .filter(|c| c.property.is_some() && !c.key.contains('.'))
     {
         let property = choice.property.as_ref().expect("filtered");
-        let ops: Vec<&str> = choice.ops.iter().map(|op| op.key()).collect();
         text.push_str(&format!(
             "- {}: {}; operators {}\n",
             choice.key,
             kind_of(property),
-            ops.join(", ")
+            op_keys(&choice.ops)
         ));
     }
-    for relationship in choices.iter().filter(|c| c.property.is_none()) {
-        let ops: Vec<&str> = relationship.ops.iter().map(|op| op.key()).collect();
+    let relationships: Vec<&Choice> = choices.iter().filter(|c| c.property.is_none()).collect();
+    let common = relationships
+        .first()
+        .map(|relationship| relationship.ops.clone())
+        .unwrap_or_default();
+    if !relationships.is_empty() {
         text.push_str(&format!(
-            "- {} ({}): operators {}; in GQ `$n {} $r`",
-            relationship.key,
-            relationship.label,
-            ops.join(", "),
-            relationship.traversal.as_deref().unwrap_or("?"),
+            "\nRelationships, each with operators {}, its GQ in a predicate from the row $n to \
+             the related record $r, and the related type; `key.<property>` tests the related \
+             record's property, with that property's operators:\n",
+            op_keys(&common)
         ));
+    }
+    let mut related: Vec<(&str, Vec<String>)> = Vec::new();
+    for relationship in relationships {
+        // The GQ names the edge and the related type its end: the menu's label says no more.
+        match (&relationship.traversal, &relationship.other_type) {
+            (Some(traversal), Some(other)) => {
+                text.push_str(&format!("- {}: `{traversal}`, {other}", relationship.key));
+            }
+            _ => text.push_str(&format!("- {} ({})", relationship.key, relationship.label)),
+        }
+        if relationship.ops != common {
+            text.push_str(&format!("; operators {}", op_keys(&relationship.ops)));
+        }
+        text.push('\n');
+        let Some(other) = relationship.other_type.as_deref() else {
+            continue;
+        };
+        if related.iter().any(|(seen, _)| *seen == other) {
+            continue;
+        }
         let prefix = format!("{}.", relationship.key);
         let nested: Vec<String> = choices
             .iter()
@@ -120,15 +146,17 @@ pub fn input(type_name: &str, choices: &[Choice], today: &str, sentence: &str) -
             })
             .collect();
         if !nested.is_empty() {
-            text.push_str(&format!(
-                "; or test the related record's property as {prefix}<property>, with that \
-                 property's operators: {}",
-                nested.join(", ")
-            ));
+            related.push((other, nested));
         }
-        text.push('\n');
     }
-    text.push_str(
+    let mut listed = String::new();
+    if !related.is_empty() {
+        listed.push_str("\nProperties of related types:\n");
+        for (other, nested) in related {
+            listed.push_str(&format!("- {other}: {}\n", nested.join(", ")));
+        }
+    }
+    let rest = format!(
         "\nOperators: eq, ne, lt, le, gt, ge compare one value; contains matches text or a \
          list member; starts_with and search (the words, in any order) match text; in takes \
          several values; is_empty and is_not_empty, today, this_week and last_30_days take no \
@@ -138,12 +166,23 @@ pub fn input(type_name: &str, choices: &[Choice], today: &str, sentence: &str) -
          exact record.\n\nGQ for `predicate`, on the row $n: a property is $n.<key>; compare \
          with =, !=, <, <=, >, >=, contains, starts_with, in [..]; `is null`; combine with and, \
          or, not, and parentheses. Or, as the whole predicate, one block on a related record: \
-         `exists { $r: <Type>  $n <traversal> $r  $r.<property> = \"x\"  $r.<other> > 3 }` \
-         or `not { ... }`, where the traversal is the relationship's GQ name given above; a \
-         block cannot sit inside or, and holds no count.\n\nRequest: ",
+         `exists {{ $r: <Type>  <its GQ>  $r.<property> = \"x\"  $r.<other> > 3 }}` or \
+         `not {{ ... }}`, with the relationship's GQ as given above, in its direction; a \
+         block cannot sit inside or, and holds no count.\n\nRequest: {}",
+        sentence.trim()
     );
-    text.push_str(sentence.trim());
-    text
+    // The related types' properties are what a wide type cannot always fit: left out, and said
+    // to be, when they would pass the task's cap, so the request is still sent.
+    if text.len() + listed.len() + rest.len() > TASK.limits.input_bytes {
+        listed = "\nThe related types' properties are left out: there are too many to list.\n"
+            .to_owned();
+    }
+    text + &listed + &rest
+}
+
+/// Operators by their keys, as the answer names them: `eq, ne, contains`.
+fn op_keys(ops: &[FilterOp]) -> String {
+    ops.iter().map(|op| op.key()).collect::<Vec<_>>().join(", ")
 }
 
 /// A property's kind in a few words: `String`, `list of String`, `enum(a, b, …)`.
@@ -253,7 +292,7 @@ mod tests {
             list: false,
             enum_values: values.map(|values| values.iter().map(|v| (*v).to_owned()).collect()),
             is_key: false,
-            indexed: false,
+            full_text: false,
         }
     }
 
@@ -282,7 +321,7 @@ mod tests {
             ops: FilterOp::for_relationship(),
             property: None,
             other_type: Some("Person".into()),
-            traversal: Some("attended".into()),
+            traversal: Some("$n attended $r".into()),
         });
         out
     }
@@ -353,10 +392,81 @@ mod tests {
         );
         assert!(
             text.contains(
-                "- out:Attended (attended Person): operators has_any, has_none, related_to"
+                "Relationships, each with operators has_any, has_none, related_to, its GQ"
             ),
             "{text}"
         );
+        assert!(
+            text.contains("- out:Attended: `$n attended $r`, Person\n"),
+            "{text}"
+        );
         assert!(text.ends_with("Request: dinners last month"));
+    }
+
+    /// A related type's properties are said once, however many relationships reach it, and a
+    /// type too wide for the task's cap leaves them out, says so, and is still asked. Before,
+    /// every relationship repeated its operators and the related type's properties, so the
+    /// personal graph's widest types (1,122 keys for Person) passed the cap and the request
+    /// was refused.
+    #[test]
+    fn the_input_says_each_related_type_once_and_fits_the_cap() {
+        let relationship = |key: &str, other: &str| Choice {
+            key: key.into(),
+            label: format!("{key} {other}"),
+            ops: FilterOp::for_relationship(),
+            property: None,
+            other_type: Some(other.into()),
+            traversal: gq_language::builder::relationship_traversal(key, "$n", "$r"),
+        };
+        let nested = |key: &str, name: &str, values: &[&str]| {
+            let property = property(name, ScalarKind::Text, "String", Some(values));
+            Choice {
+                key: format!("{key}.{name}"),
+                label: name.into(),
+                ops: FilterOp::for_property(&property),
+                property: Some(property),
+                other_type: None,
+                traversal: None,
+            }
+        };
+        let mut choices = choices();
+        for key in ["out:Attended", "in:Invited"] {
+            if key != "out:Attended" {
+                choices.push(relationship(key, "Person"));
+            }
+            choices.push(nested(key, "role", &["host", "guest"]));
+        }
+        let text = input("Event", &choices, "2026-10-29", "dinners Ada hosted");
+        assert_eq!(
+            text.matches("- Person: role enum(host, guest)\n").count(),
+            1,
+            "{text}"
+        );
+        assert!(
+            text.contains("- in:Invited: `$r invited $n`, Person\n"),
+            "{text}"
+        );
+
+        let values: Vec<String> = (0..12).map(|n| format!("value-{n:02}")).collect();
+        let values: Vec<&str> = values.iter().map(String::as_str).collect();
+        let mut wide = choices.clone();
+        for n in 0..400 {
+            let key = format!("out:Rel{n:03}");
+            wide.push(relationship(&key, &format!("Type{n:03}")));
+            wide.push(nested(&key, "status", &values));
+        }
+        let text = input("Event", &wide, "2026-10-29", "dinners Ada hosted");
+        assert!(
+            text.len() <= TASK.limits.input_bytes,
+            "{} bytes",
+            text.len()
+        );
+        assert!(
+            text.contains("related types' properties are left out"),
+            "{text}"
+        );
+        assert!(!text.contains("- Type000: status"), "{text}");
+        assert!(text.contains("- out:Rel399: `$n rel399 $r`, Type399\n"));
+        assert!(text.ends_with("Request: dinners Ada hosted"));
     }
 }

@@ -105,7 +105,7 @@ mod tests {
             list: false,
             enum_values: None,
             is_key: false,
-            indexed: false,
+            full_text: false,
         };
         let text = input(
             &target,
