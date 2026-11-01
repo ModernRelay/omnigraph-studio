@@ -28,7 +28,9 @@ use gq_language::{
 use graph_client::api::ReadOutput;
 use graph_client::{BlobCell, BlobMeta, HistoricalGap, PropertyThen, ReadError};
 use graph_store::scope::{ReadScope, ScopeSince};
-use graph_store::{DraftEntry, DraftKey, GraphSession, Loadable, SessionEvent};
+use graph_store::{
+    ChangeFold, DraftEntry, DraftKey, GraphSession, Loadable, NetChange, SessionEvent,
+};
 use serde_json::Value;
 use studio_actions::blob::{ChooseFile, ClearValue};
 use studio_actions::table::{
@@ -51,6 +53,7 @@ use ui::{
 };
 
 use crate::blob_write::{self, Binding, BlobChange, BlobEdit, BlobWritten};
+use crate::branch_diff::{BranchDiff, TARGET};
 use crate::dialogs::{
     DeleteRowModal, DeleteTarget, InsertEdgeModal, InsertRowModal, SaveViewModal,
 };
@@ -186,6 +189,8 @@ struct RowLook {
     dimmed: bool,
     cursor: bool,
     header: bool,
+    /// How the branch changed the row against its target (spec 004, "Reading on a branch").
+    change: Option<NetChange>,
 }
 
 /// How long scrolling must pause before the drawn rows' Blob cells are read.
@@ -270,6 +275,191 @@ impl BulkDraft {
     fn saving(&self) -> bool {
         self.sending.is_some()
     }
+}
+
+/// How many changes a table's diff folds before it stops (spec 004, "Reading on a branch"):
+/// the review's cap, so a table and its review agree on what is partial.
+const DIFF_CHANGE_CAP: usize = graph_store::REVIEW_CHANGE_CAP;
+/// How many changes one page of the diff asks for.
+const DIFF_PAGE: usize = 8_192;
+
+/// The colour a kind of change is drawn in, as review draws it.
+fn change_color(net: NetChange) -> Color {
+    match net {
+        NetChange::Added => Color::Created,
+        NetChange::Changed => Color::Modified,
+        NetChange::Removed => Color::Deleted,
+    }
+}
+
+/// What the branch changed in the table's rows, against its target (spec 004, "Reading on a
+/// branch"): read as the net diff from the merge base, once the table is drawn on a branch
+/// other than the target, and again when the rows are read at another commit or the table's
+/// own write moves its pin. Added and changed rows are washed in their kind's colour with a
+/// bar in the gutter, a changed row's changed cells marked, and the rows the branch removed
+/// are shown first, struck through, as what a diff shows before what came.
+impl TypeTable {
+    /// Reads the branch's diff against the target, when there is one to read.
+    fn read_diff(&mut self, cx: &mut Context<Self>) {
+        self.diff_task = None;
+        if self.branch == TARGET || self.at_commit.is_some() || self.schema.is_none() {
+            self.diff = None;
+            return;
+        }
+        let branch = self.branch.clone();
+        let session = self.session.clone();
+        let (kind, type_name) = (self.entity_kind(), self.type_name.clone());
+        self.diff_task = Some(cx.spawn(async move |this, cx| {
+            let folded = read_branch_diff(&session, &branch, cx).await;
+            let diff = cx
+                .background_executor()
+                .spawn(
+                    async move { folded.map(|folded| BranchDiff::of(&folded, kind, &type_name)) },
+                )
+                .await;
+            this.update(cx, |this, cx| {
+                // The branch moved on, or the rows are being read at another commit: a read
+                // started then replaces this one.
+                if this.branch != branch || this.diff_owed {
+                    return;
+                }
+                this.diff = diff.map(Arc::new);
+                this.place_removed(cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Puts the rows the branch removed before the rows read, once both are in, where they are
+    /// not shown already. Grouped, a removed row is in no section, so none shows.
+    fn place_removed(&mut self, cx: &mut Context<Self>) {
+        let Some(diff) = self.diff.clone() else {
+            return;
+        };
+        if self.grouping.is_some()
+            || !matches!(self.first_page, Loadable::Loaded(()))
+            || diff.removed().is_empty()
+        {
+            return;
+        }
+        let shown: HashSet<&str> = self.rows.iter().map(|row| row.id.as_str()).collect();
+        let placed: Vec<Row> = diff
+            .removed()
+            .iter()
+            .filter(|row| !shown.contains(row.id.as_str()))
+            .cloned()
+            .collect();
+        if placed.is_empty() {
+            return;
+        }
+        // The cursor stays on its row, which moves down by the rows put before it.
+        if let Some(cursor) = &mut self.cursor {
+            cursor.row += placed.len();
+        }
+        self.placed_here
+            .extend(placed.iter().map(|row| row.id.clone()));
+        self.rows.splice(0..0, placed);
+        self.lines_moved();
+        cx.notify();
+    }
+
+    /// How the branch changed the row `id`, if it did.
+    fn row_change(&self, id: &str) -> Option<NetChange> {
+        self.diff.as_ref()?.mark(id).map(|mark| mark.net)
+    }
+
+    /// The row `id` is one the branch removed: shown for what it was, on the branch no more.
+    fn is_removed(&self, id: &str) -> bool {
+        self.row_change(id) == Some(NetChange::Removed)
+    }
+
+    /// The branch changed the value the cell holds.
+    fn cell_changed(&self, id: &str, column: &str) -> bool {
+        self.diff
+            .as_ref()
+            .and_then(|diff| diff.mark(id))
+            .is_some_and(|mark| mark.changed.contains(column))
+    }
+
+    /// The toolbar's count of what the branch changed in the type, "+3 ~2 −1" in the kinds'
+    /// colours, after the row count; nothing on the target or while the branch changed nothing.
+    fn render_diff_counts(&self) -> Option<AnyElement> {
+        let (added, changed, removed) = self.diff.as_ref()?.counts();
+        if added + changed + removed == 0 {
+            return None;
+        }
+        let tooltip = format!(
+            "On {} against {TARGET}: {} added, {} changed, {} removed",
+            self.branch,
+            plural(added, "row", "rows"),
+            plural(changed, "row", "rows"),
+            plural(removed, "row", "rows"),
+        );
+        let count = |n: usize, sign: &str, color: Color| {
+            (n > 0).then(|| {
+                studio_ui::ds::text::meta(format!("{sign}{n}"))
+                    .color(color)
+                    .into_any_element()
+            })
+        };
+        Some(
+            h_flex()
+                .id("diff-counts")
+                .gap(px(space::SM))
+                .tooltip(Tooltip::text(tooltip))
+                .children(count(added, "+", Color::Created))
+                .children(count(changed, "~", Color::Modified))
+                .children(count(removed, "−", Color::Deleted))
+                .into_any_element(),
+        )
+    }
+}
+
+/// The net changes from `branch`'s merge base with the target to its head, folded, up to
+/// [`DIFF_CHANGE_CAP`]; `None` when they cannot be read, as a table shows its rows either way.
+async fn read_branch_diff(
+    session: &Entity<GraphSession>,
+    branch: &str,
+    cx: &mut gpui::AsyncApp,
+) -> Option<graph_store::FoldedChanges> {
+    let base = session
+        .update(cx, |session, cx| session.merge_base(branch, TARGET, cx))
+        .await
+        .ok()?;
+    let (from, to) = (base.merge_base.graph_commit_id, base.source_commit_id);
+    let mut fold = ChangeFold::new();
+    if from == to {
+        return Some(fold.finish());
+    }
+    let cause = graph_client::api::ChangeCauseOutput {
+        graph_commit_id: to.clone(),
+        authored_branch: branch.to_owned(),
+        authored_at: 0,
+        parent_commit_id: None,
+        merged_parent_commit_id: None,
+        actor_id: None,
+    };
+    let mut token: Option<String> = None;
+    loop {
+        let limit = DIFF_PAGE.min(DIFF_CHANGE_CAP - fold.raw_changes()).max(1) as u32;
+        let page = session
+            .update(cx, |session, cx| {
+                session.diff(&from, &to, token.take(), limit, cx)
+            })
+            .await
+            .ok()?;
+        let block = graph_client::api::ChangeBlockOutput {
+            cause: cause.clone(),
+            changes: page.changes,
+        };
+        let complete = fold.add_block_capped(block, DIFF_CHANGE_CAP);
+        match page.next_page_token {
+            Some(next) if complete && fold.raw_changes() < DIFF_CHANGE_CAP => token = Some(next),
+            _ => break,
+        }
+    }
+    Some(fold.finish())
 }
 
 /// The hover group of a grid row, for the actions its cells show under the pointer.
@@ -701,6 +891,12 @@ pub struct TypeTable {
     /// The rows are read when the table is next drawn ([`Self::owe_reload`]): a table behind
     /// another tab reads nothing when it is restored, nor when the branch or the schema moves.
     rows_owed: bool,
+    /// What the branch changed in this type's rows against its target, once read
+    /// ([`Self::read_diff`]); `None` on the target, at a commit, and until the read lands.
+    diff: Option<Arc<BranchDiff>>,
+    /// The diff is read when the table is next drawn, as the rows are.
+    diff_owed: bool,
+    diff_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     /// How often the table drew, for the test that moving through the offers draws it and
     /// leaves the grid alone.
@@ -965,6 +1161,9 @@ impl TypeTable {
             total_task: None,
             count_shift: None,
             rows_owed: false,
+            diff: None,
+            diff_owed: true,
+            diff_task: None,
             _subscriptions: subscriptions,
             #[cfg(test)]
             renders: 0,
@@ -1512,6 +1711,9 @@ impl TypeTable {
         let Some(id) = self.rows.get(row).map(|r| r.id.clone()) else {
             return;
         };
+        if self.is_removed(&id) {
+            return;
+        }
         match self.selection_anchor.filter(|_| range) {
             Some(anchor) => {
                 let between: Vec<usize> = match &self.grouping {
@@ -1519,7 +1721,9 @@ impl TypeTable {
                     None => (anchor.min(row)..=anchor.max(row).min(self.rows.len() - 1)).collect(),
                 };
                 for ix in between {
-                    if let Some(picked) = self.rows.get(ix) {
+                    if let Some(picked) = self.rows.get(ix)
+                        && !self.is_removed(&picked.id)
+                    {
                         self.selection.insert(picked.id.clone());
                     }
                 }
@@ -2974,6 +3178,10 @@ impl TypeTable {
             self.paging.pinned = self.at_commit.clone();
             self.count_shift = None;
             self.newer = false;
+            // What the branch changed is read again with the rows.
+            self.diff = None;
+            self.diff_task = None;
+            self.diff_owed = true;
             cx.emit(ItemEvent::UpdateTab);
         }
         // An edit open over the rows read before is kept as its cell's draft, as leaving the
@@ -3106,6 +3314,7 @@ impl TypeTable {
         let behind = self.paging.advance_for_own_commit(parent, commit);
         if self.paging.pinned != before {
             self.own_writes += 1;
+            self.diff_owed = true;
         }
         behind
     }
@@ -3909,6 +4118,7 @@ impl TypeTable {
                         if !counted {
                             self.load_counts(cx);
                         }
+                        self.place_removed(cx);
                     }
                     None => self.loading_more = false,
                 }
@@ -3999,6 +4209,9 @@ impl TypeTable {
         }
         cx.defer_in(window, |this, window, cx| {
             this.frame_due = false;
+            if std::mem::take(&mut this.diff_owed) {
+                this.read_diff(cx);
+            }
             if let Some(lines) = this.frame_line_range.take() {
                 this.want_row_relations(lines.clone(), window, cx);
                 this.want_blob_metas(lines.clone(), cx);
@@ -4901,6 +5114,9 @@ impl TypeTable {
         let Some(row) = self.rows.get(row) else {
             return;
         };
+        if self.is_removed(&row.id) {
+            return;
+        }
         let subject = match self.kind {
             TableKind::Node => PeekSubject::Node {
                 type_name: self.type_name.clone(),
@@ -5127,6 +5343,10 @@ impl TypeTable {
         let Some(row) = self.rows.get(cursor.row) else {
             return;
         };
+        // A row the branch removed is not on it: nothing to edit, nothing to open.
+        if self.is_removed(&row.id) {
+            return;
+        }
         let key = (row.id.clone(), column.key.clone());
         if matches!(self.cells.get(&key), Some(CellState::Saving { .. })) {
             return;
@@ -7570,6 +7790,7 @@ impl TypeTable {
                     .when_some(count_error, |d, error| d.tooltip(Tooltip::text(error)))
                     .child(studio_ui::ds::text::muted(count)),
             )
+            .children(self.render_diff_counts())
             // Where edits go is the branch the status bar names; the table says only when it
             // cannot edit, the credential's refusal included.
             .when(read_only || refused.is_some(), |d| {
@@ -8223,6 +8444,9 @@ impl TypeTable {
                     .max_w(content_width)
                     .group(ROW_GROUP)
                     .when(look.header, |row| row.bg(header_bg))
+                    .when_some(look.change, |row, net| {
+                        row.bg(studio_ui::ds::surface::wash(change_color(net), cx))
+                    })
                     .when(look.picked, |row| row.bg(picked_bg))
                     .when(look.cursor, |row| row.bg(selected_bg))
                     .when(look.dimmed, |row| {
@@ -8588,6 +8812,7 @@ impl TypeTable {
                     dimmed: data.dimmed,
                     cursor: cursor == Some(row),
                     header: false,
+                    change: self.row_change(&data.id),
                 },
             );
         }
@@ -9300,7 +9525,21 @@ impl TypeTable {
                     .relative()
                     .w_full()
                     .child(self.render_cell(ix, 0, row, window, cx))
-                    .child(self.render_row_check(ix, &row.id, cx))
+                    .when_some(self.row_change(&row.id), |cell, net| {
+                        // The gutter's bar says the kind, as a diff's does.
+                        cell.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .bottom_0()
+                                .w(px(studio_ui::ds::size::ACCENT_LINE))
+                                .bg(change_color(net).color(cx)),
+                        )
+                    })
+                    .when(!self.is_removed(&row.id), |cell| {
+                        cell.child(self.render_row_check(ix, &row.id, cx))
+                    })
                     .into_any_element(),
                 GridPlace::Column(col) => self.render_cell(ix, col, row, window, cx),
                 GridPlace::Gap(_) => div().into_any_element(),
@@ -9368,7 +9607,11 @@ impl TypeTable {
     fn all_check_state(&self) -> ToggleState {
         if self.selection.is_empty() {
             ToggleState::Unselected
-        } else if self.rows.iter().all(|row| self.selection.contains(&row.id)) {
+        } else if self
+            .rows
+            .iter()
+            .all(|row| self.selection.contains(&row.id) || self.is_removed(&row.id))
+        {
             ToggleState::Selected
         } else {
             ToggleState::Indeterminate
@@ -9381,8 +9624,13 @@ impl TypeTable {
             self.clear_selection(cx);
             return;
         }
-        self.selection
-            .extend(self.rows.iter().map(|row| row.id.clone()));
+        let kept: Vec<String> = self
+            .rows
+            .iter()
+            .filter(|row| !self.is_removed(&row.id))
+            .map(|row| row.id.clone())
+            .collect();
+        self.selection.extend(kept);
         self.selection_anchor = None;
         self.bulk.notice = None;
         cx.notify();
@@ -9505,7 +9753,12 @@ impl TypeTable {
             .when(col + 1 < self.columns.len(), |d| {
                 d.border_r_1().border_color(divider)
             })
-            .when(column.align_right, |d| d.justify_end());
+            .when(column.align_right, |d| d.justify_end())
+            // The cells the branch changed, on a stronger tint of the row's wash.
+            .when(self.cell_changed(&row.id, &column.key), |d| {
+                d.bg(studio_ui::ds::surface::mark(Color::Modified, cx))
+            });
+        let removed = self.is_removed(&row.id);
         // The cursor and the editor are drawn as a ring over the cell, so no cell changes size.
         let ring = || {
             div()
@@ -9542,6 +9795,8 @@ impl TypeTable {
         let place = (ix * self.columns.len() + col) as u64;
         let text_color = if value.is_null() {
             Color::Disabled
+        } else if removed {
+            Color::Deleted
         } else {
             Color::Default
         };
@@ -9585,6 +9840,9 @@ impl TypeTable {
             _ => {
                 // One line in the cell's room, never measured: most cells are this.
                 let mut text = studio_ui::cell_text(shown, cx).color(text_color.color(cx));
+                if removed {
+                    text = text.struck();
+                }
                 if numeric {
                     text = text.buffer_font(cx).align_end();
                 }
@@ -10194,6 +10452,107 @@ mod tests {
         cx.run_until_parked();
         shown.read_with(cx, |table, _| {
             assert!(!table.rows.is_empty(), "drawn, it reads")
+        });
+    }
+
+    /// On a branch, the rows the branch removed show first, struck through and not for
+    /// picking or editing, and the rows it added or changed are marked, a changed row by its
+    /// changed cells; on main nothing is read for it, and back on main the marks go.
+    #[gpui::test]
+    async fn a_branch_shows_what_it_changed_in_the_rows(cx: &mut TestAppContext) {
+        use serde_json::json;
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let rows = json!([
+            {"n": {"@id": "p1", "slug": "p1", "name": "Ada"}},
+            {"n": {"@id": "p2", "slug": "p2", "name": "Grace"}},
+        ]);
+        let person = json!({ "id": "Person", "name": "Person" });
+        let changes = json!([
+            { "kind": "node", "type": person, "id": "p1", "op": "insert",
+              "before": null, "after": { "properties": { "slug": "p1", "name": "Ada" } } },
+            { "kind": "node", "type": person, "id": "p2", "op": "update",
+              "before": { "properties": { "slug": "p2", "name": "Grace H" } },
+              "after": { "properties": { "slug": "p2", "name": "Grace" } } },
+            { "kind": "node", "type": person, "id": "p3", "op": "delete",
+              "before": { "properties": { "slug": "p3", "name": "Linus" } }, "after": null },
+        ]);
+        let (session, route) =
+            crate::test_support::session_with_branch_diff(PEOPLE, rows, changes, cx);
+        cx.run_until_parked();
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session.clone(),
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let ids = |table: &TypeTable| -> Vec<String> {
+            table.rows.iter().map(|row| row.id.clone()).collect()
+        };
+        table.read_with(cx, |table, _| {
+            assert_eq!(ids(table), ["p1", "p2"]);
+            assert!(table.diff.is_none(), "main is the target: no diff");
+        });
+        assert!(
+            route.reads.lock().unwrap().is_empty(),
+            "nothing read on main"
+        );
+
+        session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        cx.run_until_parked();
+        {
+            let reads = route.reads.lock().unwrap();
+            assert!(
+                reads.iter().any(|path| path.ends_with("/merge-base")),
+                "{reads:?}"
+            );
+            assert!(
+                reads.iter().any(|path| path.ends_with("/diff")),
+                "{reads:?}"
+            );
+        }
+        table.read_with(cx, |table, _| {
+            assert_eq!(ids(table), ["p3", "p1", "p2"], "the removed row first");
+            assert_eq!(table.row_change("p1"), Some(NetChange::Added));
+            assert_eq!(table.row_change("p2"), Some(NetChange::Changed));
+            assert!(table.cell_changed("p2", "name"));
+            assert!(!table.cell_changed("p2", "slug"));
+            assert!(table.is_removed("p3"));
+            assert_eq!(table.rows[0].value("name"), "Linus");
+            assert!(table.render_diff_counts().is_some());
+        });
+        table.update(cx, |table, cx| table.toggle_all_rows(cx));
+        table.read_with(cx, |table, _| {
+            let picked: Vec<&str> = table.selection.iter().map(String::as_str).collect();
+            assert_eq!(picked, ["p1", "p2"], "a removed row is not picked");
+            assert_eq!(table.all_check_state(), ToggleState::Selected);
+        });
+        table.update_in(cx, |table, window, cx| {
+            table.clear_selection(cx);
+            let col = table.columns.iter().position(|c| c.key == "name").unwrap();
+            table.start_edit(Cursor { row: 0, col }, window, cx);
+            assert!(table.editing.is_none(), "a removed row has no cell to edit");
+            assert!(table.peek.is_none(), "nor a page to open");
+            table.pick_rows(0, false, cx);
+            assert!(table.selection.is_empty());
+        });
+
+        session.update(cx, |session, cx| session.set_branch("main".into(), cx));
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(
+                ids(table),
+                ["p1", "p2"],
+                "back on main the removed row goes"
+            );
+            assert!(table.diff.is_none());
         });
     }
 

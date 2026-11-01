@@ -228,6 +228,19 @@ stay put), IX (paged, virtualized).
   2026-10-22). A table held at another commit, or one whose own writes past its pin change its
   counts, shows no snapshot count.
 - Filtered counts: `return { count($n) as n }` with the same filters, pinned to the snapshot.
+- Reading on a branch (since 2026-11-01): a table on any branch but `main` reads what the
+  branch changed in its type, as the net diff from the merge base (`branches/merge-base`, then
+  `/diff` a page at a time, folded per entity as review folds, up to review's cap of 20,000
+  changes), and draws it as a diff draws its lines: a row the branch added or changed on a
+  faint wash of its kind's colour (`ds::surface::wash`) with a bar of it in the gutter, a
+  changed row's changed cells on the stronger mark (`ds::surface::mark`), and the rows the
+  branch removed first, before the rows read, their last values struck through in the removed
+  colour. A removed row is on the branch no more: it is not picked, edited or opened, and a
+  grouped table shows none (it is in no section). The toolbar counts them after the row count,
+  "+3 ~2 −1", with the kinds in words as its tooltip. The diff is read when the table is next
+  drawn, as the rows are, and again when the rows are read at another commit (Refresh, a branch
+  or schema move) or the table's own write moves its pin; a read that fails leaves the rows
+  unmarked. On `main`, and at a commit, nothing is read.
 
 ### Filters and views
 
@@ -516,6 +529,7 @@ kept answers.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-01 | On a branch the rows the branch removed show first, struck and not for picking or editing, and the rows it added or changed are marked, a changed row by its changed cells | `type_table` `a_branch_shows_what_it_changed_in_the_rows` (a table on main, then on fix with p1 added, p2's name changed and p3 removed, then back on main), `branch_diff` `marks_the_types_rows_by_what_the_branch_did`, `a_removed_edge_keeps_its_ends`, `a_row_that_ends_where_it_began_is_not_marked` | Pass. On main nothing is read for it; on fix the rows read p3, p1, p2, select-all picked p1 and p2, Enter on p3 opened nothing; back on main p3 went. Not drawn by a test: the wash, the gutter bar and the strikethrough |
 | 2026-10-31 | A condition filter is spliced in as written and judged by the compiler before a read | `gq_language` `a_condition_is_spliced_in_and_judged_by_the_compiler` (an `or … not exists { }` condition type-checks beside a pill's clause; `$n.nope = 1` is a diagnostic; an empty one is refused by the builder) | Pass. The pill's edit-on-click and the draft's compile error are not drawn by a test |
 | 2026-10-31 | "Matches words" is offered where the compiler takes `search`, and only there | `gq_language` `every_offered_filter_op_compiles` (extended: edge properties too, and a schema with a composite key, `@index(title)` on the type, `summary: String @index`, a lone key and `note: String @index` on an edge), `text_filters_start_with_search_and_reach_neighbours` (extended: offered on `title`, `summary` and the lone key, not on a composite key's member or an unindexed property). Each fails under the earlier rule (checked) | Fixed. The first rule marked every key member and every property `@index` as searchable, so a composite key's members and an edge's indexed property offered an operator whose query failed to compile, and a one-column index declared on the type was not offered. Each property now asks the compiler's catalog, which Studio already builds |
 | 2026-11-01 | The filter menu nests each relationship's neighbour properties, its choices are built once with the columns, and a schema change keeps every filter it can still test | `type_table` `the_filter_menu_nests_each_relationships_neighbour_properties` (new), `a_schema_changed_elsewhere_waits_for_refresh` (extended: a column, relationship, neighbour-property and condition filter stay under a schema that adds a type; under one that drops the name, the two on it go and the menus no longer offer it). Each fails with its part of the fix undone (checked) | Fixed. The flat menu listed Person's 1,122 keys on the personal graph, and the toolbar rebuilt them at every draw while a filter was written; they now come from the cache the Group menu's choices use. A schema change dropped neighbour-property and condition filters, whose keys are neither a column nor a relationship |

@@ -72,6 +72,15 @@ impl CellText {
         self
     }
 
+    /// Struck through, as a value that is gone is.
+    pub fn struck(mut self) -> Self {
+        self.style.strikethrough = Some(gpui::StrikethroughStyle {
+            thickness: px(crate::ds::size::HAIRLINE),
+            color: None,
+        });
+        self
+    }
+
     /// Set against the end of its room, as numbers are.
     pub fn align_end(mut self) -> Self {
         self.align = TextAlign::Right;
