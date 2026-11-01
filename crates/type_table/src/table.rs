@@ -402,12 +402,87 @@ fn relation_samples(rows: &Value) -> Vec<(String, String, Option<String>)> {
         .collect()
 }
 
-/// What the Group menu offers for a table's columns: its submenus, and every choice by key and
-/// how it reads.
+/// What the Group and Filter menus offer for a table's columns, built once with them
+/// ([`TypeTable::build_menu_choices`]): the toolbar draws both on every render, and a type with
+/// dozens of relationships offers thousands of choices through its neighbours' properties.
 #[derive(Default)]
-struct GroupingChoices {
-    menus: Rc<Vec<GroupMenu>>,
-    choices: Rc<Vec<(String, String)>>,
+struct MenuChoices {
+    /// The Group menu's submenus.
+    group_menus: Rc<Vec<GroupMenu>>,
+    /// Every grouping by key and how it reads.
+    groups: Rc<Vec<(String, String)>>,
+    /// Every filter key, how it reads and its icon ([`TypeTable::filter_choices`]).
+    filters: Rc<Vec<(String, String, IconName)>>,
+    /// The Filter menu's entries over [`Self::filters`].
+    filter_menu: Rc<Vec<FilterMenuEntry>>,
+}
+
+/// An entry of the Filter menu, by its place in the table's filter choices: a key, or a
+/// relationship whose neighbours' properties open in a submenu of their own. A type reached
+/// by hundreds of relationships lists only those, not every neighbour property after each.
+#[derive(Debug, Clone, PartialEq)]
+enum FilterMenuEntry {
+    Key(usize),
+    Relationship {
+        key: usize,
+        /// The type at its other end, which the submenu's properties belong to.
+        other_type: String,
+        properties: Range<usize>,
+    },
+}
+
+/// A Filter menu entry that sets the filter being written to `key`.
+fn filter_key_entry(
+    table: &WeakEntity<TypeTable>,
+    key: String,
+    label: String,
+    icon: IconName,
+) -> ContextMenuEntry {
+    let table = table.clone();
+    ContextMenuEntry::new(label)
+        .icon(icon)
+        .icon_color(Color::Muted)
+        .handler(move |window, cx| {
+            table
+                .update(cx, |this, cx| {
+                    this.set_draft_property(key.clone(), window, cx)
+                })
+                .ok();
+        })
+}
+
+/// The Filter menu over `choices` (in [`TypeTable::filter_choices`]' order: each relationship
+/// followed by its neighbours' properties), each relationship naming its other end through
+/// `other_type`.
+fn filter_menu(
+    choices: &[(String, String, IconName)],
+    other_type: impl Fn(&str) -> Option<String>,
+) -> Vec<FilterMenuEntry> {
+    let mut entries = Vec::new();
+    let mut at = 0;
+    while at < choices.len() {
+        let key = &choices[at].0;
+        if builder::parse_relationship_key(key).is_none() {
+            entries.push(FilterMenuEntry::Key(at));
+            at += 1;
+            continue;
+        }
+        let prefix = format!("{key}.");
+        let end = choices[at + 1..]
+            .iter()
+            .position(|(nested, _, _)| !nested.starts_with(&prefix))
+            .map_or(choices.len(), |offset| at + 1 + offset);
+        entries.push(match other_type(key) {
+            Some(other_type) if end > at + 1 => FilterMenuEntry::Relationship {
+                key: at,
+                other_type,
+                properties: at + 1..end,
+            },
+            _ => FilterMenuEntry::Key(at),
+        });
+        at = end;
+    }
+    entries
 }
 
 /// A submenu of the Group menu (see [`TypeTable::group_menus`]).
@@ -587,7 +662,7 @@ pub struct TypeTable {
     /// then. Rows are read without them.
     absent: HashMap<String, PropertyThen>,
     /// What the Group menu offers for these columns: its submenus and every choice.
-    grouping_choices: GroupingChoices,
+    menu_choices: MenuChoices,
     /// What each cell shows, by row id and column, made the first time it is drawn: a text
     /// value is read as markdown to show its first line, too slow to do for every cell every
     /// frame. A cell set, or rows read again, are made again.
@@ -872,7 +947,7 @@ impl TypeTable {
             frame_line_range: None,
             frame_due: false,
             absent: HashMap::new(),
-            grouping_choices: Default::default(),
+            menu_choices: Default::default(),
             cell_text: RefCell::new(HashMap::new()),
             peek: None,
             newer: false,
@@ -1039,7 +1114,7 @@ impl TypeTable {
             self.missing = true;
             self.schema = Some(schema);
             self.all_columns.clear();
-            self.grouping_choices = Default::default();
+            self.menu_choices = Default::default();
             self.columns.clear();
             self.rows.clear();
             self.placed_here.clear();
@@ -1079,7 +1154,7 @@ impl TypeTable {
         self.all_columns = columns;
         self.show_columns(cx);
         self.schema = Some(schema);
-        self.build_grouping_choices();
+        self.build_menu_choices();
         // An order or a grouping asked for before the schema was read, or on a property this
         // schema no longer has, stays only where the schema allows it.
         if self
@@ -1376,8 +1451,8 @@ impl TypeTable {
     fn apply_view(&mut self, view: &studio_settings::SavedView, cx: &mut Context<Self>) {
         let known: HashSet<String> = self
             .filter_choices()
-            .into_iter()
-            .map(|(key, _, _)| key)
+            .iter()
+            .map(|(key, _, _)| key.clone())
             .collect();
         self.filters = view
             .filters
@@ -3105,22 +3180,25 @@ impl TypeTable {
     /// What the rows can be grouped by: each groupable property, then what each submenu of
     /// [`Self::group_menus`] offers. Key and how the choice reads.
     fn group_choices(&self) -> Rc<Vec<(String, String)>> {
-        self.grouping_choices.choices.clone()
+        self.menu_choices.groups.clone()
     }
 
     /// The Group menu's submenus, as [`Self::build_group_menus`] built them for these columns.
     fn group_menus(&self) -> Rc<Vec<GroupMenu>> {
-        self.grouping_choices.menus.clone()
+        self.menu_choices.group_menus.clone()
     }
 
-    /// Builds what the Group menu offers, once the columns are known: the toolbar draws it on
-    /// every render, and a type with dozens of relationships offers thousands of choices.
-    fn build_grouping_choices(&mut self) {
-        let menus = self.build_group_menus();
-        let choices = self.build_group_choices(&menus);
-        self.grouping_choices = GroupingChoices {
-            menus: Rc::new(menus),
-            choices: Rc::new(choices),
+    /// Builds what the Group and Filter menus offer, once the columns are known.
+    fn build_menu_choices(&mut self) {
+        let group_menus = self.build_group_menus();
+        let groups = self.build_group_choices(&group_menus);
+        let filters = self.build_filter_choices();
+        let filter_menu = filter_menu(&filters, |key| self.related_type(key));
+        self.menu_choices = MenuChoices {
+            group_menus: Rc::new(group_menus),
+            groups: Rc::new(groups),
+            filters: Rc::new(filters),
+            filter_menu: Rc::new(filter_menu),
         };
     }
 
@@ -6741,7 +6819,17 @@ impl TypeTable {
 
     /// What a filter can test: each filterable property, then (in a node table) each
     /// relationship group, as `(key, label, icon)`.
-    fn filter_choices(&self) -> Vec<(String, String, IconName)> {
+    fn filter_choices(&self) -> Rc<Vec<(String, String, IconName)>> {
+        self.menu_choices.filters.clone()
+    }
+
+    /// The Filter menu's entries over [`Self::filter_choices`].
+    fn filter_menu(&self) -> Rc<Vec<FilterMenuEntry>> {
+        self.menu_choices.filter_menu.clone()
+    }
+
+    /// Builds [`Self::filter_choices`] for these columns ([`Self::build_menu_choices`]).
+    fn build_filter_choices(&self) -> Vec<(String, String, IconName)> {
         let mut choices: Vec<(String, String, IconName)> = self
             .filterable()
             .map(|p| (p.name.clone(), p.name.clone(), property_icon(p)))
@@ -7186,7 +7274,8 @@ impl TypeTable {
 
     fn words_choices(&self) -> Vec<words::Choice> {
         self.filter_choices()
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|(key, label, _)| words::Choice {
                 ops: self.ops_for(&key),
                 property: self.property_for_key(&key),
@@ -7617,6 +7706,7 @@ impl TypeTable {
         if let Some(draft) = &self.filter_draft {
             let table = cx.entity().downgrade();
             let choices = self.filter_choices();
+            let entries = self.filter_menu();
             let chosen = choices
                 .iter()
                 .find(|(key, _, _)| *key == draft.property)
@@ -7657,33 +7747,74 @@ impl TypeTable {
                         .menu(move |window, cx| {
                             let table = property_table.clone();
                             let choices = choices.clone();
+                            let entries = entries.clone();
                             Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                                 let mut relationships = false;
-                                for (key, label, icon) in choices {
+                                for entry in entries.iter() {
+                                    let at = match entry {
+                                        FilterMenuEntry::Key(at)
+                                        | FilterMenuEntry::Relationship { key: at, .. } => *at,
+                                    };
+                                    let (key, label, icon) = &choices[at];
                                     if !relationships
-                                        && builder::parse_relationship_key(&key).is_some()
+                                        && builder::parse_relationship_key(key).is_some()
                                     {
                                         relationships = true;
                                         menu = menu.separator().header("Relationships");
                                     }
-                                    let table = table.clone();
-                                    let name = key.clone();
-                                    menu = menu.item(
-                                        ContextMenuEntry::new(label)
-                                            .icon(icon)
-                                            .icon_color(Color::Muted)
-                                            .handler(move |window, cx| {
-                                                table
-                                                    .update(cx, |this, cx| {
-                                                        this.set_draft_property(
-                                                            name.clone(),
-                                                            window,
-                                                            cx,
-                                                        )
-                                                    })
-                                                    .ok();
-                                            }),
-                                    );
+                                    match entry {
+                                        FilterMenuEntry::Key(_) => {
+                                            menu = menu.item(filter_key_entry(
+                                                &table,
+                                                key.clone(),
+                                                label.clone(),
+                                                *icon,
+                                            ));
+                                        }
+                                        // The neighbours' properties open beside it, as the
+                                        // Group menu's do; the relationship itself comes first.
+                                        FilterMenuEntry::Relationship {
+                                            other_type,
+                                            properties,
+                                            ..
+                                        } => {
+                                            let (table, choices) = (table.clone(), choices.clone());
+                                            let (key, label, icon) =
+                                                (key.clone(), label.clone(), *icon);
+                                            let (other_type, properties) =
+                                                (other_type.clone(), properties.clone());
+                                            menu = menu.submenu_with_colored_icon(
+                                                label.clone(),
+                                                icon,
+                                                Color::Muted,
+                                                move |mut menu, _, _| {
+                                                    menu = menu
+                                                        .item(filter_key_entry(
+                                                            &table,
+                                                            key.clone(),
+                                                            label.clone(),
+                                                            icon,
+                                                        ))
+                                                        .separator()
+                                                        .header(format!("{other_type}'s property"));
+                                                    for (nested, _, _) in
+                                                        &choices[properties.clone()]
+                                                    {
+                                                        let name = nested
+                                                            .rsplit_once('.')
+                                                            .map_or(nested.as_str(), |(_, p)| p);
+                                                        menu = menu.item(filter_key_entry(
+                                                            &table,
+                                                            nested.clone(),
+                                                            name.to_owned(),
+                                                            icon,
+                                                        ));
+                                                    }
+                                                    menu
+                                                },
+                                            );
+                                        }
+                                    }
                                 }
                                 menu
                             }))
@@ -10200,6 +10331,47 @@ mod tests {
         });
     }
 
+    /// The Filter menu lists each relationship once, with its neighbours' properties in a
+    /// submenu of it; a relationship without any is a plain entry. Before, every neighbour
+    /// property followed its relationship in the one menu: 1,122 entries for the personal
+    /// graph's Person, every one drawn at each frame the menu was open.
+    #[test]
+    fn the_filter_menu_nests_each_relationships_neighbour_properties() {
+        let choice = |key: &str| (key.to_owned(), key.to_owned(), IconName::CaseSensitive);
+        let choices = [
+            choice("name"),
+            choice("out:Knows"),
+            choice("out:Knows.name"),
+            choice("out:Knows.email"),
+            choice("in:Likes"),
+            choice("out:Owns"),
+            choice("out:Owns.title"),
+            choice(builder::WHERE_FILTER),
+        ];
+        let other = |key: &str| match key {
+            "out:Owns" => Some("Project".to_owned()),
+            _ => Some("Person".to_owned()),
+        };
+        assert_eq!(
+            filter_menu(&choices, other),
+            [
+                FilterMenuEntry::Key(0),
+                FilterMenuEntry::Relationship {
+                    key: 1,
+                    other_type: "Person".into(),
+                    properties: 2..4,
+                },
+                FilterMenuEntry::Key(4),
+                FilterMenuEntry::Relationship {
+                    key: 5,
+                    other_type: "Project".into(),
+                    properties: 6..7,
+                },
+                FilterMenuEntry::Key(7),
+            ]
+        );
+    }
+
     /// Another writer's schema change, seen at a head move, leaves the table as it was read and
     /// offers Refresh; Refresh reads it under the new schema (constitution II), keeping every
     /// filter the new schema still has what to test for, and every condition. Before, a filter
@@ -10284,6 +10456,21 @@ mod tests {
             assert_eq!(&*table.schema.as_ref().unwrap().source, grown.as_str());
             assert_eq!(table.rows.len(), 2);
             assert_eq!(table.filters, filters, "every filter still holds");
+            let knows = table
+                .filter_choices()
+                .iter()
+                .position(|(key, _, _)| key == "out:Knows")
+                .unwrap();
+            assert!(
+                table
+                    .filter_menu()
+                    .contains(&FilterMenuEntry::Relationship {
+                        key: knows,
+                        other_type: "Person".into(),
+                        properties: knows + 1..knows + 2,
+                    }),
+                "the neighbours' name in a submenu"
+            );
         });
 
         // A schema without the name: the filters on it, the table's and the neighbours', go;
@@ -10299,6 +10486,14 @@ mod tests {
         table.read_with(cx, |table, _| {
             assert_eq!(&*table.schema.as_ref().unwrap().source, unnamed);
             assert_eq!(table.filters, [filters[1].clone(), filters[3].clone()]);
+            // The menus follow the schema: no name to offer, the relationship a plain entry.
+            let choices = table.filter_choices();
+            assert!(!choices.iter().any(|(key, _, _)| key.ends_with("name")));
+            let knows = choices
+                .iter()
+                .position(|(key, _, _)| key == "out:Knows")
+                .unwrap();
+            assert!(table.filter_menu().contains(&FilterMenuEntry::Key(knows)));
         });
     }
 
@@ -11315,7 +11510,7 @@ mod tests {
             // As before the session's schema was read.
             table.schema = None;
             table.all_columns.clear();
-            table.grouping_choices = Default::default();
+            table.menu_choices = Default::default();
             table.set_sort(
                 Some(Sort {
                     property: "name".into(),
