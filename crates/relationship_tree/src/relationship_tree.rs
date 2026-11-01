@@ -1062,11 +1062,8 @@ impl RelationshipTree {
                     .flex_1()
                     .gap(px(space::SM))
                     .child(
-                        studio_ui::ds::text::meta(format!(
-                            "{} →",
-                            gq_language::traversal_name(&key.group.edge)
-                        ))
-                        .single_line(),
+                        studio_ui::ds::text::meta(gq_language::traversal_name(&key.group.edge))
+                            .single_line(),
                     )
                     // The target's dot, as on a neighbour row; none when there is no target.
                     .when(target.is_some(), |row| {
@@ -1089,7 +1086,12 @@ impl RelationshipTree {
                     Color::Default
                 };
                 let muted = if empty { Color::Disabled } else { Color::Muted };
-                let arrow = key.group.direction.arrow();
+                // No arrow: an outgoing group reads "knows Person", an incoming one "knows from
+                // Person", the way the edge runs said in words.
+                let other = match key.group.direction {
+                    gq_language::Direction::Outgoing => key.group.other_type.clone(),
+                    gq_language::Direction::Incoming => format!("from {}", key.group.other_type),
+                };
                 let count_label = match count {
                     Loadable::Loaded(n) => n.to_string(),
                     Loadable::Failed(_) => "!".to_owned(),
@@ -1115,7 +1117,6 @@ impl RelationshipTree {
                     .min_w_0()
                     .flex_1()
                     .gap(px(space::SM))
-                    .child(studio_ui::ds::text::body(arrow).color(muted))
                     .child(
                         div().min_w_0().flex_shrink(1.).child(
                             studio_ui::ds::text::body(key.group.edge.clone())
@@ -1124,11 +1125,10 @@ impl RelationshipTree {
                         ),
                     )
                     .child(
-                        div().min_w_0().flex_shrink(1.).child(
-                            studio_ui::ds::text::meta(key.group.other_type.clone())
-                                .color(muted)
-                                .truncate(),
-                        ),
+                        div()
+                            .min_w_0()
+                            .flex_shrink(1.)
+                            .child(studio_ui::ds::text::meta(other).color(muted).truncate()),
                     )
                     .children(grouped_by.map(|property| {
                         div().min_w_0().flex_shrink(1.).child(
@@ -1262,10 +1262,14 @@ impl RelationshipTree {
                     entry
                         .parent
                         .and_then(|parent| match &self.entries.get(parent)?.kind {
-                            // As the group row reads it: `→ WorksAt`.
+                            // As the group row reads it: `WorksAt`, or `Knows from Person`.
                             EntryKind::Group { key, .. } | EntryKind::Bucket { key, .. } => {
-                                let arrow = key.group.direction.arrow();
-                                Some(format!("{arrow} {}", key.group.edge))
+                                Some(match key.group.direction {
+                                    gq_language::Direction::Outgoing => key.group.edge.clone(),
+                                    gq_language::Direction::Incoming => {
+                                        format!("{} from {}", key.group.edge, key.group.other_type)
+                                    }
+                                })
                             }
                             _ => None,
                         });

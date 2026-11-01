@@ -31,7 +31,7 @@ II (the tree reads one commit), V (rows do not jump), VIII (keyboard), IX (paged
 | Row | Shows | Opens to |
 |---|---|---|
 | Node | type colour dot, label property; one short edge value at the end ("role lead") when it fits whole; the key on the root and the selected row; in review mode `+ ~ −` | its relationship groups |
-| Relationship group | `→` or `←`, edge name, other type (muted), count; zero-count groups dimmed or hidden (toggle) | neighbour nodes, 50 at a time |
+| Relationship group | edge name, other type (muted; `from Person` for an incoming group, since 2026-11-01: the arrows read as clutter), the grouping and filters in words, count; zero-count groups dimmed or hidden (toggle) | neighbour nodes, 50 at a time |
 | Field | an edge with cardinality at most one, shown on its node as `manager → Charles` | nothing (Enter follows it) |
 | Value | one value of the property the group is grouped by, and how many neighbours have it; "No value" last | the neighbours with that value, paged like a group |
 | More | "Show 50 more of 418 · Filter…" | the next page; a filter box appears above 50 |
