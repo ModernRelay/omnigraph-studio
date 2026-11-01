@@ -74,6 +74,11 @@ pub trait Item: Render + Focusable + EventEmitter<ItemEvent> {
         false
     }
 
+    /// What this tab shows, in any of its views (spec 020). The sidebar lights its row from this.
+    fn thing(&self, _cx: &App) -> Option<studio_actions::Thing> {
+        None
+    }
+
     /// The item has unsaved work; closing asks first.
     fn is_dirty(&self, _cx: &App) -> bool {
         false
@@ -118,6 +123,7 @@ pub trait ItemHandle: 'static {
     fn tab_icon(&self, cx: &App) -> Option<IconName>;
     fn dedupe_key(&self, cx: &App) -> Option<SharedString>;
     fn opened_by(&self, action: &dyn Action, cx: &App) -> bool;
+    fn thing(&self, cx: &App) -> Option<studio_actions::Thing>;
     fn is_dirty(&self, cx: &App) -> bool;
     fn is_stale(&self, cx: &App) -> bool;
     fn focus_handle(&self, cx: &App) -> FocusHandle;
@@ -150,6 +156,10 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn opened_by(&self, action: &dyn Action, cx: &App) -> bool {
         self.read(cx).opened_by(action, cx)
+    }
+
+    fn thing(&self, cx: &App) -> Option<studio_actions::Thing> {
+        self.read(cx).thing(cx)
     }
 
     fn is_dirty(&self, cx: &App) -> bool {

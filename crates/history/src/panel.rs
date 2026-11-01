@@ -50,7 +50,9 @@ impl HistoryPanel {
                 &workspace,
                 window,
                 |this, workspace, event: &WorkspaceEvent, _window, cx| {
-                    let WorkspaceEvent::SessionChanged = event;
+                    if !matches!(event, WorkspaceEvent::SessionChanged) {
+                        return;
+                    }
                     this.session = workspace.read(cx).session().cloned();
                     this.view = None;
                     cx.notify();

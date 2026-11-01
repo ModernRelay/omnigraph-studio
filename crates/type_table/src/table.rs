@@ -4878,8 +4878,9 @@ impl TypeTable {
         });
         if let Some(workspace) = self.workspace.upgrade() {
             let view: gpui::AnyView = peek.clone().into();
+            let tab = cx.entity_id();
             workspace.update(cx, |workspace, cx| {
-                workspace.set_inspector(Some(view.clone()), cx);
+                workspace.set_inspector_of(tab, Some(view.clone()), cx);
                 // The peek is a list that draws, and reads, only the relationship groups in
                 // view.
                 workspace.set_panel_scrolls_itself(&view, cx);
@@ -5002,7 +5003,10 @@ impl TypeTable {
         if self.peek.take().is_some()
             && let Some(workspace) = self.workspace.upgrade()
         {
-            workspace.update(cx, |workspace, cx| workspace.set_inspector(None, cx));
+            let tab = cx.entity_id();
+            workspace.update(cx, |workspace, cx| {
+                workspace.set_inspector_of(tab, None, cx)
+            });
         }
         cx.notify();
     }

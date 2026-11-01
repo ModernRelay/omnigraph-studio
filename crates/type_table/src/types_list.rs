@@ -54,6 +54,7 @@ impl TypesList {
                         let session = workspace.read(cx).session().cloned();
                         this.watch(session, cx);
                     }
+                    WorkspaceEvent::ActiveItemChanged => cx.notify(),
                 },
             )
         });

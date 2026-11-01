@@ -285,7 +285,9 @@ impl SettingsView {
             workspace,
             window,
             |this, workspace, event: &WorkspaceEvent, window, cx| {
-                let WorkspaceEvent::SessionChanged = event;
+                if !matches!(event, WorkspaceEvent::SessionChanged) {
+                    return;
+                }
                 let session = workspace.read(cx).session().cloned();
                 let graph = session.as_ref().map(|session| graph_scope(session, cx));
                 this.set_graph(graph, window, cx);

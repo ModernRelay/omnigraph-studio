@@ -253,6 +253,8 @@ const TOASTS_SHOWN: usize = 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceEvent {
     SessionChanged,
+    /// Another tab is active, or none is: what follows the active tab follows it (spec 020).
+    ActiveItemChanged,
 }
 
 /// An action handler a feature crate registered on the window, and when it is registered:
@@ -334,6 +336,12 @@ pub struct Workspace {
     /// Each dock panel's scrolling host, by the panel view's entity: the host is cached, so a
     /// panel is drawn again only when it notifies.
     dock_hosts: HashMap<EntityId, Entity<DockHost>>,
+    /// Each tab's inspector, by the tab's entity: the finished view, with its node or edge, its
+    /// values, its commit and its saving state, which come back with the tab (spec 020).
+    inspectors: HashMap<EntityId, AnyView>,
+    /// The tab what follows the active tab last followed.
+    followed_item: Option<EntityId>,
+    _follow_subscription: Subscription,
     toasts: Vec<Toast>,
     next_toast: usize,
     actions: Vec<ActionRegistration>,
@@ -413,6 +421,15 @@ pub fn traffic_light_position(glass: bool) -> Point<Pixels> {
     };
     point(gap + px(12.), gap + px(TRAFFIC_LIGHTS_TOP))
 }
+/// The inspector while the active tab has nothing selected.
+struct NothingSelected;
+
+impl Render for NothingSelected {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        studio_ui::ds::sidebar_note("Nothing selected")
+    }
+}
+
 /// A dock panel inside a scrolling host of its own. The host is what is cached (a cached view
 /// needs a definite size, which a panel measured by its content lacks), as Zed caches each dock
 /// and pane: a panel that notifies marks its host dirty and is drawn again; otherwise the frame
@@ -562,6 +579,9 @@ impl Workspace {
             press_on_tab: false,
             modal: None,
             dock_hosts: HashMap::new(),
+            inspectors: HashMap::new(),
+            followed_item: None,
+            _follow_subscription: cx.observe_self(|this, cx| this.follow_active_item(cx)),
             toasts: Vec::new(),
             next_toast: 0,
             actions: Vec::new(),
@@ -1056,6 +1076,7 @@ impl Workspace {
         let session = self.session.take()?;
         session.update(cx, |session, cx| session.set_shown(false, cx));
         // The inspector shows the graph's rows, and holds its session.
+        self.inspectors.clear();
         self.remove_panel(INSPECTOR_PANEL);
         self.zoomed = None;
         // A modal about this graph goes with it: a close asked about the graph, confirmed over
@@ -2056,6 +2077,7 @@ impl Workspace {
         let live: HashSet<EntityId> = [&self.left, &self.right, &self.bottom]
             .iter()
             .flat_map(|dock| dock.panels.iter().map(|panel| panel.view.entity_id()))
+            .chain(self.inspectors.values().map(|view| view.entity_id()))
             .collect();
         self.dock_hosts.retain(|id, _| live.contains(id));
     }
@@ -2138,8 +2160,65 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The inspector: the right dock's panel for the selected row or node. `None` removes it.
+    /// The inspector: the right dock's panel for what the active tab has selected. `None` removes
+    /// it. It stays that tab's, and comes back with it.
     pub fn set_inspector(&mut self, view: Option<AnyView>, cx: &mut Context<Self>) {
+        match self.active_item().map(|item| item.item_id()) {
+            Some(tab) => self.set_inspector_of(tab, view, cx),
+            None => self.show_inspector(view, cx),
+        }
+    }
+
+    /// [`Self::set_inspector`] for one tab, which may have stopped being the active one while
+    /// its selection was read: another tab's inspector stays shown.
+    pub fn set_inspector_of(
+        &mut self,
+        tab: EntityId,
+        view: Option<AnyView>,
+        cx: &mut Context<Self>,
+    ) {
+        match &view {
+            Some(view) => {
+                self.host_for(view, cx);
+                self.inspectors.insert(tab, view.clone());
+            }
+            None => {
+                self.inspectors.remove(&tab);
+            }
+        }
+        if self.active_item().map(|item| item.item_id()) == Some(tab) {
+            self.show_inspector(view, cx);
+        } else {
+            self.drop_stale_hosts();
+        }
+    }
+
+    /// Follows the active tab (spec 020): shows its inspector, or says nothing is selected where
+    /// an inspector was showing, and tells whoever else follows. Every change of the active tab
+    /// notifies the workspace, so this one place sees them all.
+    fn follow_active_item(&mut self, cx: &mut Context<Self>) {
+        let active = self.active_item().map(|item| item.item_id());
+        if active == self.followed_item {
+            return;
+        }
+        self.followed_item = active;
+        let open: HashSet<EntityId> = self
+            .panes
+            .iter()
+            .flat_map(|pane| pane.items.iter().map(|item| item.item_id()))
+            .collect();
+        self.inspectors.retain(|tab, _| open.contains(tab));
+        match active.and_then(|tab| self.inspectors.get(&tab).cloned()) {
+            Some(view) => self.show_inspector(Some(view), cx),
+            None if self.dock_of(INSPECTOR_PANEL).is_some() => {
+                self.show_inspector(Some(cx.new(|_| NothingSelected).into()), cx)
+            }
+            None => self.drop_stale_hosts(),
+        }
+        cx.emit(WorkspaceEvent::ActiveItemChanged);
+    }
+
+    fn show_inspector(&mut self, view: Option<AnyView>, cx: &mut Context<Self>) {
         match view {
             Some(view) => {
                 self.host_for(&view, cx);
@@ -6152,6 +6231,84 @@ mod tests {
         });
     }
 
+    /// Each tab keeps its own inspector, and whoever follows the active tab hears of the change.
+    #[gpui::test]
+    fn each_tab_keeps_its_inspector(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            cx.set_global(StudioSettings::default());
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let changes = Rc::new(std::cell::Cell::new(0));
+        let heard = changes.clone();
+        let _hearing = cx.update(|_, cx| {
+            cx.subscribe(&workspace, move |_, event: &WorkspaceEvent, _| {
+                if matches!(event, WorkspaceEvent::ActiveItemChanged) {
+                    heard.set(heard.get() + 1);
+                }
+            })
+        });
+        let shown = |workspace: &Workspace| {
+            workspace
+                .right
+                .panels
+                .iter()
+                .find(|panel| panel.id == INSPECTOR_PANEL)
+                .map(|panel| panel.view.entity_id())
+        };
+        let (first, second, first_peek, second_peek) =
+            workspace.update_in(cx, |workspace, window, cx| {
+                let first = workspace.add_item(window, cx, |_, cx| TabProbe {
+                    focus_handle: cx.focus_handle(),
+                    name: "first",
+                    reads: false,
+                });
+                let first_peek = cx.new(|_| Field);
+                workspace.set_inspector(Some(first_peek.clone().into()), cx);
+                let second = workspace.add_item(window, cx, |_, cx| TabProbe {
+                    focus_handle: cx.focus_handle(),
+                    name: "second",
+                    reads: false,
+                });
+                let second_peek = cx.new(|_| Field);
+                (first, second, first_peek, second_peek)
+            });
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, _| {
+            assert_ne!(
+                shown(workspace),
+                Some(first_peek.entity_id()),
+                "the new tab has nothing selected"
+            );
+            assert!(shown(workspace).is_some(), "and says so, in the same place");
+        });
+        let heard_so_far = changes.get();
+        assert!(heard_so_far > 0);
+        workspace.update_in(cx, |workspace, window, cx| {
+            // A selection read in the tab behind arrives while the other is active.
+            workspace.set_inspector_of(first.entity_id(), Some(first_peek.clone().into()), cx);
+            workspace.set_inspector(Some(second_peek.clone().into()), cx);
+            assert_eq!(shown(workspace), Some(second_peek.entity_id()));
+            workspace.activate_item_by_id(first.entity_id(), window, cx);
+        });
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, _| {
+            assert_eq!(shown(workspace), Some(first_peek.entity_id()));
+            assert!(
+                workspace.dock_hosts.contains_key(&second_peek.entity_id()),
+                "a remembered inspector keeps its host"
+            );
+        });
+        assert!(changes.get() > heard_so_far);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_item_by_id(second.entity_id(), window, cx);
+        });
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, _| {
+            assert_eq!(shown(workspace), Some(second_peek.entity_id()));
+        });
+    }
+
     /// The keyboard in an inspector another replaces is not left with no view to hear it: the
     /// active tab takes it, so the table's arrows and ⎋ work again.
     #[gpui::test]
@@ -6265,9 +6422,20 @@ mod tests {
         // A graph shown, for the pane's buttons.
         let session = idle_session("http://studio.test", "notes", cx);
         let (workspace, cx) = cx.add_window_view(Workspace::new);
-        let (fields, tab) = workspace.update_in(cx, |workspace, window, cx| {
+        let tab = workspace.update_in(cx, |workspace, window, cx| {
             workspace.graph_order.push(session.entity_id());
             workspace.subscribe_session(session.clone(), cx);
+            workspace.open_item("draft".to_owned(), window, cx, |_, cx| Unsaved {
+                focus_handle: cx.focus_handle(),
+            });
+            workspace
+                .pane(workspace.active_pane)
+                .and_then(|pane| pane.active_item())
+                .map(|item| item.focus_handle(cx))
+                .expect("the tab")
+        });
+        cx.run_until_parked();
+        let fields = workspace.update_in(cx, |workspace, _, cx| {
             let mut fields = Vec::new();
             for (position, id) in [
                 (PanelPosition::Right, "inspector"),
@@ -6281,15 +6449,7 @@ mod tests {
                 workspace.activate_panel(id, cx);
                 fields.push(field);
             }
-            workspace.open_item("draft".to_owned(), window, cx, |_, cx| Unsaved {
-                focus_handle: cx.focus_handle(),
-            });
-            let tab = workspace
-                .pane(workspace.active_pane)
-                .and_then(|pane| pane.active_item())
-                .map(|item| item.focus_handle(cx))
-                .expect("the tab");
-            (fields, tab)
+            fields
         });
         // Drawn, so the frame knows which panel holds each field.
         cx.run_until_parked();

@@ -206,7 +206,9 @@ impl RelationshipTree {
             workspace,
             window,
             |this, workspace, event: &WorkspaceEvent, window, cx| {
-                let WorkspaceEvent::SessionChanged = event;
+                if !matches!(event, WorkspaceEvent::SessionChanged) {
+                    return;
+                }
                 let open: HashSet<EntityId> = workspace
                     .read(cx)
                     .open_graphs()

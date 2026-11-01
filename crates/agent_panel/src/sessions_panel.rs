@@ -144,6 +144,7 @@ impl SessionsPanel {
                     &workspace,
                     |this, _, event: &WorkspaceEvent, cx| match event {
                         WorkspaceEvent::SessionChanged => this.rows_changed(cx),
+                        WorkspaceEvent::ActiveItemChanged => {}
                     },
                 ),
             );

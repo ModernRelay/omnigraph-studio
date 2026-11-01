@@ -54,6 +54,7 @@ impl ActivityLog {
                     WorkspaceEvent::SessionChanged => {
                         this.watch(workspace.read(cx).session().cloned(), cx);
                     }
+                    WorkspaceEvent::ActiveItemChanged => {}
                 },
             ));
         }

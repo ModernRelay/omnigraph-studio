@@ -139,6 +139,7 @@ impl QueriesPanel {
                         this.watch_session(session, cx);
                         this.owe_folder(cx);
                     }
+                    WorkspaceEvent::ActiveItemChanged => {}
                 },
             ));
         }

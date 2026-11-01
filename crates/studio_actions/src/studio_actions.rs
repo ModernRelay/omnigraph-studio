@@ -7,6 +7,18 @@
 //! arguments has a default binding in `assets/keymaps/`, except the few that are rare or
 //! destructive, as in Zed. The keymap test (`crates/studio/tests/keymaps.rs`) lists those.
 
+/// What a tab shows, in any of its views (spec 020): the answer to "what?", which the sidebar's
+/// rows are made of.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Thing {
+    /// The graph's schema, as a map or as source text.
+    Schema,
+    /// A node type or an edge type, by name.
+    Type(String),
+    /// One node.
+    Node { type_name: String, id: String },
+}
+
 pub mod workspace {
     use gpui::actions;
 
