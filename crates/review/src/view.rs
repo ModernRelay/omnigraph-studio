@@ -2,6 +2,7 @@
 //! entity, with fixes bound to the reviewed head and a merge that checks the head first.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,15 +23,20 @@ use graph_store::{
     AccessAction, AccessScope, ChangeFold, EntityGroup, EntityGroups, FoldedChange, FoldedChanges,
     ForkSearch, GraphSession, GroupRun, GroupSection, HeadWatch, MergeSent, MergeSettled,
     NodeNames, OutcomeEntry, OutcomeKind, REVIEW_CHANGE_CAP, SessionEvent, TypeCounts,
-    contains_merge_of, revert_query, summary_sentence,
+    contains_merge_of, entity_name, revert_query, summary_sentence,
 };
 use serde_json::Value;
 use studio_actions::review::{
     AcceptAndNext, EditChange, Merge, NextChange, PreviousChange, RevertAndNext, Summarize,
+    SwitchLayout, ToggleChange,
 };
 use studio_actions::workspace::Refresh;
+use studio_settings::{ReviewLayout, StudioSettings};
 use studio_ui::ds::{radii, space};
-use studio_ui::{ChangeCard, change_counts, group_digits, short_commit_id, type_swatch};
+use studio_ui::{
+    ChangeKind, RelationshipLine, TextFolds, change_counts, group_digits, short_commit_id,
+    type_swatch,
+};
 use studio_workspace::models::{Error as ModelError, Models, Request as ModelRequest};
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace, workspace_for};
 use ui::prelude::*;
@@ -451,14 +457,6 @@ fn revert_checks(
 
 /// Whether two schemas group and draw the cards alike: the same text, naming each type's nodes
 /// by the same property. A schema read again with the same text is the same one.
-fn same_schema(a: Option<&Arc<SchemaModel>>, b: Option<&Arc<SchemaModel>>) -> bool {
-    match (a, b) {
-        (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a.same_as(b),
-        (None, None) => true,
-        _ => false,
-    }
-}
-
 pub struct ReviewView {
     session: Entity<GraphSession>,
     branch: String,
@@ -494,6 +492,17 @@ pub struct ReviewView {
     summary: String,
     /// A model's summary of the branch (spec 019), kept until the head moves.
     ai_summary: SummaryState,
+    /// Runs folded to their header, by section, kind and type: a review is read by type, and
+    /// a type looked through is folded away.
+    collapsed_runs: HashSet<(GroupSection, bool, String)>,
+    /// Groups unfolded to their changes; the rest show one line each.
+    expanded: HashSet<usize>,
+    /// The feed of types, or the changes beside one record (spec 008).
+    layout: ReviewLayout,
+    /// Long texts shown whole, by group and property.
+    whole_texts: HashSet<(usize, SharedString)>,
+    /// What each run's feed row says beyond its counts, made with the rows.
+    run_facts: Vec<RunFacts>,
     /// Reviewed marks, by entity and what its change does ([`mark_of`]), kept across Refresh:
     /// an entity changed again since is reviewed again.
     reviewed_keys: HashSet<u64>,
@@ -672,6 +681,15 @@ impl ReviewView {
             bound_head: None,
             summary: String::new(),
             ai_summary: SummaryState::None,
+            collapsed_runs: HashSet::new(),
+            expanded: HashSet::new(),
+            layout: cx
+                .try_global::<StudioSettings>()
+                .map_or_else(ReviewLayout::default, |settings| {
+                    settings.studio.review_layout
+                }),
+            whole_texts: HashSet::new(),
+            run_facts: Vec::new(),
             reviewed_keys: HashSet::new(),
             merge: MergeState::Idle,
             logged_merge_held: false,
@@ -810,6 +828,10 @@ impl ReviewView {
         self._names_task = None;
         self.preview = Preview::Unread;
         self._preview_task = None;
+        // A read under way is the old token's: landing, it would show its cards.
+        self._load_task = None;
+        self._slow_task = None;
+        self.reading_slowly = false;
         self.owe_read(cx);
     }
 
@@ -833,7 +855,7 @@ impl ReviewView {
         let schema = self.session.read(cx).schema_model();
         let shows_head = self.shows_head();
         let Some(data) = &self.data else { return };
-        if same_schema(data.schema.as_ref(), schema.as_ref()) {
+        if SchemaModel::same_held(data.schema.as_ref(), schema.as_ref()) {
             // Grouped as the session's schema groups: a regroup under way is for one since gone.
             self._regroup_task = None;
             return;
@@ -1146,8 +1168,14 @@ impl ReviewView {
     fn select(&mut self, change: usize, cx: &mut Context<Self>) {
         if change < self.change_count() {
             self.selected = Some(change);
-            if let Some(row) = self.group_of(change).and_then(|g| self.row_of_group(g)) {
-                self.list_state.scroll_to_reveal_item(row);
+            if let Some(group) = self.group_of(change) {
+                // The feed unfolds what is selected, so J and K read change by change.
+                if self.layout == ReviewLayout::Feed {
+                    self.expanded.insert(group);
+                }
+                if let Some(row) = self.row_of_group(group) {
+                    self.list_state.scroll_to_reveal_item(row);
+                }
             }
             cx.notify();
         }
@@ -1237,6 +1265,21 @@ impl ReviewView {
     fn lay_out(&mut self) {
         let Some(data) = &self.data else { return };
         (self.rows, self.headers) = build_rows(data, self.searched.matched.as_deref());
+        self.run_facts = self
+            .headers
+            .iter()
+            .map(|run| run_facts(data, run))
+            .collect();
+        // A folded run keeps its header and hides its rows.
+        let mut hidden = false;
+        self.rows.retain(|row| match row {
+            Row::Header(ix) => {
+                let run = &self.headers[*ix];
+                hidden = self.collapsed_runs.contains(&run_key(run, data));
+                true
+            }
+            Row::Entity(_) => !hidden,
+        });
         self.list_state.reset(self.rows.len());
         let visible = self.visible_groups();
         let shown = self
@@ -1244,10 +1287,50 @@ impl ReviewView {
             .and_then(|s| data.groups.home.get(s))
             .is_some_and(|g| visible.contains(g));
         if !shown {
-            self.selected = visible
-                .first()
-                .and_then(|&group| data.groups.groups[group].primary());
+            let first = visible.first().copied();
+            self.selected = first.and_then(|group| data.groups.groups[group].primary());
+            // The feed opens with its first change unfolded.
+            if let (ReviewLayout::Feed, Some(group)) = (self.layout, first) {
+                self.expanded.insert(group);
+            }
         }
+    }
+
+    /// Folds a run to its header, or unfolds it.
+    fn toggle_run(&mut self, key: (GroupSection, bool, String), cx: &mut Context<Self>) {
+        if !self.collapsed_runs.remove(&key) {
+            self.collapsed_runs.insert(key);
+        }
+        self.lay_out_in_place();
+        cx.notify();
+    }
+
+    /// Space: the selected change's row unfolds, or folds back.
+    fn toggle_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(data) = &self.data else {
+            return;
+        };
+        if let Some(group) = self.selected.and_then(|s| data.groups.home.get(s).copied()) {
+            self.toggle_expanded(group, cx);
+        }
+    }
+
+    /// A click on a group's row: selects it, which unfolds it, or folds it when it was open.
+    fn click_group(&mut self, group: usize, cx: &mut Context<Self>) {
+        // Selecting unfolds the row (`select`), so only an open row is folded.
+        let open = self.expanded.contains(&group);
+        self.select_group(group, cx);
+        if open {
+            self.toggle_expanded(group, cx);
+        }
+    }
+
+    /// Unfolds a group's row to its changes, or folds it to its line.
+    fn toggle_expanded(&mut self, group: usize, cx: &mut Context<Self>) {
+        if !self.expanded.remove(&group) {
+            self.expanded.insert(group);
+        }
+        cx.notify();
     }
 
     /// [`Self::lay_out`] for the same changes grouped again, keeping the place the person
@@ -1819,7 +1902,7 @@ impl ReviewView {
                 }
             }
             WriteOutcome::Refused(error) if error.status == 412 => FixState::Moved,
-            WriteOutcome::Refused(error) => FixState::Refused(error.body.error),
+            WriteOutcome::Refused(error) => FixState::Refused(error.reason().to_owned()),
             WriteOutcome::NotSent { reason } => FixState::NotSent(reason),
             WriteOutcome::Unknown { .. } => FixState::Unknown,
         };
@@ -2144,9 +2227,9 @@ impl ReviewView {
                         deleted,
                     }
                 }
-                WriteOutcome::Refused(error) => match error.body.merge_conflicts {
+                WriteOutcome::Refused(mut error) => match error.body.merge_conflicts.take() {
                     Some(conflicts) if !conflicts.is_empty() => MergeState::Conflicts(conflicts),
-                    _ => MergeState::Refused(error.body.error),
+                    _ => MergeState::Refused(error.reason().to_owned()),
                 },
                 WriteOutcome::NotSent { reason } => MergeState::NotSent(reason),
                 WriteOutcome::Unknown { reason } => {
@@ -2227,197 +2310,31 @@ impl ReviewView {
     // ---- rendering ----
 
     fn render_header(&self, cx: &mut Context<Self>) -> AnyElement {
-        let border = studio_ui::ds::surface::rule(cx);
         let focus = self.focus_handle.clone();
-        let mergeable = self.mergeable(cx);
-        let merge_refused = self.merge_refusal(cx);
-        let delete_refused = self.delete_refusal(cx);
-        let merge_button = studio_ui::ds::button(
-            "merge",
-            format!("Merge {} into {}", self.branch, self.target),
-        )
-        .style(ButtonStyle::Filled)
-        .start_icon(Icon::new(IconName::GitBranch))
-        // A key the credential may not use is not shown, as it is not registered.
-        .when(merge_refused.is_none(), |button| {
-            button.key_binding(KeyBinding::for_action_in(&Merge, &focus, cx))
-        })
-        .disabled(!mergeable || merge_refused.is_some())
-        .tooltip({
-            let cli = format!(
-                "omnigraph branch merge {} --into {}{}",
-                self.branch,
-                self.target,
-                if self.delete_after_merge(cx) {
-                    " --delete-branch"
-                } else {
-                    ""
-                }
-            );
-            // A disabled Merge says why (constitution VI).
-            let title = merge_refused
-                .clone()
-                .or_else(|| self.merge_blocked(cx))
-                .unwrap_or_else(|| "Merge after checking the branch has not moved".to_owned());
-            move |_, cx| Tooltip::with_meta(title.clone(), None, cli.clone(), cx)
-        })
-        .on_click(cx.listener(|this, _, _, cx| this.merge(cx)));
-        let refresh = studio_ui::ds::icon_button("refresh", IconName::RotateCw)
-            .tooltip(refresh_tooltip(
-                "Read the branch and its target again",
-                &self.focus_handle,
-            ))
-            .on_click(cx.listener(|this, _, _, cx| this.reload(cx)));
-
-        let (sentence, detail) = match (&self.load, &self.data) {
-            (LoadState::Ready, Some(data)) => {
-                let sentence = self.summary.clone();
-                let detail = match (&data.fork, &data.head) {
-                    (Some(fork), Some(head)) if data.merged_in => format!(
-                        "Since {} was last merged in at {} · head {}",
-                        self.target,
-                        short_commit_id(fork),
-                        short_commit_id(head)
-                    ),
-                    (Some(fork), Some(head)) => format!(
-                        "Forked from {} at {} · head {}",
-                        self.target,
-                        short_commit_id(fork),
-                        short_commit_id(head)
-                    ),
-                    (None, _) => format!("{} shares no history with {}", self.branch, self.target),
-                    _ => String::new(),
-                };
-                // What a merge would do now, by the dry run read with the review; conflicts
-                // show in the banner instead.
-                let preview = match &self.preview {
-                    Preview::Reading => " · checking the merge…".to_owned(),
-                    Preview::Merges(BranchMergeOutcome::FastForward) => {
-                        " · merges cleanly as a fast-forward".to_owned()
-                    }
-                    Preview::Merges(BranchMergeOutcome::AlreadyUpToDate) => {
-                        format!(" · {} already has every change", self.target)
-                    }
-                    Preview::Merges(_) => " · merges cleanly".to_owned(),
-                    Preview::Unread | Preview::Conflicts(_) => String::new(),
-                };
-                let detail = if detail.is_empty() {
-                    detail
-                } else {
-                    format!("{detail}{preview}")
-                };
-                (sentence, detail)
-            }
-            (LoadState::Loading { folded }, _) => (
-                if *folded == 0 {
+        let sentence = match (&self.load, &self.data) {
+            (LoadState::Ready, Some(_)) => self.summary.clone(),
+            (LoadState::Loading { folded }, _) => {
+                let mut text = if *folded == 0 {
                     format!("Reading what {} changed…", self.branch)
                 } else {
                     format!(
                         "Reading what {} changed… {folded} changes so far",
                         self.branch
                     )
-                },
+                };
                 if self.reading_slowly {
-                    "On a large graph this can take a few minutes.".to_owned()
-                } else {
-                    String::new()
-                },
-            ),
-            (LoadState::Failed(error), _) => (
-                format!("The review could not be read: {error}"),
-                String::new(),
-            ),
-            _ => (String::new(), String::new()),
+                    text.push_str(" On a large graph this can take a few minutes.");
+                }
+                text
+            }
+            (LoadState::Failed(error), _) => {
+                format!("The review could not be read: {error}")
+            }
+            _ => String::new(),
         };
 
-        let counts = self.data.as_ref().map(|data| {
-            h_flex()
-                .flex_wrap()
-                .gap_x(px(space::XL))
-                .gap_y(px(space::XS))
-                .children(data.counts.iter().map(|count| {
-                    h_flex()
-                        .gap(px(space::SM))
-                        .child(studio_ui::kind_swatch(&count.type_name, count.is_edge, cx))
-                        .child(studio_ui::ds::text::body(count.type_name.clone()))
-                        .child(change_counts(count.added, count.changed, count.removed))
-                }))
-        });
-
-        let mut banners: Vec<AnyElement> = Vec::new();
-        if self.data.as_ref().is_some_and(|data| data.partial) {
-            let text = format!(
-                "Partial: showing the first {} changes, the most a review holds.",
-                group_digits(REVIEW_CHANGE_CAP)
-            );
-            banners.push(
-                studio_ui::ds::banner(Severity::Warning)
-                    .child(studio_ui::ds::text::body(text))
-                    .into_any_element(),
-            );
-        }
-        if let Some(note) = self
-            .data
-            .as_ref()
-            .and_then(|data| capped_commits_note(data, &self.branch, &self.target))
-        {
-            banners.push(
-                studio_ui::ds::banner(Severity::Info)
-                    .child(studio_ui::ds::text::body(note))
-                    .into_any_element(),
-            );
-        }
-        // Only over cards read: without them there is nothing the fixes moved past.
-        let own_head = self
-            .bound_head
-            .as_ref()
-            .filter(|_| self.data.is_some())
-            .filter(|head| Some(*head) != self.reviewed_head().as_ref());
-        if let (Some(head), false) = (own_head, self.newer) {
-            banners.push(
-                studio_ui::ds::banner(Severity::Info)
-                    .child(
-                        studio_ui::ds::text::body(format!(
-                            "Your fixes moved {} to {}. Cards show the review as read; merging uses the new head.",
-                            self.branch,
-                            short_commit_id(head)
-                        )),
-                    )
-                    .action_slot(
-                        studio_ui::ds::button("refresh-own", "Refresh")
-                            .tooltip(refresh_tooltip(
-                                "Read the review again at the branch's head",
-                                &self.focus_handle,
-                            ))
-                            .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
-                    )
-                    .into_any_element(),
-            );
-        }
-        if self.newer && !matches!(self.merge, MergeState::Moved { .. }) {
-            banners.push(
-                studio_ui::ds::banner(Severity::Info)
-                    .child(studio_ui::ds::text::body(format!(
-                        "Newer data: {} changed after this review was read.",
-                        self.branch
-                    )))
-                    .action_slot(
-                        studio_ui::ds::button("refresh-newer", "Refresh")
-                            .tooltip(refresh_tooltip(
-                                "Read the review again at the branch's head",
-                                &self.focus_handle,
-                            ))
-                            .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
-                    )
-                    .into_any_element(),
-            );
-        }
-        if let Some(banner) = self.render_merge_banner(cx) {
-            banners.push(banner);
-        }
-
         // What is reviewed (everything since the fork, or one commit) and a search over the
-        // cards.
+        // changes.
         let scope_label = match &self.scope {
             None => "Since the fork".to_owned(),
             Some(id) => format!("Commit {}", short_commit_id(id)),
@@ -2438,68 +2355,305 @@ impl ReviewView {
             });
         let search =
             studio_ui::ds::search_field(self.search.clone(), cx).w(px(studio_ui::ds::size::FIELD));
+        let layout = self.layout;
+        let segment =
+            |id: &'static str, label: &'static str, this: ReviewLayout, tip: &'static str| {
+                let focus = focus.clone();
+                studio_ui::ds::segment(id, label, layout == this, cx)
+                    .tooltip(move |_, cx| Tooltip::for_action_in(tip, &SwitchLayout, &focus, cx))
+                    .on_click(cx.listener(move |view, _, _, cx| view.set_layout(this, cx)))
+            };
+        let layouts = studio_ui::ds::segmented(cx)
+            .child(segment(
+                "layout-feed",
+                "Feed",
+                ReviewLayout::Feed,
+                "One row per type changed, its entities under it",
+            ))
+            .child(segment(
+                "layout-split",
+                "Split",
+                ReviewLayout::Split,
+                "The changes listed beside one record at a time",
+            ));
+        let ready = self.data.is_some() && matches!(self.load, LoadState::Ready);
+
+        // The facts under the heading, as the commit view's: what changed, then where the
+        // branch forked from its target.
+        let mut facts: Vec<AnyElement> = Vec::new();
+        if !sentence.is_empty() {
+            facts.push(studio_ui::ds::text::meta(sentence).into_any_element());
+        }
+        if let Some(data) = self.data.as_ref().filter(|_| ready) {
+            match (&data.fork, &data.head) {
+                (Some(fork), Some(_)) => {
+                    let fork_tooltip = if data.merged_in {
+                        format!("Since {} was last merged in at {fork}", self.target)
+                    } else {
+                        format!("Forked from {} at {fork}", self.target)
+                    };
+                    facts.push(
+                        div()
+                            .id("review-fork")
+                            .tooltip(Tooltip::text(fork_tooltip))
+                            .child(studio_ui::ds::meta_code(
+                                IconName::GitBranch,
+                                format!("{} at {}", self.target, short_commit_id(fork)),
+                                cx,
+                            ))
+                            .into_any_element(),
+                    );
+                }
+                (None, _) => facts.push(
+                    studio_ui::ds::text::meta(format!("shares no history with {}", self.target))
+                        .into_any_element(),
+                ),
+                _ => {}
+            }
+        }
 
         v_flex()
             .flex_none()
-            .px(px(space::XL))
-            .pt(px(space::LG))
-            .pb(px(space::MD))
-            .gap(px(space::MD))
             .border_b_1()
-            .border_color(border)
+            .border_color(studio_ui::ds::surface::rule(cx))
             .child(
-                h_flex()
-                    .gap(px(space::MD))
-                    .child(studio_ui::ds::icon::lead(IconName::GitBranch))
-                    .child(studio_ui::ds::text::title(format!(
+                v_flex()
+                    .px(px(space::EDGE))
+                    .py(px(space::LG))
+                    .gap(px(space::SM))
+                    .child(
+                        h_flex()
+                            .gap(px(space::INLINE))
+                            .items_center()
+                            .child(studio_ui::ds::icon::meta(IconName::GitBranch))
+                            .child(studio_ui::ds::text::meta("Review"))
+                            .child(div().flex_1())
+                            .child(
+                                h_flex()
+                                    .gap(px(space::CONTROLS))
+                                    .items_center()
+                                    .child(search)
+                                    .child(scope_menu)
+                                    .when(ready, |row| row.child(self.render_summarize_button(cx)))
+                                    .child(layouts),
+                            ),
+                    )
+                    .child(studio_ui::ds::text::heading(format!(
                         "{} → {}",
                         self.branch, self.target
                     )))
-                    .child(div().flex_1())
-                    .child(refresh)
-                    .when(self.branch != "main", |row| {
-                        // A branch the credential may not delete stays, unchecked, saying why.
-                        let deletable = mergeable && delete_refused.is_none();
-                        row.child(
-                            studio_ui::ds::checkbox(
-                                "delete-after-merge",
-                                self.delete_branch && delete_refused.is_none(),
-                                format!("Delete {}", self.branch),
-                                !deletable,
-                                cx,
-                            )
-                            .when_some(delete_refused, |checkbox, reason| {
-                                checkbox.tooltip(Tooltip::text(reason))
-                            })
-                            .when(deletable, |checkbox| {
-                                checkbox.on_click(cx.listener(|this, _, _, cx| {
-                                    this.delete_branch = !this.delete_branch;
-                                    cx.notify();
-                                }))
-                            }),
-                        )
-                    })
-                    .child(merge_button),
+                    .when(!facts.is_empty(), |header| {
+                        header.child(studio_ui::ds::meta_row(facts).flex_wrap())
+                    }),
             )
-            .child(h_flex().gap(px(space::MD)).child(scope_menu).child(search))
-            .child(
-                h_flex()
-                    .gap(px(space::MD))
-                    .items_center()
-                    .child(studio_ui::ds::text::plain(sentence))
-                    .child(div().flex_1())
-                    .when(
-                        self.data.is_some() && matches!(self.load, LoadState::Ready),
-                        |row| row.child(self.render_summarize_button(cx)),
-                    ),
-            )
-            .when(!detail.is_empty(), |d| {
-                d.child(studio_ui::ds::text::muted(detail))
-            })
             .children(self.render_ai_summary(cx))
-            .children(counts)
-            .children(banners)
+            .children(self.render_notices(cx))
             .into_any_element()
+    }
+
+    /// What qualifies the review, as strips under the header: a partial read, a cap on the
+    /// commits, heads that moved, and what the merge did or would do.
+    fn render_notices(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut notices: Vec<AnyElement> = Vec::new();
+        if self.data.as_ref().is_some_and(|data| data.partial) {
+            notices.push(notice(
+                Severity::Warning,
+                format!(
+                    "Partial: showing the first {} changes, the most a review holds.",
+                    group_digits(REVIEW_CHANGE_CAP)
+                ),
+                None,
+            ));
+        }
+        if let Some(note) = self
+            .data
+            .as_ref()
+            .and_then(|data| capped_commits_note(data, &self.branch, &self.target))
+        {
+            notices.push(notice(Severity::Info, note, None));
+        }
+        let refresh = |id: &'static str, cx: &mut Context<Self>| {
+            studio_ui::ds::button(id, "Refresh")
+                .tooltip(refresh_tooltip(
+                    "Read the review again at the branch's head",
+                    &self.focus_handle,
+                ))
+                .on_click(cx.listener(|this, _, _, cx| this.reload(cx)))
+                .into_any_element()
+        };
+        // Only over cards read: without them there is nothing the fixes moved past.
+        let own_head = self
+            .bound_head
+            .as_ref()
+            .filter(|_| self.data.is_some())
+            .filter(|head| Some(*head) != self.reviewed_head().as_ref());
+        if let (Some(head), false) = (own_head, self.newer) {
+            notices.push(notice(
+                Severity::Info,
+                format!(
+                    "Your fixes moved {} to {}. The changes show the review as read; merging uses the new head.",
+                    self.branch,
+                    short_commit_id(head)
+                ),
+                Some(refresh("refresh-own", cx)),
+            ));
+        }
+        if self.newer && !matches!(self.merge, MergeState::Moved { .. }) {
+            notices.push(notice(
+                Severity::Info,
+                format!(
+                    "Newer data: {} changed after this review was read.",
+                    self.branch
+                ),
+                Some(refresh("refresh-newer", cx)),
+            ));
+        }
+        if let Some(banner) = self.render_merge_banner(cx) {
+            notices.push(banner);
+        }
+        notices
+    }
+
+    /// Under the changes, the merge: what it would do now, by the dry run read with the
+    /// review, whether it deletes the branch, and the button.
+    fn render_footer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.data.is_none() || !matches!(self.load, LoadState::Ready) {
+            return None;
+        }
+        let focus = self.focus_handle.clone();
+        let mergeable = self.mergeable(cx);
+        let merge_refused = self.merge_refusal(cx);
+        let merge_button = studio_ui::ds::button("merge", format!("Merge into {}", self.target))
+            .style(ButtonStyle::Filled)
+            // A key the credential may not use is not shown, as it is not registered.
+            .when(merge_refused.is_none(), |button| {
+                button.key_binding(KeyBinding::for_action_in(&Merge, &focus, cx))
+            })
+            .disabled(!mergeable || merge_refused.is_some())
+            .tooltip({
+                let cli = format!(
+                    "omnigraph branch merge {} --into {}{}",
+                    self.branch,
+                    self.target,
+                    if self.delete_after_merge(cx) {
+                        " --delete-branch"
+                    } else {
+                        ""
+                    }
+                );
+                // A disabled Merge says why (constitution VI).
+                let title = merge_refused
+                    .clone()
+                    .or_else(|| self.merge_blocked(cx))
+                    .unwrap_or_else(|| "Merge after checking the branch has not moved".to_owned());
+                move |_, cx| Tooltip::with_meta(title.clone(), None, cli.clone(), cx)
+            })
+            .on_click(cx.listener(|this, _, _, cx| this.merge(cx)));
+
+        let mark = |name: IconName, color: Color| {
+            studio_ui::ds::icon::meta(name)
+                .color(color)
+                .into_any_element()
+        };
+        let (status, icon): (String, Option<AnyElement>) = match &self.preview {
+            Preview::Reading => (
+                "Checking the merge…".to_owned(),
+                Some(studio_ui::ds::spinner().into_any_element()),
+            ),
+            Preview::Merges(BranchMergeOutcome::FastForward) => (
+                format!("Merges cleanly into {} as a fast-forward", self.target),
+                Some(mark(IconName::Check, Color::Success)),
+            ),
+            Preview::Merges(BranchMergeOutcome::AlreadyUpToDate) => (
+                format!("Already merged into {}", self.target),
+                Some(mark(IconName::Check, Color::Muted)),
+            ),
+            Preview::Merges(_) => (
+                format!("Merges cleanly into {}", self.target),
+                Some(mark(IconName::Check, Color::Success)),
+            ),
+            Preview::Conflicts(conflicts) => (
+                format!(
+                    "{} stop a merge into {}. Fix each on the branch, then merge.",
+                    studio_ui::plural(conflicts.len(), "conflict", "conflicts"),
+                    self.target
+                ),
+                Some(mark(IconName::Warning, Color::Warning)),
+            ),
+            Preview::Unread => (String::new(), None),
+        };
+        let show_conflicts = matches!(self.preview, Preview::Conflicts(_)).then(|| {
+            studio_ui::ds::button(
+                "toggle-preview-conflicts",
+                if self.show_conflicts {
+                    "Show changes"
+                } else {
+                    "Show conflicts"
+                },
+            )
+            .style(ButtonStyle::Outlined)
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_conflicts(cx)))
+        });
+        let delete_refused = self.delete_refusal(cx);
+        Some(
+            h_flex()
+                .flex_none()
+                .px(px(space::EDGE))
+                .py(px(space::LG))
+                .gap(px(space::CONTROLS))
+                .items_center()
+                .border_t_1()
+                .border_color(studio_ui::ds::surface::rule(cx))
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap(px(space::INLINE))
+                        .items_center()
+                        .children(icon)
+                        .when(!status.is_empty(), |row| {
+                            row.child(div().min_w_0().child(studio_ui::ds::text::body(status)))
+                        }),
+                )
+                .children(show_conflicts)
+                .when(self.branch != "main", |row| {
+                    // A branch the credential may not delete stays, unchecked, saying why.
+                    let deletable = mergeable && delete_refused.is_none();
+                    row.child(
+                        studio_ui::ds::checkbox(
+                            "delete-after-merge",
+                            self.delete_branch && delete_refused.is_none(),
+                            "Delete the branch after merging",
+                            !deletable,
+                            cx,
+                        )
+                        .when_some(delete_refused, |checkbox, reason| {
+                            checkbox.tooltip(Tooltip::text(reason))
+                        })
+                        .when(deletable, |checkbox| {
+                            checkbox.on_click(cx.listener(|this, _, _, cx| {
+                                this.delete_branch = !this.delete_branch;
+                                cx.notify();
+                            }))
+                        }),
+                    )
+                })
+                .child(merge_button)
+                .into_any_element(),
+        )
+    }
+
+    /// Switches between the feed and one record at a time, and remembers it.
+    fn set_layout(&mut self, layout: ReviewLayout, cx: &mut Context<Self>) {
+        if self.layout == layout {
+            return;
+        }
+        self.layout = layout;
+        if cx.has_global::<StudioSettings>() {
+            studio_settings::update(cx, |settings| settings.studio.review_layout = layout);
+        }
+        self.lay_out_in_place();
+        cx.notify();
     }
 
     // ---- a model's summary (spec 019) ----
@@ -2639,30 +2793,7 @@ impl ReviewView {
 
     fn render_merge_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (severity, text, action): (Severity, String, Option<AnyElement>) = match &self.merge {
-            MergeState::Idle => match &self.preview {
-                Preview::Conflicts(conflicts) => (
-                    Severity::Warning,
-                    format!(
-                        "{} would stop a merge into {} now. {}",
-                        studio_ui::plural(conflicts.len(), "conflict", "conflicts"),
-                        self.target,
-                        resolution_hint(&self.branch, &self.target)
-                    ),
-                    Some(
-                        studio_ui::ds::button(
-                            "toggle-preview-conflicts",
-                            if self.show_conflicts {
-                                "Show changes"
-                            } else {
-                                "Show conflicts"
-                            },
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_conflicts(cx)))
-                        .into_any_element(),
-                    ),
-                ),
-                _ => return None,
-            },
+            MergeState::Idle => return None,
             MergeState::Checking => (
                 Severity::Info,
                 format!("Checking that {} has not moved…", self.branch),
@@ -2796,13 +2927,7 @@ impl ReviewView {
                 None,
             ),
         };
-        let mut banner = studio_ui::ds::banner(severity)
-            .wrap_content(true)
-            .child(studio_ui::ds::text::body(text));
-        if let Some(action) = action {
-            banner = banner.action_slot(action);
-        }
-        Some(banner.into_any_element())
+        Some(notice(severity, text, action))
     }
 
     fn render_conflicts(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2890,155 +3015,479 @@ impl ReviewView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(data) = &self.data else {
+        if self.data.is_none() {
+            return div().into_any_element();
+        }
+        let Some(kind) = self.rows.get(row).copied() else {
             return div().into_any_element();
         };
-        match self.rows.get(row).copied() {
-            Some(Row::Header(ix)) => div()
-                .px(px(space::XL))
-                .child(change_cards::run_header(
-                    &self.headers[ix],
-                    |section| match section {
-                        GroupSection::Existing => format!("Changes to what {} has", self.target),
-                        GroupSection::Added => format!("Added on {}", self.branch),
-                    },
-                    cx,
-                ))
-                .into_any_element(),
-            Some(Row::Entity(group)) => {
-                // The schema the groups were made with, which the cards' rows agree with.
-                let card = self.entity_card(data, group, data.schema.as_deref(), cx);
-                div()
-                    .px(px(space::XL))
-                    .py(px(space::XS))
-                    .child(card)
-                    .into_any_element()
+        match (self.layout, kind) {
+            (ReviewLayout::Feed, Row::Header(ix)) => self.feed_section_row(ix, cx),
+            (ReviewLayout::Feed, Row::Entity(group)) => {
+                let first = row == 0 || matches!(self.rows[row - 1], Row::Header(_));
+                let last = self
+                    .rows
+                    .get(row + 1)
+                    .is_none_or(|next| matches!(next, Row::Header(_)));
+                self.feed_entity_row(group, first, last, cx)
             }
-            None => div().into_any_element(),
+            (ReviewLayout::Split, Row::Header(ix)) => self.split_group_row(ix, cx),
+            (ReviewLayout::Split, Row::Entity(group)) => self.split_item_row(group, cx),
         }
     }
 
-    /// One entity's card: its own change, with Mark reviewed, Edit and Revert, then each
-    /// relationship change reviewed on it, each with its own Revert, then the relationships
-    /// reviewed on another card that it is an end of.
-    fn entity_card(
+    /// The section a run opens, in the view's words, above the run's row.
+    fn section_title(&self, run: &GroupRun) -> Option<String> {
+        run.section.map(|section| match section {
+            GroupSection::Existing => format!("Changes to what {} has", self.target),
+            GroupSection::Added => "Added on the branch".to_owned(),
+        })
+    }
+
+    /// The feed's row for a run of one type: a status dot, "1 changed in Task", the properties
+    /// its changes touched, and when; it folds the run's entities away and back.
+    fn feed_section_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(data) = &self.data else {
+            return div().into_any_element();
+        };
+        let run = &self.headers[ix];
+        let key = run_key(run, data);
+        let folded = self.collapsed_runs.contains(&key);
+        let facts = self.run_facts.get(ix).cloned().unwrap_or_default();
+        let (counts, joiner) = run_sentence(run);
+        let color = if run.changed > 0 {
+            Color::Modified
+        } else if run.removed > 0 {
+            Color::Deleted
+        } else if run.added > 0 {
+            Color::Created
+        } else {
+            Color::Muted
+        };
+        // One entity's row under the run says the same: the detail is the many's.
+        let detail = if run.groups.len() < 2 {
+            String::new()
+        } else if !facts.properties.is_empty() {
+            facts.properties.clone()
+        } else if run.relationships > 0 {
+            format!(
+                "with {}",
+                studio_ui::plural(run.relationships, "relationship", "relationships")
+            )
+        } else {
+            String::new()
+        };
+        let when = facts.latest.map(|at| {
+            let ago = studio_ui::relative_time(at, studio_ui::now_micros());
+            if facts.commits > 1 {
+                format!(
+                    "{} · {ago}",
+                    studio_ui::plural(facts.commits, "commit", "commits")
+                )
+            } else {
+                ago
+            }
+        });
+        let hover = studio_ui::ds::surface::hover(cx);
+        v_flex()
+            .children(self.section_title(run).map(|title| {
+                div()
+                    .px(px(space::EDGE))
+                    .pt(px(space::LG))
+                    .pb(px(space::XS))
+                    .child(studio_ui::ds::text::meta(title))
+            }))
+            .child(
+                h_flex()
+                    .id(("run", ix))
+                    .h(px(studio_ui::ds::size::FEED_ROW))
+                    .px(px(space::XL))
+                    .gap(px(space::MD))
+                    .items_center()
+                    .cursor_pointer()
+                    .when(folded, |row| {
+                        row.border_b_1()
+                            .border_color(studio_ui::ds::surface::rule(cx))
+                    })
+                    .hover(move |style| style.bg(hover))
+                    .child(studio_ui::ds::dot(color))
+                    .child(studio_ui::ds::icon::meta(if folded {
+                        IconName::ChevronRight
+                    } else {
+                        IconName::ChevronDown
+                    }))
+                    .child(studio_ui::ds::text::body(counts))
+                    .child(studio_ui::ds::text::muted(joiner))
+                    .child(studio_ui::kind_swatch(&run.type_name, run.is_edge, cx))
+                    .child(studio_ui::ds::text::body(run.type_name.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(studio_ui::ds::text::muted(detail).single_line().truncate()),
+                    )
+                    .children(when.map(studio_ui::ds::text::meta))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_run(key.clone(), cx))),
+            )
+            .into_any_element()
+    }
+
+    /// What a group's row names: what happened to its entity, the entity's name (a
+    /// relationship's ends), and its id when the name is not it.
+    fn group_identity(
         &self,
         data: &ReviewData,
-        ix: usize,
-        schema: Option<&SchemaModel>,
-        cx: &mut Context<Self>,
-    ) -> ChangeCard {
-        let group = &data.groups.groups[ix];
-        let focus = self.focus_handle.clone();
-        let selected_group = self.selected.and_then(|s| data.groups.home.get(s).copied());
-        let unreviewed = self.group_unreviewed(group);
-        let total = usize::from(group.change.is_some()) + group.relationships.len();
-        let reviewed = unreviewed == 0;
+        group: usize,
+    ) -> (ChangeKind, String, Option<String>) {
+        let g = &data.groups.groups[group];
+        match g.change {
+            Some(own) => {
+                let change = &data.folded.changes[own];
+                let kind = change_cards::kind_of_change(change);
+                if change.is_edge() {
+                    return match change.endpoints() {
+                        Some((from, to)) => (kind, format!("{from} → {to}"), None),
+                        None => (kind, change.id.clone(), None),
+                    };
+                }
+                match entity_name(change, data.schema.as_deref()) {
+                    Some(name) => (kind, name, Some(change.id.clone())),
+                    None => (kind, change.id.clone(), None),
+                }
+            }
+            None => match self.names.get(&(g.type_name.clone(), g.id.clone())) {
+                Some(name) => (ChangeKind::Unchanged, name.clone(), Some(g.id.clone())),
+                None => (ChangeKind::Unchanged, g.id.clone(), None),
+            },
+        }
+    }
 
-        let mut card = change_cards::entity_card(
-            &data.groups,
-            &data.folded,
-            ix,
-            schema,
-            &self.names,
-            &data.card_rows,
-            ("change", ix),
-        )
-        .selected(selected_group == Some(ix))
-        .hollow(reviewed);
-        if let Some((text, color)) = group
-            .change
-            .and_then(|own| fix_status(&self.cards[own].fix))
-        {
-            card = card.status(text, color);
-        } else if !reviewed && unreviewed < total {
-            card = card.status(
+    /// What a group's row says of its review: a fix's state, how many of its changes are not
+    /// reviewed, or that it is.
+    fn group_status(&self, data: &ReviewData, group: usize) -> Option<(String, Color)> {
+        let g = &data.groups.groups[group];
+        let unreviewed = self.group_unreviewed(g);
+        let total = usize::from(g.change.is_some()) + g.relationships.len();
+        if let Some(status) = g.change.and_then(|own| fix_status(&self.cards[own].fix)) {
+            Some(status)
+        } else if unreviewed == 0 {
+            Some(("Reviewed".to_owned(), Color::Muted))
+        } else if unreviewed < total {
+            Some((
                 format!("{unreviewed} of {total} not reviewed"),
                 Color::Muted,
-            );
+            ))
+        } else {
+            None
         }
+    }
 
-        let review_button = studio_ui::ds::row_button(
-            ("reviewed", ix),
-            if reviewed {
-                "Reviewed"
+    fn selected_group(&self, data: &ReviewData) -> Option<usize> {
+        self.selected.and_then(|s| data.groups.home.get(s).copied())
+    }
+
+    /// One entity's row in the feed's table under its type: a chevron, its name, what changed
+    /// in a few words, its state and its id; unfolded, what changed in full. The table is
+    /// drawn row by row: the first and last rows carry its rounded ends.
+    fn feed_entity_row(
+        &self,
+        group: usize,
+        first: bool,
+        last: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(data) = &self.data else {
+            return div().into_any_element();
+        };
+        let selected = self.selected_group(data) == Some(group);
+        let open = self.expanded.contains(&group);
+        let reviewed = self.group_unreviewed(&data.groups.groups[group]) == 0;
+        let (kind, name, id) = self.group_identity(data, group);
+        let status = self.group_status(data, group);
+        let summary = group_summary(data, &data.groups.groups[group]);
+        let radius = studio_ui::ds::radius::flush(radii(cx).md);
+        let hover = studio_ui::ds::surface::hover(cx);
+        let head = h_flex()
+            .id(("change-head", group))
+            .min_h(px(studio_ui::ds::size::HEADER))
+            .px(px(space::LG))
+            .gap(px(space::MD))
+            .items_center()
+            .cursor_pointer()
+            .when(first, |head| head.rounded_t(px(radius)))
+            .when(last && !open, |head| head.rounded_b(px(radius)))
+            .when(selected, |head| {
+                head.bg(studio_ui::ds::surface::selected_document(cx))
+            })
+            .when(!selected, |head| head.hover(move |style| style.bg(hover)))
+            .when(reviewed, |head| {
+                head.opacity(studio_ui::ds::opacity::DIMMED)
+            })
+            .child(studio_ui::ds::icon::meta(if open {
+                IconName::ChevronDown
             } else {
-                "Mark reviewed"
-            },
-        )
-        .style(ButtonStyle::Subtle)
-        .toggle_state(reviewed)
-        .when(reviewed, |b| b.start_icon(Icon::new(IconName::Check)))
-        .tooltip({
-            let focus = focus.clone();
-            move |_, cx| {
-                Tooltip::for_action_in(
-                    "Mark this card reviewed and go to the next",
-                    &AcceptAndNext,
-                    &focus,
-                    cx,
-                )
-            }
-        })
-        .on_click(cx.listener(move |this, _, _, cx| this.toggle_reviewed(ix, cx)));
-        card = card.action(review_button);
-
-        // A credential the access route refused changes on the branch writes nothing here: Edit
-        // and every Revert are disabled with that reason (spec 002).
-        let refused = self.change_refusal(cx);
-        if let Some(own) = group.change {
-            let state = &self.cards[own];
-            let done = state.fix.done() || self.merge_may_land(cx);
-            if self.editable(own, cx) {
-                let branch = self.branch.clone();
-                let focus = focus.clone();
-                let refused = refused.clone();
-                card = card.action(
-                    studio_ui::ds::row_button(("edit", ix), "Edit")
-                        .style(ButtonStyle::Subtle)
-                        .start_icon(Icon::new(IconName::Pencil))
-                        .disabled(done || refused.is_some())
-                        .tooltip(move |_, cx| match &refused {
-                            Some(reason) => Tooltip::simple(reason.clone(), cx),
-                            None => Tooltip::for_action_in(
-                                format!("Change what {branch} holds now"),
-                                &EditChange,
-                                &focus,
-                                cx,
-                            ),
-                        })
-                        .on_click(
-                            cx.listener(move |this, _, window, cx| this.open_edit(own, window, cx)),
-                        ),
-                );
-            }
-            let blocked = refused.clone().or_else(|| state.revert_blocked.clone());
-            let branch = self.branch.clone();
-            card = card.action(
-                studio_ui::ds::row_button(("revert", ix), "Revert")
-                    .style(ButtonStyle::Subtle)
-                    .start_icon(Icon::new(IconName::Undo))
-                    .disabled(blocked.is_some() || done)
-                    .tooltip(move |_, cx| match &blocked {
-                        Some(reason) => Tooltip::simple(reason.clone(), cx),
-                        None => Tooltip::with_meta(
-                            "Restore the value before this branch changed it",
-                            Some(&RevertAndNext),
-                            format!("Writes to {branch}, bound to the reviewed head"),
-                            cx,
-                        ),
+                IconName::ChevronRight
+            }))
+            .child(
+                studio_ui::ds::text::body(name)
+                    .when(kind == ChangeKind::Removed, |name| name.strikethrough())
+                    .single_line()
+                    .truncate(),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(studio_ui::ds::text::muted(summary).single_line().truncate()),
+            )
+            .children(status.map(|(text, color)| studio_ui::ds::text::meta(text).color(color)))
+            .children(id.map(|id| {
+                studio_ui::ds::text::meta(id)
+                    .buffer_font(cx)
+                    .single_line()
+                    .truncate()
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| this.click_group(group, cx)));
+        let body = open.then(|| self.entity_body(data, group, cx));
+        let outline = studio_ui::ds::surface::outline(cx);
+        div()
+            .pl(px(space::XL + studio_ui::ds::size::GUTTER))
+            .pr(px(space::XL))
+            .when(last, |row| row.pb(px(space::LG)))
+            .child(
+                v_flex()
+                    .w_full()
+                    .border_l_1()
+                    .border_r_1()
+                    .border_color(outline)
+                    .when(first, |table| {
+                        table.border_t_1().rounded_t(px(radii(cx).md))
                     })
-                    .on_click(cx.listener(move |this, _, _, cx| this.revert(own, cx))),
-            );
-        }
+                    .when(last, |table| table.border_b_1().rounded_b(px(radii(cx).md)))
+                    .child(if first {
+                        head.into_any_element()
+                    } else {
+                        studio_ui::ds::dotted(div().border_t_1(), cx)
+                            .child(head)
+                            .into_any_element()
+                    })
+                    .children(body),
+            )
+            .into_any_element()
+    }
 
-        // A card of many relationships shows its first few and more as they are asked for, and
-        // grows by itself through a relationship selected below them (from a mirror, or a
-        // change of a fix). Only the lines it shows are made.
+    /// The split's label for a run of one type: the type with its counts, folding its items.
+    fn split_group_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(data) = &self.data else {
+            return div().into_any_element();
+        };
+        let run = &self.headers[ix];
+        let key = run_key(run, data);
+        v_flex()
+            .w_full()
+            .children(self.section_title(run).map(|title| {
+                div()
+                    .px(px(space::XL))
+                    .pt(px(space::LG))
+                    .child(studio_ui::ds::text::meta(title))
+            }))
+            .child(
+                h_flex()
+                    .id(("run", ix))
+                    .px(px(space::XL))
+                    .pt(px(space::MD))
+                    .pb(px(space::XS))
+                    .gap(px(space::SM))
+                    .items_center()
+                    .cursor_pointer()
+                    .child(studio_ui::kind_swatch(&run.type_name, run.is_edge, cx))
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            studio_ui::ds::text::muted(run.type_name.clone())
+                                .single_line()
+                                .truncate(),
+                        ),
+                    )
+                    .child(change_counts(run.added, run.changed, run.removed))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_run(key.clone(), cx))),
+            )
+            .into_any_element()
+    }
+
+    /// One change in the split's list: a dot of its kind, its name, and a check once reviewed.
+    fn split_item_row(&self, group: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(data) = &self.data else {
+            return div().into_any_element();
+        };
+        let selected = self.selected_group(data) == Some(group);
+        let reviewed = self.group_unreviewed(&data.groups.groups[group]) == 0;
+        let (kind, name, _) = self.group_identity(data, group);
+        let hover = studio_ui::ds::surface::hover(cx);
+        div()
+            .w_full()
+            .px(px(space::MD))
+            .child(
+                h_flex()
+                    .id(("item", group))
+                    .h(px(studio_ui::ds::size::ROW))
+                    .px(px(space::MD))
+                    .gap(px(space::MD))
+                    .items_center()
+                    .rounded(px(radii(cx).sm))
+                    .cursor_pointer()
+                    .when(selected, |row| {
+                        row.bg(studio_ui::ds::surface::selected_document(cx))
+                    })
+                    .when(!selected, |row| row.hover(move |style| style.bg(hover)))
+                    .child(studio_ui::ds::dot(kind.color()))
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            studio_ui::ds::text::body(name)
+                                .color(if reviewed {
+                                    Color::Muted
+                                } else {
+                                    Color::Default
+                                })
+                                .when(kind == ChangeKind::Removed, |name| name.strikethrough())
+                                .single_line()
+                                .truncate(),
+                        ),
+                    )
+                    .when(reviewed, |row| {
+                        row.child(studio_ui::ds::icon::meta(IconName::Check).color(Color::Created))
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| this.select_group(group, cx))),
+            )
+            .into_any_element()
+    }
+
+    /// The split's record: the selected group in full, with what can be done to it.
+    fn render_detail(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(data) = &self.data else {
+            return div().into_any_element();
+        };
+        let Some(group) = self.selected_group(data) else {
+            return studio_ui::ds::empty_state(IconName::ListTree, "Choose a change")
+                .child(studio_ui::ds::state_detail(
+                    "Its record shows here, with what changed in it.",
+                ))
+                .into_any_element();
+        };
+        let g = &data.groups.groups[group];
+        let (kind, name, id) = self.group_identity(data, group);
+        let reviewed = self.group_unreviewed(g) == 0;
+        let next = self
+            .visible_groups()
+            .into_iter()
+            .skip_while(|&v| v != group)
+            .nth(1)
+            .map(|next| self.group_identity(data, next).1);
+        let crumb = h_flex()
+            .gap(px(space::SM))
+            .items_center()
+            .child(studio_ui::kind_swatch(&g.type_name, g.is_edge, cx))
+            .child(studio_ui::ds::text::muted(g.type_name.clone()))
+            .child(studio_ui::ds::text::meta(format!("· {}", kind.label())));
+        let sub = id.map(|id| studio_ui::ds::text::meta(id).buffer_font(cx));
+        let focus = self.focus_handle.clone();
+        let next_line = h_flex()
+            .pt(px(space::LG))
+            .gap(px(space::MD))
+            .items_center()
+            .child(
+                studio_ui::ds::button(
+                    "reviewed-next",
+                    if reviewed {
+                        "Next change"
+                    } else {
+                        "Reviewed, next"
+                    },
+                )
+                .style(ButtonStyle::Filled)
+                .key_binding(KeyBinding::for_action_in(&AcceptAndNext, &focus, cx))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.accept_and_next(&AcceptAndNext, window, cx)
+                })),
+            )
+            .children(next.map(|next| studio_ui::ds::text::muted(format!("Next: {next}"))));
+        div()
+            .id("review-detail")
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .overflow_y_scroll()
+            .child(
+                v_flex()
+                    .px(px(space::XXL))
+                    .pt(px(space::XL))
+                    .pb(px(space::XXL))
+                    .gap(px(space::SM))
+                    .child(crumb)
+                    .child(studio_ui::ds::text::heading(name))
+                    .children(sub)
+                    .child(
+                        div()
+                            .pt(px(space::MD))
+                            .child(self.entity_actions(data, group, cx)),
+                    )
+                    .child(self.entity_body(data, group, cx))
+                    .child(next_line),
+            )
+            .into_any_element()
+    }
+
+    /// Which of a group's long texts show whole, and what a fold's click does.
+    fn text_folds(&self, group: usize, cx: &mut Context<Self>) -> TextFolds {
+        let whole: HashSet<SharedString> = self
+            .whole_texts
+            .iter()
+            .filter(|(g, _)| *g == group)
+            .map(|(_, name)| name.clone())
+            .collect();
+        let on_toggle = cx.listener(move |this, name: &SharedString, _, cx| {
+            let key = (group, name.clone());
+            if !this.whole_texts.remove(&key) {
+                this.whole_texts.insert(key);
+            }
+            cx.notify();
+        });
+        TextFolds {
+            whole: Rc::new(move |name| whole.contains(name)),
+            on_toggle: Rc::new(on_toggle),
+        }
+    }
+
+    /// What changed in a group, in full: its entity's property rows, then each relationship
+    /// change reviewed on it, each with its own Revert, then the relationships reviewed on
+    /// another entity that it is an end of. In the feed it ends with what can be done to it.
+    fn entity_body(&self, data: &ReviewData, ix: usize, cx: &mut Context<Self>) -> Div {
+        let group = &data.groups.groups[ix];
+        let schema = data.schema.as_deref();
+        let folds = self.text_folds(ix, cx);
+        let kind = self.group_identity(data, ix).0;
+        let rows = group
+            .change
+            .map(|own| change_cards::change_rows(&data.folded, own, schema, &data.card_rows));
+        let property_rows: Vec<AnyElement> = rows
+            .iter()
+            .flat_map(|rows| rows.iter())
+            .map(|row| {
+                studio_ui::ds::dotted(div().border_t_1(), cx)
+                    .py(px(space::SM))
+                    .child(studio_ui::property_row(row, kind, Some(&folds), cx))
+                    .into_any_element()
+            })
+            .collect();
+
+        // A group of many relationships shows its first few and more as they are asked for,
+        // and grows by itself through a relationship selected below them (from a mirror, or
+        // a change of a fix). Only the lines it shows are made.
+        let refused = self.change_refusal(cx);
         let card_key = (group.type_name.clone(), group.id.clone());
         let total = data.groups.line_count(ix);
-        // Looked for on the card the selection is reviewed on only, not through every card's
-        // lines at every frame.
+        let selected_group = self.selected_group(data);
+        // Looked for on the group the selection is reviewed on only, not through every
+        // group's lines at every frame.
         let selected_at = self
             .selected
             .filter(|_| selected_group == Some(ix))
@@ -3048,15 +3497,15 @@ impl ReviewView {
         let card_lines = data
             .groups
             .lines(&data.folded, ix, schema, &self.names, shown);
-        let counts = (card_lines.added, card_lines.changed, card_lines.removed);
-        let lines = card_lines
+        let (added, changed, removed) = (card_lines.added, card_lines.changed, card_lines.removed);
+        let lines: Vec<RelationshipLine> = card_lines
             .entries
             .into_iter()
             .map(|entry| {
                 let change = entry.change;
                 let mirror = entry.net.is_none();
                 let moved_from = entry.replaces.as_ref().map(|(removed, _)| *removed);
-                // A mirror's other end is the card it is reviewed on.
+                // A mirror's other end is the group it is reviewed on.
                 let mut line = change_cards::relationship_line(
                     entry,
                     &data.folded,
@@ -3103,8 +3552,8 @@ impl ReviewView {
                             ),
                         })
                         .on_click(cx.listener(move |this, _, _, cx| this.revert_line(change, cx)));
-                // The selected change is what ⌥⌘Z reverts: a card without its own change selects
-                // its first relationship, which shows it.
+                // The selected change is what ⌥⌘Z reverts: a group without its own change
+                // selects its first relationship, which shows it.
                 line = line
                     .selected(
                         self.selected
@@ -3119,27 +3568,225 @@ impl ReviewView {
                 line
             })
             .collect();
-        card = card.relationships(counts, lines);
-        if left_out > 0 {
-            card = card.relationships_footer(change_cards::more_lines_button(
-                ix,
-                left_out,
-                cx.listener(move |this, _, _, cx| {
-                    this.card_lines.show_more(card_key.clone(), shown);
-                    cx.notify();
-                }),
-            ));
-        }
-        card.on_click(cx.listener(move |this, _, _, cx| {
-            let primary = this
-                .data
-                .as_ref()
-                .and_then(|data| data.groups.groups[ix].primary());
-            if let Some(change) = primary {
-                this.select(change, cx);
-            }
-        }))
+        let relationships = (!lines.is_empty()).then(|| {
+            studio_ui::ds::dotted(v_flex().border_t_1(), cx)
+                .py(px(space::SM))
+                .gap(px(space::WITHIN))
+                .child(
+                    h_flex()
+                        .gap(px(space::MD))
+                        .pb(px(space::XXS))
+                        .child(studio_ui::ds::text::meta("Relationships"))
+                        .child(change_counts(added, changed, removed)),
+                )
+                .children(lines)
+                .when(left_out > 0, |block| {
+                    block.child(change_cards::more_lines_button(
+                        ix,
+                        left_out,
+                        cx.listener(move |this, _, _, cx| {
+                            this.card_lines.show_more(card_key.clone(), shown);
+                            cx.notify();
+                        }),
+                    ))
+                })
+        });
+        let actions = (self.layout == ReviewLayout::Feed).then(|| {
+            div()
+                .pt(px(space::MD))
+                .child(self.entity_actions(data, ix, cx))
+        });
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .when(self.layout == ReviewLayout::Feed, |body| {
+                body.px(px(space::LG)).pb(px(space::LG))
+            })
+            .children(property_rows)
+            .children(relationships)
+            .children(actions)
     }
+
+    /// What can be done to a group: mark it reviewed, edit its node on the branch, revert
+    /// its change. A credential the access route refused changes on the branch writes
+    /// nothing here: Edit and Revert are disabled with that reason (spec 002).
+    fn entity_actions(&self, data: &ReviewData, ix: usize, cx: &mut Context<Self>) -> Div {
+        let group = &data.groups.groups[ix];
+        let focus = self.focus_handle.clone();
+        let reviewed = self.group_unreviewed(group) == 0;
+        let review_button = studio_ui::ds::button(
+            ("reviewed", ix),
+            if reviewed {
+                "Reviewed"
+            } else {
+                "Mark reviewed"
+            },
+        )
+        .style(ButtonStyle::Outlined)
+        .toggle_state(reviewed)
+        .start_icon(Icon::new(IconName::Check))
+        .tooltip({
+            let focus = focus.clone();
+            move |_, cx| {
+                Tooltip::for_action_in(
+                    "Mark this change reviewed and go to the next",
+                    &AcceptAndNext,
+                    &focus,
+                    cx,
+                )
+            }
+        })
+        .on_click(cx.listener(move |this, _, _, cx| this.toggle_reviewed(ix, cx)));
+        let mut actions = h_flex().gap(px(space::SM)).flex_wrap().child(review_button);
+        let refused = self.change_refusal(cx);
+        if let Some(own) = group.change {
+            let state = &self.cards[own];
+            let done = state.fix.done() || self.merge_may_land(cx);
+            if self.editable(own, cx) {
+                let branch = self.branch.clone();
+                let focus = focus.clone();
+                let refused = refused.clone();
+                actions = actions.child(
+                    studio_ui::ds::button(("edit", ix), "Edit")
+                        .style(ButtonStyle::Outlined)
+                        .start_icon(Icon::new(IconName::Pencil))
+                        .disabled(done || refused.is_some())
+                        .tooltip(move |_, cx| match &refused {
+                            Some(reason) => Tooltip::simple(reason.clone(), cx),
+                            None => Tooltip::for_action_in(
+                                format!("Change what {branch} holds now"),
+                                &EditChange,
+                                &focus,
+                                cx,
+                            ),
+                        })
+                        .on_click(
+                            cx.listener(move |this, _, window, cx| this.open_edit(own, window, cx)),
+                        ),
+                );
+            }
+            let blocked = refused.clone().or_else(|| state.revert_blocked.clone());
+            let branch = self.branch.clone();
+            actions = actions.child(
+                studio_ui::ds::button(("revert", ix), "Revert")
+                    .style(ButtonStyle::Outlined)
+                    .start_icon(Icon::new(IconName::Undo))
+                    .disabled(blocked.is_some() || done)
+                    .tooltip(move |_, cx| match &blocked {
+                        Some(reason) => Tooltip::simple(reason.clone(), cx),
+                        None => Tooltip::with_meta(
+                            "Restore the value before this branch changed it",
+                            Some(&RevertAndNext),
+                            format!("Writes to {branch}, bound to the reviewed head"),
+                            cx,
+                        ),
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| this.revert(own, cx))),
+            );
+        }
+        actions
+    }
+
+    /// Selects a group: its own change, or its first relationship's.
+    fn select_group(&mut self, group: usize, cx: &mut Context<Self>) {
+        let primary = self
+            .data
+            .as_ref()
+            .and_then(|data| data.groups.groups[group].primary());
+        if let Some(change) = primary {
+            self.select(change, cx);
+        }
+    }
+}
+
+/// A notice under the header: a strip of the severity's tint, with its action at the end.
+fn notice(severity: Severity, text: String, action: Option<AnyElement>) -> AnyElement {
+    let mut callout = studio_ui::ds::callout(severity, text);
+    if let Some(action) = action {
+        callout = callout.actions_slot(action);
+    }
+    callout.into_any_element()
+}
+
+/// What a feed's row says of a run beyond its type: the properties its changes touched, how
+/// many commits made them, and the latest commit's time.
+#[derive(Debug, Clone, Default)]
+struct RunFacts {
+    properties: String,
+    commits: usize,
+    latest: Option<i64>,
+}
+
+fn run_facts(data: &ReviewData, run: &GroupRun) -> RunFacts {
+    let mut names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut commits: HashSet<&str> = HashSet::new();
+    for &g in &run.groups {
+        for change in data.groups.groups[g].changes() {
+            let change = &data.folded.changes[change];
+            commits.extend(change.commits.iter().map(String::as_str));
+            if let (Some(before), Some(after)) = (&change.before, &change.after)
+                && !change.is_edge()
+            {
+                names.extend(
+                    after
+                        .properties
+                        .iter()
+                        .filter(|(key, value)| before.properties.get(*key) != Some(value))
+                        .map(|(key, _)| key.as_str()),
+                );
+                names.extend(
+                    before
+                        .properties
+                        .keys()
+                        .filter(|key| !after.properties.contains_key(*key))
+                        .map(String::as_str),
+                );
+            }
+        }
+    }
+    let shown: Vec<&str> = names.iter().copied().take(4).collect();
+    let mut properties = shown.join(", ");
+    if names.len() > 4 {
+        properties.push_str(&format!(" and {} more", names.len() - 4));
+    }
+    let latest = commits
+        .iter()
+        .filter_map(|id| data.commits.iter().find(|c| c.id == *id))
+        .map(|c| c.created_at)
+        .max();
+    RunFacts {
+        properties,
+        commits: commits.len(),
+        latest,
+    }
+}
+
+/// A run's counts as the feed says them, and the word to its type: "1 changed" "in" Task,
+/// "2 added" "to" Email, "1 removed" "from" Person; a run of entities standing for their
+/// relationships alone, "3 entities" "with relationships that changed in".
+fn run_sentence(run: &GroupRun) -> (String, &'static str) {
+    let mut parts = Vec::new();
+    if run.changed > 0 {
+        parts.push(format!("{} changed", group_digits(run.changed)));
+    }
+    if run.added > 0 {
+        parts.push(format!("{} added", group_digits(run.added)));
+    }
+    if run.removed > 0 {
+        parts.push(format!("{} removed", group_digits(run.removed)));
+    }
+    if parts.is_empty() {
+        return (
+            studio_ui::plural(run.groups.len(), "entity", "entities"),
+            "with relationships that changed in",
+        );
+    }
+    let joiner = match (run.changed, run.added, run.removed) {
+        (0, _, 0) => "to",
+        (0, 0, _) => "from",
+        _ => "in",
+    };
+    (parts.join(", "), joiner)
 }
 
 /// What the merge banner says the target's history showed of a merge that committed.
@@ -3282,6 +3929,70 @@ fn search_text_of(change: &FoldedChange) -> String {
 /// without one), under a header for each run of one type, the first of a section carrying its
 /// title. A card matches when its own change or a relationship reviewed on it does. The headers
 /// count what the run shows.
+/// A run's fold key: its section, whether it is of edges, and its type.
+fn run_key(run: &GroupRun, data: &ReviewData) -> (GroupSection, bool, String) {
+    let section = run
+        .groups
+        .first()
+        .map_or(GroupSection::Added, |&g| data.groups.groups[g].section);
+    (section, run.is_edge, run.type_name.clone())
+}
+
+/// What a group's folded line says: the properties its change touched, or how many an added
+/// or removed record has, then its relationship changes.
+fn group_summary(data: &ReviewData, group: &EntityGroup) -> String {
+    let mut parts = Vec::new();
+    if let Some(own) = group.change {
+        let change = &data.folded.changes[own];
+        match (&change.before, &change.after) {
+            (Some(before), Some(after)) => {
+                let mut names: Vec<&String> = after
+                    .properties
+                    .iter()
+                    .filter(|(key, value)| before.properties.get(*key) != Some(value))
+                    .map(|(key, _)| key)
+                    .chain(
+                        before
+                            .properties
+                            .keys()
+                            .filter(|key| !after.properties.contains_key(*key)),
+                    )
+                    .collect();
+                names.sort();
+                names.dedup();
+                if !names.is_empty() {
+                    let shown: Vec<&str> = names.iter().take(4).map(|s| s.as_str()).collect();
+                    let mut text = shown.join(", ");
+                    if names.len() > 4 {
+                        text.push_str(&format!(" and {} more", names.len() - 4));
+                    }
+                    text.push_str(" changed");
+                    parts.push(text);
+                }
+            }
+            (None, Some(after)) => parts.push(studio_ui::plural(
+                after.properties.len(),
+                "property",
+                "properties",
+            )),
+            (Some(before), None) => parts.push(format!(
+                "{} removed",
+                studio_ui::plural(before.properties.len(), "property", "properties")
+            )),
+            (None, None) => {}
+        }
+    }
+    let relationships = group.relationships.len();
+    if relationships > 0 {
+        parts.push(studio_ui::plural(
+            relationships,
+            "relationship",
+            "relationships",
+        ));
+    }
+    parts.join(" · ")
+}
+
 fn build_rows(data: &ReviewData, matched: Option<&[bool]>) -> (Vec<Row>, Vec<GroupRun>) {
     let matches =
         |change: usize| matched.is_none_or(|matched| matched.get(change).copied().unwrap_or(false));
@@ -3592,7 +4303,8 @@ async fn fold_pages(
         match next {
             Some(next) if complete && fold.raw_changes() < REVIEW_CHANGE_CAP => token = Some(next),
             Some(_) => return Ok((fold, true)),
-            None => return Ok((fold, false)),
+            // A last page the cap cut is partial too, as the feed's fold says it.
+            None => return Ok((fold, !complete)),
         }
     }
 }
@@ -4051,14 +4763,33 @@ impl Render for ReviewView {
                     }))
                     .into_any_element()
             }
-            (LoadState::Ready, Some(_)) => list(
-                self.list_state.clone(),
-                cx.processor(|this, row, window, cx| this.render_row(row, window, cx)),
-            )
-            .flex_1()
-            .min_h_0()
-            .py(px(space::MD))
-            .into_any_element(),
+            (LoadState::Ready, Some(_)) => {
+                let rows = list(
+                    self.list_state.clone(),
+                    cx.processor(|this, row, window, cx| this.render_row(row, window, cx)),
+                )
+                .flex_1()
+                .min_h_0()
+                .py(px(space::MD));
+                match self.layout {
+                    ReviewLayout::Feed => rows.into_any_element(),
+                    ReviewLayout::Split => h_flex()
+                        .flex_1()
+                        .min_h_0()
+                        .items_stretch()
+                        .child(
+                            v_flex()
+                                .w(px(SPLIT_LIST_WIDTH))
+                                .flex_none()
+                                .min_h_0()
+                                .border_r_1()
+                                .border_color(studio_ui::ds::surface::rule(cx))
+                                .child(rows),
+                        )
+                        .child(self.render_detail(cx))
+                        .into_any_element(),
+                }
+            }
             (LoadState::Failed(error), _) => {
                 studio_ui::ds::error_state("The review could not be read", error.clone())
                     .child(
@@ -4105,6 +4836,9 @@ impl Render for ReviewView {
             .when(self.merge_refusal(cx).is_none(), |view| {
                 view.on_action(cx.listener(|this, _: &Merge, _, cx| this.merge(cx)))
                     .on_action(cx.listener(|this, _: &Summarize, _, cx| this.summarize(cx)))
+                    .on_action(
+                        cx.listener(|this, _: &ToggleChange, _, cx| this.toggle_selected(cx)),
+                    )
             })
             // ⌘R reads the review again, as its Refresh buttons do, and goes on to the
             // workspace, which reads the graph's schema, branches and counts again.
@@ -4112,10 +4846,19 @@ impl Render for ReviewView {
                 this.reload(cx);
                 cx.propagate();
             }))
+            .on_action(
+                cx.listener(|this, _: &SwitchLayout, _, cx| {
+                    this.set_layout(this.layout.other(), cx)
+                }),
+            )
             .child(header)
             .child(body)
+            .children(self.render_footer(cx))
     }
 }
+
+/// The split's list of changes, beside its record.
+const SPLIT_LIST_WIDTH: f32 = 300.;
 
 /// A Refresh button's tooltip, which shows the key that does the same in the review.
 fn refresh_tooltip(
@@ -4291,6 +5034,78 @@ pub(crate) mod tests {
         );
     }
 
+    /// A last page of changes past the cap is said partial, as the feed's fold says it: the cap
+    /// left changes out whether or not the server named a page after it. Before, the diff's
+    /// fold said such a review whole.
+    #[gpui::test]
+    async fn a_last_page_past_the_cap_is_partial(cx: &mut gpui::TestAppContext) {
+        let mut acx = cx.to_async();
+        let cause: ChangeCauseOutput = serde_json::from_value(json!({
+            "graph_commit_id": "c1", "authored_branch": "feature", "authored_at": 0
+        }))
+        .unwrap();
+        let change: graph_client::api::EntityChangeOutput = serde_json::from_value(json!({
+            "kind": "node", "type": { "id": "Person", "name": "Person" }, "id": "p", "op": "update"
+        }))
+        .unwrap();
+        let this = WeakEntity::<ReviewView>::new_invalid();
+        let (fold, partial) = fold_pages(
+            &this,
+            &mut acx,
+            async |_: Option<String>, _: u32, _: &mut AsyncApp| {
+                let changes = (0..=REVIEW_CHANGE_CAP)
+                    .map(|i| graph_client::api::EntityChangeOutput {
+                        id: format!("p{i}"),
+                        ..change.clone()
+                    })
+                    .collect();
+                let block = ChangeBlockOutput {
+                    cause: cause.clone(),
+                    changes,
+                };
+                Ok((block, None))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(fold.raw_changes(), REVIEW_CHANGE_CAP);
+        assert!(partial, "the cap left a change out");
+    }
+
+    /// A review behind another tab whose read is out when the token changes lets that read go:
+    /// it is the old token's, and nothing reads the review again until it is drawn. Before, the
+    /// read stayed, and landing showed the old token's cards, with Revert and Edit, until the
+    /// review was shown.
+    #[gpui::test]
+    async fn a_hidden_reviews_read_under_the_old_token_does_not_land(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _) = reviewed_server_writing(false, cx);
+        let (_blank, cx) = cx.add_window_view(|_, _| gpui::EmptyView);
+        let hidden = cx.update(|window, cx| {
+            let session = session.clone();
+            cx.new(|cx| ReviewView::new(session, "feature".into(), "main".into(), window, cx))
+        });
+        cx.run_until_parked();
+        // A Refresh's read is out under the old token when the token changes.
+        hidden.update(cx, |view, cx| view.reload(cx));
+        session.update(cx, |_, cx| cx.emit(SessionEvent::CredentialChanged));
+        cx.run_until_parked();
+        hidden.read_with(cx, |view, _| {
+            assert!(
+                view.data.is_none() && view.cards.is_empty(),
+                "no cards landed"
+            );
+            assert!(matches!(view.load, LoadState::Loading { .. }));
+            assert!(view.read_owed, "read again when drawn");
+            assert!(!view.reading_slowly);
+        });
+    }
+
     /// A review not drawn (restored with the workspace behind another tab) reads no diff until
     /// it is shown; drawn, it reads. Before, every restored review read its whole diff at start.
     #[gpui::test]
@@ -4415,6 +5230,42 @@ pub(crate) mod tests {
                 .iter()
                 .any(|request| request.contains("/mutate"))
         );
+    }
+
+    /// A click on a feed row opens it, and a second click folds it: selecting a row unfolds
+    /// it, so a click on a folded row must not fold it again.
+    #[gpui::test]
+    async fn a_click_opens_a_folded_row_and_folds_an_open_one(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _asked) = reviewed_server_writing(false, cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.layout = ReviewLayout::Feed;
+            let groups = view.visible_groups();
+            assert!(groups.len() >= 2, "the review has rows to click");
+            let first = groups[0];
+            let second = groups[1];
+            assert!(
+                view.expanded.contains(&first),
+                "the feed opens on its first row"
+            );
+            assert!(!view.expanded.contains(&second));
+            view.click_group(second, cx);
+            assert!(
+                view.expanded.contains(&second),
+                "a click opens a folded row"
+            );
+            view.click_group(second, cx);
+            assert!(!view.expanded.contains(&second), "a second click folds it");
+            view.click_group(first, cx);
+            assert!(!view.expanded.contains(&first), "a click folds an open row");
+        });
     }
 
     /// The second half of a moved relationship waits for the first and is not sent when the
@@ -5798,7 +6649,10 @@ pub(crate) mod tests {
         cx.run_until_parked();
         let grouped_with = |view: &ReviewView| view.data.as_ref().unwrap().schema.clone();
         view.read_with(cx, |view, _| {
-            assert!(same_schema(grouped_with(view).as_ref(), Some(&loaded)));
+            assert!(SchemaModel::same_held(
+                grouped_with(view).as_ref(),
+                Some(&loaded)
+            ));
             let data = view.data.as_ref().unwrap();
             assert_eq!(data.groups, EntityGroups::new(&data.folded, Some(&*loaded)));
         });
@@ -5815,7 +6669,10 @@ pub(crate) mod tests {
             "the schema held, not compiled again"
         );
         view.read_with(cx, |view, _| {
-            assert!(same_schema(grouped_with(view).as_ref(), Some(&again)));
+            assert!(SchemaModel::same_held(
+                grouped_with(view).as_ref(),
+                Some(&again)
+            ));
             assert!(
                 Arc::ptr_eq(&grouped_with(view).unwrap(), &grouped),
                 "not grouped again"

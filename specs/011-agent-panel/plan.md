@@ -285,8 +285,12 @@ and Delta's sidebar.
   one, which folder redirection can put on a network share, and cmd cannot work in a network
   folder (spec 013). A conversation keeps the directory it started in (recorded with it;
   `sessions::working_dir`), so one started under a graph's older key still resumes where the
-  agent keeps it; only a new one gets the directory of the key it has now. Import lists the
-  key's directory alone. Earlier conversations ran in the shared `agent/workspace`.
+  agent keeps it; only a new one gets the directory of the key it has now, in a folder of its
+  own there. Import asks the agent for the key's directory and each folder in it, as an agent
+  lists sessions by exact folder, keeps the sessions that ran in the folder asked about, and
+  records each one's own folder, where it resumes. A conversation nothing was sent in that
+  starts again (Restart, or another agent) leaves its folder for a new one, which removes the
+  old. Earlier conversations ran in the shared `agent/workspace`.
 - **The Conversations panel** is a tab of the left sidebar (the agent mark;
   `studio_agent::ShowConversations`), after Delta's threads list, every title on one edge. Its
   title line holds Filter, More (Import from the agent) and New conversation, before the
@@ -429,6 +433,7 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 | 2026-10-20 | A sessions or preferences file Studio could not read is never written over | `agent_panel` `a_file_that_could_not_be_read_is_never_written_over`, `a_preferences_file_that_could_not_be_read_is_never_written_over` (run on macOS; a folder at each name the file would be set aside as stands in for a program holding it); `a_file_another_program_holds_is_never_written_over` (Windows only: a handle without delete sharing, then without any; runs in CI on `windows-2025`, not run here) | Before the fix: a sessions file that was not UTF-8 was not set aside, and both files were written over when the rename failed. After it: a file that is not text is set aside like one that does not parse; one that cannot be set aside stays byte for byte through a save, the changes kept in memory, and `not_saved` names it for the Conversations panel's note |
 | 2026-10-20 | On Windows agents work in the local application folder | `agent_panel` `agents_work_in_the_local_folder_of_studios_roaming_data` (run on macOS) | A data folder under `%APPDATA%`, local or on a `\\server\share`, maps to the same name under `%LOCALAPPDATA%`; a data folder set elsewhere keeps its agents |
 | 2026-10-20 | Conversations follow the graph's key, and an old one resumes where it ran | `agent_panel` `conversations_filed_by_server_name_move_to_the_graphs_key` (records written as a build before wrote them, loaded with the server list `dev` → `http://127.0.0.1:8787`); `graph_store` `a_name_resolves_only_to_a_known_server`; the panel's working directory now `sessions::working_dir` (`panel.rs`, `start`), the record's own `cwd` when resuming | `dev/crm` became `http://127.0.0.1:8787/crm`, its `cwd` still `graph_cwd("dev/crm")`, and `latest` found it under the key; a new conversation gets `graph_cwd` of the key, another directory; `gone/crm`, a name no server has, stayed; the next load read the record under the key. Import lists only the key's directory, so a conversation the agent has in the old directory and the list lacks is not offered. Not yet seen in the running app |
+| 2026-10-31 | Import finds conversations in their own folders, and Restart cleans up | `agent_panel` `sessions_panel::tests::import_asks_every_conversation_folder_and_keeps_each_ones_own` (new) and `panel::tests::starting_an_unsent_conversation_again_removes_its_folder` (new). Each fails without its fix (checked) | Taken: since conversations started in folders of their own, Import still asked the agent for the graph's folder alone and kept exact matches, so it found none of them and said the list had them all; and it recorded the graph's folder, where the agent could not load the conversation. Restart of a conversation nothing was sent in claimed a new folder and left the old one, with its `AGENTS.md` and skill, on disk, where choosing another agent removed it |
 
 ## Corrections
 

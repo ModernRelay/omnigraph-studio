@@ -526,7 +526,7 @@ async fn written(
                     "Nothing was written: the server takes no value this large. {}",
                     error.body.error
                 ),
-                _ => format!("Nothing was written. {}", error.body.error),
+                _ => format!("Nothing was written. {}", error.reason()),
             };
             BlobWritten::Refused(Notice::new(Tone::Refused, message))
         }

@@ -7,7 +7,7 @@
 //! own conversations in the graph's directory can be imported. A row opens the conversation in
 //! its own tab, or shows the tab it is in.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -40,10 +40,10 @@ pub const PANEL_ID: &str = "agent-conversations";
 const AGENT_ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// `answer`, or `None` when the agent has not answered within [`AGENT_ANSWER_WITHIN`].
-async fn within_time<T>(
-    answer: futures::channel::oneshot::Receiver<T>,
+async fn within_time<F: std::future::Future + Unpin>(
+    answer: F,
     cx: &gpui::AsyncApp,
-) -> Option<Result<T, futures::channel::oneshot::Canceled>> {
+) -> Option<F::Output> {
     let late = cx.background_executor().timer(AGENT_ANSWER_WITHIN);
     match futures::future::select(answer, late).await {
         futures::future::Either::Left((answer, _)) => Some(answer),
@@ -343,38 +343,38 @@ impl SessionsPanel {
         let (Some(graph), Some(agent)) = (self.graph(cx), Self::agent(cx)) else {
             return;
         };
-        let cwd = graph_cwd(&graph);
+        let graph_dir = graph_cwd(&graph);
         let agent_name = agent.command.join(" ");
         let connection: Arc<AgentConnection> = connection::connection(agent, cx);
-        let answer = connection.list(cwd.clone());
         cx.spawn(async move |this, cx| {
-            let result = within_time(answer, cx)
-                .await
-                .unwrap_or_else(|| Ok(Err("The agent did not answer in two minutes.".to_owned())));
+            let folders = cx
+                .background_spawn(async move { conversation_folders(&graph_dir) })
+                .await;
+            let answers = folders
+                .iter()
+                .map(|folder| connection.list(folder.clone()))
+                .collect::<Vec<_>>();
+            let answered = within_time(futures::future::join_all(answers), cx).await;
             drop(connection);
-            // The list is asked for this graph's folder, a filter an agent may not keep: one
-            // elsewhere is no conversation of this graph, and opened here it would be handed the
-            // graph's gateway. Compared off the main thread, links resolved.
-            let result = match result {
-                Ok(Ok(found)) => {
-                    let cwd = cwd.clone();
-                    Ok(Ok(cx
-                        .background_spawn(async move {
-                            found
-                                .into_iter()
-                                .filter(|info| same_folder(&info.cwd, &cwd))
-                                .collect::<Vec<_>>()
-                        })
-                        .await))
-                }
-                other => other,
+            let result = match answered {
+                None => Ok(Err("The agent did not answer in two minutes.".to_owned())),
+                Some(lists) => match lists.into_iter().collect::<Result<Vec<_>, _>>() {
+                    Err(stopped) => Err(stopped),
+                    Ok(lists) => match lists.into_iter().collect::<Result<Vec<_>, _>>() {
+                        Err(reason) => Ok(Err(reason)),
+                        // Compared off the main thread, links resolved.
+                        Ok(lists) => Ok(Ok(cx
+                            .background_spawn(async move { of_their_folders(folders, lists) })
+                            .await)),
+                    },
+                },
             };
             this.update(cx, |this, cx| {
                 let (kind, note) = match result {
                     Ok(Ok(found)) => {
                         let records = found
                             .into_iter()
-                            .map(|info| imported(info, &graph, &agent_name, &cwd))
+                            .map(|info| imported(info, &graph, &agent_name))
                             .collect();
                         let added = this
                             .sessions
@@ -610,9 +610,41 @@ fn same_folder(a: &Path, b: &Path) -> bool {
             .is_some_and(|a| std::fs::canonicalize(b).is_ok_and(|b| a == b))
 }
 
+/// The folders a graph's conversations run in: its own directory, where they ran before each
+/// had a folder of its own, and every folder in it, one per conversation
+/// ([`crate::sessions::working_dir`]). An agent lists its sessions by exact folder, so each is
+/// asked for.
+fn conversation_folders(graph_dir: &Path) -> Vec<PathBuf> {
+    let mut folders = vec![graph_dir.to_path_buf()];
+    if let Ok(entries) = std::fs::read_dir(graph_dir) {
+        folders.extend(
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir()),
+        );
+    }
+    folders
+}
+
+/// The sessions each folder's list holds that ran in that folder. The folder is a filter an
+/// agent may not keep: a session elsewhere is no conversation of this graph, and opened here
+/// it would be handed the graph's gateway.
+fn of_their_folders(folders: Vec<PathBuf>, lists: Vec<Vec<SessionInfo>>) -> Vec<SessionInfo> {
+    folders
+        .into_iter()
+        .zip(lists)
+        .flat_map(|(folder, list)| {
+            list.into_iter()
+                .filter(move |info| same_folder(&info.cwd, &folder))
+        })
+        .collect()
+}
+
 /// A conversation the agent knows and the list does not, as a record: the agent's title (one
-/// line, cut as a title Studio makes is) and time, a branch named for when it was last active.
-fn imported(info: SessionInfo, graph: &str, agent: &str, cwd: &Path) -> SessionRecord {
+/// line, cut as a title Studio makes is) and time, a branch named for when it was last active,
+/// and the folder it ran in, where it resumes.
+fn imported(info: SessionInfo, graph: &str, agent: &str) -> SessionRecord {
     let updated = info
         .updated_at
         .as_deref()
@@ -636,7 +668,7 @@ fn imported(info: SessionInfo, graph: &str, agent: &str, cwd: &Path) -> SessionR
         branch_created: false,
         pinned: false,
         archived: false,
-        cwd: cwd.to_owned(),
+        cwd: info.cwd,
     }
 }
 
@@ -1018,6 +1050,49 @@ pub(crate) fn agent_name(command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Import asks the agent for every folder a graph's conversations run in, the graph's own
+    /// and each conversation's, as an agent lists its sessions by exact folder. It keeps only
+    /// the sessions that ran in the folder asked about, and records each one's own folder,
+    /// where it resumes. Before, it asked for the graph's folder alone, so no conversation
+    /// started in a folder of its own was found, and an import recorded the graph's folder,
+    /// where the agent could not load the conversation.
+    #[test]
+    fn import_asks_every_conversation_folder_and_keeps_each_ones_own() {
+        let root = std::env::temp_dir().join(format!(
+            "studio-import-{}",
+            crate::confined::random_hex(8).unwrap()
+        ));
+        let graph = root.join("graph");
+        std::fs::create_dir_all(graph.join("main-ab12")).unwrap();
+        std::fs::create_dir_all(graph.join("feature-cd34")).unwrap();
+        std::fs::write(graph.join("notes.txt"), "").unwrap();
+        let mut folders = conversation_folders(&graph);
+        folders[1..].sort();
+        assert_eq!(
+            folders,
+            vec![
+                graph.clone(),
+                graph.join("feature-cd34"),
+                graph.join("main-ab12")
+            ]
+        );
+        let lists = vec![
+            vec![SessionInfo::new("before-folders", graph.clone())],
+            // A list that did not keep its filter.
+            vec![SessionInfo::new("elsewhere", root.join("other"))],
+            vec![SessionInfo::new("in-its-folder", graph.join("main-ab12"))],
+        ];
+        let kept = of_their_folders(folders, lists);
+        let ids: Vec<String> = kept
+            .iter()
+            .map(|info| info.session_id.0.to_string())
+            .collect();
+        assert_eq!(ids, ["before-folders", "in-its-folder"]);
+        let record = imported(kept.into_iter().nth(1).unwrap(), "server/crm", "claude");
+        assert_eq!(record.cwd, graph.join("main-ab12"), "where it resumes");
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     /// A conversation is deleted only with its title typed whole, as the list shows it: the
     /// person's name for it over the agent's, and "New conversation" before either.

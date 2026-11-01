@@ -1221,6 +1221,10 @@ async fn run_with(
     }
 }
 
+/// How long a command's pipes are read after it ends: what it wrote is in them by then, and a
+/// program it started that holds them open is not waited for.
+const PIPES_AFTER_EXIT: Duration = Duration::from_millis(250);
+
 /// [`run_with`], once.
 async fn run_once(
     command: std::process::Command,
@@ -1254,18 +1258,47 @@ async fn run_once(
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
         return Err(Unrun::Failed("its output could not be read".to_owned()));
     };
-    // Each pipe is closed once read to its bound, so a program that writes more stops.
-    let read = |pipe: Box<dyn futures::AsyncRead + Send + Unpin>, bound: usize| async move {
-        let mut read = Vec::new();
-        pipe.take(bound as u64).read_to_end(&mut read).await?;
-        Ok::<_, std::io::Error>(read)
-    };
     let work = async move {
-        let (written, out, err) = futures::join!(
-            write,
-            read(Box::new(stdout), limit),
-            read(Box::new(stderr), MAX_ANSWER_BYTES),
+        // Each pipe is closed once read to its bound, so a program that writes more stops.
+        let (mut stdout, mut stderr) = (
+            stdout.take(limit as u64),
+            stderr.take(MAX_ANSWER_BYTES as u64),
         );
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let (written, exited) = {
+            let reads = futures::future::join3(
+                write,
+                stdout.read_to_end(&mut out),
+                stderr.read_to_end(&mut err),
+            )
+            .fuse();
+            let exit = child.status().fuse();
+            futures::pin_mut!(reads, exit);
+            futures::select! {
+                (written, read_out, read_err) = reads => {
+                    read_out.map_err(|error| error.to_string())?;
+                    read_err.map_err(|error| error.to_string())?;
+                    (written, None)
+                }
+                // Ended: what it wrote is in its pipes, which a program it started may hold
+                // open after it (a credential helper's background process). They are read a
+                // moment more, not until that program ends, which would hold the CLI's turn to
+                // the timeout.
+                status = exit => {
+                    let grace = smol::Timer::after(PIPES_AFTER_EXIT).fuse();
+                    futures::pin_mut!(grace);
+                    let written = futures::select! {
+                        (written, read_out, read_err) = reads => {
+                            read_out.map_err(|error| error.to_string())?;
+                            read_err.map_err(|error| error.to_string())?;
+                            written
+                        }
+                        _ = grace => Ok(()),
+                    };
+                    (written, Some(status))
+                }
+            }
+        };
         // A command that stopped reading its input (it exited, refused a lock) says why in its
         // output and how it ended: those decide, not the pipe it closed.
         written
@@ -1274,11 +1307,11 @@ async fn run_once(
                 _ => Err(error),
             })
             .map_err(|error| error.to_string())?;
-        let (out, err) = (
-            out.map_err(|error| error.to_string())?,
-            err.map_err(|error| error.to_string())?,
-        );
-        let status = child.status().await.map_err(|error| error.to_string())?;
+        let status = match exited {
+            Some(status) => status,
+            None => child.status().await,
+        }
+        .map_err(|error| error.to_string())?;
         Ok::<_, String>(Ran {
             status,
             stdout: out,
@@ -2432,6 +2465,35 @@ exit 64
         };
         assert!(!ran.status.success());
         assert!(String::from_utf8_lossy(&ran.stderr).contains("lock refused"));
+
+        // One that leaves a program holding its output open (a credential helper's background
+        // process) is done when it ends, with what it wrote. Before, the run waited for that
+        // program, holding the CLI's turn up to the timeout.
+        let leaving = dir.join("leaving");
+        std::fs::write(
+            &leaving,
+            "#!/bin/sh
+(sleep 5) &
+echo token
+",
+        )
+        .unwrap();
+        std::fs::set_permissions(&leaving, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
+        let ran = smol::block_on(run_once(
+            std::process::Command::new(&leaving),
+            None,
+            Duration::from_secs(10),
+            1024,
+        ))
+        .unwrap_or_else(|_| panic!("the command's own answer"));
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(ran.status.success());
+        assert_eq!(String::from_utf8_lossy(&ran.stdout), "token\n");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2917,7 +2979,10 @@ exit 64
         assert_eq!(lists.load(std::sync::atomic::Ordering::SeqCst), listed);
         stale.read_with(cx, |connection, _| {
             assert_eq!(connection.state, ConnectionState::Unauthorized);
-            assert!(connection.refused_with_token);
+            assert_eq!(
+                connection.refusal,
+                Some(graph_client::Unauthorized::TokenRefused)
+            );
             assert_eq!(connection.label(), "Token refused");
         });
         stale.update(cx, |connection, cx| connection.refresh_token(cx));
@@ -2967,7 +3032,7 @@ exit 64
         assert_eq!(lists.load(std::sync::atomic::Ordering::SeqCst), 0);
         connection.read_with(cx, |connection, _| {
             assert_eq!(connection.state, ConnectionState::Unauthorized);
-            assert!(!connection.refused_with_token);
+            assert_eq!(connection.refusal, None, "no 401 stands: nothing was sent");
             assert!(!connection.token_unanswered);
             assert_eq!(connection.token_unread.as_deref(), Some(reason));
             assert_eq!(connection.label(), "No token from the CLI");
@@ -3075,7 +3140,10 @@ exit 64
         cx.run_until_parked();
         connection.read_with(cx, |connection, _| {
             assert_eq!(connection.state, ConnectionState::Unauthorized);
-            assert!(!connection.refused_with_token);
+            assert_eq!(
+                connection.refusal,
+                Some(graph_client::Unauthorized::TokenNeeded)
+            );
             assert_eq!(connection.label(), "Asks for a token");
         });
     }

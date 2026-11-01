@@ -608,7 +608,7 @@ impl NodePeek {
                 this.schema = Some(now);
                 for index in 0..this.groups.len() {
                     if matches!(this.groups[index].neighbours, Loadable::Loaded(_)) {
-                        this.load_group(index, false, false, cx);
+                        this.load_group(index, false, cx);
                     }
                 }
                 cx.notify();
@@ -2073,7 +2073,7 @@ impl NodePeek {
                 return;
             }
             match group.count {
-                Loadable::NotLoaded => this.load_group(index, this.debounce, false, cx),
+                Loadable::NotLoaded => this.load_group(index, this.debounce, cx),
                 Loadable::Loaded(n)
                     if !group.expanded
                         && matches!(group.neighbours, Loadable::NotLoaded)
@@ -2095,11 +2095,17 @@ impl NodePeek {
     /// then a page (spec 015). A group past the page shows its first neighbours and reads how
     /// many edges it has: the peek lists each edge, two to one neighbour (a person rehired by
     /// one company) as two rows, so each can be removed. `debounce` delays the read, for a peek that
-    /// follows a moving cursor; `open` opens the group when it has any neighbours, as after the
-    /// person's own write to it, where otherwise only a small one opens by itself.
-    fn load_group(&mut self, index: usize, debounce: bool, open: bool, cx: &mut Context<Self>) {
+    /// follows a moving cursor. Only a small group opens by itself; one the person wrote to is
+    /// read by [`Self::reload_group`], which opens it.
+    fn load_group(&mut self, index: usize, debounce: bool, cx: &mut Context<Self>) {
         let snapshot = self.snapshot.clone();
-        self.read_group(index, snapshot, debounce, GroupRead::Whole { open }, cx);
+        self.read_group(
+            index,
+            snapshot,
+            debounce,
+            GroupRead::Whole { open: false },
+            cx,
+        );
     }
 
     /// Reads group `index`'s first edges at `snapshot` ([`read_first_edges`]), landing them as

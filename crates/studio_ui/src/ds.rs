@@ -530,6 +530,18 @@ pub mod surface {
     }
 
     /// A hovered control's fill and the highlighted menu row's: a faint ink.
+    /// A faint tint of a status colour behind a whole line (a diff line of its kind): the
+    /// colour says the kind, the text keeps its contrast.
+    pub fn wash(color: Color, cx: &App) -> Hsla {
+        color.color(cx).opacity(0.08)
+    }
+
+    /// A stronger tint of a status colour behind the words that changed inside a washed line:
+    /// three times the wash, still under the text.
+    pub fn mark(color: Color, cx: &App) -> Hsla {
+        color.color(cx).opacity(0.22)
+    }
+
     pub fn highlight(cx: &App) -> Hsla {
         cx.theme().colors().text.opacity(0.045)
     }

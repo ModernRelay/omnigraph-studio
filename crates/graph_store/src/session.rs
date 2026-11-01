@@ -22,13 +22,13 @@ use graph_client::api::{
 };
 use graph_client::{
     ApiErrorSummary, BlobAt, BlobCell, BlobMeta, CommitChanges, FeedAt, GraphClient, ReadError,
-    WriteOutcome,
+    Unauthorized, WriteOutcome,
 };
 use serde_json::Value;
 
 use crate::access::{Access, AccessScope, Allowed};
 use crate::carry::{ChangeLog, ChangesSince, FeedFold, Since, answer_unchanged};
-use crate::connection::{Connection, ConnectionEvent, ConnectionWatch};
+use crate::connection::{Connection, ConnectionEvent, ConnectionState, ConnectionWatch};
 use crate::degrees::{DEGREE_BATCH, DegreeBatchKey, DegreeBatches, page_counts};
 use crate::memo::{Held, Memo};
 use crate::scope::{ReadScope, Scope, ScopeSince};
@@ -260,7 +260,9 @@ pub enum SessionEvent {
     AccessChanged,
     /// The connection's token changed, and the session reads under the new one: a view that
     /// shows what it read of the server itself (the storage inspector) reads it again, since
-    /// the new token may see less. A parked graph says so when shown again.
+    /// the new token may see less. Said too when the connection is ready again with the token
+    /// a read was refused under, which is read again alike. A parked graph says so when shown
+    /// again.
     CredentialChanged,
 }
 
@@ -735,6 +737,10 @@ pub struct GraphSession {
     head_watches: Vec<(String, Weak<()>)>,
     /// Head reads under way, by branch.
     head_reads: HashMap<String, Task<()>>,
+    /// The head held of each branch that answered a read of it at another commit: reads at
+    /// that commit go to the commit itself, not the branch, until the head watch moves the
+    /// head ([`Self::read_at_commit`]).
+    not_at_head: HashMap<String, String>,
     /// Views waiting for a branch's head read to land ([`Self::head_now`]).
     head_waiters: HashMap<String, Vec<oneshot::Sender<()>>>,
     /// Studio's own data commits on top of the head held, by branch, until a feed read went
@@ -807,13 +813,15 @@ pub struct GraphSession {
     /// The settings named a type's nodes otherwise while the graph was parked: views hear it
     /// ([`SessionEvent::SchemaChanged`]) when it is shown again.
     names_owed: bool,
-    /// Numbers the branch-list reads as they are sent, and the newest whose list was taken: a
-    /// list asked for before one already taken answers for an older moment, and is not taken.
-    branch_lists_sent: u64,
-    branch_list_taken: u64,
     /// A new token came while the graph was parked: its counts, catalog and branch list are
     /// read under it when shown again ([`Self::read_again_for_credential`]).
     credential_owed: bool,
+    /// A read was answered 401 under the token held, which nothing reads again unless the token
+    /// changes: the connection ready again with that token reads it
+    /// ([`Self::connection_state_changed`]).
+    read_refused: bool,
+    /// Whether the connection was ready when last heard from.
+    connection_ready: bool,
     /// What the credential may do was forgotten while parked: it is read when shown again.
     access_owed: bool,
     _connection_watch: Option<ConnectionWatch>,
@@ -891,6 +899,7 @@ impl GraphSession {
             drafts: HashMap::new(),
             head_watches: Vec::new(),
             head_reads: HashMap::new(),
+            not_at_head: HashMap::new(),
             head_waiters: HashMap::new(),
             own_heads: HashMap::new(),
             foreign_moves: HashSet::new(),
@@ -924,13 +933,14 @@ impl GraphSession {
             opened: false,
             recheck_owed: false,
             names_owed: false,
-            branch_lists_sent: 0,
-            branch_list_taken: 0,
             credential_owed: false,
+            read_refused: false,
+            connection_ready: false,
             access_owed: false,
             _connection_watch: None,
         };
         session.credential = session.client(cx).credential_changes();
+        session.connection_ready = session.connection.read(cx).state == ConnectionState::Ready;
         session._connection_events = Some(cx.subscribe(
             &session.connection,
             |this, _, event: &ConnectionEvent, cx| match event {
@@ -938,7 +948,7 @@ impl GraphSession {
                     this.sync_access(cx);
                 }
                 ConnectionEvent::TokenReady => this.open_when_ready(cx),
-                ConnectionEvent::StateChanged => {}
+                ConnectionEvent::StateChanged => this.connection_state_changed(cx),
             },
         ));
         session.labels = session.chosen_labels(cx);
@@ -1033,6 +1043,7 @@ impl GraphSession {
         let credential = client.credential_changes();
         if credential != self.credential {
             self.credential = credential;
+            self.read_refused = false;
             self.forget_reads();
             self.read_again_for_credential(cx);
         }
@@ -1085,8 +1096,9 @@ impl GraphSession {
         self.whole_commit_pages.clear();
     }
 
-    /// Reads again, under a new token, what the session shows of the graph as the old one was
-    /// answered it: the type counts, the stored-query catalog (once wanted) and the branch
+    /// Reads again, under a new token (or the token held, once the connection is ready again
+    /// after a 401 refused reads under it), what the session shows of the graph as the old one
+    /// was answered it: the type counts, the stored-query catalog (once wanted) and the branch
     /// list; and every read a 401 could have refused under the old one: the schema, when none
     /// is held. The new token's policy may refuse it what the old one read, so none of it shows
     /// meanwhile: each is being read, and views hear it, and [`SessionEvent::CredentialChanged`]
@@ -1198,14 +1210,10 @@ impl GraphSession {
                 }
             }
             Err(ReadError::Transport(_)) => {}
-            // The token may have lapsed: the connection asks its source again, once for it. A 401
-            // that refused no token (one that never arrived, as a proxy drops it) asks nothing:
-            // the next token would fare no better.
             Err(ReadError::Refused(error)) if error.status == 401 => {
-                let sent = self.connection.read(cx).has_token();
-                if graph_client::Challenge::refuses(error.challenge.as_deref(), sent) {
-                    self.connection
-                        .update(cx, |connection, cx| connection.read_refused(cx));
+                self.read_refused = true;
+                if error.unauthorized == Some(Unauthorized::TokenRefused) {
+                    self.token_refused(cx);
                 }
             }
             _ => {
@@ -1217,11 +1225,6 @@ impl GraphSession {
                     if self.shown {
                         self.check_heads(cx);
                     }
-                }
-                // The token was taken: should it lapse later, its refusal asks the source again.
-                if self.connection.read(cx).read_refusal_noted() {
-                    self.connection
-                        .update(cx, |connection, _| connection.read_taken());
                 }
                 // The policy may allow less than was read: the client counted the refusal, and
                 // what the credential may do is read again, as after a refused write.
@@ -1523,7 +1526,9 @@ impl GraphSession {
         self.schema = schema;
         cx.emit(SessionEvent::SchemaChanged);
         cx.notify();
-        self.check_heads(cx);
+        // The heads under it; the branch list a schema does not change is read beside the
+        // schema by a reload, and by every poll.
+        self.check(false, cx);
     }
 
     /// A text other than the one held starts a new schema epoch: what was kept under the old
@@ -1646,7 +1651,6 @@ impl GraphSession {
         let client = self.client(cx);
         let graph = self.graph_id.clone();
         let moves = self.branch_moves;
-        let sent = self.next_branch_list();
         let read = cx.background_spawn(async move { client.branches(&graph).await });
         self._branches_task = Some(cx.spawn(async move |this, cx| {
             let read = read.await;
@@ -1661,10 +1665,6 @@ impl GraphSession {
                     this.head_commits.forget(changed);
                 }
                 let result = match result {
-                    // Asked for before a list already taken (a poll's, sent while this one was
-                    // out and answered first): the newer stays, and nothing is dropped for a
-                    // branch only it holds, nor kept for one it lacks.
-                    Loadable::Loaded(_) if sent < this.branch_list_taken => return,
                     Loadable::Loaded(branches) => branches,
                     // The list held is still the graph's.
                     _ if matches!(this.branches, Loadable::Loaded(_)) => return,
@@ -1675,7 +1675,6 @@ impl GraphSession {
                         return;
                     }
                 };
-                this.branch_list_taken = sent;
                 // A name the server lists again was made again since it was deleted.
                 this.gone_branches.retain(|branch| !result.contains(branch));
                 // The first list changes nothing read before it: lists asked for meanwhile
@@ -2494,6 +2493,34 @@ impl GraphSession {
         self.read_access(branch, cx);
     }
 
+    /// The server refused the token a request of this graph carried (a read, a write, or the
+    /// agent's through its gateway; [`Unauthorized::TokenRefused`]): it may have lapsed, so the
+    /// connection asks its source again, once for the token held
+    /// ([`Connection::request_refused`]). A 401 that refused no token (one that never arrived, as
+    /// a proxy drops it) is not told here: the next token would fare no better.
+    pub fn token_refused(&mut self, cx: &mut Context<Self>) {
+        self.connection
+            .update(cx, |connection, cx| connection.request_refused(cx));
+    }
+
+    /// The connection's state moved. Ready again with the token a read was refused under (one
+    /// that never arrived, put right and Retried; a refused one given back): what the session
+    /// shows is read again, as under a new token ([`Self::read_again_for_credential`]), since
+    /// nothing else reads what the 401 refused and each view's failure would stand until its own
+    /// Try again. A new token reads it all again itself ([`Self::sync_access`]).
+    fn connection_state_changed(&mut self, cx: &mut Context<Self>) {
+        let ready = self.connection.read(cx).state == ConnectionState::Ready;
+        let was_ready = std::mem::replace(&mut self.connection_ready, ready);
+        if ready
+            && !was_ready
+            && self.read_refused
+            && self.client(cx).credential_changes() == self.credential
+        {
+            self.read_refused = false;
+            self.read_again_for_credential(cx);
+        }
+    }
+
     /// Whether a window shows the graph ([`Self::set_shown`]).
     pub fn is_shown(&self) -> bool {
         self.shown
@@ -2521,6 +2548,11 @@ impl GraphSession {
     /// way, and the branch list. Heads of branches no longer watched are forgotten. A parked
     /// graph asks nothing: it asks when shown again.
     pub fn check_heads(&mut self, cx: &mut Context<Self>) {
+        self.check(true, cx);
+    }
+
+    /// [`Self::check_heads`], the branch list read again only `with_branches`.
+    fn check(&mut self, with_branches: bool, cx: &mut Context<Self>) {
         if !self.shown {
             self.head_check_missed = true;
             return;
@@ -2542,7 +2574,9 @@ impl GraphSession {
         if self.unavailable.is_some() {
             return;
         }
-        self.recheck_branches(cx);
+        if with_branches {
+            self.recheck_branches(cx);
+        }
         for branch in watched {
             if !self.head_reads.contains_key(&branch) {
                 self.read_head(branch, cx);
@@ -2634,15 +2668,10 @@ impl GraphSession {
         self.head_reads.insert(key, read);
     }
 
-    /// A number for a branch-list read about to be sent: the lists are taken in the order
-    /// they were asked for, whatever order they answer in.
-    fn next_branch_list(&mut self) -> u64 {
-        self.branch_lists_sent += 1;
-        self.branch_lists_sent
-    }
-
     /// Reads the branch list again once it has been read, so a branch made or deleted elsewhere
-    /// (the CLI, an agent, another window) appears; an unchanged list changes nothing.
+    /// (the CLI, an agent, another window) appears; an unchanged list changes nothing. One list
+    /// read is out at a time: none beside a reload's, and a reload drops one under way
+    /// ([`Self::read_branches`]), so an older list never lands after a newer one.
     fn recheck_branches(&mut self, cx: &mut Context<Self>) {
         // A read of the list under way answers for now: a poll beside it would read it twice.
         if self.branch_recheck.is_some()
@@ -2654,7 +2683,6 @@ impl GraphSession {
         let client = self.client(cx);
         let graph = self.graph_id.clone();
         let moves = self.branch_moves;
-        let sent = self.next_branch_list();
         let read = cx.background_spawn(async move { client.branches(&graph).await });
         self.branch_recheck = Some(cx.spawn(async move |this, cx| {
             let read = read.await;
@@ -2664,11 +2692,6 @@ impl GraphSession {
                 let Ok(output) = read else {
                     return;
                 };
-                // A list read again since, and taken, is newer.
-                if sent < this.branch_list_taken {
-                    return;
-                }
-                this.branch_list_taken = sent;
                 let branches = branch_order(output.branches);
                 if this.branches.loaded() != Some(&branches) {
                     this.forget_branches_changed(&branches, cx);
@@ -2725,6 +2748,7 @@ impl GraphSession {
             return;
         }
         self.heads.insert(branch.clone(), head.clone());
+        self.not_at_head.remove(&branch);
         // Before views hear of the move, so they find the read under way. Only Studio's own
         // commit on top of the head held leaves the schema as it was: one placed by a head read
         // sits on another writer's.
@@ -3127,45 +3151,57 @@ impl GraphSession {
             return self.read_request(request, cx);
         };
         // A branch whose head is the commit answers the read faster than the commit does: the
-        // session's own branch, else another watched one at it (a review's, an agent's).
-        let at_head = if self.heads.get(&self.branch) == Some(&commit) {
+        // session's own branch, else another watched one at it (a review's, an agent's). Not
+        // one that answered a read at another commit since.
+        let at = |branch: &String| {
+            self.heads.get(branch) == Some(&commit) && self.not_at_head.get(branch) != Some(&commit)
+        };
+        let at_head = if at(&self.branch) {
             Some(self.branch.clone())
         } else {
-            self.heads
-                .iter()
-                .find(|(_, head)| **head == commit)
-                .map(|(branch, _)| branch.clone())
+            self.heads.keys().find(|branch| at(branch)).cloned()
         };
         let Some(branch) = at_head else {
             return self.read_request(request, cx);
         };
         let at_branch = QueryRequest {
-            branch: Some(branch),
+            branch: Some(branch.clone()),
             snapshot: None,
             ..request.clone()
         };
         let branch_read = self.read_request(at_branch, cx);
         cx.spawn(async move |this, cx| {
-            match branch_read.await {
+            let elsewhere = match branch_read.await {
                 Ok(mut output) if output.graph_commit_id.as_deref() == Some(commit.as_str()) => {
                     // Answered as the pinned read would be.
                     output.target.branch = None;
                     output.target.snapshot = Some(commit);
                     return Ok(output);
                 }
-                // The branch moved past the commit, or went (a branch the server does not
-                // know is not found), or the credential may not read it, which says nothing of
-                // the commit read by itself (a policy may scope reads by branch): read at the
-                // commit itself. Any other refusal is the read's own, which the commit would
-                // answer alike: on this route a 409 is a full-text index to rebuild, which no
-                // read clears.
-                Ok(_)
-                | Err(ReadError::Refused(ApiErrorSummary {
+                // The branch answered at another commit: read at the commit itself.
+                Ok(_) => true,
+                // The branch went (a branch the server does not know is not found), or the
+                // credential may not read it, which says nothing of the commit read by itself (a
+                // policy may scope reads by branch): read at the commit itself. Any other refusal
+                // is the read's own, which the commit would answer alike: on this route a 409 is
+                // a full-text index to rebuild, which no read clears.
+                Err(ReadError::Refused(ApiErrorSummary {
                     status: 404 | 403, ..
-                })) => {}
+                })) => false,
                 Err(error) => return Err(error),
-            }
-            let pinned = this.update(cx, |this, cx| this.read_request(request, cx));
+            };
+            let pinned = this.update(cx, |this, cx| {
+                // The reads at the commit after this one go to it at once, rather than each
+                // reading the branch and then the commit until the next poll moves the head (up
+                // to 30 s). The head itself is left to the head watch: the other commit is not
+                // known to be newer (a server replica behind, or Studio's own commit not yet
+                // served), and taking it would move the head back and call Studio's own write
+                // another writer's.
+                if elsewhere && this.heads.get(&branch) == Some(&commit) {
+                    this.not_at_head.insert(branch, commit.clone());
+                }
+                this.read_request(request, cx)
+            });
             match pinned {
                 Ok(pinned) => pinned.await,
                 Err(_) => Err(ReadError::Transport(
@@ -4173,6 +4209,14 @@ impl GraphSession {
             let kind = outcome_kind(&outcome, commit);
             let parent = parent_of(&outcome, commit);
             this.update(cx, |this, cx| {
+                // Refused for its token: asked for the next as for a read, though the write is
+                // not sent again.
+                if let WriteOutcome::Refused(error) = &outcome
+                    && error.unauthorized == Some(Unauthorized::TokenRefused)
+                    && !error.token_replaced
+                {
+                    this.token_refused(cx);
+                }
                 let log = log(this, &outcome, cx);
                 this.finish_write(log, kind, parent, cx);
                 after(this, &outcome, cx);
@@ -4217,7 +4261,7 @@ fn outcome_kind<T>(
             commit(value).map(|commit| (commit.graph_commit_id.clone(), commit.kind)),
         ),
         WriteOutcome::Refused(error) => OutcomeKind::Refused {
-            message: error.body.error.clone(),
+            message: error.reason().to_owned(),
         },
         WriteOutcome::NotSent { reason } => OutcomeKind::Refused {
             message: nothing_sent(reason),
@@ -5413,10 +5457,65 @@ mod tests {
         );
     }
 
+    /// A graph opened, or refreshed, reads its branch list once, though the list answers before
+    /// the schema: taking the schema probes the heads under it, and leaves the list read
+    /// beside it. Before, it read the list again, so about half of all opens and Refreshes
+    /// read it twice, on a graph an agent may have left thousands of branches on.
+    #[gpui::test]
+    async fn a_graph_opened_reads_its_branch_list_once(cx: &mut TestAppContext) {
+        let lists = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listed = lists.clone();
+        // The schema answers once the test lets it, after the branch list.
+        let (release, gate) = oneshot::channel::<()>();
+        let gate = gate.shared();
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let (listed, gate) = (listed.clone(), gate.clone());
+            async move {
+                let body = if path.ends_with("/schema") {
+                    gate.await.ok();
+                    r#"{"schema_source":"node Person {\n  slug: String @key\n}\n"}"#
+                } else if path.ends_with("/branches") {
+                    listed.fetch_add(1, Ordering::SeqCst);
+                    r#"{"branches":["main"]}"#
+                } else if path.ends_with("/query") {
+                    r#"{"query_name":"q","target":{"branch":"main","snapshot":null},"row_count":0,"columns":[],"rows":[],"graph_commit_id":"c1"}"#
+                } else {
+                    "{}"
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        assert_eq!(lists.load(Ordering::SeqCst), 1, "the list answered first");
+        release.send(()).unwrap();
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| {
+            assert!(matches!(session.schema, Loadable::Loaded(_)));
+            assert_eq!(session.head("main"), Some("c1"), "the heads probed");
+        });
+        assert_eq!(lists.load(Ordering::SeqCst), 1, "the list read once");
+    }
+
     /// A read at the commit the branch's head is at goes as a read of the branch, which the
     /// server answers from its warm caches, and counts only if it comes back at that commit.
-    /// Once the branch has moved past it, the read is sent again pinned to the commit; the head
-    /// moves only by the head watch.
+    /// Once the branch has answered at another commit, the read is sent again pinned to the
+    /// commit, and so is every read at it after, at once; the head moves only by the head
+    /// watch. Before, every read at the old head until the next poll, up to 30 seconds, read
+    /// the branch and then the commit.
     #[gpui::test]
     async fn a_read_at_the_head_goes_to_the_branch_and_checks_its_commit(cx: &mut TestAppContext) {
         use futures::AsyncReadExt as _;
@@ -5451,6 +5550,8 @@ mod tests {
                         "graph_commit_id": at,
                     })
                     .to_string()
+                } else if path.ends_with("/schema") {
+                    r#"{"schema_source":"node Person {\n  slug: String @key\n}\n"}"#.to_owned()
                 } else {
                     r#"{"branches":["main"]}"#.to_owned()
                 };
@@ -5471,8 +5572,8 @@ mod tests {
         let session =
             cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
         cx.run_until_parked();
-        session.update(cx, |session, _| {
-            session.heads.insert("main".into(), "c1".into());
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.head("main"), Some("c1"), "the head watch read c1");
         });
         sent.lock().unwrap().clear();
         let query = |n: i64| BuiltQuery {
@@ -5505,8 +5606,9 @@ mod tests {
             session.read(&query(2), Some("c1".into()), cx)
         });
         let output = read.await.unwrap();
+        cx.run_until_parked();
         assert_eq!(
-            *sent.lock().unwrap(),
+            std::mem::take(&mut *sent.lock().unwrap()),
             vec![
                 (Some("main".to_owned()), None),
                 (None, Some("c1".to_owned()))
@@ -5525,6 +5627,16 @@ mod tests {
                 "a read does not move the head"
             );
         });
+        // The next read at the old commit goes pinned at once.
+        let read = session.update(cx, |session, cx| {
+            session.read(&query(4), Some("c1".into()), cx)
+        });
+        read.await.unwrap();
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![(None, Some("c1".to_owned()))],
+            "pinned, the branch not read first"
+        );
 
         // At the head of another watched branch (a review's): read through that branch.
         session.update(cx, |session, _| {
@@ -5734,9 +5846,9 @@ mod tests {
         );
     }
 
-    /// A poll's branch list sent while a reload's was out, and answered first, is the newer:
-    /// the reload's, landing after it, is not taken, so a branch only the poll's lists keeps
-    /// its drafts.
+    /// A reload's branch list sent while a poll's was out is the newer: the poll's, older,
+    /// never lands (the reload drops it, and no poll goes beside a reload), so a branch only the
+    /// reload's lists keeps its drafts.
     #[gpui::test]
     async fn an_older_branch_list_landing_last_does_not_replace_a_newer_one(
         cx: &mut TestAppContext,
@@ -5754,8 +5866,8 @@ mod tests {
                 } else if path.ends_with("/query") {
                     serde_json::json!({ "query_name": "studio_head", "target": { "branch": "main" }, "row_count": 0, "rows": [], "graph_commit_id": "c1" })
                 } else if path.ends_with("/branches") {
-                    // The first list; the reload's, held, from before a branch was made; the
-                    // poll's, after.
+                    // The first list; the poll's, held, from before a branch was made; the
+                    // reload's, after.
                     match count.fetch_add(1, Ordering::SeqCst) {
                         0 => serde_json::json!({ "branches": ["main"] }),
                         1 => {
@@ -5790,12 +5902,13 @@ mod tests {
         };
         assert_eq!(listed(cx), Some(vec!["main".to_owned()]));
 
-        session.update(cx, |session, cx| session.reload_branches(cx));
-        cx.run_until_parked();
         session.update(cx, |session, cx| session.check_heads(cx));
         cx.run_until_parked();
+        assert_eq!(lists.load(Ordering::SeqCst), 2, "the poll's list out");
+        session.update(cx, |session, cx| session.reload_branches(cx));
+        cx.run_until_parked();
         let both = Some(vec!["main".to_owned(), "made".to_owned()]);
-        assert_eq!(listed(cx), both, "the poll's");
+        assert_eq!(listed(cx), both, "the reload's");
         let key = DraftKey {
             type_name: "Person".into(),
             id: "p1".into(),
@@ -7479,7 +7592,9 @@ mod tests {
                 } else if token != accepted {
                     (
                         401,
-                        json!({ "error": "unauthorized", "code": "unauthorized" }),
+                        json!({ "error": "unauthorized", "code": "unauthorized",
+                            "disposition": { "execution": "not_started", "effects": "none",
+                                "action": "fix" } }),
                     )
                 } else {
                     let body = match read.as_str() {
@@ -7609,6 +7724,209 @@ mod tests {
         *accepted.lock().unwrap() = DROPPED;
         session.update(cx, |session, cx| session.reload(cx));
         cx.run_until_parked();
+        assert_eq!(asked(), 3, "a token that never arrived asks nothing");
+    }
+
+    /// A graph whose reads were refused because its token never arrived (a proxy dropped it)
+    /// reads them again once the connection is ready again with that token: put right, then
+    /// Retried. The token did not change, so before nothing read them, and each failure stood
+    /// until its own Try again.
+    #[gpui::test]
+    async fn reads_refused_before_the_connection_is_ready_again_are_read_again(
+        cx: &mut TestAppContext,
+    ) {
+        /// Gives `t1` whenever asked.
+        struct Same;
+        impl TokenSource for Same {
+            fn token(
+                &self,
+                _: Arc<AtomicBool>,
+            ) -> futures::future::BoxFuture<'static, Result<Token, NoToken>> {
+                async { Ok(Token::new("t1")) }.boxed()
+            }
+        }
+        let accepted = Arc::new(std::sync::Mutex::new(DROPPED));
+        let (http, _) = answers_alone(accepted.clone());
+        let server = ServerEntry {
+            name: "personal".into(),
+            url: "https://graph.test".into(),
+            source: ServerSource::Cli,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| {
+            Connection::new(server, None, http)
+                .unwrap()
+                .with_token_source(Some(Arc::new(Same)))
+        });
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        let session =
+            cx.update(|cx| open_session(connection.clone(), "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        connection.read_with(cx, |connection, _| assert!(connection.token_not_received()));
+        let schema_loaded = |cx: &mut TestAppContext| {
+            session.read_with(cx, |session, _| {
+                matches!(session.schema, Loadable::Loaded(_))
+            })
+        };
+        assert!(!schema_loaded(cx), "refused while the token is dropped");
+
+        // Put right, then Retry.
+        *accepted.lock().unwrap() = "t1";
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        cx.run_until_parked();
+        connection.read_with(cx, |connection, _| {
+            assert_eq!(connection.state, ConnectionState::Ready)
+        });
+        assert!(schema_loaded(cx), "read again once the connection is ready");
+    }
+
+    /// A write refused for its token asks the source again, as a read does (spec 016, 401 and
+    /// 403), and is not sent again; once the server takes a write with the next token, its lapse
+    /// in turn asks again, though no read took it; one whose token never arrived asks
+    /// nothing. Before, only a read's 401 asked, and only a read taken let the next lapse ask,
+    /// so once a token lapsed writes and the agent's requests were refused until a read
+    /// happened to notice.
+    #[gpui::test]
+    async fn a_write_refused_for_its_token_asks_the_source_again(cx: &mut TestAppContext) {
+        /// Gives `t1`, `t2`, `t3` in turn, then `t3` again.
+        #[derive(Default)]
+        struct Counted(std::sync::Mutex<usize>);
+        impl TokenSource for Counted {
+            fn token(
+                &self,
+                _: Arc<AtomicBool>,
+            ) -> futures::future::BoxFuture<'static, Result<Token, NoToken>> {
+                let mut asked = self.0.lock().unwrap();
+                *asked += 1;
+                let token = ["t1", "t2", "t3"][(*asked - 1).min(2)];
+                async move { Ok(Token::new(token)) }.boxed()
+            }
+        }
+        // A write is refused for any token but `accepted`, as Omnigraph refuses one
+        // (`invalid_token` for a token received, a bare `Bearer` for none), and taken for it. A
+        // graph's read (the branch list a write reads after it) is answered 404, which takes no
+        // token and refuses none: only a write can ask, and only a write taken ends the one
+        // more try.
+        let accepted = Arc::new(std::sync::Mutex::new("t1"));
+        let accepts = accepted.clone();
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sent = writes.clone();
+        let http = FakeHttpClient::create(move |request| {
+            use serde_json::json;
+            let write = request.method() == http_client::http::Method::POST;
+            if write {
+                sent.fetch_add(1, Ordering::SeqCst);
+            }
+            let path = request.uri().path().to_owned();
+            let accepted = *accepts.lock().unwrap();
+            let token = if accepted == DROPPED {
+                String::new()
+            } else {
+                request
+                    .headers()
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            let accepted = format!("Bearer {accepted}");
+            async move {
+                let mut response = Response::builder()
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT);
+                let body = if write && token != accepted {
+                    response = response.status(401).header(
+                        "www-authenticate",
+                        if token.is_empty() {
+                            "Bearer"
+                        } else {
+                            r#"Bearer error="invalid_token""#
+                        },
+                    );
+                    json!({ "error": "unauthorized", "code": "unauthorized",
+                        "disposition": { "execution": "not_started", "effects": "none",
+                            "action": "fix" } })
+                } else if path.ends_with("/healthz") {
+                    json!({ "status": "ok", "version": "0.14.0", "internal_schema_version": 16 })
+                } else if path.ends_with("/graphs") {
+                    json!({ "graphs": [] })
+                } else if write {
+                    json!({ "branches": ["main"] })
+                } else {
+                    response = response.status(404);
+                    json!({ "error": "not found", "code": "not_found" })
+                };
+                Ok(response.body(AsyncBody::from(body.to_string())).unwrap())
+            }
+        });
+        let source = Arc::new(Counted::default());
+        let asked = || *source.0.lock().unwrap();
+        let server = ServerEntry {
+            name: "personal".into(),
+            url: "https://graph.test".into(),
+            source: ServerSource::Cli,
+            known_graphs: Vec::new(),
+        };
+        let held: Arc<dyn TokenSource> = source.clone();
+        let connection = cx.new(|_| {
+            Connection::new(server, None, http)
+                .unwrap()
+                .with_token_source(Some(held))
+        });
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        // Behind its window, so it reads nothing of its own accord.
+        let session = cx.update(|cx| {
+            open_session_behind(connection.clone(), "knowledge".into(), "main".into(), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(asked(), 1);
+
+        // `t1` lapses: the write is refused for it, and the source is asked again.
+        *accepted.lock().unwrap() = "t2";
+        let write = session.update(cx, |session, cx| {
+            session.create_branch("x".into(), BranchStart::Head("main".into()), cx)
+        });
+        cx.run_until_parked();
+        assert!(matches!(
+            write.await,
+            WriteOutcome::Refused(graph_client::ApiError { status: 401, .. })
+        ));
+        assert_eq!(asked(), 2, "the write's refusal asked for the next token");
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            1,
+            "the refused write was not sent again"
+        );
+
+        // `t2` is taken by a write, then lapses in turn: asked again, though no read took it.
+        let write = session.update(cx, |session, cx| {
+            session.create_branch("y".into(), BranchStart::Head("main".into()), cx)
+        });
+        cx.run_until_parked();
+        assert!(!matches!(write.await, WriteOutcome::Refused(_)));
+        *accepted.lock().unwrap() = "t3";
+        let write = session.update(cx, |session, cx| {
+            session.create_branch("z".into(), BranchStart::Head("main".into()), cx)
+        });
+        cx.run_until_parked();
+        assert!(matches!(
+            write.await,
+            WriteOutcome::Refused(graph_client::ApiError { status: 401, .. })
+        ));
+        assert_eq!(asked(), 3, "the second lapse asked again");
+
+        // `t3` is taken; then a token that never arrives: the write's 401 refused none, and
+        // nothing is asked, though a refusal now could ask.
+        let write = session.update(cx, |session, cx| {
+            session.create_branch("v".into(), BranchStart::Head("main".into()), cx)
+        });
+        cx.run_until_parked();
+        assert!(!matches!(write.await, WriteOutcome::Refused(_)));
+        *accepted.lock().unwrap() = DROPPED;
+        let write = session.update(cx, |session, cx| {
+            session.create_branch("w".into(), BranchStart::Head("main".into()), cx)
+        });
+        cx.run_until_parked();
+        assert!(matches!(write.await, WriteOutcome::Refused(_)));
         assert_eq!(asked(), 3, "a token that never arrived asks nothing");
     }
 
