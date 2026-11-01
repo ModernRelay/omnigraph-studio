@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Sign a build with the Mac's own development identity, so the Keychain keeps trusting it.
+#
+#   script/sign-dev                                 # target/debug/omnigraph-studio
+#   script/sign-dev target/release-fast/omnigraph-studio
+#   script/sign-dev "target/bundle/Omnigraph Studio.app"
+#
+# A debug build is signed ad hoc, so every rebuild is a new app to macOS: the Keychain, which
+# holds each server's token, asks again at every launch, and "Always Allow" blesses one binary
+# only. A self-signed code-signing certificate in the login keychain gives every build one
+# identity (the Keychain trusts the certificate and the identifier, not the bytes), so one
+# "Always Allow" holds across rebuilds. It opens only on this Mac; a release takes the
+# Developer ID (`script/bundle-mac`, STUDIO_SIGN_IDENTITY).
+#
+# Make the certificate once (it lasts ten years):
+#
+#   script/sign-dev --make-identity
+#
+# STUDIO_DEV_SIGN_IDENTITY names the identity (default "Omnigraph Studio Dev");
+# STUDIO_BUNDLE_ID the identifier (default com.modernrelay.omnigraph-studio).
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+identity=${STUDIO_DEV_SIGN_IDENTITY:-Omnigraph Studio Dev}
+bundle_id=${STUDIO_BUNDLE_ID:-com.modernrelay.omnigraph-studio}
+keychain=$HOME/Library/Keychains/login.keychain-db
+
+if [[ "${1:-}" == "--make-identity" ]]; then
+  if security find-identity -v -p codesigning | grep -q "\"$identity\""; then
+    echo "identity \"$identity\" exists" >&2
+    exit 0
+  fi
+  work=$(mktemp -d)
+  chmod 700 "$work"
+  trap 'rm -rf "$work"' EXIT
+  cat > "$work/ext.cnf" <<EOF
+[req]
+distinguished_name = dn
+x509_extensions = v3
+prompt = no
+[dn]
+CN = $identity
+[v3]
+basicConstraints = critical,CA:false
+keyUsage = critical,digitalSignature
+extendedKeyUsage = critical,codeSigning
+subjectKeyIdentifier = hash
+EOF
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout "$work/key.pem" -out "$work/cert.pem" \
+    -days 3650 -config "$work/ext.cnf" > /dev/null 2>&1
+  pass=$(openssl rand -hex 16)
+  # macOS reads only the legacy PKCS12 encoding, not OpenSSL 3's default.
+  openssl pkcs12 -export -inkey "$work/key.pem" -in "$work/cert.pem" -name "$identity" \
+    -out "$work/dev.p12" -passout "pass:$pass" \
+    -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
+  security import "$work/dev.p12" -k "$keychain" -P "$pass" -T /usr/bin/codesign
+  # Trusted for code signing by this user; macOS may ask for the login password here.
+  security add-trusted-cert -r trustRoot -p codeSign -k "$keychain" "$work/cert.pem"
+  security find-identity -v -p codesigning | grep "\"$identity\""
+  exit 0
+fi
+
+target=${1:-$ROOT/target/debug/omnigraph-studio}
+if ! security find-identity -v -p codesigning | grep -q "\"$identity\""; then
+  echo "no identity \"$identity\" in the keychain: run script/sign-dev --make-identity" >&2
+  exit 1
+fi
+/usr/bin/codesign --force --sign "$identity" --identifier "$bundle_id" \
+  --entitlements "$ROOT/resources/macos/studio.entitlements" "$target"
+/usr/bin/codesign --verify --verbose=2 "$target"

@@ -13,7 +13,9 @@
 #                           the DMG, waits, and staples the ticket
 # Beside the DMG it writes the update Studio's updater installs (spec 017),
 # Omnigraph-Studio-<version>-<arch>.app.tar.gz: the signed app, the bundle its top directory.
-# Without an identity the app is signed ad hoc and opens only on the Mac that built it.
+# Without one, the Mac's own development identity signs it when there is one (script/sign-dev
+# --make-identity), so the Keychain keeps trusting the app across builds; else it is signed ad
+# hoc. Either opens only on the Mac that built it.
 # STUDIO_BUNDLE_ID overrides the bundle identifier.
 set -euo pipefail
 
@@ -129,6 +131,10 @@ entitlements="$ROOT/resources/macos/studio.entitlements"
 if [[ -n "${STUDIO_SIGN_IDENTITY:-}" ]]; then
   /usr/bin/codesign --force --timestamp --options runtime --entitlements "$entitlements" \
     --sign "$STUDIO_SIGN_IDENTITY" "$app"
+elif security find-identity -v -p codesigning | grep -q "\"${STUDIO_DEV_SIGN_IDENTITY:-Omnigraph Studio Dev}\""; then
+  # This Mac's own identity (script/sign-dev): the Keychain keeps trusting the app across builds.
+  /usr/bin/codesign --force --entitlements "$entitlements" \
+    --sign "${STUDIO_DEV_SIGN_IDENTITY:-Omnigraph Studio Dev}" "$app"
 else
   /usr/bin/codesign --force --entitlements "$entitlements" --sign - "$app"
 fi

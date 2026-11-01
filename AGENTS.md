@@ -60,6 +60,10 @@ python3 script/test_release_files.py   # a release's version-free copies and lat
   `advance_clock`, with `http_client::FakeHttpClient` behind the session
   (`type_table/src/dialogs.rs` tests). Offscreen snapshots (`crates/studio/examples/snapshot.rs`)
   check what a view looks like.
+- A debug build run from `target/` is signed ad hoc, so each rebuild is a new app to the
+  Keychain and it asks for the login password again. Sign it after every build with
+  `script/sign-dev` (once: `script/sign-dev --make-identity`); `script/bundle-mac` uses the same
+  identity when no Developer ID is set.
 - Write files with `studio_settings::write_atomic`, never by truncating in place.
 - A function used on one platform carries the same `cfg` as its caller, so the other platforms
   still build.
