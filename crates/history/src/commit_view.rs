@@ -1,9 +1,8 @@
 //! One commit's changes against its first parent (spec 009), with the same entity cards as the
-//! review. Shown in History's detail split, or as its own tab through `OpenCommit`.
+//! review. Its own tab, opened from History or through `OpenCommit`.
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
 
 use change_cards::{CardLines, CardRows, Row};
 use gpui::{
@@ -30,17 +29,6 @@ const CAP: usize = 5_000;
 /// Changes asked for per page: the whole of [`CAP`], since each page restarts the server's
 /// comparison after the last change returned; the server's byte budget still bounds a page.
 const PAGE: u32 = CAP as u32;
-
-/// A commit's counts, once its changes are read; History shows them in its list.
-#[derive(Debug, Clone)]
-pub struct CommitCounts {
-    pub commit_id: String,
-    pub added: usize,
-    pub changed: usize,
-    pub removed: usize,
-    /// More changes are still to read: the counts are of those read so far.
-    pub partial: bool,
-}
 
 enum State {
     Loading,
@@ -89,7 +77,6 @@ pub struct CommitView {
     focus_handle: FocusHandle,
     _task: Option<Task<()>>,
     /// The wait before a stepped-to commit's first read; dropped with the view.
-    _pause: Option<Task<()>>,
     /// The commit and its changes are read when the tab is next drawn ([`Self::when_shown`]):
     /// a tab restored with the workspace behind another reads nothing until it is shown.
     read_owed: bool,
@@ -98,7 +85,6 @@ pub struct CommitView {
 }
 
 impl EventEmitter<ItemEvent> for CommitView {}
-impl EventEmitter<CommitCounts> for CommitView {}
 
 impl Focusable for CommitView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -156,28 +142,6 @@ impl CommitView {
         view
     }
 
-    /// A commit stepped to, which reads its changes only once the stepping has paused for
-    /// `pause`: a held arrow key passes commits whose reads the server would otherwise start
-    /// and the view drop. The header shows at once.
-    pub fn after_pause(
-        session: Entity<GraphSession>,
-        commit_id: String,
-        commit: Option<CommitOutput>,
-        pause: Duration,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let mut view = Self::unread(session, commit_id, commit, cx);
-        view._pause = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(pause).await;
-            this.update(cx, |this, cx| {
-                this.read_commit(cx);
-                this.load_more(cx);
-            })
-            .ok();
-        }));
-        view
-    }
-
     fn unread(
         session: Entity<GraphSession>,
         commit_id: String,
@@ -213,15 +177,10 @@ impl CommitView {
             list_state: ListState::new(0, ListAlignment::Top, px(600.)),
             focus_handle: cx.focus_handle(),
             _task: None,
-            _pause: None,
             read_owed: false,
             _regroup_task: None,
             _schema_subscription: schema_subscription,
         }
-    }
-
-    pub fn commit_id(&self) -> &str {
-        &self.commit_id
     }
 
     /// Reads the commit itself when the view came without it (a tab restored, a toast's or a
@@ -395,17 +354,6 @@ impl CommitView {
                         this.state = State::Ready;
                         // A schema that arrived while these were grouped groups them again.
                         this.regroup(cx);
-                        let (added, changed, removed) =
-                            this.counts.iter().fold((0, 0, 0), |(a, c, r), t| {
-                                (a + t.added, c + t.changed, r + t.removed)
-                            });
-                        cx.emit(CommitCounts {
-                            commit_id: this.commit_id.clone(),
-                            added,
-                            changed,
-                            removed,
-                            partial: this.next_page_token.is_some(),
-                        });
                     }
                     Err(message) => this.state = State::Failed(message.into()),
                 }
@@ -545,6 +493,7 @@ impl CommitView {
                     window.dispatch_action(
                         Box::new(OpenCommit {
                             commit_id: id.clone(),
+                            preview: false,
                         }),
                         cx,
                     )
@@ -883,10 +832,11 @@ pub(crate) fn open_in(
     session: Entity<GraphSession>,
     id: String,
     listed: Option<CommitOutput>,
+    preview: bool,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    workspace.open_item::<CommitView>(commit_key(&id), window, cx, |_, cx| {
+    workspace.open_item_with::<CommitView>(commit_key(&id), preview, window, cx, |_, cx| {
         CommitView::new(session, id, listed, cx)
     });
 }
@@ -897,17 +847,24 @@ pub(crate) fn open_in(
 pub(crate) fn open_listed(
     session: &Entity<GraphSession>,
     commit: &CommitOutput,
+    preview: bool,
     window: &mut Window,
     cx: &mut App,
 ) {
     let id = commit.graph_commit_id.clone();
     let Some(workspace) = studio_workspace::workspace_for(window) else {
-        window.dispatch_action(Box::new(OpenCommit { commit_id: id }), cx);
+        window.dispatch_action(
+            Box::new(OpenCommit {
+                commit_id: id,
+                preview,
+            }),
+            cx,
+        );
         return;
     };
     let (session, listed) = (session.clone(), commit.clone());
     workspace.update(cx, |workspace, cx| {
-        open_in(workspace, session, id, Some(listed), window, cx)
+        open_in(workspace, session, id, Some(listed), preview, window, cx)
     });
 }
 
@@ -1110,14 +1067,6 @@ mod tests {
         let session =
             cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
         let view = cx.new(|cx| CommitView::new(session, "c9".into(), None, cx));
-        let partial = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let heard = partial.clone();
-        cx.update(|cx| {
-            cx.subscribe(&view, move |_, counts: &CommitCounts, _| {
-                heard.lock().unwrap().push(counts.partial)
-            })
-            .detach()
-        });
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert!(matches!(view.state, State::Ready));
@@ -1132,7 +1081,6 @@ mod tests {
             assert_eq!(view.next_page_token, None);
             assert!(view.more_error.is_none());
         });
-        assert_eq!(*partial.lock().unwrap(), [true, false]);
     }
 
     /// A schema that arrives after the changes were grouped groups them again from what was
@@ -1512,7 +1460,7 @@ mod tests {
             json!({ "graph_commit_id": "c7", "graph_manifest_version": 1, "kind": "published", "created_at": 0, "parent_commit_id": "c6" }),
         )
         .unwrap();
-        cx.update(|window, cx| open_listed(&session, &listed, window, cx));
+        cx.update(|window, cx| open_listed(&session, &listed, false, window, cx));
         cx.run_until_parked();
         let tab = workspace
             .read_with(cx, |workspace, _| {
@@ -1535,57 +1483,5 @@ mod tests {
                 .count(),
             1
         );
-    }
-
-    /// A commit stepped past reads nothing; the one the steps stop on reads once they pause.
-    #[gpui::test]
-    async fn a_stepped_commit_reads_only_once_the_steps_pause(cx: &mut TestAppContext) {
-        cx.update(studio_theme::init_test);
-        let reads = Arc::new(AtomicUsize::new(0));
-        let counted = reads.clone();
-        let http = FakeHttpClient::create(move |request| {
-            let changes = request.uri().path().ends_with("/changes");
-            if changes {
-                counted.fetch_add(1, Ordering::SeqCst);
-            }
-            async move {
-                let cause = json!({ "graph_commit_id": "c9", "parent_commit_id": "c8", "authored_branch": "main", "authored_at": 0 });
-                let body = json!({ "cause": cause, "changes": [] });
-                Ok(Response::builder()
-                    .status(if changes { 200 } else { 404 })
-                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
-                    .body(AsyncBody::from(body.to_string()))
-                    .unwrap())
-            }
-        });
-        let server = ServerEntry {
-            name: "dev".into(),
-            url: "http://127.0.0.1:8787".into(),
-            source: ServerSource::Environment,
-            known_graphs: Vec::new(),
-        };
-        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
-        let session =
-            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
-        let pause = Duration::from_millis(120);
-        let passed =
-            cx.new(|cx| CommitView::after_pause(session.clone(), "c8".into(), None, pause, cx));
-        cx.run_until_parked();
-        drop(passed);
-        let stopped = cx.new(|cx| CommitView::after_pause(session, "c9".into(), None, pause, cx));
-        cx.run_until_parked();
-        assert_eq!(
-            reads.load(Ordering::SeqCst),
-            0,
-            "nothing reads before the pause"
-        );
-        cx.executor().advance_clock(pause);
-        cx.run_until_parked();
-        assert_eq!(
-            reads.load(Ordering::SeqCst),
-            1,
-            "only the commit stopped on reads"
-        );
-        stopped.read_with(cx, |view, _| assert!(matches!(view.state, State::Ready)));
     }
 }

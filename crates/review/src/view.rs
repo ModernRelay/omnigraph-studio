@@ -31,6 +31,7 @@ use studio_actions::review::{
     SwitchLayout, ToggleChange,
 };
 use studio_actions::workspace::Refresh;
+use studio_actions::{ViewKind, ViewLink};
 use studio_settings::{ReviewLayout, StudioSettings};
 use studio_ui::ds::{radii, space};
 use studio_ui::{
@@ -582,6 +583,26 @@ impl Item for ReviewView {
 
     fn tab_icon(&self, _cx: &App) -> Option<IconName> {
         Some(IconName::GitBranch)
+    }
+
+    fn thing(&self, _cx: &App) -> Option<studio_actions::Thing> {
+        Some(studio_actions::Thing::Branch(self.branch.clone()))
+    }
+
+    fn views(&self, _cx: &App) -> Vec<ViewLink> {
+        vec![
+            ViewLink::current(ViewKind::Review),
+            ViewLink::to(ViewKind::History),
+        ]
+    }
+
+    fn view_action(&self, kind: ViewKind, _cx: &App) -> Option<Box<dyn gpui::Action>> {
+        (kind == ViewKind::History).then(|| {
+            Box::new(studio_actions::graph::OpenBranchHistory {
+                branch: self.branch.clone(),
+                preview: true,
+            }) as Box<dyn gpui::Action>
+        })
     }
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
@@ -2425,8 +2446,7 @@ impl ReviewView {
                         h_flex()
                             .gap(px(space::INLINE))
                             .items_center()
-                            .child(studio_ui::ds::icon::meta(IconName::GitBranch))
-                            .child(studio_ui::ds::text::meta("Review"))
+                            .children(studio_workspace::view_strip(Item::views(self, cx), cx))
                             .child(div().flex_1())
                             .child(
                                 h_flex()
@@ -4878,6 +4898,18 @@ pub fn open_review(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    open_review_with(workspace, branch, target, false, window, cx)
+}
+
+/// [`open_review`], as the pane's preview tab when `preview` says so.
+pub fn open_review_with(
+    workspace: &mut Workspace,
+    branch: String,
+    target: String,
+    preview: bool,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
     let Some(session) = workspace.session().cloned() else {
         return;
     };
@@ -4890,7 +4922,7 @@ pub fn open_review(
         return;
     }
     let key = review_key(&branch, &target);
-    workspace.open_item::<ReviewView>(key, window, cx, |window, cx| {
+    workspace.open_item_with::<ReviewView>(key, preview, window, cx, |window, cx| {
         ReviewView::new(session, branch, target, window, cx)
     });
 }

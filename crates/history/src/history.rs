@@ -5,13 +5,11 @@
 mod commit_view;
 mod lanes;
 mod merged;
-mod panel;
 mod view;
 
-use gpui::{App, AppContext as _};
-use studio_actions::graph::{OpenCommit, OpenHistory};
-use studio_workspace::{PanelPosition, Workspace};
-use ui::IconName;
+use gpui::App;
+use studio_actions::graph::{OpenBranchHistory, OpenCommit, OpenHistory};
+use studio_workspace::Workspace;
 
 use view::{HistoryView, history_key};
 
@@ -45,21 +43,7 @@ pub fn init(cx: &mut App) {
             |_, cx| commit_view::CommitView::when_shown(session, id, cx),
         );
     });
-    cx.observe_new(|workspace: &mut Workspace, window, cx| {
-        if let Some(window) = window {
-            let handle = cx.entity().downgrade();
-            let session = workspace.session().cloned();
-            let panel = cx.new(|cx| panel::HistoryPanel::new(handle, session, window, cx));
-            workspace.add_panel(
-                PanelPosition::Bottom,
-                "history",
-                "History",
-                IconName::HistoryRerun,
-                panel.clone().into(),
-                cx,
-            );
-            workspace.set_panel_focus("history", move |cx| panel.read(cx).focus(cx), cx);
-        }
+    cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(|workspace, _: &OpenHistory, window, cx| {
             let Some(session) = workspace.session().cloned() else {
                 return;
@@ -69,6 +53,19 @@ pub fn init(cx: &mut App) {
                 HistoryView::new(session, branch, window, cx)
             });
         });
+        workspace.register_action(|workspace, action: &OpenBranchHistory, window, cx| {
+            let Some(session) = workspace.session().cloned() else {
+                return;
+            };
+            let branch = action.branch.clone();
+            workspace.open_item_with::<HistoryView>(
+                history_key(&branch),
+                action.preview,
+                window,
+                cx,
+                |window, cx| HistoryView::new(session, branch, window, cx),
+            );
+        });
         // A commit named by its id alone (a toast's, a parent link's): its tab reads it beside
         // its changes. History opens the commits it lists with the commit as listed.
         workspace.register_action(|workspace, action: &OpenCommit, window, cx| {
@@ -76,7 +73,7 @@ pub fn init(cx: &mut App) {
                 return;
             };
             let id = action.commit_id.clone();
-            commit_view::open_in(workspace, session, id, None, window, cx);
+            commit_view::open_in(workspace, session, id, None, action.preview, window, cx);
         });
     })
     .detach();

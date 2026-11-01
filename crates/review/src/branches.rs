@@ -15,14 +15,16 @@ use gpui::{
 use graph_client::WriteOutcome;
 use graph_client::api::{BranchStartRefusalOutput, BranchStartRefusalReason, CommitOutput};
 use graph_store::{AccessAction, AccessScope, BranchStart, GraphSession, SessionEvent};
-use studio_actions::graph::{CreateBranch, CreateBranchAt, DeleteBranch, ReviewBranch};
+use studio_actions::graph::{
+    CreateBranch, CreateBranchAt, DeleteBranch, OpenBranch, OpenBranchHistory, ReviewBranch,
+};
 use studio_ui::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::{ds, now_micros, relative_time, short_commit_id};
 use studio_workspace::{Workspace, WorkspaceEvent};
 use ui::prelude::*;
 use ui::{Tooltip, right_click_menu};
 
-use crate::view::open_review;
+use crate::view::{open_review, open_review_with};
 use studio_workspace::ModalView;
 
 /// The branch every review and merge targets.
@@ -89,7 +91,7 @@ impl BranchList {
                     WorkspaceEvent::SessionChanged => {
                         this.watch(workspace.read(cx).session().cloned(), cx)
                     }
-                    WorkspaceEvent::ActiveItemChanged => {}
+                    WorkspaceEvent::ActiveItemChanged => cx.notify(),
                 },
             ));
         }
@@ -200,6 +202,7 @@ impl BranchList {
         index: usize,
         branch: String,
         current: bool,
+        lit: bool,
     ) -> impl IntoElement + use<> {
         let detail = self.details.get(&branch).map(|d| {
             let actor = d.actor.clone().unwrap_or_else(|| "unknown actor".into());
@@ -218,22 +221,49 @@ impl BranchList {
                 let session = session.clone();
                 move |_, _, _| {
                     let (when, tooltip) = detail.clone().unzip();
+                    // Opening a branch leaves the window on the one it reads; moving the window
+                    // is this button, the top bar's popover or the row's menu (spec 020).
+                    let end = h_flex()
+                        .gap(px(studio_ui::ds::space::XS))
+                        .children(when.map(studio_ui::ds::sidebar_count))
+                        .map(|end| {
+                            if current {
+                                end.child(studio_ui::ds::text::meta("current"))
+                            } else {
+                                let session = session.clone();
+                                let name = name.clone();
+                                end.child(
+                                    studio_ui::ds::row_button(("switch", index), "Switch")
+                                        .tooltip(Tooltip::text("Read and edit this branch"))
+                                        .on_click(move |_, _, cx| {
+                                            cx.stop_propagation();
+                                            if let Some(session) = &session {
+                                                session.update(cx, |s, cx| {
+                                                    s.set_branch(name.clone(), cx)
+                                                });
+                                            }
+                                        }),
+                                )
+                            }
+                        });
                     let row = studio_ui::ds::SidebarRow::new(("branch", index), name.clone())
                         .icon(IconName::GitBranch)
-                        .selected(current)
-                        .when_some(when, |row, when| {
-                            row.end(studio_ui::ds::sidebar_count(when))
-                        });
+                        .selected(lit)
+                        .end(end);
                     let row = match tooltip {
                         Some(tooltip) => row.tooltip(tooltip),
                         None => row,
                     };
                     row.on_click({
-                        let session = session.clone();
-                        move |_, _, cx| {
-                            if let Some(session) = &session {
-                                session.update(cx, |s, cx| s.set_branch(name.clone(), cx));
-                            }
+                        let name = name.clone();
+                        move |event, window, cx| {
+                            window.dispatch_action(
+                                Box::new(OpenBranch {
+                                    branch: name.clone(),
+                                    preview: event.click_count() < 2,
+                                }),
+                                cx,
+                            )
                         }
                     })
                 }
@@ -372,11 +402,25 @@ impl BranchList {
             return Vec::new();
         };
         let current = session.branch.as_str();
+        // The branch the active tab shows is the lit row; the one the window reads says so.
+        let active = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).active_item()?.thing(cx))
+            .and_then(|thing| match thing {
+                studio_actions::Thing::Branch(branch) => Some(branch),
+                _ => None,
+            });
         let rows = range
             .clone()
             .map(|index| match branches.get(index) {
                 Some(branch) => self
-                    .render_branch(index, branch.clone(), *branch == current)
+                    .render_branch(
+                        index,
+                        branch.clone(),
+                        *branch == current,
+                        active.as_deref() == Some(branch.as_str()),
+                    )
                     .into_any_element(),
                 None => Self::render_new_branch(current).into_any_element(),
             })
@@ -1002,6 +1046,26 @@ pub fn register(workspace: &mut Workspace) {
         };
         let branch = session.read(cx).branch.clone();
         open_review(workspace, branch, TARGET.into(), window, cx);
+    });
+    workspace.register_action(|workspace, action: &OpenBranch, window, cx| {
+        if action.branch == TARGET {
+            window.dispatch_action(
+                Box::new(OpenBranchHistory {
+                    branch: action.branch.clone(),
+                    preview: action.preview,
+                }),
+                cx,
+            );
+            return;
+        }
+        open_review_with(
+            workspace,
+            action.branch.clone(),
+            TARGET.into(),
+            action.preview,
+            window,
+            cx,
+        );
     });
     workspace.register_action(|workspace, _: &CreateBranch, window, cx| {
         let Some(session) = workspace.session().cloned() else {

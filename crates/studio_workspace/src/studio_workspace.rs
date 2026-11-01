@@ -31,8 +31,8 @@ use graph_store::{
     OutcomeKind, SessionEvent,
 };
 use studio_actions::graph::{
-    OpenAsCanvas, OpenAsMap, OpenAsPage, OpenAsSource, OpenAsTable, OpenAsTree, OpenCommit,
-    OpenHistory,
+    OpenAsCanvas, OpenAsHistory, OpenAsMap, OpenAsPage, OpenAsReview, OpenAsSource, OpenAsTable,
+    OpenAsTree, OpenCommit, OpenHistory,
 };
 use studio_actions::workspace::OpenViewAt;
 use studio_actions::workspace::{
@@ -672,6 +672,8 @@ impl Workspace {
         this.register_view_action::<OpenAsCanvas>(ViewKind::Canvas);
         this.register_view_action::<OpenAsMap>(ViewKind::Map);
         this.register_view_action::<OpenAsSource>(ViewKind::Source);
+        this.register_view_action::<OpenAsReview>(ViewKind::Review);
+        this.register_view_action::<OpenAsHistory>(ViewKind::History);
         this.register_action(|workspace, action: &OpenViewAt, window, cx| {
             let kind = workspace
                 .active_item()
@@ -4608,6 +4610,7 @@ fn committed_follow_up(
             "View commit",
             Box::new(OpenCommit {
                 commit_id: commit.to_owned(),
+                preview: false,
             }),
         ),
     }
@@ -7457,7 +7460,8 @@ mod tests {
         let (label, action) = committed_follow_up(&entry(None), "c2");
         assert_eq!(label, "View commit");
         assert!(action.partial_eq(&OpenCommit {
-            commit_id: "c2".into()
+            commit_id: "c2".into(),
+            preview: false,
         }));
     }
 

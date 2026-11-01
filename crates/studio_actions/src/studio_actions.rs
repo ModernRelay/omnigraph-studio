@@ -17,6 +17,8 @@ pub enum Thing {
     Type(String),
     /// One node.
     Node { type_name: String, id: String },
+    /// A branch, by name.
+    Branch(String),
 }
 
 /// One way to see a thing (spec 020): the answer to "how?". Each is a tab of its own.
@@ -28,6 +30,8 @@ pub enum ViewKind {
     Canvas,
     Map,
     Source,
+    Review,
+    History,
 }
 
 impl ViewKind {
@@ -39,6 +43,8 @@ impl ViewKind {
             Self::Canvas => "Canvas",
             Self::Map => "Map",
             Self::Source => "Source",
+            Self::Review => "Review",
+            Self::History => "History",
         }
     }
 }
@@ -255,6 +261,10 @@ pub mod graph {
             OpenAsMap,
             /// Show the schema's source.
             OpenAsSource,
+            /// Show this branch's review against main.
+            OpenAsReview,
+            /// Show this branch's commits.
+            OpenAsHistory,
             /// Create a branch from the current branch.
             CreateBranch,
             /// Delete the current branch.
@@ -476,11 +486,35 @@ pub mod graph {
         pub preview: bool,
     }
 
+    /// Open a branch: its review against main, or for main, which merges into nothing, its
+    /// history. The window stays on the branch it reads.
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct OpenBranch {
+        pub branch: String,
+        /// Open as the pane's preview tab, which the next preview replaces (spec 002).
+        #[serde(default)]
+        pub preview: bool,
+    }
+
+    /// Open one branch's commits.
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct OpenBranchHistory {
+        pub branch: String,
+        /// Open as the pane's preview tab, which the next preview replaces (spec 002).
+        #[serde(default)]
+        pub preview: bool,
+    }
+
     /// Open one commit's changes.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph)]
     pub struct OpenCommit {
         pub commit_id: String,
+        /// Open as the pane's preview tab, which the next preview replaces (spec 002).
+        #[serde(default)]
+        pub preview: bool,
     }
 
     /// Create a branch that starts at a published commit, with that commit's data and history

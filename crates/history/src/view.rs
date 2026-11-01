@@ -1,5 +1,5 @@
-//! The history tab (spec 009): a branch's commits newest first, a lane graph for merges, and
-//! the selected commit's changes in a detail split.
+//! The history tab (spec 009): a branch's commits newest first and a lane graph for merges. A
+//! commit opens in a tab of its own (spec 020).
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -18,13 +18,14 @@ use graph_client::api::{CommitListOutput, CommitOutput};
 use graph_store::{GraphSession, HeadWatch, NetChange, SessionEvent};
 use studio_actions::history::{NewBranchHere, NextMatch, PreviousMatch};
 use studio_actions::workspace::Refresh;
+use studio_actions::{ViewKind, ViewLink};
 use studio_ui::menu::ContextMenu;
 use studio_ui::{change_counts, group_digits, now_micros, relative_time, short_commit_id};
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 use ui::{Tooltip, right_click_menu};
 
-use crate::commit_view::{CommitCounts, CommitView, branch_start, new_branch_at, open_listed};
+use crate::commit_view::{branch_start, new_branch_at, open_listed};
 use crate::lanes::{Graph, GraphCommit, assign_lanes};
 use crate::merged::{Absent, Drawn, HistoryRead, branch_heads};
 
@@ -153,10 +154,9 @@ impl FirstPage {
     };
 }
 
-/// What the session's events asked of the bottom-dock panel since it was last drawn, read when
-/// it is next drawn ([`HistoryView::panel`]). A dock draws only the panel it shows, so a History
-/// panel hidden behind another or in a closed dock reads nothing for the commits that land
-/// meanwhile, and shown again reads once for all of them; a shown one reads at its next frame.
+/// What the session's events asked of the tab since it was last drawn, read when it is next
+/// drawn. A tab behind another reads nothing for the commits that land meanwhile, and shown again
+/// reads once for all of them; a shown one reads at its next frame.
 #[derive(Default)]
 struct Owed {
     /// The window's branch changed: its history is read from its first page.
@@ -329,7 +329,6 @@ pub struct HistoryView {
     branch: String,
     /// The bottom-dock panel: rows only, following the window's branch; a commit opens in its
     /// own tab.
-    compact: bool,
     /// Finds commits by id prefix or actor.
     search: Entity<Editor>,
     matches: Vec<usize>,
@@ -368,7 +367,6 @@ pub struct HistoryView {
     commit_texts: Vec<CommitText>,
     graph: Graph,
     selected: Option<usize>,
-    detail: Option<Entity<CommitView>>,
     /// The commit list, drawn cached on its own: the commit beside it scrolls and reads
     /// without the list drawing again.
     rows: Entity<HistoryRows>,
@@ -390,7 +388,6 @@ pub struct HistoryView {
     /// The read of the history under way, until it ends: a page, then the merged-in commits it
     /// names, or a walk of those alone.
     _task: Option<Task<()>>,
-    _detail_subscription: Option<Subscription>,
     _search_subscription: Subscription,
     _session_subscription: Option<Subscription>,
     /// A tab's own branch asked after while it is open, so another writer's commits to it
@@ -430,6 +427,31 @@ impl Item for HistoryView {
         format!("History · {}", self.branch).into()
     }
 
+    fn thing(&self, _cx: &App) -> Option<studio_actions::Thing> {
+        Some(studio_actions::Thing::Branch(self.branch.clone()))
+    }
+
+    /// `main` merges into nothing, so it has no review.
+    fn views(&self, _cx: &App) -> Vec<ViewLink> {
+        vec![
+            if self.branch == "main" {
+                ViewLink::disabled_because(ViewKind::Review, "main is what branches merge into")
+            } else {
+                ViewLink::to(ViewKind::Review)
+            },
+            ViewLink::current(ViewKind::History),
+        ]
+    }
+
+    fn view_action(&self, kind: ViewKind, _cx: &App) -> Option<Box<dyn gpui::Action>> {
+        (kind == ViewKind::Review).then(|| {
+            Box::new(studio_actions::graph::OpenBranch {
+                branch: self.branch.clone(),
+                preview: true,
+            }) as Box<dyn gpui::Action>
+        })
+    }
+
     fn tab_icon(&self, _cx: &App) -> Option<IconName> {
         Some(IconName::HistoryRerun)
     }
@@ -457,50 +479,22 @@ impl HistoryView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut view = Self::build(session.clone(), branch, false, window, cx);
+        let mut view = Self::build(session.clone(), branch, window, cx);
         view._head_watch =
             Some(session.update(cx, |session, cx| session.watch_head(&view.branch, cx)));
         // Its own branch's commits, and the other branches whose heads it shows: a tab restored
         // before the branch list was read draws them once it is.
-        view._session_subscription = Some(cx.subscribe(&session, |this, session, event, cx| {
-            this.session_event(&session, event, false, cx)
-        }));
-        view
-    }
-
-    /// The bottom-dock panel: the window's branch, rows only. It is made when first drawn, and,
-    /// as a tab does, reads what the session's events ask of it when next drawn
-    /// ([`Self::session_event`]).
-    pub fn panel(
-        session: Entity<GraphSession>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let branch = session.read(cx).branch.clone();
-        let mut view = Self::build(session.clone(), branch, true, window, cx);
-        view._session_subscription = Some(cx.subscribe(&session, |this, session, event, cx| {
-            this.session_event(&session, event, true, cx)
-        }));
+        view._session_subscription =
+            Some(cx.subscribe(&session, |this, _, event, cx| this.session_event(event, cx)));
         view
     }
 
     /// What the session's events ask of the history, owed until it is next drawn ([`Owed`]):
     /// a tab or panel behind another, or in a closed dock, asks the server nothing for the
-    /// commits that land meanwhile. The panel (`follows_window`) follows the window's branch.
-    fn session_event(
-        &mut self,
-        session: &Entity<GraphSession>,
-        event: &SessionEvent,
-        follows_window: bool,
-        cx: &mut Context<Self>,
-    ) {
+    /// commits that land meanwhile.
+    fn session_event(&mut self, event: &SessionEvent, cx: &mut Context<Self>) {
         match event {
             // The branch left's commits never show under the new one's name meanwhile.
-            SessionEvent::BranchChanged if follows_window => {
-                self.branch = session.read(cx).branch.clone();
-                self.forget_branch();
-                self.owe(|owed| owed.reload = true, cx);
-            }
             SessionEvent::Committed { branch } if *branch == self.branch => {
                 self.owe(|owed| owed.landed = true, cx)
             }
@@ -554,7 +548,6 @@ impl HistoryView {
     fn build(
         session: Entity<GraphSession>,
         branch: String,
-        compact: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -577,7 +570,6 @@ impl HistoryView {
         let mut view = Self {
             session,
             branch,
-            compact,
             search,
             matches: Vec::new(),
             match_at: None,
@@ -610,7 +602,6 @@ impl HistoryView {
             commit_texts: Vec::new(),
             graph: Graph::default(),
             selected: None,
-            detail: None,
             rows: HistoryRows::new(cx),
             counts: HashMap::new(),
             partial_counts: HashSet::new(),
@@ -623,45 +614,9 @@ impl HistoryView {
             heads: HashMap::new(),
             scroll: UniformListScrollHandle::new(),
             _task: None,
-            _detail_subscription: None,
         };
         view.reload(cx);
         view
-    }
-
-    /// Lets go of what was shown and read for the branch left, so its commits never show under
-    /// the new one's name while that is read; the branch left is one of the others now. A read
-    /// of the branch left still under way ends here (`_task` is dropped): landing, it would lay
-    /// out that branch's commits under the new one's name, or say why they could not be read.
-    /// Until the new branch is read, the history is being read.
-    fn forget_branch(&mut self) {
-        self._task = None;
-        self.state = State::Loading {
-            read: FirstPage::REPLACE,
-        };
-        self.read = Arc::default();
-        self.next_page = None;
-        self.listing_head = None;
-        self.more = More::Idle;
-        self.wanted.clear();
-        self.merged_failed.clear();
-        self._merged_retry = None;
-        self.by_id = true;
-        self.listed = None;
-        self.commits.clear();
-        self.commit_texts.clear();
-        self.graph = Graph::default();
-        self.selected = None;
-        self.detail = None;
-        self._detail_subscription = None;
-        self.heads.clear();
-        self.matches.clear();
-        self.match_at = None;
-        self.count_rows = None;
-        self.others.clear();
-        self.other_heads.clear();
-        self.head_asked.clear();
-        self.head_reads.clear();
     }
 
     /// Shows the branch's history again from its first page, and reads the heads of other
@@ -1431,65 +1386,21 @@ impl HistoryView {
         self.step_to(self.matches[at], cx);
     }
 
-    /// Selects a commit and, in the tab, shows its changes in the detail split.
+    /// Selects a commit; opening it is what shows its changes.
     pub fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
-        self.show(ix, None, cx);
+        self.show(ix, cx);
     }
 
-    /// Selects a commit reached by a key: its changes are read once the steps pause, so a
-    /// held arrow or a search being typed reads only where it stops.
     fn step_to(&mut self, ix: usize, cx: &mut Context<Self>) {
-        self.show(ix, Some(COUNTS_AFTER), cx);
+        self.show(ix, cx);
     }
 
-    fn show(&mut self, ix: usize, pause: Option<Duration>, cx: &mut Context<Self>) {
-        let Some(commit) = self.commits.get(ix).cloned() else {
+    fn show(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if self.commits.get(ix).is_none() {
             return;
-        };
+        }
         self.selected = Some(ix);
         self.scroll.scroll_to_item(ix, ScrollStrategy::Center);
-        if self.compact {
-            cx.notify();
-            return;
-        }
-        let same = self
-            .detail
-            .as_ref()
-            .is_some_and(|d| d.read(cx).commit_id() == commit.graph_commit_id);
-        if !same {
-            // The detail counts its commit's changes whole: the row does not read them too. A
-            // commit left before its detail counted it is asked for again.
-            if let Some(left) = self
-                .detail
-                .as_ref()
-                .map(|d| d.read(cx).commit_id().to_owned())
-                && !self.counts.contains_key(&left)
-            {
-                self.asked_counts.remove(&left);
-                self.count_rows = None;
-            }
-            self.asked_counts.insert(commit.graph_commit_id.clone());
-            let session = self.session.clone();
-            let id = commit.graph_commit_id.clone();
-            let detail = cx.new(|cx| match pause {
-                Some(pause) => CommitView::after_pause(session, id, Some(commit), pause, cx),
-                None => CommitView::new(session, id, Some(commit), cx),
-            });
-            self._detail_subscription =
-                Some(cx.subscribe(&detail, |this, _, counts: &CommitCounts, cx| {
-                    if counts.partial {
-                        this.partial_counts.insert(counts.commit_id.clone());
-                    } else {
-                        this.partial_counts.remove(&counts.commit_id);
-                    }
-                    this.counts.insert(
-                        counts.commit_id.clone(),
-                        (counts.added, counts.changed, counts.removed),
-                    );
-                    cx.notify();
-                }));
-            self.detail = Some(detail);
-        }
         cx.notify();
     }
 
@@ -1525,7 +1436,7 @@ impl HistoryView {
     /// ↵ opens the selected commit's own tab, with the commit as listed.
     fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(commit) = self.selected.and_then(|ix| self.commits.get(ix)) {
-            open_listed(&self.session, commit, window, cx);
+            open_listed(&self.session, commit, false, window, cx);
         }
     }
 
@@ -1813,12 +1724,11 @@ impl HistoryView {
                     .on_click(
                         cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                             this.select(ix, cx);
-                            // The panel has no detail split: a click opens the commit's tab,
-                            // with the commit as listed.
-                            if (this.compact || event.click_count() == 2)
-                                && let Some(commit) = this.commits.get(ix)
-                            {
-                                open_listed(&this.session, commit, window, cx);
+                            // A click previews the commit's tab, with the commit as listed; a
+                            // double click keeps it (spec 020).
+                            if let Some(commit) = this.commits.get(ix) {
+                                let preview = event.click_count() < 2;
+                                open_listed(&this.session, commit, preview, window, cx);
                             }
                         }),
                     );
@@ -1958,7 +1868,7 @@ fn commit_menu(
         cx.write_to_clipboard(ClipboardItem::new_string(copy_id.clone()))
     })
     .entry("Open in a tab", None, move |window, cx| {
-        open_listed(&session, &listed, window, cx)
+        open_listed(&session, &listed, false, window, cx)
     })
     .when_some(branch_at, |menu, commit| {
         menu.separator().entry(
@@ -2152,7 +2062,7 @@ impl Render for HistoryView {
         let count = self.commits.len();
         let counter = self.match_counter();
         let search = studio_ui::ds::search_field(self.search.clone(), cx)
-            .w(px(if self.compact { 200. } else { 240. }))
+            .w(px(240.))
             .children(counter.map(studio_ui::ds::text::meta));
         let summary = match self.state {
             State::Ready | State::Stale { .. } => summary(
@@ -2168,11 +2078,7 @@ impl Render for HistoryView {
             _ => None,
         };
         let header = studio_ui::ds::toolbar(cx)
-            .when(!self.compact, |header| {
-                header
-                    .child(studio_ui::ds::icon::lead(IconName::HistoryRerun))
-                    .child(studio_ui::ds::text::title("History"))
-            })
+            .children(studio_workspace::view_strip(Item::views(self, cx), cx))
             // One quiet fact after the title, as the table's row count: the tab already names
             // the branch.
             .child(studio_ui::ds::text::muted(summary))
@@ -2224,30 +2130,7 @@ impl Render for HistoryView {
             State::Loading { .. } if self.commits.is_empty() => {
                 studio_ui::ds::loading_state("Reading commits…").into_any_element()
             }
-            _ if self.compact => self.cached_rows(),
-            _ => {
-                let list = self.cached_rows();
-                let detail = match &self.detail {
-                    Some(detail) => detail.clone().into_any_element(),
-                    None => studio_ui::ds::empty_state(IconName::HistoryRerun, "Select a commit")
-                        .into_any_element(),
-                };
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .child(div().flex_1().min_w_0().h_full().child(list))
-                    .child(
-                        div()
-                            .w(relative(0.46))
-                            .flex_none()
-                            .h_full()
-                            .border_l_1()
-                            .border_color(studio_ui::ds::surface::rule(cx))
-                            .child(detail),
-                    )
-                    .into_any_element()
-            }
+            _ => self.cached_rows(),
         };
         // Typing in the search box must not move the selection.
         let context =
@@ -3619,11 +3502,10 @@ mod tests {
     /// A commit landing on `branch`, as the session tells it, read as a drawn history reads it
     /// ([`HistoryView::read_owed`]).
     fn landed(view: &mut HistoryView, branch: &str, cx: &mut Context<HistoryView>) {
-        let session = view.session.clone();
         let event = SessionEvent::Committed {
             branch: branch.into(),
         };
-        view.session_event(&session, &event, false, cx);
+        view.session_event(&event, cx);
         view.read_owed(cx);
     }
 
@@ -3634,96 +3516,6 @@ mod tests {
             ..Default::default()
         };
         serve(served, cx).0
-    }
-
-    /// Draws the History panel, cached, while it shows it, as a dock draws its active panel.
-    struct DockStandIn {
-        panel: Entity<crate::panel::HistoryPanel>,
-        shown: bool,
-    }
-
-    impl Render for DockStandIn {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div().size_full().when(self.shown, |dock| {
-                dock.child(
-                    AnyView::from(self.panel.clone())
-                        .cached(StyleRefinement::default().size_full()),
-                )
-            })
-        }
-    }
-
-    /// A History panel hidden (another panel shown in its dock, or the dock closed) reads
-    /// nothing for the commits that land, about twenty an hour on a busy graph; shown again, it
-    /// reads its first page once for all of them, keeping what it had read.
-    #[gpui::test]
-    async fn a_hidden_panel_reads_nothing_until_shown_again(cx: &mut TestAppContext) {
-        let (session, served) = serve(
-            Served {
-                branches: vec![("main".into(), chain("m", 3))],
-                ..Default::default()
-            },
-            cx,
-        );
-        let held = session.clone();
-        let (dock, cx) = cx.add_window_view(move |window, cx| {
-            let panel = cx.new(|cx| {
-                crate::panel::HistoryPanel::new(WeakEntity::new_invalid(), Some(held), window, cx)
-            });
-            DockStandIn { panel, shown: true }
-        });
-        cx.run_until_parked();
-        let listings = |served: &Arc<Mutex<Served>>| served.lock().unwrap().listings().len();
-        assert_eq!(
-            listings(&served),
-            1,
-            "the first page, as the panel was drawn"
-        );
-        let show = |shown: bool, cx: &mut VisualTestContext| {
-            dock.update(cx, |dock, cx| {
-                dock.shown = shown;
-                cx.notify();
-            });
-            cx.run_until_parked();
-        };
-        show(false, cx);
-        session
-            .update(cx, |session, cx| session.head_now("main", cx))
-            .await;
-        for (id, parent, at) in [("m3", "m2", 1_000), ("m4", "m3", 1_010)] {
-            served
-                .lock()
-                .unwrap()
-                .chain_mut("main")
-                .insert(0, commit(id, at, Some(parent), None));
-            session
-                .update(cx, |session, cx| session.head_now("main", cx))
-                .await;
-            cx.run_until_parked();
-        }
-        assert_eq!(listings(&served), 1, "nothing read while hidden");
-
-        show(true, cx);
-        assert_eq!(listings(&served), 2, "one read for both commits");
-        let view = dock.read_with(cx, |dock, cx| dock.panel.read(cx).view().cloned());
-        let view = view.expect("made when first drawn");
-        view.read_with(cx, |view, _| {
-            assert_eq!(ids(view), ["m4", "m3", "m2", "m1", "m0"])
-        });
-        // Shown, a commit is read at the next frame.
-        served
-            .lock()
-            .unwrap()
-            .chain_mut("main")
-            .insert(0, commit("m5", 1_020, Some("m4"), None));
-        session
-            .update(cx, |session, cx| session.head_now("main", cx))
-            .await;
-        cx.run_until_parked();
-        assert_eq!(listings(&served), 3);
-        view.read_with(cx, |view, _| {
-            assert_eq!(view.commits[0].graph_commit_id, "m5")
-        });
     }
 
     /// Draws a History tab, cached, while it is its pane's active item, as a pane draws it.
@@ -3798,103 +3590,6 @@ mod tests {
         tab.read_with(cx, |tab, _| {
             assert_eq!(ids(tab), ["m4", "m3", "m2", "m1", "m0"])
         });
-    }
-
-    /// The panel follows the window's branch. A read of the branch left that is still out when
-    /// the branch changes lands on nothing: neither its commits nor its failure show under the
-    /// new branch's name while the panel waits, hidden, to read that branch.
-    #[gpui::test]
-    async fn a_panel_shows_nothing_of_the_branch_left_under_the_new_ones_name(
-        cx: &mut TestAppContext,
-    ) {
-        let (session, served) = serve(
-            Served {
-                branches: vec![
-                    ("main".into(), chain("m", 3)),
-                    ("feature".into(), chain("f", 2)),
-                ],
-                ..Default::default()
-            },
-            cx,
-        );
-        let held = session.clone();
-        let (dock, cx) = cx.add_window_view(move |window, cx| {
-            let panel = cx.new(|cx| {
-                crate::panel::HistoryPanel::new(WeakEntity::new_invalid(), Some(held), window, cx)
-            });
-            DockStandIn { panel, shown: true }
-        });
-        cx.run_until_parked();
-        let view = dock.read_with(cx, |dock, cx| dock.panel.read(cx).view().cloned());
-        let view = view.expect("made when first drawn");
-        view.read_with(cx, |view, _| assert_eq!(ids(view), ["m2", "m1", "m0"]));
-        for fails in [false, true] {
-            if fails {
-                session.update(cx, |session, cx| session.set_branch("main".into(), cx));
-                dock.update(cx, |dock, cx| {
-                    dock.shown = true;
-                    cx.notify();
-                });
-                cx.run_until_parked();
-                view.read_with(cx, |view, _| assert_eq!(ids(view), ["m2", "m1", "m0"]));
-                served
-                    .lock()
-                    .unwrap()
-                    .fail_listings
-                    .insert("branch=main&limit=200".into(), 1);
-            }
-            // `main`'s first page is out when the window moves to `feature`, with the panel
-            // hidden.
-            view.update(cx, |view, cx| view.load(FirstPage::KEEP, cx));
-            dock.update(cx, |dock, cx| {
-                dock.shown = false;
-                cx.notify();
-            });
-            session.update(cx, |session, cx| session.set_branch("feature".into(), cx));
-            cx.run_until_parked();
-            view.read_with(cx, |view, _| {
-                assert_eq!(view.branch, "feature");
-                assert!(
-                    ids(view).is_empty(),
-                    "main's commits showed under feature's name"
-                );
-                assert!(
-                    matches!(view.state, State::Loading { .. }),
-                    "main's page landed on feature's history"
-                );
-            });
-            // Shown again, it reads `feature`.
-            dock.update(cx, |dock, cx| {
-                dock.shown = true;
-                cx.notify();
-            });
-            cx.run_until_parked();
-            view.read_with(cx, |view, _| {
-                assert!(matches!(view.state, State::Ready));
-                assert_eq!(ids(view), ["f1", "f0"]);
-            });
-        }
-    }
-
-    /// The commit shown beside the list draws on its own: a change there (a scroll, a page of
-    /// changes read) leaves the list as it was drawn; a change of the history draws it again.
-    #[gpui::test]
-    async fn the_commit_beside_the_list_leaves_the_list_drawn(cx: &mut TestAppContext) {
-        let session = one_commit_session(cx);
-        let (view, cx) = open(&session, cx);
-        view.update(cx, |view, cx| view.select(0, cx));
-        cx.run_until_parked();
-        let renders = |cx: &mut gpui::VisualTestContext| {
-            view.read_with(cx, |view, cx| view.rows.read(cx).renders)
-        };
-        let detail = view.read_with(cx, |view, _| view.detail.clone().expect("a commit shown"));
-        let before = renders(cx);
-        detail.update(cx, |_, cx| cx.notify());
-        cx.run_until_parked();
-        assert_eq!(renders(cx), before, "the commit drew the list again");
-        view.update(cx, |_, cx| cx.notify());
-        cx.run_until_parked();
-        assert_eq!(renders(cx), before + 1);
     }
 
     /// Typing searches once it pauses, not at each key, and the counter speaks of the text the
