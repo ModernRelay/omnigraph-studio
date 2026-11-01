@@ -7113,8 +7113,7 @@ impl TypeTable {
                 ops: self.ops_for(&key),
                 property: self.property_for_key(&key),
                 other_type: self.related_type(&key),
-                traversal: builder::parse_relationship_key(&key)
-                    .map(|(_, edge)| gq_language::traversal_name(edge)),
+                traversal: builder::relationship_traversal(&key, "$n", "$r"),
                 key,
                 label,
             })

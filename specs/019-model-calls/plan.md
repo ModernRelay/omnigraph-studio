@@ -249,7 +249,9 @@ exact record, whose name goes through the node search the filter's own value fie
 gets its id; a name no record matches is dropped and named. What the pills cannot say (`or`,
 `not`, a further hop, two tests on one related record) the model puts in `predicate`, a GQ
 condition on `$n` the answer's schema has beside `filters`: the input gives each
-relationship's GQ traversal and a short grammar; the table makes it a condition filter (spec
+relationship as GQ in the edge's own direction from the row `$n` to the related record `$r`
+(`$n attended $r`, `$r knows $n` for an incoming key; `builder::relationship_traversal`) and a
+short grammar; the table makes it a condition filter (spec
 004) only when the compiler accepts it, else the note names the diagnostic. The rest become pills as if added by hand, so
 they are seen and removable, and the table reads as it does for any filter. A second sentence
 replaces the filters the first made and keeps ones added by hand. Measured: 1.5–2.8 s on
@@ -333,6 +335,7 @@ A call is never retried. The model list is read at most once a day.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-01 | A predicate names an incoming relationship in its own direction | `gq_language` `a_condition_is_spliced_in_and_judged_by_the_compiler` (extended: `out:Knows` is `$n knows $r`, `in:Knows` `$r knows $n`, a reserved-word edge quoted, and an incoming block compiles), `type_table` `words::tests` (the input shows the oriented GQ). The builder test fails with every key oriented outgoing (checked); the throwaway instrument over the personal graph's schema measured the input after the merge with the condition filter | Fixed. The input gave `$n <traversal> $r` for every relationship. The compiler orients a traversal by its ends' types, so that read right between two types, but on an edge from a type to itself it always reads outgoing: a predicate on an incoming same-type relationship matched the other way round. The edge was also not quoted where its name is a reserved word. Each relationship line now shows its GQ and the related type in place of the label, which keeps Artifact at 32,647 B and Person at 26,706 B, under the 32 KiB cap |
 | 2026-10-31 | The sentence filter's input fits the cap on the personal graph's widest types | `type_table` `the_input_says_each_related_type_once_and_fits_the_cap` (a related type reached twice is described once; 400 relationships leave the related types' properties out, say so, and stay within the cap); an uncommitted instrument over the personal graph's schema (100 node types, 549 edge types) | Before: Person 50,383 B and Artifact 48,303 B, over the 32 KiB cap, so the call was refused on both. After: 25,452 B and 31,393 B, every type within the cap and none leaving related properties out. Each relationship repeated the relationship operators and the related type's properties; both are now said once |
 | 2026-10-30 | The crate sends the schema under strict with the provider policy, parses the answer as the task's type, and tells its errors apart | `model` `a_call_sends_the_schema_and_parses_the_answer`, `errors_are_told_apart`, `the_model_list_keeps_schema_models_with_prices` (a fake HTTP client) | Pass |
 | 2026-10-30 | A sentence's answer becomes filters the type takes, and a branch condenses to titles and changed property names without values | `type_table` `words::tests::an_answer_becomes_filters_the_type_takes`, `fill::tests::a_rows_input_names_the_target_and_its_sources`; `review` `summary::tests::the_input_holds_titles_and_changed_property_names_but_no_values` | Pass. The live calls were not run from the app yet: no key is stored in it |

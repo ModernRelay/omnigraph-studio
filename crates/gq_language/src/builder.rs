@@ -1238,6 +1238,19 @@ fn hop<'a>(
     )
 }
 
+/// The traversal a relationship key names, from `near` (the row) to `far` (the related record),
+/// written as a query writes it: `$n attended $r`, or `$r knows $n` for an incoming key, the
+/// edge quoted where its name is a reserved word.
+pub fn relationship_traversal(key: &str, near: &str, far: &str) -> Option<String> {
+    let (direction, edge) = parse_relationship_key(key)?;
+    Some(oriented(
+        direction,
+        near,
+        &crate::schema::traversal_token(edge),
+        far,
+    ))
+}
+
 /// A traversal from `near` to `far` along `edge` (its token, with any `$e:` binding), written
 /// in the edge's own direction.
 fn oriented(direction: Direction, near: &str, edge: &str, far: &str) -> String {
@@ -3141,6 +3154,39 @@ mod tests {
             node_page(&schema, "Person", &[empty], None, &PageStart::First, 10),
             Err(BuildError::EmptyCondition)
         ));
+
+        // A block names a relationship in the edge's own direction, as the sentence filter's
+        // input gives it ([`relationship_traversal`]): the compiler orients a traversal by its
+        // ends' types, so on an edge between two types either order reads the same, but on one
+        // from a type to itself `$n knows $r` is always outgoing, and an incoming key must say
+        // `$r knows $n`. Before, the input gave the row first for both, so a condition on an
+        // incoming same-type relationship matched the other way round.
+        assert_eq!(
+            relationship_traversal("out:Knows", "$n", "$r").as_deref(),
+            Some("$n knows $r")
+        );
+        assert_eq!(
+            relationship_traversal("in:Knows", "$n", "$r").as_deref(),
+            Some("$r knows $n")
+        );
+        let incoming = relationship_traversal("in:WorksAt", "$n", "$r").unwrap();
+        assert_eq!(incoming, "$r worksAt $n");
+        let block = Filter {
+            property: WHERE_FILTER.into(),
+            op: FilterOp::Expr,
+            value: json!(format!(
+                "exists {{ $r: Person  {incoming}  $r.name = \"Ada\" }}"
+            )),
+        };
+        assert_compiles(
+            &node_page(&schema, "Company", &[block], None, &PageStart::First, 10).unwrap(),
+        );
+        // An edge named by a reserved word is quoted, as a query spells it.
+        assert_eq!(
+            relationship_traversal("out:In", "$n", "$r").as_deref(),
+            Some("$n \"in\" $r")
+        );
+        assert_eq!(relationship_traversal("name", "$n", "$r"), None);
     }
 
     #[test]

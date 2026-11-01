@@ -43,7 +43,9 @@ pub struct Choice {
     pub property: Option<Property>,
     /// For a relationship key, the type at its other end, whose records `related_to` names.
     pub other_type: Option<String>,
-    /// For a relationship key, its GQ traversal (`attended`), for a predicate.
+    /// For a relationship key, the GQ that names it in a predicate's block, from the row `$n`
+    /// to the related record `$r`: `$n attended $r`, or `$r knows $n` for an incoming key
+    /// ([`gq_language::builder::relationship_traversal`]).
     pub traversal: Option<String>,
 }
 
@@ -109,19 +111,23 @@ pub fn input(type_name: &str, choices: &[Choice], today: &str, sentence: &str) -
         .unwrap_or_default();
     if !relationships.is_empty() {
         text.push_str(&format!(
-            "\nRelationships, each with operators {}; `key.<property>` tests the related \
+            "\nRelationships, each with operators {}, its GQ in a predicate from the row $n to \
+             the related record $r, and the related type; `key.<property>` tests the related \
              record's property, with that property's operators:\n",
             op_keys(&common)
         ));
     }
     let mut related: Vec<(&str, Vec<String>)> = Vec::new();
     for relationship in relationships {
-        text.push_str(&format!("- {} ({})", relationship.key, relationship.label));
+        // The GQ names the edge and the related type its end: the menu's label says no more.
+        match (&relationship.traversal, &relationship.other_type) {
+            (Some(traversal), Some(other)) => {
+                text.push_str(&format!("- {}: `{traversal}`, {other}", relationship.key));
+            }
+            _ => text.push_str(&format!("- {} ({})", relationship.key, relationship.label)),
+        }
         if relationship.ops != common {
             text.push_str(&format!("; operators {}", op_keys(&relationship.ops)));
-        }
-        if let Some(traversal) = &relationship.traversal {
-            text.push_str(&format!("; in GQ `$n {traversal} $r`"));
         }
         text.push('\n');
         let Some(other) = relationship.other_type.as_deref() else {
@@ -160,8 +166,8 @@ pub fn input(type_name: &str, choices: &[Choice], today: &str, sentence: &str) -
          exact record.\n\nGQ for `predicate`, on the row $n: a property is $n.<key>; compare \
          with =, !=, <, <=, >, >=, contains, starts_with, in [..]; `is null`; combine with and, \
          or, not, and parentheses. Or, as the whole predicate, one block on a related record: \
-         `exists {{ $r: <Type>  $n <traversal> $r  $r.<property> = \"x\"  $r.<other> > 3 }}` \
-         or `not {{ ... }}`, where the traversal is the relationship's GQ name given above; a \
+         `exists {{ $r: <Type>  <its GQ>  $r.<property> = \"x\"  $r.<other> > 3 }}` or \
+         `not {{ ... }}`, with the relationship's GQ as given above, in its direction; a \
          block cannot sit inside or, and holds no count.\n\nRequest: {}",
         sentence.trim()
     );
@@ -315,7 +321,7 @@ mod tests {
             ops: FilterOp::for_relationship(),
             property: None,
             other_type: Some("Person".into()),
-            traversal: Some("attended".into()),
+            traversal: Some("$n attended $r".into()),
         });
         out
     }
@@ -385,11 +391,13 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("Relationships, each with operators has_any, has_none, related_to;"),
+            text.contains(
+                "Relationships, each with operators has_any, has_none, related_to, its GQ"
+            ),
             "{text}"
         );
         assert!(
-            text.contains("- out:Attended (attended Person); in GQ `$n attended $r`\n"),
+            text.contains("- out:Attended: `$n attended $r`, Person\n"),
             "{text}"
         );
         assert!(text.ends_with("Request: dinners last month"));
@@ -408,7 +416,7 @@ mod tests {
             ops: FilterOp::for_relationship(),
             property: None,
             other_type: Some(other.into()),
-            traversal: key.split_once(':').map(|(_, edge)| edge.to_lowercase()),
+            traversal: gq_language::builder::relationship_traversal(key, "$n", "$r"),
         };
         let nested = |key: &str, name: &str, values: &[&str]| {
             let property = property(name, ScalarKind::Text, "String", Some(values));
@@ -435,7 +443,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("- in:Invited (in:Invited Person); in GQ `$n invited $r`\n"),
+            text.contains("- in:Invited: `$r invited $n`, Person\n"),
             "{text}"
         );
 
@@ -458,7 +466,7 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("- Type000: status"), "{text}");
-        assert!(text.contains("- out:Rel399 (out:Rel399 Type399); in GQ `$n rel399 $r`\n"));
+        assert!(text.contains("- out:Rel399: `$n rel399 $r`, Type399\n"));
         assert!(text.ends_with("Request: dinners Ada hosted"));
     }
 }
