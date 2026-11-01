@@ -4,6 +4,7 @@
 //!
 //! Layer 5 (`docs/architecture.md`). Plan: `specs/005-relationship-tree/plan.md`.
 
+mod neighbour_filters;
 mod rows;
 
 use std::ops::Range;
@@ -28,6 +29,7 @@ use studio_actions::tree::{
 };
 use studio_actions::workspace::Refresh;
 use studio_actions::{ViewKind, ViewLink};
+use studio_ui::ds::Tipped;
 use studio_ui::ds::space;
 use studio_ui::menu::ContextMenu;
 use studio_ui::type_swatch;
@@ -1101,6 +1103,14 @@ impl RelationshipTree {
                 let group_menu = (!empty)
                     .then(|| self.group_by_menu(row, entry, &key.group, sticky, selected, cx))
                     .flatten();
+                let filters: Vec<String> = self
+                    .exploration
+                    .read(cx)
+                    .filters(&key.group)
+                    .iter()
+                    .map(neighbour_filters::filter_words)
+                    .collect();
+                let filter_menu = self.filter_menu(row, &key.group, sticky, selected, cx);
                 h_flex()
                     .min_w_0()
                     .flex_1()
@@ -1127,7 +1137,18 @@ impl RelationshipTree {
                                 .truncate(),
                         )
                     }))
+                    // The filters set, in words, as the grouping is.
+                    .when(!filters.is_empty(), |row| {
+                        row.child(
+                            div().min_w_0().flex_shrink(1.).child(
+                                studio_ui::ds::text::meta(filters.join(", "))
+                                    .color(Color::Accent)
+                                    .truncate(),
+                            ),
+                        )
+                    })
                     .child(div().flex_1())
+                    .children(filter_menu)
                     .children(group_menu)
                     .child(
                         studio_ui::ds::text::meta(count_label)
@@ -1206,7 +1227,7 @@ impl RelationshipTree {
                             .id(("error", row))
                             .min_w_0()
                             .flex_shrink(1.)
-                            .tooltip(Tooltip::text(tooltip))
+                            .tip(studio_ui::ds::tooltip(tooltip))
                             .child(studio_ui::ds::text::error_note(message.clone()).truncate()),
                     )
                     .child(
@@ -1292,7 +1313,8 @@ impl RelationshipTree {
                 }))
             })
             .when_some(card, |d, card| {
-                d.tooltip(Tooltip::element(move |_, cx| card.render(cx)))
+                // ds-exempt: the hover card is the tooltip, drawn by Zed's element tooltip
+                d.tip_fn(Tooltip::element(move |_, cx| card.render(cx)))
             })
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 let Some(row) = rows::find(&this.visible, &this.entries, &identity) else {
@@ -1324,6 +1346,44 @@ impl RelationshipTree {
 
     /// The button on a relationship group that groups its neighbours by a property of the
     /// other type or of the edge, shown while the row is hovered or selected.
+    /// The group row's filter button (spec 005, "Filtering a relationship's neighbours"): shown
+    /// while the row is hovered or selected, and always while filters are set.
+    fn filter_menu(
+        &self,
+        row: usize,
+        group: &gq_language::RelationshipGroup,
+        sticky: bool,
+        selected: bool,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        let exploration = self.exploration.clone();
+        if !neighbour_filters::can_filter(exploration.read(cx), group) {
+            return None;
+        }
+        let set = !exploration.read(cx).filters(group).is_empty();
+        let always = selected || set;
+        let id = (
+            if sticky {
+                "sticky-filter-neighbours"
+            } else {
+                "filter-neighbours"
+            },
+            row,
+        );
+        Some(
+            div()
+                .flex_none()
+                .when(!always, |d| d.visible_on_hover("tree-row"))
+                .child(neighbour_filters::filter_button(
+                    id,
+                    set,
+                    exploration,
+                    group.clone(),
+                ))
+                .into_any_element(),
+        )
+    }
+
     fn group_by_menu(
         &self,
         row: usize,
@@ -1360,7 +1420,7 @@ impl RelationshipTree {
                 studio_ui::ds::row_icon_button(id, IconName::ListTree)
                     .icon_color(Color::Muted)
                     .toggle_state(current.is_some())
-                    .tooltip(Tooltip::text(tooltip)),
+                    .tip(studio_ui::ds::tooltip(tooltip)),
             )
             .anchor(gpui::Anchor::TopRight)
             .menu(move |window, cx| {
@@ -1441,8 +1501,8 @@ impl RelationshipTree {
                             )
                             .icon_color(Color::Muted)
                             .toggle_state(hide_empty)
-                            .tooltip(move |_, cx| {
-                                Tooltip::for_action(
+                            .tip_fn(move |_, cx| {
+                                studio_ui::ds::tooltip_for_action_view(
                                     if hide_empty {
                                         "Show relationships with none"
                                     } else {
@@ -1462,7 +1522,7 @@ impl RelationshipTree {
                     .child(
                         studio_ui::ds::row_icon_button("collapse-to-root", IconName::ListCollapse)
                             .icon_color(Color::Muted)
-                            .tooltip(Tooltip::text("Collapse all"))
+                            .tip(studio_ui::ds::tooltip("Collapse all"))
                             .on_click(cx.listener(|this, _, _, cx| this.collapse_to_root(cx))),
                     ),
             )
@@ -1486,10 +1546,10 @@ impl RelationshipTree {
                     d.child(
                         studio_ui::ds::row_button("newer", "Newer data · Refresh")
                             .style(ButtonStyle::Tinted(ui::TintColor::Accent))
-                            .tooltip({
+                            .tip_fn({
                                 let focus = self.focus_handle.clone();
                                 move |_, cx| {
-                                    Tooltip::for_action_in(
+                                    studio_ui::ds::tooltip_for_action_in_view(
                                         "The branch moved since this tree was read. Refresh reads it again.",
                                         &Refresh,
                                         &focus,
@@ -1842,6 +1902,63 @@ mod tests {
                     .child(self.tree.clone()),
             )
         }
+    }
+
+    /// The group row's popover sets a relationship's filters from a property, a test and a
+    /// value, refuses an empty value, and takes a filter off again (spec 005).
+    #[gpui::test]
+    async fn the_filter_popover_sets_and_removes_a_relationships_filters(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::neighbour_filters::{NeighbourFilters, can_filter, filter_words};
+        use gq_language::builder::{Filter, FilterOp};
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _served) = followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\n",
+            |_| serde_json::json!([{ "id": "p1", "label": "Ada", "n": 0 }]),
+            cx,
+        );
+        cx.run_until_parked();
+        let ada = NodeRef::new("Person", "p1");
+        let exploration = cx.update(|cx| Exploration::for_walk(&session, ada, None, cx));
+        cx.run_until_parked();
+        let knows = gq_language::RelationshipGroup {
+            edge: "Knows".into(),
+            direction: gq_language::Direction::Outgoing,
+            other_type: "Person".into(),
+        };
+        assert!(exploration.read_with(cx, |e, _| can_filter(e, &knows)));
+        let (popover, cx) = cx.add_window_view(|window, cx| {
+            NeighbourFilters::new(exploration.clone(), knows.clone(), window, cx)
+        });
+        cx.run_until_parked();
+        popover.update_in(cx, |popover, window, cx| {
+            popover.add(window, cx);
+            assert!(popover.error.is_some(), "a value is needed");
+            popover.set_property("name".into(), cx);
+            popover.set_op(FilterOp::Eq, cx);
+            popover
+                .value
+                .update(cx, |editor, cx| editor.set_text("Bob", window, cx));
+            popover.add(window, cx);
+            assert!(popover.error.is_none());
+            assert_eq!(popover.value.read(cx).text(cx), "", "the field is cleared");
+        });
+        let set = exploration.read_with(cx, |e, _| e.filters(&knows).to_vec());
+        assert_eq!(
+            set,
+            [Filter {
+                property: "name".into(),
+                op: FilterOp::Eq,
+                value: serde_json::json!("Bob"),
+            }]
+        );
+        assert_eq!(filter_words(&set[0]), "name is Bob");
+        popover.update(cx, |popover, cx| popover.remove(0, cx));
+        assert!(exploration.read_with(cx, |e, _| e.filters(&knows).is_empty()));
     }
 
     /// A tab not drawn makes no rows at each answer; what it owes it makes when drawn. Two tabs on

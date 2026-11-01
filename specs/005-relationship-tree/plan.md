@@ -87,6 +87,18 @@ on the canvas. Typing filters the visible rows.
   with `exists { $v: Company  $m worksAt $v  $v.@id = $value }`, or `not { … }` for none. A
   neighbour related to two values is under both, so the values' counts can add up to more than
   the group's.
+- Filtering a relationship's neighbours (since 2026-11-01): a group row's filter button opens
+  a popover that lists the filters set on the relationship as pills, each removable, and takes
+  one more as a property of the other type, a test and a value, the tests and values as the
+  table's filters take them (`FilterOp::for_property`, `input::parse_input`). The filters belong
+  to the relationship (edge, direction, other type), as a grouping does: they narrow it wherever
+  it appears in the walk, and the row says them in words after the grouping ("city is London").
+  Setting them lets go of the relationship's counts, pages and values, which are read again
+  under them: a page through `builder::neighbours` with `Narrow::filters` as clauses on `$m`, a
+  count through `builder::neighbour_count` (one node's own read, where an unfiltered count is
+  read with the page's `page_degrees`), and grouped values and the "no value" bucket through the
+  same clauses. A condition (`@where`) is not offered, since it names the table's row. Filters
+  are not saved with the tab.
 - The whole tree reads one commit; when the session sees the branch's head elsewhere (spec 003:
   Studio's commit, or another writer's at the next poll), "Newer data · Refresh" appears. It is
   read and flattened under one schema too, the one its reads were made under: another writer's
@@ -153,6 +165,7 @@ on the canvas. Typing filters the visible rows.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-01 | A relationship's neighbours are filtered by a property wherever it appears, in counts, pages and values | `gq_language` `neighbour_reads_take_filters_on_the_neighbours`; `graph_store` `filters_on_a_relationship_read_its_count_and_page_again`; `relationship_tree` `the_filter_popover_sets_and_removes_a_relationships_filters` | Pass. Offscreen snapshot of a Tree on the dev graph with a filter set on one relationship |
 | 2026-11-01 | A tree holds a set of nodes as well as one | `relationship_tree` `a_set_opens_closed_and_canvas_takes_the_selected_node`; `graph_store` `a_set_is_paged_and_its_rows_open_on_their_own`; an offscreen snapshot | Spec 020. A table's rows open as closed rows, read a page at a time; a closed row reads nothing |
 | 2026-11-01 | The tree is a tab, one per root and commit | `relationship_tree` `a_hidden_tree_makes_no_rows_and_a_walk_is_shared_by_root_and_commit`; `graph_store` `a_held_walk_stays_at_its_commit`; an offscreen snapshot beside a table | Spec 020 moves it from the left dock. Re-rooting opens a tab, and Back replaces the breadcrumb |
 | 2026-10-22 | Reads left by a read ahead take no answer's place in the memo | `graph_store` `memo::a_read_nobody_waits_for_goes_before_any_answer` (spec 015) | Five reads each left as the next started kept a 2-entry memo's answer, one read held at the end. Before, each stayed until the entry cap let it go after every answer |

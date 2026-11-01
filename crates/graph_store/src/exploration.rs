@@ -319,6 +319,18 @@ pub enum LoadTarget {
     Values(GroupKey, GroupBy),
 }
 
+impl LoadTarget {
+    /// The relationship the read is of, for every read but the root's.
+    pub fn group(&self) -> Option<&RelationshipGroup> {
+        match self {
+            LoadTarget::Root => None,
+            LoadTarget::Count(key) | LoadTarget::Page(key) | LoadTarget::Values(key, _) => {
+                Some(&key.group)
+            }
+        }
+    }
+}
+
 /// How many values of a grouping property one read returns, most common first.
 pub const VALUES_LIMIT: u32 = 100;
 
@@ -428,6 +440,9 @@ pub struct ExploreState {
     pub searches: HashMap<GroupKey, String>,
     /// The property each relationship's neighbours are grouped by, wherever it appears.
     pub grouping: HashMap<RelationshipGroup, GroupBy>,
+    /// The filters each relationship's neighbours are read under, wherever it appears (spec
+    /// 005, "Filtering a relationship's neighbours"): its counts, pages and values all narrow.
+    pub filters: HashMap<RelationshipGroup, Vec<Filter>>,
     pub values: HashMap<(GroupKey, GroupBy), Loadable<Buckets>>,
     pub selection: Option<ExplorePath>,
     /// The rows of a tree holding a set; none for a walk from one node.
@@ -446,6 +461,7 @@ impl Default for ExploreState {
             neighbours: HashMap::new(),
             searches: HashMap::new(),
             grouping: HashMap::new(),
+            filters: HashMap::new(),
             values: HashMap::new(),
             selection: None,
             set: None,
@@ -553,6 +569,24 @@ impl ExploreState {
             Some(by) => self.grouping.insert(group.clone(), by),
             None => self.grouping.remove(group),
         };
+    }
+
+    /// Filters a relationship's neighbours wherever it appears, or stops: what was read of it
+    /// (counts, pages, values) goes, to be read again under the filters; paths stay open.
+    pub fn set_filters(&mut self, group: &RelationshipGroup, filters: Vec<Filter>) {
+        if filters.is_empty() {
+            self.filters.remove(group);
+        } else {
+            self.filters.insert(group.clone(), filters);
+        }
+        self.counts.retain(|key, _| key.group != *group);
+        self.neighbours.retain(|key, _| key.group != *group);
+        self.values.retain(|(key, _), _| key.group != *group);
+    }
+
+    /// The filters a relationship's neighbours are read under.
+    pub fn filters_of(&self, group: &RelationshipGroup) -> &[Filter] {
+        self.filters.get(group).map_or(&[], Vec::as_slice)
     }
 
     /// Expands a node or group path. A group known to be empty stays closed.
@@ -1862,6 +1896,30 @@ impl Exploration {
         self.state.grouping.get(group)
     }
 
+    /// The filters a relationship's neighbours are read under, wherever it appears.
+    pub fn filters(&self, group: &RelationshipGroup) -> &[Filter] {
+        self.state.filters_of(group)
+    }
+
+    /// Filters a relationship's neighbours wherever it appears in this exploration, or stops
+    /// (spec 005, "Filtering a relationship's neighbours"): its counts, pages and values are
+    /// read again under the filters, reads out for them dropped.
+    pub fn set_filters(
+        &mut self,
+        group: &RelationshipGroup,
+        filters: Vec<Filter>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.filters_of(group) == filters.as_slice() {
+            return;
+        }
+        self.state.set_filters(group, filters);
+        self.tasks
+            .retain(|target, _| target.group().is_none_or(|g| g != group));
+        self.request_missing(cx);
+        self.changed(cx);
+    }
+
     /// Groups a relationship's neighbours by a property wherever it appears in this
     /// exploration, or stops grouping them.
     pub fn set_grouping(
@@ -2197,6 +2255,16 @@ impl Exploration {
                 };
                 builder::node_label(&schema, &root.type_name, &root.id)
             }
+            LoadTarget::Count(key) if !self.state.filters_of(&key.group).is_empty() => {
+                // Filtered, a count is one node's own read, not a page's batch.
+                builder::neighbour_count(
+                    &schema,
+                    &key.node.type_name,
+                    &key.group,
+                    &key.node.id,
+                    self.state.filters_of(&key.group),
+                )
+            }
             LoadTarget::Count(key) => {
                 let snapshot = self.pin.clone();
                 let scope = &self.scope;
@@ -2246,6 +2314,7 @@ impl Exploration {
                         .as_ref()
                         .zip(value.as_ref())
                         .map(|(within, value)| (&within.by, value)),
+                    filters: self.state.filters_of(&key.group),
                 };
                 builder::neighbours(
                     &schema,
@@ -2258,12 +2327,14 @@ impl Exploration {
                 )
             }
             LoadTarget::Values(key, by) => {
+                let filters = self.state.filters_of(&key.group);
                 let values = builder::neighbour_values(
                     &schema,
                     &key.node.type_name,
                     &key.group,
                     &key.node.id,
                     by,
+                    filters,
                     VALUES_LIMIT,
                 );
                 // By a relationship, the neighbours with none are counted by a second read.
@@ -2274,6 +2345,7 @@ impl Exploration {
                         &key.group,
                         &key.node.id,
                         by,
+                        filters,
                     );
                     match values.and_then(|values| Ok((values, without?))) {
                         Ok((values, without)) => {
@@ -2567,8 +2639,16 @@ impl Exploration {
                 state.apply_set_page(key.clone(), &output, page_size, schema.as_deref())
             }
             LoadTarget::Root => state.apply_root(&output),
-            // A count is read with the others asked for this turn, and taken by `spawn_count`.
-            LoadTarget::Count(_) => {}
+            // An unfiltered count is read with the others asked for this turn, and taken by
+            // `spawn_count`; a filtered one is this node's own read, its `n` column.
+            LoadTarget::Count(key) => {
+                let n = rows(&output)
+                    .first()
+                    .and_then(|row| row.get("n"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                state.apply_count(key.clone(), n);
+            }
             LoadTarget::Values(key, by) => {
                 state.apply_values(key.clone(), by.clone(), &output, VALUES_LIMIT)
             }
@@ -3152,6 +3232,135 @@ mod tests {
         assert_eq!(state.root_status, Loadable::Loaded(()));
         assert!(!state.reroot(&ExplorePath::root()));
         let _ = schema;
+    }
+
+    /// Filters set on a relationship let go of its count and page, which are read again under
+    /// them: the count as the node's own read, the page with the filter's clause; taking them
+    /// off reads both again unfiltered (spec 005, "Filtering a relationship's neighbours").
+    #[gpui::test]
+    async fn filters_on_a_relationship_read_its_count_and_page_again(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::sync::Mutex;
+
+        use gq_language::builder::FilterOp;
+
+        use crate::test_server::followed_session;
+        let asked: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let seen = asked.clone();
+        let (session, _served) = followed_session(
+            SCHEMA,
+            move |asked| {
+                seen.lock().unwrap().push(asked.clone());
+                match asked["name"].as_str() {
+                    Some("studio_node") => json!([{ "id": "p1", "label": "Ada" }]),
+                    Some("studio_page_degrees") => json!([{ "id": "p1", "n": 2 }]),
+                    Some("studio_neighbour_count") => json!([{ "n": 1 }]),
+                    Some("studio_neighbours") => json!([{ "id": "p2", "label": "Bob" }]),
+                    _ => json!([]),
+                }
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        let schema = schema();
+        let knows = group(&schema, "Person", "Knows", Direction::Outgoing);
+        let key = GroupKey::new(person("p1"), knows.clone());
+        let path = ExplorePath::root().child_group(&knows);
+        let exploration = cx.update(|cx| Exploration::for_session(&session, cx));
+        exploration.update(cx, |exploration, cx| exploration.root_at(person("p1"), cx));
+        cx.run_until_parked();
+        exploration.update(cx, |exploration, cx| exploration.expand(&path, cx));
+        cx.run_until_parked();
+        exploration.read_with(cx, |exploration, _| {
+            assert_eq!(exploration.state().counts[&key], Loadable::Loaded(2));
+            assert_eq!(exploration.state().neighbours[&key].rows.len(), 1);
+        });
+        eprintln!(
+            "BEFORE {:?}",
+            asked
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|a| a["name"].clone())
+                .collect::<Vec<_>>()
+        );
+        asked.lock().unwrap().clear();
+
+        let filter = Filter {
+            property: "name".into(),
+            op: FilterOp::Eq,
+            value: json!("Bob"),
+        };
+        exploration.update(cx, |exploration, cx| {
+            exploration.set_filters(&knows, vec![filter.clone()], cx);
+            assert_eq!(exploration.filters(&knows), std::slice::from_ref(&filter));
+            // Let go, and asked for again at once.
+            assert_eq!(
+                exploration.state().counts.get(&key),
+                Some(&Loadable::Loading),
+                "let go"
+            );
+            // The page follows the count, as a group's first read does.
+            assert!(!exploration.state().neighbours.contains_key(&key), "let go");
+        });
+        cx.run_until_parked();
+        exploration.read_with(cx, |e, _| {
+            eprintln!(
+                "STATE counts={:?} tasks={:?} pin={:?}",
+                e.state().counts,
+                e.tasks.keys().collect::<Vec<_>>(),
+                e.pin
+            )
+        });
+        eprintln!("AFTER {:?}", asked.lock().unwrap());
+        let reads: Vec<(String, Value)> = asked
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|asked| {
+                (
+                    asked["name"].as_str().unwrap_or_default().to_owned(),
+                    asked["params"]["f0"].clone(),
+                )
+            })
+            .collect();
+        assert!(
+            reads.contains(&("studio_neighbour_count".to_owned(), json!("Bob"))),
+            "{reads:?}"
+        );
+        assert!(
+            reads.contains(&("studio_neighbours".to_owned(), json!("Bob"))),
+            "{reads:?}"
+        );
+        exploration.read_with(cx, |exploration, _| {
+            assert_eq!(exploration.state().counts[&key], Loadable::Loaded(1));
+            assert_eq!(exploration.state().neighbours[&key].rows.len(), 1);
+        });
+
+        // Taken off, the count and the page are the unfiltered ones again: the session kept
+        // their answers at the pin, so nothing is sent for them.
+        asked.lock().unwrap().clear();
+        exploration.update(cx, |exploration, cx| {
+            exploration.set_filters(&knows, Vec::new(), cx);
+            // The same filters again change nothing.
+            exploration.set_filters(&knows, Vec::new(), cx);
+        });
+        cx.run_until_parked();
+        let names: Vec<String> = asked
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|asked| asked["name"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        assert!(
+            !names.contains(&"studio_neighbour_count".to_owned()),
+            "{names:?}"
+        );
+        exploration.read_with(cx, |exploration, _| {
+            assert_eq!(exploration.state().counts[&key], Loadable::Loaded(2));
+            assert_eq!(exploration.state().neighbours[&key].rows.len(), 1);
+        });
     }
 
     /// A root not found at the exploration's commit is not found there again: Retry reads it
