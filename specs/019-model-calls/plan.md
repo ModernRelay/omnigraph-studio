@@ -235,9 +235,9 @@ filter box, since the key is the person's own and the settings row already says 
 "Filter in words…", always shown, before the control chips: a pill on the chips' height
 (`ds::pill_field`) with the model's mark where the search field has its glass, its spinner while a call is out,
 and its red line when one failed, with why in its tooltip (`studio_table::FilterInWords`,
-⌘⇧F, puts the cursor in it). Enter calls `table-filter` (Fast; 32 KB in, since a wide type with many relationships describes itself in more than 8 KB; 300 tokens out, 10 s) with the type's property names and
-value types, its enums' values, its relationship keys (`relationship_key`), the 16 operators
-with one line each on what they take, today's date, and the sentence. The schema is built per
+⌘⇧F, puts the cursor in it). Enter calls `table-filter` (Fast; 32 KB in, since a wide type with many relationships describes itself in more than 8 KB; 300 tokens out, 10 s; each related type's properties are said once, and left out, with a line saying so, when they would pass the cap) with the type's property names and
+value types, its enums' values, its relationship keys (`relationship_key`), what each operator
+takes, today's date, and the sentence. The schema is built per
 type: `property` an enum of the type's keys, `op` an enum of the operators, `value` a list of
 strings. The answer's filters go through `builder::build`'s checks; any it refuses is dropped
 and the bar says "Could not use: {property}". Relationships filter too: `has_any` and
@@ -333,6 +333,7 @@ A call is never retried. The model list is read at most once a day.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-31 | The sentence filter's input fits the cap on the personal graph's widest types | `type_table` `the_input_says_each_related_type_once_and_fits_the_cap` (a related type reached twice is described once; 400 relationships leave the related types' properties out, say so, and stay within the cap); an uncommitted instrument over the personal graph's schema (100 node types, 549 edge types) | Before: Person 50,383 B and Artifact 48,303 B, over the 32 KiB cap, so the call was refused on both. After: 25,452 B and 31,393 B, every type within the cap and none leaving related properties out. Each relationship repeated the relationship operators and the related type's properties; both are now said once |
 | 2026-10-30 | The crate sends the schema under strict with the provider policy, parses the answer as the task's type, and tells its errors apart | `model` `a_call_sends_the_schema_and_parses_the_answer`, `errors_are_told_apart`, `the_model_list_keeps_schema_models_with_prices` (a fake HTTP client) | Pass |
 | 2026-10-30 | A sentence's answer becomes filters the type takes, and a branch condenses to titles and changed property names without values | `type_table` `words::tests::an_answer_becomes_filters_the_type_takes`, `fill::tests::a_rows_input_names_the_target_and_its_sources`; `review` `summary::tests::the_input_holds_titles_and_changed_property_names_but_no_values` | Pass. The live calls were not run from the app yet: no key is stored in it |
 | 2026-10-29 | Direct schema-bound calls answer filters in 1–3 s and agent routes in 4–6 s; ACP without a schema does not keep the shape | Eight requests on `Event`, graded; `claude -p`, `codex exec`, warm ACP sessions of both agents, OpenRouter with four models, Anthropic direct (scratchpad `nlfilter/`, scripts `run.sh`, `direct.py`, `acp_turns.py`, `grade.py`) | As in the table above. Haiku, Flash Lite and the CLIs 8/8; nano 5/8; ACP 0/5 with the wrong field names |
