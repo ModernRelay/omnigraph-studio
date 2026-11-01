@@ -63,11 +63,16 @@ fn open_file(
     }
     let read = {
         let path = path.clone();
-        cx.background_spawn(async move { std::fs::read_to_string(&path).ok() })
+        cx.background_spawn(async move { crate::view::read_text_file(&path) })
     };
     let tab = editor.downgrade();
     cx.spawn_in(window, async move |workspace, cx| {
-        let on_disk = read.await;
+        let (on_disk, why) = match read.await {
+            Ok(text) => (text, None),
+            // One there that cannot be read: the tab keeps what it remembered, as for a file
+            // gone, and a save refuses to write over it.
+            Err(why) => (None, Some(why)),
+        };
         workspace
             .update_in(cx, |workspace, window, cx| {
                 let Some(tab) = tab.upgrade() else {
@@ -76,7 +81,10 @@ fn open_file(
                 if !tab.update(cx, |tab, cx| tab.file_read(on_disk, window, cx)) {
                     workspace.show_toast(
                         ToastKind::Error,
-                        format!("{} could not be read.", path.display()),
+                        match &why {
+                            Some(why) => format!("{} could not be read: {why}.", path.display()),
+                            None => format!("{} could not be read.", path.display()),
+                        },
                         cx,
                     );
                     tab.update(cx, |_, cx| cx.emit(ItemEvent::Close));
