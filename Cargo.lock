@@ -206,6 +206,7 @@ dependencies = [
  "studio_theme",
  "studio_ui",
  "studio_workspace",
+ "tempfile",
  "ui",
  "url",
  "windows-sys 0.61.2",
