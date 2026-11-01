@@ -23,14 +23,14 @@ says where a graph needs something different.
 
 | Article | How this touches it |
 |---|---|
-| I. The engine is the authority | A captured set is a copy for drawing, never treated as true |
+| I. The engine is the authority | A tree of a set reads its rows from the server; rows ticked are a list of nodes, never treated as true |
 | II. One snapshot per view | Every table, page and walk reads one commit. Tree and Canvas on one walk share that commit |
 | IV. Every write names its branch | Scope moves to the top bar, always visible |
 | V. Nothing moves under you | Opening a view never changes or closes the tab it came from. Refreshing a shared walk shows in both of its tabs |
 | VI. Every control explains itself | A view that can't open stays visible, disabled, with the reason |
 | VII. Loudness matches cost | Opening a view is silent |
 | VIII. Keyboard first | Every view has an action and a key; the palette lists only those available |
-| IX. Work is bounded | A set drawn on Canvas uses the existing cap and its honest exit |
+| IX. Work is bounded | A set in Tree is paged; Canvas keeps its cap and honest exit |
 | XI. Zed lineage | The model is Zed's; the deviations are listed under Decisions |
 | XII. Evidence over assumption | The prediction test gates the surface moves |
 
@@ -174,8 +174,8 @@ are rules, not five new Rust types.
 |---|---|---|
 | **Subject** | The schema, type, node, edge, query or branch being viewed | Sets the view strip. A view that needs one node narrows a type to that node, and the tab's title says so |
 | **Read context** | The session and branch, and either "head" or a held commit | Always carried to the destination, and part of a tab's identity. A held view is read-only |
-| **Captured set** | The records drawn when a set Canvas opened, and whether they're only part of a result | Fixed at opening. Never follows its source |
-| **Tab identity** | The key that decides whether an open tab is reused | Subject, view and read context; for a captured set, also its contents |
+| **Set** | A type's rows under filters, or nodes listed | Fixed at opening: what a tree reads. Never follows its source |
+| **Tab identity** | The key that decides whether an open tab is reused | Subject, view and read context; for a set, also what it reads |
 | **Shared walk** | The expansion, selection and commit behind a Tree and a Canvas | One per session, root and read context. Refreshes together |
 
 ### What each view holds
