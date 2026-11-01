@@ -1193,12 +1193,13 @@ mod tests {
         sent: &Arc<Mutex<Vec<String>>>,
         cx: &mut TestAppContext,
     ) -> Option<String> {
+        // A protected read: the public routes carry no token.
         let client = connection.read_with(cx, |connection, _| connection.client().clone());
-        let health = cx
+        let read = cx
             .background_executor
-            .spawn(async move { client.health().await });
+            .spawn(async move { client.graphs().await });
         cx.run_until_parked();
-        drop(health);
+        drop(read);
         sent.lock().unwrap().pop()
     }
 
