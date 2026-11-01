@@ -233,10 +233,12 @@ stay put), IX (paged, virtualized).
 
 - Filter chips per column: equals, not equals, greater or less, contains, starts with, in
   list, is empty, is not empty; dates as Today, This week, Last 30 days, or a range, through
-  `now()`. Free text with a full-text index (`@index`, or a key) also offers "matches words",
-  the engine's `search($n.p, $q)`: the words in any order and form, which the compiler refuses
-  on a property without the index (T27), so the operator is offered only where it holds
-  (since 2026-10-31). A preset
+  `now()`. A node's free text with a full-text index also offers "matches words", the
+  engine's `search($n.p, $q)`: the words in any order and form. The compiler refuses it on a
+  property without the index (T27) and on every edge property, so it is offered only where
+  the compiler's own reading of the schema finds one (`NodeType::has_full_text_index`: a
+  one-column `@index` on the property or the type, or a key of one property; since
+  2026-10-31). A preset
   holds no value of its own: a row edited, inserted or deleted is judged here against the days
   it stands for now, as the engine is asked (since 2026-10-21; before, every row was dimmed
   after an edit and counted as not matching).
@@ -512,6 +514,7 @@ kept answers.
 | Date | Claim | Check | Result |
 |---|---|---|---|
 | 2026-10-31 | A condition filter is spliced in as written and judged by the compiler before a read | `gq_language` `a_condition_is_spliced_in_and_judged_by_the_compiler` (an `or … not exists { }` condition type-checks beside a pill's clause; `$n.nope = 1` is a diagnostic; an empty one is refused by the builder) | Pass. The pill's edit-on-click and the draft's compile error are not drawn by a test |
+| 2026-10-31 | "Matches words" is offered where the compiler takes `search`, and only there | `gq_language` `every_offered_filter_op_compiles` (extended: edge properties too, and a schema with a composite key, `@index(title)` on the type, `summary: String @index`, a lone key and `note: String @index` on an edge), `text_filters_start_with_search_and_reach_neighbours` (extended: offered on `title`, `summary` and the lone key, not on a composite key's member or an unindexed property). Each fails under the earlier rule (checked) | Fixed. The first rule marked every key member and every property `@index` as searchable, so a composite key's members and an edge's indexed property offered an operator whose query failed to compile, and a one-column index declared on the type was not offered. Each property now asks the compiler's catalog, which Studio already builds |
 | 2026-10-31 | A filter tests a neighbour's property, text starts-with, and full-text search where the property is indexed | `gq_language` `text_filters_start_with_search_and_reach_neighbours` (a schema with `name: String @index` and `bio` without: Search offered for one, not the other; `starts_with`, `search()` and `search($r0.name …)` through `out:Knows.name` type-check), `every_offered_filter_op_compiles`; live on the personal graph with the CLI: `starts_with`, `search($p.name, …)` and an `or` group answer, `fuzzy` answers loosely; `cargo test -p type_table` | Pass. `fuzzy()` and `or` groups are not offered yet |
 | 2026-10-29 | A table's rows do not paint as one scene layer | `type_table` `instrument_a_frame_of_a_full_table` (ignored, `instrument:`; 200 rows of 20 text columns, a frame with the grid replayed from its cache, the mean of 600), three runs each with the grid wrapped in `Window::paint_layer` and without; GPUI's `Scene` batching read at Zed v1.23.2 | Without, 9.72, 9.64 and 9.61 ms a frame; with, 8.86, 8.85 and 8.78 (two columns: 3.25 against 3.08). Inside a layer every quad takes one draw order and skips the bounds-tree search, but at one order GPUI draws every shadow before every quad, so a ring drawn as a shadow (the design system's, an unchecked row's checkbox) goes under the cursor row's fill, and every shadowed piece put in a cell later would too. Not adopted: the rows keep the bounds tree, and the instrument stays for the next frame-cost change |
 | 2026-10-29 | Rows are picked by checkbox; the bar comes with the first and deletes | `type_table` `checkboxes_pick_rows_and_the_header_selects_all` (drawn and clicked: the select-all picks both rows, a row's box takes the first out and leaves a dash and the cursor where it was, one row has the bar, the select-all picks the rest and then takes all out); the workspace suite; the relaunched app's Claim table | Pass. Before, rows were picked only by ⌘-click and ⇧-click on a cell, which nothing on screen told, and the bar waited for a second row |

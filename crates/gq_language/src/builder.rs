@@ -315,7 +315,7 @@ impl FilterOp {
                         FilterOp::StartsWith,
                     ];
                     // `search` needs the property's full-text index (the compiler's T27).
-                    if property.indexed {
+                    if property.full_text {
                         ops.push(FilterOp::Search);
                     }
                     ops.push(FilterOp::In);
@@ -3045,6 +3045,31 @@ mod tests {
             "{}",
             query.text
         );
+
+        // Words are offered where the compiler takes `search`: a one-column index, declared on
+        // the property or the type, and a lone key ([`every_offered_filter_op_compiles`] holds
+        // the other half, on a composite key's members and an edge's properties).
+        let schema = indexes();
+        let searchable = |name: &str| {
+            let property = schema.node("Doc").unwrap().property(name).unwrap();
+            FilterOp::for_property(property).contains(&FilterOp::Search)
+        };
+        assert!(searchable("title") && searchable("summary"));
+        assert!(!searchable("code") && !searchable("body"));
+        let tag = schema.node("Tag").unwrap().property("slug").unwrap();
+        assert!(FilterOp::for_property(tag).contains(&FilterOp::Search));
+    }
+
+    /// Every kind of full-text declaration the compiler reads: a composite key, an index on the
+    /// type and on a property, a lone key, and an index on an edge's property.
+    fn indexes() -> SchemaModel {
+        SchemaModel::parse(
+            "node Doc {\n  code: String\n  lang: String\n  title: String\n  \
+             summary: String @index\n  body: String?\n  @key(code, lang)\n  @index(title)\n}\n\
+             node Tag {\n  slug: String @key\n}\n\
+             edge Cites: Doc -> Doc @card(0..) {\n  note: String @index\n}\n",
+        )
+        .unwrap()
     }
 
     /// A condition is spliced in as written, in parentheses, beside the pills' clauses, and the
@@ -3589,31 +3614,51 @@ mod tests {
         assert_compiles(&node_count(&schema, "Person", &filters).unwrap());
     }
 
+    /// Every operator a node's or an edge's property offers compiles, on the dev schema and on
+    /// one with every kind of full-text declaration. Before, "matches words" was offered on a
+    /// composite key's members and on an edge's indexed property, and failed the compiler's
+    /// T27 and its edge-property refusal.
     #[test]
     fn every_offered_filter_op_compiles() {
-        let schema = dev();
-        for node in &schema.nodes {
-            for property in node.properties.iter().filter(|p| p.projectable()) {
-                for op in FilterOp::for_property(property) {
-                    let value = match property.kind {
-                        crate::ScalarKind::Integer => json!(1),
-                        crate::ScalarKind::Float => json!(1.5),
-                        crate::ScalarKind::Bool => json!(true),
-                        crate::ScalarKind::Date => json!("2020-01-01"),
-                        _ => json!("x"),
-                    };
-                    let filters = [Filter {
-                        property: property.name.clone(),
-                        op,
-                        value,
-                    }];
-                    assert_compiles(
-                        &node_page(&schema, &node.name, &filters, None, &PageStart::First, 10)
-                            .unwrap(),
-                    );
+        let filter = |property: &crate::schema::Property, op| {
+            let value = match property.kind {
+                crate::ScalarKind::Integer => json!(1),
+                crate::ScalarKind::Float => json!(1.5),
+                crate::ScalarKind::Bool => json!(true),
+                crate::ScalarKind::Date => json!("2020-01-01"),
+                _ => json!("x"),
+            };
+            [Filter {
+                property: property.name.clone(),
+                op,
+                value,
+            }]
+        };
+        for schema in [dev(), indexes()] {
+            for node in &schema.nodes {
+                for property in node.properties.iter().filter(|p| p.projectable()) {
+                    for op in FilterOp::for_property(property) {
+                        let filters = filter(property, op);
+                        let page =
+                            node_page(&schema, &node.name, &filters, None, &PageStart::First, 10)
+                                .unwrap();
+                        assert_compiles_in(&schema, &page);
+                    }
+                }
+            }
+            for edge in &schema.edges {
+                for property in edge.properties.iter().filter(|p| p.projectable()) {
+                    for op in FilterOp::for_property(property) {
+                        let filters = filter(property, op);
+                        let page =
+                            edge_page(&schema, &edge.name, &filters, None, &PageStart::First, 10)
+                                .unwrap();
+                        assert_compiles_in(&schema, &page);
+                    }
                 }
             }
         }
+        let schema = dev();
         let name = schema.node("Person").unwrap().property("name").unwrap();
         assert!(!FilterOp::for_property(name).contains(&FilterOp::IsEmpty));
     }

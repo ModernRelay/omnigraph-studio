@@ -1965,7 +1965,7 @@ mod tests {
                 list: false,
                 enum_values: None,
                 is_key: false,
-                indexed: false,
+                full_text: false,
             };
             relative_value(Some(&property), &Value::String(text.into()), now)
         };
