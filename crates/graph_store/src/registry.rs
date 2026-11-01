@@ -628,8 +628,10 @@ impl ConnectionRegistry {
         {
             return Ok(http.clone());
         }
-        let made = match prepared.iter().position(|(made, _)| made == transport) {
-            Some(at) => prepared.swap_remove(at).1,
+        // Read, not taken: another target naming a transport that could not be made gets the
+        // same refusal rather than making it again here.
+        let made = match prepared.iter().find(|(made, _)| made == transport) {
+            Some((_, made)) => made.clone(),
             None => (self.transported)(transport).map_err(|error| error.to_string()),
         };
         if let Ok(http) = &made {
@@ -1110,6 +1112,44 @@ mod tests {
         registry.update(cx, |registry, cx| {
             registry.apply_cli_targets(files, Vec::new(), cx)
         })
+    }
+
+    /// Two targets naming one transport whose client could not be made off the main thread
+    /// are both refused with why, and the client is not made again here for the second. Before,
+    /// the first took the prepared failure, and the second made the client on the main thread.
+    #[gpui::test]
+    async fn a_transport_that_could_not_be_made_is_not_made_again_here(cx: &mut TestAppContext) {
+        let (http, _) = answering();
+        let registry = cx.new(|_| ConnectionRegistry::empty(http, None));
+        let made = Arc::new(AtomicUsize::new(0));
+        let counted = made.clone();
+        registry.update(cx, |registry, _| {
+            registry.transported = Arc::new(move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::anyhow!("not a certificate"))
+            });
+        });
+        let mut prod = server("prod", "http://a.test", "1");
+        prod.transport.proxy = Some("http://proxy.test:8080".into());
+        let mut staging = server("staging", "http://b.test", "1");
+        staging.transport = prod.transport.clone();
+        let prepared = vec![(prod.transport.clone(), Err("not a certificate".to_owned()))];
+        registry.update(cx, |registry, cx| {
+            registry.apply_cli_targets(files(vec![prod, staging]), prepared, cx)
+        });
+        assert_eq!(
+            made.load(Ordering::SeqCst),
+            0,
+            "none made on the main thread"
+        );
+        registry.read_with(cx, |registry, _| {
+            let refused = registry
+                .notices()
+                .iter()
+                .filter(|notice| notice.contains("not a certificate"))
+                .count();
+            assert_eq!(refused, 2, "{:?}", registry.notices());
+        });
     }
 
     fn find(
