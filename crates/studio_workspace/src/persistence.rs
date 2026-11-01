@@ -101,21 +101,71 @@ fn file_name(key: &str) -> String {
     format!("{hash:016x}.json")
 }
 
+/// A save asked for whose write has not landed: its text, and whether its write failed.
+struct Unwritten {
+    text: Arc<str>,
+    failed: bool,
+}
+
 /// The saves asked for whose writes have not landed, by file. Saves are written on the write
-/// thread in turn ([`write_private`]), so for a moment the file can hold an older one: a graph
-/// closed and opened again then reads its last save from here.
-fn unwritten() -> MutexGuard<'static, HashMap<PathBuf, Arc<str>>> {
-    static UNWRITTEN: OnceLock<Mutex<HashMap<PathBuf, Arc<str>>>> = OnceLock::new();
+/// thread in turn ([`write_state`]), so for a moment the file can hold an older one: a graph
+/// closed and opened again then reads its last save from here. A save whose write failed stays
+/// until a later one lands.
+fn unwritten() -> MutexGuard<'static, HashMap<PathBuf, Unwritten>> {
+    static UNWRITTEN: OnceLock<Mutex<HashMap<PathBuf, Unwritten>>> = OnceLock::new();
     UNWRITTEN
         .get_or_init(Mutex::default)
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Writes `text` over the state file at `path` as [`write_private`] does, kept in
+/// [`unwritten`] until it lands. A failed write (a full disk) is marked: the state it held is
+/// what the window still shows, so nothing changes to write it again, and the next flush asks
+/// [`write_failed`] instead.
+fn write_state(path: PathBuf, text: String) {
+    let text: Arc<str> = text.into();
+    unwritten().insert(
+        path.clone(),
+        Unwritten {
+            text: text.clone(),
+            failed: false,
+        },
+    );
+    studio_settings::run_in_turn(move || {
+        let written =
+            studio_settings::write_atomic(&path, text.as_bytes(), studio_settings::Access::Private);
+        if let Err(error) = &written {
+            log::warn!("Studio could not write {}: {error}", path.display());
+        }
+        let mut unwritten = unwritten();
+        // A later save on its way replaces this one either way.
+        if let Some(last) = unwritten.get_mut(&path)
+            && Arc::ptr_eq(&last.text, &text)
+        {
+            if written.is_ok() {
+                unwritten.remove(&path);
+            } else {
+                last.failed = true;
+            }
+        }
+    });
+}
+
+/// Whether the last write of the state file at `path` failed, and no save has replaced it.
+fn write_failed(path: &Path) -> bool {
+    unwritten().get(path).is_some_and(|last| last.failed)
+}
+
+/// Whether the last save of the graph whose key is `key` failed to be written.
+pub(crate) fn save_failed(key: &str) -> bool {
+    write_failed(&workspaces_dir().join(file_name(key)))
+}
+
 /// The saved state of the graph whose key is `key`.
 pub(crate) fn load(key: &str) -> Option<SavedWorkspace> {
     let path = workspaces_dir().join(file_name(key));
-    let pending = unwritten().get(&path).cloned();
+    let pending = unwritten().get(&path).map(|last| last.text.clone());
     let text = match pending {
         Some(text) => text.to_string(),
         None => read_or_set_aside(&path)?,
@@ -152,21 +202,7 @@ pub(crate) fn save(key: &str, saved: &SavedWorkspace) {
         return;
     }
     if let Ok(text) = serde_json::to_string_pretty(saved) {
-        let path = workspaces_dir().join(file_name(key));
-        let text: Arc<str> = text.into();
-        unwritten().insert(path.clone(), text.clone());
-        write_private(&path, &text);
-        // Written (or not, said in the log): the file is the graph's state again, unless a
-        // later save is still on its way.
-        studio_settings::run_in_turn(move || {
-            let mut unwritten = unwritten();
-            if unwritten
-                .get(&path)
-                .is_some_and(|last| Arc::ptr_eq(last, &text))
-            {
-                unwritten.remove(&path);
-            }
-        });
+        write_state(workspaces_dir().join(file_name(key)), text);
     }
 }
 
@@ -357,7 +393,9 @@ impl WindowSession {
         .detach();
         cx.on_app_quit(|cx| {
             cx.global_mut::<WindowSession>().quitting = true;
-            // The last state written before the app goes.
+            // A write that failed is tried once more, and the last state written before the
+            // app goes.
+            Self::write(cx);
             studio_settings::writes_done();
             async {}
         })
@@ -379,7 +417,7 @@ impl WindowSession {
         if session.written.is_none() && saved.is_empty() {
             return;
         }
-        if session.written.as_ref() != Some(&saved) {
+        if session.written.as_ref() != Some(&saved) || write_failed(&session_path()) {
             write_session(&saved);
             session.written = Some(saved);
         }
@@ -411,7 +449,7 @@ fn write_session(windows: &[SavedWindow]) {
         windows: windows.to_vec(),
     };
     if let Ok(text) = serde_json::to_string_pretty(&file) {
-        write_private(&session_path(), &text);
+        write_state(session_path(), text);
     }
 }
 
@@ -505,6 +543,39 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"active": 1}"#);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_state_write_that_failed_is_remembered_until_one_lands() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("studio-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.json");
+        std::fs::write(&path, "old").unwrap();
+        // A folder the write cannot add its temporary file to, as a full disk refuses one.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        write_state(path.clone(), "new".into());
+        studio_settings::writes_done();
+        let kept = unwritten().get(&path).map(|last| last.text.to_string());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(write_failed(&path), "the next flush writes it again");
+        assert_eq!(
+            kept.as_deref(),
+            Some("new"),
+            "read back from here meanwhile"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+
+        write_state(path.clone(), "newer".into());
+        studio_settings::writes_done();
+        assert!(!write_failed(&path));
+        assert!(
+            unwritten().get(&path).is_none(),
+            "the file is the state again"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "newer");
         std::fs::remove_dir_all(&dir).ok();
     }
 

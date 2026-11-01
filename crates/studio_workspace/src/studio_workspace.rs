@@ -1133,14 +1133,14 @@ impl Workspace {
     }
 
     /// Writes the shown graph's state now, rather than after the save delay, when a save is
-    /// waiting or the state is not what was last written.
+    /// waiting, the state is not what was last saved, or the last save's write failed.
     fn save_now(&mut self, cx: &mut Context<Self>) {
         let Some(key) = self.saved_key(cx) else {
             return;
         };
         let pending = self._save.take().is_some();
         let snapshot = self.snapshot(cx);
-        if pending || self.saved.as_ref() != Some(&snapshot) {
+        if pending || self.saved.as_ref() != Some(&snapshot) || persistence::save_failed(&key) {
             persistence::save(&key, &snapshot);
             self.saved = Some(snapshot);
         }

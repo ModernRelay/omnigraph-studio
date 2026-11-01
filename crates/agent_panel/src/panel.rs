@@ -21,7 +21,7 @@ use gpui::{
 };
 use graph_client::api::CommitKind;
 use graph_store::{GraphSession, OutcomeKind};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use studio_actions::agent::{Allow, AllowAlways, ClearQueue, Reject, Restart, Send, SendNow, Stop};
 use studio_actions::graph::ReviewBranch;
 use studio_settings::{AgentSettings, StudioSettings};
@@ -328,7 +328,7 @@ struct WriteCard {
     id: u64,
     summary: String,
     query: String,
-    params: Option<Map<String, Value>>,
+    params: Vec<(String, String)>,
     branch: String,
     creates_from: Option<String>,
     state: WriteState,
@@ -592,10 +592,7 @@ fn hash_entry(entry: &Entry, hasher: &mut impl std::hash::Hasher) {
             card.query.hash(hasher);
             card.branch.hash(hasher);
             card.creates_from.hash(hasher);
-            card.params
-                .as_ref()
-                .map(|params| Value::Object(params.clone()).to_string())
-                .hash(hasher);
+            card.params.hash(hasher);
             match &card.state {
                 WriteState::Waiting(_) => 0u8.hash(hasher),
                 WriteState::Running => 1u8.hash(hasher),
@@ -3784,19 +3781,11 @@ impl AgentPanel {
             .when(card.creates_from.is_some(), |header| {
                 header.child(studio_ui::ds::tag("new", cx))
             });
-        let params = card.params.as_ref().map(|params| {
-            ds::fields().children(params.iter().map(|(key, value)| {
+        let params = (!card.params.is_empty()).then(|| {
+            ds::fields().children(card.params.iter().map(|(key, value)| {
                 ds::field(
                     format!("${key}"),
-                    ds::text::code(
-                        match value {
-                            Value::String(text) => text.clone(),
-                            other => other.to_string(),
-                        },
-                        cx,
-                    )
-                    .single_line()
-                    .truncate(),
+                    ds::text::code(value.clone(), cx).single_line().truncate(),
                 )
             }))
         });
@@ -4563,7 +4552,7 @@ mod tests {
             id,
             summary: "Mutation".into(),
             query: String::new(),
-            params: None,
+            params: Vec::new(),
             branch: "agent/x".into(),
             creates_from: None,
             state,

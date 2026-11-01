@@ -113,8 +113,9 @@ struct FilterDraft {
     property: String,
     op: FilterOp,
     error: Option<String>,
-    /// The applied filter this draft edits, taken out of the bar while it is open: put back
-    /// when the draft is cancelled, replaced when it is applied.
+    /// The applied filter this draft edits: still applied, and so still filtering the rows and
+    /// every page read, while its pill shows as this draft. Replaced where it stands when the
+    /// draft is applied; left as it was when the draft goes.
     replacing: Option<Filter>,
     /// What the value field offers for its text, the one ↵ picks, and the node search under way.
     offers: Offers,
@@ -417,8 +418,9 @@ impl TypeTable {
     }
 }
 
-/// The net changes from `branch`'s merge base with the target to its head, folded, up to
-/// [`DIFF_CHANGE_CAP`]; `None` when they cannot be read, as a table shows its rows either way.
+/// The net changes from `branch`'s merge base with the target to its head, folded off the main
+/// thread, up to [`DIFF_CHANGE_CAP`]; `None` when they cannot be read, as a table shows its rows
+/// either way.
 async fn read_branch_diff(
     session: &Entity<GraphSession>,
     branch: &str,
@@ -454,13 +456,24 @@ async fn read_branch_diff(
             cause: cause.clone(),
             changes: page.changes,
         };
-        let complete = fold.add_block_capped(block, DIFF_CHANGE_CAP);
+        let (folded, complete) = cx
+            .background_executor()
+            .spawn(async move {
+                let complete = fold.add_block_capped(block, DIFF_CHANGE_CAP);
+                (fold, complete)
+            })
+            .await;
+        fold = folded;
         match page.next_page_token {
             Some(next) if complete && fold.raw_changes() < DIFF_CHANGE_CAP => token = Some(next),
             _ => break,
         }
     }
-    Some(fold.finish())
+    Some(
+        cx.background_executor()
+            .spawn(async move { fold.finish() })
+            .await,
+    )
 }
 
 /// The hover group of a grid row, for the actions its cells show under the pointer.
@@ -1224,6 +1237,11 @@ impl TypeTable {
             if let Some(editing) = this.editing.take() {
                 this.keep_edit_on(&this.branch, editing, cx);
             }
+            // Its peek, which the inspector keeps, hears of its saves no more: they show as
+            // landed, and the head they move is compared, rather than staying "saving".
+            if let Some((_, peek)) = this.peek.take() {
+                peek.update(cx, |peek, cx| peek.table_saves(HashSet::new(), cx));
+            }
         })
         .detach();
         // Drafts already kept for this type (on a node's page, in another table) show at once.
@@ -1266,8 +1284,10 @@ impl TypeTable {
                         window.focus(&self.focus_handle, cx);
                     }
                 }
-                // A Refresh asked for on the branch left reads nothing here.
+                // A Refresh asked for on the branch left reads nothing here, and a fill under
+                // way ends: its answers are drafts bound to the rows the branch left showed.
                 self._refresh = None;
+                self.fill = None;
                 // A file still being stored goes on to the branch left, and its toast tells how
                 // it ended; the new branch's cells show none of it.
                 self.blob_edits.clear();
@@ -2165,6 +2185,11 @@ impl TypeTable {
     /// Opens the fill for the bulk bar's property, over the selected rows, from every other
     /// column the row shows.
     fn open_fill(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Its answers are drafts on the branch: none where the table writes nothing (edges, a
+        // commit it reads, a branch the credential may not change).
+        if self.kind == TableKind::Edge || self.write_refusal(cx).is_some() {
+            return;
+        }
         let target = match self.bulk.property.clone().or_else(|| {
             let cursor = self.cursor?;
             self.columns
@@ -7435,12 +7460,9 @@ impl TypeTable {
         if index >= self.filters.len() {
             return;
         }
-        // A draft already open goes back first, so nothing is lost.
-        self.cancel_filter_draft(window, cx);
-        let filter = self.filters.remove(index);
+        let filter = self.filters[index].clone();
         self.set_draft_property(filter.property.clone(), window, cx);
         let Some(draft) = &mut self.filter_draft else {
-            self.filters.insert(index, filter);
             return;
         };
         draft.op = filter.op;
@@ -7463,12 +7485,9 @@ impl TypeTable {
         cx.notify();
     }
 
-    /// Closes the draft; a filter it was editing goes back where it was.
+    /// Closes the draft; a filter it was editing stays as it was.
     fn cancel_filter_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(draft) = self.filter_draft.take() {
-            if let Some(filter) = draft.replacing {
-                self.filters.push(filter);
-            }
+        if self.filter_draft.take().is_some() {
             window.focus(&self.focus_handle, cx);
             cx.notify();
         }
@@ -7534,12 +7553,16 @@ impl TypeTable {
                 }
             }
         };
-        self.filter_draft = None;
-        self.filters.push(Filter {
+        let filter = Filter {
             property: key,
             op,
             value,
-        });
+        };
+        let replacing = self.filter_draft.take().and_then(|draft| draft.replacing);
+        match replacing.and_then(|old| self.filters.iter().position(|f| *f == old)) {
+            Some(index) => self.filters[index] = filter,
+            None => self.filters.push(filter),
+        }
         window.focus(&self.focus_handle, cx);
         self.reload(true, cx);
     }
@@ -8036,7 +8059,16 @@ impl TypeTable {
             .items_center()
             .border_b_1()
             .border_color(studio_ui::ds::surface::rule(cx));
+        // The filter being edited shows as the draft, after the others.
+        let editing = self
+            .filter_draft
+            .as_ref()
+            .and_then(|draft| draft.replacing.as_ref())
+            .and_then(|old| self.filters.iter().position(|f| f == old));
         for (index, filter) in self.filters.iter().enumerate() {
+            if Some(index) == editing {
+                continue;
+            }
             let (field, test, mut value) = filter_parts(filter);
             if filter.op == FilterOp::RelatedTo
                 && let Some(label) = value.as_ref().and_then(|id| self.node_labels.get(id))
@@ -10348,7 +10380,10 @@ impl Render for TypeTable {
             .on_action(
                 cx.listener(|this, _: &FilterInWords, window, cx| this.open_words(window, cx)),
             )
-            .on_action(cx.listener(Self::on_fill_column))
+            .when(
+                writable && self.at_commit.is_none() && self.kind != TableKind::Edge,
+                |table| table.on_action(cx.listener(Self::on_fill_column)),
+            )
             .on_action(cx.listener(|this, _: &FilterBySelection, window, cx| {
                 this.filter_by_selection(window, cx)
             }))
@@ -11259,6 +11294,43 @@ mod tests {
             before,
             "the cell editor drew the grid"
         );
+    }
+
+    /// A filter opened for editing still filters the rows, and every page read, until it is
+    /// applied, replaced where it stands, or the draft goes, leaving it as it was. Before, it
+    /// left the filters while open: another draft, or a page read meanwhile, lost it while the
+    /// rows still showed it.
+    #[gpui::test]
+    async fn a_filter_being_edited_still_filters_the_rows(cx: &mut TestAppContext) {
+        let session = session(PEOPLE, cx);
+        let (table, cx) = people_table(&session, cx);
+        let named = |name: &str| Filter {
+            property: "name".into(),
+            op: FilterOp::Eq,
+            value: serde_json::json!(name),
+        };
+        table.update(cx, |table, cx| {
+            table.filters = vec![named("Ada")];
+            table.reload(true, cx);
+        });
+        cx.run_until_parked();
+        table.update_in(cx, |table, window, cx| {
+            table.edit_filter(0, window, cx);
+            assert_eq!(table.filters, [named("Ada")], "still applied while edited");
+            // Another draft opened over it leaves it as it was.
+            table.set_draft_property("name".into(), window, cx);
+            assert_eq!(table.filters, [named("Ada")]);
+            table.cancel_filter_draft(window, cx);
+            assert_eq!(table.filters, [named("Ada")]);
+
+            table.edit_filter(0, window, cx);
+            table
+                .filter_editor
+                .update(cx, |editor, cx| editor.set_text("Grace", window, cx));
+            table.apply_filter_draft(window, cx);
+            assert_eq!(table.filters, [named("Grace")], "replaced where it stood");
+            assert!(table.filter_draft.is_none());
+        });
     }
 
     /// A text cell with more than one line or with markup is not edited in the one-line cell
@@ -12178,6 +12250,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["studio_page", "studio_page_fields"]
         );
+        // A fill writes drafts on the branch, so a table at a commit opens none.
+        table.update_in(cx, |table, window, cx| {
+            table.selection.insert("p1".into());
+            let col = table.column_index("name").unwrap();
+            table.set_cursor(Cursor { row: 0, col }, cx);
+            table.open_fill(window, cx);
+            assert!(table.fill.is_none());
+            table.selection.clear();
+        });
 
         // Sorted and filtered by it there, no row held it: the table answers its page and its
         // count of 0 without a read.
@@ -13826,13 +13907,14 @@ mod tests {
             table: &Entity<TypeTable>,
             cx: &mut VisualTestContext,
         ) -> (Vec<bool>, Vec<String>) {
-            let writes: [&dyn gpui::Action; 6] = [
+            let writes: [&dyn gpui::Action; 7] = [
                 &EditCell,
                 &InsertRow,
                 &DeleteRow,
                 &SaveDrafts,
                 &ChooseFile,
                 &ClearValue,
+                &FillColumn,
             ];
             let available = cx.update(|window, cx| {
                 writes
@@ -13850,7 +13932,7 @@ mod tests {
         let (unknown, _) = crate::test_support::session_with_blobs(&schema, cx);
         let (table, unknown_cx) = open(unknown, cx);
         let (available, keys) = offered(&table, unknown_cx);
-        assert_eq!(available, [true; 6], "offered while not known: {keys:?}");
+        assert_eq!(available, [true; 7], "offered while not known: {keys:?}");
         assert!(keys.iter().any(|key| key == "New row"), "{keys:?}");
 
         let (session, sent, blobs) = crate::test_support::session_with_access(
@@ -13870,7 +13952,7 @@ mod tests {
             );
         });
         let (available, keys) = offered(&table, cx);
-        assert_eq!(available, [false; 6]);
+        assert_eq!(available, [false; 7]);
         assert_eq!(
             keys,
             [
@@ -14094,8 +14176,18 @@ mod tests {
         let session = session(PEOPLE, cx);
         let (table, cx) = people_table(&session, cx);
         type_in_name(&table, "Ada King", cx);
+        // A fill open on the branch left ends with it: its answers would be drafts here, bound
+        // to the rows the other branch showed.
+        table.update(cx, |table, _| {
+            table.fill = Some(FillState {
+                target: "name".into(),
+                sources: Vec::new(),
+                phase: FillPhase::Typing,
+            })
+        });
         session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
         cx.run_until_parked();
+        table.read_with(cx, |table, _| assert!(table.fill.is_none()));
         session.read_with(cx, |session, _| {
             let typed = DraftEntry {
                 old: "Ada".into(),
@@ -14406,6 +14498,24 @@ mod tests {
                 }
             });
         }
+
+        // The table let go while its save is out (its tab closed): the peek, which the
+        // inspector keeps, shows the property as saving no more.
+        let committed = crate::test_support::committed("c2", "c1");
+        let session = crate::test_support::session_answering(PEOPLE, 200, committed, cx);
+        let (table, cx) = people_table(&session, cx);
+        type_in_name(&table, "Ada Lovelace", cx);
+        let peek = table.update_in(cx, |table, window, cx| {
+            table.confirm_edit(window, cx);
+            table.peek_row(0, cx)
+        });
+        peek.read_with(cx, |peek, _| assert!(peek.shown("name").1, "saving"));
+        drop(table);
+        cx.update(|window, _| window.remove_window());
+        cx.run_until_parked();
+        peek.read_with(cx, |peek, _| {
+            assert!(!peek.shown("name").1, "saving no more")
+        });
     }
 
     /// Every write the table makes reaches its peek, which follows it as it follows its own: a

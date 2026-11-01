@@ -446,6 +446,40 @@ enum Saved {
     Changed(String),
 }
 
+/// A query file's text, read as text: `Ok(None)` when there is no file, an error when it is
+/// there but cannot be read as text (not UTF-8, not permitted). A save never takes such a file
+/// for one that is gone, and never writes over it.
+pub(crate) fn read_text_file(path: &std::path::Path) -> Result<Option<String>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| "it is not UTF-8 text".to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// A file's text as the editor holds it, every line break `\n`, as its buffer keeps them (a
+/// `\r\n` and a lone `\r` alike), and whether the file broke its lines with `\r\n`, which a
+/// save writes back.
+fn as_edited(disk: String) -> (String, bool) {
+    if !disk.contains('\r') {
+        return (disk, false);
+    }
+    let crlf = disk.contains("\r\n");
+    (disk.replace("\r\n", "\n").replace('\r', "\n"), crlf)
+}
+
+/// What a row's cells show, kept for the frames that draw it: each value's start a cell can
+/// show ([`studio_ui::shown_part`]), not the whole of a long text, which the table holds
+/// already. Before, a text-heavy answer was held twice.
+fn cells_of(values: &[Value]) -> Box<[SharedString]> {
+    values
+        .iter()
+        .map(|value| studio_ui::shown_part(format_value(value).into()))
+        .collect()
+}
+
 /// A stable hash of a file's text, kept with a remembered draft to tell, after a restart,
 /// whether the file changed since the draft was typed over it: FNV-1a over its bytes, with
 /// their count, so the same text gives the same hash in every build.
@@ -494,6 +528,9 @@ pub struct QueryEditor {
     saved_hash: Option<String>,
     /// The text differs from `saved_text`: found once per edit, not on every draw of the tab.
     unsaved: bool,
+    /// The file broke its lines with `\r\n` when last read, which a save writes back: the
+    /// editor holds every line break as `\n`, and `saved_text` with them.
+    crlf: bool,
     file_error: Option<String>,
     /// The file's text is being read: the tab says so until it is in.
     loading: Option<Loading>,
@@ -770,15 +807,20 @@ impl Item for QueryEditor {
             (Some(loading), _) => loading.draft.clone(),
             // Saved: the file's text, for the restart that finds the file gone.
             (None, Some(_)) if !self.unsaved => {
-                let text = self.editor.read(cx).text(cx);
-                (text.len() <= REMEMBERED_SAVED_TEXT).then(|| Draft {
-                    // The text is the file's.
-                    based_on: self
-                        .saved_hash
-                        .clone()
-                        .or_else(|| Some(content_hash(&text))),
-                    text,
-                    saved: true,
+                // Measured before it is copied: the workspace asks every few seconds, and a
+                // text past the cap is not kept.
+                let length = self.editor.read(cx).buffer().read(cx).read(cx).len().0;
+                (length <= REMEMBERED_SAVED_TEXT).then(|| {
+                    let text = self.editor.read(cx).text(cx);
+                    Draft {
+                        // The text is the file's.
+                        based_on: self
+                            .saved_hash
+                            .clone()
+                            .or_else(|| Some(content_hash(&text))),
+                        text,
+                        saved: true,
+                    }
                 })
             }
             (None, Some(_)) => Some(Draft {
@@ -961,6 +1003,7 @@ impl QueryEditor {
             saved_text: None,
             saved_hash: None,
             unsaved: false,
+            crlf: false,
             file_error: None,
             loading: None,
             file_gone: None,
@@ -1261,6 +1304,7 @@ impl QueryEditor {
         let Some(Loading { draft }) = self.loading.take() else {
             return true;
         };
+        let disk = disk.map(|disk| self.read_disk_text(disk));
         self.editor
             .update(cx, |editor, _| editor.set_read_only(false));
         match (draft, disk) {
@@ -1306,7 +1350,8 @@ impl QueryEditor {
         if self.loading.is_some() || self.saving || self.disk_task.is_some() {
             return;
         }
-        let read = cx.background_spawn(async move { std::fs::read_to_string(&path).ok() });
+        // One that cannot be read as text says nothing: a save refuses to write over it.
+        let read = cx.background_spawn(async move { read_text_file(&path).ok().flatten() });
         self.disk_task = Some(cx.spawn_in(window, async move |this, cx| {
             let disk = read.await;
             this.update_in(cx, |this, window, cx| {
@@ -1327,6 +1372,7 @@ impl QueryEditor {
         if self.saving || self.loading.is_some() {
             return;
         }
+        let disk = self.read_disk_text(disk);
         if let Some(gone) = self.file_gone.take() {
             self.file_back(gone, disk, cx);
             cx.emit(ItemEvent::UpdateTab);
@@ -1416,6 +1462,16 @@ impl QueryEditor {
         window.focus(&self.editor_focus, cx);
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
+    }
+
+    /// `disk`, a file's text as read, as the editor holds it, noting whether the file broke its
+    /// lines with `\r\n` ([`as_edited`]). Before, a file with `\r\n` showed unsaved as soon as
+    /// it opened, since the editor holds its line breaks as `\n`, so it never took the file's
+    /// changes and a save wrote every line's break anew.
+    fn read_disk_text(&mut self, disk: String) -> String {
+        let (text, crlf) = as_edited(disk);
+        self.crlf = crlf;
+        text
     }
 
     /// Takes `text` as the file's text, which the tab's text is compared with.
@@ -1572,18 +1628,31 @@ impl QueryEditor {
         // A read made to see whether the file changed would answer for the text this replaces.
         self.disk_task = None;
         let text = self.editor.read(cx).text(cx);
-        let written = text.clone();
+        let written = if self.crlf {
+            text.replace('\n', "\r\n")
+        } else {
+            text.clone()
+        };
         let write = cx.background_spawn(async move {
             let path = match target {
                 SaveTarget::File { path, expected } => {
                     // A file gone since is written again; one holding other text is not
                     // written over, nor one back where there was none, whatever it holds.
+                    // One there that cannot be read as text is not taken for one gone, and is
+                    // not written over. Before, it was, and the save replaced it.
                     let now = match expected {
                         Expected::Anything => None,
-                        Expected::Text(_) | Expected::NoFile => std::fs::read_to_string(&path).ok(),
+                        Expected::Text(_) | Expected::NoFile => read_text_file(&path).map_err(|why| {
+                            std::io::Error::other(format!(
+                                "{} is there but cannot be read ({why}), so it was not written over",
+                                path.display()
+                            ))
+                        })?,
                     };
                     match (expected, now) {
-                        (Expected::Text(expected), Some(now)) if now != expected => {
+                        (Expected::Text(expected), Some(now))
+                            if as_edited(now.clone()).0 != expected =>
+                        {
                             return Ok(Saved::Changed(now));
                         }
                         (Expected::NoFile, Some(now)) => return Ok(Saved::Changed(now)),
@@ -1613,32 +1682,34 @@ impl QueryEditor {
                         this.file_error = None;
                         crate::saved_queries_changed(cx);
                     }
-                    Ok(Saved::Changed(now)) => match this.file_gone.take() {
-                        // The save expected no file and found it back, so nothing was written.
-                        // Back as the tab knew it, the save goes on over it; changed elsewhere,
-                        // the bar asks.
-                        Some(gone) => {
-                            this.file_back(gone, now, cx);
-                            if let Some(change) = &mut this.disk_change {
-                                change.asked = true;
+                    Ok(Saved::Changed(now)) => {
+                        match (this.read_disk_text(now), this.file_gone.take()) {
+                            // The save expected no file and found it back, so nothing was written.
+                            // Back as the tab knew it, the save goes on over it; changed elsewhere,
+                            // the bar asks.
+                            (now, Some(gone)) => {
+                                this.file_back(gone, now, cx);
+                                if let Some(change) = &mut this.disk_change {
+                                    change.asked = true;
+                                    this.save_next = None;
+                                    window.focus(&this.file_focus, cx);
+                                } else if this.unsaved {
+                                    this.save_next.get_or_insert(None);
+                                }
+                            }
+                            (now, None) => {
+                                // Nothing was written: the draft stays, and the bar asks.
+                                this.disk_change = Some(DiskChange {
+                                    based_on: this.saved_hash.clone(),
+                                    asked: true,
+                                });
+                                this.set_saved(now);
+                                this.sync_unsaved(cx);
                                 this.save_next = None;
                                 window.focus(&this.file_focus, cx);
-                            } else if this.unsaved {
-                                this.save_next.get_or_insert(None);
                             }
                         }
-                        None => {
-                            // Nothing was written: the draft stays, and the bar asks.
-                            this.disk_change = Some(DiskChange {
-                                based_on: this.saved_hash.clone(),
-                                asked: true,
-                            });
-                            this.set_saved(now);
-                            this.sync_unsaved(cx);
-                            this.save_next = None;
-                            window.focus(&this.file_focus, cx);
-                        }
-                    },
+                    }
                     Err(error) => {
                         this.file_error = Some(format!("Could not save: {error}"));
                     }
@@ -4300,12 +4371,7 @@ impl QueryEditor {
         range
             .filter_map(|ix| {
                 let values = rows.table.rows.get(ix)?;
-                let shown = rows.shown.get(ix)?.get_or_init(|| {
-                    values
-                        .iter()
-                        .map(|value| SharedString::from(format_value(value)))
-                        .collect()
-                });
+                let shown = rows.shown.get(ix)?.get_or_init(|| cells_of(values));
                 let row_selected = selected.is_some_and(|(row, _)| row == ix);
                 Some(
                     h_flex()
@@ -5067,6 +5133,17 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// A row keeps the start of a long text that a cell shows, not the whole, which the table
+    /// holds already; other values as they read.
+    #[test]
+    fn a_rows_cells_keep_what_a_cell_shows() {
+        let long = "word ".repeat(2_000);
+        let cells = cells_of(&[json!(long), json!(12), json!("Ada")]);
+        assert_eq!(&*cells[0], &long[..512]);
+        assert_eq!(&*cells[1], "12");
+        assert_eq!(&*cells[2], "Ada");
+    }
 
     /// A new query is written beside the files of its name, never over one: `name.gq` taken,
     /// it goes to `name-2.gq`, and what was there is kept.
@@ -6349,6 +6426,97 @@ mod tests {
             editor.read_with(cx, |editor, cx| {
                 assert!(editor.disk_change.is_none() && !editor.is_dirty(cx));
             });
+        }
+
+        /// A file whose lines end in `\r\n` opens saved, takes a change made elsewhere, and is
+        /// written back with its own line breaks. Before, it showed unsaved as soon as it opened
+        /// (the editor holds its line breaks as `\n`), so it never took the change, and a save
+        /// wrote every line's break anew.
+        #[gpui::test]
+        async fn a_file_with_crlf_line_breaks_keeps_them(cx: &mut TestAppContext) {
+            init(cx);
+            let session = session(cx);
+            let path = scratch("crlf").join("people.gq");
+            std::fs::write(&path, "query a() {\r\n}\r\n").unwrap();
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::with_text(1, session, "", window, cx));
+            editor.update_in(cx, |editor, window, cx| {
+                editor.path = Some(path.clone());
+                editor.loading = Some(Loading { draft: None });
+                assert!(editor.file_read(Some("query a() {\r\n}\r\n".into()), window, cx));
+                assert_eq!(editor.editor.read(cx).text(cx), "query a() {\n}\n");
+                assert!(!editor.is_dirty(cx), "opens saved");
+            });
+            std::fs::write(&path, "query b() {\r\n}\r\n").unwrap();
+            editor.update_in(cx, |editor, window, cx| editor.check_disk(window, cx));
+            cx.run_until_parked();
+            editor.update_in(cx, |editor, window, cx| {
+                assert_eq!(
+                    editor.editor.read(cx).text(cx),
+                    "query b() {\n}\n",
+                    "takes it"
+                );
+                editor.set_text("query c() {\n}\n", window, cx);
+                editor.save_now(window, cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "query c() {\r\n}\r\n",
+                "its line breaks kept"
+            );
+            editor.read_with(cx, |editor, cx| assert!(!editor.is_dirty(cx)));
+        }
+
+        /// A file there that cannot be read as text is not taken for one gone, and a save does
+        /// not write over it, whether the tab knew it as gone or as text it read. Before, either
+        /// save replaced it.
+        #[gpui::test]
+        async fn a_file_that_is_not_text_is_not_written_over(cx: &mut TestAppContext) {
+            init(cx);
+            let session = session(cx);
+            let path = scratch("not-text").join("people.gq");
+            let latin1: &[u8] = b"query caf\xe9() {}";
+            std::fs::write(&path, latin1).unwrap();
+            assert!(read_text_file(&path).is_err(), "there, and not text");
+            let (editor, cx) = cx.add_window_view(|window, cx| {
+                QueryEditor::with_text(1, session, "query a() {}", window, cx)
+            });
+            editor.update_in(cx, |editor, window, cx| {
+                editor.path = Some(path.clone());
+                editor.loading = Some(Loading {
+                    draft: Some(Draft {
+                        text: "query a() {}".into(),
+                        based_on: None,
+                        saved: false,
+                    }),
+                });
+                assert!(editor.file_read(None, window, cx));
+                assert!(editor.file_gone.is_some());
+                editor.save_now(window, cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(std::fs::read(&path).unwrap(), latin1, "not written over");
+            editor.update_in(cx, |editor, window, cx| {
+                assert!(
+                    editor
+                        .file_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("cannot be read")),
+                    "{:?}",
+                    editor.file_error
+                );
+                editor.file_gone = None;
+                editor.set_file(path.clone(), Some("query a() {}".into()), cx);
+                editor.set_text("query b() {}", window, cx);
+                editor.save_now(window, cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                latin1,
+                "nor over text it read"
+            );
         }
 
         /// A tab given text, even none, keeps it when the schema arrives; only a new query is

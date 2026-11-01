@@ -244,6 +244,15 @@ struct BlobSlot {
     _save: Option<Task<()>>,
 }
 
+impl BlobSlot {
+    /// Whether a save of its value to a file is going: its file being chosen or written. One
+    /// that ended is not: the value read again offers Open and Save… again.
+    fn saving_to_file(&self) -> bool {
+        self._save.is_some()
+            && !matches!(self.save, Some(SaveState::Saved(_) | SaveState::Failed(_)))
+    }
+}
+
 /// One property being edited in place (spec 014): its editor, the value it was read at, which
 /// the save is bound to, and why the last save did not land.
 struct FieldEdit {
@@ -861,7 +870,7 @@ impl NodePeek {
         // is there. A value being saved to a file, or a file being stored, goes on.
         self.release_images(cx);
         self.blobs.retain(|slot| {
-            slot._save.is_some() || slot.edit.as_ref().is_some_and(BlobEdit::is_saving)
+            slot.saving_to_file() || slot.edit.as_ref().is_some_and(BlobEdit::is_saving)
         });
         for slot in &mut self.blobs {
             slot.meta = Loadable::NotLoaded;
@@ -1241,9 +1250,12 @@ impl NodePeek {
         let mut going: HashMap<String, Going> = std::mem::take(&mut self.blobs)
             .into_iter()
             .filter_map(|slot| {
+                let (save, task) = match slot.saving_to_file() {
+                    true => (slot.save, slot._save),
+                    false => (None, None),
+                };
                 let edit = slot.edit.filter(BlobEdit::is_saving);
-                (slot._save.is_some() || edit.is_some())
-                    .then_some((slot.property, (slot.save, slot._save, edit)))
+                (task.is_some() || edit.is_some()).then_some((slot.property, (save, task, edit)))
             })
             .collect();
         self.blobs = self
@@ -3088,7 +3100,16 @@ impl NodePeek {
         if !self.draft_as_sent(&name, sent, cx) {
             return;
         }
-        self.start_edit(property, window, cx);
+        // Not over what the person does meanwhile (another field open, the keyboard in a table
+        // cell): opened, the field would take the keyboard and what they type. The text is kept
+        // as the field's draft then, and the node's drafts say why.
+        let busy = self.edits.keys().any(|open| *open != name)
+            || window
+                .focused(cx)
+                .is_some_and(|focused| !self.focus_handle.contains(&focused, window));
+        if !busy {
+            self.start_edit(property, window, cx);
+        }
         match self.edits.get_mut(&name) {
             Some(edit) => {
                 edit.old = old;
@@ -3793,6 +3814,11 @@ impl NodePeek {
     /// The bar a node with drafts shows under its title: how many, Discard, and Save (⌘S), one
     /// commit to the branch.
     fn render_drafts_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        // Held at a commit, the view writes nothing: its Save would do nothing, and its Discard
+        // would act on a branch it no longer follows.
+        if self.holds_commit {
+            return None;
+        }
         let count = self.node_drafts(cx).len();
         if count == 0 && !self.saving_drafts {
             return None;
@@ -7222,6 +7248,53 @@ mod tests {
         );
     }
 
+    /// A refused write does not open its field over another the person opened meanwhile, which
+    /// would take the keyboard and what they type: its text is kept as its draft, with why.
+    #[gpui::test]
+    async fn a_refused_field_leaves_the_keyboard_where_it_is(cx: &mut TestAppContext) {
+        let refused = json!({ "error": "policy denied", "code": "forbidden", "disposition": { "action": "refresh", "effects": "none" } });
+        let schema = PEOPLE.replace("  name: String\n", "  name: String\n  email: String?\n");
+        let session = session_answering(&schema, 403, refused, cx);
+        let (view, cx) = page(session.clone(), cx);
+        view.update_in(cx, |view, window, cx| {
+            let person = view.schema.as_ref().unwrap().node("Person").unwrap();
+            let name = person.property("name").unwrap().clone();
+            let email = person.property("email").unwrap().clone();
+            view.start_edit(name, window, cx);
+            let editor = view.edits["name"].editor.clone();
+            editor.update(cx, |editor, cx| editor.set_text("Ada Lovelace", window, cx));
+            view.save_field("name", window, cx);
+            view.start_edit(email, window, cx);
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(
+                !view.edits.contains_key("name"),
+                "not opened over the other"
+            );
+            assert!(
+                view.edits["email"]
+                    .editor
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+            assert_eq!(
+                view.drafts_notice.as_ref().map(|notice| notice.tone),
+                Some(Tone::Refused)
+            );
+        });
+        let key = DraftKey {
+            type_name: "Person".into(),
+            id: "p1".into(),
+            property: "name".into(),
+        };
+        let draft = session.read_with(cx, |session, _| session.draft(&key).cloned());
+        assert_eq!(
+            draft.map(|draft| draft.text).as_deref(),
+            Some("Ada Lovelace")
+        );
+    }
+
     /// A write out when the peek goes (the table's cursor moved on) is settled where it was
     /// typed: refused, its text is kept as the property's draft.
     #[gpui::test]
@@ -7953,6 +8026,17 @@ mod tests {
         cx.executor().advance_clock(Duration::from_millis(10));
         cx.run_until_parked();
         assert!(ended.get(), "the save went on");
+
+        // Ended, it is not carried over the next read: the value offers Open and Save… again.
+        view.update(cx, |view, cx| {
+            view.blobs[0].save = Some(SaveState::Saved("/saved/doc.pdf".into()));
+            view.refresh(cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.blobs[0].save.is_none());
+            assert!(view.blobs[0]._save.is_none());
+        });
     }
 
     const DOCS: &str = "node Person {\n  slug: String @key\n  name: String\n  doc: Blob?\n}\n";
@@ -7983,6 +8067,32 @@ mod tests {
         });
         cx.run_until_parked();
         (view, session, blobs, cx)
+    }
+
+    /// A page held at a commit saves no drafts, so it shows no bar offering to: its Save did
+    /// nothing, and its Discard acted on a branch it no longer followed. A page that follows its
+    /// branch shows the node's drafts.
+    #[gpui::test]
+    async fn only_a_page_that_follows_its_branch_shows_the_drafts_bar(cx: &mut TestAppContext) {
+        for (at_commit, shown) in [(None, true), (Some("c1"), false)] {
+            let (view, session, _, cx) = page_with_doc(None, at_commit, cx);
+            session.update(cx, |session, cx| {
+                let key = DraftKey {
+                    type_name: "Person".into(),
+                    id: "p1".into(),
+                    property: "name".into(),
+                };
+                let draft = graph_store::DraftEntry {
+                    old: "Ada".into(),
+                    text: "Ada King".into(),
+                };
+                session.set_draft(key, draft, cx);
+            });
+            cx.run_until_parked();
+            view.update(cx, |view, cx| {
+                assert_eq!(view.render_drafts_bar(cx).is_some(), shown, "{at_commit:?}");
+            });
+        }
     }
 
     /// A reload lets go of the Blob values shown, as of everything read at the old commit: on a

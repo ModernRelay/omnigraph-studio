@@ -13,8 +13,10 @@ use crate::shown;
 
 /// How long one request to the listener may take to arrive in full.
 const REQUEST_WAIT: Duration = Duration::from_secs(10);
-/// The most of one request's head the listener reads.
-const MAX_REQUEST_BYTES: usize = 8 * 1024;
+/// The most of one request's head the listener reads before it answers. Only the request line
+/// is judged, but the browser sends its cookies for `127.0.0.1` from every port (local tools
+/// set them), and a head left unread can reset the connection before the browser shows the page.
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
 /// The most connections answered at once; more wait to be accepted until one is answered.
 const MAX_ANSWERING: usize = 8;
 
@@ -123,7 +125,7 @@ async fn answer(mut stream: TcpStream, state: &str, issuer: &str, host: &str) ->
         None
     })
     .await;
-    let Some(Some(head)) = head else {
+    let Some(head) = head else {
         return Answered::Other;
     };
     let (status, page, answered) = judge(&head, state, issuer, host);
@@ -145,25 +147,24 @@ async fn answer(mut stream: TcpStream, state: &str, issuer: &str, host: &str) ->
     answered
 }
 
-/// One request's head, up to its blank line; `None` when it is longer than
-/// [`MAX_REQUEST_BYTES`] or the connection ends first.
-async fn read_head(stream: &mut TcpStream) -> Option<Vec<u8>> {
+/// One request's head, up to its blank line, [`MAX_REQUEST_BYTES`], or the end of the
+/// connection, whichever comes first.
+async fn read_head(stream: &mut TcpStream) -> Vec<u8> {
     let mut head = Vec::new();
-    let mut buffer = [0u8; 1024];
-    while !head.windows(4).any(|end| end == b"\r\n\r\n") {
-        let read = stream.read(&mut buffer).await.ok()?;
-        if read == 0 || head.len() + read > MAX_REQUEST_BYTES {
-            return None;
+    let mut buffer = [0u8; 4096];
+    while head.len() < MAX_REQUEST_BYTES && !head.windows(4).any(|end| end == b"\r\n\r\n") {
+        match stream.read(&mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => head.extend_from_slice(&buffer[..read.min(MAX_REQUEST_BYTES - head.len())]),
         }
-        head.extend_from_slice(&buffer[..read]);
     }
-    Some(head)
+    head
 }
 
-/// What a request is: its status line, the page's sentence, and what it means for the sign-in.
+/// What a request is, from its request line alone: its status line, the page's sentence, and
+/// what it means for the sign-in. Its headers, however many or long, do not matter: a
+/// redirect's answer is in its target.
 fn judge(head: &[u8], state: &str, issuer: &str, host: &str) -> (&'static str, String, Answered) {
-    let mut headers = [httparse::EMPTY_HEADER; 32];
-    let mut request = httparse::Request::new(&mut headers);
     let not_found = || {
         (
             "404 Not Found",
@@ -171,11 +172,18 @@ fn judge(head: &[u8], state: &str, issuer: &str, host: &str) -> (&'static str, S
             Answered::Other,
         )
     };
-    let (Ok(httparse::Status::Complete(_)), Some("GET"), Some(path)) =
-        (request.parse(head), request.method, request.path)
-    else {
+    let parts: Vec<&str> = head
+        .windows(2)
+        .position(|end| end == b"\r\n")
+        .and_then(|end| std::str::from_utf8(&head[..end]).ok())
+        .map(|line| line.split(' ').collect())
+        .unwrap_or_default();
+    let ["GET", path, version] = parts.as_slice() else {
         return not_found();
     };
+    if !version.starts_with("HTTP/1.") {
+        return not_found();
+    }
     let Ok(url) = Url::parse(&format!("http://127.0.0.1{path}")) else {
         return not_found();
     };
@@ -215,7 +223,10 @@ fn judge(head: &[u8], state: &str, issuer: &str, host: &str) -> (&'static str, S
     match param("code") {
         Some(code) if !code.is_empty() => (
             "200 OK",
-            format!("Signed in to {host}. You can close this tab."),
+            format!(
+                "Omnigraph Studio has the sign-in to {host} and finishes it now. You can close \
+                 this tab and go back to Studio."
+            ),
             Answered::Code(code),
         ),
         _ => (
@@ -273,7 +284,10 @@ mod tests {
         assert_eq!(code, Ok("the-code".to_owned()));
         assert!(other.starts_with("HTTP/1.1 404"), "{other}");
         assert!(forged.starts_with("HTTP/1.1 400"), "{forged}");
-        assert!(signed_in.contains("Signed in to graphs.example. You can close this tab."));
+        assert!(
+            signed_in.contains("Omnigraph Studio has the sign-in to graphs.example"),
+            "{signed_in}"
+        );
         // Answered, the listener is gone.
         assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
     }
@@ -302,6 +316,32 @@ mod tests {
         );
         browser.join().unwrap();
         drop(silent);
+    }
+
+    /// The redirect's answer is taken however many and long its headers are: a browser sends
+    /// its cookies for `127.0.0.1` from every port, which local tools set.
+    #[test]
+    fn a_redirect_with_many_long_headers_is_taken() {
+        use std::io::{Read as _, Write as _};
+        let callback = Callback::bind().unwrap();
+        let port = port_of(&callback);
+        let browser = std::thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let mut request =
+                "GET /callback?code=the-code&state=s1 HTTP/1.1\r\nhost: 127.0.0.1\r\n".to_owned();
+            for n in 0..40 {
+                request.push_str(&format!("x-header-{n}: {n}\r\n"));
+            }
+            request.push_str(&format!("cookie: dev={}\r\n\r\n", "c".repeat(20 * 1024)));
+            stream.write_all(request.as_bytes()).unwrap();
+            let mut answer = String::new();
+            stream.read_to_string(&mut answer).unwrap();
+            answer
+        });
+        let code = smol::block_on(callback.code("s1", "https://id.example", "graphs.example"));
+        let page = browser.join().unwrap();
+        assert_eq!(code, Ok("the-code".to_owned()));
+        assert!(page.starts_with("HTTP/1.1 200"), "{page}");
     }
 
     #[test]
