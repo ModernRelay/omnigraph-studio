@@ -243,6 +243,19 @@ stay put), IX (paged, virtualized).
 - Relationship filters: "has any", "has none", "related to …" through `exists { }`, `not { }`,
   and a bound endpoint. Measure "has none" on a large type before shipping it (it was too
   slow on an older engine).
+- A condition, anything the pills cannot say: the filter menu's last entry, "Condition (GQ)",
+  takes a GQ condition on the row's variable (`$n`; `$e`, `$a` and `$b` in an edge table) and
+  splices it into the match block in parentheses (`FilterOp::Expr`, key `@where`,
+  `builder::expression_clause`): `or`, `not`, a further hop, two tests on one neighbour,
+  anything the grammar has. Before it is applied, the page query with it is type-checked by
+  the compiler against the schema (`TypeTable::check_condition`, `gq_language::check`), and
+  a diagnostic is the draft's error, so nothing wrong is sent; the pill reads "Condition ·
+  where · {text}" with the code icon, and a view saves it as any filter. The table does not
+  re-judge rows against it after an edit (as with relationships): the engine judges it on the
+  next read (since 2026-10-31).
+- Every applied filter can be edited: a click on its pill takes it out of the bar into the
+  draft with its key, test and value as they were (the list as typed, a related record by its
+  id); ↵ applies the change, Esc or the draft's × puts it back as it was (since 2026-10-31).
 - A neighbour's property, a nested search: after each relationship the menu lists the other
   type's filterable properties ("attended Person · name", key `out:Attended.name`), with that
   property's own operators and offers, through `exists { $r: Person  $n attended $r  $r.name
@@ -498,6 +511,7 @@ kept answers.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-31 | A condition filter is spliced in as written and judged by the compiler before a read | `gq_language` `a_condition_is_spliced_in_and_judged_by_the_compiler` (an `or … not exists { }` condition type-checks beside a pill's clause; `$n.nope = 1` is a diagnostic; an empty one is refused by the builder) | Pass. The pill's edit-on-click and the draft's compile error are not drawn by a test |
 | 2026-10-31 | A filter tests a neighbour's property, text starts-with, and full-text search where the property is indexed | `gq_language` `text_filters_start_with_search_and_reach_neighbours` (a schema with `name: String @index` and `bio` without: Search offered for one, not the other; `starts_with`, `search()` and `search($r0.name …)` through `out:Knows.name` type-check), `every_offered_filter_op_compiles`; live on the personal graph with the CLI: `starts_with`, `search($p.name, …)` and an `or` group answer, `fuzzy` answers loosely; `cargo test -p type_table` | Pass. `fuzzy()` and `or` groups are not offered yet |
 | 2026-10-29 | A table's rows do not paint as one scene layer | `type_table` `instrument_a_frame_of_a_full_table` (ignored, `instrument:`; 200 rows of 20 text columns, a frame with the grid replayed from its cache, the mean of 600), three runs each with the grid wrapped in `Window::paint_layer` and without; GPUI's `Scene` batching read at Zed v1.23.2 | Without, 9.72, 9.64 and 9.61 ms a frame; with, 8.86, 8.85 and 8.78 (two columns: 3.25 against 3.08). Inside a layer every quad takes one draw order and skips the bounds-tree search, but at one order GPUI draws every shadow before every quad, so a ring drawn as a shadow (the design system's, an unchecked row's checkbox) goes under the cursor row's fill, and every shadowed piece put in a cell later would too. Not adopted: the rows keep the bounds tree, and the instrument stays for the next frame-cost change |
 | 2026-10-29 | Rows are picked by checkbox; the bar comes with the first and deletes | `type_table` `checkboxes_pick_rows_and_the_header_selects_all` (drawn and clicked: the select-all picks both rows, a row's box takes the first out and leaves a dash and the cursor where it was, one row has the bar, the select-all picks the rest and then takes all out); the workspace suite; the relaunched app's Claim table | Pass. Before, rows were picked only by ⌘-click and ⇧-click on a cell, which nothing on screen told, and the bar waited for a second row |

@@ -246,7 +246,11 @@ and the bar says "Could not use: {property}". Relationships filter too: `has_any
 "events Aaron attended" matches every Aaron as a nested search; and `related_to` for one
 exact record, whose name goes through the node search the filter's own value field uses
 (`suggest::search_nodes`, the first match taken), so the pill shows the record and the query
-gets its id; a name no record matches is dropped and named. The rest become pills as if added by hand, so
+gets its id; a name no record matches is dropped and named. What the pills cannot say (`or`,
+`not`, a further hop, two tests on one related record) the model puts in `predicate`, a GQ
+condition on `$n` the answer's schema has beside `filters`: the input gives each
+relationship's GQ traversal and a short grammar; the table makes it a condition filter (spec
+004) only when the compiler accepts it, else the note names the diagnostic. The rest become pills as if added by hand, so
 they are seen and removable, and the table reads as it does for any filter. A second sentence
 replaces the filters the first made and keeps ones added by hand. Measured: 1.5–2.8 s on
 Haiku with every answer right; Escape leaves the field and clears what it said.

@@ -27,8 +27,11 @@ pub static TASK: ModelTask = ModelTask {
 pub const INSTRUCTIONS: &str = "Turn the request into filters on a table of rows of one type. \
 Use only the properties and operators listed. Answer with the JSON object only. A date is \
 ISO 8601. An operator that takes no value gets an empty list; `in` lists every member; every \
-other operator takes one value. Prefer an enum's exact value. When the request names nothing \
-the table has, answer with no filters.";
+other operator takes one value. Prefer an enum's exact value. Filters are joined with and. \
+When the request needs or, not, a count, two tests on one related record or more than one \
+hop, put that part in `predicate` as a GQ condition on the row variable $n and leave it out \
+of the filters; otherwise predicate is null. When the request names nothing the table has, \
+answer with no filters and a null predicate.";
 
 /// A key the table's filter menu offers: a property, or a relationship key.
 #[derive(Debug, Clone)]
@@ -40,6 +43,8 @@ pub struct Choice {
     pub property: Option<Property>,
     /// For a relationship key, the type at its other end, whose records `related_to` names.
     pub other_type: Option<String>,
+    /// For a relationship key, its GQ traversal (`attended`), for a predicate.
+    pub traversal: Option<String>,
 }
 
 /// The answer's shape: filters whose property and operator are each one of the keys offered.
@@ -67,8 +72,12 @@ pub fn schema(choices: &[Choice]) -> Value {
                     "additionalProperties": false,
                 },
             },
+            "predicate": {
+                "type": ["string", "null"],
+                "description": "A GQ condition on $n for what the filters cannot say: or, not, a count, a further hop. Null when the filters say it all.",
+            },
         },
-        "required": ["filters"],
+        "required": ["filters", "predicate"],
         "additionalProperties": false,
     })
 }
@@ -95,10 +104,11 @@ pub fn input(type_name: &str, choices: &[Choice], today: &str, sentence: &str) -
     for relationship in choices.iter().filter(|c| c.property.is_none()) {
         let ops: Vec<&str> = relationship.ops.iter().map(|op| op.key()).collect();
         text.push_str(&format!(
-            "- {} ({}): operators {}",
+            "- {} ({}): operators {}; in GQ `$n {} $r`",
             relationship.key,
             relationship.label,
-            ops.join(", ")
+            ops.join(", "),
+            relationship.traversal.as_deref().unwrap_or("?"),
         ));
         let prefix = format!("{}.", relationship.key);
         let nested: Vec<String> = choices
@@ -125,7 +135,12 @@ pub fn input(type_name: &str, choices: &[Choice], today: &str, sentence: &str) -
          value; has_any and has_none take no value and test a relationship; a key with a dot \
          tests the related records' property, which is how to filter by a related record's \
          name or kind; related_to takes one value, the related record's name, only for one \
-         exact record.\n\nRequest: ",
+         exact record.\n\nGQ for `predicate`, on the row $n: a property is $n.<key>; compare \
+         with =, !=, <, <=, >, >=, contains, starts_with, in [..]; `is null`; combine with and, \
+         or, not, and parentheses. Or, as the whole predicate, one block on a related record: \
+         `exists { $r: <Type>  $n <traversal> $r  $r.<property> = \"x\"  $r.<other> > 3 }` \
+         or `not { ... }`, where the traversal is the relationship's GQ name given above; a \
+         block cannot sit inside or, and holds no count.\n\nRequest: ",
     );
     text.push_str(sentence.trim());
     text
@@ -153,6 +168,9 @@ fn kind_of(property: &Property) -> String {
 #[derive(Debug, Deserialize)]
 pub struct Answer {
     pub filters: Vec<Item>,
+    /// A GQ condition for what the filters cannot say; the table judges it with the compiler.
+    #[serde(default)]
+    pub predicate: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,6 +190,16 @@ pub fn filters(answer: Answer, choices: &[Choice]) -> (Vec<Filter>, Vec<String>)
             Ok(filter) => filters.push(filter),
             Err(why) => refused.push(why),
         }
+    }
+    if let Some(predicate) = answer.predicate.map(|p| p.trim().to_owned())
+        && !predicate.is_empty()
+    {
+        // The table judges it with the compiler before it is applied.
+        filters.push(Filter {
+            property: gq_language::builder::WHERE_FILTER.to_owned(),
+            op: FilterOp::Expr,
+            value: Value::String(predicate),
+        });
     }
     (filters, refused)
 }
@@ -245,6 +273,7 @@ mod tests {
                 ops: FilterOp::for_property(&property),
                 property: Some(property),
                 other_type: None,
+                traversal: None,
             })
             .collect();
         out.push(Choice {
@@ -253,6 +282,7 @@ mod tests {
             ops: FilterOp::for_relationship(),
             property: None,
             other_type: Some("Person".into()),
+            traversal: Some("attended".into()),
         });
         out
     }
@@ -268,6 +298,7 @@ mod tests {
             json!(["kind", "date", "out:Attended"])
         );
         let answer = Answer {
+            predicate: Some(" $n.kind = \"dinner\" or $n.kind = \"party\" ".into()),
             filters: vec![
                 Item {
                     property: "kind".into(),
@@ -297,7 +328,12 @@ mod tests {
             ],
         };
         let (filters, refused) = filters(answer, &choices);
-        assert_eq!(filters.len(), 3);
+        assert_eq!(filters.len(), 4);
+        assert_eq!(filters[3].op, FilterOp::Expr);
+        assert_eq!(
+            filters[3].value,
+            json!("$n.kind = \"dinner\" or $n.kind = \"party\"")
+        );
         assert_eq!(filters[0].op, FilterOp::In);
         assert_eq!(filters[0].value, json!(["dinner", "trip"]));
         assert_eq!(filters[1].op, FilterOp::Last30Days);
