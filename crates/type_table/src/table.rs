@@ -652,38 +652,45 @@ impl Item for TypeTable {
         Some(studio_actions::Thing::Type(self.type_name.clone()))
     }
 
-    /// An edge table has one view; a node table's other views take its rows (spec 020).
-    fn views(&self, _cx: &App) -> Vec<ViewLink> {
+    /// An edge table has one view. A node table's Tree holds what it shows; its Canvas holds one
+    /// node, the row under the cursor (spec 020).
+    fn views(&self, cx: &App) -> Vec<ViewLink> {
         if self.kind != TableKind::Node {
             return Vec::new();
         }
-        vec![
-            ViewLink::current(ViewKind::Table),
-            if self.cursor.is_some() {
-                ViewLink::to(ViewKind::Tree)
-            } else {
-                ViewLink::disabled_because(ViewKind::Tree, "Select a row to see its relationships")
-            },
-            if self.rows.is_empty() {
-                ViewLink::disabled_because(ViewKind::Canvas, "No rows to draw")
-            } else {
-                ViewLink::to(ViewKind::Canvas)
-            },
-        ]
+        let tree = if self.rows.is_empty() {
+            ViewLink::disabled_because(ViewKind::Tree, "No rows to show")
+        } else if self.selection.is_empty() {
+            ViewLink::to(ViewKind::Tree)
+                .saying("Show these rows, each opening to its relationships")
+        } else {
+            ViewLink::to(ViewKind::Tree).saying(format!(
+                "Show the {}, each opening to its relationships",
+                studio_ui::plural(self.selection.len(), "selected row", "selected rows")
+            ))
+        };
+        let canvas = match self.cursor_row() {
+            Some(row) => {
+                let name = self.row_label(row, cx).unwrap_or_else(|| row.id.clone());
+                ViewLink::to(ViewKind::Canvas).saying(format!("Walk from {name}"))
+            }
+            None => ViewLink::disabled_because(ViewKind::Canvas, "Select a row to walk from it"),
+        };
+        vec![ViewLink::current(ViewKind::Table), tree, canvas]
     }
 
     fn view_action(&self, kind: ViewKind, cx: &App) -> Option<Box<dyn gpui::Action>> {
         match kind {
-            ViewKind::Tree => {
-                let row = self.rows.get(self.cursor?.row)?;
-                Some(Box::new(studio_actions::graph::ShowNodeInTree {
+            ViewKind::Tree => Some(self.tree_action(cx)),
+            ViewKind::Canvas => {
+                let row = self.cursor_row()?;
+                Some(Box::new(studio_actions::graph::ShowNodeOnCanvas {
                     type_name: self.type_name.clone(),
                     id: row.id.clone(),
                     at_commit: self.at_commit.clone(),
                     preview: true,
                 }))
             }
-            ViewKind::Canvas => Some(self.canvas_action(cx)),
             _ => None,
         }
     }
@@ -6521,50 +6528,49 @@ impl TypeTable {
     }
 
     /// G: the row's node on the explorer, rooted there (spec 006: from a table into the graph).
-    /// What Canvas opens from this table (spec 020): one selected row's walk; else several
-    /// selected rows, or with none selected the rows loaded under the filters, drawn as a set.
-    fn canvas_action(&self, cx: &App) -> Box<dyn gpui::Action> {
-        if let [id] = self.selection.iter().collect::<Vec<_>>().as_slice() {
-            return Box::new(studio_actions::graph::ShowNodeOnCanvas {
-                type_name: self.type_name.clone(),
-                id: (*id).clone(),
-                at_commit: self.at_commit.clone(),
-                preview: true,
-            });
-        }
+    /// The row under the cursor.
+    fn cursor_row(&self) -> Option<&Row> {
+        self.rows.get(self.cursor?.row)
+    }
+
+    /// A row's name, as the schema names its type's rows.
+    fn row_label(&self, row: &Row, cx: &App) -> Option<String> {
+        let schema = self.session.read(cx).schema_model()?;
+        let property = schema.node(&self.type_name)?.label_property()?.to_owned();
+        row.values
+            .get(&property)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }
+
+    /// What Tree opens from this table (spec 020): the selected rows, listed; with none selected,
+    /// the type's rows under the filters, which the tree reads a page at a time itself.
+    fn tree_action(&self, cx: &App) -> Box<dyn gpui::Action> {
         let picked = !self.selection.is_empty();
-        let label = self.session.read(cx).schema_model().and_then(|schema| {
-            schema
-                .node(&self.type_name)
-                .and_then(|node| node.label_property().map(str::to_owned))
+        let nodes = picked.then(|| {
+            self.rows
+                .iter()
+                .filter(|row| self.selection.contains(&row.id))
+                .map(|row| studio_actions::graph::ResultNode {
+                    type_name: self.type_name.clone(),
+                    id: row.id.clone(),
+                    label: self.row_label(row, cx),
+                })
+                .collect::<Vec<_>>()
         });
-        let nodes: Vec<studio_actions::graph::ResultNode> = self
-            .rows
-            .iter()
-            .filter(|row| !picked || self.selection.contains(&row.id))
-            .map(|row| studio_actions::graph::ResultNode {
-                type_name: self.type_name.clone(),
-                id: row.id.clone(),
-                label: label
-                    .as_deref()
-                    .and_then(|property| row.values.get(property))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            })
-            .collect();
-        let summary = if picked {
-            studio_ui::plural(nodes.len(), "selected row", "selected rows")
-        } else {
-            self.filters
+        let summary = match &nodes {
+            Some(nodes) => studio_ui::plural(nodes.len(), "selected row", "selected rows"),
+            None => self
+                .filters
                 .iter()
                 .map(|filter| {
                     let (property, op, value) = filter_parts(filter);
                     value.unwrap_or_else(|| format!("{property} {op}"))
                 })
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
         };
-        let named = if summary.is_empty() {
+        let title = if summary.is_empty() {
             self.type_name.clone()
         } else {
             format!("{}, {summary}", self.type_name)
@@ -6573,17 +6579,17 @@ impl TypeTable {
             Loadable::Loaded(count) if !picked => Some((*count).max(0) as u64),
             _ => None,
         };
-        Box::new(studio_actions::graph::ShowResultsOnCanvas {
-            title: format!("Canvas: {named}"),
+        Box::new(studio_actions::graph::ShowSetInTree {
+            title,
+            type_name: Some(self.type_name.clone()),
+            filters: (!self.filters.is_empty())
+                .then(|| serde_json::to_value(&self.filters).ok())
+                .flatten(),
             nodes,
-            links: Vec::new(),
-            source: Some(studio_actions::graph::CapturedFrom {
-                type_name: self.type_name.clone(),
-                at_commit: self.at_commit.clone(),
-                filters: serde_json::to_value(&self.filters).ok(),
-                summary: named,
-                total,
-            }),
+            total,
+            at_commit: self.at_commit.clone(),
+            select: self.cursor_row().map(|row| row.id.clone()),
+            preview: true,
         })
     }
 
@@ -10095,6 +10101,82 @@ mod tests {
 
     /// Another writer's commit that changed none of the types the table reads moves its pin to
     /// the head without reading again; one that wrote its type offers Refresh (spec 015).
+    /// A table's Tree holds what it shows: the selected rows, or its rows under the filters. Its
+    /// Canvas holds one node, the row under the cursor, and without one says why it cannot open
+    /// (spec 020).
+    #[gpui::test]
+    async fn tree_holds_the_tables_rows_and_canvas_the_row_under_the_cursor(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let session = session(PEOPLE, cx);
+        cx.run_until_parked();
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        table.update(cx, |table, cx| {
+            let views = Item::views(table, cx);
+            assert_eq!(
+                views.iter().map(|link| link.kind).collect::<Vec<_>>(),
+                [ViewKind::Table, ViewKind::Tree, ViewKind::Canvas]
+            );
+            assert_eq!(views[1].disabled, None);
+            assert_eq!(views[2].disabled, Some("Select a row to walk from it"));
+            assert!(Item::view_action(table, ViewKind::Canvas, cx).is_none());
+            let all = Item::view_action(table, ViewKind::Tree, cx).expect("the rows");
+            let all = all
+                .as_any()
+                .downcast_ref::<studio_actions::graph::ShowSetInTree>()
+                .expect("a set");
+            assert_eq!(all.nodes, None, "it reads them itself, a page at a time");
+            assert_eq!(all.title, "Person");
+
+            table.cursor = Some(Cursor { row: 1, col: 0 });
+            assert_eq!(
+                Item::views(table, cx)[2].says.as_deref(),
+                Some("Walk from Grace")
+            );
+            let walk = Item::view_action(table, ViewKind::Canvas, cx).expect("a walk");
+            assert!(walk.partial_eq(&studio_actions::graph::ShowNodeOnCanvas {
+                type_name: "Person".into(),
+                id: "p2".into(),
+                at_commit: None,
+                preview: true,
+            }));
+
+            // Rows ticked are the Tree's; the Canvas still walks from the cursor alone.
+            table.selection.insert("p1".into());
+            let picked = Item::view_action(table, ViewKind::Tree, cx).expect("the picked");
+            let picked = picked
+                .as_any()
+                .downcast_ref::<studio_actions::graph::ShowSetInTree>()
+                .expect("a set");
+            assert_eq!(picked.title, "Person, 1 selected row");
+            let nodes = picked.nodes.as_ref().expect("listed");
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0].id, "p1");
+            assert_eq!(nodes[0].label.as_deref(), Some("Ada"));
+            let walk = Item::view_action(table, ViewKind::Canvas, cx).expect("a walk");
+            assert!(walk.partial_eq(&studio_actions::graph::ShowNodeOnCanvas {
+                type_name: "Person".into(),
+                id: "p2".into(),
+                at_commit: None,
+                preview: true,
+            }));
+        });
+    }
+
     #[gpui::test]
     async fn a_table_moves_its_pin_past_commits_to_other_types(cx: &mut TestAppContext) {
         cx.update(|cx| {

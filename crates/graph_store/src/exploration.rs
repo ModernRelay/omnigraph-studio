@@ -23,7 +23,7 @@ use gpui::{
     App, AppContext as _, Context, Entity, EntityId, EventEmitter, Global, Subscription, Task,
     WeakEntity,
 };
-use gq_language::builder::{GroupBy, GroupOn, Narrow};
+use gq_language::builder::{Filter, GroupBy, GroupOn, Narrow, PageStart};
 use gq_language::{BuiltQuery, Direction, RelationshipGroup, SchemaModel, builder};
 use graph_client::ReadError;
 use graph_client::api::ReadOutput;
@@ -46,6 +46,25 @@ impl NodeRef {
             id: id.into(),
         }
     }
+}
+
+/// The nodes a tree shows as its rows when it holds a set rather than one node (spec 020). Their
+/// paths start with a node step under an anchor that is never drawn.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetRoots {
+    /// These nodes, as they were listed.
+    Listed(Vec<Neighbour>),
+    /// A type's rows under these filters, read a page at a time.
+    Filtered {
+        type_name: String,
+        filters: Vec<Filter>,
+        total: Option<u64>,
+    },
+}
+
+/// What a set's paths hang from: no node of any graph, since a type has a name.
+fn set_anchor() -> NodeRef {
+    NodeRef::new("", "")
 }
 
 /// One step of a path from the root: into a relationship group, into one value of the property
@@ -200,6 +219,23 @@ impl GroupKey {
             group,
             within: None,
         }
+    }
+
+    /// What a set's pages are kept under, as a relationship group's are.
+    fn of_set(type_name: &str) -> Self {
+        Self::new(
+            set_anchor(),
+            RelationshipGroup {
+                edge: String::new(),
+                direction: Direction::Outgoing,
+                other_type: type_name.to_owned(),
+            },
+        )
+    }
+
+    /// Whether these are a set's pages, not a relationship's.
+    pub fn is_set(&self) -> bool {
+        self.node == set_anchor()
     }
 
     /// The part of this group with one value of `by`.
@@ -394,6 +430,8 @@ pub struct ExploreState {
     pub grouping: HashMap<RelationshipGroup, GroupBy>,
     pub values: HashMap<(GroupKey, GroupBy), Loadable<Buckets>>,
     pub selection: Option<ExplorePath>,
+    /// The rows of a tree holding a set; none for a walk from one node.
+    pub set: Option<SetRoots>,
 }
 
 impl Default for ExploreState {
@@ -410,6 +448,7 @@ impl Default for ExploreState {
             grouping: HashMap::new(),
             values: HashMap::new(),
             selection: None,
+            set: None,
         }
     }
 }
@@ -424,6 +463,27 @@ impl ExploreState {
         state.expanded.insert(ExplorePath::root());
         state.selection = Some(ExplorePath::root());
         state
+    }
+
+    /// A state holding `set`, nothing open and nothing selected.
+    pub fn of_set(set: SetRoots) -> Self {
+        let mut state = Self {
+            root: Some(set_anchor()),
+            root_status: Loadable::Loaded(()),
+            set: Some(set),
+            ..Self::default()
+        };
+        state.seed_listed_labels();
+        state
+    }
+
+    /// The labels listed nodes came with, which no read brings back.
+    fn seed_listed_labels(&mut self) {
+        if let Some(SetRoots::Listed(rows)) = &self.set {
+            for row in rows {
+                self.labels.insert(row.node.clone(), row.label.clone());
+            }
+        }
     }
 
     pub fn label(&self, node: &NodeRef) -> Option<&str> {
@@ -565,11 +625,17 @@ impl ExploreState {
 
     /// Forgets everything read, keeping the root, expansions and selection.
     pub fn clear_loaded(&mut self) {
-        self.root_status = Loadable::NotLoaded;
+        // A set's rows are what is read again, not a root.
+        self.root_status = if self.set.is_some() {
+            Loadable::Loaded(())
+        } else {
+            Loadable::NotLoaded
+        };
         self.labels.clear();
         self.counts.clear();
         self.neighbours.clear();
         self.values.clear();
+        self.seed_listed_labels();
     }
 
     /// How many counts, neighbour lists, values and labels are held.
@@ -619,14 +685,25 @@ impl ExploreState {
             .flat_map(|list| list.rows.iter().map(|row| &row.node))
             .collect();
         let breadcrumb: HashSet<&NodeRef> = self.breadcrumb.iter().collect();
+        let roots: HashSet<&NodeRef> = match &self.set {
+            Some(SetRoots::Listed(rows)) => rows.iter().map(|row| &row.node).collect(),
+            _ => HashSet::new(),
+        };
         self.labels.retain(|node, _| {
-            nodes.contains(node) || listed.contains(node) || breadcrumb.contains(node)
+            nodes.contains(node)
+                || listed.contains(node)
+                || breadcrumb.contains(node)
+                || roots.contains(node)
         });
     }
 
     /// The exploration flattened in tree order.
     pub fn entries(&self, schema: &SchemaModel) -> Vec<Entry> {
         let mut out = Vec::new();
+        if let Some(set) = &self.set {
+            self.push_set(schema, set, &mut out);
+            return out;
+        }
         let Some(root) = &self.root else {
             return out;
         };
@@ -642,6 +719,106 @@ impl ExploreState {
             &mut out,
         );
         out
+    }
+
+    /// A set's rows, each a node at the top of the tree, then what its pages leave to say.
+    fn push_set(&self, schema: &SchemaModel, set: &SetRoots, out: &mut Vec<Entry>) {
+        let (key, total) = match set {
+            SetRoots::Listed(_) => (None, None),
+            SetRoots::Filtered {
+                type_name, total, ..
+            } => (Some(GroupKey::of_set(type_name)), *total),
+        };
+        let list = key.as_ref().and_then(|key| self.neighbours.get(key));
+        let rows: &[Neighbour] = match (set, list) {
+            (SetRoots::Listed(rows), _) => rows,
+            (_, Some(list)) => &list.rows,
+            (_, None) => &[],
+        };
+        for row in rows {
+            let mut ancestors = Vec::new();
+            self.push_node(
+                schema,
+                &row.node,
+                None,
+                ExplorePath::root().child_node(&row.node),
+                0,
+                None,
+                &mut ancestors,
+                out,
+            );
+        }
+        let Some(key) = key else {
+            return;
+        };
+        let tail = match list.map(|list| &list.status) {
+            None | Some(PageStatus::Loading) => Some(EntryKind::Loading {
+                target: LoadTarget::Page(key.clone()),
+            }),
+            Some(PageStatus::Failed(message)) => Some(EntryKind::Error {
+                target: LoadTarget::Page(key.clone()),
+                message: message.clone(),
+            }),
+            Some(PageStatus::Idle) => {
+                list.filter(|list| list.has_more(total))
+                    .map(|list| EntryKind::More {
+                        shown: list.rows.len(),
+                        total,
+                        key: key.clone(),
+                    })
+            }
+        };
+        if let Some(kind) = tail {
+            out.push(Entry {
+                path: ExplorePath::root(),
+                depth: 0,
+                parent: None,
+                kind,
+            });
+        }
+    }
+
+    /// Takes a page of a set: its rows come as nodes, named as the schema names them.
+    pub fn apply_set_page(
+        &mut self,
+        key: GroupKey,
+        output: &ReadOutput,
+        page_size: u32,
+        schema: Option<&SchemaModel>,
+    ) {
+        let type_name = key.group.other_type.clone();
+        let label = schema
+            .and_then(|schema| schema.node(&type_name))
+            .and_then(|node| node.label_property())
+            .map(str::to_owned);
+        let page: Vec<Neighbour> = rows(output)
+            .iter()
+            .filter_map(|row| {
+                let node = row.get("n")?.as_object()?;
+                let id = node.get("@id")?.as_str()?.to_owned();
+                Some(Neighbour {
+                    node: NodeRef::new(type_name.clone(), id),
+                    label: label
+                        .as_deref()
+                        .and_then(|property| node.get(property))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    edge: Vec::new(),
+                })
+            })
+            .collect();
+        for row in &page {
+            self.labels.insert(row.node.clone(), row.label.clone());
+        }
+        let list = self.neighbours.entry(key).or_default();
+        list.exhausted = (page.len() as u32) < page_size;
+        let mut shown: HashSet<NodeRef> = list.rows.iter().map(|row| row.node.clone()).collect();
+        for row in page {
+            if shown.insert(row.node.clone()) {
+                list.rows.push(row);
+            }
+        }
+        list.status = PageStatus::Idle;
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -983,6 +1160,8 @@ impl ExploreState {
         };
         match target {
             LoadTarget::Root => true,
+            // A set's rows are what the tree shows.
+            LoadTarget::Page(key) if key.is_set() => true,
             LoadTarget::Count(key) => node_open(&key.node),
             LoadTarget::Page(key) if key.within.is_none() && is_field(schema, &key.group) => {
                 node_open(&key.node)
@@ -1367,6 +1546,24 @@ impl Exploration {
         cx.new(|cx| Exploration::new(session.clone(), cx))
     }
 
+    /// A tree's walk over a set of nodes: its own, since no other tab shows this set. It reads its
+    /// first page at once, and nothing below a row until the row opens.
+    pub fn for_set(
+        session: &Entity<GraphSession>,
+        set: SetRoots,
+        at_commit: Option<String>,
+        cx: &mut App,
+    ) -> Entity<Exploration> {
+        cx.new(|cx| {
+            let mut exploration = Exploration::new(session.clone(), cx);
+            exploration.held = at_commit;
+            exploration.pin = exploration.held.clone();
+            *exploration.state = ExploreState::of_set(set);
+            exploration.request_missing(cx);
+            exploration
+        })
+    }
+
     /// A rootless walk of its own, for a test to root and read.
     #[cfg(test)]
     fn for_session(session: &Entity<GraphSession>, cx: &mut App) -> Entity<Exploration> {
@@ -1545,7 +1742,11 @@ impl Exploration {
     fn start_over_at(&mut self, node: NodeRef, cx: &mut Context<Self>) {
         self.reset_reads(cx);
         let grouping = std::mem::take(&mut self.state.grouping);
-        *self.state = ExploreState::rooted(node);
+        // A set stays the set: its rows are read again, with nothing open.
+        *self.state = match self.state.set.take() {
+            Some(set) => ExploreState::of_set(set),
+            None => ExploreState::rooted(node),
+        };
         self.state.grouping = grouping;
         self.changed(cx);
         cx.emit(ExplorationEvent::SelectionChanged);
@@ -2012,6 +2213,24 @@ impl Exploration {
                 self.spawn_count(key.clone(), count, snapshot, cx);
                 return;
             }
+            LoadTarget::Page(key) if key.is_set() => {
+                let Some(SetRoots::Filtered {
+                    type_name, filters, ..
+                }) = &self.state.set
+                else {
+                    return;
+                };
+                let start = self
+                    .state
+                    .neighbours
+                    .get(key)
+                    .and_then(NeighbourList::next_after)
+                    .map_or(PageStart::First, |id| PageStart::After {
+                        id: id.to_owned(),
+                        value: Value::Null,
+                    });
+                builder::node_page(&schema, type_name, filters, None, &start, page_size)
+            }
             LoadTarget::Page(key) => {
                 let search = self.state.searches.get(key).map(String::as_str);
                 let after = self
@@ -2341,8 +2560,12 @@ impl Exploration {
                 .map_or(1, |list| list.page_size.max(1)),
             _ => 1,
         };
+        let schema = self.schema();
         let state = self.state_for(target);
         match target {
+            LoadTarget::Page(key) if key.is_set() => {
+                state.apply_set_page(key.clone(), &output, page_size, schema.as_deref())
+            }
             LoadTarget::Root => state.apply_root(&output),
             // A count is read with the others asked for this turn, and taken by `spawn_count`.
             LoadTarget::Count(_) => {}
@@ -3862,5 +4085,81 @@ mod tests {
                 .as_deref(),
             Some("c0")
         );
+    }
+
+    /// A set's rows sit at the top of the tree, each its own path, with "Show more" while pages
+    /// remain; opening one reads below it alone, and the filter's first page is all it reads
+    /// before that (spec 020).
+    #[test]
+    fn a_set_is_paged_and_its_rows_open_on_their_own() {
+        let schema = schema();
+        let mut state = ExploreState::of_set(SetRoots::Filtered {
+            type_name: "Person".into(),
+            filters: Vec::new(),
+            total: Some(3),
+        });
+        let key = GroupKey::of_set("Person");
+        assert!(key.is_set());
+        assert_eq!(
+            state.missing_loads(&schema),
+            vec![LoadTarget::Page(key.clone())]
+        );
+        state.neighbours.entry(key.clone()).or_default().status = PageStatus::Loading;
+        state.apply_set_page(
+            key.clone(),
+            &output(
+                &["n"],
+                json!([
+                    {"n": {"@id": "ada", "name": "Ada"}},
+                    {"n": {"@id": "bob", "name": "Bob"}},
+                ]),
+            ),
+            2,
+            Some(&schema),
+        );
+        assert_eq!(state.label(&person("ada")), Some("Ada"));
+        assert_eq!(
+            state.missing_loads(&schema),
+            Vec::new(),
+            "nothing below closed rows"
+        );
+        let entries = state.entries(&schema);
+        assert!(matches!(entries[0].kind, EntryKind::Node { .. }));
+        assert_eq!(
+            entries[0].path,
+            ExplorePath::root().child_node(&person("ada"))
+        );
+        assert_eq!(entries[0].parent, None);
+        assert!(matches!(
+            entries.last().map(|entry| &entry.kind),
+            Some(EntryKind::More {
+                shown: 2,
+                total: Some(3),
+                ..
+            })
+        ));
+        state.expand(&ExplorePath::root().child_node(&person("ada")));
+        assert!(
+            state
+                .missing_loads(&schema)
+                .iter()
+                .all(|target| matches!(target, LoadTarget::Count(key) | LoadTarget::Page(key) if key.node == person("ada"))),
+            "only below the row opened"
+        );
+        state.apply_set_page(
+            key,
+            &output(&["n"], json!([{"n": {"@id": "cy", "name": "Cy"}}])),
+            2,
+            Some(&schema),
+        );
+        let entries = state.entries(&schema);
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| matches!(entry.kind, EntryKind::More { .. })),
+            "a short page is the last"
+        );
+        state.clear_loaded();
+        assert_eq!(state.root_status, Loadable::Loaded(()), "no root to read");
     }
 }

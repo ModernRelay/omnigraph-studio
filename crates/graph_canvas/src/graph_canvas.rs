@@ -38,7 +38,7 @@ use studio_actions::canvas::{
     WalkForward, ZoomIn, ZoomOut,
 };
 use studio_actions::graph::{
-    CapturedFrom, OpenMap, OpenNodePage, OpenType, PeekNode, ShowNodeInTree, ShowNodeOnCanvas,
+    OpenMap, OpenNodePage, OpenType, PeekNode, ShowNodeInTree, ShowNodeOnCanvas,
     ShowResultsOnCanvas,
 };
 use studio_actions::{ViewKind, ViewLink};
@@ -103,21 +103,13 @@ pub fn init(cx: &mut App) {
                 return;
             };
             let action = action.clone();
-            // A set from a table is one tab while it is the same set, and its source stays
-            // (spec 020); a query's result is a tab of its own at each showing.
-            let (key, preview) = match set_key(&action) {
-                Some(key) => {
-                    workspace.keep_active_tab(cx);
-                    (key, true)
-                }
-                None => {
-                    let seq = NEXT_RESULTS.load(std::sync::atomic::Ordering::Relaxed);
-                    (format!("canvas-results:{seq}"), false)
-                }
-            };
-            workspace.open_item_with::<GraphCanvas>(key, preview, window, cx, move |_, cx| {
-                GraphCanvas::with_results(session, &action, cx)
-            });
+            let seq = NEXT_RESULTS.load(std::sync::atomic::Ordering::Relaxed);
+            workspace.open_item::<GraphCanvas>(
+                format!("canvas-results:{seq}"),
+                window,
+                cx,
+                move |_, cx| GraphCanvas::with_results(session, &action, cx),
+            );
         });
         workspace.register_action(|workspace, action: &OpenMap, window, cx| {
             open_ontology(workspace, action.preview, window, cx);
@@ -167,26 +159,6 @@ fn open_canvas(
     })
 }
 
-/// What identifies a set captured from a table (spec 020): its type, read context, filters and
-/// the rows captured. The same set is one tab; a changed one is another, and never overwrites it.
-fn set_key(action: &ShowResultsOnCanvas) -> Option<String> {
-    use std::hash::{Hash as _, Hasher as _};
-    let source = action.source.as_ref()?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    source.type_name.hash(&mut hasher);
-    source.at_commit.hash(&mut hasher);
-    source.summary.hash(&mut hasher);
-    source
-        .filters
-        .as_ref()
-        .map(ToString::to_string)
-        .hash(&mut hasher);
-    for node in &action.nodes {
-        node.id.hash(&mut hasher);
-    }
-    Some(format!("canvas-set:{:x}", hasher.finish()))
-}
-
 /// Keeps a saved root-less canvas's placed nodes on the graph's session.
 fn adopt_positions(
     workspace: &mut Workspace,
@@ -220,9 +192,6 @@ enum Mode {
 
 /// What a results canvas draws: a query's nodes, and which ones share a row.
 struct ResultsData {
-    /// The table these nodes were captured from, and what identifies the set; none for a query's
-    /// result, which is a tab of its own at each showing.
-    source: Option<(CapturedFrom, String)>,
     title: String,
     nodes: Vec<(NodeRef, Option<String>)>,
     links: Vec<(usize, usize)>,
@@ -485,37 +454,19 @@ impl Item for GraphCanvas {
         }
     }
 
+    /// A walk's views. A query's result picture has none: it is that result's, not a thing's.
     fn views(&self, _cx: &App) -> Vec<ViewLink> {
-        if self.walk.is_some() {
-            return vec![
-                ViewLink::to(ViewKind::Page),
-                ViewLink::to(ViewKind::Tree),
-                ViewLink::current(ViewKind::Canvas),
-            ];
+        if self.walk.is_none() {
+            return Vec::new();
         }
-        match self.captured_from() {
-            Some(_) => vec![
-                ViewLink::to(ViewKind::Table),
-                ViewLink::current(ViewKind::Canvas),
-            ],
-            None => Vec::new(),
-        }
+        vec![
+            ViewLink::to(ViewKind::Page),
+            ViewLink::to(ViewKind::Tree),
+            ViewLink::current(ViewKind::Canvas),
+        ]
     }
 
     fn view_action(&self, kind: ViewKind, _cx: &App) -> Option<Box<dyn gpui::Action>> {
-        if let Some(source) = self.captured_from() {
-            // The type's table: its open tab as it stands, or a new one with these filters.
-            return (kind == ViewKind::Table).then(|| {
-                Box::new(OpenType {
-                    type_name: source.type_name.clone(),
-                    at_commit: source.at_commit.clone(),
-                    filter_id: None,
-                    via: None,
-                    preview: false,
-                    filters: source.filters.clone(),
-                }) as Box<dyn gpui::Action>
-            });
-        }
         let (root, at_commit) = self.walk.as_ref()?;
         match kind {
             ViewKind::Page => {
@@ -559,9 +510,6 @@ impl Item for GraphCanvas {
 
     fn dedupe_key(&self, cx: &App) -> Option<SharedString> {
         match (&self.results, &self.walk) {
-            (Some((_, results)), _) if results.source.is_some() => {
-                results.source.as_ref().map(|(_, key)| key.clone().into())
-            }
             (Some((seq, _)), _) => Some(format!("canvas-results:{seq}").into()),
             (None, Some((root, at_commit))) => Some(canvas_key(
                 &self.session.read(cx).graph_id,
@@ -761,7 +709,6 @@ impl GraphCanvas {
             .collect();
         let seq = NEXT_RESULTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let results = Arc::new(ResultsData {
-            source: action.source.clone().zip(set_key(action)),
             title: action.title.clone(),
             nodes,
             links: action.links.clone(),
@@ -775,12 +722,6 @@ impl GraphCanvas {
             HashMap::new(),
             cx,
         )
-    }
-
-    /// The table the set on this canvas was captured from.
-    fn captured_from(&self) -> Option<&CapturedFrom> {
-        let (_, results) = self.results.as_ref()?;
-        results.source.as_ref().map(|(source, _)| source)
     }
 
     /// The commit this canvas is held at, which what it opens is held at too (spec 020).
@@ -2443,26 +2384,6 @@ impl GraphCanvas {
         let state = exploration.state();
         let newer = exploration.newer_available();
         let summary = match self.mode() {
-            Mode::Results if self.captured_from().is_some() => {
-                let source = self.captured_from().expect("just asked");
-                let drawn = self
-                    .results
-                    .as_ref()
-                    .map_or(0, |(_, results)| results.nodes.len());
-                match source.total {
-                    Some(total) if total > drawn as u64 => format!(
-                        "From {} · {} of {} loaded",
-                        source.summary,
-                        studio_ui::group_count(drawn as i64),
-                        studio_ui::group_count(total as i64),
-                    ),
-                    _ => format!(
-                        "From {} · {}",
-                        source.summary,
-                        studio_ui::plural(drawn, "node", "nodes")
-                    ),
-                }
-            }
             Mode::Results => {
                 let count = self.scene.nodes.len();
                 let title = self
@@ -2537,23 +2458,6 @@ impl GraphCanvas {
                     .children(
                         studio_workspace::view_strip(Item::views(self, cx), cx)
                             .map(|strip| panel("canvas-views").child(strip)),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        panel("canvas-search")
-                            .px(px(space::LG))
-                            .gap(px(space::MD))
-                            .cursor_pointer()
-                            .child(studio_ui::ds::icon::lead(IconName::MagnifyingGlass))
-                            .child(studio_ui::ds::text::muted("Search nodes…"))
-                            .child(ui::KeyBinding::for_action(
-                                &studio_actions::workspace::GoTo,
-                                cx,
-                            ))
-                            .on_click(|_, window, cx| {
-                                window
-                                    .dispatch_action(Box::new(studio_actions::workspace::GoTo), cx)
-                            }),
                     )
                     .child(div().flex_1())
                     .child(
@@ -3189,7 +3093,6 @@ mod tests {
             label: None,
         };
         let action = ShowResultsOnCanvas {
-            source: None,
             title: "people".into(),
             nodes: vec![person("p1"), person("p2"), person("p3")],
             links: Vec::new(),
@@ -3314,42 +3217,6 @@ mod tests {
             canvas.read_with(cx, |canvas, _| canvas.layout_generation) > laid_out,
             "another scene is"
         );
-    }
-
-    /// The same captured set is one tab; another filter, selection or commit is another, so a
-    /// changed set never overwrites an earlier one (spec 020). A query's result has no such key.
-    #[test]
-    fn a_captured_set_is_known_by_what_it_holds() {
-        let set = |filter: &str, ids: &[&str], at_commit: Option<&str>| ShowResultsOnCanvas {
-            title: "Canvas: Person".into(),
-            nodes: ids
-                .iter()
-                .map(|id| studio_actions::graph::ResultNode {
-                    type_name: "Person".into(),
-                    id: (*id).into(),
-                    label: None,
-                })
-                .collect(),
-            links: Vec::new(),
-            source: Some(CapturedFrom {
-                type_name: "Person".into(),
-                at_commit: at_commit.map(str::to_owned),
-                filters: Some(serde_json::json!([filter])),
-                summary: format!("Person, {filter}"),
-                total: None,
-            }),
-        };
-        let berlin = set_key(&set("Berlin", &["p1", "p2"], None));
-        assert!(berlin.is_some());
-        assert_eq!(berlin, set_key(&set("Berlin", &["p1", "p2"], None)));
-        assert_ne!(berlin, set_key(&set("London", &["p1", "p2"], None)));
-        assert_ne!(berlin, set_key(&set("Berlin", &["p1"], None)));
-        assert_ne!(berlin, set_key(&set("Berlin", &["p1", "p2"], Some("c1"))));
-        let query = ShowResultsOnCanvas {
-            source: None,
-            ..set("Berlin", &["p1"], None)
-        };
-        assert_eq!(set_key(&query), None);
     }
 
     /// A canvas starts from where the person placed things on the graph's old canvas, as its own

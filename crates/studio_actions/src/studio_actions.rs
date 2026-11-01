@@ -57,6 +57,8 @@ pub struct ViewLink {
     pub current: bool,
     /// Why this view cannot open now; it stays in the strip, which does not shift.
     pub disabled: Option<&'static str>,
+    /// What it will open, in words ("Walk from Ada"), as its tooltip.
+    pub says: Option<String>,
 }
 
 impl ViewLink {
@@ -65,6 +67,7 @@ impl ViewLink {
             kind,
             current: true,
             disabled: None,
+            says: None,
         }
     }
 
@@ -73,6 +76,7 @@ impl ViewLink {
             kind,
             current: false,
             disabled: None,
+            says: None,
         }
     }
 
@@ -81,7 +85,14 @@ impl ViewLink {
             kind,
             current: false,
             disabled: Some(reason),
+            says: None,
         }
+    }
+
+    /// What this link will open, in words.
+    pub fn saying(mut self, says: impl Into<String>) -> Self {
+        self.says = Some(says.into());
+        self
     }
 }
 
@@ -238,7 +249,7 @@ pub mod palette {
 pub mod graph {
     use gpui::{Action, actions};
     use schemars::JsonSchema;
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
 
     actions!(
         studio_graph,
@@ -315,13 +326,44 @@ pub mod graph {
         pub preview: bool,
     }
 
-    /// One node of a query result, for [`ShowResultsOnCanvas`].
-    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema)]
+    /// One node of a query result or a table's selection.
+    #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
     pub struct ResultNode {
         pub type_name: String,
         pub id: String,
         #[serde(default)]
         pub label: Option<String>,
+    }
+
+    /// Show a set of nodes in a tree, each a row that opens to its relationships: a table's rows
+    /// under its filters, read a page at a time, or the nodes listed. It stays this set, whatever
+    /// the table it came from does next.
+    #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct ShowSetInTree {
+        /// The set in words, as its tab names it: "Person, Berlin".
+        pub title: String,
+        /// The type it reads, and the table it came from; none for a query's result.
+        #[serde(default)]
+        pub type_name: Option<String>,
+        /// The filters it reads under, as a table keeps them.
+        #[serde(default)]
+        pub filters: Option<serde_json::Value>,
+        /// The nodes it holds, when they are listed rather than read.
+        #[serde(default)]
+        pub nodes: Option<Vec<ResultNode>>,
+        /// How many rows it holds, when known.
+        #[serde(default)]
+        pub total: Option<u64>,
+        /// Read at this commit, read-only; `None` reads the branch head.
+        #[serde(default)]
+        pub at_commit: Option<String>,
+        /// The row selected at opening, by id.
+        #[serde(default)]
+        pub select: Option<String>,
+        /// Open as the pane's preview tab, which the next preview replaces (spec 002).
+        #[serde(default)]
+        pub preview: bool,
     }
 
     /// Draw a query result's nodes on a canvas of their own, linking the nodes of each row
@@ -333,27 +375,6 @@ pub mod graph {
         pub nodes: Vec<ResultNode>,
         /// Pairs of indices into `nodes` that share a row.
         pub links: Vec<(usize, usize)>,
-        /// The table these rows were captured from; none for a query's result.
-        #[serde(default)]
-        pub source: Option<CapturedFrom>,
-    }
-
-    /// Where a set drawn on a canvas came from (spec 020). The canvas shows it, and keeps a copy:
-    /// it never follows its source.
-    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema)]
-    pub struct CapturedFrom {
-        pub type_name: String,
-        /// The commit the table holds; none for one that reads the branch head.
-        #[serde(default)]
-        pub at_commit: Option<String>,
-        /// The table's filters, as it can open with them again.
-        #[serde(default)]
-        pub filters: Option<serde_json::Value>,
-        /// The filters or selection in words, as the canvas names the set.
-        pub summary: String,
-        /// How many rows the source matched, when it knows. More than were drawn is partial.
-        #[serde(default)]
-        pub total: Option<u64>,
     }
 
     /// Open a Blob value in a tab of its own, read at a commit or the branch head.

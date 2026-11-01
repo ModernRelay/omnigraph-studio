@@ -16,11 +16,12 @@ use gpui::{
 };
 use gq_language::builder::GroupBy;
 use graph_store::{
-    Entry, EntryKind, Exploration, ExplorationEvent, GraphSession, Loadable, NodeRef, SessionEvent,
+    Entry, EntryKind, Exploration, ExplorationEvent, GraphSession, Loadable, Neighbour, NodeRef,
+    SessionEvent, SetRoots,
 };
 use smallvec::SmallVec;
 use studio_actions::graph::{OpenType, PeekNode};
-use studio_actions::graph::{ShowNodeInTree, ShowNodeOnCanvas};
+use studio_actions::graph::{ShowNodeInTree, ShowNodeOnCanvas, ShowSetInTree};
 use studio_actions::tree::{
     ClearFilter, Collapse, CollapseAll, Expand, ExpandAll, OpenPage, OpenSelected, OpenTable,
     PeekSelected, RerootHere, SelectNext, SelectPrevious, ShowOnCanvas, ToggleEmptyGroups,
@@ -47,6 +48,14 @@ const TREE_KIND: &str = "tree";
 /// Registers the tree's tab and the action that opens it. The tree's keys are in `assets/keymaps/`.
 pub fn init(cx: &mut App) {
     studio_workspace::register_item_kind(cx, TREE_KIND, |data, workspace, window, cx| {
+        if let Some(set) = data
+            .get("set")
+            .cloned()
+            .and_then(|set| serde_json::from_value::<ShowSetInTree>(set).ok())
+        {
+            open_set(workspace, set, false, window, cx);
+            return;
+        }
         let node = data
             .get("type_name")
             .and_then(serde_json::Value::as_str)
@@ -70,6 +79,11 @@ pub fn init(cx: &mut App) {
         if window.is_none() {
             return;
         }
+        workspace.register_action(|workspace, action: &ShowSetInTree, window, cx| {
+            // The tab it was opened from stays (spec 020).
+            workspace.keep_active_tab(cx);
+            open_set(workspace, action.clone(), action.preview, window, cx);
+        });
         workspace.register_action(|workspace, action: &ShowNodeInTree, window, cx| {
             // The tab it was opened from stays (spec 020).
             workspace.keep_active_tab(cx);
@@ -107,8 +121,81 @@ fn open_tree(
     };
     let key = tree_key(&session.read(cx).graph_id, &node, at_commit.as_deref());
     workspace.open_item_with::<RelationshipTree>(key, preview, window, cx, move |_, cx| {
-        RelationshipTree::new(session, node, at_commit, cx)
+        RelationshipTree::new(session, Subject::Node(node), at_commit, cx)
     });
+}
+
+/// What identifies a tree of a set (spec 020): what it reads and at which commit. The same set is
+/// one tab; a changed one is another, and never overwrites it.
+fn set_key(graph_id: &str, set: &ShowSetInTree) -> SharedString {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    set.type_name.hash(&mut hasher);
+    set.at_commit.hash(&mut hasher);
+    set.filters
+        .as_ref()
+        .map(ToString::to_string)
+        .hash(&mut hasher);
+    for node in set.nodes.iter().flatten() {
+        node.type_name.hash(&mut hasher);
+        node.id.hash(&mut hasher);
+    }
+    format!("tree-set:{graph_id}:{:x}", hasher.finish()).into()
+}
+
+fn open_set(
+    workspace: &mut Workspace,
+    set: ShowSetInTree,
+    preview: bool,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(session) = workspace.session().cloned() else {
+        return;
+    };
+    let key = set_key(&session.read(cx).graph_id, &set);
+    let at_commit = set.at_commit.clone();
+    workspace.open_item_with::<RelationshipTree>(key, preview, window, cx, move |_, cx| {
+        RelationshipTree::new(session, Subject::Set(set), at_commit, cx)
+    });
+}
+
+/// The roots a set's action names.
+fn set_roots(set: &ShowSetInTree) -> SetRoots {
+    match &set.nodes {
+        Some(nodes) => SetRoots::Listed(
+            nodes
+                .iter()
+                .map(|node| Neighbour {
+                    node: NodeRef::new(node.type_name.clone(), node.id.clone()),
+                    label: node.label.clone(),
+                    edge: Vec::new(),
+                })
+                .collect(),
+        ),
+        None => {
+            let filters = match set.filters.clone() {
+                Some(filters) => serde_json::from_value(filters),
+                None => Ok(Vec::new()),
+            };
+            match filters {
+                Ok(filters) => SetRoots::Filtered {
+                    type_name: set.type_name.clone().unwrap_or_default(),
+                    filters,
+                    total: set.total,
+                },
+                // Filters this build cannot read: no rows, never every row under the set's name.
+                Err(_) => SetRoots::Listed(Vec::new()),
+            }
+        }
+    }
+}
+
+/// What a tree holds: one node, which it walks from and shares with a canvas of that node, or a
+/// set, each a row that opens to its relationships.
+enum Subject {
+    Node(NodeRef),
+    Set(ShowSetInTree),
 }
 
 #[derive(Clone)]
@@ -160,7 +247,9 @@ pub(crate) struct RelationshipTree {
     /// The walk this tab shows, shared with a canvas of the same root and commit. The tab holds
     /// it: closing every tab on a walk ends it.
     exploration: Entity<Exploration>,
-    root: NodeRef,
+    subject: Subject,
+    /// A set's row to select when its page arrives, as the table it came from had it.
+    select_on_load: Option<NodeRef>,
     /// The commit this tab is held at; none reads the branch head.
     at_commit: Option<String>,
     /// The walk changed while the tab was not drawn: rows are made again when it next is.
@@ -202,7 +291,10 @@ impl EventEmitter<ItemEvent> for RelationshipTree {}
 impl Item for RelationshipTree {
     fn tab_title(&self, cx: &App) -> SharedString {
         let state = self.exploration.read(cx).state();
-        let name = rows::node_text(state, &self.root);
+        let name = match &self.subject {
+            Subject::Node(root) => rows::node_text(state, root),
+            Subject::Set(set) => set.title.clone(),
+        };
         match &self.at_commit {
             Some(commit) => format!("Tree: {name} @ {}", studio_ui::short_commit_id(commit)).into(),
             None => format!("Tree: {name}").into(),
@@ -214,44 +306,85 @@ impl Item for RelationshipTree {
     }
 
     fn dedupe_key(&self, cx: &App) -> Option<SharedString> {
-        Some(tree_key(
-            &self.session.read(cx).graph_id,
-            &self.root,
-            self.at_commit.as_deref(),
-        ))
-    }
-
-    fn thing(&self, _cx: &App) -> Option<studio_actions::Thing> {
-        Some(studio_actions::Thing::Node {
-            type_name: self.root.type_name.clone(),
-            id: self.root.id.clone(),
+        let graph_id = &self.session.read(cx).graph_id;
+        Some(match &self.subject {
+            Subject::Node(root) => tree_key(graph_id, root, self.at_commit.as_deref()),
+            Subject::Set(set) => set_key(graph_id, set),
         })
     }
 
-    fn views(&self, _cx: &App) -> Vec<ViewLink> {
-        vec![
-            ViewLink::to(ViewKind::Page),
-            ViewLink::current(ViewKind::Tree),
-            ViewLink::to(ViewKind::Canvas),
-        ]
+    fn thing(&self, _cx: &App) -> Option<studio_actions::Thing> {
+        match &self.subject {
+            Subject::Node(root) => Some(studio_actions::Thing::Node {
+                type_name: root.type_name.clone(),
+                id: root.id.clone(),
+            }),
+            Subject::Set(set) => set.type_name.clone().map(studio_actions::Thing::Type),
+        }
+    }
+
+    /// A node's views, or a set's: a set's Canvas walks from the row selected in it.
+    fn views(&self, cx: &App) -> Vec<ViewLink> {
+        match &self.subject {
+            Subject::Node(_) => vec![
+                ViewLink::to(ViewKind::Page),
+                ViewLink::current(ViewKind::Tree),
+                ViewLink::to(ViewKind::Canvas),
+            ],
+            Subject::Set(set) => {
+                let canvas = match self.walks_from() {
+                    Some(node) => ViewLink::to(ViewKind::Canvas).saying(format!(
+                        "Walk from {}",
+                        rows::node_text(self.exploration.read(cx).state(), &node)
+                    )),
+                    None => ViewLink::disabled_because(
+                        ViewKind::Canvas,
+                        "Select a node to walk from it",
+                    ),
+                };
+                set.type_name
+                    .iter()
+                    .map(|_| ViewLink::to(ViewKind::Table))
+                    .chain([ViewLink::current(ViewKind::Tree), canvas])
+                    .collect()
+            }
+        }
     }
 
     fn view_action(&self, kind: ViewKind, _cx: &App) -> Option<Box<dyn gpui::Action>> {
         let at_commit = self.at_commit.clone();
-        match kind {
-            ViewKind::Page => {
-                let node = self.selected_node().unwrap_or_else(|| self.root.clone());
+        match (&self.subject, kind) {
+            (Subject::Node(root), ViewKind::Page) => {
+                let node = self.selected_node().unwrap_or_else(|| root.clone());
                 Some(Box::new(studio_actions::graph::OpenNodePage {
                     type_name: node.type_name,
                     id: node.id,
                     at_commit,
                 }))
             }
-            ViewKind::Canvas => Some(Box::new(ShowNodeOnCanvas {
-                type_name: self.root.type_name.clone(),
-                id: self.root.id.clone(),
+            (Subject::Node(root), ViewKind::Canvas) => Some(Box::new(ShowNodeOnCanvas {
+                type_name: root.type_name.clone(),
+                id: root.id.clone(),
                 at_commit,
                 preview: true,
+            })),
+            (Subject::Set(_), ViewKind::Canvas) => {
+                let node = self.walks_from()?;
+                Some(Box::new(ShowNodeOnCanvas {
+                    type_name: node.type_name,
+                    id: node.id,
+                    at_commit,
+                    preview: true,
+                }))
+            }
+            // The type's table: its open tab as it stands, or a new one with these filters.
+            (Subject::Set(set), ViewKind::Table) => Some(Box::new(OpenType {
+                type_name: set.type_name.clone()?,
+                at_commit,
+                filter_id: None,
+                via: None,
+                preview: false,
+                filters: set.filters.clone(),
             })),
             _ => None,
         }
@@ -262,13 +395,17 @@ impl Item for RelationshipTree {
     }
 
     fn serialize(&self, _cx: &App) -> Option<SavedItem> {
-        Some(SavedItem {
-            kind: TREE_KIND.into(),
-            data: serde_json::json!({
-                "type_name": self.root.type_name,
-                "id": self.root.id,
+        let data = match &self.subject {
+            Subject::Node(root) => serde_json::json!({
+                "type_name": root.type_name,
+                "id": root.id,
                 "at_commit": self.at_commit,
             }),
+            Subject::Set(set) => serde_json::json!({ "set": set }),
+        };
+        Some(SavedItem {
+            kind: TREE_KIND.into(),
+            data,
         })
     }
 }
@@ -276,11 +413,26 @@ impl Item for RelationshipTree {
 impl RelationshipTree {
     fn new(
         session: Entity<GraphSession>,
-        root: NodeRef,
+        subject: Subject,
         at_commit: Option<String>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let exploration = Exploration::for_walk(&session, root.clone(), at_commit.clone(), cx);
+        let exploration = match &subject {
+            Subject::Node(root) => {
+                Exploration::for_walk(&session, root.clone(), at_commit.clone(), cx)
+            }
+            Subject::Set(set) => {
+                Exploration::for_set(&session, set_roots(set), at_commit.clone(), cx)
+            }
+        };
+        let select_on_load = match &subject {
+            Subject::Set(ShowSetInTree {
+                type_name: Some(type_name),
+                select: Some(id),
+                ..
+            }) => Some(NodeRef::new(type_name.clone(), id.clone())),
+            _ => None,
+        };
         let subscriptions = vec![
             cx.subscribe(&exploration, |this, _, event, cx| match event {
                 ExplorationEvent::Changed => {
@@ -318,7 +470,8 @@ impl RelationshipTree {
         let mut tree = Self {
             session,
             exploration,
-            root,
+            subject,
+            select_on_load,
             at_commit,
             rebuild_owed: false,
             selection_owed: false,
@@ -360,6 +513,21 @@ impl RelationshipTree {
             )
         });
         self.refilter(cx);
+        self.select_loaded_row(cx);
+    }
+
+    /// Selects the row a set's tree opened to, once its page has brought it.
+    fn select_loaded_row(&mut self, cx: &mut Context<Self>) {
+        let Some(node) = &self.select_on_load else {
+            return;
+        };
+        let row = self.visible.iter().position(|ix| {
+            matches!(&self.entries[*ix].kind, EntryKind::Node { node: shown, .. } if shown == node)
+        });
+        if let Some(row) = row {
+            self.select_on_load = None;
+            self.select_row(row, cx);
+        }
     }
 
     /// Recomputes the visible rows. Call after `entries` changed, or with the previous
@@ -578,7 +746,10 @@ impl RelationshipTree {
                 // With text typed, a group not read in full is searched on the server.
                 let filter = self.filter.trim().to_owned();
                 let searching = self.group_search(&key, cx);
-                if !filter.is_empty() && searching.as_deref() != Some(filter.as_str()) {
+                if !key.is_set()
+                    && !filter.is_empty()
+                    && searching.as_deref() != Some(filter.as_str())
+                {
                     self.with_exploration(cx, |e, cx| e.search_group(&key, &filter, cx));
                 } else {
                     self.with_exploration(cx, |e, cx| e.load_more(&key, cx));
@@ -636,6 +807,14 @@ impl RelationshipTree {
             } => Some(target.node.clone()),
             _ => None,
         }
+    }
+
+    /// The node a set's Canvas walks from: the selected row's, or a relationship's own node.
+    fn walks_from(&self) -> Option<NodeRef> {
+        self.selected_node().or_else(|| {
+            self.selected_entry()
+                .and_then(|entry| entry.path.nodes().last().cloned())
+        })
     }
 
     fn show_on_canvas(&mut self, _: &ShowOnCanvas, window: &mut Window, cx: &mut Context<Self>) {
@@ -1502,7 +1681,13 @@ impl Render for RelationshipTree {
         if self.entries.is_empty() {
             return root
                 .child(toolbar)
-                .child(studio_ui::ds::sidebar_note("Reading…"))
+                .child(studio_ui::ds::sidebar_note(
+                    if self.exploration.read(cx).state().set.is_some() && !self.rebuild_owed {
+                        "No rows"
+                    } else {
+                        "Reading…"
+                    },
+                ))
                 .into_any_element();
         }
 
@@ -1673,7 +1858,8 @@ mod tests {
         );
         cx.run_until_parked();
         let ada = NodeRef::new("Person", "p1");
-        let tree = cx.new(|cx| RelationshipTree::new(session.clone(), ada.clone(), None, cx));
+        let tree = cx
+            .new(|cx| RelationshipTree::new(session.clone(), Subject::Node(ada.clone()), None, cx));
         let before = tree.read_with(cx, |tree, _| tree.entries.clone());
         cx.run_until_parked();
         cx.executor()
@@ -1688,6 +1874,198 @@ mod tests {
         assert_eq!(same, tree.read_with(cx, |tree, _| tree.exploration.clone()));
         let held = cx.update(|cx| Exploration::for_walk(&session, ada, Some("c0".into()), cx));
         assert_ne!(held, same);
+    }
+
+    fn person_set(select: Option<&str>) -> ShowSetInTree {
+        ShowSetInTree {
+            title: "Person, Berlin".into(),
+            type_name: Some("Person".into()),
+            filters: serde_json::to_value(vec![gq_language::builder::Filter {
+                property: "name".into(),
+                op: gq_language::builder::FilterOp::Contains,
+                value: "a".into(),
+            }])
+            .ok(),
+            nodes: None,
+            total: None,
+            at_commit: None,
+            select: select.map(str::to_owned),
+            preview: true,
+        }
+    }
+
+    /// A tree of a set holds the type's rows under the filters, each closed: it asks for nothing
+    /// below a row until the row opens. Its Canvas waits for a selected node, walks from that one
+    /// alone, and its Table goes back with the filters (spec 020).
+    #[gpui::test]
+    async fn a_set_opens_closed_and_canvas_takes_the_selected_node(cx: &mut gpui::TestAppContext) {
+        use std::sync::Mutex;
+
+        cx.update(studio_theme::init_test);
+        let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = asked.clone();
+        let (session, _served) = followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\n",
+            move |request| {
+                let name = request["name"].as_str().unwrap_or_default().to_owned();
+                let rows = if name.starts_with("studio_page") {
+                    serde_json::json!([
+                        { "n": { "@id": "p1", "name": "Ada" } },
+                        { "n": { "@id": "p2", "name": "Grace" } },
+                    ])
+                } else {
+                    serde_json::json!([])
+                };
+                seen.lock().unwrap().push(name);
+                rows
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        let shown = session.clone();
+        let (dock, cx) = cx.add_window_view(move |_, cx| Dock {
+            tree: cx.new(|cx| {
+                RelationshipTree::new(
+                    shown.clone(),
+                    Subject::Set(person_set(Some("p2"))),
+                    None,
+                    cx,
+                )
+            }),
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(10));
+        }
+        cx.run_until_parked();
+        let tree = dock.read_with(cx, |dock, _| dock.tree.clone());
+        tree.read_with(cx, |tree, _| {
+            let nodes: Vec<&str> = tree
+                .entries
+                .iter()
+                .filter_map(|entry| match &entry.kind {
+                    EntryKind::Node { node, expanded, .. } => {
+                        assert!(!expanded, "{} opens closed", node.id);
+                        assert_eq!(entry.depth, 0);
+                        Some(node.id.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(nodes, ["p1", "p2"]);
+        });
+        let reads = asked.lock().unwrap().clone();
+        assert!(!reads.is_empty());
+        assert!(
+            reads.iter().all(|name| name.starts_with("studio_page")),
+            "the page alone, nothing below a closed row: {reads:?}"
+        );
+        // The table's cursor row came selected, so Canvas walks from it.
+        tree.read_with(cx, |tree, cx| {
+            let views = Item::views(tree, cx);
+            let kinds: Vec<_> = views.iter().map(|link| link.kind).collect();
+            assert_eq!(kinds, [ViewKind::Table, ViewKind::Tree, ViewKind::Canvas]);
+            assert_eq!(views[2].says.as_deref(), Some("Walk from Grace"));
+            let action = Item::view_action(tree, ViewKind::Canvas, cx).expect("a walk");
+            assert!(action.partial_eq(&ShowNodeOnCanvas {
+                type_name: "Person".into(),
+                id: "p2".into(),
+                at_commit: None,
+                preview: true,
+            }));
+            let back = Item::view_action(tree, ViewKind::Table, cx).expect("its table");
+            assert!(back.partial_eq(&OpenType {
+                type_name: "Person".into(),
+                at_commit: None,
+                filter_id: None,
+                via: None,
+                preview: false,
+                filters: person_set(None).filters,
+            }));
+            assert_eq!(
+                Item::thing(tree, cx),
+                Some(studio_actions::Thing::Type("Person".into()))
+            );
+        });
+        // With no row selected, Canvas says why it cannot open.
+        tree.update(cx, |tree, _| {
+            tree.selected = None;
+        });
+        tree.read_with(cx, |tree, cx| {
+            assert_eq!(
+                Item::views(tree, cx)[2].disabled,
+                Some("Select a node to walk from it")
+            );
+        });
+    }
+
+    /// Listed nodes are exactly what the tree holds, read no page, and keep their names through a
+    /// refresh. Another set is another tab, and a tree comes back from what it saves.
+    #[gpui::test]
+    async fn listed_nodes_are_the_set_and_a_set_is_known_by_what_it_holds(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(studio_theme::init_test);
+        let (session, _served) = followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\n",
+            |_| serde_json::json!([]),
+            cx,
+        );
+        cx.run_until_parked();
+        let node = |id: &str, label: &str| studio_actions::graph::ResultNode {
+            type_name: "Person".into(),
+            id: id.into(),
+            label: Some(label.into()),
+        };
+        let listed = ShowSetInTree {
+            nodes: Some(vec![node("p7", "Ada"), node("p9", "Radia")]),
+            filters: None,
+            ..person_set(None)
+        };
+        let tree = cx.new(|cx| {
+            RelationshipTree::new(session.clone(), Subject::Set(listed.clone()), None, cx)
+        });
+        cx.run_until_parked();
+        tree.update(cx, |tree, cx| tree.rebuild(cx));
+        tree.read_with(cx, |tree, cx| {
+            let state = tree.exploration.read(cx).state();
+            let texts: Vec<String> = tree
+                .entries
+                .iter()
+                .filter_map(|entry| match &entry.kind {
+                    EntryKind::Node { node, .. } => Some(rows::node_text(state, node)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(texts, ["Ada", "Radia"]);
+            let saved = Item::serialize(tree, cx).expect("a tree is saved");
+            let back: ShowSetInTree =
+                serde_json::from_value(saved.data["set"].clone()).expect("it reads back");
+            assert_eq!(back, listed);
+        });
+        tree.update(cx, |tree, cx| {
+            tree.exploration.update(cx, |e, cx| e.refresh(cx));
+            tree.rebuild(cx);
+        });
+        cx.run_until_parked();
+        tree.read_with(cx, |tree, cx| {
+            let state = tree.exploration.read(cx).state();
+            assert_eq!(state.label(&NodeRef::new("Person", "p7")), Some("Ada"));
+        });
+        let berlin = person_set(None);
+        let london = ShowSetInTree {
+            filters: Some(serde_json::json!(["London"])),
+            ..person_set(None)
+        };
+        assert_eq!(set_key("g", &berlin), set_key("g", &person_set(Some("p2"))));
+        assert_ne!(set_key("g", &berlin), set_key("g", &london));
+        assert_ne!(set_key("g", &berlin), set_key("g", &listed));
+        let held = ShowSetInTree {
+            at_commit: Some("c1".into()),
+            ..person_set(None)
+        };
+        assert_ne!(set_key("g", &berlin), set_key("g", &held));
     }
 
     /// ⌘R where the tree has the keyboard reads it again at the branch head, as its "Newer
@@ -1716,7 +2094,12 @@ mod tests {
         let shown = session.clone();
         let (dock, cx) = cx.add_window_view(move |_, cx| Dock {
             tree: cx.new(|cx| {
-                RelationshipTree::new(shown.clone(), NodeRef::new("Person", "p1"), None, cx)
+                RelationshipTree::new(
+                    shown.clone(),
+                    Subject::Node(NodeRef::new("Person", "p1")),
+                    None,
+                    cx,
+                )
             }),
         });
         let exploration = dock.read_with(cx, |dock, cx| dock.tree.read(cx).exploration.clone());
@@ -1776,7 +2159,12 @@ mod tests {
         let shown = session.clone();
         let (dock, cx) = cx.add_window_view(move |_, cx| Dock {
             tree: cx.new(|cx| {
-                RelationshipTree::new(shown.clone(), NodeRef::new("Person", "p1"), None, cx)
+                RelationshipTree::new(
+                    shown.clone(),
+                    Subject::Node(NodeRef::new("Person", "p1")),
+                    None,
+                    cx,
+                )
             }),
         });
         // The tree draws reads that land together once they all have.

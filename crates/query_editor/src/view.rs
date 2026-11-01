@@ -3331,27 +3331,54 @@ impl QueryEditor {
 
                 if let Some(graph) = rows.graph.clone() {
                     let title = format!("{} · result", rows.label);
+                    // Its nodes as a tree, each opening to its relationships.
+                    let set = studio_actions::graph::ShowSetInTree {
+                        title: title.clone(),
+                        type_name: None,
+                        filters: None,
+                        nodes: Some(graph.0.clone()),
+                        total: None,
+                        at_commit: None,
+                        select: None,
+                        preview: true,
+                    };
                     end.push(
-                        ds::button("result-canvas", "Canvas")
+                        ds::button("result-tree", "Tree")
                             .style(ButtonStyle::Subtle)
-                            .start_icon(Icon::new(IconName::GitGraph))
+                            .start_icon(Icon::new(IconName::ListTree))
                             .tooltip(Tooltip::text(format!(
-                                "Draw the result's {} nodes, linking those in the same row",
-                                graph.0.len()
+                                "Show the result's {} as a tree",
+                                studio_ui::plural(graph.0.len(), "node", "nodes")
                             )))
                             .on_click(move |_, window, cx| {
-                                window.dispatch_action(
-                                    Box::new(studio_actions::graph::ShowResultsOnCanvas {
-                                        title: title.clone(),
-                                        nodes: graph.0.clone(),
-                                        links: graph.1.clone(),
-                                        source: None,
-                                    }),
-                                    cx,
-                                )
+                                window.dispatch_action(Box::new(set.clone()), cx)
                             })
                             .into_any_element(),
                     );
+                    // A picture only of what the result links: nodes that share a row. A result
+                    // with one node column links nothing, and has none to draw.
+                    if !graph.1.is_empty() {
+                        end.push(
+                            ds::button("result-graph", "Graph")
+                                .style(ButtonStyle::Subtle)
+                                .start_icon(Icon::new(IconName::GitGraph))
+                                .tooltip(Tooltip::text(format!(
+                                    "Draw the result's {} nodes, linking those in the same row",
+                                    graph.0.len()
+                                )))
+                                .on_click(move |_, window, cx| {
+                                    window.dispatch_action(
+                                        Box::new(studio_actions::graph::ShowResultsOnCanvas {
+                                            title: title.clone(),
+                                            nodes: graph.0.clone(),
+                                            links: graph.1.clone(),
+                                        }),
+                                        cx,
+                                    )
+                                })
+                                .into_any_element(),
+                        );
+                    }
                 }
                 if self.selected.is_some() {
                     let focus = &self.results_focus;

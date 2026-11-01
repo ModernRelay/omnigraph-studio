@@ -452,6 +452,9 @@ pub fn view_strip(views: Vec<ViewLink>, cx: &App) -> Option<AnyElement> {
                         .into_any_element(),
                     None if link.current => segment.into_any_element(),
                     None => segment
+                        .when_some(link.says, |segment, says| {
+                            segment.tooltip(Tooltip::text(says))
+                        })
                         .on_click(move |event: &ClickEvent, window, cx| {
                             window.dispatch_action(
                                 Box::new(OpenViewAt {

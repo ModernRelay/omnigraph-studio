@@ -113,7 +113,9 @@ pub fn filter(
     }
     let mut keep = vec![false; entries.len()];
     for (index, entry) in entries.iter().enumerate() {
-        if index == 0
+        // A walk's root always stays, so the filter never empties the tree; a set's rows have to
+        // match, as any row does.
+        if (index == 0 && entry.path.is_root())
             || row_text(entry, state, schema)
                 .to_lowercase()
                 .contains(&query)
@@ -130,7 +132,7 @@ pub fn filter(
     }
     for (index, entry) in entries.iter().enumerate() {
         if matches!(entry.kind, EntryKind::More { .. })
-            && entry.parent.is_some_and(|parent| keep[parent])
+            && entry.parent.is_none_or(|parent| keep[parent])
         {
             keep[index] = true;
         }
