@@ -516,7 +516,9 @@ fn diff_line(line: &DiffLine, cx: &App) -> Div {
         .pr(px(space::MD))
         .py(px(space::XXS))
         .rounded(px(crate::ds::radii(cx).xs))
-        .when_some(color, |line, color| line.bg(color.color(cx).opacity(0.08)))
+        .when_some(color, |line, color| {
+            line.bg(crate::ds::surface::wash(color, cx))
+        })
         .child(
             div()
                 .w(px(SIGN_WIDTH))
@@ -554,7 +556,7 @@ fn piece_words(pieces: &[Piece], side: Option<PieceKind>, cx: &App) -> Vec<AnyEl
         words.push(if own {
             div()
                 .rounded(px(crate::ds::radii(cx).xs))
-                .bg(color.color(cx).opacity(0.22))
+                .bg(crate::ds::surface::mark(color, cx))
                 .child(label)
                 .into_any_element()
         } else {
@@ -893,13 +895,11 @@ impl RenderOnce for ChangeCard {
         let selected = self.selected;
         let kind = self.kind;
         let collapsed = self.collapsed;
-        let chevron = Icon::new(if collapsed {
+        let chevron = crate::ds::icon::meta(if collapsed {
             IconName::ChevronRight
         } else {
             IconName::ChevronDown
-        })
-        .size(IconSize::XSmall)
-        .color(Color::Muted);
+        });
         // The actions show while the row is hovered or selected, so a list of rows is calm.
         let actions = h_flex()
             .flex_none()

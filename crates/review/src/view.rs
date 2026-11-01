@@ -2551,8 +2551,7 @@ impl ReviewView {
             .on_click(cx.listener(|this, _, _, cx| this.merge(cx)));
 
         let mark = |name: IconName, color: Color| {
-            Icon::new(name)
-                .size(IconSize::XSmall)
+            studio_ui::ds::icon::meta(name)
                 .color(color)
                 .into_any_element()
         };
@@ -3112,15 +3111,11 @@ impl ReviewView {
                     })
                     .hover(move |style| style.bg(hover))
                     .child(studio_ui::ds::dot(color))
-                    .child(
-                        Icon::new(if folded {
-                            IconName::ChevronRight
-                        } else {
-                            IconName::ChevronDown
-                        })
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
-                    )
+                    .child(studio_ui::ds::icon::meta(if folded {
+                        IconName::ChevronRight
+                    } else {
+                        IconName::ChevronDown
+                    }))
                     .child(studio_ui::ds::text::body(counts))
                     .child(studio_ui::ds::text::muted(joiner))
                     .child(studio_ui::kind_swatch(&run.type_name, run.is_edge, cx))
@@ -3228,15 +3223,11 @@ impl ReviewView {
             .when(reviewed, |head| {
                 head.opacity(studio_ui::ds::opacity::DIMMED)
             })
-            .child(
-                Icon::new(if open {
-                    IconName::ChevronDown
-                } else {
-                    IconName::ChevronRight
-                })
-                .size(IconSize::XSmall)
-                .color(Color::Muted),
-            )
+            .child(studio_ui::ds::icon::meta(if open {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            }))
             .child(
                 studio_ui::ds::text::body(name)
                     .when(kind == ChangeKind::Removed, |name| name.strikethrough())
@@ -3363,11 +3354,7 @@ impl ReviewView {
                         ),
                     )
                     .when(reviewed, |row| {
-                        row.child(
-                            Icon::new(IconName::Check)
-                                .size(IconSize::XSmall)
-                                .color(Color::Created),
-                        )
+                        row.child(studio_ui::ds::icon::meta(IconName::Check).color(Color::Created))
                     })
                     .on_click(cx.listener(move |this, _, _, cx| this.select_group(group, cx))),
             )
