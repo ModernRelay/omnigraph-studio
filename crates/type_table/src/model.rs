@@ -823,7 +823,10 @@ pub fn row_matches(filters: &[Filter], values: &Map<String, Value>) -> bool {
         let value = values.get(&filter.property).unwrap_or(&Value::Null);
         match filter.op {
             _ if filter.property == gq_language::builder::ID_FILTER => true,
-            FilterOp::HasAny | FilterOp::HasNone | FilterOp::RelatedTo => true,
+            // The engine judges a condition and a relationship; a row is kept as read.
+            FilterOp::HasAny | FilterOp::HasNone | FilterOp::RelatedTo | FilterOp::Expr => true,
+            // A neighbour's property is not in the row either.
+            _ if filter.property.contains('.') => true,
             FilterOp::IsEmpty => value.is_null(),
             FilterOp::IsNotEmpty => !value.is_null(),
             _ if value.is_null() => false,
@@ -834,6 +837,21 @@ pub fn row_matches(filters: &[Filter], values: &Map<String, Value>) -> bool {
             FilterOp::Contains => match (value, &filter.value) {
                 (Value::String(text), Value::String(part)) => text.contains(part.as_str()),
                 (Value::Array(items), wanted) => items.iter().any(|v| same_value(v, wanted)),
+                _ => false,
+            },
+            FilterOp::StartsWith => match (value, &filter.value) {
+                (Value::String(text), Value::String(start)) => text.starts_with(start.as_str()),
+                _ => false,
+            },
+            // The engine's full-text search, near enough: every word of the query somewhere in
+            // the text, whatever the case.
+            FilterOp::Search => match (value, &filter.value) {
+                (Value::String(text), Value::String(words)) => {
+                    let text = text.to_lowercase();
+                    words
+                        .split_whitespace()
+                        .all(|word| text.contains(&word.to_lowercase()))
+                }
                 _ => false,
             },
             FilterOp::Eq => same_value(value, &filter.value),
@@ -865,6 +883,25 @@ pub fn row_matches(filters: &[Filter], values: &Map<String, Value>) -> bool {
 /// A filter as its pill's parts: the field, the test and the value it compares with, if any,
 /// as it reads: `title is Engineer`, `email is empty`, `has worksAt →`.
 pub fn filter_parts(filter: &Filter) -> (String, String, Option<String>) {
+    if filter.op == FilterOp::Expr {
+        return (
+            "Condition".into(),
+            "where".into(),
+            Some(edit_text(&filter.value)),
+        );
+    }
+    // A neighbour's property is named by the traversal and the property: `attended name
+    // contains Aaron`; the pill's icon shows the direction.
+    if let Some((relationship, property)) = filter.property.split_once('.')
+        && let Some((_, edge)) = gq_language::builder::parse_relationship_key(relationship)
+    {
+        let value = filter.op.takes_value().then(|| edit_text(&filter.value));
+        return (
+            format!("{} {property}", gq_language::traversal_name(edge)),
+            filter.op.label().to_owned(),
+            value,
+        );
+    }
     // A relationship is named by its traversal; the pill's icon shows its direction.
     if let Some((_, edge)) = gq_language::builder::parse_relationship_key(&filter.property) {
         let relationship = gq_language::traversal_name(edge);
@@ -960,7 +997,7 @@ pub fn save_result(outcome: &WriteOutcome<ChangeOutput>, branch: &str) -> SaveRe
         },
         WriteOutcome::Refused(error) => SaveResult::Refused(refusal(
             error.status,
-            &error.body.error,
+            error.reason(),
             error.body.precondition_failure.is_some(),
             branch,
         )),
@@ -1626,6 +1663,8 @@ mod tests {
     fn refused(status: u16, precondition: bool) -> WriteOutcome<ChangeOutput> {
         WriteOutcome::Refused(ApiError {
             status,
+            unauthorized: None,
+            token_replaced: false,
             body: ErrorOutput {
                 error: "policy denied".into(),
                 precondition_failure: precondition.then(|| PreconditionFailureOutput {
@@ -1669,6 +1708,24 @@ mod tests {
             panic!()
         };
         assert_eq!(notice.message, "Nothing was written. policy denied");
+        // A 401 says what became of the token, not the server's words.
+        let unauthorized = WriteOutcome::Refused(ApiError {
+            status: 401,
+            unauthorized: Some(graph_client::Unauthorized::TokenNotReceived),
+            token_replaced: false,
+            body: ErrorOutput {
+                error: "unauthorized".into(),
+                ..Default::default()
+            },
+        });
+        let SaveResult::Refused(notice) = save_result(&unauthorized, "main") else {
+            panic!()
+        };
+        assert_eq!(
+            notice.message,
+            "Nothing was written. The server received no token, though Studio sent one: \
+             something between them may drop it."
+        );
         assert_eq!(
             save_result(
                 &WriteOutcome::Unknown {
@@ -1902,6 +1959,7 @@ mod tests {
                 list: false,
                 enum_values: None,
                 is_key: false,
+                indexed: false,
             };
             relative_value(Some(&property), &Value::String(text.into()), now)
         };

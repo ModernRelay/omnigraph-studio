@@ -367,7 +367,8 @@
       "j": "studio_review::NextChange",
       "down": "studio_review::NextChange",
       "k": "studio_review::PreviousChange",
-      "up": "studio_review::PreviousChange"
+      "up": "studio_review::PreviousChange",
+      "space": "studio_review::ToggleChange"
     }
   },
   {
@@ -376,7 +377,8 @@
       "cmd-y": "studio_review::AcceptAndNext",
       "alt-cmd-z": "studio_review::RevertAndNext",
       "cmd-shift-enter": "studio_review::Merge",
-      "cmd-shift-m": "studio_review::Summarize"
+      "cmd-shift-m": "studio_review::Summarize",
+      "cmd-shift-v": "studio_review::SwitchLayout"
     }
   },
   {

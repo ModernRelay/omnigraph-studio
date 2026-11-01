@@ -946,11 +946,12 @@ impl HistoryView {
             .get(rows.start..rows.end.min(self.commits.len()))
             .unwrap_or_default();
         let lists_due = !self.by_id && self.listed.as_ref().is_some_and(|l| l.due(now));
+        let wanted: HashSet<&str> = self.wanted.iter().map(String::as_str).collect();
         let names_unread = drawn
             .iter()
             .flat_map(|c| c.parent_commit_id.iter().chain(&c.merged_parent_commit_id))
             .any(|id| {
-                (self.wanted.contains(id) && self.may_ask(id, now))
+                (wanted.contains(id.as_str()) && self.may_ask(id, now))
                     || (lists_due && self.read.absent(id) == Some(Absent::Unlisted))
             });
         if names_unread {

@@ -437,6 +437,7 @@ mod tests {
                 "studio.type_table_page_size",
                 "studio.tree_page_size",
                 "studio.canvas_max_nodes",
+                "studio.review_layout",
                 "studio.health_check_seconds",
                 "studio.show_performance",
                 "studio.auto_update",

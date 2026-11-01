@@ -1356,6 +1356,9 @@ impl AgentPanel {
         self.clear_thread();
         // What the start given up said is said again by this one.
         self.said_while_starting.clear();
+        // A conversation nothing was sent in starts in a folder of its own again, as when
+        // another agent is chosen: the one it ran in goes.
+        self.discard_unused_folder(cx);
         self.start(cx);
     }
 
@@ -2089,6 +2092,9 @@ impl AgentPanel {
     fn apply_gateway(&mut self, event: GatewayEvent, cx: &mut Context<Self>) {
         match event {
             GatewayEvent::Write { id, write, decide } => self.gateway_write(id, write, decide, cx),
+            GatewayEvent::TokenRefused => self
+                .session
+                .update(cx, |session, cx| session.token_refused(cx)),
             GatewayEvent::Abandoned { id } => {
                 if let Some(card) = self.gateway_cards.remove(&id) {
                     self.set_write_state(
@@ -4309,6 +4315,53 @@ mod tests {
     /// waits for the tab's first draw, which takes it. Before, every restored conversation
     /// started its agent at launch, a process and a replay each. (A drawn tab here has no agent
     /// to start, so the test starts no process.)
+    /// Starting a conversation nothing was sent in again (Restart, or Start again after a slow
+    /// start) removes the folder it ran in, as choosing another agent does: the start takes a
+    /// folder of its own. Before, the old folder, with its `AGENTS.md` and skill, stayed.
+    #[gpui::test]
+    async fn starting_an_unsent_conversation_again_removes_its_folder(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+            editor::init(cx);
+            let mut settings = StudioSettings::get(cx).clone();
+            settings.agent.command = vec!["an-agent".to_owned()];
+            cx.set_global(settings);
+        });
+        let (session, _) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n}\n",
+            |_| serde_json::json!([]),
+            cx,
+        );
+        cx.run_until_parked();
+        let (_root, cx) = cx.add_window_view(|_, _| gpui::EmptyView);
+        let panel = cx.update(|window, cx| {
+            cx.new(|cx| {
+                AgentPanel::new(
+                    session,
+                    WeakEntity::new_invalid(),
+                    Some("s1".into()),
+                    window,
+                    cx,
+                )
+            })
+        });
+        let old = panel.read_with(cx, |panel, cx| {
+            crate::sessions::graph_cwd(&panel.session.read(cx).overrides_key()).join("main-old")
+        });
+        std::fs::create_dir_all(&old).unwrap();
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.cwd = Some(old.clone());
+                panel.restart(&Restart, window, cx);
+            })
+        });
+        cx.run_until_parked();
+        assert!(!old.exists(), "the unused folder removed");
+    }
+
     #[gpui::test]
     async fn a_restored_conversation_starts_its_agent_when_shown(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
