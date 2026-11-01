@@ -59,7 +59,7 @@ use crate::grouping::{GROUP_LIMIT, Grouping, Line, Lines, SECTION_FIRST_PAGE};
 use crate::model::{
     ColumnLayout, ColumnRole, ColumnSpec, Notice, Paging, RELATION_CHIPS_SHOWN,
     RELATION_SAMPLE_BUDGET, Row, SaveResult, TableKind, Tone, changed_elsewhere, chips_that_fit,
-    count_of, display_value, edge_columns, edge_rows, edit_text, edited, field_rows, filter_parts,
+    display_value, edge_columns, edge_rows, edit_text, edited, field_rows, filter_parts,
     insert_position, node_columns, node_rows, parse_filter_list, parse_filter_value, parse_input,
     preset_range, published, reads_as_markdown, relation_sample, row_matches,
 };
@@ -3463,8 +3463,9 @@ impl TypeTable {
         if self.grouping.as_ref().map(|g| g.generation) != Some(generation) {
             return;
         }
-        let none =
-            none.map(|read| read.map(|output| count_of(&output.rows).unwrap_or(0).max(0) as u64));
+        let none = none.map(|read| {
+            read.map(|output| builder::count_of(&output.rows).unwrap_or(0).max(0) as u64)
+        });
         let result = match (result, none) {
             (Ok(output), Some(Ok(none))) => Ok((output, Some(none))),
             (Ok(output), None) => Ok((output, None)),
@@ -4371,7 +4372,7 @@ impl TypeTable {
             this.update(cx, |this, cx| {
                 let shift = this.count_shift_at(at.as_deref(), filtered);
                 let value = match result {
-                    Ok(output) => match count_of(&output.rows) {
+                    Ok(output) => match builder::count_of(&output.rows) {
                         Some(n) => Loadable::Loaded(n + shift),
                         None => Loadable::Failed("The count came back empty".into()),
                     },

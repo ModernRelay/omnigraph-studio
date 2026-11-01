@@ -448,11 +448,6 @@ pub fn edge_rows(edge: &EdgeType, rows: &Value) -> Vec<Row> {
         .collect()
 }
 
-/// The single count a `count(…) as n` query returns.
-pub fn count_of(rows: &Value) -> Option<i64> {
-    rows.as_array()?.first()?.get("n")?.as_i64()
-}
-
 /// Where the Blob values a view shows hold as it shows them, which a Blob write is bound at: a
 /// managed value's validator names its type's table version, so it is read at a commit holding
 /// that table as the view shows it.
@@ -1351,7 +1346,15 @@ mod tests {
         assert_eq!(edges[0].id, "e1");
         assert_eq!(edges[0].value(FROM_COLUMN), &json!("p1"));
         assert_eq!(edges[0].value("role"), &json!("lead"));
-        assert_eq!(count_of(&json!([{"n": 37}])), Some(37));
+        assert_eq!(
+            gq_language::builder::count_of(&json!([{"n": 37}])),
+            Some(37)
+        );
+        assert_eq!(
+            gq_language::builder::count_of(&json!([])),
+            None,
+            "no row is no count"
+        );
     }
 
     fn rows(ids: &[&str]) -> Vec<Row> {

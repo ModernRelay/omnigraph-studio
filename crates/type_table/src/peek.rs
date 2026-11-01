@@ -38,8 +38,8 @@ use crate::blob::{
 };
 use crate::blob_write::{self, Binding, BlobChange, BlobEdit, BlobWritten};
 use crate::model::{
-    BlobsAt, FROM_COLUMN, Notice, SaveResult, TO_COLUMN, Tone, changed_elsewhere, count_of,
-    display_value, edited, field_rows, node_label, node_rows, reads_as_markdown, save_result,
+    BlobsAt, FROM_COLUMN, Notice, SaveResult, TO_COLUMN, Tone, changed_elsewhere, display_value,
+    edited, field_rows, node_label, node_rows, reads_as_markdown, save_result,
 };
 use crate::offers::Offers;
 use crate::suggest;
@@ -5073,7 +5073,7 @@ async fn read_first_edges(
                 })
                 .ok()?;
             match read.await {
-                Ok(output) => match count_of(&output.rows) {
+                Ok(output) => match builder::count_of(&output.rows) {
                     Some(n) => Loadable::Loaded(n),
                     None => Loadable::Failed("The count came back empty".into()),
                 },

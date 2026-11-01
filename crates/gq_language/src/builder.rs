@@ -1055,6 +1055,13 @@ fn node_page_reading(
     })
 }
 
+/// The count a query returning `count(…) as n` answers ([`node_count`], [`edge_count`]). The
+/// engine answers one row even when nothing matches (`{"n": 0}`), so an answer of no row, or a
+/// row without `n`, is no count, for the caller to say so rather than take it for none.
+pub fn count_of(rows: &Value) -> Option<i64> {
+    rows.as_array()?.first()?.get("n")?.as_i64()
+}
+
 /// How many rows of a node type match the filters.
 pub fn node_count(
     schema: &SchemaModel,
