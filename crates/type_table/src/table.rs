@@ -1298,6 +1298,7 @@ impl TypeTable {
                 self.owe_reload(cx);
             }
             SessionEvent::DraftsChanged => self.drafts_changed(cx),
+            SessionEvent::CredentialChanged => self.credential_changed(cx),
             SessionEvent::HeadMoved { branch, .. } if *branch == self.branch => {
                 self.compare_head(cx)
             }
@@ -3265,14 +3266,7 @@ impl TypeTable {
         // At the same commit a row's relationships and Blob cells cannot have changed: a new
         // order or filter keeps what was read and reads only rows not seen yet.
         if !keep_pin {
-            self.blobs.clear();
-            self.blob_tasks.clear();
-            self.blob_queue.clear();
-            // A file still being stored stays shown as going; why one did not land goes.
-            self.blob_edits.retain(|_, edit| edit.is_saving());
-            self.relations.clear();
-            self.relation_tasks.clear();
-            self.relations_asked.clear();
+            self.forget_cells_read();
         }
         self.lines_moved();
         // The view scrolls back to its first line (below): until a frame draws it, the rows
@@ -3304,6 +3298,40 @@ impl TypeTable {
             .scroll_handle
             .scroll_to_item(0, ScrollStrategy::Top);
         true
+    }
+
+    /// Lets go of the Blob cells and the relationships read for the rows, and of the reads out
+    /// for them.
+    fn forget_cells_read(&mut self) {
+        self.blobs.clear();
+        self.blob_tasks.clear();
+        self.blob_queue.clear();
+        // A file still being stored stays shown as going; why one did not land goes.
+        self.blob_edits.retain(|_, edit| edit.is_saving());
+        self.relations.clear();
+        self.relation_tasks.clear();
+        self.relations_asked.clear();
+    }
+
+    /// The connection's token changed ([`SessionEvent::CredentialChanged`]): the new one may
+    /// see less than the old, so nothing the old one read stays shown (the rows, their counts,
+    /// Blob cells and relationships, what the branch changed) and the reads still out for them
+    /// go, as the session refuses what lands under the old token. The rows are read again
+    /// under the new token at the commit the table shows, when it is next drawn: a table held
+    /// at a commit, or behind its branch's head, reads where it was (constitution II), and a
+    /// refusal shows as the table's error. Drafts are the person's, kept by the session, and an
+    /// edit open is kept as one; a fill's answers would be drafts bound to rows the old token
+    /// read, so it ends.
+    fn credential_changed(&mut self, cx: &mut Context<Self>) {
+        self.fill = None;
+        self.forget_cells_read();
+        self.diff = None;
+        self.diff_task = None;
+        self.diff_owed = true;
+        if self.forget_rows(true, cx) {
+            self.rows_owed = true;
+        }
+        cx.notify();
     }
 
     /// Reads the rows [`Self::forget_rows`] let go of: the sections of a grouping, else the
@@ -10582,6 +10610,222 @@ mod tests {
 
     fn grid_renders(table: &Entity<TypeTable>, cx: &mut VisualTestContext) -> usize {
         table.read_with(cx, |table, cx| table.grid.read(cx).renders)
+    }
+
+    /// The people a fake server answers, by the token a read carries: one person named for the
+    /// token, or the read refused (403) for `denied`.
+    fn people_by_token(read: &serde_json::Value) -> serde_json::Value {
+        use serde_json::json;
+        match read["token"].as_str() {
+            Some("denied") => json!({ "refuse": "not for this credential", "forbidden": true }),
+            Some(token) => json!([
+                {"n": {"@id": "p1", "slug": "p1", "name": format!("read with {token}")}},
+            ]),
+            None => json!([]),
+        }
+    }
+
+    /// The names the table's rows show.
+    fn row_names(table: &Entity<TypeTable>, cx: &mut VisualTestContext) -> Vec<String> {
+        table.read_with(cx, |table, _| {
+            table
+                .rows
+                .iter()
+                .map(|row| row.values["name"].as_str().unwrap_or_default().to_owned())
+                .collect()
+        })
+    }
+
+    fn token_table(
+        session: &Entity<GraphSession>,
+        at_commit: Option<&str>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<TypeTable> {
+        let session = session.clone();
+        let at_commit = at_commit.map(str::to_owned);
+        cx.new(|cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                at_commit,
+                window,
+                cx,
+            )
+        })
+    }
+
+    /// Another token on the connection: the rows the old one read go, and the table reads
+    /// again under the new one at the commit it shows, a table following its branch at its pin
+    /// and one held at a commit at that commit. Before, the old token's rows stayed, and
+    /// nothing was read again.
+    #[gpui::test]
+    async fn a_new_token_reads_the_rows_again_at_the_commit_shown(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _, served) = crate::test_support::session_served(PEOPLE, people_by_token, cx);
+        session.update(cx, |session, cx| session.set_shown(true, cx));
+        cx.run_until_parked();
+        let (_window, cx) = cx.add_window_view(|_, _| gpui::EmptyView);
+        let (following, held) = cx.update(|window, cx| {
+            (
+                token_table(&session, None, window, cx),
+                token_table(&session, Some("c0"), window, cx),
+            )
+        });
+        // Drawn, each reads.
+        for table in [&following, &held] {
+            table.update(cx, |table, cx| table.read_rows(cx));
+        }
+        cx.run_until_parked();
+        assert_eq!(row_names(&following, cx), ["read with t"]);
+        assert_eq!(row_names(&held, cx), ["read with t"]);
+        let pin = following.read_with(cx, |table, _| table.paging.pinned.clone());
+        assert_eq!(pin.as_deref(), Some("c1"));
+        let before = served.sent("studio_page").len();
+
+        let connection = session.read_with(cx, |session, _| session.connection.clone());
+        connection.update(cx, |connection, cx| {
+            connection.set_token(Some("b".into()), cx)
+        });
+        cx.run_until_parked();
+        for table in [&following, &held] {
+            assert!(
+                row_names(table, cx).is_empty(),
+                "the old token's rows go at once"
+            );
+            table.read_with(cx, |table, _| assert!(table.rows_owed, "read when drawn"));
+        }
+        for table in [&following, &held] {
+            table.update(cx, |table, cx| {
+                table.rows_owed = false;
+                table.read_rows(cx)
+            });
+        }
+        cx.run_until_parked();
+        assert_eq!(row_names(&following, cx), ["read with b"]);
+        assert_eq!(row_names(&held, cx), ["read with b"]);
+        let again: Vec<_> = served.sent("studio_page")[before..]
+            .iter()
+            .map(|read| (read["token"].clone(), read["at"].clone()))
+            .collect();
+        assert_eq!(
+            again,
+            [
+                (serde_json::json!("b"), serde_json::json!("c1")),
+                (serde_json::json!("b"), serde_json::json!("c0")),
+            ],
+            "each read again under the new token, at its own commit"
+        );
+        let pin = following.read_with(cx, |table, _| table.paging.pinned.clone());
+        assert_eq!(pin.as_deref(), Some("c1"), "the pin stays");
+    }
+
+    /// A new token refused the rows the old one read: the table shows the refusal, and none
+    /// of the old rows.
+    #[gpui::test]
+    async fn a_new_token_refused_the_rows_shows_none_of_the_old(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _, _) = crate::test_support::session_served(PEOPLE, people_by_token, cx);
+        session.update(cx, |session, cx| session.set_shown(true, cx));
+        cx.run_until_parked();
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session.clone(),
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert_eq!(row_names(&table, cx), ["read with t"]);
+
+        let connection = session.read_with(cx, |session, _| session.connection.clone());
+        connection.update(cx, |connection, cx| {
+            connection.set_token(Some("denied".into()), cx)
+        });
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(row_names(&table, cx).is_empty());
+        table.read_with(cx, |table, _| {
+            assert!(
+                matches!(&table.first_page, Loadable::Failed(why) if why.contains("not for this credential")),
+                "{:?}",
+                table.first_page
+            );
+        });
+    }
+
+    /// A read sent under the old token that lands after the new one is in shows nothing: the
+    /// table reads again under the new one. And a graph parked when the token changed refuses
+    /// what lands for it then, and reads again when shown.
+    #[gpui::test]
+    async fn a_read_under_the_old_token_lands_nothing(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _, served) = crate::test_support::session_served(PEOPLE, people_by_token, cx);
+        session.update(cx, |session, cx| session.set_shown(true, cx));
+        cx.run_until_parked();
+        let first = served.hold(|read| read["name"] == "studio_page");
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session.clone(),
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert_eq!(served.sent("studio_page").len(), 1, "the first read is out");
+        let connection = session.read_with(cx, |session, _| session.connection.clone());
+        connection.update(cx, |connection, cx| {
+            connection.set_token(Some("b".into()), cx)
+        });
+        first.send(()).unwrap();
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert_eq!(row_names(&table, cx), ["read with b"]);
+
+        // Parked with a read out, the token changes; what lands is the old token's.
+        let reading = served.hold(|read| read["name"] == "studio_page");
+        connection.update(cx, |connection, cx| {
+            connection.set_token(Some("b2".into()), cx)
+        });
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let sent = served.sent("studio_page");
+        assert_eq!(sent.len(), 3, "a read out under b2");
+        assert_eq!(sent[2]["token"], "b2");
+        session.update(cx, |session, cx| session.set_shown(false, cx));
+        connection.update(cx, |connection, cx| {
+            connection.set_token(Some("c".into()), cx)
+        });
+        reading.send(()).unwrap();
+        cx.run_until_parked();
+        assert!(
+            row_names(&table, cx).is_empty(),
+            "nothing the old token read lands"
+        );
+        session.update(cx, |session, cx| session.set_shown(true, cx));
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert_eq!(row_names(&table, cx), ["read with c"]);
     }
 
     /// A table not drawn (restored with the workspace behind another tab) reads no rows: not

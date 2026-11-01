@@ -259,10 +259,12 @@ pub enum SessionEvent {
     /// What the credential may do was read, or is to be read again ([`GraphSession::allows`]).
     AccessChanged,
     /// The connection's token changed, and the session reads under the new one: a view that
-    /// shows what it read of the server itself (the storage inspector) reads it again, since
-    /// the new token may see less. Said too when the connection is ready again with the token
-    /// a read was refused under, which is read again alike. A parked graph says so when shown
-    /// again.
+    /// shows what it read of the server itself (a table's rows, a node page, the storage
+    /// inspector) lets it go and reads it again, at the commit it shows, since the new token
+    /// may see less. A read still out under the old token answers nothing of it
+    /// ([`GraphSession::counted_read`]). Said too when the connection is ready again with the
+    /// token a read was refused under, which is read again alike. A parked graph says so when
+    /// shown again.
     CredentialChanged,
 }
 
@@ -291,6 +293,17 @@ const COMMIT_CHANGE_BYTES: usize = 32 * 1024 * 1024;
 /// id.
 const NAME_BATCH: usize = 500;
 const NAME_LIMIT: usize = 5_000;
+
+/// What a read answers when the connection's token changed while it was out
+/// ([`GraphSession::counted_read`]): the server's answer was the old token's, so none of it is
+/// shown. A view that heard [`SessionEvent::CredentialChanged`] has dropped the read and reads
+/// again; one that did not says this.
+fn stale_credential() -> ReadError {
+    ReadError::Transport(
+        "The connection's token changed while this was read; read it again under the new one."
+            .into(),
+    )
+}
 
 /// How often a session asks after the heads of the branches its views show, while a window of
 /// Studio's is active.
@@ -3280,11 +3293,19 @@ impl GraphSession {
     /// nobody waits for any more (its task dropped, as a search does when the text changes)
     /// stops, and is counted out either way: a count that only came down on an answer would
     /// leave "queries running" up for reads that no longer exist.
+    ///
+    /// A read whose connection changed its token while it was out (or its transport, or was
+    /// retired: [`GraphClient::credential_changes`]) answers [`stale_credential`] in place of
+    /// what the server said: the answer was the old token's, which may see more than the new
+    /// one, and no view shows it, whether or not it heard [`SessionEvent::CredentialChanged`]
+    /// in time to drop the read. A renewal of the same token ([`GraphClient::renew_token`]) is
+    /// no change.
     fn counted_read<T: Send + 'static>(
         &mut self,
         request: impl Future<Output = Result<T, ReadError>> + Send + 'static,
         cx: &mut Context<Self>,
     ) -> Task<Result<T, ReadError>> {
+        let credential = self.client(cx).credential_changes();
         self.reads_in_flight += 1;
         cx.emit(SessionEvent::ActivityChanged);
         let (answer_tx, answer_rx) = oneshot::channel();
@@ -3298,15 +3319,24 @@ impl GraphSession {
                 Either::Left((result, _)) => Some(result),
                 Either::Right(_) => None,
             };
-            this.update(cx, |this, cx| {
-                if let Some(result) = &result {
-                    this.note_read(result, cx);
+            let changed = this
+                .update(cx, |this, cx| {
+                    if let Some(result) = &result {
+                        this.note_read(result, cx);
+                    }
+                    this.reads_in_flight = this.reads_in_flight.saturating_sub(1);
+                    cx.emit(SessionEvent::ActivityChanged);
+                    cx.notify();
+                    this.client(cx).credential_changes() != credential
+                })
+                .unwrap_or(false);
+            let result = result.map(|result| {
+                if changed {
+                    Err(stale_credential())
+                } else {
+                    result
                 }
-                this.reads_in_flight = this.reads_in_flight.saturating_sub(1);
-                cx.emit(SessionEvent::ActivityChanged);
-                cx.notify();
-            })
-            .ok();
+            });
             if let Some(result) = result {
                 answer_tx.send(result).ok();
             }
