@@ -211,7 +211,7 @@ impl Default for StudioOptions {
             canvas_max_nodes: 2000,
             review_layout: ReviewLayout::default(),
             health_check_seconds: 30,
-            show_performance: true,
+            show_performance: false,
             auto_update: true,
         }
     }
