@@ -29,6 +29,9 @@
   {
     "context": "Workspace",
     "bindings": {
+      "ctrl-shift-1": ["studio::ActivatePanel", { "id": "types" }],
+      "ctrl-shift-2": ["studio::ActivatePanel", { "id": "queries" }],
+      "ctrl-shift-3": ["studio::ActivatePanel", { "id": "branches" }],
       "ctrl-alt-1": ["studio::OpenViewAt", { "index": 0 }],
       "ctrl-alt-shift-1": ["studio::OpenViewAt", { "index": 0, "beside": true }],
       "ctrl-alt-2": ["studio::OpenViewAt", { "index": 1 }],

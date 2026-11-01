@@ -418,15 +418,10 @@ const TRAFFIC_LIGHTS_WIDTH: f32 = 76.;
 /// The traffic lights' offset from the top of that strip: centers the 16-point buttons in it.
 const TRAFFIC_LIGHTS_TOP: f32 = (HEADER_HEIGHT - 16.) / 2.;
 
-/// Where the traffic lights sit: centered in the first header strip, which the glass style
-/// insets. A window opens with them there, so they do not move on its first draw.
-pub fn traffic_light_position(glass: bool) -> Point<Pixels> {
-    let gap = if glass {
-        px(studio_ui::ds::size::SHEET_GAP)
-    } else {
-        px(0.)
-    };
-    point(gap + px(12.), gap + px(TRAFFIC_LIGHTS_TOP))
+/// Where the traffic lights sit: centered in the top bar. A window opens with them there, so they
+/// do not move on its first draw.
+pub fn traffic_light_position(_glass: bool) -> Point<Pixels> {
+    point(px(12.), px(TRAFFIC_LIGHTS_TOP))
 }
 /// A tab's view strip (spec 020): links to the other views of what it shows, the first thing in
 /// its toolbar. Nothing to choose between draws nothing. A view that cannot open stays, with why,
@@ -2844,46 +2839,46 @@ impl Workspace {
             })
     }
 
-    /// Room for the traffic lights at the start of a top-left strip (`lights_room`).
-    fn lights_room(&self, zoomed: bool, cx: &App) -> Option<f32> {
-        lights_room(self.lights_shown, zoomed, cx)
-    }
-
     /// The sidebar, drawn `width` wide ([`panels::side_widths`]).
     fn render_sidebar(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let panel = studio_ui::ds::surface::chrome(cx);
         let hairline = studio_ui::ds::surface::rule(cx);
-        // The column's header is its panel's own, as a Zed panel draws its header: the panel's
-        // title and its buttons. Panels are switched, and the sidebar shown and hidden, from
-        // the status bar.
-        let header = self
-            .strip("sidebar-header", HEADER_HEIGHT, cx)
-            .pr(px(studio_ui::ds::space::SM))
-            .gap(px(studio_ui::ds::space::XS))
+        // What can be listed, in words, one row each (spec 020). The active one's own buttons
+        // (new, filter) sit at its end.
+        let nav = v_flex()
+            .id("sidebar-nav")
+            .flex_none()
+            .py(px(studio_ui::ds::space::XS))
             .when(!studio_ui::ds::is_glass(cx), |d| {
                 d.border_b_1().border_color(hairline)
             })
-            .map(|strip| match self.lights_room(false, cx) {
-                Some(room) => strip.child(div().w(px(room)).flex_none()),
-                None => strip.pl(px(studio_ui::ds::space::EDGE)),
-            })
-            .children(self.left.active_panel().map(dock_title))
-            .child(
-                IconButton::new("search", IconName::MagnifyingGlass)
-                    .tooltip(|_, cx| {
+            .children(self.left.panels.iter().enumerate().map(|(index, panel)| {
+                let lit = index == self.left.active;
+                let id = panel.id.to_string();
+                let tooltip_id = id.clone();
+                let title = panel.title.clone();
+                studio_ui::ds::SidebarRow::new(("sidebar-nav", index), panel.title.clone())
+                    .icon(panel.icon)
+                    .selected(lit)
+                    .when_some(panel.actions.clone().filter(|_| lit), |row, actions| {
+                        row.end(actions)
+                    })
+                    .tooltip_fn(move |_, cx| {
                         Tooltip::for_action(
-                            "Search types, queries and commands",
-                            &studio_actions::workspace::ToggleCommandPalette,
+                            title.clone(),
+                            &studio_actions::workspace::ActivatePanel {
+                                id: tooltip_id.clone(),
+                            },
                             cx,
                         )
                     })
-                    .on_click(|_, window, cx| {
+                    .on_click(move |_, window, cx| {
                         window.dispatch_action(
-                            Box::new(studio_actions::workspace::ToggleCommandPalette),
+                            Box::new(studio_actions::workspace::ActivatePanel { id: id.clone() }),
                             cx,
                         )
-                    }),
-            );
+                    })
+            }));
         // The content scrolls in its cached host.
         let body = v_flex().id("sidebar-panel").flex_1().min_h_0().children(
             self.left
@@ -2904,13 +2899,61 @@ impl Workspace {
             .w(px(width))
             .h_full()
             .flex_none()
-            .child(header)
+            .child(nav)
             .child(body)
             .child(resize_handle(PanelPosition::Left))
     }
 
-    /// The status bar's first button, as Zed's sidebar toggle: shows or hides the sidebar, its
-    /// icon drawn as the sidebar is.
+    /// The top bar (spec 020): which server, graph and branch the window reads, always in the
+    /// same place, with what shows and hides the frame's docks. It takes the window's title bar
+    /// band, so the traffic lights sit in it.
+    fn render_top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let shown = self.session.is_some();
+        let hairline = studio_ui::ds::surface::rule(cx);
+        let docks_right = shown && !(self.bottom.panels.is_empty() && self.right.panels.is_empty());
+        self.strip("top-bar", HEADER_HEIGHT, cx)
+            .debug_selector(|| "top-bar".into())
+            .pr(px(studio_ui::ds::space::SM))
+            .gap(px(studio_ui::ds::space::XS))
+            .bg(studio_ui::ds::surface::status_bar(cx))
+            .border_b_1()
+            .border_color(hairline)
+            .map(|strip| match lights_room(self.lights_shown) {
+                Some(room) => strip.child(div().w(px(room)).flex_none()),
+                None => strip.pl(px(studio_ui::ds::space::SM)),
+            })
+            .when(shown && !self.left.panels.is_empty(), |bar| {
+                bar.child(self.render_sidebar_toggle())
+                    .child(studio_ui::ds::divider_v(cx))
+            })
+            .child(self.render_graph_switcher(cx))
+            .children(self.render_branch(cx))
+            .child(div().flex_1())
+            .child(
+                IconButton::new("search", IconName::MagnifyingGlass)
+                    .tooltip(|_, cx| {
+                        Tooltip::for_action(
+                            "Search types, queries and commands",
+                            &studio_actions::workspace::ToggleCommandPalette,
+                            cx,
+                        )
+                    })
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(
+                            Box::new(studio_actions::workspace::ToggleCommandPalette),
+                            cx,
+                        )
+                    }),
+            )
+            .when(docks_right, |bar| {
+                bar.child(studio_ui::ds::divider_v(cx))
+                    .child(self.render_panel_buttons(PanelPosition::Bottom, cx))
+                    .child(self.render_panel_buttons(PanelPosition::Right, cx))
+            })
+    }
+
+    /// The top bar's first button, as Zed's sidebar toggle: shows or hides the sidebar, its icon
+    /// drawn as the sidebar is.
     fn render_sidebar_toggle(&self) -> impl IntoElement {
         let open = self.left.open;
         IconButton::new(
@@ -2960,12 +3003,8 @@ impl Workspace {
                 let tooltip_id = id.clone();
                 let workspace = workspace.clone();
                 let this = cx.entity().downgrade();
-                let (anchor, attach) = match position {
-                    PanelPosition::Left => (gpui::Anchor::BottomLeft, gpui::Anchor::TopLeft),
-                    PanelPosition::Bottom | PanelPosition::Right => {
-                        (gpui::Anchor::BottomRight, gpui::Anchor::TopRight)
-                    }
-                };
+                // In the top bar: its menu opens below.
+                let (anchor, attach) = (gpui::Anchor::TopRight, gpui::Anchor::BottomRight);
                 let button_id = id.clone();
                 // As Zed's panel buttons: the right-click menu moves the panel to another dock,
                 // and no tooltip covers it while it is open.
@@ -3308,7 +3347,8 @@ impl Workspace {
                     .child(studio_ui::ds::icon::meta(IconName::ChevronUpDown)),
             );
         PopoverMenu::new("graph-switcher-menu")
-            .anchor(gpui::Anchor::BottomLeft)
+            .anchor(gpui::Anchor::TopLeft)
+            .attach(gpui::Anchor::BottomLeft)
             .trigger(trigger)
             .menu(move |window, cx| {
                 let entries = entries.clone();
@@ -3557,12 +3597,10 @@ impl Workspace {
     }
 
     /// A pane's header strip, as Zed's tab bar starts: Back and Forward for this pane, then its
-    /// tabs. The top-left pane makes room for the traffic lights when the sidebar is hidden.
+    /// tabs.
     fn render_pane_header(&self, pane_id: PaneId, cx: &mut Context<Self>) -> impl IntoElement {
         let header_bg = studio_ui::ds::surface::header_strip(cx);
         let hairline = studio_ui::ds::surface::rule(cx);
-        let top_left = self.center.top_left() == pane_id;
-        let zoomed = self.zoomed == Some(Zoomed::Pane(pane_id));
         let (can_back, can_forward) = self.pane(pane_id).map_or((false, false), |pane| {
             (pane.can_step(true), pane.can_step(false))
         });
@@ -3609,21 +3647,6 @@ impl Workspace {
         )
         .debug_selector(move || format!("pane-header-{pane_id}"))
         .bg(header_bg)
-        .when_some(
-            (zoomed || (top_left && (!self.left.visible() || self.session.is_none())))
-                .then(|| self.lights_room(zoomed, cx))
-                .flatten(),
-            |strip, room| {
-                strip.child(
-                    div()
-                        .w(px(room))
-                        .h_full()
-                        .flex_none()
-                        .border_b_1()
-                        .border_color(hairline),
-                )
-            },
-        )
         .child(nav)
         .child(self.render_tabs(pane_id, cx))
         .children(
@@ -3942,8 +3965,6 @@ impl Workspace {
         let hairline = studio_ui::ds::surface::rule(cx);
         let mut status = status.unwrap_or_default();
         let keys = std::mem::take(&mut status.keys);
-        let has_start = !status.start.is_empty();
-        let shown = self.session.is_some();
         let running = self.session.as_ref().and_then(|session| {
             let s = session.read(cx);
             match (s.reads_in_flight, s.writes_in_flight) {
@@ -3960,17 +3981,7 @@ impl Workspace {
             .gap(px(studio_ui::ds::space::XS))
             .items_center()
             .overflow_hidden()
-            .when(shown && !self.left.panels.is_empty(), |bar| {
-                bar.child(self.render_sidebar_toggle())
-                    .child(studio_ui::ds::divider_v(cx))
-                    .child(self.render_panel_buttons(PanelPosition::Left, cx))
-                    .child(studio_ui::ds::divider_v(cx))
-            })
-            .child(self.render_graph_switcher(cx))
-            .children(self.render_branch(cx))
-            .when(has_start, |bar| bar.child(studio_ui::ds::divider_v(cx)))
             .children(status.start);
-        let docks_right = shown && !(self.bottom.panels.is_empty() && self.right.panels.is_empty());
         let has_end = !status.end.is_empty();
         let performance = self.render_performance();
         let item = self
@@ -4027,12 +4038,7 @@ impl Workspace {
                 bar.child(studio_ui::ds::divider_v(cx))
             })
             .children(item)
-            .children(performance)
-            .when(docks_right, |bar| {
-                bar.child(studio_ui::ds::divider_v(cx))
-                    .child(self.render_panel_buttons(PanelPosition::Bottom, cx))
-                    .child(self.render_panel_buttons(PanelPosition::Right, cx))
-            });
+            .children(performance);
         h_flex()
             .id("status-bar")
             .debug_selector(|| "status-bar".into())
@@ -4082,7 +4088,8 @@ impl Workspace {
                 .child(studio_ui::ds::text::body("/").color(Color::Disabled))
                 .child(
                     PopoverMenu::new("branch-menu")
-                        .anchor(gpui::Anchor::BottomLeft)
+                        .anchor(gpui::Anchor::TopLeft)
+                        .attach(gpui::Anchor::BottomLeft)
                         .trigger(
                             studio_ui::ds::bar_button("branch", branch.clone())
                                 .style(ButtonStyle::Subtle)
@@ -4261,10 +4268,6 @@ impl Workspace {
         .gap(px(studio_ui::ds::space::XS))
         .border_b_1()
         .border_color(hairline)
-        .when_some(
-            zoomed.then(|| self.lights_room(true, cx)).flatten(),
-            |strip, room| strip.child(div().w(px(room)).flex_none()),
-        )
         .children(dock.active_panel().map(dock_title))
         .child(
             div()
@@ -4497,10 +4500,10 @@ impl Workspace {
     }
 
     fn render_toasts(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        // Under the header strips, so a toast never covers the status bar or a composer.
+        // Under the top bar and a pane's tabs, so a toast never covers the scope or a tab.
         v_flex()
             .absolute()
-            .top(px(HEADER_HEIGHT + studio_ui::ds::space::MD))
+            .top(px(HEADER_HEIGHT * 2. + studio_ui::ds::space::MD))
             .right(px(studio_ui::ds::space::LG))
             .gap(px(studio_ui::ds::space::MD))
             .children(self.toasts.iter().map(|toast| {
@@ -4990,20 +4993,21 @@ impl Render for Workspace {
                     .children(bottom),
             ),
         };
-        root.child(
-            div()
-                .flex()
-                .flex_1()
-                .min_h_0()
-                .w_full()
-                .relative()
-                .when(glass, |d| d.p(gap).pb_0())
-                .child(docks)
-                .children(self.render_zoomed(cx)),
-        )
-        .child(self.render_status_bar(status, cx))
-        .child(self.render_toasts(cx))
-        .children(modal)
+        root.child(self.render_top_bar(cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .relative()
+                    .when(glass, |d| d.p(gap).pb_0())
+                    .child(docks)
+                    .children(self.render_zoomed(cx)),
+            )
+            .child(self.render_status_bar(status, cx))
+            .child(self.render_toasts(cx))
+            .children(modal)
     }
 }
 
@@ -5025,22 +5029,10 @@ fn dock_title(panel: &PanelEntry) -> impl IntoElement {
         .children(panel.actions.clone())
 }
 
-/// Room for the traffic lights at the start of a header strip at the window's top left; a
-/// zoomed one starts inside the zoom's inset, the lights where the window style puts them.
-/// `None` without lights, as Zed's title bar: off macOS, and in full screen.
-fn lights_room(shown: bool, zoomed: bool, cx: &App) -> Option<f32> {
-    if !shown {
-        return None;
-    }
-    if !zoomed {
-        return Some(TRAFFIC_LIGHTS_WIDTH);
-    }
-    let gap = if studio_ui::ds::is_glass(cx) {
-        studio_ui::ds::size::SHEET_GAP
-    } else {
-        0.
-    };
-    Some(TRAFFIC_LIGHTS_WIDTH + gap - ZOOM_INSET)
+/// Room for the traffic lights at the start of the top bar. `None` without lights, as Zed's
+/// title bar: off macOS, and in full screen.
+fn lights_room(shown: bool) -> Option<f32> {
+    shown.then_some(TRAFFIC_LIGHTS_WIDTH)
 }
 
 /// The dock a panel goes in: where the settings place it, else its own.
@@ -8288,20 +8280,12 @@ mod tests {
         assert_eq!(paused(&mut cx), Some(true));
     }
 
-    /// The top-left strips make room for traffic lights only where the window shows them: off
-    /// macOS and in full screen they start at their own edge, as Zed's title bar does.
-    #[gpui::test]
-    fn strips_make_room_for_traffic_lights_only_when_they_show(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| {
-            assert_eq!(lights_room(false, false, cx), None, "no lights");
-            assert_eq!(lights_room(false, true, cx), None, "no lights, zoomed");
-            assert_eq!(lights_room(true, false, cx), Some(TRAFFIC_LIGHTS_WIDTH));
-            assert_eq!(
-                lights_room(true, true, cx),
-                Some(TRAFFIC_LIGHTS_WIDTH - ZOOM_INSET),
-                "flat, inside the zoom's inset"
-            );
-        });
+    /// The top bar makes room for traffic lights only where the window shows them: off macOS and
+    /// in full screen it starts at its own edge, as Zed's title bar does.
+    #[test]
+    fn the_top_bar_makes_room_for_traffic_lights_only_when_they_show() {
+        assert_eq!(lights_room(false), None, "no lights");
+        assert_eq!(lights_room(true), Some(TRAFFIC_LIGHTS_WIDTH));
     }
 
     /// Only the top-left pane's first tab on glass, with nothing before it, meets the sheet's
