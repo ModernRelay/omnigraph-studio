@@ -7826,7 +7826,9 @@ mod tests {
     fn leaving_the_window_pauses_the_cpu_reading(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
             studio_theme::init_test(cx);
-            cx.set_global(StudioSettings::default());
+            let mut settings = StudioSettings::default();
+            settings.studio.show_performance = true;
+            cx.set_global(settings);
         });
         let window = cx.add_window(Workspace::new);
         window
