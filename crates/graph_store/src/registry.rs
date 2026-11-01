@@ -203,19 +203,15 @@ pub(crate) fn transport_client(transport: &CliTransport) -> anyhow::Result<Arc<d
     )))
 }
 
-/// The clients the transports of `targets` need that `held` does not hold already, made off the
-/// main thread: one that trusts the system's roots too reads them from the system's store,
-/// which can take a while. A failure is kept as its message, said when the target is applied.
-fn prepare_transports(
-    targets: &CliTargets,
-    held: &[CliTransport],
-    make: &TransportHttp,
-) -> Prepared {
+/// The clients the transports of `targets` need, made off the main thread: one that trusts the
+/// system's roots too reads them from the system's store, which can take a while. Those made
+/// for a transport already are made again: another listing applied before this one may let
+/// that client go. A failure is kept as its message, said when the target is applied.
+fn prepare_transports(targets: &CliTargets, make: &TransportHttp) -> Prepared {
     let mut prepared: Prepared = Vec::new();
     for server in targets.servers.iter().flatten() {
         let transport = &server.transport;
         if *transport == CliTransport::default()
-            || held.contains(transport)
             || prepared.iter().any(|(made, _)| made == transport)
         {
             continue;
@@ -555,7 +551,7 @@ impl ConnectionRegistry {
                 if !listing && !listed_files && !cli_moved {
                     continue;
                 }
-                let Ok((held, make)) = this.update(cx, |this, _| this.transport_maker()) else {
+                let Ok(prepare) = this.update(cx, |this, _| this.transport_preparer()) else {
                     break;
                 };
                 let lister = lister.clone();
@@ -564,7 +560,7 @@ impl ConnectionRegistry {
                     .background_executor()
                     .spawn(async move {
                         let targets = lister(dir, places, platform).await;
-                        let prepared = prepare_transports(&targets, &held, &make);
+                        let prepared = prepare(&targets);
                         (targets, prepared)
                     })
                     .await;
@@ -599,15 +595,11 @@ impl ConnectionRegistry {
         }
     }
 
-    /// The transports a client is made for already, and what makes a client for another, for a
-    /// listing to prepare off the main thread ([`prepare_transports`]).
-    fn transport_maker(&self) -> (Vec<CliTransport>, TransportHttp) {
-        let held = self
-            .transport_clients
-            .iter()
-            .map(|(transport, _)| transport.clone())
-            .collect();
-        (held, self.transported.clone())
+    /// What prepares the clients a listing's targets need, off the main thread
+    /// ([`prepare_transports`]).
+    fn transport_preparer(&self) -> impl FnOnce(&CliTargets) -> Prepared + Send + use<> {
+        let make = self.transported.clone();
+        move |targets| prepare_transports(targets, &make)
     }
 
     /// The client for `transport`: the one made for it already, which every target naming it
@@ -616,7 +608,7 @@ impl ConnectionRegistry {
     fn transport_http(
         &mut self,
         transport: &CliTransport,
-        prepared: &mut Prepared,
+        prepared: &Prepared,
     ) -> Result<Arc<dyn HttpClient>, String> {
         if *transport == CliTransport::default() {
             return Ok(self.http.clone());
@@ -656,7 +648,7 @@ impl ConnectionRegistry {
     fn apply_cli_targets(
         &mut self,
         targets: CliTargets,
-        mut prepared: Prepared,
+        prepared: Prepared,
         cx: &mut Context<Self>,
     ) -> bool {
         let CliTargets {
@@ -726,7 +718,7 @@ impl ConnectionRegistry {
                     .get(&url)
                     .is_some_and(|held| held.transport != server.transport);
                 if moved {
-                    match self.transport_http(&server.transport, &mut prepared) {
+                    match self.transport_http(&server.transport, &prepared) {
                         Ok(http) => connection
                             .update(cx, |connection, cx| connection.replace_http(http, cx)),
                         Err(error) => {
@@ -783,7 +775,7 @@ impl ConnectionRegistry {
                 source: ServerSource::Cli,
                 known_graphs: graphs,
             };
-            let http = match self.transport_http(&server.transport, &mut prepared) {
+            let http = match self.transport_http(&server.transport, &prepared) {
                 Ok(http) => http,
                 Err(error) => {
                     errors.push(format!(
@@ -897,7 +889,7 @@ impl ConnectionRegistry {
         let dir = self.operator_dir.clone();
         let places = self.cli_places.clone();
         let lister = self.lister.clone();
-        let (held, make) = self.transport_maker();
+        let prepare = self.transport_preparer();
         cx.spawn(async move |this, cx| {
             let (added, targets, prepared) = {
                 let (name, url) = (name.clone(), url.clone());
@@ -906,7 +898,7 @@ impl ConnectionRegistry {
                         let added =
                             cli_tokens::add_server_target(&places, &name, &url, token).await;
                         let targets = lister(dir, places, platform).await;
-                        let prepared = prepare_transports(&targets, &held, &make);
+                        let prepared = prepare(&targets);
                         (added, targets, prepared)
                     })
                     .await
@@ -1150,6 +1142,41 @@ mod tests {
                 .count();
             assert_eq!(refused, 2, "{:?}", registry.notices());
         });
+
+        // Two listings that overlap: the one applied first lets go of a client the other's
+        // targets name, which that one prepared all the same, so it is not made here either.
+        let (client, _) = answering();
+        let made = Arc::new(AtomicUsize::new(0));
+        let counted = made.clone();
+        registry.update(cx, |registry, _| {
+            registry.transported = Arc::new(move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(client.clone())
+            });
+        });
+        let mut dev = server("dev", "http://c.test", "1");
+        dev.transport.proxy = Some("http://proxy.test:9090".into());
+        let listed = || files(vec![dev.clone()]);
+        let prepare = |cx: &mut TestAppContext| {
+            registry.read_with(cx, |registry, _| registry.transport_preparer())(&listed())
+        };
+        let first = prepare(cx);
+        registry.update(cx, |registry, cx| {
+            registry.apply_cli_targets(listed(), first, cx)
+        });
+        let overlapping = prepare(cx);
+        registry.update(cx, |registry, cx| {
+            registry.apply_cli_targets(files(Vec::new()), Vec::new(), cx)
+        });
+        let before = made.load(Ordering::SeqCst);
+        registry.update(cx, |registry, cx| {
+            registry.apply_cli_targets(listed(), overlapping, cx)
+        });
+        assert_eq!(
+            made.load(Ordering::SeqCst),
+            before,
+            "none made on the main thread"
+        );
     }
 
     fn find(

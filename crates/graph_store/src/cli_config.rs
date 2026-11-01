@@ -227,28 +227,42 @@ pub async fn read_targets(
         };
     };
     let config = config_path(dir);
-    let refused = |error: String| CliTargets {
-        servers: None,
-        errors: vec![error],
-        watched: vec![(config.clone(), stamp_of(&config))],
-        managed: Vec::new(),
+    // A failure that may pass (the CLI busy, or slow to start or to answer) lists the targets
+    // again at the next check; one that lasts waits for the operator file, as `stamp` saw it, to
+    // change.
+    let failed = |passing: bool, error: String, stamp: Option<FileStamp>| {
+        if passing {
+            return unlisted(&config, error);
+        }
+        CliTargets {
+            servers: None,
+            errors: vec![error],
+            watched: vec![(config.clone(), stamp)],
+            managed: Vec::new(),
+        }
     };
     let asked = "`omnigraph target list --json`";
     let turn = match cli_tokens::take_turn(&Arc::default(), cli_tokens::READ_TIMEOUT, asked).await {
         Ok(turn) => turn,
         Err(busy) => {
-            return unlisted(
-                &config,
+            return failed(
+                true,
                 format!("Studio could not list the CLI's targets: {busy}"),
+                None,
             );
         }
     };
-    let cli = match cli_tokens::find_cli(programs, &turn).await {
+    let cli = match cli_tokens::found_cli(programs, &turn).await {
         Ok(cli) => cli,
         Err(why) => {
-            return refused(format!(
-                "Studio lists the CLI's targets with the Omnigraph CLI, and {why}"
-            ));
+            return failed(
+                why.passing,
+                format!(
+                    "Studio lists the CLI's targets with the Omnigraph CLI, and {}",
+                    why.why
+                ),
+                stamp_of(&config),
+            );
         }
     };
     // Taken before the CLI reads the file: a write while it lists changes the next stamp.
@@ -260,14 +274,16 @@ pub async fn read_targets(
             read.watched.insert(0, (config, config_stamp));
             read
         }
-        Err(refusal) => CliTargets {
-            watched: vec![(config.clone(), config_stamp)],
-            ..refused(format!(
-                "The Omnigraph CLI ({}, {}) could not list its targets: {refusal}",
+        Err(refusal) => failed(
+            refusal.passing,
+            format!(
+                "The Omnigraph CLI ({}, {}) could not list its targets: {}",
                 cli.path.display(),
-                cli.version
-            ))
-        },
+                cli.version,
+                refusal.why
+            ),
+            config_stamp,
+        ),
     }
 }
 
@@ -322,7 +338,7 @@ pub type FileStamp = (SystemTime, u64, u32);
 /// The stamp of a file whose listing did not happen: no file has it.
 const UNLISTED: FileStamp = (SystemTime::UNIX_EPOCH, u64::MAX, u32::MAX);
 
-/// A listing that did not happen (the CLI busy), saying `why`: the operator file `config` is
+/// A listing that did not happen (the CLI busy or slow to answer), saying `why`: the operator file `config` is
 /// kept with a stamp no file has, so the next check lists the targets again, an operator file
 /// that is not there (no stamp) included.
 pub(crate) fn unlisted(config: &Path, why: String) -> CliTargets {
