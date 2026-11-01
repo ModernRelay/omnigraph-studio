@@ -513,6 +513,8 @@ impl SettingsView {
             return;
         };
         let removing = key.trim().is_empty();
+        // A test under way was of the key before: its answer would read as this one's.
+        self.key_test = None;
         let written = models.update(cx, |models, cx| models.set_key(key, cx));
         cx.spawn(async move |this, cx| {
             let result = written.await;
@@ -1304,6 +1306,34 @@ mod tests {
         // value they hold.
         cx.run_until_parked();
         assert_eq!(text(cx), "/usr/local/bin/omnigraph");
+    }
+
+    /// A key stored while a test of the key before is out drops that test: its answer, about
+    /// the key before, would read as this one's. Before, a slow "Not connected" landed after
+    /// "Stored in the keychain." and read as the new key's.
+    #[gpui::test]
+    fn storing_a_key_drops_the_test_of_the_one_before(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+            studio_settings::init_test(cx);
+        });
+        // A model service that never answers: the test stays out.
+        let http = http_client::FakeHttpClient::create(|_| std::future::pending());
+        cx.update(|cx| Models::init_for_tests(http, Some("old-key"), cx));
+        let (view, cx): (_, &mut VisualTestContext) = cx.add_window_view(|window, cx| {
+            SettingsView::new(Some(("k".into(), "Graph".into())), window, cx)
+        });
+        view.update(cx, |view, cx| {
+            view.test_key(cx);
+            assert!(view.key_test.is_some(), "testing the old key");
+            view.put_key("new-key".into(), cx);
+            assert!(view.key_test.is_none(), "its test dropped");
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.key_notice.as_deref(), Some("Stored in the keychain."));
+        });
     }
 
     /// The system's fonts are listed off the main thread when a tab opens, once for every tab;

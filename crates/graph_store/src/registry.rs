@@ -44,6 +44,15 @@ type Lister = Arc<
     dyn Fn(Option<PathBuf>, Vec<PathBuf>, Platform) -> BoxFuture<'static, CliTargets> + Send + Sync,
 >;
 
+/// Adds a server as a CLI target with the first CLI Studio can drive of the places given
+/// ([`cli_tokens::add_server_target`]): its name, its address and the token typed for it; run
+/// off the main thread.
+type Adder = Arc<
+    dyn Fn(Vec<PathBuf>, String, String, Option<Token>) -> BoxFuture<'static, Result<(), String>>
+        + Send
+        + Sync,
+>;
+
 /// The graph ids opened on each CLI target, by the target's name, which Studio remembers so the
 /// Open dialog offers them again when a token may not list the server's graphs. It names no
 /// server: the CLI's targets are the only ones.
@@ -79,6 +88,7 @@ pub struct ConnectionRegistry {
     transport_clients: Vec<(CliTransport, Arc<dyn HttpClient>)>,
     token_sources: TokenSources,
     lister: Lister,
+    adder: Adder,
     /// Whether the CLI gives Studio a token here: the system Studio runs on, but in a test. Where
     /// it gives none (Windows), a target that takes a token is refused as it is listed, and Add
     /// server takes no token.
@@ -262,6 +272,15 @@ fn list_with_the_cli(
     async move { cli_config::read_targets(dir.as_deref(), &places, platform).await }.boxed()
 }
 
+fn add_with_the_cli(
+    places: Vec<PathBuf>,
+    name: String,
+    url: String,
+    token: Option<Token>,
+) -> BoxFuture<'static, Result<(), String>> {
+    async move { cli_tokens::add_server_target(&places, &name, &url, token).await }.boxed()
+}
+
 impl ConnectionRegistry {
     pub fn global(cx: &App) -> Entity<Self> {
         cx.global::<GlobalRegistry>().0.clone()
@@ -425,6 +444,7 @@ impl ConnectionRegistry {
             transport_clients: Vec::new(),
             token_sources: Arc::new(|_| None),
             lister: Arc::new(list_with_the_cli),
+            adder: Arc::new(add_with_the_cli),
             platform: Platform::CURRENT,
             operator_dir,
             watched: Vec::new(),
@@ -889,32 +909,45 @@ impl ConnectionRegistry {
         let dir = self.operator_dir.clone();
         let places = self.cli_places.clone();
         let lister = self.lister.clone();
+        let adder = self.adder.clone();
         let prepare = self.transport_preparer();
+        // The add runs to its end whatever happens to whoever asked (the Open dialog closed
+        // while it ran): dropped, it would stop the CLI between `target add` and `credentials
+        // set`, leaving a target with no token, and nothing would remove it again.
+        let (answer, answered) = oneshot::channel();
         cx.spawn(async move |this, cx| {
             let (added, targets, prepared) = {
                 let (name, url) = (name.clone(), url.clone());
                 cx.background_executor()
                     .spawn(async move {
-                        let added =
-                            cli_tokens::add_server_target(&places, &name, &url, token).await;
+                        let added = adder(places.clone(), name, url, token).await;
                         let targets = lister(dir, places, platform).await;
                         let prepared = prepare(&targets);
                         (added, targets, prepared)
                     })
                     .await
             };
-            this.update(cx, |this, cx| {
-                this.keep_stamp(&targets);
-                if this.apply_cli_targets(targets, prepared, cx) {
-                    this.save(cx);
-                    cx.notify();
-                }
-                added?;
-                this.find(&name, cx).ok_or_else(|| {
-                    format!("The CLI added the target '{name}', but does not list it")
+            let found = this
+                .update(cx, |this, cx| {
+                    this.keep_stamp(&targets);
+                    if this.apply_cli_targets(targets, prepared, cx) {
+                        this.save(cx);
+                        cx.notify();
+                    }
+                    added?;
+                    this.find(&name, cx).ok_or_else(|| {
+                        format!("The CLI added the target '{name}', but does not list it")
+                    })
                 })
-            })
-            .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())
+                .and_then(|found| found);
+            answer.send(found).ok();
+        })
+        .detach();
+        cx.spawn(async move |_, _| {
+            answered
+                .await
+                .unwrap_or_else(|_| Err("Studio stopped before the CLI answered".to_owned()))
         })
     }
 
@@ -1842,6 +1875,55 @@ mod tests {
         // Listed already: what asks now goes on at once.
         let again = registry.update(cx, |registry, _| registry.when_listed());
         assert_eq!(again.now_or_never(), Some(()));
+    }
+
+    /// An add whose asker let go of it (the Open dialog closed while it ran) runs to its end:
+    /// the CLI's add finishes, the targets are listed again, and the new one is a server.
+    /// Before, dropping it stopped the CLI between adding the target and storing its token.
+    #[gpui::test]
+    async fn an_add_let_go_of_runs_to_its_end(cx: &mut TestAppContext) {
+        let (http, _) = answering();
+        let listing = HeldListing::default();
+        let answer = listing.next();
+        // The CLI's add, out until the test lets it end.
+        let (finish, finished) = oneshot::channel::<()>();
+        let finished = Arc::new(Mutex::new(Some(finished)));
+        let ended = Arc::new(AtomicBool::new(false));
+        let registry = cx.new(|_| {
+            let mut registry = ConnectionRegistry::empty(http, None);
+            registry.lister = listing.lister();
+            let (finished, ended) = (finished.clone(), ended.clone());
+            registry.adder = Arc::new(move |_, _, _, _| {
+                let (finished, ended) = (finished.lock().unwrap().take(), ended.clone());
+                async move {
+                    if let Some(finished) = finished {
+                        finished.await.ok();
+                    }
+                    ended.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+                .boxed()
+            });
+            registry
+        });
+        let adding = registry.update(cx, |registry, cx| {
+            registry.add_target("new".into(), "https://new.test".into(), None, cx)
+        });
+        cx.run_until_parked();
+        drop(adding);
+        finish.send(()).unwrap();
+        answer
+            .send(files(vec![server("new", "https://new.test", "1")]))
+            .ok();
+        cx.run_until_parked();
+        assert!(ended.load(Ordering::SeqCst), "the CLI's add ran to its end");
+        assert_eq!(listing.asked(), 1);
+        registry.read_with(cx, |registry, cx| {
+            assert!(
+                registry.find("new", cx).is_some(),
+                "listed again after the add"
+            );
+        });
     }
 
     /// A listing that names a token file for the first time keeps the stamp it took of it: the

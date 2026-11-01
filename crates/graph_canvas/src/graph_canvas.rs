@@ -760,6 +760,13 @@ impl GraphCanvas {
         if !self.layout_owed {
             return;
         }
+        // A layout under way is let finish and shown, and what the walk changed meanwhile is
+        // laid out after it, from where it put the chips. Thrown away at each change, as it
+        // was, a walk that changed faster than a layout ran (Expand all, pages landing near the
+        // cap) showed none until the changes stopped.
+        if self.layout_task.is_some() {
+            return;
+        }
         let settled = self.draws_exploration()
             && self.layout_task.is_none()
             && self.next_layout.is_none()
@@ -806,8 +813,10 @@ impl GraphCanvas {
         let root = self.exploration.read(cx).root().cloned();
         let key = (Mode::Explore, root);
         if self.layout_key.as_ref() != Some(&key) {
+            // Another root: the chips' places and the hubs widened are the old walk's.
             if self.known_root != key.1 {
                 self.known.clear();
+                self.hub_limits.clear();
                 self.known_root = key.1.clone();
             }
             self.fit_pending = true;
@@ -912,6 +921,9 @@ impl GraphCanvas {
                 }
                 if let Some(next) = this.next_layout.take() {
                     this.start_layout(next, cx);
+                } else if this.layout_owed {
+                    // Drawn again, the canvas lays out what the walk changed meanwhile.
+                    cx.notify();
                 }
             })
             .ok();
@@ -2145,6 +2157,7 @@ impl GraphCanvas {
     fn reset_layout(&mut self, _: &ResetLayout, _window: &mut Window, cx: &mut Context<Self>) {
         self.pinned.clear();
         self.known.clear();
+        self.hub_limits.clear();
         self.fit_pending = true;
         cx.emit(ItemEvent::UpdateTab);
         self.rebuild(cx);
@@ -2710,6 +2723,14 @@ impl Render for GraphCanvas {
             Loadable::Loaded(_) if self.scene.nodes.is_empty() => Some(
                 match self.mode() {
                     Mode::Explore => studio_ui::ds::loading_state("Laying out…"),
+                    Mode::Results
+                        if self
+                            .results
+                            .as_ref()
+                            .is_some_and(|(_, results)| !results.nodes.is_empty()) =>
+                    {
+                        studio_ui::ds::loading_state("Laying out…")
+                    }
                     Mode::Results => {
                         studio_ui::ds::empty_state(IconName::Hash, "No nodes in the result")
                     }
@@ -3216,15 +3237,42 @@ mod tests {
             "the same scene is not laid out again"
         );
 
+        // A hub widened under the old root is not, under the new one.
+        let widened = canvas.read_with(cx, |canvas, cx| {
+            let root = NodeRef::new("Person", "p1");
+            let group = canvas
+                .session
+                .read(cx)
+                .schema_model()
+                .unwrap()
+                .relationships_of("Person")[0]
+                .clone();
+            GroupKey::new(root, group)
+        });
+        canvas.update(cx, |canvas, _| canvas.hub_limits.insert(widened, 48));
         exploration.update(cx, |exploration, cx| {
             exploration.root_at(NodeRef::new("Person", "p2"), cx)
         });
-        canvas.update(cx, |canvas, cx| canvas.lay_out_owed(cx));
+        let running = canvas.update(cx, |canvas, cx| {
+            canvas.lay_out_owed(cx);
+            assert!(canvas.layout_task.is_some(), "under way");
+            // A change while it runs leaves it to finish and be shown, and is owed after it.
+            canvas.owe_layout(cx);
+            canvas.lay_out_owed(cx);
+            assert!(canvas.layout_owed);
+            canvas.layout_generation
+        });
+        assert!(running > laid_out, "another scene is");
         cx.run_until_parked();
-        assert!(
-            canvas.read_with(cx, |canvas, _| canvas.layout_generation) > laid_out,
-            "another scene is"
-        );
+        canvas.read_with(cx, |canvas, _| {
+            assert_eq!(
+                canvas.layout_generation, running,
+                "the layout under way was kept"
+            );
+            assert!(canvas.hub_limits.is_empty(), "the old root's hubs");
+            assert!(canvas.layout_task.is_none());
+            assert!(!canvas.scene.nodes.is_empty(), "and shown");
+        });
     }
 
     /// A canvas starts from where the person placed things on the graph's old canvas, as its own

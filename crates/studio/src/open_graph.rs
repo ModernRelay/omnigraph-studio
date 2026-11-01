@@ -196,10 +196,24 @@ impl OpenGraphModal {
                 self.followed.push((id, subscription, watch));
             }
         }
-        if self
-            .selected
-            .as_ref()
-            .is_some_and(|selected| !connections.contains(selected))
+        // Opened before the CLI's targets were listed, it showed the form to add a server for
+        // want of one: the first listed is chosen once they land, as it would have been, unless
+        // a server is being added or the form was typed in.
+        let first_listed = self.selected.is_none()
+            && self.connections.is_empty()
+            && !connections.is_empty()
+            && self._adding.is_none()
+            && [&self.new_name, &self.new_url, &self.new_token]
+                .iter()
+                .all(|editor| editor.read(cx).text(cx).is_empty());
+        if first_listed {
+            self.adding = false;
+        }
+        if first_listed
+            || self
+                .selected
+                .as_ref()
+                .is_some_and(|selected| !connections.contains(selected))
         {
             self.choose(first_choice(&connections, cx), window, cx);
             if let Some(connection) = &self.selected {
@@ -444,14 +458,15 @@ impl OpenGraphModal {
             return;
         }
         let graph_id = graph_id.trim().to_owned();
-        // A graph id typed in is kept with its server, for a token that cannot list graphs. One
-        // the server lists needs no keeping, and kept would be offered after its deletion.
-        let listed = match &connection.read(cx).graphs {
-            GraphListing::Listed(graphs) => graphs.iter().any(|g| g.graph_id == graph_id),
-            GraphListing::Discovered(ids) => ids.contains(&graph_id),
-            _ => false,
-        };
-        if !listed {
+        // A graph id typed in is kept with its server, for a token that cannot list graphs. Where
+        // the server says which graphs the token reaches, none is kept: one it lists needs no
+        // keeping, and kept would be offered after its deletion; one it does not is a mistyped
+        // id, offered for good.
+        let says_which = matches!(
+            connection.read(cx).graphs,
+            GraphListing::Listed(_) | GraphListing::Discovered(_)
+        );
+        if !says_which {
             connection.update(cx, |connection, _| connection.remember_graph(&graph_id));
             if let Some(registry) = ConnectionRegistry::try_global(cx) {
                 registry.update(cx, |registry, cx| registry.save(cx));
@@ -1868,6 +1883,62 @@ mod tests {
         replacement.update(cx, |connection, cx| connection.connect(cx));
         cx.run_until_parked();
         assert_eq!(drawn.get(), before + 1, "its replacement is");
+    }
+
+    /// Opened before the CLI's targets were listed, the dialog shows the form to add a server;
+    /// when they land, the first is chosen, as it would have been, unless the form was typed in.
+    #[gpui::test]
+    fn the_first_server_listed_after_the_dialog_opened_is_chosen(cx: &mut TestAppContext) {
+        let alpha = server(&["one"], cx);
+        let (modal, cx) = dialog(Vec::new(), cx);
+        modal.read_with(cx, |modal, _| assert!(modal.adding));
+        modal.update_in(cx, |modal, window, cx| {
+            modal.follow(vec![alpha.clone()], window, cx)
+        });
+        modal.read_with(cx, |modal, _| {
+            assert_eq!(modal.selected, Some(alpha.clone()));
+            assert!(!modal.adding);
+        });
+
+        let beta = server(&["two"], cx);
+        let (modal, cx) = dialog(Vec::new(), cx);
+        modal.update_in(cx, |modal, window, cx| {
+            modal.new_url.update(cx, |editor, cx| {
+                editor.set_text("https://typed.test", window, cx)
+            });
+            modal.follow(vec![beta.clone()], window, cx)
+        });
+        modal.read_with(cx, |modal, _| {
+            assert_eq!(modal.selected, None, "what was typed stays");
+            assert!(modal.adding);
+        });
+    }
+
+    /// A graph id typed in is remembered only where the server does not say which graphs the
+    /// token reaches: one it does not list is a mistyped id, which would be offered for good.
+    #[gpui::test]
+    fn a_graph_id_is_remembered_only_where_the_server_lists_none(cx: &mut TestAppContext) {
+        for (graphs, remembered) in [
+            (GraphListing::Discovered(vec!["knowledge".into()]), false),
+            (GraphListing::NotAllowed, true),
+        ] {
+            let connection = server(&[], cx);
+            connection.update(cx, |connection, _| connection.graphs = graphs.clone());
+            let (modal, cx) = dialog(vec![connection.clone()], cx);
+            modal.update_in(cx, |modal, window, cx| {
+                modal.open("knowlege".into(), window, cx)
+            });
+            connection.read_with(cx, |connection, _| {
+                assert_eq!(
+                    connection
+                        .server
+                        .known_graphs
+                        .contains(&"knowlege".to_owned()),
+                    remembered,
+                    "{graphs:?}"
+                );
+            });
+        }
     }
 
     /// Which of Add server's fields has the keyboard.
