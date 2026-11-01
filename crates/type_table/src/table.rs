@@ -1049,12 +1049,33 @@ impl TypeTable {
         };
         self.missing = false;
         let names: HashSet<&str> = columns.iter().map(|c| c.key.as_str()).collect();
-        // A filter stays while its column, or its relationship, is still in the schema.
-        self.filters
-            .retain(|f| match builder::parse_relationship_key(&f.property) {
-                Some((_, edge)) => schema.edge(edge).is_some(),
-                None => f.property == builder::ID_FILTER || names.contains(f.property.as_str()),
-            });
+        // A filter stays while what it tests is still in the schema: its column, its
+        // relationship, or the neighbours' property it reaches through one. A condition stays
+        // whatever it names: the next read judges it against this schema, and says why it
+        // cannot run.
+        let type_name = self.type_name.clone();
+        self.filters.retain(|f| {
+            if f.op == FilterOp::Expr || f.property == builder::ID_FILTER {
+                return true;
+            }
+            match builder::parse_group_key(&f.property) {
+                builder::GroupKey::Relationship(_, edge) => schema.edge(edge).is_some(),
+                builder::GroupKey::NeighbourProperty {
+                    direction,
+                    edge,
+                    property,
+                } => schema.relationships_of(&type_name).iter().any(|group| {
+                    group.direction == direction
+                        && group.edge == edge
+                        && schema
+                            .node(&group.other_type)
+                            .is_some_and(|other| other.property(property).is_some())
+                }),
+                builder::GroupKey::Property(_) | builder::GroupKey::EndpointProperty { .. } => {
+                    names.contains(f.property.as_str())
+                }
+            }
+        });
         self.all_columns = columns;
         self.show_columns(cx);
         self.schema = Some(schema);
@@ -10180,15 +10201,19 @@ mod tests {
     }
 
     /// Another writer's schema change, seen at a head move, leaves the table as it was read and
-    /// offers Refresh; Refresh reads it under the new schema (constitution II).
+    /// offers Refresh; Refresh reads it under the new schema (constitution II), keeping every
+    /// filter the new schema still has what to test for, and every condition. Before, a filter
+    /// on a neighbour's property and a condition were dropped there, their keys being neither a
+    /// column nor a relationship.
     #[gpui::test]
     async fn a_schema_changed_elsewhere_waits_for_refresh(cx: &mut TestAppContext) {
         cx.update(|cx| {
             studio_theme::init_test(cx);
             editor::init(cx);
         });
+        let base = format!("{PEOPLE}edge Knows: Person -> Person @card(0..)\n");
         let (session, writer) = session_followed(
-            PEOPLE,
+            &base,
             |request| {
                 if request["name"] == "studio_head" {
                     return serde_json::json!([]);
@@ -10211,7 +10236,32 @@ mod tests {
             )
         });
         cx.run_until_parked();
-        let grown = format!("{PEOPLE}node Note {{\n  slug: String @key\n}}\n");
+        // A filter on a column, on a relationship, and on a neighbour's property: each stays
+        // under a schema that still has what it tests.
+        let filters = vec![
+            Filter {
+                property: "name".into(),
+                op: FilterOp::Contains,
+                value: serde_json::json!("a"),
+            },
+            Filter {
+                property: "out:Knows".into(),
+                op: FilterOp::HasAny,
+                value: Value::Null,
+            },
+            Filter {
+                property: "out:Knows.name".into(),
+                op: FilterOp::Contains,
+                value: serde_json::json!("Ada"),
+            },
+            Filter {
+                property: builder::WHERE_FILTER.into(),
+                op: FilterOp::Expr,
+                value: serde_json::json!("$n.name = \"Ada\""),
+            },
+        ];
+        table.update(cx, |table, _| table.filters = filters.clone());
+        let grown = format!("{base}node Note {{\n  slug: String @key\n}}\n");
         writer.set_schema(&grown);
         writer.commit("c2", vec![changed("node", "Note", "n1", None)]);
         session.update(cx, |session, cx| session.check_heads(cx));
@@ -10224,7 +10274,7 @@ mod tests {
                 Some("c1"),
                 "and their commit"
             );
-            assert_eq!(&*table.schema.as_ref().unwrap().source, PEOPLE);
+            assert_eq!(&*table.schema.as_ref().unwrap().source, base.as_str());
         });
 
         table.update_in(cx, |table, window, cx| table.refresh(window, cx));
@@ -10233,6 +10283,22 @@ mod tests {
             assert!(!table.newer);
             assert_eq!(&*table.schema.as_ref().unwrap().source, grown.as_str());
             assert_eq!(table.rows.len(), 2);
+            assert_eq!(table.filters, filters, "every filter still holds");
+        });
+
+        // A schema without the name: the filters on it, the table's and the neighbours', go;
+        // the relationship's and the condition stay.
+        let unnamed = "node Person {\n  slug: String @key\n}\n\
+                       edge Knows: Person -> Person @card(0..)\n";
+        writer.set_schema(unnamed);
+        writer.commit("c3", vec![changed("node", "Person", "p1", None)]);
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        table.update_in(cx, |table, window, cx| table.refresh(window, cx));
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(&*table.schema.as_ref().unwrap().source, unnamed);
+            assert_eq!(table.filters, [filters[1].clone(), filters[3].clone()]);
         });
     }
 
