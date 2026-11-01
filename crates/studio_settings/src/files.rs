@@ -80,19 +80,33 @@ pub fn run_in_turn(job: impl FnOnce() + Send + 'static) {
 }
 
 /// Waits until every write asked for so far is done: at quit, a few seconds at most, so the last
-/// state is on disk without holding the quit up. In a test build, as long as a loaded machine
-/// takes: every test in the process shares the one write thread, and a test that reads a file
-/// back after a capped wait could read it before its own write lands.
+/// state is on disk without holding the quit up. Every quit handler that writes waits, one
+/// after another, so the calls share one deadline, set by the first: a write that hangs holds
+/// the quit up once, not once per window. In a test build, each call as long as a loaded
+/// machine takes: every test in the process shares the one write thread, and a test that reads
+/// a file back after a capped wait could read it before its own write lands.
 pub fn writes_done() {
-    const WAIT: std::time::Duration = if cfg!(any(test, feature = "test-support")) {
+    static DEADLINE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let wait = if cfg!(any(test, feature = "test-support")) {
         std::time::Duration::from_secs(120)
     } else {
-        std::time::Duration::from_secs(5)
+        left_until(&DEADLINE, std::time::Duration::from_secs(5))
     };
-    let (done, wait) = std::sync::mpsc::channel();
+    let (done, finished) = std::sync::mpsc::channel();
     if writer().send(Job::Done(done)).is_ok() {
-        wait.recv_timeout(WAIT).ok();
+        finished.recv_timeout(wait).ok();
     }
+}
+
+/// The time left until `deadline`, which the first call sets `wait` from now.
+fn left_until(
+    deadline: &std::sync::OnceLock<std::time::Instant>,
+    wait: std::time::Duration,
+) -> std::time::Duration {
+    let now = std::time::Instant::now();
+    deadline
+        .get_or_init(|| now + wait)
+        .saturating_duration_since(now)
 }
 
 /// Replaces `path` with `contents` in one step. A link is written through to its target, so the
@@ -390,6 +404,19 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&after_it).unwrap(), "taken");
         assert_eq!(std::fs::read_to_string(&again).unwrap(), "{ again");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn waits_for_writes_share_the_first_ones_deadline() {
+        let deadline = std::sync::OnceLock::new();
+        let wait = std::time::Duration::from_millis(200);
+        assert!(left_until(&deadline, wait) <= wait);
+        std::thread::sleep(wait);
+        assert_eq!(
+            left_until(&deadline, wait),
+            std::time::Duration::ZERO,
+            "a later wait gets what is left of the first one's, not a wait of its own"
+        );
     }
 
     #[test]
