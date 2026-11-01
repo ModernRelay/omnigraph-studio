@@ -26,6 +26,7 @@ use studio_actions::tree::{
     PeekSelected, RerootHere, SelectNext, SelectPrevious, ShowOnCanvas, ToggleEmptyGroups,
 };
 use studio_actions::workspace::Refresh;
+use studio_actions::{ViewKind, ViewLink};
 use studio_ui::ds::space;
 use studio_ui::menu::ContextMenu;
 use studio_ui::type_swatch;
@@ -225,6 +226,35 @@ impl Item for RelationshipTree {
             type_name: self.root.type_name.clone(),
             id: self.root.id.clone(),
         })
+    }
+
+    fn views(&self, _cx: &App) -> Vec<ViewLink> {
+        vec![
+            ViewLink::to(ViewKind::Page),
+            ViewLink::current(ViewKind::Tree),
+            ViewLink::to(ViewKind::Canvas),
+        ]
+    }
+
+    fn view_action(&self, kind: ViewKind, _cx: &App) -> Option<Box<dyn gpui::Action>> {
+        let at_commit = self.at_commit.clone();
+        match kind {
+            ViewKind::Page => {
+                let node = self.selected_node().unwrap_or_else(|| self.root.clone());
+                Some(Box::new(studio_actions::graph::OpenNodePage {
+                    type_name: node.type_name,
+                    id: node.id,
+                    at_commit,
+                }))
+            }
+            ViewKind::Canvas => Some(Box::new(ShowNodeOnCanvas {
+                type_name: self.root.type_name.clone(),
+                id: self.root.id.clone(),
+                at_commit,
+                preview: true,
+            })),
+            _ => None,
+        }
     }
 
     fn is_stale(&self, cx: &App) -> bool {
@@ -677,6 +707,7 @@ impl RelationshipTree {
                 filter_id: Some(node.id.clone()),
                 via: None,
                 preview: false,
+                filters: None,
             },
             Some(EntryKind::Group { key, .. } | EntryKind::Bucket { key, .. }) => {
                 // Seen from the other type, the relationship runs the other way.
@@ -687,6 +718,7 @@ impl RelationshipTree {
                     filter_id: Some(key.node.id.clone()),
                     via: Some(gq_language::builder::relationship_key(&back)),
                     preview: false,
+                    filters: None,
                 }
             }
             _ => return,
@@ -1210,45 +1242,51 @@ impl RelationshipTree {
     /// The tab's toolbar: hide relationships with none, and close everything below the root.
     fn render_toolbar(&self, cx: &mut Context<Self>) -> gpui::Div {
         let hide_empty = self.hide_empty;
-        studio_ui::ds::toolbar(cx).child(div().flex_1()).child(
-            studio_ui::ds::toolbar_actions()
-                // The toggle shows only when it changes something: an empty group, or
-                // hiding on.
-                .when(hide_empty || self.any_empty, |row| {
-                    row.child(
-                        studio_ui::ds::row_icon_button(
-                            "toggle-empty-groups",
-                            if hide_empty {
-                                IconName::EyeOff
-                            } else {
-                                IconName::Eye
-                            },
-                        )
-                        .icon_color(Color::Muted)
-                        .toggle_state(hide_empty)
-                        .tooltip(move |_, cx| {
-                            Tooltip::for_action(
+        let strip = studio_workspace::view_strip(Item::views(self, cx), cx);
+        studio_ui::ds::toolbar(cx)
+            .children(strip)
+            .child(div().flex_1())
+            .child(
+                studio_ui::ds::toolbar_actions()
+                    // The toggle shows only when it changes something: an empty group, or
+                    // hiding on.
+                    .when(hide_empty || self.any_empty, |row| {
+                        row.child(
+                            studio_ui::ds::row_icon_button(
+                                "toggle-empty-groups",
                                 if hide_empty {
-                                    "Show relationships with none"
+                                    IconName::EyeOff
                                 } else {
-                                    "Hide relationships with none"
+                                    IconName::Eye
                                 },
-                                &ToggleEmptyGroups,
-                                cx,
                             )
-                        })
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.toggle_empty_groups(&ToggleEmptyGroups, window, cx)
-                        })),
-                    )
-                })
-                .child(
-                    studio_ui::ds::row_icon_button("collapse-to-root", IconName::ListCollapse)
-                        .icon_color(Color::Muted)
-                        .tooltip(Tooltip::text("Collapse all"))
-                        .on_click(cx.listener(|this, _, _, cx| this.collapse_to_root(cx))),
-                ),
-        )
+                            .icon_color(Color::Muted)
+                            .toggle_state(hide_empty)
+                            .tooltip(move |_, cx| {
+                                Tooltip::for_action(
+                                    if hide_empty {
+                                        "Show relationships with none"
+                                    } else {
+                                        "Hide relationships with none"
+                                    },
+                                    &ToggleEmptyGroups,
+                                    cx,
+                                )
+                            })
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.toggle_empty_groups(&ToggleEmptyGroups, window, cx)
+                                },
+                            )),
+                        )
+                    })
+                    .child(
+                        studio_ui::ds::row_icon_button("collapse-to-root", IconName::ListCollapse)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Collapse all"))
+                            .on_click(cx.listener(|this, _, _, cx| this.collapse_to_root(cx))),
+                    ),
+            )
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> Option<AnyElement> {

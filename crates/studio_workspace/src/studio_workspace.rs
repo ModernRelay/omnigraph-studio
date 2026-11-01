@@ -30,7 +30,11 @@ use graph_store::{
     AccessAction, AccessScope, ConnectionRegistry, ConnectionState, GraphSession, Loadable,
     OutcomeKind, SessionEvent,
 };
-use studio_actions::graph::{OpenCommit, OpenHistory};
+use studio_actions::graph::{
+    OpenAsCanvas, OpenAsMap, OpenAsPage, OpenAsSource, OpenAsTable, OpenAsTree, OpenCommit,
+    OpenHistory,
+};
+use studio_actions::workspace::OpenViewAt;
 use studio_actions::workspace::{
     ActivateItem, ActivateLastItem, ActivateNextGraph, ActivateNextItem, ActivateNextPane,
     ActivatePreviousGraph, ActivatePreviousItem, ActivatePreviousPane, CloseActiveItem,
@@ -38,6 +42,7 @@ use studio_actions::workspace::{
     SplitDown, SplitLeft, SplitRight, SplitUp, ToggleActivity, ToggleInspector, TogglePinTab,
     ToggleSidebar, ToggleZoom,
 };
+use studio_actions::{ViewKind, ViewLink};
 use studio_settings::{BottomDockLayout, StudioSettings};
 use studio_ui::ds::IconButton;
 use studio_ui::menu::{ContextMenu, ContextMenuEntry, ContextMenuItem};
@@ -341,6 +346,8 @@ pub struct Workspace {
     inspectors: HashMap<EntityId, AnyView>,
     /// The tab what follows the active tab last followed.
     followed_item: Option<EntityId>,
+    /// The next new tab goes in a pane to the right ([`Self::open_view`]).
+    open_beside: bool,
     _follow_subscription: Subscription,
     toasts: Vec<Toast>,
     next_toast: usize,
@@ -421,6 +428,42 @@ pub fn traffic_light_position(glass: bool) -> Point<Pixels> {
     };
     point(gap + px(12.), gap + px(TRAFFIC_LIGHTS_TOP))
 }
+/// A tab's view strip (spec 020): links to the other views of what it shows, the first thing in
+/// its toolbar. Nothing to choose between draws nothing. A view that cannot open stays, with why,
+/// so the strip does not shift.
+pub fn view_strip(views: Vec<ViewLink>, cx: &App) -> Option<AnyElement> {
+    if views.len() < 2 {
+        return None;
+    }
+    Some(
+        studio_ui::ds::segmented(cx)
+            .children(views.into_iter().enumerate().map(|(index, link)| {
+                let segment =
+                    studio_ui::ds::segment(("view", index), link.kind.label(), link.current, cx);
+                match link.disabled {
+                    Some(reason) => segment
+                        .opacity(studio_ui::ds::opacity::DIMMED)
+                        .cursor_default()
+                        .tooltip(Tooltip::text(reason))
+                        .into_any_element(),
+                    None if link.current => segment.into_any_element(),
+                    None => segment
+                        .on_click(move |event: &ClickEvent, window, cx| {
+                            window.dispatch_action(
+                                Box::new(OpenViewAt {
+                                    index,
+                                    beside: event.modifiers().alt,
+                                }),
+                                cx,
+                            )
+                        })
+                        .into_any_element(),
+                }
+            }))
+            .into_any_element(),
+    )
+}
+
 /// The inspector while the active tab has nothing selected.
 struct NothingSelected;
 
@@ -581,6 +624,7 @@ impl Workspace {
             dock_hosts: HashMap::new(),
             inspectors: HashMap::new(),
             followed_item: None,
+            open_beside: false,
             _follow_subscription: cx.observe_self(|this, cx| this.follow_active_item(cx)),
             toasts: Vec::new(),
             next_toast: 0,
@@ -622,6 +666,20 @@ impl Workspace {
             this.show_server_notices(&registry, cx);
         }
         this.watch_performance(cx);
+        this.register_view_action::<OpenAsTable>(ViewKind::Table);
+        this.register_view_action::<OpenAsPage>(ViewKind::Page);
+        this.register_view_action::<OpenAsTree>(ViewKind::Tree);
+        this.register_view_action::<OpenAsCanvas>(ViewKind::Canvas);
+        this.register_view_action::<OpenAsMap>(ViewKind::Map);
+        this.register_view_action::<OpenAsSource>(ViewKind::Source);
+        this.register_action(|workspace, action: &OpenViewAt, window, cx| {
+            let kind = workspace
+                .active_item()
+                .and_then(|item| item.views(cx).get(action.index).map(|link| link.kind));
+            if let Some(kind) = kind {
+                workspace.open_view(kind, action.beside, window, cx);
+            }
+        });
         this
     }
 
@@ -1569,6 +1627,15 @@ impl Workspace {
         );
         self._item_subscriptions
             .push((item.entity_id(), subscription));
+        if std::mem::take(&mut self.open_beside) {
+            let at = self.active_pane;
+            let new = self.next_pane;
+            if self.center.split(at, new, SplitDirection::Right) {
+                self.next_pane += 1;
+                self.panes.push(Pane::new(new));
+                self.active_pane = new;
+            }
+        }
         self.insert(Box::new(item.clone()), preview, window, cx);
         item
     }
@@ -1647,6 +1714,47 @@ impl Workspace {
         {
             pane.keep(active);
         }
+    }
+
+    /// Opens a view of what the active tab shows (spec 020). The tab it opens from stays, as a
+    /// filtered table in the preview slot must, and `beside` puts a new tab in a pane to the
+    /// right. A view already open is activated where it is.
+    pub fn open_view(
+        &mut self,
+        kind: ViewKind,
+        beside: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(action) = self.active_item().and_then(|item| {
+            let link = item.views(cx).into_iter().find(|link| link.kind == kind)?;
+            (!link.current && link.disabled.is_none())
+                .then(|| item.view_action(kind, cx))
+                .flatten()
+        }) else {
+            return;
+        };
+        self.keep_active_tab(cx);
+        self.open_beside = beside;
+        window.dispatch_action(action, cx);
+        // After the action, which the dispatch defers too: a tab it did not add takes no pane.
+        cx.defer_in(window, |this, _, _| this.open_beside = false);
+    }
+
+    /// Whether the active tab offers a view that can open now.
+    fn offers_view(&self, kind: ViewKind, cx: &App) -> bool {
+        self.active_item().is_some_and(|item| {
+            item.views(cx)
+                .iter()
+                .any(|link| link.kind == kind && !link.current && link.disabled.is_none())
+        })
+    }
+
+    fn register_view_action<A: Action>(&mut self, kind: ViewKind) {
+        self.register_action_when(
+            move |workspace, cx| workspace.offers_view(kind, cx),
+            move |workspace, _: &A, window, cx| workspace.open_view(kind, false, window, cx),
+        );
     }
 
     /// Activates a tab of the active pane.
@@ -6248,6 +6356,149 @@ mod tests {
             assert!(hosted(workspace, &next));
             workspace.set_inspector(None, cx);
             assert!(!hosted(workspace, &next), "and the removed one's");
+        });
+    }
+
+    gpui::actions!(view_test, [OpenTarget]);
+
+    /// A tab with a second view, which [`OpenTarget`] opens.
+    struct Viewed {
+        focus_handle: FocusHandle,
+        key: &'static str,
+        disabled: Option<&'static str>,
+    }
+
+    impl EventEmitter<ItemEvent> for Viewed {}
+
+    impl Focusable for Viewed {
+        fn focus_handle(&self, _: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    impl Render for Viewed {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().track_focus(&self.focus_handle)
+        }
+    }
+
+    impl Item for Viewed {
+        fn tab_title(&self, _: &App) -> SharedString {
+            "Viewed".into()
+        }
+
+        fn dedupe_key(&self, _: &App) -> Option<SharedString> {
+            Some(self.key.into())
+        }
+
+        fn views(&self, _: &App) -> Vec<ViewLink> {
+            vec![
+                ViewLink::current(ViewKind::Table),
+                match self.disabled {
+                    Some(reason) => ViewLink::disabled_because(ViewKind::Canvas, reason),
+                    None => ViewLink::to(ViewKind::Canvas),
+                },
+            ]
+        }
+
+        fn view_action(&self, kind: ViewKind, _: &App) -> Option<Box<dyn Action>> {
+            (kind == ViewKind::Canvas).then(|| Box::new(OpenTarget) as Box<dyn Action>)
+        }
+    }
+
+    fn views_workspace<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        disabled: Option<&'static str>,
+    ) -> (Entity<Workspace>, &'a mut gpui::VisualTestContext, EntityId) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            cx.set_global(StudioSettings::default());
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let source = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.register_action(|workspace, _: &OpenTarget, window, cx| {
+                workspace.open_item_with("target".to_owned(), true, window, cx, |_, cx| Viewed {
+                    focus_handle: cx.focus_handle(),
+                    key: "target",
+                    disabled: None,
+                });
+            });
+            workspace
+                .open_item_with("viewed".to_owned(), true, window, cx, |_, cx| Viewed {
+                    focus_handle: cx.focus_handle(),
+                    key: "viewed",
+                    disabled,
+                })
+                .expect("opened")
+                .entity_id()
+        });
+        cx.run_until_parked();
+        (workspace, cx, source)
+    }
+
+    /// A view opens from a preview tab without taking its place, and Back returns to it; a view
+    /// that is open is activated where it is (spec 020).
+    #[gpui::test]
+    fn opening_a_view_keeps_its_source(cx: &mut gpui::TestAppContext) {
+        let (workspace, cx, source) = views_workspace(cx, None);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_view(ViewKind::Canvas, false, window, cx);
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            let pane = workspace.pane(workspace.active_pane).expect("the pane");
+            assert_eq!(pane.items.len(), 2, "the source stayed");
+            assert_eq!(workspace.center.panes().len(), 1);
+            assert_eq!(pane.items[0].item_id(), source);
+            let active = workspace.active_pane;
+            workspace.navigate(active, true, window, cx);
+            assert_eq!(
+                workspace.active_item().map(|item| item.item_id()),
+                Some(source),
+                "Back returns to it"
+            );
+        });
+    }
+
+    /// Beside opens a new pane to the right, with the source still on screen.
+    #[gpui::test]
+    fn a_view_opens_beside_its_source(cx: &mut gpui::TestAppContext) {
+        let (workspace, cx, source) = views_workspace(cx, None);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_view(ViewKind::Canvas, true, window, cx);
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert_eq!(workspace.center.panes().len(), 2);
+            let active = workspace.pane(workspace.active_pane).expect("the pane");
+            assert_eq!(active.items.len(), 1);
+            assert_ne!(active.items[0].item_id(), source);
+            assert!(!workspace.open_beside, "only that opening");
+            // Reused where it is: asking again adds no pane.
+            let first = workspace.center.panes()[0];
+            let index = workspace.pane(first).expect("the first").position(source);
+            workspace.activate_in(first, index.expect("the source"), true, window, cx);
+            workspace.open_view(ViewKind::Canvas, true, window, cx);
+        });
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, _| {
+            assert_eq!(workspace.center.panes().len(), 2, "no third pane");
+        });
+    }
+
+    /// A view that cannot open stays in the strip with why, and asking for it does nothing.
+    #[gpui::test]
+    fn a_disabled_view_does_not_open(cx: &mut gpui::TestAppContext) {
+        let (workspace, cx, _) = views_workspace(cx, Some("No rows to draw"));
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(!workspace.offers_view(ViewKind::Canvas, cx));
+            workspace.open_view(ViewKind::Canvas, false, window, cx);
+        });
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, _| {
+            let pane = workspace.pane(workspace.active_pane).expect("the pane");
+            assert_eq!(pane.items.len(), 1);
+            assert!(pane.is_preview(0), "and the source stays a preview");
         });
     }
 

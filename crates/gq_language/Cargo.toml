@@ -11,6 +11,7 @@ path = "src/gq_language.rs"
 [dependencies]
 chrono = { workspace = true }
 omnigraph-compiler = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 
 [lints]

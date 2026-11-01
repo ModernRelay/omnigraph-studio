@@ -8,6 +8,8 @@ use editor::scroll::Autoscroll;
 use editor::{Editor, MultiBufferOffset, SelectionEffects};
 use gpui::{App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, SharedString};
 use graph_store::{GraphSession, Loadable, SessionEvent};
+use studio_actions::graph::OpenMap;
+use studio_actions::{ViewKind, ViewLink};
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 use ui::{TintColor, Tooltip};
@@ -52,6 +54,18 @@ impl Item for SchemaView {
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
         Some(SCHEMA_KEY.into())
+    }
+
+    fn views(&self, _cx: &App) -> Vec<ViewLink> {
+        vec![
+            ViewLink::to(ViewKind::Map),
+            ViewLink::current(ViewKind::Source),
+        ]
+    }
+
+    fn view_action(&self, kind: ViewKind, _cx: &App) -> Option<Box<dyn gpui::Action>> {
+        (kind == ViewKind::Map)
+            .then(|| Box::new(OpenMap { preview: true }) as Box<dyn gpui::Action>)
     }
 
     fn is_stale(&self, _cx: &App) -> bool {
@@ -187,7 +201,10 @@ impl Render for SchemaView {
         }
         v_flex()
             .size_full()
-            .pt(px(studio_ui::ds::space::XS))
+            .child(
+                studio_ui::ds::toolbar(cx)
+                    .children(studio_workspace::view_strip(Item::views(self, cx), cx)),
+            )
             .when(self.newer, |d| {
                 d.child(
                     h_flex()

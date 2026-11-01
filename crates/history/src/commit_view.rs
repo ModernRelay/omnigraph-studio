@@ -673,6 +673,7 @@ impl CommitView {
                                         filter_id: None,
                                         via: None,
                                         preview: false,
+                                        filters: None,
                                     }),
                                 );
                             }

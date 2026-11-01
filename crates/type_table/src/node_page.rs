@@ -7,6 +7,7 @@ use gpui::{
 };
 use graph_store::GraphSession;
 use serde_json::json;
+use studio_actions::{ViewKind, ViewLink};
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 
@@ -95,6 +96,37 @@ impl Item for NodePage {
         self.title(cx).into()
     }
 
+    fn views(&self, _cx: &App) -> Vec<ViewLink> {
+        vec![
+            ViewLink::current(ViewKind::Page),
+            ViewLink::to(ViewKind::Tree),
+            ViewLink::to(ViewKind::Canvas),
+        ]
+    }
+
+    fn view_action(&self, kind: ViewKind, _cx: &App) -> Option<Box<dyn gpui::Action>> {
+        let (type_name, id, at_commit) = (
+            self.type_name.clone(),
+            self.id.clone(),
+            self.at_commit.clone(),
+        );
+        match kind {
+            ViewKind::Tree => Some(Box::new(studio_actions::graph::ShowNodeInTree {
+                type_name,
+                id,
+                at_commit,
+                preview: true,
+            })),
+            ViewKind::Canvas => Some(Box::new(studio_actions::graph::ShowNodeOnCanvas {
+                type_name,
+                id,
+                at_commit,
+                preview: true,
+            })),
+            _ => None,
+        }
+    }
+
     fn thing(&self, _cx: &App) -> Option<studio_actions::Thing> {
         Some(studio_actions::Thing::Node {
             type_name: self.type_name.clone(),
@@ -134,12 +166,16 @@ impl Item for NodePage {
 
 impl Render for NodePage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        v_flex()
             .id("node-page")
             .key_context("NodePage")
             .size_full()
             .bg(studio_ui::ds::surface::document(cx))
+            .child(
+                studio_ui::ds::toolbar(cx)
+                    .children(studio_workspace::view_strip(Item::views(self, cx), cx)),
+            )
             // The page scrolls as a list of its own, drawing only what is in view.
-            .child(self.view.clone())
+            .child(div().flex_1().min_h_0().child(self.view.clone()))
     }
 }

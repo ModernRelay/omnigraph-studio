@@ -4692,6 +4692,7 @@ impl NodePeek {
                             filter_id: None,
                             via: None,
                             preview: false,
+                            filters: None,
                         }),
                         cx,
                     );

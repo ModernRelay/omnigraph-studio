@@ -29,6 +29,12 @@
   {
     "context": "Workspace",
     "bindings": {
+      "ctrl-alt-1": ["studio::OpenViewAt", { "index": 0 }],
+      "ctrl-alt-shift-1": ["studio::OpenViewAt", { "index": 0, "beside": true }],
+      "ctrl-alt-2": ["studio::OpenViewAt", { "index": 1 }],
+      "ctrl-alt-shift-2": ["studio::OpenViewAt", { "index": 1, "beside": true }],
+      "ctrl-alt-3": ["studio::OpenViewAt", { "index": 2 }],
+      "ctrl-alt-shift-3": ["studio::OpenViewAt", { "index": 2, "beside": true }],
       "shift-escape": "studio::ToggleZoom",
       "ctrl-w": "studio::CloseActiveItem",
       "ctrl-tab": "studio::ActivateNextItem",

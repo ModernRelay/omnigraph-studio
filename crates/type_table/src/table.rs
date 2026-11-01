@@ -37,6 +37,7 @@ use studio_actions::table::{
     OpenRowPage, PeekRow, RefreshTable, SaveDrafts, SelectNextSuggestion, SelectPreviousSuggestion,
     StageEdit,
 };
+use studio_actions::{ViewKind, ViewLink};
 use studio_ui::ds::Button;
 use studio_ui::ds::space;
 use studio_ui::menu::{ContextMenu, ContextMenuEntry};
@@ -649,6 +650,42 @@ impl Focusable for TypeTable {
 impl Item for TypeTable {
     fn thing(&self, _cx: &App) -> Option<studio_actions::Thing> {
         Some(studio_actions::Thing::Type(self.type_name.clone()))
+    }
+
+    /// An edge table has one view; a node table's other views take its rows (spec 020).
+    fn views(&self, _cx: &App) -> Vec<ViewLink> {
+        if self.kind != TableKind::Node {
+            return Vec::new();
+        }
+        vec![
+            ViewLink::current(ViewKind::Table),
+            if self.cursor.is_some() {
+                ViewLink::to(ViewKind::Tree)
+            } else {
+                ViewLink::disabled_because(ViewKind::Tree, "Select a row to see its relationships")
+            },
+            if self.rows.is_empty() {
+                ViewLink::disabled_because(ViewKind::Canvas, "No rows to draw")
+            } else {
+                ViewLink::to(ViewKind::Canvas)
+            },
+        ]
+    }
+
+    fn view_action(&self, kind: ViewKind, cx: &App) -> Option<Box<dyn gpui::Action>> {
+        match kind {
+            ViewKind::Tree => {
+                let row = self.rows.get(self.cursor?.row)?;
+                Some(Box::new(studio_actions::graph::ShowNodeInTree {
+                    type_name: self.type_name.clone(),
+                    id: row.id.clone(),
+                    at_commit: self.at_commit.clone(),
+                    preview: true,
+                }))
+            }
+            ViewKind::Canvas => Some(self.canvas_action(cx)),
+            _ => None,
+        }
     }
 
     /// The grid is drawn cached on its own (`TableGrid`).
@@ -4783,6 +4820,7 @@ impl TypeTable {
                     filter_id: Some(id),
                     via: Some(builder::relationship_key(&back)),
                     preview: false,
+                    filters: None,
                 }),
                 cx,
             );
@@ -6483,6 +6521,72 @@ impl TypeTable {
     }
 
     /// G: the row's node on the explorer, rooted there (spec 006: from a table into the graph).
+    /// What Canvas opens from this table (spec 020): one selected row's walk; else several
+    /// selected rows, or with none selected the rows loaded under the filters, drawn as a set.
+    fn canvas_action(&self, cx: &App) -> Box<dyn gpui::Action> {
+        if let [id] = self.selection.iter().collect::<Vec<_>>().as_slice() {
+            return Box::new(studio_actions::graph::ShowNodeOnCanvas {
+                type_name: self.type_name.clone(),
+                id: (*id).clone(),
+                at_commit: self.at_commit.clone(),
+                preview: true,
+            });
+        }
+        let picked = !self.selection.is_empty();
+        let label = self.session.read(cx).schema_model().and_then(|schema| {
+            schema
+                .node(&self.type_name)
+                .and_then(|node| node.label_property().map(str::to_owned))
+        });
+        let nodes: Vec<studio_actions::graph::ResultNode> = self
+            .rows
+            .iter()
+            .filter(|row| !picked || self.selection.contains(&row.id))
+            .map(|row| studio_actions::graph::ResultNode {
+                type_name: self.type_name.clone(),
+                id: row.id.clone(),
+                label: label
+                    .as_deref()
+                    .and_then(|property| row.values.get(property))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
+            .collect();
+        let summary = if picked {
+            studio_ui::plural(nodes.len(), "selected row", "selected rows")
+        } else {
+            self.filters
+                .iter()
+                .map(|filter| {
+                    let (property, op, value) = filter_parts(filter);
+                    value.unwrap_or_else(|| format!("{property} {op}"))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let named = if summary.is_empty() {
+            self.type_name.clone()
+        } else {
+            format!("{}, {summary}", self.type_name)
+        };
+        let total = match &self.count {
+            Loadable::Loaded(count) if !picked => Some((*count).max(0) as u64),
+            _ => None,
+        };
+        Box::new(studio_actions::graph::ShowResultsOnCanvas {
+            title: format!("Canvas: {named}"),
+            nodes,
+            links: Vec::new(),
+            source: Some(studio_actions::graph::CapturedFrom {
+                type_name: self.type_name.clone(),
+                at_commit: self.at_commit.clone(),
+                filters: serde_json::to_value(&self.filters).ok(),
+                summary: named,
+                total,
+            }),
+        })
+    }
+
     fn on_explore(&mut self, _: &ExploreRow, window: &mut Window, cx: &mut Context<Self>) {
         if self.kind != TableKind::Node {
             return;
@@ -7391,6 +7495,7 @@ impl TypeTable {
             format!("Edits, inserts and deletes here commit to {}", self.branch)
         };
         studio_ui::ds::toolbar(cx)
+            .children(studio_workspace::view_strip(Item::views(self, cx), cx))
             .child(studio_ui::kind_swatch(
                 &self.type_name,
                 self.kind == TableKind::Edge,

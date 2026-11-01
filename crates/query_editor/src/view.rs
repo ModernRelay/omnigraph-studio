@@ -3345,6 +3345,7 @@ impl QueryEditor {
                                         title: title.clone(),
                                         nodes: graph.0.clone(),
                                         links: graph.1.clone(),
+                                        source: None,
                                     }),
                                     cx,
                                 )

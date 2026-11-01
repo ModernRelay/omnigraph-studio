@@ -156,7 +156,7 @@ impl BuiltQuery {
 }
 
 /// A comparison on one property, or a test on one relationship (spec 004).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterOp {
     Eq,
     Ne,
@@ -577,7 +577,7 @@ fn keyset(
     })
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Filter {
     pub property: String,
     pub op: FilterOp,

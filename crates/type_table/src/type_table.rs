@@ -161,8 +161,14 @@ pub fn init(cx: &mut App) {
                     value: Value::String(id),
                 },
             });
+            // Filters that come with the action: a captured set's table, reopened (spec 020).
+            let captured: Vec<Filter> = action
+                .filters
+                .clone()
+                .and_then(|filters| serde_json::from_value(filters).ok())
+                .unwrap_or_default();
             let opening = Opening {
-                filters: filter.clone().into_iter().collect(),
+                filters: filter.clone().into_iter().chain(captured).collect(),
                 ..Opening::default()
             };
             let table = open_type(

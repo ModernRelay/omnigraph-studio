@@ -17,6 +17,7 @@ use gq_language::{Property, SchemaModel};
 use graph_store::{EntityKind, GraphSession, SessionEvent};
 use studio_actions::graph::{OpenSource, OpenType};
 use studio_actions::ontology::{Back, Open, SelectNext, SelectPrevious, ShowDomains};
+use studio_actions::{ViewKind, ViewLink};
 use studio_ui::ds::{self, size, space};
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::Tooltip;
@@ -1046,6 +1047,7 @@ impl OntologyPage {
                                     filter_id: None,
                                     via: None,
                                     preview: false,
+                                    filters: None,
                                 }),
                                 cx,
                             )
@@ -1272,6 +1274,7 @@ impl OntologyPage {
             .px(px(space::PAGE))
             .gap(px(space::MD))
             .flex_none()
+            .children(studio_workspace::view_strip(Item::views(self, cx), cx))
             .map(|bar| match (&focus, view) {
                 (Some(focus), Some(view)) => {
                     let place = view.index.get(focus).map(|ty| view.place(*ty));
@@ -1297,14 +1300,12 @@ impl OntologyPage {
                     }))
                     .child(div().flex_none().child(ds::text::title(focus.clone())))
                 }
+                // The view strip names the map; a schema too large to draw says what it shows
+                // instead.
                 _ => bar
-                    .child(ds::text::title(
-                        if view.is_some_and(|view| view.map.is_some()) {
-                            "Map"
-                        } else {
-                            "Domains"
-                        },
-                    ))
+                    .when(!view.is_some_and(|view| view.map.is_some()), |bar| {
+                        bar.child(ds::text::title("Domains"))
+                    })
                     .children(summary.map(ds::text::meta)),
             })
     }
@@ -1379,6 +1380,22 @@ impl Item for OntologyPage {
 
     fn thing(&self, _cx: &App) -> Option<studio_actions::Thing> {
         Some(studio_actions::Thing::Schema)
+    }
+
+    fn views(&self, _cx: &App) -> Vec<ViewLink> {
+        vec![
+            ViewLink::current(ViewKind::Map),
+            ViewLink::to(ViewKind::Source),
+        ]
+    }
+
+    fn view_action(&self, kind: ViewKind, _cx: &App) -> Option<Box<dyn gpui::Action>> {
+        (kind == ViewKind::Source).then(|| {
+            Box::new(OpenSource {
+                type_name: self.focus.clone(),
+                preview: true,
+            }) as Box<dyn gpui::Action>
+        })
     }
 
     /// The page comes back after a restart with the type that was in focus.

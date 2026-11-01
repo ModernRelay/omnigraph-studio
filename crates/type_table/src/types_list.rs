@@ -230,6 +230,7 @@ impl TypesList {
                     filter_id: None,
                     via: None,
                     preview: true,
+                    filters: None,
                 };
                 studio_ui::ds::SidebarRow::new(("type", ix), name.clone())
                     .start(studio_ui::kind_swatch(name, *is_edge, cx))

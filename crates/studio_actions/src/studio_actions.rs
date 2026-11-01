@@ -19,8 +19,80 @@ pub enum Thing {
     Node { type_name: String, id: String },
 }
 
+/// One way to see a thing (spec 020): the answer to "how?". Each is a tab of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewKind {
+    Table,
+    Page,
+    Tree,
+    Canvas,
+    Map,
+    Source,
+}
+
+impl ViewKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Table => "Table",
+            Self::Page => "Page",
+            Self::Tree => "Tree",
+            Self::Canvas => "Canvas",
+            Self::Map => "Map",
+            Self::Source => "Source",
+        }
+    }
+}
+
+/// One entry of a tab's view strip: a view of what the tab shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ViewLink {
+    pub kind: ViewKind,
+    /// The view this tab is.
+    pub current: bool,
+    /// Why this view cannot open now; it stays in the strip, which does not shift.
+    pub disabled: Option<&'static str>,
+}
+
+impl ViewLink {
+    pub fn current(kind: ViewKind) -> Self {
+        Self {
+            kind,
+            current: true,
+            disabled: None,
+        }
+    }
+
+    pub fn to(kind: ViewKind) -> Self {
+        Self {
+            kind,
+            current: false,
+            disabled: None,
+        }
+    }
+
+    pub fn disabled_because(kind: ViewKind, reason: &'static str) -> Self {
+        Self {
+            kind,
+            current: false,
+            disabled: Some(reason),
+        }
+    }
+}
+
 pub mod workspace {
-    use gpui::actions;
+    use gpui::{Action, actions};
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+
+    /// Open the active tab's view at this place in its view strip (spec 020).
+    #[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio)]
+    pub struct OpenViewAt {
+        pub index: usize,
+        /// In a pane to the right.
+        #[serde(default)]
+        pub beside: bool,
+    }
 
     actions!(
         studio,
@@ -171,6 +243,18 @@ pub mod graph {
             ReviewBranch,
             /// Open the commit history.
             OpenHistory,
+            /// Show what the active tab shows as a table.
+            OpenAsTable,
+            /// Show what the active tab shows as a page.
+            OpenAsPage,
+            /// Show what the active tab shows as a tree of its relationships.
+            OpenAsTree,
+            /// Show what the active tab shows on a canvas.
+            OpenAsCanvas,
+            /// Show the schema as a map.
+            OpenAsMap,
+            /// Show the schema's source.
+            OpenAsSource,
             /// Create a branch from the current branch.
             CreateBranch,
             /// Delete the current branch.
@@ -195,6 +279,10 @@ pub mod graph {
         /// Open as the pane's preview tab, which the next preview replaces (spec 002).
         #[serde(default)]
         pub preview: bool,
+        /// Filters a new table opens with, as a table saves them; an open table is left as it
+        /// is, since it may hold other work (spec 020).
+        #[serde(default)]
+        pub filters: Option<serde_json::Value>,
     }
 
     /// Open the schema's map: the graph's types and how they relate, one type at a time.
@@ -235,6 +323,27 @@ pub mod graph {
         pub nodes: Vec<ResultNode>,
         /// Pairs of indices into `nodes` that share a row.
         pub links: Vec<(usize, usize)>,
+        /// The table these rows were captured from; none for a query's result.
+        #[serde(default)]
+        pub source: Option<CapturedFrom>,
+    }
+
+    /// Where a set drawn on a canvas came from (spec 020). The canvas shows it, and keeps a copy:
+    /// it never follows its source.
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema)]
+    pub struct CapturedFrom {
+        pub type_name: String,
+        /// The commit the table holds; none for one that reads the branch head.
+        #[serde(default)]
+        pub at_commit: Option<String>,
+        /// The table's filters, as it can open with them again.
+        #[serde(default)]
+        pub filters: Option<serde_json::Value>,
+        /// The filters or selection in words, as the canvas names the set.
+        pub summary: String,
+        /// How many rows the source matched, when it knows. More than were drawn is partial.
+        #[serde(default)]
+        pub total: Option<u64>,
     }
 
     /// Open a Blob value in a tab of its own, read at a commit or the branch head.

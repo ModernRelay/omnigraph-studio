@@ -72,6 +72,17 @@ pub trait Item: Render + Focusable + EventEmitter<ItemEvent> {
         None
     }
 
+    /// The views of what this tab shows, in strip order; none or one shows no strip (spec 020).
+    /// Asked at every draw, so it reads what it needs cheaply.
+    fn views(&self, _cx: &App) -> Vec<studio_actions::ViewLink> {
+        Vec::new()
+    }
+
+    /// What opens this view of what the tab shows, with the tab's read context.
+    fn view_action(&self, _kind: studio_actions::ViewKind, _cx: &App) -> Option<Box<dyn Action>> {
+        None
+    }
+
     /// The item has unsaved work; closing asks first.
     fn is_dirty(&self, _cx: &App) -> bool {
         false
@@ -116,6 +127,8 @@ pub trait ItemHandle: 'static {
     fn tab_icon(&self, cx: &App) -> Option<IconName>;
     fn dedupe_key(&self, cx: &App) -> Option<SharedString>;
     fn thing(&self, cx: &App) -> Option<studio_actions::Thing>;
+    fn views(&self, cx: &App) -> Vec<studio_actions::ViewLink>;
+    fn view_action(&self, kind: studio_actions::ViewKind, cx: &App) -> Option<Box<dyn Action>>;
     fn is_dirty(&self, cx: &App) -> bool;
     fn is_stale(&self, cx: &App) -> bool;
     fn focus_handle(&self, cx: &App) -> FocusHandle;
@@ -148,6 +161,14 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn thing(&self, cx: &App) -> Option<studio_actions::Thing> {
         self.read(cx).thing(cx)
+    }
+
+    fn views(&self, cx: &App) -> Vec<studio_actions::ViewLink> {
+        self.read(cx).views(cx)
+    }
+
+    fn view_action(&self, kind: studio_actions::ViewKind, cx: &App) -> Option<Box<dyn Action>> {
+        self.read(cx).view_action(kind, cx)
     }
 
     fn is_dirty(&self, cx: &App) -> bool {
