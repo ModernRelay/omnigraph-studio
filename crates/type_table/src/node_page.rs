@@ -95,6 +95,13 @@ impl Item for NodePage {
         self.title(cx).into()
     }
 
+    fn thing(&self, _cx: &App) -> Option<studio_actions::Thing> {
+        Some(studio_actions::Thing::Node {
+            type_name: self.type_name.clone(),
+            id: self.id.clone(),
+        })
+    }
+
     fn tab_icon(&self, _cx: &App) -> Option<IconName> {
         Some(IconName::Reader)
     }

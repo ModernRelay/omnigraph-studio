@@ -39,7 +39,11 @@ impl Focusable for SchemaView {
 
 impl Item for SchemaView {
     fn tab_title(&self, _cx: &App) -> SharedString {
-        "Schema".into()
+        "Source".into()
+    }
+
+    fn thing(&self, _cx: &App) -> Option<studio_actions::Thing> {
+        Some(studio_actions::Thing::Schema)
     }
 
     fn tab_icon(&self, _cx: &App) -> Option<IconName> {

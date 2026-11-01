@@ -135,7 +135,7 @@ pub fn init(cx: &mut App) {
         workspace.add_panel(
             PanelPosition::Left,
             "types",
-            "Graph",
+            "Data",
             IconName::Blocks,
             types.clone(),
             cx,

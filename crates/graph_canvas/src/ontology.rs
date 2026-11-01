@@ -15,7 +15,7 @@ use gpui::{
 };
 use gq_language::{Property, SchemaModel};
 use graph_store::{EntityKind, GraphSession, SessionEvent};
-use studio_actions::graph::{OpenOntology, OpenSchema, OpenType};
+use studio_actions::graph::{OpenSource, OpenType};
 use studio_actions::ontology::{Back, Open, SelectNext, SelectPrevious, ShowDomains};
 use studio_ui::ds::{self, size, space};
 use studio_workspace::{Item, ItemEvent, SavedItem};
@@ -1052,10 +1052,11 @@ impl OntologyPage {
                         },
                     ))
                     .child(
-                        ds::row_button("in-schema", "Schema").on_click(move |_, window, cx| {
+                        ds::row_button("in-source", "Source").on_click(move |_, window, cx| {
                             window.dispatch_action(
-                                Box::new(OpenSchema {
+                                Box::new(OpenSource {
                                     type_name: Some(source.clone()),
+                                    preview: false,
                                 }),
                                 cx,
                             )
@@ -1363,8 +1364,8 @@ impl Focusable for OntologyPage {
 impl Item for OntologyPage {
     fn tab_title(&self, _cx: &App) -> SharedString {
         match &self.focus {
-            Some(focus) => format!("Ontology · {focus}").into(),
-            None => "Ontology".into(),
+            Some(focus) => format!("Map · {focus}").into(),
+            None => "Map".into(),
         }
     }
 
@@ -1376,8 +1377,8 @@ impl Item for OntologyPage {
         Some(ontology_key(&self.session.read(cx).graph_id))
     }
 
-    fn opened_by(&self, action: &dyn gpui::Action, _cx: &App) -> bool {
-        action.as_any().is::<OpenOntology>()
+    fn thing(&self, _cx: &App) -> Option<studio_actions::Thing> {
+        Some(studio_actions::Thing::Schema)
     }
 
     /// The page comes back after a restart with the type that was in focus.

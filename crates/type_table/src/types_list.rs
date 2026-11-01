@@ -1,24 +1,23 @@
-//! The sidebar's "Types" section (spec 004): every node type, then every edge type, with its
-//! color and its row count at the branch head. A click opens the type's table.
+//! The sidebar's Data panel (spec 020): the schema, every node type, then every edge type, each
+//! type with its color and its row count at the branch head. Every row is a thing, never a view:
+//! a click opens the thing, and the tab's view strip offers its other views.
 
 use std::sync::Arc;
 
 use gpui::{
-    Context, Entity, ListAlignment, ListState, Render, SharedString, Subscription, WeakEntity,
-    Window, list,
+    Context, Entity, ListAlignment, ListState, Render, Subscription, WeakEntity, Window, list,
 };
+use gq_language::SchemaModel;
 use graph_store::{GraphSession, Loadable, SessionEvent};
-use studio_actions::graph::{OpenCanvas, OpenOntology, OpenSchema, OpenType};
+use studio_actions::Thing;
+use studio_actions::graph::{OpenMap, OpenType};
 use studio_workspace::{Workspace, WorkspaceEvent};
 use ui::Tooltip;
 use ui::prelude::*;
 
-use crate::TABLE_KEY_PREFIX;
-
 /// One row of the sidebar's list.
+#[derive(Debug, PartialEq)]
 enum Row {
-    Ontology,
-    Canvas,
     Schema,
     Section(&'static str),
     Type { name: String, is_edge: bool },
@@ -31,8 +30,8 @@ pub struct TypesList {
     /// the list draws only the rows in view.
     rows: Vec<Row>,
     rows_for: Option<Arc<str>>,
-    /// The active tab's key as this frame draws the rows, taken once for all of them.
-    frame_active: Option<SharedString>,
+    /// What the active tab shows as this frame draws the rows, taken once for all of them.
+    frame_active: Option<Thing>,
     list: ListState,
     _workspace_subscription: Option<Subscription>,
     _session_subscription: Option<Subscription>,
@@ -86,21 +85,27 @@ impl TypesList {
         cx.notify();
     }
 
-    fn active_key(&self, cx: &App) -> Option<SharedString> {
+    fn active_thing(&self, cx: &App) -> Option<Thing> {
         let workspace = self.workspace.upgrade()?;
-        workspace.read(cx).active_item()?.dedupe_key(cx)
+        workspace.read(cx).active_item()?.thing(cx)
     }
+}
 
-    /// Whether the active tab shows what `action` opens: the canvas's ontology and its walk
-    /// from a node are one tab, which only the tab can tell apart.
-    fn active_shows(&self, action: &dyn gpui::Action, cx: &App) -> bool {
-        self.workspace.upgrade().is_some_and(|workspace| {
-            workspace
-                .read(cx)
-                .active_item()
-                .is_some_and(|item| item.opened_by(action, cx))
-        })
+/// The rows for a schema: the schema itself, then its types.
+fn rows_of(schema: &SchemaModel) -> Vec<Row> {
+    let mut rows = vec![Row::Schema, Row::Section("Node types")];
+    rows.extend(schema.nodes.iter().map(|node| Row::Type {
+        name: node.name.clone(),
+        is_edge: false,
+    }));
+    if !schema.edges.is_empty() {
+        rows.push(Row::Section("Edge types"));
     }
+    rows.extend(schema.edges.iter().map(|edge| Row::Type {
+        name: edge.name.clone(),
+        is_edge: true,
+    }));
+    rows
 }
 
 impl Render for TypesList {
@@ -145,30 +150,13 @@ impl Render for TypesList {
                 return studio_ui::ds::sidebar_note("Reading types…").into_any_element();
             }
         };
-        // The graph as a whole first: its ontology, the explorer and the schema, then its types.
         if self.rows_for.as_deref() != Some(&*schema.source) {
-            let mut rows = vec![
-                Row::Ontology,
-                Row::Canvas,
-                Row::Schema,
-                Row::Section("Types"),
-            ];
-            rows.extend(schema.nodes.iter().map(|node| Row::Type {
-                name: node.name.clone(),
-                is_edge: false,
-            }));
-            if !schema.edges.is_empty() {
-                rows.push(Row::Section("Relationships"));
-            }
-            rows.extend(schema.edges.iter().map(|edge| Row::Type {
-                name: edge.name.clone(),
-                is_edge: true,
-            }));
+            let rows = rows_of(&schema);
             self.list.reset(rows.len());
             self.rows = rows;
             self.rows_for = Some(schema.source.clone());
         }
-        self.frame_active = self.active_key(cx);
+        self.frame_active = self.active_thing(cx);
         list(
             self.list.clone(),
             // Each row in a column of the list's width, as the rows sat in one before.
@@ -190,44 +178,21 @@ impl TypesList {
         let (Some(row), Some(session)) = (self.rows.get(ix), &self.session) else {
             return div().into_any_element();
         };
-        let active = self.frame_active.as_deref();
-        let view_row = |id: &'static str, label: &'static str, icon: IconName| {
-            studio_ui::ds::SidebarRow::new(id, label).icon(icon)
-        };
         match row {
-            Row::Ontology => view_row("view-ontology", "Ontology", IconName::GitGraph)
-                .selected(self.active_shows(&OpenOntology, cx))
+            Row::Schema => studio_ui::ds::SidebarRow::new("schema", "Schema")
+                .icon(IconName::Code)
+                .selected(self.frame_active == Some(Thing::Schema))
                 .tooltip_fn(|_, cx| {
                     Tooltip::for_action(
-                        "The types by domain, and each type's relationships",
-                        &OpenOntology,
+                        "The graph's types and how they relate",
+                        &OpenMap::default(),
                         cx,
                     )
                 })
-                .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenOntology), cx))
-                .into_any_element(),
-            Row::Canvas => view_row("view-canvas", "Canvas", IconName::Crosshair)
-                .selected(self.active_shows(&OpenCanvas, cx))
-                .tooltip_fn(|_, cx| {
-                    Tooltip::for_action(
-                        "Walk the graph from a node: ↵ on a row opens one",
-                        &OpenCanvas,
-                        cx,
-                    )
-                })
-                .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenCanvas), cx))
-                .into_any_element(),
-            Row::Schema => view_row("view-schema", "Schema", IconName::Code)
-                .selected(active == Some("schema"))
-                .tooltip_fn(|_, cx| {
-                    Tooltip::for_action(
-                        "The schema's source, read-only",
-                        &OpenSchema::default(),
-                        cx,
-                    )
-                })
-                .on_click(|_, window, cx| {
-                    window.dispatch_action(Box::new(OpenSchema::default()), cx)
+                // A click previews the map in the pane's preview tab; a double click keeps it.
+                .on_click(|event, window, cx| {
+                    let preview = event.click_count() < 2;
+                    window.dispatch_action(Box::new(OpenMap { preview }), cx)
                 })
                 .into_any_element(),
             Row::Section(title) => studio_ui::ds::section_label(*title)
@@ -256,9 +221,8 @@ impl TypesList {
                     ),
                     _ => format!("Rows at the head of {}", s.branch),
                 };
-                // The type's table at the head is the active tab ([`crate::table_key`]).
-                let selected = active.and_then(|key| key.strip_prefix(TABLE_KEY_PREFIX))
-                    == Some(name.as_str());
+                let selected =
+                    matches!(&self.frame_active, Some(Thing::Type(active)) if active == name);
                 // A click previews the type in the pane's preview tab; a double click keeps it.
                 let action = OpenType {
                     type_name: name.clone(),
@@ -281,5 +245,35 @@ impl TypesList {
                     .into_any_element()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every row names a thing: the schema, or a type. No row is a view (spec 020).
+    #[test]
+    fn every_row_is_a_thing() {
+        let schema = SchemaModel::parse(
+            "node Person {\n  slug: String @key\n}\nedge Knows: Person -> Person\n",
+        )
+        .expect("the schema parses");
+        assert_eq!(
+            rows_of(&schema),
+            vec![
+                Row::Schema,
+                Row::Section("Node types"),
+                Row::Type {
+                    name: "Person".into(),
+                    is_edge: false
+                },
+                Row::Section("Edge types"),
+                Row::Type {
+                    name: "Knows".into(),
+                    is_edge: true
+                },
+            ]
+        );
     }
 }

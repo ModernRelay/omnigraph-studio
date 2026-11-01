@@ -38,7 +38,7 @@ use studio_actions::canvas::{
     WalkForward, ZoomIn, ZoomOut,
 };
 use studio_actions::graph::{
-    OpenCanvas, OpenNode, OpenOntology, OpenType, PeekNode, ShowNodeOnCanvas, ShowResultsOnCanvas,
+    OpenCanvas, OpenMap, OpenNode, OpenType, PeekNode, ShowNodeOnCanvas, ShowResultsOnCanvas,
 };
 use studio_settings::StudioSettings;
 use studio_ui::ds::space;
@@ -63,7 +63,7 @@ pub fn init(cx: &mut App) {
         ontology::ONTOLOGY_KIND,
         |data, workspace, window, cx| {
             let focus = ontology::saved_focus(data);
-            if let Some(page) = open_ontology(workspace, window, cx)
+            if let Some(page) = open_ontology(workspace, false, window, cx)
                 && let Some(focus) = focus
             {
                 page.update(cx, |page, cx| page.focus_on(&focus, cx));
@@ -96,8 +96,8 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &OpenCanvas, window, cx| {
             open_canvas(workspace, window, cx);
         });
-        workspace.register_action(|workspace, _: &OpenOntology, window, cx| {
-            open_ontology(workspace, window, cx);
+        workspace.register_action(|workspace, action: &OpenMap, window, cx| {
+            open_ontology(workspace, action.preview, window, cx);
         });
         workspace.register_action(|workspace, action: &ShowNodeOnCanvas, window, cx| {
             if let Some(canvas) = open_canvas(workspace, window, cx) {
@@ -111,12 +111,13 @@ pub fn init(cx: &mut App) {
 
 fn open_ontology(
     workspace: &mut Workspace,
+    preview: bool,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Option<Entity<ontology::OntologyPage>> {
     let session = workspace.session()?.clone();
     let key = ontology::ontology_key(&session.read(cx).graph_id);
-    workspace.open_item::<ontology::OntologyPage>(key, window, cx, |_window, cx| {
+    workspace.open_item_with::<ontology::OntologyPage>(key, preview, window, cx, |_window, cx| {
         ontology::OntologyPage::new(session, cx)
     })
 }
@@ -408,11 +409,6 @@ impl Item for GraphCanvas {
             Some((seq, _)) => format!("canvas-results:{seq}").into(),
             None => canvas_key(&self.session.read(cx).graph_id),
         })
-    }
-
-    /// The walk from a node is what `OpenCanvas` opens; a query's result nodes are not.
-    fn opened_by(&self, action: &dyn gpui::Action, _cx: &App) -> bool {
-        self.mode() == Mode::Explore && action.as_any().is::<OpenCanvas>()
     }
 
     /// The exploration canvas comes back after a restart; a results canvas is transient.

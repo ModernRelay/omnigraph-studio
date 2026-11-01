@@ -176,7 +176,7 @@
   {
     "bindings": {
       "cmd-n": "studio_graph::NewQuery",
-      "cmd-shift-o": "studio_graph::OpenOntology",
+      "cmd-shift-o": "studio_graph::OpenMap",
       "cmd-shift-e": "studio_graph::OpenCanvas"
     }
   },

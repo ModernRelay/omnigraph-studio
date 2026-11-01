@@ -4,7 +4,7 @@
 use gpui::{App, Menu, MenuItem, OsAction, SystemMenuType};
 use studio_actions::agent::OpenAgent;
 use studio_actions::graph::{
-    CreateBranch, NewQuery, OpenCanvas, OpenHistory, OpenOntology, OpenQueryFile, OpenSchema,
+    CreateBranch, NewQuery, OpenCanvas, OpenHistory, OpenMap, OpenQueryFile, OpenSource,
     ReviewBranch,
 };
 use studio_actions::query::{Save, SaveAs};
@@ -88,8 +88,8 @@ pub fn set(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("New Query", NewQuery),
             MenuItem::action("History", OpenHistory),
-            MenuItem::action("Ontology", OpenOntology),
-            MenuItem::action("Schema", OpenSchema::default()),
+            MenuItem::action("Map", OpenMap::default()),
+            MenuItem::action("Source", OpenSource::default()),
             MenuItem::action("Canvas", OpenCanvas),
             MenuItem::action("Agent", OpenAgent),
             MenuItem::separator(),

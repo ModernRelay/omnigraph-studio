@@ -647,6 +647,10 @@ impl Focusable for TypeTable {
 }
 
 impl Item for TypeTable {
+    fn thing(&self, _cx: &App) -> Option<studio_actions::Thing> {
+        Some(studio_actions::Thing::Type(self.type_name.clone()))
+    }
+
     /// The grid is drawn cached on its own (`TableGrid`).
     fn caches_its_parts(&self) -> bool {
         true

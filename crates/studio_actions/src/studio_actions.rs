@@ -173,8 +173,6 @@ pub mod graph {
             OpenHistory,
             /// Open the canvas: the nodes being explored and their relationships.
             OpenCanvas,
-            /// Open the ontology: the graph's types in domains, one type at a time.
-            OpenOntology,
             /// Create a branch from the current branch.
             CreateBranch,
             /// Delete the current branch.
@@ -201,12 +199,24 @@ pub mod graph {
         pub preview: bool,
     }
 
+    /// Open the schema's map: the graph's types and how they relate, one type at a time.
+    #[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph, deprecated_aliases = ["studio_graph::OpenOntology"])]
+    pub struct OpenMap {
+        /// Open as the pane's preview tab, which the next preview replaces (spec 002).
+        #[serde(default)]
+        pub preview: bool,
+    }
+
     /// Open the schema's source, read-only; with a type, at its declaration (spec 007).
     #[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
-    #[action(namespace = studio_graph)]
-    pub struct OpenSchema {
+    #[action(namespace = studio_graph, deprecated_aliases = ["studio_graph::OpenSchema"])]
+    pub struct OpenSource {
         #[serde(default)]
         pub type_name: Option<String>,
+        /// Open as the pane's preview tab, which the next preview replaces (spec 002).
+        #[serde(default)]
+        pub preview: bool,
     }
 
     /// One node of a query result, for [`ShowResultsOnCanvas`].

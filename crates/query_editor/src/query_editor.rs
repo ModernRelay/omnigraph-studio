@@ -19,7 +19,7 @@ use gpui::{App, AppContext as _, Context, Entity, Global, PathPromptOptions, Win
 use graph_client::api::QueryCatalogEntry;
 use serde_json::{Map, Value};
 use studio_actions::graph::{
-    NewQuery, NewQueryWithText, OpenQueryAt, OpenQueryFile, OpenSchema, OpenStoredQuery,
+    NewQuery, NewQueryWithText, OpenQueryAt, OpenQueryFile, OpenSource, OpenStoredQuery,
 };
 use studio_workspace::{ItemEvent, PanelPosition, ToastKind, Workspace};
 use ui::IconName;
@@ -148,6 +148,7 @@ fn saved_widths(data: &Value) -> BTreeMap<String, f32> {
 fn open_schema(
     workspace: &mut Workspace,
     type_name: Option<String>,
+    preview: bool,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
@@ -159,9 +160,13 @@ fn open_schema(
         );
         return;
     };
-    let view = workspace.open_item(schema_view::SCHEMA_KEY, window, cx, |window, cx| {
-        SchemaView::new(session, window, cx)
-    });
+    let view = workspace.open_item_with(
+        schema_view::SCHEMA_KEY,
+        preview,
+        window,
+        cx,
+        |window, cx| SchemaView::new(session, window, cx),
+    );
     if let Some(type_name) = type_name
         && let Some(view) = view
     {
@@ -242,7 +247,7 @@ pub fn init(cx: &mut App) {
         cx,
         schema_view::SCHEMA_KEY,
         |_, workspace, window, cx| {
-            open_schema(workspace, None, window, cx);
+            open_schema(workspace, None, false, window, cx);
         },
     );
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
@@ -321,8 +326,14 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, action: &OpenStoredQuery, window, cx| {
             open_stored(workspace, action.name.clone(), None, None, window, cx);
         });
-        workspace.register_action(|workspace, action: &OpenSchema, window, cx| {
-            open_schema(workspace, action.type_name.clone(), window, cx);
+        workspace.register_action(|workspace, action: &OpenSource, window, cx| {
+            open_schema(
+                workspace,
+                action.type_name.clone(),
+                action.preview,
+                window,
+                cx,
+            );
         });
         workspace.register_action(|workspace, _: &NewQuery, window, cx| {
             let Some(session) = workspace.session().cloned() else {
