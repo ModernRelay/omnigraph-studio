@@ -807,7 +807,12 @@ impl HistoryView {
                 this.listing_head = listing.head;
             }
             this.state = State::Ready;
-            this.more = More::Idle;
+            // A next page that failed stays failed while the pages it continues are kept: its
+            // row says so and offers to try again. Before, a commit landing cleared it, and the
+            // page that failed was asked for again unasked.
+            if !kept {
+                this.more = More::Idle;
+            }
             // The merged-in commits this page names are read afresh: by id first, and those
             // whose read failed without waiting.
             this.merged_failed.clear();
@@ -1100,7 +1105,8 @@ impl HistoryView {
             let kept = this.update(cx, |this, cx| match taken {
                 Answered::Drawn(arranged) => this.take(arranged, cx),
                 Answered::Unseen(read, answered) => {
-                    this.read = read;
+                    let replaced = std::mem::replace(&mut this.read, read);
+                    cx.background_spawn(async move { drop(replaced) }).detach();
                     this.wanted.retain(|id| !answered.contains(id));
                 }
             });
@@ -1210,10 +1216,16 @@ impl HistoryView {
             .and_then(|ix| self.commits.get(ix))
             .map(|c| c.graph_commit_id.clone());
         let place = self.reading_at();
-        self.read = arranged.read;
-        self.commits = arranged.commits;
-        self.commit_texts = arranged.commit_texts;
-        self.graph = arranged.graph;
+        // What it replaces is freed in the background: the commits read, their texts and lanes
+        // are thousands of allocations each, which freed here would hold up a frame, as copying
+        // them would (`first_page`).
+        let replaced = (
+            std::mem::replace(&mut self.read, arranged.read),
+            std::mem::replace(&mut self.commits, arranged.commits),
+            std::mem::replace(&mut self.commit_texts, arranged.commit_texts),
+            std::mem::replace(&mut self.graph, arranged.graph),
+        );
+        cx.background_spawn(async move { drop(replaced) }).detach();
         self.wanted = arranged.wanted;
         self.heads = self.branch_heads();
         // The drawn rows' counts were found in the list before.
@@ -3384,6 +3396,39 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert_eq!(view.selected, Some(349));
             assert_eq!(view.commits[349].graph_commit_id, "m100");
+        });
+    }
+
+    /// A next page that failed stays failed while a commit landing keeps the pages it
+    /// continues: its row still offers Try again. Before, the commit landing cleared it, and
+    /// the page that failed was asked for again unasked.
+    #[gpui::test]
+    async fn a_failed_next_page_stays_failed_when_a_commit_lands(cx: &mut TestAppContext) {
+        let (session, served) = serve(
+            Served {
+                branches: vec![("main".into(), chain("m", 450))],
+                fail_tokens: true,
+                ..Default::default()
+            },
+            cx,
+        );
+        let (view, cx) = open(&session, cx);
+        view.update(cx, |view, cx| view.want_more(&(170..200), cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.more, More::Failed { restart: false, .. }));
+        });
+        served
+            .lock()
+            .unwrap()
+            .chain_mut("main")
+            .insert(0, commit("m450", 4_510, Some("m449"), None));
+        view.update(cx, |view, cx| view.load(FirstPage::KEEP, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.commits[0].graph_commit_id, "m450");
+            assert_eq!(view.commits.len(), 201, "the pages read are kept under it");
+            assert!(matches!(view.more, More::Failed { restart: false, .. }));
         });
     }
 
