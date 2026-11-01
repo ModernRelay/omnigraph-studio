@@ -51,7 +51,6 @@ pub fn init(cx: &mut App) {
     query_editor::init(cx);
     review::init(cx);
     history::init(cx);
-    inspectors::init(cx);
     agent_panel::init(cx);
 
     #[cfg(debug_assertions)]
@@ -1132,7 +1131,6 @@ mod start_tests {
             query_editor::init(cx);
             review::init(cx);
             history::init(cx);
-            inspectors::init(cx);
             agent_panel::init(cx);
         });
         let (_workspace, cx) = cx.add_window_view(Workspace::new);

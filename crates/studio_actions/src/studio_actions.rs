@@ -163,8 +163,6 @@ pub mod graph {
             OpenCanvas,
             /// Open the ontology: the graph's types in domains, one type at a time.
             OpenOntology,
-            /// Open the storage inspector: the server's health and the graph's storage.
-            OpenInspector,
             /// Create a branch from the current branch.
             CreateBranch,
             /// Delete the current branch.

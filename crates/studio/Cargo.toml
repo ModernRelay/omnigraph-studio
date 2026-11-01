@@ -54,7 +54,6 @@ query_editor = { workspace = true }
 agent_panel = { workspace = true }
 review = { workspace = true }
 history = { workspace = true }
-inspectors = { workspace = true }
 
 # Text needs `font-kit` on macOS; Linux needs a windowing backend.
 [target.'cfg(target_os = "macos")'.dependencies]

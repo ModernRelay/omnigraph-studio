@@ -40,7 +40,7 @@ Add tasks, contracts or data-model files only for large features.
 | 007 | [Query editor](007-query-editor/plan.md) | first slice landed |
 | 008 | [Branches, review and merge](008-branches-review-merge/plan.md) | built on 0.13 |
 | 009 | [History](009-history/plan.md) | built on 0.13 |
-| 010 | [Inspectors](010-inspectors/plan.md) | built on 0.13 |
+| 010 | [Inspectors](010-inspectors/plan.md) | superseded: removed 2026-10-31 |
 | 011 | [Agent panel](011-agent-panel/plan.md) | implemented |
 | 012 | [Omnigraph engine changes](012-omnigraph-engine-changes/plan.md) | deferred |
 | 013 | [The agent uses the Omnigraph CLI](013-agent-cli/plan.md) | implemented |

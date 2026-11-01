@@ -27,7 +27,6 @@ LAYERS = {
     "query_editor": 5,
     "review": 5,
     "history": 5,
-    "inspectors": 5,
     "agent_panel": 5,
     "studio": 6,
 }

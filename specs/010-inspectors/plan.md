@@ -1,7 +1,8 @@
 # 010: Inspectors
 
-Status: built on 0.13 · 2026-10-12 (`crates/inspectors`): a "Storage" tab. Index facts wait on
-E13: 0.13's `explain` names none for a scan (see the validation log).
+Status: superseded · removed 2026-10-31, to cut what Studio shows to what its work needs (see
+`ui-ux-audit-report.md`). Built on 0.13 · 2026-10-12 (`crates/inspectors`): a "Storage" tab.
+The last commit with it is `8b26a45`.
 
 ## Problem
 

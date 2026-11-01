@@ -220,8 +220,8 @@ what was last saved at most every 250 ms rather than serializing every tab on ev
   `Workspace`, `TypeTable`, `Tree`, `Canvas`, `QueryEditor`, `Review`, `History`, `Inspector`.
   Every action without arguments has a key on every platform except, as in Zed, the rare and
   the destructive (reveal the log, the design system gallery, directional splits left and up,
-  pin and keep tab, close graph, branch create, delete, merge and review, history, the storage
-  inspector, the agent's queue, restart and conversation list), which the palette and menus
+  pin and keep tab, close graph, branch create, delete, merge and review, history, the agent's
+  queue, restart and conversation list), which the palette and menus
   reach. `crates/studio/tests/keymaps.rs` holds that list and fails on an action outside it with
   no key. Workspace keys from Zed: ⌥⌘O open a graph (Zed's open recent), ⌥⌘T close others, ⌘R
   refresh the graph (a table's own ⌘R refreshes the table); ⌥⌘W closes every tab, since ⌘K is
