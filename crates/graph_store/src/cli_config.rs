@@ -627,6 +627,9 @@ fn land(
         transport: CliTransport { proxy, roots },
         alternatives: Vec::new(),
         // The name too: an entry renamed is listed alike, and its token is asked for by name.
+        // Not a managed profile's organization ([`name_organizations`]): a read of it the CLI
+        // missed would replace the token source, so a profile moved to another organization is
+        // followed at the target's next change or Studio's next start.
         revision: format!("{name} {value} {file_stamp:?}"),
     })
 }
