@@ -429,8 +429,6 @@ pub fn is_field(schema: &SchemaModel, group: &RelationshipGroup) -> bool {
 pub struct ExploreState {
     pub root: Option<NodeRef>,
     pub root_status: Loadable<()>,
-    /// The roots walked before the current one, oldest first (re-rooting keeps the path).
-    pub breadcrumb: Vec<NodeRef>,
     /// Labels read so far. `None` means the type has no label besides its key.
     pub labels: HashMap<NodeRef, Option<String>>,
     pub expanded: HashSet<ExplorePath>,
@@ -454,7 +452,6 @@ impl Default for ExploreState {
         Self {
             root: None,
             root_status: Loadable::NotLoaded,
-            breadcrumb: Vec::new(),
             labels: HashMap::new(),
             expanded: HashSet::new(),
             counts: HashMap::new(),
@@ -482,6 +479,15 @@ impl ExploreState {
     }
 
     /// A state holding `set`, nothing open and nothing selected.
+    /// Lets go of a set's count, which was the rows' number at the commit it was read at: read
+    /// again at another (the branch's head moved, or another branch), the rows may number
+    /// otherwise, and "Show more" goes by whether pages remain.
+    fn forget_set_total(&mut self) {
+        if let Some(SetRoots::Filtered { total, .. }) = &mut self.set {
+            *total = None;
+        }
+    }
+
     pub fn of_set(set: SetRoots) -> Self {
         let mut state = Self {
             root: Some(set_anchor()),
@@ -627,36 +633,6 @@ impl ExploreState {
         }
     }
 
-    /// Makes the node at `path` the root. Expansions below it are kept; the old root and the
-    /// nodes on the way join the breadcrumb.
-    pub fn reroot(&mut self, path: &ExplorePath) -> bool {
-        let Some(root) = self.root.clone() else {
-            return false;
-        };
-        if path.is_root() || !path.ends_at_node() {
-            return false;
-        }
-        let new_root = path.node(&root).clone();
-        self.breadcrumb.push(root);
-        let on_the_way: Vec<NodeRef> = path.nodes().cloned().collect();
-        self.breadcrumb
-            .extend(on_the_way[..on_the_way.len() - 1].iter().cloned());
-        self.expanded = self
-            .expanded
-            .iter()
-            .filter_map(|expanded| expanded.strip_prefix(path))
-            .collect();
-        self.expanded.insert(ExplorePath::root());
-        self.selection = Some(ExplorePath::root());
-        self.root_status = if self.labels.contains_key(&new_root) {
-            Loadable::Loaded(())
-        } else {
-            Loadable::NotLoaded
-        };
-        self.root = Some(new_root);
-        true
-    }
-
     /// Forgets everything read, keeping the root, expansions and selection.
     pub fn clear_loaded(&mut self) {
         // A set's rows are what is read again, not a root.
@@ -681,7 +657,7 @@ impl ExploreState {
     /// was read ahead for rows that never opened, and what was read below a subtree closed
     /// whole. Kept: whatever is still being read; each open node's counts and fields; each
     /// open relationship's or value's neighbours, values and counts; the labels of the root,
-    /// the breadcrumb, the nodes on open paths and the neighbours kept.
+    /// the nodes on open paths and the neighbours kept.
     pub fn retain_reachable(&mut self) {
         let Some(root) = self.root.clone() else {
             return;
@@ -718,16 +694,12 @@ impl ExploreState {
             .values()
             .flat_map(|list| list.rows.iter().map(|row| &row.node))
             .collect();
-        let breadcrumb: HashSet<&NodeRef> = self.breadcrumb.iter().collect();
         let roots: HashSet<&NodeRef> = match &self.set {
             Some(SetRoots::Listed(rows)) => rows.iter().map(|row| &row.node).collect(),
             _ => HashSet::new(),
         };
         self.labels.retain(|node, _| {
-            nodes.contains(node)
-                || listed.contains(node)
-                || breadcrumb.contains(node)
-                || roots.contains(node)
+            nodes.contains(node) || listed.contains(node) || roots.contains(node)
         });
     }
 
@@ -1294,7 +1266,11 @@ impl ExploreState {
     /// The shallowest visible path at which `node` appears.
     #[cfg(test)]
     pub fn path_of(&self, schema: &SchemaModel, node: &NodeRef) -> Option<ExplorePath> {
-        path_in(&self.entries(schema), node)
+        self.entries(schema)
+            .iter()
+            .filter(|entry| matches!(&entry.kind, EntryKind::Node { node: n, .. } if n == node))
+            .min_by_key(|entry| entry.depth)
+            .map(|entry| entry.path.clone())
     }
 
     /// Applies the answer to a root read.
@@ -1432,15 +1408,6 @@ type WalkKey = (EntityId, NodeRef, Option<String>);
 struct ExplorationRegistry(HashMap<WalkKey, WeakEntity<Exploration>>);
 
 impl Global for ExplorationRegistry {}
-
-/// The shallowest of `entries` at which `node` appears.
-fn path_in(entries: &[Entry], node: &NodeRef) -> Option<ExplorePath> {
-    entries
-        .iter()
-        .filter(|entry| matches!(&entry.kind, EntryKind::Node { node: n, .. } if n == node))
-        .min_by_key(|entry| entry.depth)
-        .map(|entry| entry.path.clone())
-}
 
 /// The exploration's state and its flattening as last made, under the schema it was made
 /// with. Any access to the state through `&mut` lets the flattening go, so it is never stale,
@@ -1775,70 +1742,20 @@ impl Exploration {
     /// change.
     fn start_over_at(&mut self, node: NodeRef, cx: &mut Context<Self>) {
         self.reset_reads(cx);
+        // How each relationship's neighbours are grouped and filtered stays, wherever it
+        // appears, as Refresh keeps it.
         let grouping = std::mem::take(&mut self.state.grouping);
+        let filters = std::mem::take(&mut self.state.filters);
         // A set stays the set: its rows are read again, with nothing open.
         *self.state = match self.state.set.take() {
             Some(set) => ExploreState::of_set(set),
             None => ExploreState::rooted(node),
         };
         self.state.grouping = grouping;
-        self.changed(cx);
-        cx.emit(ExplorationEvent::SelectionChanged);
-    }
-
-    /// Selects `node` where it is already visible, else roots the exploration at it; whether it
-    /// was visible.
-    pub fn reveal(&mut self, node: NodeRef, cx: &mut Context<Self>) -> bool {
-        let path = self
-            .schema()
-            .and_then(|schema| path_in(&self.state.entries(&schema), &node));
-        let shown = path.is_some();
-        match path {
-            Some(path) => self.select(Some(path), cx),
-            None => self.root_at(node, cx),
+        self.state.filters = filters;
+        if self.held.is_none() {
+            self.state.forget_set_total();
         }
-        shown
-    }
-
-    /// Makes the node at `path` the root, at the same commit.
-    pub fn reroot(&mut self, path: &ExplorePath, cx: &mut Context<Self>) {
-        if self.state.reroot(path) {
-            self.walk_starts_over();
-            self.request_missing(cx);
-            self.changed(cx);
-            cx.emit(ExplorationEvent::SelectionChanged);
-        }
-    }
-
-    /// Goes back to a root in the breadcrumb, at the same commit.
-    pub fn back_to(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(node) = self.state.breadcrumb.get(index).cloned() else {
-            return;
-        };
-        let breadcrumb = self.state.breadcrumb[..index].to_vec();
-        let labels = std::mem::take(&mut self.state.labels);
-        let counts = std::mem::take(&mut self.state.counts);
-        let neighbours = std::mem::take(&mut self.state.neighbours);
-        let values = std::mem::take(&mut self.state.values);
-        let grouping = std::mem::take(&mut self.state.grouping);
-        // A searched group's neighbours are its matches: the search goes with them.
-        let searches = std::mem::take(&mut self.state.searches);
-        let mut state = ExploreState::rooted(node.clone());
-        state.root_status = if labels.contains_key(&node) {
-            Loadable::Loaded(())
-        } else {
-            Loadable::NotLoaded
-        };
-        state.breadcrumb = breadcrumb;
-        state.labels = labels;
-        state.counts = counts;
-        state.neighbours = neighbours;
-        state.values = values;
-        state.grouping = grouping;
-        state.searches = searches;
-        *self.state = state;
-        self.walk_starts_over();
-        self.request_missing(cx);
         self.changed(cx);
         cx.emit(ExplorationEvent::SelectionChanged);
     }
@@ -2124,6 +2041,9 @@ impl Exploration {
     fn forget_at_head(&mut self, cx: &mut Context<Self>) {
         self.reset_reads(cx);
         self.state.clear_loaded();
+        if self.held.is_none() {
+            self.state.forget_set_total();
+        }
         self.changed(cx);
     }
 
@@ -2574,14 +2494,6 @@ impl Exploration {
         }
         cx.emit(ExplorationEvent::Loaded);
         cx.notify();
-    }
-
-    /// The walk starts over from another root, keeping what was read: the bound is
-    /// [`KEPT_READS`] again, so what the old root's paths read and the new one's cannot reach
-    /// goes now rather than once the state has grown to the old walk's size twice over.
-    fn walk_starts_over(&mut self) {
-        self.prune_at = KEPT_READS;
-        self.bound_reads();
     }
 
     /// Keeps what the state holds bounded: past [`KEPT_READS`] counts, neighbour lists, values
@@ -3213,27 +3125,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reroot_keeps_expansions_below_and_extends_the_breadcrumb() {
-        let schema = schema();
-        let mut state = loaded_root(&schema);
-        let knows = group(&schema, "Person", "Knows", Direction::Outgoing);
-        let bob = ExplorePath::root()
-            .child_group(&knows)
-            .child_node(&person("bob"));
-        let cy = bob.child_group(&knows).child_node(&person("cy"));
-        state.labels.insert(person("cy"), Some("Cy".into()));
-        state.expand(&cy);
-        state.expand(&cy.child_group(&knows));
-        assert!(state.reroot(&cy));
-        assert_eq!(state.root, Some(person("cy")));
-        assert_eq!(state.breadcrumb, vec![person("ada"), person("bob")]);
-        assert!(state.is_expanded(&ExplorePath::root().child_group(&knows)));
-        assert_eq!(state.root_status, Loadable::Loaded(()));
-        assert!(!state.reroot(&ExplorePath::root()));
-        let _ = schema;
-    }
-
     /// Filters set on a relationship let go of its count and page, which are read again under
     /// them: the count as the node's own read, the page with the filter's clause; taking them
     /// off reads both again unfiltered (spec 005, "Filtering a relationship's neighbours").
@@ -3276,15 +3167,6 @@ mod tests {
             assert_eq!(exploration.state().counts[&key], Loadable::Loaded(2));
             assert_eq!(exploration.state().neighbours[&key].rows.len(), 1);
         });
-        eprintln!(
-            "BEFORE {:?}",
-            asked
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|a| a["name"].clone())
-                .collect::<Vec<_>>()
-        );
         asked.lock().unwrap().clear();
 
         let filter = Filter {
@@ -3305,15 +3187,6 @@ mod tests {
             assert!(!exploration.state().neighbours.contains_key(&key), "let go");
         });
         cx.run_until_parked();
-        exploration.read_with(cx, |e, _| {
-            eprintln!(
-                "STATE counts={:?} tasks={:?} pin={:?}",
-                e.state().counts,
-                e.tasks.keys().collect::<Vec<_>>(),
-                e.pin
-            )
-        });
-        eprintln!("AFTER {:?}", asked.lock().unwrap());
         let reads: Vec<(String, Value)> = asked
             .lock()
             .unwrap()
@@ -3360,6 +3233,17 @@ mod tests {
         exploration.read_with(cx, |exploration, _| {
             assert_eq!(exploration.state().counts[&key], Loadable::Loaded(2));
             assert_eq!(exploration.state().neighbours[&key].rows.len(), 1);
+        });
+
+        // The walk started over on another branch keeps the relationship's filters, as Refresh
+        // does: its group reads under them there.
+        exploration.update(cx, |exploration, cx| {
+            exploration.set_filters(&knows, vec![filter.clone()], cx)
+        });
+        session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        cx.run_until_parked();
+        exploration.read_with(cx, |exploration, _| {
+            assert_eq!(exploration.filters(&knows), std::slice::from_ref(&filter));
         });
     }
 
@@ -4169,51 +4053,6 @@ mod tests {
         );
     }
 
-    /// The bound a large walk raised starts over at `KEPT_READS` when the walk does: a re-root
-    /// lets go at once of what the new root cannot reach, rather than once the state has grown
-    /// to twice the old walk's size.
-    #[gpui::test]
-    async fn a_reroot_starts_the_bound_over(cx: &mut gpui::TestAppContext) {
-        use crate::test_server::followed_session;
-        let (session, _served) = followed_session(
-            SCHEMA,
-            |_| json!([{ "id": "p1", "label": "Ada", "n": 0 }]),
-            cx,
-        );
-        cx.run_until_parked();
-        let exploration = cx.update(|cx| Exploration::for_session(&session, cx));
-        exploration.update(cx, |exploration, cx| exploration.root_at(person("p1"), cx));
-        cx.run_until_parked();
-        let schema = schema();
-        let knows = group(&schema, "Person", "Knows", Direction::Outgoing);
-        exploration.update(cx, |exploration, cx| {
-            // What a walk far wider than the bound left: counts no path reaches any more.
-            let state = exploration.state.unseen();
-            for n in 0..KEPT_READS + 100 {
-                state.apply_count(GroupKey::new(person(&format!("x{n}")), knows.clone()), 1);
-            }
-            exploration.prune_at = 4 * KEPT_READS;
-            exploration.bound_reads();
-            assert!(
-                exploration.state().held() > KEPT_READS,
-                "under the raised bound"
-            );
-
-            let p2 = ExplorePath::root()
-                .child_group(&knows)
-                .child_node(&person("p2"));
-            exploration.reroot(&p2, cx);
-            assert_eq!(exploration.prune_at, KEPT_READS);
-            let far = exploration
-                .state()
-                .counts
-                .keys()
-                .filter(|key| key.node.id.starts_with('x'))
-                .count();
-            assert_eq!(far, 0, "what the new root cannot reach went");
-        });
-    }
-
     /// Past its bound, the state lets go of what nothing open reaches and keeps the rest.
     #[test]
     fn what_nothing_open_reaches_is_let_go() {
@@ -4294,6 +4133,37 @@ mod tests {
                 .as_deref(),
             Some("c0")
         );
+    }
+
+    /// A set's count is its rows' number at the commit it was read at: a set at the head read
+    /// again (Refresh, another branch) lets it go, and "Show more" goes by its pages. Before, it
+    /// kept the count it opened with, and stopped short on a branch with more rows. A set held
+    /// at a commit keeps it.
+    #[gpui::test]
+    async fn a_sets_count_goes_when_it_is_read_at_another_commit(cx: &mut gpui::TestAppContext) {
+        use crate::test_server::followed_session;
+        let (session, _served) = followed_session(SCHEMA, |_| json!([]), cx);
+        cx.run_until_parked();
+        let set = SetRoots::Filtered {
+            type_name: "Person".into(),
+            filters: Vec::new(),
+            total: Some(100),
+        };
+        let total = |exploration: &Entity<Exploration>, cx: &mut gpui::TestAppContext| {
+            exploration.read_with(cx, |exploration, _| match &exploration.state().set {
+                Some(SetRoots::Filtered { total, .. }) => *total,
+                _ => panic!("a filtered set"),
+            })
+        };
+        let at_head = cx.update(|cx| Exploration::for_set(&session, set.clone(), None, cx));
+        let held = cx.update(|cx| Exploration::for_set(&session, set, Some("c1".into()), cx));
+        cx.run_until_parked();
+        assert_eq!(total(&at_head, cx), Some(100), "as it opened");
+        at_head.update(cx, |exploration, cx| exploration.refresh(cx));
+        held.update(cx, |exploration, cx| exploration.refresh(cx));
+        cx.run_until_parked();
+        assert_eq!(total(&at_head, cx), None);
+        assert_eq!(total(&held, cx), Some(100), "held at its commit");
     }
 
     /// A set's rows sit at the top of the tree, each its own path, with "Show more" while pages

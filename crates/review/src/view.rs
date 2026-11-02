@@ -1807,14 +1807,14 @@ impl ReviewView {
         };
         let title = format!("{} {}", change.type_name, change.id);
         let key = change.key();
-        let branch = self.branch.clone();
+        let scope = self.session.read(cx).write_scope(&self.branch, cx);
         let view = cx.entity().downgrade();
         let Some(workspace) = workspace_for(window) else {
             return;
         };
         workspace.update(cx, |workspace, cx| {
             workspace.toggle_modal(window, cx, move |window, cx| {
-                crate::edit::EditModal::new(view, key, title, branch, values, window, cx)
+                crate::edit::EditModal::new(view, key, title, scope, values, window, cx)
             })
         });
     }
