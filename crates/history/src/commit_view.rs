@@ -867,6 +867,11 @@ pub(crate) fn open_listed(
     };
     let (session, listed) = (session.clone(), commit.clone());
     workspace.update(cx, |workspace, cx| {
+        // The click came from History, the active tab: a preview it opens must not take its
+        // place (spec 020, the source tab is never replaced).
+        if preview {
+            workspace.keep_active_tab(cx);
+        }
         open_in(workspace, session, id, Some(listed), preview, window, cx)
     });
 }
@@ -1453,6 +1458,48 @@ mod tests {
         let times = |end: &str| asked.iter().filter(|path| path.ends_with(end)).count();
         assert_eq!(times("/commits/c0/changes"), 1);
         assert_eq!(times("/commits/c9/changes"), 1);
+    }
+
+    /// A commit previewed from a History tab that is itself the preview keeps History: the
+    /// preview slot goes to the commit, and History stays as a tab of its own (spec 020).
+    #[gpui::test]
+    async fn a_commit_previewed_from_a_preview_history_keeps_it(cx: &mut TestAppContext) {
+        let (session, _asked) = held_commit_session(Duration::from_secs(5), cx);
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let history = workspace.update_in(cx, |workspace, window, cx| {
+            let session = session.clone();
+            workspace.open_item_with::<crate::view::HistoryView>(
+                crate::view::history_key("main"),
+                true,
+                window,
+                cx,
+                |window, cx| crate::view::HistoryView::new(session, "main".into(), window, cx),
+            )
+        });
+        cx.run_until_parked();
+        let history = history.expect("History opened");
+        let listed: CommitOutput = serde_json::from_value(
+            json!({ "graph_commit_id": "c7", "graph_manifest_version": 1, "kind": "published", "created_at": 0, "parent_commit_id": "c6" }),
+        )
+        .unwrap();
+        cx.update(|window, cx| open_listed(&session, &listed, true, window, cx));
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            let ids: Vec<_> = workspace
+                .items()
+                .iter()
+                .map(|item| item.item_id())
+                .collect();
+            assert_eq!(ids.len(), 2, "History stayed beside the commit");
+            assert_eq!(ids[0], history.entity_id());
+            assert!(
+                workspace
+                    .active_item()
+                    .and_then(|item| item.to_any().downcast::<CommitView>().ok())
+                    .is_some(),
+                "the commit's tab is active"
+            );
+        });
     }
 
     /// A commit History lists opens in its own tab with the commit as listed: the tab reads its

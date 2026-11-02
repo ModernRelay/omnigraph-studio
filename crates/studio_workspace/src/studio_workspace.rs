@@ -3142,7 +3142,12 @@ impl Workspace {
                         let workspace = workspace.clone();
                         let id = id.clone();
                         ContextMenu::build(window, cx, move |mut menu, _, _| {
-                            for to in PanelPosition::ALL {
+                            // The right dock is the inspector's: it has no panel buttons, so
+                            // a panel moved there would have no way back.
+                            for to in PanelPosition::ALL
+                                .into_iter()
+                                .filter(|to| *to != PanelPosition::Right)
+                            {
                                 let workspace = workspace.clone();
                                 let id = id.clone();
                                 menu = menu.toggleable_entry(
@@ -5142,10 +5147,18 @@ fn lights_room(shown: bool) -> Option<f32> {
 
 /// The dock a panel goes in: where the settings place it, else its own.
 fn placed(id: &str, home: PanelPosition, cx: &App) -> PanelPosition {
-    cx.try_global::<StudioSettings>()
+    let saved = cx
+        .try_global::<StudioSettings>()
         .and_then(|settings| settings.panels.get(id))
         .and_then(|placement| placement.dock)
-        .map_or(home, PanelPosition::from_side)
+        .map(PanelPosition::from_side);
+    match saved {
+        // The right dock is the inspector's alone: a panel saved there (by an earlier build)
+        // goes home, where it has a button.
+        Some(PanelPosition::Right) if id != INSPECTOR_PANEL => home,
+        Some(position) => position,
+        None => home,
+    }
 }
 
 /// The action that shows or hides a dock.
@@ -7031,6 +7044,21 @@ mod tests {
             assert_eq!(placed_in(workspace, "types"), Some(PanelPosition::Left));
             workspace.activate_panel("explore", cx);
             assert!(workspace.bottom.open);
+        });
+        // Saved in the right dock, the inspector's, a panel goes home: it would have no button.
+        cx.update(|_, cx| {
+            let mut settings = StudioSettings::default();
+            settings.panels.insert(
+                "explore".into(),
+                studio_settings::PanelPlacement {
+                    dock: Some(studio_settings::DockSide::Right),
+                },
+            );
+            cx.set_global(settings);
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, _, _| {
+            assert_eq!(placed_in(workspace, "explore"), Some(PanelPosition::Left));
         });
         // The setting goes: explore goes home, still showing.
         cx.update(|_, cx| cx.set_global(StudioSettings::default()));

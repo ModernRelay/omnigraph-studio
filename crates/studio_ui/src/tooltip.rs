@@ -1,8 +1,9 @@
 //! Tooltips under their control (spec 002, "Visual language"): GPUI draws a tooltip at the
 //! pointer, so one over a short control in a toolbar lands on the rows beneath, and its place
 //! follows wherever the pointer was. Studio's tooltips are anchored instead: the control
-//! records its bounds as it is laid out ([`Anchor`]), and the tooltip draws under the
-//! control's left edge, a gap below it, flipping above when the window ends first.
+//! records its bounds as it is laid out ([`Anchor`]), and the tooltip hangs under the
+//! control's left edge, a gap below it, or over the control when the window ends first, and
+//! is measured where it draws so it stays inside the window.
 //!
 //! Views take [`Tipped::tip`] with [`tooltip`], [`tooltip_for_action`] and
 //! [`tooltip_for_action_in`] (`script/check-design-tokens.py` refuses `ui::Tooltip` and a bare
@@ -15,7 +16,7 @@ use std::rc::Rc;
 
 use gpui::{
     Action, AnyView, App, Bounds, Context, Div, FocusHandle, Pixels, Point, Render, Size, Stateful,
-    Window, canvas, point, px,
+    Window, anchored, canvas, point, px,
 };
 use ui::prelude::*;
 use ui::{KeyBinding, Tooltip as ZedTooltip};
@@ -112,22 +113,34 @@ impl TipContent {
         self
     }
 
-    /// The tooltip as a view at the pointer, for [`Tipped::tip_fn`], which shifts it to the
+    /// How many lines it takes: the title, and the detail under it.
+    fn lines(&self) -> usize {
+        1 + usize::from(self.meta.is_some())
+    }
+
+    /// The tooltip as a view at the pointer, for [`Tipped::tip_fn`], which hangs it from the
     /// control.
     pub fn into_view(self, cx: &mut App) -> AnyView {
         cx.new(|_| Tip {
             content: self,
-            offset: Point::default(),
+            at: None,
         })
         .into()
     }
 }
 
-/// The tooltip's own view: the content in Studio's floating surface, drawn `offset` from where
-/// GPUI puts a tooltip (the pointer).
+/// Where a tooltip hangs from: a corner of it at a point of the window.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Placement {
+    origin: Point<Pixels>,
+    corner: gpui::Anchor,
+}
+
+/// The tooltip's own view: the content in Studio's floating surface, hung at `at`, or off the
+/// pointer where GPUI puts a tooltip when it has no place.
 struct Tip {
     content: TipContent,
-    offset: Point<Pixels>,
+    at: Option<Placement>,
 }
 
 impl Render for Tip {
@@ -139,8 +152,9 @@ impl Render for Tip {
             }
             None => None,
         };
-        shifted(
-            self.offset,
+        placed(
+            self.at,
+            Point::default(),
             ds::menu_surface(v_flex(), cx)
                 .max_w(px(size::TOOLTIP_WIDTH))
                 .py(px(space::XS))
@@ -159,31 +173,47 @@ impl Render for Tip {
     }
 }
 
-/// A tooltip's frame holding `content`, `offset` from where GPUI puts it (the pointer): GPUI
-/// lays the view out as a root, where a margin moves nothing, so the frame is a child set off
-/// its zero-sized root.
-fn shifted(offset: Point<Pixels>, content: impl IntoElement) -> Div {
-    div().relative().size_0().child(
-        div()
-            .absolute()
-            .left(offset.x)
-            .top(offset.y)
-            .flex()
-            .flex_none()
-            .child(content),
-    )
+/// A tooltip's frame holding `content`, hung at `at` in the window by GPUI's `anchored`, which
+/// measures the frame and keeps it inside the window; `pull` is what the content sets itself
+/// off by (Zed's own tooltip view), taken back. GPUI lays the tooltip view out as a root, where
+/// a margin moves nothing, so the frame hangs off a zero-sized root. With no place (the control
+/// not laid out yet, or one that cannot be positioned) it sits off the pointer, as Zed's does.
+fn placed(at: Option<Placement>, pull: Point<Pixels>, content: impl IntoElement) -> Div {
+    let root = div().relative().size_0();
+    match at {
+        Some(Placement { origin, corner }) => root.child(
+            anchored()
+                .position(origin - pull)
+                .anchor(corner)
+                .snap_to_window_with_margin(px(space::SM))
+                .child(div().flex().flex_none().child(content)),
+        ),
+        None => {
+            let inset = point(px(size::ZED_TOOLTIP_INSET.0), px(size::ZED_TOOLTIP_INSET.1)) - pull;
+            root.child(
+                div()
+                    .absolute()
+                    .left(inset.x)
+                    .top(inset.y)
+                    .flex()
+                    .flex_none()
+                    .child(content),
+            )
+        }
+    }
 }
 
-/// A tooltip view made elsewhere, drawn `offset` from the pointer: Zed's own carries its
-/// pointer inset, pulled back so it sits where Studio's would.
+/// A tooltip view made elsewhere, hung at `at`: Zed's own carries its pointer inset, pulled
+/// back so it sits where Studio's would.
 struct Shifted {
     inner: AnyView,
-    offset: Point<Pixels>,
+    at: Option<Placement>,
+    pull: Point<Pixels>,
 }
 
 impl Render for Shifted {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        shifted(self.offset, self.inner.clone())
+        placed(self.at, self.pull, self.inner.clone())
     }
 }
 
@@ -206,16 +236,12 @@ impl Anchor {
             .inset_0()
     }
 
-    /// How far from the pointer the tooltip draws: under the control's left edge, a gap below
-    /// it, kept inside the window and flipped above when the window ends first. `None` before
-    /// the control was laid out, when GPUI's place stands.
-    fn offset(&self, window: &Window) -> Option<Point<Pixels>> {
+    /// Where the tooltip hangs: under the control's left edge, a gap below it, or over the
+    /// control when `lines` of it would not fit under. `None` before the control was laid out,
+    /// when GPUI's place stands.
+    fn placement(&self, lines: usize, window: &Window) -> Option<Placement> {
         let bounds = self.0.get()?;
-        Some(place(
-            bounds,
-            window.mouse_position(),
-            window.viewport_size(),
-        ))
+        Some(place(bounds, lines, window.viewport_size()))
     }
 
     /// The builder GPUI calls when the control is hovered: `content` at the anchor.
@@ -225,17 +251,14 @@ impl Anchor {
     ) -> impl Fn(&mut Window, &mut App) -> AnyView + use<> {
         let anchor = self.clone();
         move |window, cx| {
-            // Unanchored, it keeps clear of the pointer as Zed's does.
-            let offset = anchor.offset(window).unwrap_or_else(|| {
-                point(px(size::ZED_TOOLTIP_INSET.0), px(size::ZED_TOOLTIP_INSET.1))
-            });
+            let at = anchor.placement(content.lines(), window);
             let content = content.clone();
-            cx.new(|_| Tip { content, offset }).into()
+            cx.new(|_| Tip { content, at }).into()
         }
     }
 
-    /// The builder for a tooltip made by `build` (one that depends on state): its view, shifted
-    /// to the anchor.
+    /// The builder for a tooltip made by `build` (one that depends on state): its view, hung
+    /// from the anchor.
     pub fn builder_fn<F: Fn(&mut Window, &mut App) -> AnyView + 'static>(
         &self,
         build: F,
@@ -243,7 +266,7 @@ impl Anchor {
         let anchor = self.clone();
         move |window, cx| {
             let inner = build(window, cx);
-            let Some(offset) = anchor.offset(window) else {
+            let Some(at) = anchor.placement(1, window) else {
                 return inner;
             };
             let pull = if inner.entity_type() == TypeId::of::<ZedTooltip>() {
@@ -253,30 +276,33 @@ impl Anchor {
             };
             cx.new(|_| Shifted {
                 inner,
-                offset: offset - pull,
+                at: Some(at),
+                pull,
             })
             .into()
         }
     }
 }
 
-/// How far from the pointer a tooltip draws for a control at `bounds`: under its left edge,
-/// a gap below it, kept inside a window of `viewport`, and above the control when the window
-/// ends first. GPUI puts a tooltip one pixel past the pointer.
-fn place(bounds: Bounds<Pixels>, mouse: Point<Pixels>, viewport: Size<Pixels>) -> Point<Pixels> {
+/// Where a tooltip of `lines` hangs for a control at `bounds` in a window of `viewport`: its
+/// top-left corner a gap under the control's left edge, or its bottom-left corner a gap over
+/// the control when that many lines would run past the window's bottom. Its width is measured
+/// where it draws, and kept inside the window there.
+fn place(bounds: Bounds<Pixels>, lines: usize, viewport: Size<Pixels>) -> Placement {
     let gap = px(space::SM);
-    let x = bounds
-        .left()
-        .min(viewport.width - px(size::TOOLTIP_WIDTH) - gap)
-        .max(gap);
     let below = bounds.bottom() + gap;
-    let y = if below + px(size::TOOLTIP_HEIGHT) > viewport.height {
-        bounds.top() - gap - px(size::TOOLTIP_HEIGHT)
+    let height = px(size::TOOLTIP_HEIGHT * lines.max(1) as f32);
+    if below + height > viewport.height {
+        Placement {
+            origin: point(bounds.left(), bounds.top() - gap),
+            corner: gpui::Anchor::BottomLeft,
+        }
     } else {
-        below
-    };
-    let placed = mouse + point(px(1.), px(1.));
-    point(x - placed.x, y - placed.y)
+        Placement {
+            origin: point(bounds.left(), below),
+            corner: gpui::Anchor::TopLeft,
+        }
+    }
 }
 
 /// A control that takes an anchored tooltip.
@@ -356,28 +382,37 @@ mod tests {
         );
     }
 
-    /// A tooltip draws under its control's left edge, a gap below it, wherever the pointer is
-    /// in the control; at the window's right it stays inside; at the bottom it flips above.
+    /// A tooltip hangs under its control's left edge, a gap below it; at the window's bottom it
+    /// hangs over the control instead, and a taller tooltip flips sooner.
     #[test]
     fn a_tooltip_sits_under_its_control_and_flips_at_the_bottom() {
         let viewport = size(px(1000.), px(600.));
-        let control = Bounds::new(point(px(200.), px(100.)), size(px(60.), px(22.)));
         let gap = px(space::SM);
-        for mouse in [point(px(210.), px(105.)), point(px(255.), px(120.))] {
-            let offset = place(control, mouse, viewport);
-            // Where GPUI draws it, one pixel past the pointer, plus the offset.
-            let drawn = mouse + point(px(1.), px(1.)) + offset;
-            assert_eq!(drawn, point(px(200.), px(122.) + gap), "{mouse:?}");
-        }
-        let at_right = Bounds::new(point(px(980.), px(100.)), size(px(20.), px(22.)));
-        let drawn = point(px(985.), px(110.))
-            + point(px(1.), px(1.))
-            + place(at_right, point(px(985.), px(110.)), viewport);
-        assert_eq!(drawn.x, px(1000.) - px(size::TOOLTIP_WIDTH) - gap);
+        let control = Bounds::new(point(px(200.), px(100.)), size(px(60.), px(22.)));
+        assert_eq!(
+            place(control, 1, viewport),
+            Placement {
+                origin: point(px(200.), px(122.) + gap),
+                corner: gpui::Anchor::TopLeft,
+            }
+        );
         let at_bottom = Bounds::new(point(px(200.), px(580.)), size(px(60.), px(20.)));
-        let drawn = point(px(210.), px(590.))
-            + point(px(1.), px(1.))
-            + place(at_bottom, point(px(210.), px(590.)), viewport);
-        assert_eq!(drawn.y, px(580.) - gap - px(size::TOOLTIP_HEIGHT));
+        assert_eq!(
+            place(at_bottom, 1, viewport),
+            Placement {
+                origin: point(px(200.), px(580.) - gap),
+                corner: gpui::Anchor::BottomLeft,
+            }
+        );
+        // Under a control 50 px from the bottom one line fits; two do not.
+        let near_bottom = Bounds::new(point(px(200.), px(530.)), size(px(60.), px(20.)));
+        assert_eq!(
+            place(near_bottom, 1, viewport).corner,
+            gpui::Anchor::TopLeft
+        );
+        assert_eq!(
+            place(near_bottom, 2, viewport).corner,
+            gpui::Anchor::BottomLeft
+        );
     }
 }
