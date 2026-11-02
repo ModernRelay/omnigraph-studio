@@ -1765,7 +1765,6 @@ impl Workspace {
         cx.defer_in(window, |this, _, _| this.open_beside = false);
     }
 
-    /// Whether the active tab offers a view that can open now.
     /// The views the active tab offers to open: neither the one it is nor one that cannot open.
     fn offers_view(&self, cx: &App) -> Vec<ViewKind> {
         self.active_item().map_or_else(Vec::new, |item| {
@@ -3326,10 +3325,6 @@ impl Workspace {
         self.activate_in(self.active_pane, index, false, window, cx);
     }
 
-    /// Where the window reads, the first part of the bar's breadcrumb: the connection's status
-    /// dot, the server and the graph. It opens the graph switcher: the graphs open in this
-    /// window, another graph, closing this one. The connection's state shows beside it only
-    /// when it is not ready, and always in its tooltip, with the round trip and the actor.
     /// Whether the window's server answers: its connection is ready.
     fn server_ready(&self, cx: &App) -> bool {
         self.session.as_ref().is_some_and(|session| {
@@ -3363,6 +3358,10 @@ impl Workspace {
         }));
     }
 
+    /// Where the window reads, the first part of the bar's breadcrumb: the connection's status
+    /// dot, the server and the graph. It opens the graph switcher: the graphs open in this
+    /// window, another graph, closing this one. The connection's state shows beside it only
+    /// when it is not ready, and always in its tooltip, with the round trip and the actor.
     fn render_graph_switcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (color, server, url, state, ready, actor, graph, unavailable) = match &self.session {
             Some(session) => {
@@ -6576,11 +6575,14 @@ mod tests {
     }
 
     /// A view opens from a preview tab without taking its place, and Back returns to it; a view
-    /// that is open is activated where it is (spec 020).
+    /// that is open is activated where it is (spec 020). Drawn, the window offers the view's
+    /// key, as the frame asked the tab what it offers.
     #[gpui::test]
     fn opening_a_view_keeps_its_source(cx: &mut gpui::TestAppContext) {
         let (workspace, cx, source) = views_workspace(cx, None);
+        cx.run_until_parked();
         workspace.update_in(cx, |workspace, window, cx| {
+            assert!(window.is_action_available(&OpenAsCanvas, cx));
             workspace.open_view(ViewKind::Canvas, false, window, cx);
         });
         cx.run_until_parked();

@@ -398,7 +398,6 @@ impl SettingsView {
         self.text_inputs[index].shown = typed;
     }
 
-    /// Text field `index`'s control: the field, which Enter writes.
     /// The OpenRouter key row (spec 019): whether the keychain holds one, a field to store
     /// one, Remove, and where provider keys are set.
     fn key_control(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -534,6 +533,7 @@ impl SettingsView {
         .detach();
     }
 
+    /// Text field `index`'s control: the field, which Enter writes.
     fn text_control(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         ds::field_frame(false, cx)
             .key_context("SettingsField")

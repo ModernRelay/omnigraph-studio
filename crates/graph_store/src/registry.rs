@@ -25,6 +25,9 @@ use crate::sign_in::{self, PlatformKeychain, SignInContext};
 
 /// How often the CLI's files are checked for a change, as Studio's settings file is.
 const OPERATOR_POLL: Duration = Duration::from_secs(2);
+/// How many first listings that did not happen (the CLI busy, a slow first start) are taken
+/// again before what waits for the targets goes on without them.
+const FIRST_LISTING_TRIES: u32 = 5;
 
 /// Makes the HTTP client for a CLI target whose `transport` names a proxy or its own certificate
 /// authority.
@@ -120,6 +123,9 @@ pub struct ConnectionRegistry {
     /// servers are not known, and what looks for one waits ([`Self::when_listed`]).
     listed: bool,
     listing_waiters: Vec<oneshot::Sender<()>>,
+    /// The first listings that did not happen ([`CliTargets::lists_again`]) since the start
+    /// asked for one, up to [`FIRST_LISTING_TRIES`].
+    unlisted_tries: u32,
     /// The graph ids remembered for each CLI target, as last read or saved.
     known: KnownGraphs,
     /// What a CLI server's connection signs in with when its server asks (spec 016): `None` in
@@ -375,6 +381,38 @@ impl ConnectionRegistry {
         }
     }
 
+    /// Adds servers as the CLI would, without one: a server added is listed at once as a
+    /// target of that name and address that takes no token, for the tests of what an add does
+    /// once it lands.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn add_targets_in_memory_for_tests(&mut self) {
+        let added: Arc<std::sync::Mutex<Vec<CliServer>>> = Arc::default();
+        let listed = added.clone();
+        self.adder = Arc::new(move |_, name, url, _| {
+            added.lock().unwrap().push(CliServer {
+                endpoint: format!("{url}/"),
+                name,
+                url,
+                graphs: Vec::new(),
+                auth: CliAuth::Anonymous,
+                transport: CliTransport::default(),
+                alternatives: Vec::new(),
+                revision: "1".into(),
+            });
+            async { Ok(()) }.boxed()
+        });
+        self.lister = Arc::new(move |_, _, _| {
+            let servers = listed.lock().unwrap().clone();
+            async move {
+                CliTargets {
+                    servers: Some(servers),
+                    ..CliTargets::default()
+                }
+            }
+            .boxed()
+        });
+    }
+
     /// Takes `platform` as the system Studio runs on, for the tests of what Studio does where
     /// the CLI gives it no token (Windows).
     #[cfg(any(test, feature = "test-support"))]
@@ -509,6 +547,7 @@ impl ConnectionRegistry {
             cli_kept: HashMap::new(),
             listed: true,
             listing_waiters: Vec::new(),
+            unlisted_tries: 0,
             known: KnownGraphs::default(),
             sign_in: None,
             saving: false,
@@ -552,6 +591,7 @@ impl ConnectionRegistry {
     /// [`Self::listed`].
     fn start_listing(&mut self, cx: &mut Context<Self>) {
         self.listed = false;
+        self.unlisted_tries = 0;
         self.watched = self
             .operator_dir
             .iter()
@@ -642,6 +682,13 @@ impl ConnectionRegistry {
                     .update(cx, |this, cx| {
                         // A CLI that moved since the start's listing asks every token again.
                         let asks_again = cli_moved && !listing;
+                        // A first listing that may pass is taken again at the next check
+                        // before what waits for the targets goes on, a few times at most: taken
+                        // as the targets, it would close the reopened windows of every target
+                        // it missed, and refuse a link to one.
+                        let held_back = listing
+                            && targets.lists_again()
+                            && this.unlisted_tries < FIRST_LISTING_TRIES;
                         this.cli_stamp = cli_stamp;
                         this.keep_stamp(&targets);
                         let changed = this.apply_cli_targets(targets, prepared, cx);
@@ -652,7 +699,11 @@ impl ConnectionRegistry {
                             this.save(cx);
                             cx.notify();
                         }
-                        this.finish_listing(cx);
+                        if held_back {
+                            this.unlisted_tries += 1;
+                        } else {
+                            this.finish_listing(cx);
+                        }
                     })
                     .is_ok();
                 if !alive {
@@ -1917,7 +1968,23 @@ mod tests {
         });
         assert!(!listed.load(Ordering::SeqCst), "waiting for the listing");
 
+        // A first listing that did not happen (the CLI busy) is taken again at the next check,
+        // and what waits for the targets waits on: taken as the targets, it would close every
+        // reopened window.
+        let retried = listing.next();
         answer
+            .send(cli_config::unlisted(
+                &cli_config::config_path(&dir),
+                "the CLI was busy".into(),
+            ))
+            .ok();
+        cx.run_until_parked();
+        assert!(!listed.load(Ordering::SeqCst), "still waiting");
+        cx.executor().advance_clock(OPERATOR_POLL);
+        cx.run_until_parked();
+        assert_eq!(listing.asked(), 2, "listed again");
+
+        retried
             .send(files(vec![server("a", "http://a.test", "1")]))
             .ok();
         cx.run_until_parked();

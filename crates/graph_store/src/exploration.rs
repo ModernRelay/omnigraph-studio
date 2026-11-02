@@ -1463,8 +1463,9 @@ impl DerefMut for Flattened {
     }
 }
 
-/// One session's exploration. Get it with [`Exploration::for_session`]; the tree and the
-/// canvas of a session share it.
+/// One walk of a session's graph: from a root, at a commit or the branch head
+/// ([`Exploration::for_walk`], shared by the tree and the canvas showing it), over a set of
+/// nodes ([`Exploration::for_set`]), or with no root ([`Exploration::unrooted`]).
 pub struct Exploration {
     session: Entity<GraphSession>,
     state: Flattened,
@@ -1519,7 +1520,8 @@ impl Exploration {
         self.session.read(cx).options(cx).tree_page_size.max(1)
     }
 
-    /// The exploration of `session`, created on first use.
+    /// The walk of `session` from `root`, at `at_commit` or the branch head, created on first
+    /// use: the tree and the canvas showing that walk share it.
     pub fn for_walk(
         session: &Entity<GraphSession>,
         root: NodeRef,
@@ -1857,7 +1859,8 @@ impl Exploration {
             LoadTarget::Root => true,
         });
         // What those reads marked as being read goes with them, or the grouping switched back
-        // to would wait on reads nobody makes. What came in stays, for a switch back.
+        // to would wait on reads nobody makes. What came in stays, for a switch back: a value's
+        // rows whose next page was being read stay, that page to be asked for again.
         let state = self.state.unseen();
         let ours = |key: &GroupKey| key.group == *group;
         state
@@ -1867,7 +1870,11 @@ impl Exploration {
             !ours(key) || key.within.is_none() || !matches!(count, Loadable::Loading)
         });
         state.neighbours.retain(|key, list| {
-            !ours(key) || key.within.is_none() || !matches!(list.status, PageStatus::Loading)
+            if !ours(key) || key.within.is_none() || list.status != PageStatus::Loading {
+                return true;
+            }
+            list.status = PageStatus::Idle;
+            !list.rows.is_empty()
         });
         self.request_missing(cx);
         self.changed(cx);
@@ -3288,6 +3295,26 @@ mod tests {
                 property: "out:WorksAt".into(),
             };
             exploration.set_grouping(&knows, Some(by_name.clone()), cx);
+            // A value whose first page is in and whose next is being read keeps its rows, its
+            // next page to be asked for again; one with none in yet is let go.
+            let ada = GroupKey::new(person("p1"), knows.clone());
+            let (bob, eve) = (
+                ada.with_value(&by_name, &BucketValue("Bob".into())),
+                ada.with_value(&by_name, &BucketValue("Eve".into())),
+            );
+            let reading = |rows: Vec<Neighbour>| NeighbourList {
+                rows,
+                status: PageStatus::Loading,
+                ..NeighbourList::default()
+            };
+            let row = Neighbour {
+                node: person("p2"),
+                label: None,
+                edge: Vec::new(),
+            };
+            let state = exploration.state.unseen();
+            state.neighbours.insert(bob.clone(), reading(vec![row]));
+            state.neighbours.insert(eve.clone(), reading(Vec::new()));
             let asked = |exploration: &Exploration, by: &GroupBy| {
                 exploration
                     .tasks
@@ -3300,6 +3327,9 @@ mod tests {
                 !asked(exploration, &by_name),
                 "the first grouping's read let go"
             );
+            let kept = &exploration.state.neighbours[&bob];
+            assert_eq!((kept.rows.len(), &kept.status), (1, &PageStatus::Idle));
+            assert!(!exploration.state.neighbours.contains_key(&eve));
             // Switched back before it answered, the first grouping is read again: its read let
             // go leaves no mark that it is being read.
             exploration.set_grouping(&knows, Some(by_name.clone()), cx);

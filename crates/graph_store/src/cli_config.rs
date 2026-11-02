@@ -212,6 +212,16 @@ pub struct CliTargets {
     pub managed: Vec<ManagedTarget>,
 }
 
+impl CliTargets {
+    /// Whether this is a listing that did not happen and is taken again at the next check
+    /// ([`unlisted`]): the CLI busy, or slow to start or to answer.
+    pub(crate) fn lists_again(&self) -> bool {
+        self.watched
+            .iter()
+            .any(|(_, stamp)| *stamp == Some(UNLISTED))
+    }
+}
+
 /// Lists the targets of the operator home in `dir` with the first CLI of `programs` Studio can
 /// drive, in one turn at the CLI, as they land on `platform` ([`servers_from`]). No directory is
 /// no servers.
@@ -308,22 +318,29 @@ async fn name_organizations(
         else {
             continue;
         };
-        if let Some((_, known)) = named.iter().find(|(read, _)| read == profile) {
-            organization.clone_from(known);
-            continue;
-        }
-        let found = match cli_tokens::profile_organization(cli, turn, profile).await {
-            Ok(found) => found,
-            Err(why) => {
-                read.errors.push(format!(
-                    "Studio could not read which organization CLI profile '{profile}' is in \
-                     ({why}), so a sign-in to its clusters is checked by the server alone"
-                ));
-                None
+        let found = match named.iter().find(|(read, _)| read == profile) {
+            Some((_, known)) => known.clone(),
+            None => {
+                let found = match cli_tokens::profile_organization(cli, turn, profile).await {
+                    Ok(found) => found,
+                    Err(why) => {
+                        read.errors.push(format!(
+                            "Studio could not read which organization CLI profile '{profile}' \
+                             is in ({why}), so a sign-in to its clusters is checked by the \
+                             server alone"
+                        ));
+                        None
+                    }
+                };
+                named.push((profile.clone(), found.clone()));
+                found
             }
         };
         organization.clone_from(&found);
-        named.push((profile.clone(), found));
+        // The organization is the profile's, not the target's: a change of it alone gives the
+        // target a new revision, so its token source, which checks a sign-in against it, is
+        // made again.
+        server.revision.push_str(&format!(" {found:?}"));
     }
 }
 

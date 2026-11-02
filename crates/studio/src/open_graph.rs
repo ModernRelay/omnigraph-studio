@@ -1958,6 +1958,12 @@ mod tests {
     /// typed in while the add ran keeps what was typed. Before, every field was cleared.
     #[gpui::test]
     fn a_field_typed_in_while_a_server_is_added_keeps_its_text(cx: &mut TestAppContext) {
+        let (registry, _) = cx.update(ConnectionRegistry::init_for_tests);
+        registry.update(cx, |registry, _| {
+            // Where the CLI gives a token, so the token typed is taken (not on Windows).
+            registry.set_platform_for_tests(Platform::Unix);
+            registry.add_targets_in_memory_for_tests();
+        });
         let (modal, cx) = dialog(Vec::new(), cx);
         modal.update_in(cx, |modal, window, cx| {
             let typed = |editor: &Entity<Editor>, text: &str, window: &mut Window, cx: &mut App| {
@@ -1966,18 +1972,17 @@ mod tests {
             typed(&modal.new_name, "work", window, cx);
             typed(&modal.new_url, "https://graph.test", window, cx);
             typed(&modal.new_token, "secret", window, cx);
-            let added = [
-                "work".to_owned(),
-                "https://graph.test".into(),
-                "secret".into(),
-            ];
+            modal.add_server(window, cx);
             // The next server's address, typed while the first is added.
             typed(&modal.new_url, "https://next.test", window, cx);
-            modal.clear_added(&added, window, cx);
-            let text = |editor: &Entity<Editor>, cx: &App| editor.read(cx).text(cx);
-            assert_eq!(text(&modal.new_name, cx), "");
-            assert_eq!(text(&modal.new_url, cx), "https://next.test");
-            assert_eq!(text(&modal.new_token, cx), "");
+        });
+        cx.run_until_parked();
+        modal.read_with(cx, |modal, cx| {
+            assert_eq!(modal.error, None, "added");
+            let text = |editor: &Entity<Editor>| editor.read(cx).text(cx);
+            assert_eq!(text(&modal.new_name), "");
+            assert_eq!(text(&modal.new_url), "https://next.test");
+            assert_eq!(text(&modal.new_token), "");
         });
     }
 

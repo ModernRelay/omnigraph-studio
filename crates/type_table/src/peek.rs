@@ -1495,10 +1495,12 @@ impl NodePeek {
                 self.blobs[index].meta.loaded(),
             ),
         };
-        let slot = &mut self.blobs[index];
-        if slot.edit.as_ref().is_some_and(BlobEdit::is_saving) {
+        // One write of a slot at a time on a branch, one sent before the view left the branch
+        // and came back included, which the slot no longer marks.
+        if self.saving.on(&self.branch, property) {
             return;
         }
+        let slot = &mut self.blobs[index];
         let shown = match (&over, slot.meta.loaded()) {
             (Some(over), _) => Some(over.clone()),
             (None, Some(shown)) => Some(shown.clone()),
@@ -1605,11 +1607,9 @@ impl NodePeek {
         let (written, bound_at) = landed;
         self.saving.remove(branch, property);
         let index = self.blobs.iter().position(|slot| slot.property == property);
-        // The view reads another branch now; the write's outcome is told by its toast.
+        // The view reads another branch now, whose slots the change of branch cleared: what
+        // they mark is that branch's own. The write's outcome is told by its toast.
         if self.branch != branch {
-            if let Some(index) = index {
-                self.blobs[index].edit = None;
-            }
             cx.notify();
             return;
         }
@@ -1751,7 +1751,7 @@ impl NodePeek {
         v_flex()
             .gap(px(space::MD))
             .children(self.blobs.iter().enumerate().map(|(index, slot)| {
-                let saving = slot.edit.as_ref().is_some_and(BlobEdit::is_saving);
+                let saving = self.saving.on(&self.branch, &slot.property);
                 let facts = match &slot.meta {
                     _ if saving => format!("saving to {}…", self.branch),
                     Loadable::Loaded(BlobMeta::Managed { size, .. }) => {
@@ -1970,7 +1970,7 @@ impl NodePeek {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let cell = self.blob_cell(&slot.property);
-        let saving = slot.edit.as_ref().is_some_and(BlobEdit::is_saving);
+        let saving = self.saving.on(&self.branch, &slot.property);
         let pinned = self.held_commit();
         let upload_refusal = self.blob_write_refusal(&slot.property, cx);
         let clear_refusal = blob_write::clear_refusal(
@@ -8301,7 +8301,8 @@ mod tests {
 
     /// A file still being stored when the view moves to another branch goes on to the branch
     /// left: the new branch's slot does not show it as going, the view compares the new
-    /// branch's head moves again, and the write's landing changes nothing there.
+    /// branch's head moves again, and the write's landing changes nothing there, not the mark
+    /// of that branch's own write. Back on its branch, it holds a second write back.
     #[gpui::test]
     async fn a_blob_write_out_stays_with_the_branch_left(cx: &mut TestAppContext) {
         let (view, session, blobs, cx) = page_with_doc(Some(b"old"), None, cx);
@@ -8320,12 +8321,31 @@ mod tests {
             assert!(view.saving.on("main", "doc"), "main's write is still out");
             assert_eq!(view.blobs[0].edit, None);
         });
+
+        // Back on main while its write is out, a second write of the slot is held back.
+        session.update(cx, |session, cx| session.set_branch("main".into(), cx));
+        cx.run_until_parked();
+        view.update(cx, |view, cx| view.clear_blob("doc", cx));
+        view.read_with(cx, |view, _| assert_eq!(view.blobs[0].edit, None));
+
+        // On fix again, a write of fix's own goes to the slot.
+        session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            view.blobs[0].edit = Some(BlobEdit::Saving(BlobChange::Clear));
+            view.saving.insert("fix", "doc");
+        });
         open.send(()).ok();
         cx.run_until_parked();
-        assert_eq!(blobs.writes.lock().unwrap()[0].branch, "main");
+        let writes = blobs.writes.lock().unwrap().clone();
+        assert_eq!(writes.len(), 1, "the second write was held back");
+        assert_eq!(writes[0].branch, "main");
         view.read_with(cx, |view, _| {
-            assert_eq!(view.blobs[0].edit, None);
-            assert!(view.saving.is_empty());
+            assert!(
+                matches!(view.blobs[0].edit, Some(BlobEdit::Saving(_))),
+                "fix's own"
+            );
+            assert!(view.saving.on("fix", "doc") && !view.saving.any_on("main"));
         });
     }
 

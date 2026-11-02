@@ -138,7 +138,15 @@ mod tests {
         assert!(text.contains(&shown), "{text}");
         // Characters of many bytes each are cut to the byte bound too.
         let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}".repeat(VALUE_CHARS);
-        let shown = shown_value(&family);
+        let text = input(
+            &target,
+            &[("notes".into(), Value::from(family))],
+            "the city",
+        );
+        let shown = text
+            .lines()
+            .find_map(|line| line.strip_prefix("- notes: "))
+            .expect("the value's line");
         assert!(shown.len() <= VALUE_BYTES, "{}", shown.len());
         assert!(shown.ends_with('…'));
         assert_eq!(
