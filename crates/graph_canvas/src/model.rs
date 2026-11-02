@@ -491,9 +491,11 @@ pub fn explore_scene(
 fn left_out(entry: &Entry, drawn: &HashMap<SceneId, usize>, hidden: &mut HashSet<SceneId>) {
     let id = match &entry.kind {
         EntryKind::Node { node, .. } => SceneId::Node(node.clone()),
-        EntryKind::Group { key, count, .. } if matches!(count, Loadable::Loaded(n) if *n > 0) => {
-            SceneId::Hub(key.clone())
-        }
+        EntryKind::Group {
+            key,
+            count: Loadable::Loaded(n),
+            ..
+        } if *n > 0 => SceneId::Hub(key.clone()),
         EntryKind::Field {
             key,
             target: Some(_),
