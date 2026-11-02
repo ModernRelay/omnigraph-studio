@@ -231,13 +231,17 @@ stay put), IX (paged, virtualized).
 - Reading on a branch (since 2026-11-01): a table on any branch but `main` reads what the
   branch changed in its type, as the net diff from the merge base (`branches/merge-base`, then
   `/diff` a page at a time, folded per entity as review folds, up to review's cap of 20,000
-  changes), and draws it as a diff draws its lines: a row the branch added or changed on a
-  faint wash of its kind's colour (`ds::surface::wash`) with a bar of it in the gutter, a
-  changed row's changed cells on the stronger mark (`ds::surface::mark`), and the rows the
-  branch removed first, before the rows read, their last values struck through in the removed
-  colour. A removed row is on the branch no more: it is not picked, edited or opened, and a
+  changes), and draws it as a diff draws its lines, in green and red only: a row the branch
+  added on a faint wash of green (`ds::surface::wash`) with a bar of it in the gutter; a
+  changed row with the green bar and no wash, each changed cell showing what the target holds
+  struck through on the red mark beside the branch's value on the green one
+  (`ds::surface::mark`), as the review's row says a change (since 2026-11-01; before, a changed
+  row and its cells were washed in the modified colour, which said that something changed but
+  not what); and the rows the branch removed first, before the rows read, their last values
+  struck through in the removed colour. A removed row is on the branch no more: it is not picked, edited or opened, and a
   grouped table shows none (it is in no section). The toolbar counts them after the row count,
-  "+3 ~2 −1", with the kinds in words as its tooltip. The diff is read when the table is next
+  "+3 ~2 −1" (the changed count muted: its colour is in the cells), with the kinds in words as
+  its tooltip. The diff is read when the table is next
   drawn, as the rows are, and again when the rows are read at another commit (Refresh, a branch
   or schema move) or the table's own write moves its pin; a read that fails leaves the rows
   unmarked. On `main`, and at a commit, nothing is read.

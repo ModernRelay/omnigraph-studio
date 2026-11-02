@@ -285,11 +285,13 @@ const DIFF_CHANGE_CAP: usize = graph_store::REVIEW_CHANGE_CAP;
 /// How many changes one page of the diff asks for.
 const DIFF_PAGE: usize = 8_192;
 
-/// The colour a kind of change is drawn in, as review draws it.
+/// The colour a kind of change is drawn in: green for what the branch has that the target
+/// does not (an added row, a changed cell's new value), red for what it lost. A changed row is
+/// said by its cells, old value struck in red beside the new in green, as the review's rows
+/// say it; it carries no wash of its own.
 fn change_color(net: NetChange) -> Color {
     match net {
-        NetChange::Added => Color::Created,
-        NetChange::Changed => Color::Modified,
+        NetChange::Added | NetChange::Changed => Color::Created,
         NetChange::Removed => Color::Deleted,
     }
 }
@@ -394,6 +396,14 @@ impl TypeTable {
             .is_some_and(|mark| mark.changed.contains(column))
     }
 
+    /// What the cell held on the target, when the branch changed it.
+    fn cell_before(&self, id: &str, column: &str) -> Option<&Value> {
+        let mark = self.diff.as_ref()?.mark(id)?;
+        mark.changed
+            .contains(column)
+            .then(|| mark.before.get(column).unwrap_or(&Value::Null))
+    }
+
     /// The toolbar's count of what the branch changed in the type, "+3 ~2 −1" in the kinds'
     /// colours, after the row count; nothing on the target or while the branch changed nothing.
     fn render_diff_counts(&self) -> Option<AnyElement> {
@@ -421,7 +431,7 @@ impl TypeTable {
                 .gap(px(space::SM))
                 .tip(studio_ui::ds::tooltip(tooltip))
                 .children(count(added, "+", Color::Created))
-                .children(count(changed, "~", Color::Modified))
+                .children(count(changed, "~", Color::Muted))
                 .children(count(removed, "−", Color::Deleted))
                 .into_any_element(),
         )
@@ -8627,9 +8637,11 @@ impl TypeTable {
                     .max_w(content_width)
                     .group(ROW_GROUP)
                     .when(look.header, |row| row.bg(header_bg))
-                    .when_some(look.change, |row, net| {
-                        row.bg(studio_ui::ds::surface::wash(change_color(net), cx))
-                    })
+                    // A changed row is said by its cells, not by a wash.
+                    .when_some(
+                        look.change.filter(|net| *net != NetChange::Changed),
+                        |row, net| row.bg(studio_ui::ds::surface::wash(change_color(net), cx)),
+                    )
                     .when(look.picked, |row| row.bg(picked_bg))
                     .when(look.cursor, |row| row.bg(selected_bg))
                     .when(look.dimmed, |row| {
@@ -9936,11 +9948,7 @@ impl TypeTable {
             .when(col + 1 < self.columns.len(), |d| {
                 d.border_r_1().border_color(divider)
             })
-            .when(column.align_right, |d| d.justify_end())
-            // The cells the branch changed, on a stronger tint of the row's wash.
-            .when(self.cell_changed(&row.id, &column.key), |d| {
-                d.bg(studio_ui::ds::surface::mark(Color::Modified, cx))
-            });
+            .when(column.align_right, |d| d.justify_end());
         let removed = self.is_removed(&row.id);
         // The cursor and the editor are drawn as a ring over the cell, so no cell changes size.
         let ring = || {
@@ -10001,6 +10009,48 @@ impl TypeTable {
             _ => None,
         };
         let content: AnyElement = match column.property() {
+            // A cell the branch changed: what the target holds, struck in red, then the
+            // branch's value in green, as the review's row says a change.
+            Some(property)
+                if property.kind != ScalarKind::Blob
+                    && draft.is_none()
+                    && self.cell_changed(&row.id, &column.key) =>
+            {
+                let before = self
+                    .cell_before(&row.id, &column.key)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let mark = |text: String, color: Color, struck: bool| {
+                    let mut label = studio_ui::cell_text(text, cx).color(color.color(cx));
+                    if struck {
+                        label = label.struck();
+                    }
+                    // Each asks for its line and gives way when the cell is short, cut at its
+                    // edge, so two long values share the cell rather than overlap.
+                    div()
+                        .min_w_0()
+                        .flex_shrink(1.)
+                        .overflow_hidden()
+                        .px(px(space::XS))
+                        .rounded(px(studio_ui::ds::radii(cx).xs))
+                        .bg(studio_ui::ds::surface::mark(color, cx))
+                        .child(label.hug())
+                };
+                h_flex()
+                    .min_w_0()
+                    .gap(px(space::XS))
+                    .child(mark(
+                        display_value(Some(property), &before),
+                        Color::Deleted,
+                        true,
+                    ))
+                    .child(mark(
+                        display_value(Some(property), value),
+                        Color::Created,
+                        false,
+                    ))
+                    .into_any_element()
+            }
             _ if draft.is_some() => {
                 let text = draft.unwrap_or_default();
                 let empty = text.trim().is_empty();
@@ -10714,7 +10764,12 @@ mod tests {
             assert_eq!(table.row_change("p1"), Some(NetChange::Added));
             assert_eq!(table.row_change("p2"), Some(NetChange::Changed));
             assert!(table.cell_changed("p2", "name"));
+            assert_eq!(
+                table.cell_before("p2", "name"),
+                Some(&serde_json::json!("Grace H"))
+            );
             assert!(!table.cell_changed("p2", "slug"));
+            assert!(table.cell_before("p2", "slug").is_none());
             assert!(table.is_removed("p3"));
             assert_eq!(table.rows[0].value("name"), "Linus");
             assert!(table.render_diff_counts().is_some());

@@ -19,6 +19,9 @@ pub struct RowMark {
     pub net: NetChange,
     /// The columns whose value differs from the target's, for a changed row; empty otherwise.
     pub changed: HashSet<String>,
+    /// What those columns held on the target, by column: the cell shows it struck beside the
+    /// branch's value, as the review's row does.
+    pub before: Map<String, Value>,
 }
 
 /// One type's rows as a branch changed them.
@@ -41,18 +44,24 @@ impl BranchDiff {
             let Some(net) = change.net() else {
                 continue;
             };
+            let mut before = Map::new();
             let changed = match net {
-                NetChange::Changed => change
-                    .property_diffs(&[])
-                    .into_iter()
-                    .map(|diff| diff.name)
-                    .chain(
-                        change
-                            .moved_ends()
-                            .into_iter()
-                            .flat_map(|_| [FROM_COLUMN.to_owned(), TO_COLUMN.to_owned()]),
-                    )
-                    .collect(),
+                NetChange::Changed => {
+                    let mut changed: HashSet<String> = change
+                        .property_diffs(&[])
+                        .into_iter()
+                        .map(|diff| {
+                            before.insert(diff.name.clone(), diff.before.unwrap_or(Value::Null));
+                            diff.name
+                        })
+                        .collect();
+                    if let Some(((from, to), _)) = change.moved_ends() {
+                        before.insert(FROM_COLUMN.to_owned(), Value::String(from));
+                        before.insert(TO_COLUMN.to_owned(), Value::String(to));
+                        changed.extend([FROM_COLUMN.to_owned(), TO_COLUMN.to_owned()]);
+                    }
+                    changed
+                }
                 _ => HashSet::new(),
             };
             if net == NetChange::Removed
@@ -64,8 +73,14 @@ impl BranchDiff {
                     dimmed: false,
                 });
             }
-            diff.marks
-                .insert(change.id.clone(), RowMark { net, changed });
+            diff.marks.insert(
+                change.id.clone(),
+                RowMark {
+                    net,
+                    changed,
+                    before,
+                },
+            );
         }
         diff
     }
@@ -199,6 +214,7 @@ mod tests {
         let changed = diff.mark("p2").expect("changed");
         assert_eq!(changed.net, NetChange::Changed);
         assert_eq!(changed.changed, HashSet::from(["name".to_owned()]));
+        assert_eq!(changed.before.get("name"), Some(&json!("Grace")));
         assert_eq!(diff.mark("p3").map(|m| m.net), Some(NetChange::Removed));
         assert!(diff.mark("n1").is_none(), "another type");
         assert!(diff.mark("e1").is_none(), "an edge of the same name");
