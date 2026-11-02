@@ -165,30 +165,48 @@ impl Render for Tip {
             }
             None => None,
         };
+        // A tooltip with a detail row is a hover card: roomier, its detail a grey footer
+        // across the card under a hairline, as a card's ([`ds::card_footer`]).
+        let card = self.content.detail.is_some();
+        let (pad_x, pad_y) = if card {
+            (space::LG, space::MD)
+        } else {
+            (space::MD, space::XS)
+        };
+        let menu = ds::radii(cx).menu();
         placed(
             self.at,
             Point::default(),
             ds::menu_surface(v_flex(), cx)
                 .max_w(px(size::TOOLTIP_WIDTH))
-                .py(px(space::XS))
-                .px(px(space::MD))
+                // A hover card takes the tooltip's whole width, so its footer's counts and
+                // "Open" sit at its two ends.
+                .when(card, |tip| tip.w(px(size::TOOLTIP_WIDTH)))
                 .child(
-                    h_flex()
-                        .gap(px(space::XL))
-                        .justify_between()
-                        .child(ds::text::plain(self.content.title.clone()))
-                        .children(key),
+                    v_flex()
+                        .py(px(pad_y))
+                        .px(px(pad_x))
+                        .gap(px(if card { space::XS } else { 0. }))
+                        .child(
+                            h_flex()
+                                .gap(px(space::XL))
+                                .justify_between()
+                                .child(ds::text::plain(self.content.title.clone()))
+                                .children(key),
+                        )
+                        .when_some(self.content.meta.clone(), |tip, meta| {
+                            tip.child(ds::text::meta(meta))
+                        }),
                 )
-                .when_some(self.content.meta.clone(), |tip, meta| {
-                    tip.child(ds::text::meta(meta))
-                })
                 .when_some(self.content.detail.clone(), |tip, detail| {
                     tip.child(
                         div()
-                            .mt(px(space::XS))
-                            .pt(px(space::XS))
+                            .rounded_b(px(ds::radius::flush(menu)))
+                            .px(px(pad_x))
+                            .py(px(space::SM))
                             .border_t_1()
-                            .border_color(ds::surface::rule(cx))
+                            .border_color(ds::surface::floating_border(cx))
+                            .bg(ds::surface::footer(cx))
                             .child(detail(cx)),
                     )
                 }),

@@ -364,6 +364,7 @@ pub mod surface {
     pub(crate) const SELECTED_INK: f32 = 0.05;
     pub(crate) const HOVER_INK: f32 = 0.025;
     pub(crate) const TAB_INK: f32 = 0.025;
+    pub(crate) const FOOTER_INK: f32 = 0.025;
 
     /// The ink a state is laid over a sheet in ([`rule`], [`well`], [`selected_chrome`],
     /// [`hover`], [`tab_inactive`]), at `alpha`: black on the light style's warm white; white in
@@ -441,6 +442,13 @@ pub mod surface {
     /// A card's hairline, and the rule inside it over its footer: the [`outline`].
     pub fn card_border(cx: &App) -> Hsla {
         outline(cx)
+    }
+
+    /// A card's footer (its counts and actions) and a hover card's: a faint grey band laid
+    /// over the card's own fill, darker in a light theme and lighter in a dark one, so the
+    /// footer reads as the card's base whatever the card is filled with.
+    pub fn footer(cx: &App) -> Hsla {
+        ink_in(FOOTER_INK, cx)
     }
 
     /// Sunken areas: header strips, code blocks, a card's header. The editor background, 2%
@@ -2909,31 +2917,36 @@ pub fn card(cx: &App) -> Div {
     )
 }
 
+/// A card's title row: on the card's own fill, a hairline under it, as the reference's
+/// "Commit History" card.
 pub fn card_header(cx: &App) -> Div {
     h_flex()
         .w_full()
-        // Its fill meets the card's top corners.
-        .rounded_t(px(radius::flush(radii(cx).md)))
         .min_h(px(size::SIDEBAR_ROW + space::MD))
         .px(px(space::LG))
         .gap(px(space::MD))
         .items_center()
-        .bg(surface::sunken(cx))
+        .border_b_1()
+        .border_color(surface::card_border(cx))
 }
 
 pub fn card_body() -> Div {
     v_flex().p(px(space::LG)).gap(px(space::LG))
 }
 
+/// A card's footer of counts and actions: a grey band under a hairline, its fill meeting the
+/// card's bottom corners.
 pub fn card_footer(cx: &App) -> Div {
     h_flex()
         .w_full()
+        .rounded_b(px(radius::flush(radii(cx).md)))
         .px(px(space::MD))
         .py(px(space::SM))
         .gap(px(space::XS))
         .items_center()
         .border_t_1()
         .border_color(surface::card_border(cx))
+        .bg(surface::footer(cx))
 }
 
 /// An empty state, as Zed's panels draw one: an icon, a title of two or three words, then the
