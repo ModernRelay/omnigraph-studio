@@ -70,14 +70,20 @@ pub fn condense(
     );
     let mut titles = 0;
     let mut cut = false;
+    // The changes by type, in one pass: filtered again for each type, a review of many types
+    // went through every change once per type.
+    let mut by_type: std::collections::HashMap<(bool, &str), Vec<&FoldedChange>> =
+        std::collections::HashMap::new();
+    for change in &folded.changes {
+        by_type
+            .entry((change.is_edge(), change.type_name.as_str()))
+            .or_default()
+            .push(change);
+    }
     for count in counts {
-        let in_type: Vec<&FoldedChange> = folded
-            .changes
-            .iter()
-            .filter(|change| {
-                change.is_edge() == count.is_edge && change.type_name == count.type_name
-            })
-            .collect();
+        let in_type: &[&FoldedChange] = by_type
+            .get(&(count.is_edge, count.type_name.as_str()))
+            .map_or(&[], Vec::as_slice);
         let kind = if count.is_edge { "edge" } else { "node" };
         text.push_str(&format!(
             "\n## {} ({kind}: {} added, {} changed, {} removed)\n",
