@@ -994,8 +994,10 @@ async fn read_request(
             // twice its size.
             rest.reserve_exact(length.saturating_sub(rest.len()));
             while rest.len() < length {
+                // Never past the length: bytes sent beyond it would grow the body over it.
+                let want = (length - rest.len()).min(chunk.len());
                 let read = stream
-                    .read(&mut chunk)
+                    .read(&mut chunk[..want])
                     .await
                     .map_err(|_| ReadFailure::Gone)?;
                 if read == 0 {
@@ -1020,6 +1022,18 @@ async fn read_request(
         headers,
         body,
     })
+}
+
+/// Makes room in `body` for `size` more bytes, which the caller has checked keep it within
+/// [`MAX_BODY`]: by doubling, as a `Vec` grows, so a body of many small chunks is copied a few
+/// times rather than at each, but never past `MAX_BODY`, which a body of that size may fill.
+fn make_room(body: &mut Vec<u8>, size: usize) {
+    let needed = body.len() + size;
+    if needed <= body.capacity() {
+        return;
+    }
+    let grown = (body.capacity() * 2).clamp(needed, MAX_BODY.max(needed));
+    body.reserve_exact(grown - body.len());
 }
 
 /// The refusal of a body past [`MAX_BODY`].
@@ -1081,6 +1095,7 @@ async fn read_chunked(
         }
         // The data goes straight into the body, as it arrives: gathered first, a large chunk
         // would be held twice.
+        make_room(&mut body, size);
         let buffered = size.min(pending.len());
         body.extend_from_slice(&pending[..buffered]);
         pending.drain(..buffered);
@@ -1311,10 +1326,27 @@ mod tests {
         }
     }
 
-    /// A full listener closes the oldest connection whose peer has not proved itself to take
-    /// the next, so connections another local process holds open, idle within their bound,
-    /// never keep out one that proves itself (the agent's CLI with its token). With every one
-    /// proved, the next is closed unread.
+    /// A chunked body grows by doubling, so many small chunks copy it a few times, but never
+    /// past the largest body: before, a chunk of nearly that size and then a small one took
+    /// twice its room.
+    #[test]
+    fn a_chunked_body_grows_within_the_largest_body() {
+        let mut body = Vec::new();
+        make_room(&mut body, MAX_BODY - 1024);
+        body.resize(MAX_BODY - 1024, 0);
+        make_room(&mut body, 1024);
+        assert_eq!(body.capacity(), MAX_BODY);
+        let mut small = Vec::new();
+        let mut copies = 0;
+        for _ in 0..10_000 {
+            let room = small.capacity();
+            make_room(&mut small, 100);
+            small.extend_from_slice(&[0; 100]);
+            copies += usize::from(small.capacity() != room);
+        }
+        assert!(copies < 25, "{copies}");
+    }
+
     /// A full listener closes the oldest connection whose peer has not proved itself to take
     /// the next, so connections another local process holds open, idle within their bound,
     /// never keep out one that proves itself (the agent's CLI with its token). With every one

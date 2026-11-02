@@ -24,7 +24,7 @@ pub struct SessionRecord {
     pub session: String,
     /// The graph, as its key (`<target>@<address>/<graph id>`, `GraphSession::overrides_key`).
     pub graph: String,
-    /// The agent command, joined with spaces: a session belongs to the agent that made it.
+    /// The agent command ([`command_key`]): a session belongs to the agent that made it.
     pub agent: String,
     /// The agent's title for it, else the start of the first message; none until one of them
     /// names it.
@@ -507,6 +507,61 @@ pub(crate) fn title_of(message: &str) -> Option<String> {
     Some(studio_ui::text::cut(line, TITLE_CHARS))
 }
 
+/// A conversation's agent command as its record keeps it: the words joined with spaces, a word
+/// holding a space, a quote or a backslash quoted, so [`command_of`] gives the command back
+/// whole (a program under `Application Support`). A command with no such word is kept as it
+/// always was, its words joined with spaces.
+pub fn command_key(command: &[String]) -> String {
+    let word = |word: &String| {
+        let plain = !word.is_empty()
+            && !word
+                .chars()
+                .any(|c| c.is_whitespace() || c == '"' || c == '\\');
+        if plain {
+            return word.clone();
+        }
+        let mut quoted = String::from('"');
+        for c in word.chars() {
+            if c == '"' || c == '\\' {
+                quoted.push('\\');
+            }
+            quoted.push(c);
+        }
+        quoted.push('"');
+        quoted
+    };
+    command.iter().map(word).collect::<Vec<_>>().join(" ")
+}
+
+/// The command a record keeps ([`command_key`]). A record kept before words were quoted gives
+/// its words split at spaces, as it always did.
+pub fn command_of(key: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut chars = key.chars().peekable();
+    loop {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        let Some(first) = chars.next() else {
+            return words;
+        };
+        let mut word = String::new();
+        if first == '"' {
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => word.extend(chars.next()),
+                    '"' => break,
+                    c => word.push(c),
+                }
+            }
+        } else {
+            word.push(first);
+            while let Some(c) = chars.next_if(|c| !c.is_whitespace()) {
+                word.push(c);
+            }
+        }
+        words.push(word);
+    }
+}
+
 /// The form of the file's records. A build that reads a file of another version sets it
 /// aside whole: serde passes over fields it does not know, so a record a newer build wrote
 /// with one more field would read here and be written back without it. It changes when a build
@@ -735,6 +790,32 @@ pub fn prefer(command: &[String], option: &str, value: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A record keeps its agent's command whole, a word holding a space, a quote or a
+    /// backslash included; a command of plain words is kept as it always was, and a record kept
+    /// before words were quoted reads as it always did. Before, a program under `Application
+    /// Support` came back split at its space.
+    #[test]
+    fn a_record_keeps_its_agents_command_whole() {
+        let words = |command: &[&str]| -> Vec<String> {
+            command.iter().map(|word| (*word).to_owned()).collect()
+        };
+        for command in [
+            words(&["npx", "-y", "@zed-industries/codex-acp"]),
+            words(&["/Users/me/Application Support/acp/agent", "--acp"]),
+            words(&[r#"say "hi""#, r"C:\Tools\agent", ""]),
+        ] {
+            assert_eq!(command_of(&command_key(&command)), command, "{command:?}");
+        }
+        assert_eq!(
+            command_key(&words(&["npx", "-y", "@zed-industries/codex-acp"])),
+            "npx -y @zed-industries/codex-acp"
+        );
+        assert_eq!(
+            command_of(r"C:\Tools\my-agent  --acp"),
+            words(&[r"C:\Tools\my-agent", "--acp"])
+        );
+    }
     use serde_json::json;
 
     /// A directory of the test's own, named at random: no other test shares it, nor a later

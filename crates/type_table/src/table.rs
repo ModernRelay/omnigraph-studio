@@ -254,6 +254,8 @@ struct BlobSent {
     key: (String, String),
     change: BlobChange,
     bound_at: Option<String>,
+    /// The table's [`TypeTable::blob_round`] when the write was sent.
+    round: u64,
 }
 
 /// A grouped section's read under way: how many rows it asks for, which a read dropped away
@@ -655,7 +657,8 @@ enum FilterMenuEntry {
     },
 }
 
-/// A Filter menu entry that sets the filter being written to `key`.
+/// A Filter menu entry that sets the filter being written to `key`: the draft's own key menu,
+/// so a filter opened from its pill is still the one it replaces ([`TypeTable::change_draft_key`]).
 fn filter_key_entry(
     table: &WeakEntity<TypeTable>,
     key: String,
@@ -669,7 +672,7 @@ fn filter_key_entry(
         .handler(move |window, cx| {
             table
                 .update(cx, |this, cx| {
-                    this.set_draft_property(key.clone(), window, cx)
+                    this.change_draft_key(key.clone(), window, cx)
                 })
                 .ok();
         })
@@ -859,6 +862,9 @@ pub struct TypeTable {
     /// Files dropped on Blob cells being stored, by row id and property, and why one that did
     /// not land did not.
     blob_edits: HashMap<(String, String), BlobEdit>,
+    /// How many times the branch changed, which clears `blob_edits`: a write sent before the
+    /// last change lands without touching the marks the cells show now, another write's.
+    blob_round: u64,
     /// Each row's neighbours in the relationship columns, by row id and relationship key;
     /// read for each page at the page's commit.
     relations: CellMap<Relation>,
@@ -1215,6 +1221,7 @@ impl TypeTable {
             blob_tasks: HashMap::new(),
             blob_queue: Default::default(),
             blob_edits: HashMap::new(),
+            blob_round: 0,
             relations: CellMap::default(),
             relation_tasks: HashMap::new(),
             next_relation_task: 0,
@@ -1284,8 +1291,9 @@ impl TypeTable {
             // What the credential may do was read: the controls that write follow it.
             SessionEvent::AccessChanged if self.at_commit.is_none() => cx.notify(),
             // Another writer changed the schema: what the table shows was read under the old
-            // one, and stays until Refresh takes the new one.
-            SessionEvent::SchemaMoved if !self.newer => {
+            // one, and stays until Refresh takes the new one. A table held at a commit reads
+            // that commit's, whatever the branch's becomes.
+            SessionEvent::SchemaMoved if !self.newer && self.at_commit.is_none() => {
                 self.newer = true;
                 cx.emit(ItemEvent::UpdateTab);
                 cx.notify();
@@ -1307,10 +1315,14 @@ impl TypeTable {
                 // A Refresh asked for on the branch left reads nothing here, and a fill under
                 // way ends: its answers are drafts bound to the rows the branch left showed.
                 self._refresh = None;
+                if self.fill_editor.focus_handle(cx).is_focused(window) {
+                    window.focus(&self.focus_handle, cx);
+                }
                 self.fill = None;
                 // A file still being stored goes on to the branch left, and its toast tells how
                 // it ended; the new branch's cells show none of it.
                 self.blob_edits.clear();
+                self.blob_round += 1;
                 // The branch's own drafts show; the other's wait in the session.
                 self.cells.clear();
                 self.draft_notices.clear();
@@ -7311,6 +7323,22 @@ impl TypeTable {
         self.set_draft_property(property.name, window, cx);
     }
 
+    /// The draft tests another key, from its own key menu: opened from a pill, it still replaces
+    /// that pill's filter where it stands. A draft started anew ([`Self::set_draft_property`])
+    /// leaves a filter being edited as it was.
+    fn change_draft_key(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let replacing = self
+            .filter_draft
+            .as_ref()
+            .and_then(|draft| draft.replacing.clone());
+        self.set_draft_property(name, window, cx);
+        if let Some(draft) = &mut self.filter_draft
+            && draft.replacing.is_none()
+        {
+            draft.replacing = replacing;
+        }
+    }
+
     fn set_draft_property(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(&op) = self.ops_for(&name).first() else {
             return;
@@ -7474,8 +7502,9 @@ impl TypeTable {
         }
     }
 
-    /// A click on a pill: the filter comes out of the bar into the draft, its key, test and
-    /// value as they were, to change and apply again or put back with Esc.
+    /// A click on a pill: the pill shows as the draft, its key, test and value as they were, to
+    /// change and apply in its place; Esc leaves it as it was. The filter stays applied the
+    /// while, so the rows and every page read follow it.
     fn edit_filter(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index >= self.filters.len() {
             return;
@@ -7594,7 +7623,6 @@ impl TypeTable {
         cx.notify();
     }
 
-    /// The keys the filter menu offers, with their operators and properties, for the model.
     /// What a sentence may order, group and show the rows by: the properties that can order
     /// the table, what the Group menu offers, and the columns.
     fn view_choices(&self) -> words::ViewChoices {
@@ -7624,10 +7652,12 @@ impl TypeTable {
     /// do, those named shown in the order named and the rest hidden. The caller reads the table
     /// again.
     fn apply_words_view(&mut self, view: words::View, cx: &mut Context<Self>) {
-        if let Some(sort) = view.sort {
+        // Judged again as it lands: the schema can change while the model answers, and an
+        // order or a grouping by a property it no longer has would fail the read.
+        if let Some(sort) = view.sort.filter(|sort| self.can_sort_by(sort)) {
             self.sort = Some(sort);
         }
-        if let Some(key) = view.group_by
+        if let Some(key) = view.group_by.filter(|key| self.can_group_by(key))
             && self.grouping.as_ref().map(|grouping| &grouping.property) != Some(&key)
         {
             self.grouping = Some(Grouping::new(key));
@@ -7652,6 +7682,7 @@ impl TypeTable {
         }
     }
 
+    /// The keys the filter menu offers, with their operators and properties, for the model.
     fn words_choices(&self) -> Vec<words::Choice> {
         self.filter_choices()
             .iter()
@@ -9017,7 +9048,12 @@ impl TypeTable {
     /// scrolling has paused: a fast scroll reads nothing for the rows it passes, and reads
     /// still out for cells no longer drawn, scrolled away up, down or sideways, are dropped.
     fn want_blob_metas(&mut self, lines: Range<usize>, cx: &mut Context<Self>) {
-        if self.blob_lines.as_ref() == Some(&lines) || self.blob_columns.is_empty() {
+        // With no Blob column drawn there is nothing to read, but the reads still out or
+        // waiting for cells scrolled away are let go all the same.
+        let idle = self.blob_columns.is_empty()
+            && self.blob_tasks.is_empty()
+            && self.blob_queue.is_empty();
+        if self.blob_lines.as_ref() == Some(&lines) || idle {
             return;
         }
         self.blob_lines = Some(lines.clone());
@@ -9434,6 +9470,7 @@ impl TypeTable {
         self.blob_edits
             .insert(key.clone(), BlobEdit::Saving(change.clone()));
         self.saves_in_flight += 1;
+        let round = self.blob_round;
         // Detached: a write is never cancelled by closing the tab.
         cx.spawn(async move |this, cx| {
             let written = write.await;
@@ -9442,6 +9479,7 @@ impl TypeTable {
                     key,
                     change,
                     bound_at: bound_at.borrow().clone(),
+                    round,
                 };
                 this.blob_written(sent, &session, &branch, written, cx)
             })
@@ -9488,12 +9526,12 @@ impl TypeTable {
             key,
             change,
             bound_at,
+            round,
         } = sent;
         self.saves_in_flight = self.saves_in_flight.saturating_sub(1);
         // The table moved to another branch or graph meanwhile; the outcome is told by its
         // toast.
         if !self.shows(session, branch) {
-            self.blob_edits.remove(&key);
             self.saves_settled(cx);
             cx.emit(ItemEvent::UpdateTab);
             cx.notify();
@@ -9526,10 +9564,14 @@ impl TypeTable {
                 .insert(key.0.clone(), key.1.clone(), Loadable::Loaded(meta.clone()));
             self.read_queued_blobs(cx);
         }
-        match BlobEdit::ended(written, change, &key.1) {
-            Some(edit) => self.blob_edits.insert(key, edit),
-            None => self.blob_edits.remove(&key),
-        };
+        // Sent before the branch changed and came back: the cell marks a later write now, and
+        // this one's outcome is told by its toast.
+        if round == self.blob_round {
+            match BlobEdit::ended(written, change, &key.1) {
+                Some(edit) => self.blob_edits.insert(key, edit),
+                None => self.blob_edits.remove(&key),
+            };
+        }
         self.saves_settled(cx);
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
@@ -11013,10 +11055,6 @@ mod tests {
         });
     }
 
-    /// The Filter menu lists each relationship once, with its neighbours' properties in a
-    /// submenu of it; a relationship without any is a plain entry. Before, every neighbour
-    /// property followed its relationship in the one menu: 1,122 entries for the personal
-    /// graph's Person, every one drawn at each frame the menu was open.
     /// The condition field's hint names the row the queries bind ([`builder::NODE_VAR`]).
     #[test]
     fn the_condition_hint_names_the_row_variable() {
@@ -11026,6 +11064,10 @@ mod tests {
         );
     }
 
+    /// The Filter menu lists each relationship once, with its neighbours' properties in a
+    /// submenu of it; a relationship without any is a plain entry. Before, every neighbour
+    /// property followed its relationship in the one menu: 1,122 entries for the personal
+    /// graph's Person, every one drawn at each frame the menu was open.
     #[test]
     fn the_filter_menu_nests_each_relationships_neighbour_properties() {
         let choice = |key: &str| (key.to_owned(), key.to_owned(), IconName::CaseSensitive);
@@ -11370,7 +11412,8 @@ mod tests {
     /// rows still showed it.
     #[gpui::test]
     async fn a_filter_being_edited_still_filters_the_rows(cx: &mut TestAppContext) {
-        let session = session(PEOPLE, cx);
+        let schema = PEOPLE.replace("  name: String\n", "  name: String\n  city: String?\n");
+        let session = session(&schema, cx);
         let (table, cx) = people_table(&session, cx);
         let named = |name: &str| Filter {
             property: "name".into(),
@@ -11398,6 +11441,45 @@ mod tests {
             table.apply_filter_draft(window, cx);
             assert_eq!(table.filters, [named("Grace")], "replaced where it stood");
             assert!(table.filter_draft.is_none());
+
+            // Its key changed from the draft's own key menu, it still replaces the filter it
+            // was opened from rather than adding another.
+            table.edit_filter(0, window, cx);
+        });
+        cx.run_until_parked();
+        table.update_in(cx, |table, window, cx| {
+            table.filter_menus[0].show(window, cx)
+        });
+        cx.run_until_parked();
+        // The menu takes the keyboard two frames after it opens, as Zed's popover menus do.
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            window.simulate_next_frame(cx);
+        });
+        // The menu lists name, then city.
+        cx.dispatch_action(menu::SelectNext);
+        cx.dispatch_action(menu::SelectNext);
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        table.update_in(cx, |table, window, cx| {
+            let key = table
+                .filter_draft
+                .as_ref()
+                .map(|draft| draft.property.as_str());
+            assert_eq!(key, Some("city"));
+            table
+                .filter_editor
+                .update(cx, |editor, cx| editor.set_text("London", window, cx));
+            table.apply_filter_draft(window, cx);
+            assert_eq!(
+                table.filters,
+                [Filter {
+                    property: "city".into(),
+                    op: FilterOp::Eq,
+                    value: serde_json::json!("London"),
+                }],
+                "one filter, on the other key"
+            );
         });
     }
 
@@ -13322,6 +13404,12 @@ mod tests {
             assert_eq!(held.count, Loadable::Loaded(70_702))
         });
         assert!(served.sent("studio_count").is_empty(), "no count read");
+        // Another writer changes the schema: the table at the head offers Refresh; the one held
+        // at c1 reads that commit's schema, whatever the branch's becomes, and offers nothing.
+        session.update(cx, |_, cx| cx.emit(graph_store::SessionEvent::SchemaMoved));
+        cx.run_until_parked();
+        held.read_with(&held_cx, |held, _| assert!(!held.newer));
+        table.read_with(&table_cx, |table, _| assert!(table.newer));
 
         // Another writer adds a person: once the session sees it, the snapshot and the newest
         // commit are read again, both at version 2, and a Refresh counts the new head from it.
@@ -13812,7 +13900,7 @@ mod tests {
 
     /// A file still being stored when the table moves to another branch goes on to the branch
     /// left: the new branch's cell does not show it as going and takes a file of its own, and
-    /// the write's landing changes nothing there.
+    /// the write's landing changes nothing there, not the mark of that branch's own write.
     #[gpui::test]
     async fn a_blob_write_out_stays_with_the_branch_left(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -13853,13 +13941,22 @@ mod tests {
             assert!(table.blob_edits.is_empty(), "not shown on fix");
             assert!(table.takes_blob_drop("p1", "doc", cx));
         });
+        // A file going to the cell on fix, as one dropped there would be.
+        table.update(cx, |table, _| {
+            table
+                .blob_edits
+                .insert(key.clone(), BlobEdit::Saving(BlobChange::Clear));
+        });
         open.send(()).ok();
         cx.run_until_parked();
         let writes = blobs.writes.lock().unwrap().clone();
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].branch, "main", "it went to the branch left");
         table.read_with(cx, |table, _| {
-            assert!(table.blob_edits.is_empty());
+            assert!(
+                table.blob_edits[&key].is_saving(),
+                "fix's own write still marked"
+            );
             assert_eq!(table.saves_in_flight, 0);
         });
     }
@@ -15265,6 +15362,15 @@ mod tests {
                 table.blob_queue.front().map(|(id, _)| id.as_str()),
                 Some("r4")
             );
+            // The Blob column scrolled away while they are out: they are let go, though no
+            // Blob column is drawn to read.
+            let drawn = vec![false; table.columns.len()];
+            table.note_blob_columns(&drawn);
+            table._blob_wait = None;
+            table.want_blob_metas(0..10, cx);
+            assert!(table._blob_wait.is_some(), "the reads away are let go");
+            table.note_blob_columns(&vec![true; table.columns.len()]);
+            table.blob_lines = None;
         });
         cx.run_until_parked();
         table.read_with(cx, |table, _| {

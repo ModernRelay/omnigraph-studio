@@ -20,7 +20,7 @@ use crate::api::{
     BranchListOutput, BranchMergeOutput, BranchMergeRequest, ChangeFeedOutput, ChangeOutput,
     ChangeRequest, CommitChanges, CommitListOutput, DiffOutput, DispositionEffects, ErrorOutput,
     GraphListResponse, HealthOutput, InvokeStoredQueryRequest, MergeBaseOutput,
-    QueriesCatalogOutput, QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput, SnapshotOutput,
+    QueriesCatalogOutput, QueryRequest, ReadOutput, SchemaOutput, SnapshotOutput,
 };
 use crate::{
     Answered, ApiError, CONTRACT, CONTRACT_HEADER, IF_GRAPH_COMMIT_HEADER, WriteOutcome,
@@ -1211,7 +1211,7 @@ impl GraphClient {
         .await
     }
 
-    /// A `GET` of a public route (`/healthz`, `/readyz`), which takes no token: none is sent,
+    /// A `GET` of the public route `/healthz`, which takes no token: none is sent,
     /// so none is shown to whatever is between Studio and the server at every check, and none
     /// is waited for ([`Self::fresh_token`]).
     async fn send_public(&self, url: Url) -> Result<RawResponse, String> {
@@ -1754,18 +1754,6 @@ impl GraphClient {
             contract: raw.contract,
             health,
         })
-    }
-
-    /// `GET /readyz`. Public. A 503 still carries a readiness body, and is the server's only
-    /// with the contract header, as a 200 is.
-    pub async fn readiness(&self) -> Result<ReadinessOutput, ReadError> {
-        let url = self.url(&["readyz"], &[]);
-        let raw = self.send_public(url).await.map_err(ReadError::Transport)?;
-        if !raw.status.is_success() && raw.status != StatusCode::SERVICE_UNAVAILABLE {
-            return Err(refusal(&raw));
-        }
-        check_contract(&raw)?;
-        serde_json::from_slice(&raw.body).map_err(|e| ReadError::Decode(e.to_string()))
     }
 
     // ---- protected reads ----
@@ -2741,7 +2729,6 @@ mod tests {
         };
         block_on(async {
             at.health().await.ok();
-            at.readiness().await.ok();
             at.graphs().await.ok();
             at.discover_graphs().await.ok();
             at.schema(graph).await.ok();
@@ -2790,9 +2777,9 @@ mod tests {
                     .all(|(part, segment)| part.starts_with('{') || part == segment)
         };
         let sent = sent.lock().unwrap();
-        assert_eq!(sent.len(), 29, "one request per call: {sent:?}");
+        assert_eq!(sent.len(), 28, "one request per call: {sent:?}");
         for (method, path, carried) in sent.iter() {
-            let public = path.ends_with("/healthz") || path.ends_with("/readyz");
+            let public = path.ends_with("/healthz");
             assert_eq!(*carried, !public, "{method} {path} and the token");
             assert!(
                 paths
@@ -4190,7 +4177,6 @@ mod tests {
         block_on(async {
             vec![
                 ("health", ended(at.health().await)),
-                ("readiness", ended(at.readiness().await)),
                 ("graphs", ended(at.graphs().await)),
                 ("discover_graphs", ended(at.discover_graphs().await)),
                 ("schema", ended(at.schema(graph).await)),

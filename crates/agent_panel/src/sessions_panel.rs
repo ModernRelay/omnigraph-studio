@@ -278,7 +278,8 @@ impl SessionsPanel {
         let id = self.sessions.read(cx).current(&record.session);
         self.sessions
             .update(cx, |sessions, cx| sessions.remove(&id, cx));
-        let Some(agent) = Self::agent(cx).filter(|agent| agent.command.join(" ") == record.agent)
+        let Some(agent) = Self::agent(cx)
+            .filter(|agent| crate::sessions::command_key(&agent.command) == record.agent)
         else {
             self.toast(
                 ToastKind::Info,
@@ -346,7 +347,7 @@ impl SessionsPanel {
             return;
         };
         let graph_dir = graph_cwd(&graph);
-        let agent_name = agent.command.join(" ");
+        let agent_key = crate::sessions::command_key(&agent.command);
         let connection: Arc<AgentConnection> = connection::connection(agent, cx);
         cx.spawn(async move |this, cx| {
             let folders = cx
@@ -376,7 +377,7 @@ impl SessionsPanel {
                     Ok(Ok(found)) => {
                         let records = found
                             .into_iter()
-                            .map(|info| imported(info, &graph, &agent_name))
+                            .map(|info| imported(info, &graph, &agent_key))
                             .collect();
                         let added = this
                             .sessions
@@ -1037,10 +1038,11 @@ impl Render for DeleteConversation {
 
 /// The agent's name from its command: the package or program, without a version or path.
 pub(crate) fn agent_name(command: &str) -> String {
-    let program = command
-        .split_whitespace()
+    let words = crate::sessions::command_of(command);
+    let program = words
+        .iter()
         .rfind(|part| !part.starts_with('-'))
-        .unwrap_or(command);
+        .map_or(command, String::as_str);
     // A Windows path parts its folders with `\` too.
     let base = program.rsplit(['/', '\\']).next().unwrap_or(program);
     base.split('@')
@@ -1135,5 +1137,10 @@ mod tests {
         );
         assert_eq!(agent_name("/usr/local/bin/my-agent --acp"), "my-agent");
         assert_eq!(agent_name(r"C:\Tools\my-agent --acp"), "my-agent");
+        let spaced = [
+            "/Users/me/Application Support/acp/agent".to_owned(),
+            "--acp".to_owned(),
+        ];
+        assert_eq!(agent_name(&crate::sessions::command_key(&spaced)), "agent");
     }
 }

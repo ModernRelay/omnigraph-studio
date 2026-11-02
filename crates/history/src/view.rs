@@ -161,8 +161,6 @@ impl FirstPage {
 /// reads once for all of them; a shown one reads at its next frame.
 #[derive(Default)]
 struct Owed {
-    /// The window's branch changed: its history is read from its first page.
-    reload: bool,
     /// A commit landed on the branch: its first page is read again, keeping the pages read.
     landed: bool,
     /// The branch list changed: the tags follow it ([`HistoryView::branches_changed`]).
@@ -173,7 +171,7 @@ struct Owed {
 
 impl Owed {
     fn is_empty(&self) -> bool {
-        !self.reload && !self.landed && !self.branches && self.tags.is_empty()
+        !self.landed && !self.branches && self.tags.is_empty()
     }
 }
 
@@ -505,24 +503,19 @@ impl HistoryView {
     }
 
     /// The reads the view owes, once for everything that came since it was last drawn: the
-    /// branch's history again (from its first page after a branch change, else keeping the
-    /// pages read after commits), the tags for a changed branch list, and the heads of the other
-    /// branches commits landed on.
+    /// branch's first page again after commits, keeping the pages read, the tags for a changed
+    /// branch list, and the heads of the other branches commits landed on.
     fn read_owed(&mut self, cx: &mut Context<Self>) {
         let owed = std::mem::take(&mut self.owed);
-        if owed.reload {
-            self.reload(cx);
-        } else if owed.landed {
+        if owed.landed {
             self.load(FirstPage::KEEP, cx);
         }
         if owed.branches {
             self.branches_changed(cx);
         }
-        if !owed.reload {
-            for branch in owed.tags {
-                if branch != self.branch && self.others.contains(&branch) {
-                    self.read_head(branch, false, cx);
-                }
+        for branch in owed.tags {
+            if branch != self.branch && self.others.contains(&branch) {
+                self.read_head(branch, false, cx);
             }
         }
     }
@@ -1534,14 +1527,11 @@ impl HistoryView {
                     .await;
                 this.update(cx, |this, cx| {
                     this.count_tasks.remove(&id);
-                    // The detail's full count, if it arrived meanwhile, wins.
-                    if !this.counts.contains_key(&id) {
-                        this.counts.insert(id.clone(), folded);
-                        if more {
-                            this.partial_counts.insert(id);
-                        }
-                        cx.notify();
+                    this.counts.insert(id.clone(), folded);
+                    if more {
+                        this.partial_counts.insert(id);
                     }
+                    cx.notify();
                 })
                 .ok();
             });

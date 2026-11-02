@@ -8,11 +8,6 @@ use graph_store::{Entry, EntryKind, ExplorePath, ExploreState, GroupKey, Loadabl
 /// Neighbours a hub shows before "+K more", and how many each click on it adds.
 pub const HUB_STEP: usize = 8;
 
-/// The cap the tests draw under: the default of the `canvas_max_nodes` setting, which is the
-/// cap in use.
-#[cfg(test)]
-pub const NODE_CAP: usize = 2_000;
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SceneId {
     Node(NodeRef),
@@ -552,6 +547,11 @@ mod tests {
 
     use super::*;
 
+    /// The cap the tests draw under: the `canvas_max_nodes` setting's default, the cap in use.
+    fn node_cap() -> usize {
+        studio_settings::StudioOptions::default().canvas_max_nodes as usize
+    }
+
     const SCHEMA: &str = "node Person {\n  slug: String @key\n  name: String\n}\n\
         node Company {\n  slug: String @key\n  name: String\n}\n\
         edge WorksAt: Person -> Company @card(0..)\n\
@@ -646,7 +646,7 @@ mod tests {
             },
         );
         // Expanding Ada shows the relationship, not the company it reaches.
-        let closed = explore_scene(&state.entries(&schema), &state, &HashMap::new(), NODE_CAP);
+        let closed = explore_scene(&state.entries(&schema), &state, &HashMap::new(), node_cap());
         let hub = closed
             .index_of(&SceneId::Hub(key.clone()))
             .expect("a hub for the relationship");
@@ -659,7 +659,7 @@ mod tests {
         state
             .expanded
             .insert(ExplorePath::root().child_group(&employer));
-        let open = explore_scene(&state.entries(&schema), &state, &HashMap::new(), NODE_CAP);
+        let open = explore_scene(&state.entries(&schema), &state, &HashMap::new(), node_cap());
         let hub = open.index_of(&SceneId::Hub(key)).unwrap();
         let company = open
             .index_of(&SceneId::Node(acme))
@@ -672,7 +672,7 @@ mod tests {
     fn hubs_show_eight_then_more_and_draw_each_node_once() {
         let (schema, state) = exploration();
         let entries = state.entries(&schema);
-        let scene = explore_scene(&entries, &state, &HashMap::new(), NODE_CAP);
+        let scene = explore_scene(&entries, &state, &HashMap::new(), node_cap());
         let people = scene
             .nodes
             .iter()
@@ -708,7 +708,7 @@ mod tests {
             })
             .unwrap();
         limits.insert(key, HUB_STEP * 3);
-        let wider = explore_scene(&entries, &state, &limits, NODE_CAP);
+        let wider = explore_scene(&entries, &state, &limits, node_cap());
         assert!(
             !wider
                 .nodes
@@ -744,7 +744,7 @@ mod tests {
             ..Default::default()
         };
         state.neighbours.insert(ada_knows.clone(), matches);
-        let scene = explore_scene(&state.entries(&schema), &state, &HashMap::new(), NODE_CAP);
+        let scene = explore_scene(&state.entries(&schema), &state, &HashMap::new(), node_cap());
         let hub = scene.index_of(&SceneId::Hub(ada_knows.clone())).unwrap();
         assert!(matches!(
             scene.nodes[hub].kind,
@@ -774,7 +774,7 @@ mod tests {
             .child_node(&person("p05"));
         let p05 = SceneId::Node(person("p05"));
         let opened = |state: &ExploreState| {
-            let scene = explore_scene(&state.entries(&schema), state, &HashMap::new(), NODE_CAP);
+            let scene = explore_scene(&state.entries(&schema), state, &HashMap::new(), node_cap());
             let chip = &scene.nodes[scene.index_of(&p05).unwrap()];
             matches!(chip.kind, SceneKind::Node { expanded: true, .. })
         };
@@ -860,7 +860,7 @@ mod tests {
         ] {
             state.expanded.insert(path);
         }
-        let scene = explore_scene(&state.entries(&schema), &state, &HashMap::new(), NODE_CAP);
+        let scene = explore_scene(&state.entries(&schema), &state, &HashMap::new(), node_cap());
         let hub = scene.index_of(&SceneId::Hub(key)).unwrap();
         assert!(matches!(
             scene.nodes[hub].kind,

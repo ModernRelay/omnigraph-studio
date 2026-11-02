@@ -2634,7 +2634,6 @@ fn measurer(cx: &App, widths: &CharWidths) -> impl Fn(&str, f32, gpui::FontWeigh
 /// Character widths measured so far, by character, size and weight, for one font family.
 type CharWidths = Rc<RefCell<(SharedString, HashMap<(char, u32, u32), f32>)>>;
 
-/// Half of each node's chip width at zoom 1, measured as the painter draws it.
 /// Each chip's text, and half its width as `measure` measures it: made once a layout, for the
 /// layout's room and for drawing the chips it places.
 fn chip_texts(

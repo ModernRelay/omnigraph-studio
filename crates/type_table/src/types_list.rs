@@ -207,12 +207,12 @@ impl TypesList {
                 };
                 let count = match s.count_of(entity, name) {
                     Some(n) => studio_ui::group_count(n),
-                    None if matches!(s.snapshot, Loadable::Loading | Loadable::NotLoaded) => {
+                    None if matches!(s.counts, Loadable::Loading | Loadable::NotLoaded) => {
                         "…".into()
                     }
                     None => "—".into(),
                 };
-                let tooltip = match (&s.snapshot, s.counts_stale()) {
+                let tooltip = match (&s.counts, s.counts_stale()) {
                     (Loadable::Failed(error), _) => format!("Counts could not be read: {error}"),
                     (_, Some(error)) => format!(
                         "Rows as last read on {}: reading them again failed ({error}). They \

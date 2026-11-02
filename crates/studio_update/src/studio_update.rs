@@ -95,8 +95,8 @@ pub struct Job {
 pub enum InstallError {
     /// The file is not a genuine update: never fetched again this run.
     Refused(String),
-    /// The download or install did not finish. Said, and not tried again this run, as a
-    /// refused one is not: the person asks again (Check for Updates).
+    /// The download or install did not finish. Said, and tried again at the next check, which
+    /// the person can also ask for (Check for Updates).
     Failed(String),
 }
 
@@ -388,10 +388,19 @@ impl Updater {
             let installed = installer.install(&job, bytes).await;
             this.update(cx, |this, cx| match installed {
                 Ok(()) => this.end(UpdateState::Ready { version }, cx),
-                Err(InstallError::Refused(error) | InstallError::Failed(error)) => {
-                    log::warn!("update {version} install failed: {error}");
+                Err(InstallError::Refused(error)) => {
+                    log::warn!("update {version} install refused: {error}");
                     let reason = format!("Couldn't install {version}: {error}.");
                     this.refuse(version, reason, cx);
+                }
+                // One that may pass (a full disk) is tried again, as a download that did not
+                // finish is.
+                Err(InstallError::Failed(error)) => {
+                    log::warn!("update {version} install failed: {error}");
+                    let message = format!(
+                        "Couldn't install {version}: {error}. Studio will try again at the next check."
+                    );
+                    this.finish(UpdateState::Failed { message }, cx);
                 }
             })
             .ok();
@@ -640,12 +649,14 @@ mod tests {
         (http, count)
     }
 
-    /// An installer that serves `archive`, or refuses, and records what it installed. A
-    /// download given a `gate` waits for it after reporting 50 %.
+    /// An installer that serves `archive`, or refuses, and records what it installed, or
+    /// fails the install with `install_fails`. A download given a `gate` waits for it after
+    /// reporting 50 %.
     #[derive(Default)]
     struct FakeInstaller {
         archive: Mutex<Option<Vec<u8>>>,
         refuse: Mutex<Option<InstallError>>,
+        install_fails: Mutex<Option<InstallError>>,
         gate: Mutex<Option<oneshot::Receiver<()>>>,
         downloads: AtomicUsize,
         installed: Mutex<Vec<PathBuf>>,
@@ -678,7 +689,11 @@ mod tests {
             _bytes: Vec<u8>,
         ) -> BoxFuture<'static, Result<(), InstallError>> {
             self.installed.lock().unwrap().push(job.bundle.clone());
-            Box::pin(async { Ok(()) })
+            let result = match self.install_fails.lock().unwrap().clone() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            };
+            Box::pin(async move { result })
         }
     }
 
@@ -886,6 +901,31 @@ mod tests {
         cx.executor().advance_clock(CHECK_EVERY);
         cx.run_until_parked();
         assert_eq!(installer.downloads.load(Ordering::SeqCst), 2);
+    }
+
+    /// An install that did not finish (a full disk) is tried again at the next check, as a
+    /// download that did not finish is. Before, it was refused for the rest of the run.
+    #[gpui::test]
+    async fn a_failed_install_waits_for_the_next_check(cx: &mut TestAppContext) {
+        let folder = bundle();
+        let (http, _) = host(|| manifest("0.3.0"));
+        let installer = Arc::new(FakeInstaller::default());
+        *installer.archive.lock().unwrap() = Some(archive("0.3.0"));
+        *installer.install_fails.lock().unwrap() = Some(InstallError::Failed("disk full".into()));
+        let updater = updater(
+            options(MAC, &folder.path().join("Omnigraph Studio.app")),
+            http,
+            installer.clone(),
+            cx,
+        );
+        updater.update(cx, |updater, cx| updater.set_automatic(true, cx));
+        cx.executor().advance_clock(FIRST_CHECK);
+        cx.run_until_parked();
+        assert_eq!(installer.installed.lock().unwrap().len(), 1);
+        cx.executor().advance_clock(CHECK_EVERY);
+        cx.run_until_parked();
+        assert_eq!(installer.downloads.load(Ordering::SeqCst), 2, "tried again");
+        assert_eq!(installer.installed.lock().unwrap().len(), 2);
     }
 
     #[gpui::test]

@@ -253,8 +253,8 @@ struct ReviewData {
     commits_capped: Option<Capped>,
 }
 
-/// The model's summary of the branch (spec 019): none asked, waiting for the person to allow
-/// the task, under way, done, or failed with why.
+/// The model's summary of the branch (spec 019): none asked, under way, done, or failed with
+/// why.
 enum SummaryState {
     None,
     Running {
@@ -285,10 +285,6 @@ const MERGE_RUNNING: &str =
     "A merge is running, or may be: a fix now could land on either side of it.";
 const BRANCH_DELETED: &str = "The merge deleted the branch: there is no branch to fix now.";
 
-/// What a reviewed mark is kept by: the entity and what its change does, so the mark holds
-/// until the entity changes again, whichever commits the review reads the change from. A review
-/// since a merge reads every change at the reviewed head, which a fix moves. Made with the fold,
-/// off the main thread: a review holds up to 20,000 changes, and their values can be long.
 /// What an entity group is, whatever its place among the groups: an edge or a node, its type
 /// and its id.
 type GroupId = (bool, String, String);
@@ -297,6 +293,10 @@ fn group_id(group: &EntityGroup) -> GroupId {
     (group.is_edge, group.type_name.clone(), group.id.clone())
 }
 
+/// What a reviewed mark is kept by: the entity and what its change does, so the mark holds
+/// until the entity changes again, whichever commits the review reads the change from. A review
+/// since a merge reads every change at the reviewed head, which a fix moves. Made with the fold,
+/// off the main thread: a review holds up to 20,000 changes, and their values can be long.
 fn mark_of(change: &FoldedChange) -> u64 {
     use std::fmt::Write as _;
     use std::hash::{DefaultHasher, Hash as _, Hasher};
@@ -491,6 +491,8 @@ pub struct ReviewView {
     /// Names of the nodes the review knows only by id, read at the reviewed head after it
     /// loads; until then, and for a node without a name, its id shows.
     names: NodeNames,
+    /// The head `names` were read at: a review read at another head reads them again.
+    names_at: Option<String>,
     /// How many relationship lines each card shows.
     card_lines: CardLines,
     list_state: ListState,
@@ -707,6 +709,7 @@ impl ReviewView {
             headers: Vec::new(),
             selected: None,
             names: NodeNames::default(),
+            names_at: None,
             card_lines: CardLines::default(),
             list_state: ListState::new(0, ListAlignment::Top, px(800.)),
             conflict_list: ListState::new(0, ListAlignment::Top, px(800.)),
@@ -830,6 +833,17 @@ impl ReviewView {
                 );
                 self.branch_deleted = false;
                 self.merge = MergeState::Idle;
+                // Nothing of the deleted branch's review holds for this one: not a commit it was
+                // scoped to, which this branch may not hold, nor the marks made on its changes.
+                // Its cards stay shown while this one is read, so their marks go too, or the next
+                // read under way would keep them again.
+                self.scope = None;
+                for card in &mut self.cards {
+                    card.reviewed = false;
+                }
+                self.reviewed_keys.clear();
+                self.expanded.clear();
+                self.whole_texts.clear();
                 self.reload(cx);
             }
             _ => return,
@@ -1100,14 +1114,19 @@ impl ReviewView {
     }
 
     /// Reads the names of the nodes the review knows only by id, at the head it read. A name
-    /// already known is not read again: a node is known only by id while the branch has not
-    /// changed it, so its name has not moved, and a Refresh keeps showing it.
+    /// known at that head is not read again, so a Refresh at the same head keeps showing it; a
+    /// review read at another head reads every name again, since a merge into the branch (or
+    /// the branch deleted and made again) may have renamed a node it did not change.
     fn read_names(
         &mut self,
         ends: Vec<(String, String)>,
         head: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        if self.names_at != head {
+            self.names.clear();
+            self.names_at.clone_from(&head);
+        }
         let missing: Vec<_> = ends
             .into_iter()
             .filter(|end| !self.names.contains_key(end))
@@ -1229,6 +1248,10 @@ impl ReviewView {
                 // hidden, and the keys do not act on it ([`Self::cards_shown`]).
                 if self.row_of_group(group).is_none() && self.unfold_run_of(group) {
                     self.lay_out_in_place();
+                    // Laid out with the card still hidden (a search hides it), the selection
+                    // would move to the first card shown, and the keys act on that one: the
+                    // change asked for stays selected, and they act on nothing.
+                    self.selected = Some(change);
                 }
                 if let Some(row) = self.row_of_group(group) {
                     self.list_state.scroll_to_reveal_item(row);
@@ -5420,9 +5443,19 @@ pub(crate) mod tests {
             assert!(view.row_of_group(group).is_some(), "its run opened");
             assert!(view.cards_shown());
 
-            view.toggle_run(run, cx);
+            view.toggle_run(run.clone(), cx);
             view.selected = Some(change);
             assert!(!view.cards_shown(), "a hidden card is not acted on");
+
+            // Its run folded and a search hiding it, the change asked for stays selected rather
+            // than the first card shown taking its place, and the keys act on nothing.
+            view.searched.matched = Some(vec![false; view.change_count()]);
+            view.lay_out();
+            view.select(change, cx);
+            assert_eq!(view.selected, Some(change));
+            assert!(!view.cards_shown());
+            view.searched = Searched::default();
+            view.lay_out();
 
             // The model's summary is of the review it read: another scope, or another token,
             // lets it go, though the head is the same.
@@ -6121,6 +6154,35 @@ pub(crate) mod tests {
         );
     }
 
+    /// A name read for a node the review knows only by id is kept while the review is read at
+    /// the same head, and read again at another: a merge into the branch may have renamed it.
+    /// Before, a name once read stood for the life of the tab.
+    #[gpui::test]
+    async fn names_are_read_again_at_a_new_head(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _) = review_server(false, None, "f2", |_| (500, json!({})), cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        let end = ("Person".to_owned(), "p9".to_owned());
+        view.update(cx, |view, cx| {
+            let head = view.data.as_ref().and_then(|data| data.head.clone());
+            view.names.insert(end.clone(), "Ada".into());
+            view.read_names(vec![end.clone()], head, cx);
+            assert_eq!(
+                view.names.get(&end).map(String::as_str),
+                Some("Ada"),
+                "same head"
+            );
+            view.read_names(Vec::new(), Some("f3".into()), cx);
+            assert!(view.names.is_empty(), "another head");
+        });
+    }
+
     /// A new token may see less than the one the review was read with: nothing read under the
     /// old one shows while the review is read again under the new one, not the cards, the
     /// counts, the names, the dry run or the scope menu's commits, and none of it comes back
@@ -6351,19 +6413,29 @@ pub(crate) mod tests {
                 });
             }
             // Made again under its name, the branch is another, whose review the tab, reused for
-            // it, reads afresh: its head watched, its fixes not refused, and kept with the window.
+            // it, reads afresh: its head watched, its fixes not refused, and kept with the window;
+            // neither the commit the old review was scoped to nor its marks carry over, not even
+            // through a second read asked for while the old review's cards still show.
+            view.update(cx, |view, _| {
+                view.scope = Some("f1".into());
+                view.reviewed_keys.insert(42);
+                view.cards[0].reviewed = true;
+            });
             let session = view.read_with(cx, |view, _| view.session.clone());
             session.update(cx, |session, cx| {
                 session.branches =
                     graph_store::Loadable::Loaded(vec!["main".into(), "feature".into()]);
                 cx.emit(graph_store::SessionEvent::BranchesChanged);
             });
+            view.update(cx, |view, cx| view.reload(cx));
             cx.run_until_parked();
             view.read_with(cx, |view, cx| {
                 assert!(!view.branch_deleted);
                 assert!(view._head_watch.is_some());
                 assert!(view.serialize(cx).is_some());
                 assert!(matches!(view.merge, MergeState::Idle));
+                assert!(view.scope.is_none(), "no commit of the branch deleted");
+                assert!(view.reviewed_keys.is_empty(), "nor its marks");
             });
         }
     }

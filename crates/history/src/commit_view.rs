@@ -77,7 +77,6 @@ pub struct CommitView {
     list_state: ListState,
     focus_handle: FocusHandle,
     _task: Option<Task<()>>,
-    /// The wait before a stepped-to commit's first read; dropped with the view.
     /// The commit and its changes are read when the tab is next drawn ([`Self::when_shown`]):
     /// a tab restored with the workspace behind another reads nothing until it is shown.
     read_owed: bool,
@@ -237,10 +236,14 @@ impl CommitView {
         branch_start(self.commit.as_ref()?)
     }
 
-    /// Whether the list's last row offers to read more changes ("Load more changes", or "Try
-    /// again" after a read of them failed), with no read under way.
+    /// Whether the view offers to read more changes ("Load more changes", or "Try again" after
+    /// a read of them failed, the first included), with no read under way.
     fn offers_more(&self) -> bool {
-        self.next_page_token.is_some() && !matches!(self.state, State::Loading)
+        match self.state {
+            State::Failed(_) => true,
+            State::Loading => false,
+            _ => self.next_page_token.is_some(),
+        }
     }
 
     /// Reads the next pages of changes, up to [`CAP`] more. The graph's first commit, known by
@@ -934,8 +937,19 @@ impl Render for CommitView {
         let header = self.render_header(cx);
         let more = usize::from(self.next_page_token.is_some());
         let body = match &self.state {
+            // Read again from the start: nothing of the commit's changes was read.
             State::Failed(message) => {
                 studio_ui::ds::error_state("The changes could not be read", message.clone())
+                    .child(
+                        studio_ui::ds::button("read-changes-again", "Try again")
+                            .style(ButtonStyle::Subtle)
+                            .key_binding(KeyBinding::for_action_in(
+                                &LoadMoreChanges,
+                                &self.focus_handle,
+                                cx,
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| this.load_more(cx))),
+                    )
                     .into_any_element()
             }
             State::Ready if self.rows.is_empty() => {
@@ -1090,6 +1104,54 @@ mod tests {
             assert_eq!(view.folded.changes.len(), 2);
             assert_eq!(view.next_page_token, None);
             assert!(view.more_error.is_none());
+        });
+    }
+
+    /// A first read of the changes that failed is offered again, by its button and the Load
+    /// more key, and read from the start. Before, the tab stayed failed until it was closed.
+    #[gpui::test]
+    async fn a_failed_first_read_is_offered_again(cx: &mut TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let failures = Arc::new(AtomicUsize::new(0));
+        let failed = failures.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let changes = request.uri().path().ends_with("/changes");
+            let failed = failed.clone();
+            async move {
+                let change = json!({ "kind": "node", "type": { "id": "Person", "name": "Person" }, "id": "p1", "op": "insert", "before": null, "after": { "properties": { "slug": "p1" } } });
+                let cause = json!({ "graph_commit_id": "c9", "parent_commit_id": "c8", "authored_branch": "main", "authored_at": 0 });
+                let (status, body) = if changes && failed.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (503, json!({ "error": "busy" }))
+                } else {
+                    (200, json!({ "cause": cause, "changes": [change] }))
+                };
+                Ok(Response::builder()
+                    .status(status)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        let view = cx.new(|cx| CommitView::new(session, "c9".into(), None, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.state, State::Failed(_)));
+            assert!(view.offers_more(), "its key is offered");
+        });
+        view.update(cx, |view, cx| view.load_more(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.state, State::Ready));
+            assert_eq!(view.folded.changes.len(), 1);
         });
     }
 

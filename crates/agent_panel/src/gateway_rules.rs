@@ -419,10 +419,19 @@ const SHOWN_QUERY_CHARS: usize = 20_000;
 /// The most of one parameter's value its card shows, on one line.
 const SHOWN_VALUE_CHARS: usize = 300;
 
-/// A write's query as its card shows it: its start, when it is long. A mutation may carry as
-/// much as a request body, which the card would otherwise copy and lay out on every frame.
+/// A write's query as its card shows it: its start, when it is long, and how much it leaves
+/// out, since Allow sends the whole of it. A mutation may carry as much as a request body, which
+/// the card would otherwise copy and lay out on every frame.
 fn shown_query(query: &str) -> String {
-    studio_ui::text::cut(query, SHOWN_QUERY_CHARS)
+    let total = query.chars().count();
+    if total <= SHOWN_QUERY_CHARS {
+        return query.to_owned();
+    }
+    let kept: String = query.chars().take(SHOWN_QUERY_CHARS).collect();
+    format!(
+        "{kept}\n… and {} more characters, not shown here, which Allow sends too",
+        studio_ui::group_digits(total - SHOWN_QUERY_CHARS)
+    )
 }
 
 /// A write's parameters as its card shows them: each name, with its value as text cut to what
@@ -550,8 +559,13 @@ mod tests {
             panic!("{write:?}")
         };
         let query = summary.query.unwrap();
-        assert_eq!(query.chars().count(), SHOWN_QUERY_CHARS);
-        assert!(query.ends_with('…'));
+        let (shown, note) = query.split_once('\n').unwrap();
+        assert_eq!(shown.chars().count(), SHOWN_QUERY_CHARS);
+        // Allow sends the whole of it, so the card says how much it does not show.
+        assert_eq!(
+            note,
+            "… and 60,000 more characters, not shown here, which Allow sends too"
+        );
         let params: Vec<(&str, usize, bool)> = summary
             .params
             .iter()

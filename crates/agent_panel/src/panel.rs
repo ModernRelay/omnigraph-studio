@@ -183,7 +183,7 @@ pub fn open(
         return Some(panel);
     }
     let graph = workspace.session()?.read(cx).overrides_key();
-    let agent = StudioSettings::get(cx).agent.command.join(" ");
+    let agent = crate::sessions::command_key(&StudioSettings::get(cx).agent.command);
     let sessions = AgentSessions::global(cx);
     let latest = sessions
         .read(cx)
@@ -1380,7 +1380,7 @@ impl AgentPanel {
         let record = SessionRecord {
             session: session.clone(),
             graph: self.session.read(cx).overrides_key(),
-            agent: self.agent.join(" "),
+            agent: crate::sessions::command_key(&self.agent),
             title: None,
             title_override: None,
             created_at: now,
@@ -2594,7 +2594,7 @@ fn agents(cx: &App) -> Vec<(String, Vec<String>)> {
         .collect();
     let configured = &StudioSettings::get(cx).agent.command;
     if !configured.is_empty() && !agents.iter().any(|(_, command)| command == configured) {
-        let name = crate::sessions_panel::agent_name(&configured.join(" "));
+        let name = crate::sessions_panel::agent_name(&crate::sessions::command_key(configured));
         agents.push((name, configured.clone()));
     }
     agents
@@ -2609,8 +2609,8 @@ fn agent_for(session_id: Option<&str>, sessions: &Entity<AgentSessions>, cx: &Ap
     agents(cx)
         .into_iter()
         .map(|(_, command)| command)
-        .find(|command| command.join(" ") == held)
-        .unwrap_or_else(|| held.split_whitespace().map(str::to_owned).collect())
+        .find(|command| crate::sessions::command_key(command) == held)
+        .unwrap_or_else(|| crate::sessions::command_of(&held))
 }
 
 /// The model menu, or the menu in its place before the agent offers a model: a section of
@@ -4281,6 +4281,8 @@ mod tests {
         };
         let codex = words(PRESETS[1].1);
         let custom = words(&["my-agent", "--acp"]);
+        // A program whose path holds a space, no longer the default.
+        let spaced = words(&["/Users/me/Library/Application Support/acp/agent", "--acp"]);
         cx.update(|cx| {
             studio_settings::init_test(cx);
             let mut settings = StudioSettings::get(cx).clone();
@@ -4292,26 +4294,29 @@ mod tests {
         let sessions = cx.new(|_| AgentSessions::load(path.clone()));
         let now = chrono::Utc::now();
         sessions.update(cx, |sessions, cx| {
-            sessions.upsert(
-                SessionRecord {
-                    session: "held".into(),
-                    graph: "server/crm".into(),
-                    agent: codex.join(" "),
-                    title: None,
-                    title_override: None,
-                    created_at: now,
-                    updated_at: now,
-                    branch: "agent/held".into(),
-                    branch_created: false,
-                    pinned: false,
-                    archived: false,
-                    cwd: std::env::temp_dir(),
-                },
-                cx,
-            )
+            for (session, command) in [("held", &codex), ("spaced", &spaced)] {
+                sessions.upsert(
+                    SessionRecord {
+                        session: session.into(),
+                        graph: "server/crm".into(),
+                        agent: crate::sessions::command_key(command),
+                        title: None,
+                        title_override: None,
+                        created_at: now,
+                        updated_at: now,
+                        branch: format!("agent/{session}"),
+                        branch_created: false,
+                        pinned: false,
+                        archived: false,
+                        cwd: std::env::temp_dir(),
+                    },
+                    cx,
+                )
+            }
         });
         cx.update(|cx| {
             assert_eq!(agent_for(Some("held"), &sessions, cx), codex);
+            assert_eq!(agent_for(Some("spaced"), &sessions, cx), spaced, "whole");
             assert_eq!(agent_for(Some("unknown"), &sessions, cx), custom);
             assert_eq!(agent_for(None, &sessions, cx), custom);
             let names: Vec<String> = agents(cx).into_iter().map(|(name, _)| name).collect();
@@ -4320,10 +4325,6 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// A conversation restored with the workspace behind another tab starts no agent: its start
-    /// waits for the tab's first draw, which takes it. Before, every restored conversation
-    /// started its agent at launch, a process and a replay each. (A drawn tab here has no agent
-    /// to start, so the test starts no process.)
     /// Starting a conversation nothing was sent in again (Restart, or Start again after a slow
     /// start) removes the folder it ran in, as choosing another agent does: the start takes a
     /// folder of its own. Before, the old folder, with its `AGENTS.md` and skill, stayed.
@@ -4371,6 +4372,10 @@ mod tests {
         assert!(!old.exists(), "the unused folder removed");
     }
 
+    /// A conversation restored with the workspace behind another tab starts no agent: its start
+    /// waits for the tab's first draw, which takes it. Before, every restored conversation
+    /// started its agent at launch, a process and a replay each. (A drawn tab here has no agent
+    /// to start, so the test starts no process.)
     #[gpui::test]
     async fn a_restored_conversation_starts_its_agent_when_shown(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
