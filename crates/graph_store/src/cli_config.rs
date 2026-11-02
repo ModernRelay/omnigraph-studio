@@ -337,10 +337,6 @@ async fn name_organizations(
             }
         };
         organization.clone_from(&found);
-        // The organization is the profile's, not the target's: a change of it alone gives the
-        // target a new revision, so its token source, which checks a sign-in against it, is
-        // made again.
-        server.revision.push_str(&format!(" {found:?}"));
     }
 }
 

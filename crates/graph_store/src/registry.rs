@@ -25,9 +25,10 @@ use crate::sign_in::{self, PlatformKeychain, SignInContext};
 
 /// How often the CLI's files are checked for a change, as Studio's settings file is.
 const OPERATOR_POLL: Duration = Duration::from_secs(2);
-/// How many first listings that did not happen (the CLI busy, a slow first start) are taken
-/// again before what waits for the targets goes on without them.
-const FIRST_LISTING_TRIES: u32 = 5;
+/// How long first listings that did not happen (the CLI busy, a slow first start) are taken
+/// again before what waits for the targets goes on without them: a try can itself wait out
+/// the CLI's read timeout, so this bounds the wait, not the tries.
+const FIRST_LISTING_PATIENCE: Duration = Duration::from_secs(15);
 
 /// Makes the HTTP client for a CLI target whose `transport` names a proxy or its own certificate
 /// authority.
@@ -123,9 +124,9 @@ pub struct ConnectionRegistry {
     /// servers are not known, and what looks for one waits ([`Self::when_listed`]).
     listed: bool,
     listing_waiters: Vec<oneshot::Sender<()>>,
-    /// The first listings that did not happen ([`CliTargets::lists_again`]) since the start
-    /// asked for one, up to [`FIRST_LISTING_TRIES`].
-    unlisted_tries: u32,
+    /// When the start asked for the first listing: one that did not happen
+    /// ([`CliTargets::lists_again`]) is taken again until [`FIRST_LISTING_PATIENCE`] has passed.
+    listing_started: Option<std::time::Instant>,
     /// The graph ids remembered for each CLI target, as last read or saved.
     known: KnownGraphs,
     /// What a CLI server's connection signs in with when its server asks (spec 016): `None` in
@@ -547,7 +548,7 @@ impl ConnectionRegistry {
             cli_kept: HashMap::new(),
             listed: true,
             listing_waiters: Vec::new(),
-            unlisted_tries: 0,
+            listing_started: None,
             known: KnownGraphs::default(),
             sign_in: None,
             saving: false,
@@ -591,7 +592,7 @@ impl ConnectionRegistry {
     /// [`Self::listed`].
     fn start_listing(&mut self, cx: &mut Context<Self>) {
         self.listed = false;
-        self.unlisted_tries = 0;
+        self.listing_started = Some(cx.background_executor().now());
         self.watched = self
             .operator_dir
             .iter()
@@ -686,9 +687,10 @@ impl ConnectionRegistry {
                         // before what waits for the targets goes on, a few times at most: taken
                         // as the targets, it would close the reopened windows of every target
                         // it missed, and refuse a link to one.
-                        let held_back = listing
-                            && targets.lists_again()
-                            && this.unlisted_tries < FIRST_LISTING_TRIES;
+                        let patient = this.listing_started.is_some_and(|started| {
+                            cx.background_executor().now() - started < FIRST_LISTING_PATIENCE
+                        });
+                        let held_back = listing && targets.lists_again() && patient;
                         this.cli_stamp = cli_stamp;
                         this.keep_stamp(&targets);
                         let changed = this.apply_cli_targets(targets, prepared, cx);
@@ -699,9 +701,7 @@ impl ConnectionRegistry {
                             this.save(cx);
                             cx.notify();
                         }
-                        if held_back {
-                            this.unlisted_tries += 1;
-                        } else {
+                        if !held_back {
                             this.finish_listing(cx);
                         }
                     })
@@ -1971,24 +1971,28 @@ mod tests {
         // A first listing that did not happen (the CLI busy) is taken again at the next check,
         // and what waits for the targets waits on: taken as the targets, it would close every
         // reopened window.
+        let busy = || cli_config::unlisted(&cli_config::config_path(&dir), "busy".into());
         let retried = listing.next();
-        answer
-            .send(cli_config::unlisted(
-                &cli_config::config_path(&dir),
-                "the CLI was busy".into(),
-            ))
-            .ok();
+        answer.send(busy()).ok();
         cx.run_until_parked();
         assert!(!listed.load(Ordering::SeqCst), "still waiting");
         cx.executor().advance_clock(OPERATOR_POLL);
         cx.run_until_parked();
         assert_eq!(listing.asked(), 2, "listed again");
 
-        retried
+        // Past the patience, one that still did not happen lets what waits go on, and the next
+        // check lists the targets.
+        let third = listing.next();
+        cx.executor().advance_clock(FIRST_LISTING_PATIENCE);
+        retried.send(busy()).ok();
+        cx.run_until_parked();
+        assert!(listed.load(Ordering::SeqCst), "waited long enough");
+        cx.executor().advance_clock(OPERATOR_POLL);
+        cx.run_until_parked();
+        third
             .send(files(vec![server("a", "http://a.test", "1")]))
             .ok();
         cx.run_until_parked();
-        assert!(listed.load(Ordering::SeqCst));
         registry.read_with(cx, |registry, cx| {
             assert!(registry.listed());
             assert!(registry.find("a", cx).is_some());

@@ -254,8 +254,6 @@ struct BlobSent {
     key: (String, String),
     change: BlobChange,
     bound_at: Option<String>,
-    /// The table's [`TypeTable::blob_round`] when the write was sent.
-    round: u64,
 }
 
 /// A grouped section's read under way: how many rows it asks for, which a read dropped away
@@ -862,9 +860,9 @@ pub struct TypeTable {
     /// Files dropped on Blob cells being stored, by row id and property, and why one that did
     /// not land did not.
     blob_edits: HashMap<(String, String), BlobEdit>,
-    /// How many times the branch changed, which clears `blob_edits`: a write sent before the
-    /// last change lands without touching the marks the cells show now, another write's.
-    blob_round: u64,
+    /// Files still being stored to a branch the table left, by that branch: shown there again,
+    /// and holding a second write of their cell back, when the table comes back to it.
+    blob_edits_left: HashMap<String, HashMap<(String, String), BlobEdit>>,
     /// Each row's neighbours in the relationship columns, by row id and relationship key;
     /// read for each page at the page's commit.
     relations: CellMap<Relation>,
@@ -1221,7 +1219,7 @@ impl TypeTable {
             blob_tasks: HashMap::new(),
             blob_queue: Default::default(),
             blob_edits: HashMap::new(),
-            blob_round: 0,
+            blob_edits_left: HashMap::new(),
             relations: CellMap::default(),
             relation_tasks: HashMap::new(),
             next_relation_task: 0,
@@ -1319,10 +1317,20 @@ impl TypeTable {
                     window.focus(&self.focus_handle, cx);
                 }
                 self.fill = None;
-                // A file still being stored goes on to the branch left, and its toast tells how
-                // it ended; the new branch's cells show none of it.
-                self.blob_edits.clear();
-                self.blob_round += 1;
+                // A file still being stored goes on to the branch left, and shows there again
+                // if the table comes back before it lands; its toast tells how it ended. The new
+                // branch's cells show only that branch's own.
+                let going: HashMap<_, _> = std::mem::take(&mut self.blob_edits)
+                    .into_iter()
+                    .filter(|(_, edit)| edit.is_saving())
+                    .collect();
+                if !going.is_empty() {
+                    self.blob_edits_left.insert(left.clone(), going);
+                }
+                self.blob_edits = self
+                    .blob_edits_left
+                    .remove(&self.branch)
+                    .unwrap_or_default();
                 // The branch's own drafts show; the other's wait in the session.
                 self.cells.clear();
                 self.draft_notices.clear();
@@ -9470,7 +9478,6 @@ impl TypeTable {
         self.blob_edits
             .insert(key.clone(), BlobEdit::Saving(change.clone()));
         self.saves_in_flight += 1;
-        let round = self.blob_round;
         // Detached: a write is never cancelled by closing the tab.
         cx.spawn(async move |this, cx| {
             let written = write.await;
@@ -9479,7 +9486,6 @@ impl TypeTable {
                     key,
                     change,
                     bound_at: bound_at.borrow().clone(),
-                    round,
                 };
                 this.blob_written(sent, &session, &branch, written, cx)
             })
@@ -9526,12 +9532,17 @@ impl TypeTable {
             key,
             change,
             bound_at,
-            round,
         } = sent;
         self.saves_in_flight = self.saves_in_flight.saturating_sub(1);
         // The table moved to another branch or graph meanwhile; the outcome is told by its
-        // toast.
+        // toast, and the cell no longer shows it going there.
         if !self.shows(session, branch) {
+            if let Some(going) = self.blob_edits_left.get_mut(branch) {
+                going.remove(&key);
+                if going.is_empty() {
+                    self.blob_edits_left.remove(branch);
+                }
+            }
             self.saves_settled(cx);
             cx.emit(ItemEvent::UpdateTab);
             cx.notify();
@@ -9564,14 +9575,10 @@ impl TypeTable {
                 .insert(key.0.clone(), key.1.clone(), Loadable::Loaded(meta.clone()));
             self.read_queued_blobs(cx);
         }
-        // Sent before the branch changed and came back: the cell marks a later write now, and
-        // this one's outcome is told by its toast.
-        if round == self.blob_round {
-            match BlobEdit::ended(written, change, &key.1) {
-                Some(edit) => self.blob_edits.insert(key, edit),
-                None => self.blob_edits.remove(&key),
-            };
-        }
+        match BlobEdit::ended(written, change, &key.1) {
+            Some(edit) => self.blob_edits.insert(key, edit),
+            None => self.blob_edits.remove(&key),
+        };
         self.saves_settled(cx);
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
@@ -13900,7 +13907,8 @@ mod tests {
 
     /// A file still being stored when the table moves to another branch goes on to the branch
     /// left: the new branch's cell does not show it as going and takes a file of its own, and
-    /// the write's landing changes nothing there, not the mark of that branch's own write.
+    /// the write's landing changes nothing there, not the mark of that branch's own write. Back
+    /// on the branch left while it is out, the cell shows it again and holds a second write back.
     #[gpui::test]
     async fn a_blob_write_out_stays_with_the_branch_left(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -13941,6 +13949,17 @@ mod tests {
             assert!(table.blob_edits.is_empty(), "not shown on fix");
             assert!(table.takes_blob_drop("p1", "doc", cx));
         });
+        session.update(cx, |session, cx| session.set_branch("main".into(), cx));
+        cx.run_until_parked();
+        table.read_with(cx, |table, cx| {
+            assert!(table.blob_edits[&key].is_saving(), "shown again on main");
+            assert!(
+                !table.takes_blob_drop("p1", "doc", cx),
+                "a second write held back"
+            );
+        });
+        session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        cx.run_until_parked();
         // A file going to the cell on fix, as one dropped there would be.
         table.update(cx, |table, _| {
             table
@@ -13957,6 +13976,7 @@ mod tests {
                 table.blob_edits[&key].is_saving(),
                 "fix's own write still marked"
             );
+            assert!(table.blob_edits_left.is_empty(), "main's mark settled");
             assert_eq!(table.saves_in_flight, 0);
         });
     }

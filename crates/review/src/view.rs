@@ -1114,22 +1114,21 @@ impl ReviewView {
     }
 
     /// Reads the names of the nodes the review knows only by id, at the head it read. A name
-    /// known at that head is not read again, so a Refresh at the same head keeps showing it; a
+    /// read at that head is not read again, so a Refresh at the same head keeps showing it; a
     /// review read at another head reads every name again, since a merge into the branch (or
-    /// the branch deleted and made again) may have renamed a node it did not change.
+    /// the branch deleted and made again) may have renamed a node it did not change. The names
+    /// shown stay until the new ones replace them, and stay if they cannot be read.
     fn read_names(
         &mut self,
         ends: Vec<(String, String)>,
         head: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        if self.names_at != head {
-            self.names.clear();
-            self.names_at.clone_from(&head);
-        }
+        let moved = self.names_at != head;
+        self.names_at.clone_from(&head);
         let missing: Vec<_> = ends
             .into_iter()
-            .filter(|end| !self.names.contains_key(end))
+            .filter(|end| moved || !self.names.contains_key(end))
             .collect();
         if missing.is_empty() {
             self._names_task = None;
@@ -6155,8 +6154,9 @@ pub(crate) mod tests {
     }
 
     /// A name read for a node the review knows only by id is kept while the review is read at
-    /// the same head, and read again at another: a merge into the branch may have renamed it.
-    /// Before, a name once read stood for the life of the tab.
+    /// the same head, and read again at another, a merge into the branch having perhaps renamed
+    /// it; the name shown stays until the new one replaces it. Before, a name once read stood for
+    /// the life of the tab.
     #[gpui::test]
     async fn names_are_read_again_at_a_new_head(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
@@ -6173,13 +6173,14 @@ pub(crate) mod tests {
             let head = view.data.as_ref().and_then(|data| data.head.clone());
             view.names.insert(end.clone(), "Ada".into());
             view.read_names(vec![end.clone()], head, cx);
+            assert!(view._names_task.is_none(), "same head: not read again");
+            view.read_names(vec![end.clone()], Some("f3".into()), cx);
+            assert!(view._names_task.is_some(), "another head: read again");
             assert_eq!(
                 view.names.get(&end).map(String::as_str),
                 Some("Ada"),
-                "same head"
+                "shown until replaced"
             );
-            view.read_names(Vec::new(), Some("f3".into()), cx);
-            assert!(view.names.is_empty(), "another head");
         });
     }
 

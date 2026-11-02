@@ -205,10 +205,10 @@ impl AgentSessions {
     }
 
     /// The graph's last active conversation with this agent, to come back to.
-    pub fn latest(&self, graph: &str, agent: &str) -> Option<&SessionRecord> {
+    pub fn latest(&self, graph: &str, agent: &[String]) -> Option<&SessionRecord> {
         self.for_graph(graph)
             .into_iter()
-            .find(|record| record.agent == agent)
+            .find(|record| is_agent(&record.agent, agent))
     }
 
     /// Gives the conversation recorded as `old` the agent's new session id: the agent could not
@@ -508,15 +508,13 @@ pub(crate) fn title_of(message: &str) -> Option<String> {
 }
 
 /// A conversation's agent command as its record keeps it: the words joined with spaces, a word
-/// holding a space, a quote or a backslash quoted, so [`command_of`] gives the command back
-/// whole (a program under `Application Support`). A command with no such word is kept as it
-/// always was, its words joined with spaces.
+/// holding a space (a program under `Application Support`) or starting with a quote quoted, so
+/// [`command_of`] gives the command back whole. Any other command is kept as it always was, its
+/// words joined with spaces, a Windows path's backslashes included.
 pub fn command_key(command: &[String]) -> String {
     let word = |word: &String| {
-        let plain = !word.is_empty()
-            && !word
-                .chars()
-                .any(|c| c.is_whitespace() || c == '"' || c == '\\');
+        let plain =
+            !word.is_empty() && !word.starts_with('"') && !word.chars().any(char::is_whitespace);
         if plain {
             return word.clone();
         }
@@ -531,6 +529,12 @@ pub fn command_key(command: &[String]) -> String {
         quoted
     };
     command.iter().map(word).collect::<Vec<_>>().join(" ")
+}
+
+/// Whether a record's agent (`key`) is `command`: kept as [`command_key`] keeps it, or as a
+/// record kept before words were quoted joined its words with spaces.
+pub fn is_agent(key: &str, command: &[String]) -> bool {
+    key == command_key(command) || key == command.join(" ")
 }
 
 /// The command a record keeps ([`command_key`]). A record kept before words were quoted gives
@@ -815,6 +819,17 @@ mod tests {
             command_of(r"C:\Tools\my-agent  --acp"),
             words(&[r"C:\Tools\my-agent", "--acp"])
         );
+        // A record kept before words were quoted is still its agent's.
+        let windows = words(&[r"C:\Tools\my-agent", "--acp"]);
+        assert_eq!(
+            command_key(&windows),
+            r"C:\Tools\my-agent --acp",
+            "kept as it was"
+        );
+        let spaced = words(&["/Users/me/Application Support/acp/agent", "--acp"]);
+        assert!(is_agent(&spaced.join(" "), &spaced));
+        assert!(is_agent(&command_key(&spaced), &spaced));
+        assert!(!is_agent(&command_key(&windows), &spaced));
     }
     use serde_json::json;
 
@@ -976,8 +991,15 @@ mod tests {
             assert_eq!(store.archived("server/crm").len(), 1);
             assert_eq!(store.get("old").unwrap().shown_title(), "How many people?");
             assert_eq!(store.get("new").unwrap().shown_title(), "People count");
-            assert_eq!(store.latest("server/crm", "claude").unwrap().session, "new");
-            assert!(store.latest("server/crm", "codex").is_none());
+            let agent = |name: &str| vec![name.to_owned()];
+            assert_eq!(
+                store
+                    .latest("server/crm", &agent("claude"))
+                    .unwrap()
+                    .session,
+                "new"
+            );
+            assert!(store.latest("server/crm", &agent("codex")).is_none());
         });
         // An empty name gives the agent's back; a removed one stays out of an import.
         store.update(cx, |store, cx| {
