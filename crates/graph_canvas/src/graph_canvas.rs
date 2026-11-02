@@ -195,6 +195,8 @@ struct ResultsData {
     title: String,
     nodes: Vec<(NodeRef, Option<String>)>,
     links: Vec<(usize, usize)>,
+    /// The commit the result was read at, when its query was held at one.
+    at_commit: Option<String>,
 }
 
 /// Results canvases are tabs of their own, one per showing.
@@ -439,7 +441,12 @@ impl Focusable for GraphCanvas {
 impl Item for GraphCanvas {
     fn tab_title(&self, cx: &App) -> SharedString {
         if let Some((_, results)) = &self.results {
-            return results.title.clone().into();
+            return match &results.at_commit {
+                Some(commit) => {
+                    format!("{} @ {}", results.title, studio_ui::short_commit_id(commit)).into()
+                }
+                None => results.title.clone().into(),
+            };
         }
         let Some((root, at_commit)) = &self.walk else {
             return "Canvas".into();
@@ -712,6 +719,7 @@ impl GraphCanvas {
             title: action.title.clone(),
             nodes,
             links: action.links.clone(),
+            at_commit: action.at_commit.clone(),
         });
         let exploration = Exploration::unrooted(&session, cx);
         Self::build(
@@ -724,11 +732,14 @@ impl GraphCanvas {
         )
     }
 
-    /// The commit this canvas is held at, which what it opens is held at too (spec 020).
+    /// The commit this canvas is held at, which what it opens is held at too (spec 020): a
+    /// walk's, or the commit a query's result was read at.
     fn held_at(&self) -> Option<String> {
-        self.walk
-            .as_ref()
-            .and_then(|(_, at_commit)| at_commit.clone())
+        match (&self.walk, &self.results) {
+            (Some((_, at_commit)), _) => at_commit.clone(),
+            (None, Some((_, results))) => results.at_commit.clone(),
+            (None, None) => None,
+        }
     }
 
     /// The explorer's scene as the exploration stands, under the node cap; none without a
@@ -1964,7 +1975,7 @@ impl GraphCanvas {
                         None,
                         open_action(OpenType {
                             type_name: group.other_type,
-                            at_commit: None,
+                            at_commit: at_commit.clone(),
                             filter_id: Some(owner.id),
                             via: Some(gq_language::builder::relationship_key(&back)),
                             preview: false,
@@ -2262,7 +2273,7 @@ impl GraphCanvas {
                 Box::new(studio_actions::graph::OpenNodePage {
                     type_name: node.type_name.clone(),
                     id: node.id.clone(),
-                    at_commit: None,
+                    at_commit: self.held_at(),
                 }),
                 cx,
             );
@@ -3125,6 +3136,7 @@ mod tests {
             title: "people".into(),
             nodes: vec![person("p1"), person("p2"), person("p3")],
             links: Vec::new(),
+            at_commit: None,
         };
         let canvas = cx.new(|cx| GraphCanvas::with_results(session, &action, cx));
         cx.run_until_parked();
@@ -3273,6 +3285,91 @@ mod tests {
             assert!(canvas.layout_task.is_none());
             assert!(!canvas.scene.nodes.is_empty(), "and shown");
         });
+    }
+
+    /// A canvas of a result read at a commit holds that commit: peeking at a node and opening
+    /// its page read there, after the session moves to another branch too, and its tab says
+    /// so. A result read at the branch head opens what it opens at the head, as before.
+    #[gpui::test]
+    async fn a_result_read_at_a_commit_opens_its_nodes_there(cx: &mut gpui::TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let (session, _served) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\n",
+            |_| serde_json::json!([]),
+            cx,
+        );
+        cx.run_until_parked();
+        // What was opened, and at which commit.
+        type Opened = Rc<RefCell<Vec<(&'static str, Option<String>)>>>;
+        let opened: Opened = Rc::default();
+        cx.update(|cx| {
+            let heard = opened.clone();
+            cx.on_action(move |action: &PeekNode, _| {
+                heard.borrow_mut().push(("peek", action.at_commit.clone()))
+            });
+            let heard = opened.clone();
+            cx.on_action(move |action: &OpenNodePage, _| {
+                heard.borrow_mut().push(("page", action.at_commit.clone()))
+            });
+        });
+        let person = |id: &str| studio_actions::graph::ResultNode {
+            type_name: "Person".into(),
+            id: id.into(),
+            label: Some(id.to_uppercase()),
+        };
+        for (held, title) in [
+            (Some("c1"), "people · result @ c1"),
+            (None, "people · result"),
+        ] {
+            let action = ShowResultsOnCanvas {
+                title: "people · result".into(),
+                nodes: vec![person("p1"), person("p2")],
+                links: vec![(0, 1)],
+                at_commit: held.map(str::to_owned),
+            };
+            let session = session.clone();
+            let (canvas, cx) =
+                cx.add_window_view(|_, cx| GraphCanvas::with_results(session, &action, cx));
+            cx.update(|window, cx| window.focus(&canvas.focus_handle(cx), cx));
+            cx.run_until_parked();
+            canvas.update_in(cx, |canvas, window, cx| {
+                assert_eq!(Item::tab_title(canvas, cx).as_ref(), title);
+                let index = canvas
+                    .index_of(&SceneId::Node(NodeRef::new("Person", "p1")))
+                    .expect("p1 is drawn");
+                canvas.selected = Some(SceneId::Node(NodeRef::new("Person", "p1")));
+                canvas.peek(index, window, cx);
+            });
+            cx.dispatch_action(OpenSelectedPage);
+            // The session moves to another branch: the result's commit still holds.
+            canvas.update(cx, |canvas, cx| {
+                canvas
+                    .session
+                    .update(cx, |session, cx| session.set_branch("fix".into(), cx))
+            });
+            cx.run_until_parked();
+            canvas.update_in(cx, |canvas, window, cx| {
+                let index = canvas.selected_index().expect("still selected");
+                canvas.peek(index, window, cx);
+            });
+            cx.dispatch_action(OpenSelectedPage);
+            cx.run_until_parked();
+            let held = held.map(str::to_owned);
+            assert_eq!(
+                opened.borrow_mut().drain(..).collect::<Vec<_>>(),
+                [
+                    ("peek", held.clone()),
+                    ("page", held.clone()),
+                    ("peek", held.clone()),
+                    ("page", held),
+                ],
+            );
+            canvas.update(cx, |canvas, cx| {
+                canvas
+                    .session
+                    .update(cx, |session, cx| session.set_branch("main".into(), cx))
+            });
+        }
     }
 
     /// A canvas starts from where the person placed things on the graph's old canvas, as its own

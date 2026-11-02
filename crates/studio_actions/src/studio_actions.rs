@@ -375,6 +375,11 @@ pub mod graph {
         pub nodes: Vec<ResultNode>,
         /// Pairs of indices into `nodes` that share a row.
         pub links: Vec<(usize, usize)>,
+        /// The commit the result was read at, when its query was held at one: the canvas holds
+        /// it too, read-only, and what it opens reads there. `None` for a result read at the
+        /// branch head, which the canvas follows.
+        #[serde(default)]
+        pub at_commit: Option<String>,
     }
 
     /// Open a Blob value in a tab of its own, read at a commit or the branch head.

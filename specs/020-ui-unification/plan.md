@@ -336,7 +336,10 @@ availability.
 | Held | Not offered; the commit is the point | Ignored; stays at its commit, read-only |
 
 `Exploration` needs a way to start at a commit, since it starts at the head today. `ShowNodeOnCanvas`
-gains `at_commit`, and a new `ShowNodeInTree` carries it too.
+gains `at_commit`, and a new `ShowNodeInTree` carries it too. So does `ShowResultsOnCanvas`: a
+query's result read at the commit its tab is held at opens its Tree and Canvas held there, and
+what they open reads it (issue #44). A result read at the branch head opens them following it,
+as a head table's do.
 
 **Also:**
 
@@ -628,6 +631,7 @@ No engine changes are needed, so nothing goes in `docs/deferred-engine-changes.m
 | 2026-11-01 | The frame and views draw as designed | Offscreen snapshots on `script/dev-server`: sidebar, table with its strip, Map, a set on Canvas, Tree beside a table, Branches with History | As designed. Clicks ran through the snapshot tool; the running app was not driven by hand |
 | 2026-11-01 | An old session upgrades without loss | A real saved `workspaces/*.json` with a root-less `canvas` tab and `explore` and `history` panels, restored twice by the snapshot tool | The tab went, its positions stayed in `canvas_positions` through both restarts, and the panels fell back to `types` and `activity`, with the table tab intact |
 | 2026-11-01 | Tree holds a set and Canvas one node, on real reads | `relationship_tree` `a_set_opens_closed_and_canvas_takes_the_selected_node`, `listed_nodes_are_the_set_and_a_set_is_known_by_what_it_holds`; `type_table` `tree_holds_the_tables_rows_and_canvas_the_row_under_the_cursor`; `graph_store` `a_set_is_paged_and_its_rows_open_on_their_own`; offscreen snapshots on `script/dev-server` | Person filtered to Founder opened as "Tree: Person, Founder", rows closed, a row opened to its relationships with counts; selecting Edsger Hamilton, Canvas opened a walk from that one node with both tabs kept |
+| 2026-11-02 | A result read at a commit opens its views there (issue #44) | `query_editor` `a_result_read_at_a_commit_opens_its_views_there` (a tab held at `c1` and one at the head, each running a two-node query against a fake server, then unpinned); `graph_canvas` `a_result_read_at_a_commit_opens_its_nodes_there` (a results canvas at `c1` and one at the head: Space's peek and ⌘↵'s page, before and after the session moves to branch `fix`) | Held: the Tree and Canvas actions carry `c1`, unpinned too; the canvas's tab reads "people · result @ c1", and its peek and page carry `c1` on both branches. At the head: `None` throughout. Before, the query editor sent the Canvas action with no commit and the Tree action with the tab's pin when pressed (`at_commit: None` once unpinned), `ShowResultsOnCanvas` had no commit, `GraphCanvas::held_at` knew only a walk's, and ⌘↵ sent `None` even from a held walk; "Open related table" from a held walk's relationship pill sent `None` too |
 | | The top bar is right on Linux and Windows | Real builds | **Not run.** Compiled by CI only; whether those platforms draw window controls in it is unknown |
 | | The rule improves prediction | Prediction test | **Not run. No users have seen any of this** |
 | | Two walks perform acceptably | Tree baseline | **Not run** |
