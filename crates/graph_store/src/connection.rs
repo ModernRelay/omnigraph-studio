@@ -515,10 +515,16 @@ impl Connection {
     /// server has not said that it offers no sign-in, which is then held back as the standby
     /// ([`Self::standby`]). Notes the organization a sign-in must be in.
     fn hold_back(&mut self, source: Option<Arc<dyn TokenSource>>) -> Option<Arc<dyn TokenSource>> {
-        self.organization = source.as_ref().and_then(|source| source.organization());
         let login = source
             .as_ref()
             .is_some_and(|source| source.login_profile().is_some());
+        let named = source.as_ref().and_then(|source| source.organization());
+        // A managed login whose profile's organization the CLI did not say this time (a read it
+        // missed) keeps the one said before, so a sign-in held for it stays.
+        self.organization = match named {
+            None if login => self.organization.take(),
+            named => named,
+        };
         if login && !self.offers_no_sign_in {
             self.standby = source;
             return None;
@@ -2376,6 +2382,57 @@ mod tests {
     use futures::future::BoxFuture;
     use gpui::{AppContext as _, Entity, TestAppContext};
     use http_client::{AsyncBody, FakeHttpClient, Response};
+
+    /// A managed login whose profile's organization the CLI did not say this time keeps the one
+    /// it said before, so a sign-in held for it stays; one naming another organization takes
+    /// it, and a target with no source names none. Before, a read the CLI missed took the
+    /// organization away, and with it the sign-in.
+    #[gpui::test]
+    fn a_login_that_does_not_say_its_organization_keeps_the_one_before(cx: &mut TestAppContext) {
+        struct Login(Option<&'static str>);
+        impl TokenSource for Login {
+            fn token(&self, _: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, NoToken>> {
+                futures::future::pending().boxed()
+            }
+
+            fn login_profile(&self) -> Option<String> {
+                Some("work".into())
+            }
+
+            fn organization(&self) -> Option<String> {
+                self.0.map(str::to_owned)
+            }
+        }
+        let server = ServerEntry {
+            name: "work".into(),
+            url: "https://cluster.example.com".into(),
+            source: ServerSource::Cli,
+            known_graphs: Vec::new(),
+        };
+        let http = FakeHttpClient::with_404_response();
+        let connection = cx.new(|_| Connection::new(server, None, http).unwrap());
+        let take = |login: Option<Login>, cx: &mut TestAppContext| {
+            let source = login.map(|login| Arc::new(login) as Arc<dyn TokenSource>);
+            connection.update(cx, |c, cx| {
+                c.take_token_from(source, cx);
+                c.organization.clone()
+            })
+        };
+        assert_eq!(
+            take(Some(Login(Some("org_1"))), cx).as_deref(),
+            Some("org_1")
+        );
+        assert_eq!(
+            take(Some(Login(None)), cx).as_deref(),
+            Some("org_1"),
+            "kept"
+        );
+        assert_eq!(
+            take(Some(Login(Some("org_2"))), cx).as_deref(),
+            Some("org_2")
+        );
+        assert_eq!(take(None, cx), None, "no source");
+    }
 
     /// A server answering `/healthz` with `version`, and every other read with no graphs.
     /// The state a connection reaches to a server whose answers carry `contract`.

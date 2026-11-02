@@ -25,9 +25,10 @@ use crate::sign_in::{self, PlatformKeychain, SignInContext};
 
 /// How often the CLI's files are checked for a change, as Studio's settings file is.
 const OPERATOR_POLL: Duration = Duration::from_secs(2);
-/// How long first listings that did not happen (the CLI busy, a slow first start) are taken
-/// again before what waits for the targets goes on without them: a try can itself wait out
-/// the CLI's read timeout, so this bounds the wait, not the tries.
+/// How long after the start a first listing that did not happen (the CLI busy, a slow first
+/// start) is still taken again before what waits for the targets goes on without them. A try
+/// can itself wait out the CLI's read timeout, so this bounds the wait by time, not by tries;
+/// the wait ends with the first such listing to come back after it, one try past it at most.
 const FIRST_LISTING_PATIENCE: Duration = Duration::from_secs(15);
 
 /// Makes the HTTP client for a CLI target whose `transport` names a proxy or its own certificate
@@ -684,9 +685,10 @@ impl ConnectionRegistry {
                         // A CLI that moved since the start's listing asks every token again.
                         let asks_again = cli_moved && !listing;
                         // A first listing that may pass is taken again at the next check
-                        // before what waits for the targets goes on, a few times at most: taken
-                        // as the targets, it would close the reopened windows of every target
-                        // it missed, and refuse a link to one.
+                        // before what waits for the targets goes on, until
+                        // `FIRST_LISTING_PATIENCE` has passed: taken as the targets, it would
+                        // close the reopened windows of every target it missed, and refuse a
+                        // link to one.
                         let patient = this.listing_started.is_some_and(|started| {
                             cx.background_executor().now() - started < FIRST_LISTING_PATIENCE
                         });
