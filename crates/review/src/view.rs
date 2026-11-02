@@ -491,7 +491,8 @@ pub struct ReviewView {
     /// Names of the nodes the review knows only by id, read at the reviewed head after it
     /// loads; until then, and for a node without a name, its id shows.
     names: NodeNames,
-    /// The head `names` were read at: a review read at another head reads them again.
+    /// The head whose names `names` hold, once a read of them there was answered in full: a
+    /// review read at another head reads them again, and one whose read failed reads it again.
     names_at: Option<String>,
     /// How many relationship lines each card shows.
     card_lines: CardLines,
@@ -1125,21 +1126,33 @@ impl ReviewView {
         cx: &mut Context<Self>,
     ) {
         let moved = self.names_at != head;
-        self.names_at.clone_from(&head);
         let missing: Vec<_> = ends
-            .into_iter()
-            .filter(|end| moved || !self.names.contains_key(end))
+            .iter()
+            .filter(|end| moved || !self.names.contains_key(*end))
+            .cloned()
             .collect();
         if missing.is_empty() {
             self._names_task = None;
             return;
         }
-        let names = self
-            .session
-            .update(cx, |session, cx| session.node_names(missing, head, cx));
+        // At a new head, the nodes shown now: once their names land, those of nodes no longer
+        // shown go, so the names held follow what the review shows.
+        let shown: Option<std::collections::HashSet<(String, String)>> =
+            moved.then(|| ends.into_iter().collect());
+        let names = self.session.update(cx, |session, cx| {
+            session.node_names(missing, head.clone(), cx)
+        });
         self._names_task = Some(cx.spawn(async move |this, cx| {
-            let names = names.await;
+            let (names, answered) = names.await;
             this.update(cx, |this, cx| {
+                if let Some(shown) = shown {
+                    this.names.retain(|end, _| shown.contains(end));
+                }
+                // A read that failed leaves the names it would have replaced shown, and is read
+                // again at the next ask, rather than taken as the head's.
+                if answered {
+                    this.names_at = head;
+                }
                 this.names.extend(names);
                 cx.notify();
             })
@@ -5917,8 +5930,8 @@ pub(crate) mod tests {
 
     /// A name read for a node the review knows only by id is kept while the review is read at
     /// the same head, and read again at another, a merge into the branch having perhaps renamed
-    /// it; the name shown stays until the new one replaces it. Before, a name once read stood for
-    /// the life of the tab.
+    /// it; the name shown stays until the new one replaces it, and a read that failed is read
+    /// again at the next ask. Before, a name once read stood for the life of the tab.
     #[gpui::test]
     async fn names_are_read_again_at_a_new_head(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
@@ -5931,11 +5944,14 @@ pub(crate) mod tests {
         });
         cx.run_until_parked();
         let end = ("Person".to_owned(), "p9".to_owned());
+        let gone = ("Person".to_owned(), "p8".to_owned());
         view.update(cx, |view, cx| {
             let head = view.data.as_ref().and_then(|data| data.head.clone());
             view.names.insert(end.clone(), "Ada".into());
+            view.names_at.clone_from(&head);
             view.read_names(vec![end.clone()], head, cx);
             assert!(view._names_task.is_none(), "same head: not read again");
+            view.names.insert(gone.clone(), "Grace".into());
             view.read_names(vec![end.clone()], Some("f3".into()), cx);
             assert!(view._names_task.is_some(), "another head: read again");
             assert_eq!(
@@ -5943,6 +5959,22 @@ pub(crate) mod tests {
                 Some("Ada"),
                 "shown until replaced"
             );
+            // Asked again before that read lands (a regroup), it is read again, not taken as
+            // read at the new head.
+            view._names_task = None;
+            view.read_names(vec![end.clone()], Some("f3".into()), cx);
+            assert!(view._names_task.is_some(), "still read at the new head");
+        });
+        cx.run_until_parked();
+        // The read fails (this server answers it with no read's answer): the names stay shown,
+        // those of nodes no longer shown go, and the head is not taken as read, so the next ask
+        // reads again.
+        view.update(cx, |view, cx| {
+            assert_eq!(view.names_at.as_deref(), Some("f2"));
+            assert_eq!(view.names.get(&end).map(String::as_str), Some("Ada"));
+            assert!(!view.names.contains_key(&gone), "a node no longer shown");
+            view.read_names(vec![end.clone()], Some("f3".into()), cx);
+            assert!(view._names_task.is_some(), "read again after the failure");
         });
     }
 

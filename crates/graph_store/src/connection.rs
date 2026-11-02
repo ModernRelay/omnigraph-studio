@@ -234,6 +234,8 @@ pub struct Connection {
     /// The organization a sign-in to the server must be in: the one a managed target's profile
     /// names ([`TokenSource::organization`]).
     organization: Option<String>,
+    /// The managed profile `organization` was named for.
+    organization_profile: Option<String>,
     /// The sign-in service the server's 401 named, once read and checked; none again after a
     /// sign-in failed, as what it named may be what failed.
     service: Option<Service>,
@@ -483,6 +485,7 @@ impl Connection {
             standby: None,
             offers_no_sign_in: false,
             organization: None,
+            organization_profile: None,
             service: None,
             sign_in_details: None,
             oauth: None,
@@ -515,10 +518,20 @@ impl Connection {
     /// server has not said that it offers no sign-in, which is then held back as the standby
     /// ([`Self::standby`]). Notes the organization a sign-in must be in.
     fn hold_back(&mut self, source: Option<Arc<dyn TokenSource>>) -> Option<Arc<dyn TokenSource>> {
-        self.organization = source.as_ref().and_then(|source| source.organization());
-        let login = source
+        let profile = source.as_ref().and_then(|source| source.login_profile());
+        let login = profile.is_some();
+        // A managed login of the same profile whose organization the CLI would not say this time
+        // (a read it missed) keeps the one said before, so a sign-in held for it stays; one the
+        // CLI says names none, or another profile's, takes what it names.
+        let unread = source
             .as_ref()
-            .is_some_and(|source| source.login_profile().is_some());
+            .is_some_and(|source| source.organization_unread());
+        self.organization = if unread && profile == self.organization_profile {
+            self.organization.take()
+        } else {
+            source.as_ref().and_then(|source| source.organization())
+        };
+        self.organization_profile = profile;
         if login && !self.offers_no_sign_in {
             self.standby = source;
             return None;
@@ -2377,7 +2390,60 @@ mod tests {
     use gpui::{AppContext as _, Entity, TestAppContext};
     use http_client::{AsyncBody, FakeHttpClient, Response};
 
-    /// A server answering `/healthz` with `version`, and every other read with no graphs.
+    /// A managed login whose profile's organization the CLI would not say this time keeps the
+    /// one it said before, so a sign-in held for it stays; one the CLI says names none, another
+    /// organization or another profile takes what it names, and a target with no source names
+    /// none. Before, a read the CLI missed took the organization away, and with it the sign-in.
+    #[gpui::test]
+    fn a_login_that_does_not_say_its_organization_keeps_the_one_before(cx: &mut TestAppContext) {
+        /// A login of a profile, in an organization or none, or `Err` when the CLI would not say.
+        struct Login(&'static str, Result<Option<&'static str>, ()>);
+        impl TokenSource for Login {
+            fn token(&self, _: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, NoToken>> {
+                futures::future::pending().boxed()
+            }
+
+            fn login_profile(&self) -> Option<String> {
+                Some(self.0.into())
+            }
+
+            fn organization(&self) -> Option<String> {
+                self.1.ok().flatten().map(str::to_owned)
+            }
+
+            fn organization_unread(&self) -> bool {
+                self.1.is_err()
+            }
+        }
+        let server = ServerEntry {
+            name: "work".into(),
+            url: "https://cluster.example.com".into(),
+            source: ServerSource::Cli,
+            known_graphs: Vec::new(),
+        };
+        let http = FakeHttpClient::with_404_response();
+        let connection = cx.new(|_| Connection::new(server, None, http).unwrap());
+        let take = |login: Option<Login>, cx: &mut TestAppContext| {
+            let source = login.map(|login| Arc::new(login) as Arc<dyn TokenSource>);
+            connection.update(cx, |c, cx| {
+                c.take_token_from(source, cx);
+                c.organization.clone()
+            })
+        };
+        let org = |name| Ok(Some(name));
+        let work = |cx: &mut TestAppContext| take(Some(Login("work", org("org_1"))), cx);
+        assert_eq!(work(cx).as_deref(), Some("org_1"));
+        let missed = take(Some(Login("work", Err(()))), cx);
+        assert_eq!(missed.as_deref(), Some("org_1"), "kept");
+        assert_eq!(take(Some(Login("work", Ok(None))), cx), None, "names none");
+        work(cx);
+        let other = take(Some(Login("personal", Err(()))), cx);
+        assert_eq!(other, None, "another profile");
+        let moved = take(Some(Login("work", org("org_2"))), cx);
+        assert_eq!(moved.as_deref(), Some("org_2"));
+        assert_eq!(take(None, cx), None, "no source");
+    }
+
     /// The state a connection reaches to a server whose answers carry `contract`.
     fn connect_to(contract: &'static str, cx: &mut TestAppContext) -> ConnectionState {
         let http = FakeHttpClient::create(move |request| {

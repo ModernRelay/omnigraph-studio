@@ -111,10 +111,13 @@ pub enum CliCredential {
     /// offers no sign-in of its own (spec 016): with it Studio acts as the CLI's principal, not
     /// as a client of its own. `organization` is the one the profile names, as `credentials
     /// status --profile` reports it, which a sign-in to the cluster must be in; `None` when it
-    /// names none or the CLI would not say, and the server checks it alone.
+    /// names none or the CLI would not say, and the server checks it alone. `unread` when the
+    /// CLI would not say this time (a read it missed), which a connection holding the profile's
+    /// organization from before keeps.
     Managed {
         profile: String,
         organization: Option<String>,
+        unread: bool,
     },
 }
 
@@ -300,7 +303,8 @@ pub async fn read_targets(
 /// Names on each managed server of `read` the organization its profile names, as the CLI
 /// reports it (`credentials status --profile NAME --json`, once per profile, in the listing's
 /// turn): a sign-in to the cluster must be in it (spec 016). A profile whose organization the
-/// CLI would not say is a notice, and a sign-in to its clusters is checked by the server alone.
+/// CLI would not say is a notice and marked `unread`: a connection holding its organization
+/// from before keeps it, and one holding none leaves a sign-in to the server to check.
 async fn name_organizations(
     read: &mut CliTargets,
     cli: &cli_tokens::FoundCli,
@@ -309,11 +313,13 @@ async fn name_organizations(
     let Some(servers) = read.servers.as_mut() else {
         return;
     };
-    let mut named: Vec<(String, Option<String>)> = Vec::new();
+    // Each profile's organization, or `Err` when the CLI would not say it this time.
+    let mut named: Vec<(String, Result<Option<String>, ()>)> = Vec::new();
     for server in servers.iter_mut() {
         let CliAuth::Token(CliCredential::Managed {
             profile,
             organization,
+            unread,
         }) = &mut server.auth
         else {
             continue;
@@ -321,22 +327,21 @@ async fn name_organizations(
         let found = match named.iter().find(|(read, _)| read == profile) {
             Some((_, known)) => known.clone(),
             None => {
-                let found = match cli_tokens::profile_organization(cli, turn, profile).await {
-                    Ok(found) => found,
-                    Err(why) => {
+                let found = cli_tokens::profile_organization(cli, turn, profile)
+                    .await
+                    .map_err(|why| {
                         read.errors.push(format!(
                             "Studio could not read which organization CLI profile '{profile}' \
-                             is in ({why}), so a sign-in to its clusters is checked by the \
-                             server alone"
+                             is in ({why}), so a sign-in to its clusters is checked against the \
+                             one read before, else by the server alone"
                         ));
-                        None
-                    }
-                };
+                    });
                 named.push((profile.clone(), found.clone()));
                 found
             }
         };
-        organization.clone_from(&found);
+        *unread = found.is_err();
+        *organization = found.unwrap_or_default();
     }
 }
 
@@ -557,6 +562,7 @@ fn land(
                 CliAuth::Token(CliCredential::Managed {
                     profile,
                     organization: None,
+                    unread: false,
                 }),
                 None,
                 default_graph,
@@ -627,6 +633,10 @@ fn land(
         transport: CliTransport { proxy, roots },
         alternatives: Vec::new(),
         // The name too: an entry renamed is listed alike, and its token is asked for by name.
+        // Not a managed profile's organization ([`name_organizations`]): a read of it the CLI
+        // missed would replace the token source, so a profile moved to another organization is
+        // followed at the target's next change (another profile included) or Studio's next
+        // start.
         revision: format!("{name} {value} {file_stamp:?}"),
     })
 }
