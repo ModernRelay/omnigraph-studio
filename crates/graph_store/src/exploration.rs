@@ -195,12 +195,6 @@ impl ExplorePath {
             Step::Group(_) | Step::Value(_) => None,
         })
     }
-
-    /// The path with `prefix` removed, when it starts with it.
-    pub fn strip_prefix(&self, prefix: &ExplorePath) -> Option<Self> {
-        self.starts_with(prefix)
-            .then(|| Self(self.0[prefix.0.len()..].to_vec()))
-    }
 }
 
 /// One relationship group of one node, or the part of it with one value of a grouping
@@ -478,7 +472,6 @@ impl ExploreState {
         state
     }
 
-    /// A state holding `set`, nothing open and nothing selected.
     /// Lets go of a set's count, which was the rows' number at the commit it was read at: read
     /// again at another (the branch's head moved, or another branch), the rows may number
     /// otherwise, and "Show more" goes by whether pages remain.
@@ -488,6 +481,7 @@ impl ExploreState {
         }
     }
 
+    /// A state holding `set`, nothing open and nothing selected.
     pub fn of_set(set: SetRoots) -> Self {
         let mut state = Self {
             root: Some(set_anchor()),
@@ -1058,8 +1052,20 @@ impl ExploreState {
                 );
             }
         }
+        // How many neighbours the values shown leave out. A neighbour holds one value of a
+        // property of its own. Grouped by a relationship of theirs ("by company"), one falls in
+        // as many values as it has ends, so what is left is not known. By an edge property, one
+        // reached by parallel edges falls in two: the count holds while the values' counts stay
+        // under the group's, and is not known once they reach it.
         let shown: u64 = buckets.values.iter().map(|(_, n)| n).sum();
-        let rest = count.loaded().map(|total| total.saturating_sub(shown));
+        let total = count.loaded().copied();
+        let rest = match by.on {
+            GroupOn::Node => total.map(|total| total.saturating_sub(shown)),
+            GroupOn::Edge => total
+                .filter(|total| shown < *total)
+                .map(|total| total - shown),
+            GroupOn::Relationship => None,
+        };
         if !buckets.complete && rest != Some(0) {
             out.push(Entry {
                 path: group_path.clone(),
@@ -1487,7 +1493,7 @@ pub struct Exploration {
     /// How many counts, neighbour lists, values and labels the state may hold before those
     /// nothing open can reach are let go ([`ExploreState::retain_reachable`]): [`KEPT_READS`],
     /// or twice what the last letting go kept, and [`KEPT_READS`] again whenever the walk
-    /// starts over (a new root, a re-root, going back, Refresh, a reading again).
+    /// starts over (a new root, Refresh, a reading again).
     prune_at: usize,
     /// What the exploration has read at its pin: a head move that changed none of it moves the
     /// pin without reading again (spec 015).
@@ -1693,10 +1699,6 @@ impl Exploration {
         }
     }
 
-    pub fn session(&self) -> &Entity<GraphSession> {
-        &self.session
-    }
-
     pub fn state(&self) -> &ExploreState {
         &self.state
     }
@@ -1758,10 +1760,6 @@ impl Exploration {
         }
         self.changed(cx);
         cx.emit(ExplorationEvent::SelectionChanged);
-    }
-
-    pub fn is_expanded(&self, path: &ExplorePath) -> bool {
-        self.state.is_expanded(path)
     }
 
     pub fn expand(&mut self, path: &ExplorePath, cx: &mut Context<Self>) {
@@ -1849,6 +1847,15 @@ impl Exploration {
             return;
         }
         self.state.set_grouping(group, by);
+        // The old grouping's reads go, as a filter's do: its values and the pages and counts
+        // of its values. The relationship's own count and page still hold.
+        self.tasks.retain(|target, _| match target {
+            LoadTarget::Values(key, _) => key.group != *group,
+            LoadTarget::Count(key) | LoadTarget::Page(key) => {
+                key.group != *group || key.within.is_none()
+            }
+            LoadTarget::Root => true,
+        });
         self.request_missing(cx);
         self.changed(cx);
         cx.emit(ExplorationEvent::SelectionChanged);
@@ -2886,6 +2893,27 @@ mod tests {
             !shown.iter().any(|row| row.contains("value null")),
             "no bucket for no neighbours: {shown:?}"
         );
+
+        // A neighbour at two companies is in two values: the values' counts add to more than
+        // the group's four, so what the most common leave out is not known, and the row saying
+        // there are other values stays.
+        state.apply_values(
+            key.clone(),
+            by.clone(),
+            &output(
+                &["value", "label", "n"],
+                json!([
+                    {"value": "acme", "label": "Acme", "n": 3},
+                    {"value": "globex", "label": "Globex", "n": 3},
+                ]),
+            ),
+            2,
+        );
+        let shown = kinds(&state.entries(&schema));
+        assert!(
+            shown.iter().any(|row| row.trim() == "other 2 None"),
+            "{shown:?}"
+        );
     }
 
     #[test]
@@ -3234,6 +3262,34 @@ mod tests {
             assert_eq!(exploration.state().counts[&key], Loadable::Loaded(2));
             assert_eq!(exploration.state().neighbours[&key].rows.len(), 1);
         });
+
+        // A grouping changed lets go of the reads still out for the one before (its values, and
+        // the pages of its values), as a filter's change does.
+        exploration.update(cx, |exploration, cx| {
+            let by_name = GroupBy {
+                on: GroupOn::Node,
+                property: "name".into(),
+            };
+            let by_relationship = GroupBy {
+                on: GroupOn::Relationship,
+                property: "out:WorksAt".into(),
+            };
+            exploration.set_grouping(&knows, Some(by_name.clone()), cx);
+            let asked = |exploration: &Exploration, by: &GroupBy| {
+                exploration
+                    .tasks
+                    .keys()
+                    .any(|target| matches!(target, LoadTarget::Values(_, b) if b == by))
+            };
+            assert!(asked(exploration, &by_name), "its values asked for");
+            exploration.set_grouping(&knows, Some(by_relationship), cx);
+            assert!(
+                !asked(exploration, &by_name),
+                "the first grouping's read let go"
+            );
+            exploration.set_grouping(&knows, None, cx);
+        });
+        cx.run_until_parked();
 
         // The walk started over on another branch keeps the relationship's filters, as Refresh
         // does: its group reads under them there.

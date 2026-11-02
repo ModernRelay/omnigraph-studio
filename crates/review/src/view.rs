@@ -289,6 +289,14 @@ const BRANCH_DELETED: &str = "The merge deleted the branch: there is no branch t
 /// until the entity changes again, whichever commits the review reads the change from. A review
 /// since a merge reads every change at the reviewed head, which a fix moves. Made with the fold,
 /// off the main thread: a review holds up to 20,000 changes, and their values can be long.
+/// What an entity group is, whatever its place among the groups: an edge or a node, its type
+/// and its id.
+type GroupId = (bool, String, String);
+
+fn group_id(group: &EntityGroup) -> GroupId {
+    (group.is_edge, group.type_name.clone(), group.id.clone())
+}
+
 fn mark_of(change: &FoldedChange) -> u64 {
     use std::fmt::Write as _;
     use std::hash::{DefaultHasher, Hash as _, Hasher};
@@ -457,8 +465,8 @@ fn revert_checks(
         .collect()
 }
 
-/// Whether two schemas group and draw the cards alike: the same text, naming each type's nodes
-/// by the same property. A schema read again with the same text is the same one.
+/// A branch's review against its target (spec 008): its changes as cards, fixed and merged
+/// from here.
 pub struct ReviewView {
     session: Entity<GraphSession>,
     branch: String,
@@ -497,12 +505,14 @@ pub struct ReviewView {
     /// Runs folded to their header, by section, kind and type: a review is read by type, and
     /// a type looked through is folded away.
     collapsed_runs: HashSet<(GroupSection, bool, String)>,
-    /// Groups unfolded to their changes; the rest show one line each.
-    expanded: HashSet<usize>,
+    /// Groups unfolded to their changes, by what each is ([`group_id`]); the rest show one line
+    /// each. Not by place: a read again (a Refresh, a revert, another scope) numbers the groups
+    /// anew, and would open another entity's.
+    expanded: HashSet<GroupId>,
     /// The feed of types, or the changes beside one record (spec 008).
     layout: ReviewLayout,
-    /// Long texts shown whole, by group and property.
-    whole_texts: HashSet<(usize, SharedString)>,
+    /// Long texts shown whole, by group ([`group_id`]) and property.
+    whole_texts: HashSet<(GroupId, SharedString)>,
     /// What each run's feed row says beyond its counts, made with the rows.
     run_facts: Vec<RunFacts>,
     /// Reviewed marks, by entity and what its change does ([`mark_of`]), kept across Refresh:
@@ -794,23 +804,38 @@ impl ReviewView {
     /// The branch list was read. A reviewed branch it no longer holds was deleted: by the delete
     /// of a merge whose answer was lost and that landed, or outside Studio. Like one the merge
     /// said it deleted, its head is not watched, nothing is fixed on it, and its review is not
-    /// opened again with the window.
+    /// opened again with the window. A deleted branch the list holds again was made again under
+    /// its name: another branch, whose head is watched and whose review is read afresh, as the
+    /// tab is reused for it.
     fn branches_changed(&mut self, cx: &mut Context<Self>) {
-        if self.branch_deleted {
-            return;
-        }
-        let gone = self
+        let Some(listed) = self
             .session
             .read(cx)
             .branches
             .loaded()
-            .is_some_and(|branches| !branches.contains(&self.branch));
-        if gone {
-            self._head_watch = None;
-            self.branch_deleted = true;
-            cx.emit(ItemEvent::UpdateTab);
-            cx.notify();
+            .map(|branches| branches.contains(&self.branch))
+        else {
+            return;
+        };
+        match (self.branch_deleted, listed) {
+            (false, false) => {
+                self._head_watch = None;
+                self.branch_deleted = true;
+            }
+            (true, true) => {
+                let branch = self.branch.clone();
+                self._head_watch = Some(
+                    self.session
+                        .update(cx, |session, cx| session.watch_head(&branch, cx)),
+                );
+                self.branch_deleted = false;
+                self.merge = MergeState::Idle;
+                self.reload(cx);
+            }
+            _ => return,
         }
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
     }
 
     /// The session's schema was loaded, applied, or names nodes otherwise: the review shown is
@@ -841,6 +866,8 @@ impl ReviewView {
         self.selected = None;
         self.searched = Searched::default();
         self.summary.clear();
+        // The model's summary names what the old token read: it goes, with a call under way.
+        self.ai_summary = SummaryState::None;
         self._search_task = None;
         self._regroup_task = None;
         if self.fixes_running == 0 {
@@ -1192,8 +1219,16 @@ impl ReviewView {
             self.selected = Some(change);
             if let Some(group) = self.group_of(change) {
                 // The feed unfolds what is selected, so J and K read change by change.
-                if self.layout == ReviewLayout::Feed {
-                    self.expanded.insert(group);
+                if self.layout == ReviewLayout::Feed
+                    && let Some(id) = self.group_id(group)
+                {
+                    self.expanded.insert(id);
+                }
+                // A change selected from elsewhere (a conflict's "Show change", a mirror line)
+                // whose type's run is folded shows: the run opens. One a search hides stays
+                // hidden, and the keys do not act on it ([`Self::cards_shown`]).
+                if self.row_of_group(group).is_none() && self.unfold_run_of(group) {
+                    self.lay_out_in_place();
                 }
                 if let Some(row) = self.row_of_group(group) {
                     self.list_state.scroll_to_reveal_item(row);
@@ -1201,6 +1236,19 @@ impl ReviewView {
             }
             cx.notify();
         }
+    }
+
+    /// Opens the folded run `group` is in; whether it was folded.
+    fn unfold_run_of(&mut self, group: usize) -> bool {
+        let Some(group) = self
+            .data
+            .as_ref()
+            .and_then(|data| data.groups.groups.get(group))
+        else {
+            return false;
+        };
+        let key = (group.section, group.is_edge, group.type_name.clone());
+        self.collapsed_runs.remove(&key)
     }
 
     /// The groups the search leaves, in list order.
@@ -1287,10 +1335,17 @@ impl ReviewView {
     fn lay_out(&mut self) {
         let Some(data) = &self.data else { return };
         (self.rows, self.headers) = build_rows(data, self.searched.matched.as_deref());
+        // Each commit's time, found once: looked up by a scan per commit of each run, a branch
+        // of many one-change commits took a quadratic walk at every fold and search.
+        let created: HashMap<&str, i64> = data
+            .commits
+            .iter()
+            .map(|commit| (commit.id.as_str(), commit.created_at))
+            .collect();
         self.run_facts = self
             .headers
             .iter()
-            .map(|run| run_facts(data, run))
+            .map(|run| run_facts(data, run, &created))
             .collect();
         // A folded run keeps its header and hides its rows.
         let mut hidden = false;
@@ -1313,7 +1368,7 @@ impl ReviewView {
             self.selected = first.and_then(|group| data.groups.groups[group].primary());
             // The feed opens with its first change unfolded.
             if let (ReviewLayout::Feed, Some(group)) = (self.layout, first) {
-                self.expanded.insert(group);
+                self.expanded.insert(group_id(&data.groups.groups[group]));
             }
         }
     }
@@ -1340,7 +1395,9 @@ impl ReviewView {
     /// A click on a group's row: selects it, which unfolds it, or folds it when it was open.
     fn click_group(&mut self, group: usize, cx: &mut Context<Self>) {
         // Selecting unfolds the row (`select`), so only an open row is folded.
-        let open = self.expanded.contains(&group);
+        let open = self
+            .group_id(group)
+            .is_some_and(|id| self.expanded.contains(&id));
         self.select_group(group, cx);
         if open {
             self.toggle_expanded(group, cx);
@@ -1349,10 +1406,17 @@ impl ReviewView {
 
     /// Unfolds a group's row to its changes, or folds it to its line.
     fn toggle_expanded(&mut self, group: usize, cx: &mut Context<Self>) {
-        if !self.expanded.remove(&group) {
-            self.expanded.insert(group);
+        if let Some(id) = self.group_id(group)
+            && !self.expanded.remove(&id)
+        {
+            self.expanded.insert(id);
         }
         cx.notify();
+    }
+
+    /// What group `group` of the review as read is ([`group_id`]).
+    fn group_id(&self, group: usize) -> Option<GroupId> {
+        self.data.as_ref()?.groups.groups.get(group).map(group_id)
     }
 
     /// [`Self::lay_out`] for the same changes grouped again, keeping the place the person
@@ -1379,6 +1443,8 @@ impl ReviewView {
         if self.scope != scope {
             let held = self.held_fork_read(cx);
             self.scope = scope;
+            // A summary of the scope left is not this one's, though the head is the same.
+            self.ai_summary = SummaryState::None;
             self.read_again(held, cx);
         }
     }
@@ -1404,7 +1470,14 @@ impl ReviewView {
     /// keeps the cards it read before, under "Reading changes…", an error or the conflicts list,
     /// and a key there would revert or mark a card nobody sees.
     fn cards_shown(&self) -> bool {
-        matches!(self.load, LoadState::Ready) && !self.show_conflicts
+        matches!(self.load, LoadState::Ready)
+            && !self.show_conflicts
+            // The selected change's card among them: one a search or a folded run hides is not
+            // acted on.
+            && self
+                .selected
+                .and_then(|change| self.group_of(change))
+                .is_none_or(|group| self.row_of_group(group).is_some())
     }
 
     /// Marks the selected entity's card reviewed, every change on it, and moves to the next.
@@ -3229,7 +3302,9 @@ impl ReviewView {
             return div().into_any_element();
         };
         let selected = self.selected_group(data) == Some(group);
-        let open = self.expanded.contains(&group);
+        let open = self
+            .expanded
+            .contains(&group_id(&data.groups.groups[group]));
         let reviewed = self.group_unreviewed(&data.groups.groups[group]) == 0;
         let (kind, name, id) = self.group_identity(data, group);
         let status = self.group_status(data, group);
@@ -3467,14 +3542,16 @@ impl ReviewView {
 
     /// Which of a group's long texts show whole, and what a fold's click does.
     fn text_folds(&self, group: usize, cx: &mut Context<Self>) -> TextFolds {
+        // Drawn, the group is one of the review read.
+        let id = self.group_id(group).unwrap_or_default();
         let whole: HashSet<SharedString> = self
             .whole_texts
             .iter()
-            .filter(|(g, _)| *g == group)
+            .filter(|(g, _)| *g == id)
             .map(|(_, name)| name.clone())
             .collect();
         let on_toggle = cx.listener(move |this, name: &SharedString, _, cx| {
-            let key = (group, name.clone());
+            let key = (id.clone(), name.clone());
             if !this.whole_texts.remove(&key) {
                 this.whole_texts.insert(key);
             }
@@ -3746,7 +3823,7 @@ struct RunFacts {
     latest: Option<i64>,
 }
 
-fn run_facts(data: &ReviewData, run: &GroupRun) -> RunFacts {
+fn run_facts(data: &ReviewData, run: &GroupRun, created: &HashMap<&str, i64>) -> RunFacts {
     let mut names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     let mut commits: HashSet<&str> = HashSet::new();
     for &g in &run.groups {
@@ -3780,8 +3857,8 @@ fn run_facts(data: &ReviewData, run: &GroupRun) -> RunFacts {
     }
     let latest = commits
         .iter()
-        .filter_map(|id| data.commits.iter().find(|c| c.id == *id))
-        .map(|c| c.created_at)
+        .filter_map(|id| created.get(id))
+        .copied()
         .max();
     RunFacts {
         properties,
@@ -3954,10 +4031,6 @@ fn search_text_of(change: &FoldedChange) -> String {
     text.to_lowercase()
 }
 
-/// The list's rows: each card the search leaves (`matched`, each change's match; every card
-/// without one), under a header for each run of one type, the first of a section carrying its
-/// title. A card matches when its own change or a relationship reviewed on it does. The headers
-/// count what the run shows.
 /// A run's fold key: its section, whether it is of edges, and its type.
 fn run_key(run: &GroupRun, data: &ReviewData) -> (GroupSection, bool, String) {
     let section = run
@@ -4022,6 +4095,10 @@ fn group_summary(data: &ReviewData, group: &EntityGroup) -> String {
     parts.join(" · ")
 }
 
+/// The list's rows: each card the search leaves (`matched`, each change's match; every card
+/// without one), under a header for each run of one type, the first of a section carrying its
+/// title. A card matches when its own change or a relationship reviewed on it does. The headers
+/// count what the run shows.
 fn build_rows(data: &ReviewData, matched: Option<&[bool]>) -> (Vec<Row>, Vec<GroupRun>) {
     let matches =
         |change: usize| matched.is_none_or(|matched| matched.get(change).copied().unwrap_or(false));
@@ -4864,11 +4941,11 @@ impl Render for ReviewView {
             // Merge is registered only while the credential may merge (constitution VIII).
             .when(self.merge_refusal(cx).is_none(), |view| {
                 view.on_action(cx.listener(|this, _: &Merge, _, cx| this.merge(cx)))
-                    .on_action(cx.listener(|this, _: &Summarize, _, cx| this.summarize(cx)))
-                    .on_action(
-                        cx.listener(|this, _: &ToggleChange, _, cx| this.toggle_selected(cx)),
-                    )
             })
+            // Unfolding a change and summarizing the review write nothing: they work whatever
+            // the credential may merge, as their buttons and row clicks do.
+            .on_action(cx.listener(|this, _: &Summarize, _, cx| this.summarize(cx)))
+            .on_action(cx.listener(|this, _: &ToggleChange, _, cx| this.toggle_selected(cx)))
             // ⌘R reads the review again, as its Refresh buttons do, and goes on to the
             // workspace, which reads the graph's schema, branches and counts again.
             .on_action(cx.listener(|this, _: &Refresh, _, cx| {
@@ -5292,20 +5369,69 @@ pub(crate) mod tests {
             assert!(groups.len() >= 2, "the review has rows to click");
             let first = groups[0];
             let second = groups[1];
-            assert!(
-                view.expanded.contains(&first),
-                "the feed opens on its first row"
-            );
-            assert!(!view.expanded.contains(&second));
+            let open = |view: &ReviewView, group: usize| {
+                view.expanded.contains(&view.group_id(group).unwrap())
+            };
+            assert!(open(view, first), "the feed opens on its first row");
+            assert!(!open(view, second));
             view.click_group(second, cx);
-            assert!(
-                view.expanded.contains(&second),
-                "a click opens a folded row"
-            );
+            assert!(open(view, second), "a click opens a folded row");
             view.click_group(second, cx);
-            assert!(!view.expanded.contains(&second), "a second click folds it");
+            assert!(!open(view, second), "a second click folds it");
             view.click_group(first, cx);
-            assert!(!view.expanded.contains(&first), "a click folds an open row");
+            assert!(!open(view, first), "a click folds an open row");
+
+            // Unfolded by what it is, a row stays so wherever the groups move: read again, a
+            // review numbers its groups anew.
+            view.click_group(second, cx);
+            let id = view.group_id(second).unwrap();
+            let data = view.data.as_mut().unwrap();
+            data.groups.groups.swap(first, second);
+            assert!(open(view, first), "the row it was, now first");
+            assert!(!open(view, second));
+            assert!(view.expanded.contains(&id));
+        });
+    }
+
+    /// A change selected from elsewhere (a conflict's "Show change", a mirror line) whose
+    /// type's run is folded shows: its run opens. A card that stays hidden is selected but not
+    /// acted on: the keys that revert, mark or edit wait for it to show.
+    #[gpui::test]
+    async fn a_change_selected_in_a_folded_run_shows(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _asked) = reviewed_server_writing(false, cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            let group = view.visible_groups()[0];
+            let (change, run) = {
+                let found = &view.data.as_ref().unwrap().groups.groups[group];
+                let run = (found.section, found.is_edge, found.type_name.clone());
+                (found.primary().unwrap(), run)
+            };
+            view.toggle_run(run.clone(), cx);
+            assert!(view.row_of_group(group).is_none(), "folded away");
+            view.select(change, cx);
+            assert!(view.row_of_group(group).is_some(), "its run opened");
+            assert!(view.cards_shown());
+
+            view.toggle_run(run, cx);
+            view.selected = Some(change);
+            assert!(!view.cards_shown(), "a hidden card is not acted on");
+
+            // The model's summary is of the review it read: another scope, or another token,
+            // lets it go, though the head is the same.
+            view.ai_summary = SummaryState::Failed("of the scope before".into());
+            view.set_scope(Some("c1".into()), cx);
+            assert!(matches!(view.ai_summary, SummaryState::None));
+            view.ai_summary = SummaryState::Failed("of the token before".into());
+            view.credential_changed(cx);
+            assert!(matches!(view.ai_summary, SummaryState::None));
         });
     }
 
@@ -6224,6 +6350,21 @@ pub(crate) mod tests {
                     assert_eq!(view.cards[0].fix, FixState::Refused(BRANCH_DELETED.into()));
                 });
             }
+            // Made again under its name, the branch is another, whose review the tab, reused for
+            // it, reads afresh: its head watched, its fixes not refused, and kept with the window.
+            let session = view.read_with(cx, |view, _| view.session.clone());
+            session.update(cx, |session, cx| {
+                session.branches =
+                    graph_store::Loadable::Loaded(vec!["main".into(), "feature".into()]);
+                cx.emit(graph_store::SessionEvent::BranchesChanged);
+            });
+            cx.run_until_parked();
+            view.read_with(cx, |view, cx| {
+                assert!(!view.branch_deleted);
+                assert!(view._head_watch.is_some());
+                assert!(view.serialize(cx).is_some());
+                assert!(matches!(view.merge, MergeState::Idle));
+            });
         }
     }
 
@@ -6254,6 +6395,9 @@ pub(crate) mod tests {
         cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
         cx.run_until_parked();
         assert!(!cx.update(|window, cx| window.is_action_available(&Merge, cx)));
+        // Unfolding a change and summarizing write nothing: their keys stay.
+        assert!(cx.update(|window, cx| window.is_action_available(&ToggleChange, cx)));
+        assert!(cx.update(|window, cx| window.is_action_available(&Summarize, cx)));
         view.update(cx, |view, cx| {
             assert!(view.mergeable(cx), "the whole review is on screen");
             assert_eq!(

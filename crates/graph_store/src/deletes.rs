@@ -386,20 +386,27 @@ pub fn undo_query(
                 None => break,
             }
         }
-        let folded = fold.finish();
-        let mut parts = Vec::new();
-        for change in &folded.changes {
-            if change.net() != Some(NetChange::Removed) {
-                return Err(
-                    "The commit did more than delete, so Undo cannot put it back.".to_owned(),
-                );
-            }
-            parts.push(revert_query(&schema, change).map_err(|reason| reason.0)?);
-        }
-        if parts.is_empty() {
-            return Err("The commit removed nothing.".to_owned());
-        }
-        Ok(compose("studio_undo_delete", parts))
+        // The fold's end and the statements, one per change of up to `UNDO_CAP`, off the main
+        // thread too: the query they make can be megabytes long.
+        cx.background_executor()
+            .spawn(async move {
+                let folded = fold.finish();
+                let mut parts = Vec::new();
+                for change in &folded.changes {
+                    if change.net() != Some(NetChange::Removed) {
+                        return Err(
+                            "The commit did more than delete, so Undo cannot put it back."
+                                .to_owned(),
+                        );
+                    }
+                    parts.push(revert_query(&schema, change).map_err(|reason| reason.0)?);
+                }
+                if parts.is_empty() {
+                    return Err("The commit removed nothing.".to_owned());
+                }
+                Ok(compose("studio_undo_delete", parts))
+            })
+            .await
     })
 }
 

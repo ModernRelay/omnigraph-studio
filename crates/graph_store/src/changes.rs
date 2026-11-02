@@ -351,7 +351,9 @@ impl ChangeFold {
                 .or_insert((*net, position));
             rank.0 = rank.0.min(*net);
         }
-        changes.sort_by_key(|(net, change)| {
+        // Each change's place worked out once, not at every comparison (a type id cloned for
+        // each); stable, as the order within a type is the feed's.
+        changes.sort_by_cached_key(|(net, change)| {
             let (best, first_seen) = type_rank[&(change.is_edge(), change.type_id.clone())];
             (change.is_edge(), best == NetChange::Added, first_seen, *net)
         });
