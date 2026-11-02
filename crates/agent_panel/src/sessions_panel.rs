@@ -279,7 +279,7 @@ impl SessionsPanel {
         self.sessions
             .update(cx, |sessions, cx| sessions.remove(&id, cx));
         let Some(agent) = Self::agent(cx)
-            .filter(|agent| crate::sessions::command_key(&agent.command) == record.agent)
+            .filter(|agent| crate::sessions::is_agent(&record.agent, &agent.command))
         else {
             self.toast(
                 ToastKind::Info,
