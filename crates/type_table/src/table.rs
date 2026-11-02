@@ -507,7 +507,7 @@ const KEY_INSET: f32 = space::EDGE;
 /// row's checkbox shows.
 const KEY_TEXT_INSET: f32 = KEY_INSET + studio_ui::ds::size::CHECK + KEY_INSET;
 
-use crate::peek::property_icon;
+use studio_workspace::property_icon;
 
 /// One row's neighbours through one relationship: how many, and the first few by id (as many
 /// as the peek shows; the cell shows `RELATION_CHIPS_SHOWN`). `whole` when the row's whole list

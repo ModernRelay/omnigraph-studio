@@ -9832,6 +9832,7 @@ name = "studio_workspace"
 version = "0.3.0"
 dependencies = [
  "gpui",
+ "gq_language",
  "graph_client",
  "graph_store",
  "http_client",

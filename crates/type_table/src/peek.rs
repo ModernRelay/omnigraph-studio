@@ -47,6 +47,7 @@ use crate::suggest;
 use gq_language::input::same_value;
 use graph_client::api::{ChangeOutput, ReadOutput};
 use graph_client::{BlobCell, BlobMeta, HistoricalGap, PropertyThen, ReadError, WriteOutcome};
+use studio_workspace::property_icon;
 
 /// First neighbours shown under an expanded relationship group.
 pub const NEIGHBOUR_LIMIT: u32 = 8;
@@ -5531,23 +5532,6 @@ struct PropertyState {
     opens_editor: bool,
     tooltip: Option<String>,
     copied: bool,
-}
-
-/// The icon of a property's kind, as its column's header and its row show it: an enum's
-/// values, text, a truth value, a number, a time, a vector or a Blob.
-pub(crate) fn property_icon(property: &gq_language::Property) -> IconName {
-    use gq_language::ScalarKind;
-    if property.enum_values.is_some() {
-        return IconName::ListTodo;
-    }
-    match property.kind {
-        ScalarKind::Text => IconName::CaseSensitive,
-        ScalarKind::Bool => IconName::Check,
-        ScalarKind::Integer | ScalarKind::Float => IconName::Hash,
-        ScalarKind::Date | ScalarKind::DateTime => IconName::Clock,
-        ScalarKind::Vector => IconName::Sparkle,
-        ScalarKind::Blob => IconName::File,
-    }
 }
 
 /// The properties a view lists for its subject, in schema order. Blob values are shown under

@@ -5784,6 +5784,24 @@ pub fn connection_color(state: &ConnectionState) -> Color {
     }
 }
 
+/// The icon of a property's kind, as the table's column headers and pills, a node's rows and
+/// the tree's Filter buttons show it: an enum's values, text, a truth value, a number, a
+/// time, a vector or a Blob.
+pub fn property_icon(property: &gq_language::Property) -> IconName {
+    use gq_language::ScalarKind;
+    if property.enum_values.is_some() {
+        return IconName::ListTodo;
+    }
+    match property.kind {
+        ScalarKind::Text => IconName::CaseSensitive,
+        ScalarKind::Bool => IconName::Check,
+        ScalarKind::Integer | ScalarKind::Float => IconName::Hash,
+        ScalarKind::Date | ScalarKind::DateTime => IconName::Clock,
+        ScalarKind::Vector => IconName::Sparkle,
+        ScalarKind::Blob => IconName::File,
+    }
+}
+
 /// What the connection chip's tooltip says: the server, its state, and the actor the
 /// credential resolves to once the access route has named it.
 fn connection_tooltip(url: &str, state: &str, actor: Option<&str>) -> String {

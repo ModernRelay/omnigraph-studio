@@ -23,6 +23,7 @@ use studio_ui::ds::Tipped;
 use studio_ui::ds::{size, space};
 use studio_ui::menu::{ContextMenu, menu_surface};
 use studio_workspace::models::{Error as ModelError, Models, Request as ModelRequest};
+use studio_workspace::property_icon;
 use ui::prelude::*;
 use ui::{IconName, IconPosition, PopoverMenu, PopoverMenuHandle};
 
@@ -121,22 +122,6 @@ pub(crate) fn filter_words(filter: &Filter) -> String {
         words.push_str(&edit_text(&filter.value));
     }
     words
-}
-
-/// The icon of a property's kind, as the table's pills show it.
-fn property_icon(property: &Property) -> IconName {
-    use gq_language::ScalarKind;
-    if property.enum_values.is_some() {
-        return IconName::ListTodo;
-    }
-    match property.kind {
-        ScalarKind::Text => IconName::CaseSensitive,
-        ScalarKind::Bool => IconName::Check,
-        ScalarKind::Integer | ScalarKind::Float => IconName::Hash,
-        ScalarKind::Date | ScalarKind::DateTime => IconName::Clock,
-        ScalarKind::Vector => IconName::Sparkle,
-        ScalarKind::Blob => IconName::File,
-    }
 }
 
 /// Every grouping `group` offers, its sections run together.
