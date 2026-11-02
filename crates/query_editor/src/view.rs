@@ -1262,25 +1262,6 @@ impl QueryEditor {
             .collect();
     }
 
-    /// A result's nodes as the set a Tree opens to (spec 020): listed, and held at the tab's
-    /// commit when the tab is, so a view opened from a held tab stays held.
-    fn results_set(
-        &self,
-        title: String,
-        nodes: Vec<studio_actions::graph::ResultNode>,
-    ) -> studio_actions::graph::ShowSetInTree {
-        studio_actions::graph::ShowSetInTree {
-            title,
-            type_name: None,
-            filters: None,
-            nodes: Some(nodes),
-            total: None,
-            at_commit: self.at_commit.clone(),
-            select: None,
-            preview: true,
-        }
-    }
-
     /// Pins reads to a commit and refuses writes, for a query opened from History.
     pub fn pin_to(&mut self, commit: String, cx: &mut Context<Self>) {
         self.at_commit = Some(commit);
@@ -3424,8 +3405,10 @@ impl QueryEditor {
 
                 if let Some(graph) = rows.graph.clone() {
                     let title = format!("{} · result", rows.label);
-                    // Its nodes as a tree, each opening to its relationships.
-                    let set = self.results_set(title.clone(), graph.0.clone());
+                    // Its nodes as a tree, each opening to its relationships: copied when the
+                    // button is pressed, not each time the status bar is drawn.
+                    let (tree_title, nodes, at_commit) =
+                        (title.clone(), graph.clone(), self.at_commit.clone());
                     end.push(
                         ds::button("result-tree", "Tree")
                             .style(ButtonStyle::Subtle)
@@ -3435,7 +3418,12 @@ impl QueryEditor {
                                 studio_ui::plural(graph.0.len(), "node", "nodes")
                             )))
                             .on_click(move |_, window, cx| {
-                                window.dispatch_action(Box::new(set.clone()), cx)
+                                let set = results_set(
+                                    tree_title.clone(),
+                                    nodes.0.clone(),
+                                    at_commit.clone(),
+                                );
+                                window.dispatch_action(Box::new(set), cx)
                             })
                             .into_any_element(),
                     );
@@ -5138,6 +5126,25 @@ fn confirm_words(prepared: &Prepared, branch: &str) -> (String, String) {
     }
 }
 
+/// A result's nodes as the set a Tree opens to (spec 020): listed, and held at the tab's commit
+/// when the tab is, so a view opened from a held tab stays held.
+fn results_set(
+    title: String,
+    nodes: Vec<studio_actions::graph::ResultNode>,
+    at_commit: Option<String>,
+) -> studio_actions::graph::ShowSetInTree {
+    studio_actions::graph::ShowSetInTree {
+        title,
+        type_name: None,
+        filters: None,
+        nodes: Some(nodes),
+        total: None,
+        at_commit,
+        select: None,
+        preview: true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -5429,11 +5436,15 @@ mod tests {
                 label: Some("Ada".into()),
             }];
             editor.update(cx, |editor, cx| {
-                let set = editor.results_set("people · result".into(), nodes.clone());
+                let set = results_set(
+                    "people · result".into(),
+                    nodes.clone(),
+                    editor.at_commit.clone(),
+                );
                 assert_eq!(set.at_commit, None, "a tab at the head");
                 assert_eq!(set.nodes.as_ref().map(Vec::len), Some(1));
                 editor.pin_to("c1".into(), cx);
-                let set = editor.results_set("people · result".into(), nodes);
+                let set = results_set("people · result".into(), nodes, editor.at_commit.clone());
                 assert_eq!(set.at_commit.as_deref(), Some("c1"), "a held tab");
             });
         }
