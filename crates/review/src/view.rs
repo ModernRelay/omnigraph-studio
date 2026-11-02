@@ -23,7 +23,7 @@ use graph_store::{
     AccessAction, AccessScope, ChangeFold, EntityGroup, EntityGroups, FoldedChange, FoldedChanges,
     ForkSearch, GraphSession, GroupRun, GroupSection, HeadWatch, MergeSent, MergeSettled,
     NodeNames, OutcomeEntry, OutcomeKind, REVIEW_CHANGE_CAP, SessionEvent, TypeCounts,
-    contains_merge_of, entity_name, revert_query, summary_sentence,
+    contains_merge_of, revert_query, summary_sentence,
 };
 use serde_json::Value;
 use studio_actions::review::{
@@ -3178,29 +3178,7 @@ impl ReviewView {
         let key = run_key(run, data);
         let folded = self.collapsed_runs.contains(&key);
         let facts = self.run_facts.get(ix).cloned().unwrap_or_default();
-        let (counts, joiner) = run_sentence(run);
-        let color = if run.changed > 0 {
-            Color::Modified
-        } else if run.removed > 0 {
-            Color::Deleted
-        } else if run.added > 0 {
-            Color::Created
-        } else {
-            Color::Muted
-        };
-        // One entity's row under the run says the same: the detail is the many's.
-        let detail = if run.groups.len() < 2 {
-            String::new()
-        } else if !facts.properties.is_empty() {
-            facts.properties.clone()
-        } else if run.relationships > 0 {
-            format!(
-                "with {}",
-                studio_ui::plural(run.relationships, "relationship", "relationships")
-            )
-        } else {
-            String::new()
-        };
+        let detail = change_cards::run_detail(run, &facts.properties);
         let when = facts.latest.map(|at| {
             let ago = studio_ui::relative_time(at, studio_ui::now_micros());
             if facts.commits > 1 {
@@ -3212,48 +3190,18 @@ impl ReviewView {
                 ago
             }
         });
-        let hover = studio_ui::ds::surface::hover(cx);
-        v_flex()
-            .children(self.section_title(run).map(|title| {
-                div()
-                    .px(px(space::EDGE))
-                    .pt(px(space::LG))
-                    .pb(px(space::XS))
-                    .child(studio_ui::ds::text::meta(title))
-            }))
-            .child(
-                h_flex()
-                    .id(("run", ix))
-                    .h(px(studio_ui::ds::size::FEED_ROW))
-                    .px(px(space::XL))
-                    .gap(px(space::MD))
-                    .items_center()
-                    .cursor_pointer()
-                    .when(folded, |row| {
-                        row.border_b_1()
-                            .border_color(studio_ui::ds::surface::rule(cx))
-                    })
-                    .hover(move |style| style.bg(hover))
-                    .child(studio_ui::ds::dot(color))
-                    .child(studio_ui::ds::icon::meta(if folded {
-                        IconName::ChevronRight
-                    } else {
-                        IconName::ChevronDown
-                    }))
-                    .child(studio_ui::ds::text::body(counts))
-                    .child(studio_ui::ds::text::muted(joiner))
-                    .child(studio_ui::kind_swatch(&run.type_name, run.is_edge, cx))
-                    .child(studio_ui::ds::text::body(run.type_name.clone()))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(studio_ui::ds::text::muted(detail).single_line().truncate()),
-                    )
-                    .children(when.map(studio_ui::ds::text::meta))
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_run(key.clone(), cx))),
-            )
-            .into_any_element()
+        change_cards::run_row(
+            ("run", ix),
+            run,
+            change_cards::RunWords {
+                section: self.section_title(run),
+                detail,
+                when,
+            },
+            folded,
+            cx.listener(move |this, _, _, cx| this.toggle_run(key.clone(), cx)),
+            cx,
+        )
     }
 
     /// What a group's row names: what happened to its entity, the entity's name (a
@@ -3263,27 +3211,13 @@ impl ReviewView {
         data: &ReviewData,
         group: usize,
     ) -> (ChangeKind, String, Option<String>) {
-        let g = &data.groups.groups[group];
-        match g.change {
-            Some(own) => {
-                let change = &data.folded.changes[own];
-                let kind = change_cards::kind_of_change(change);
-                if change.is_edge() {
-                    return match change.endpoints() {
-                        Some((from, to)) => (kind, format!("{from} → {to}"), None),
-                        None => (kind, change.id.clone(), None),
-                    };
-                }
-                match entity_name(change, data.schema.as_deref()) {
-                    Some(name) => (kind, name, Some(change.id.clone())),
-                    None => (kind, change.id.clone(), None),
-                }
-            }
-            None => match self.names.get(&(g.type_name.clone(), g.id.clone())) {
-                Some(name) => (ChangeKind::Unchanged, name.clone(), Some(g.id.clone())),
-                None => (ChangeKind::Unchanged, g.id.clone(), None),
-            },
-        }
+        change_cards::identity(
+            &data.groups,
+            &data.folded,
+            group,
+            data.schema.as_deref(),
+            &self.names,
+        )
     }
 
     /// What a group's row says of its review: a fix's state, how many of its changes are not
@@ -3330,76 +3264,26 @@ impl ReviewView {
         let reviewed = self.group_unreviewed(&data.groups.groups[group]) == 0;
         let (kind, name, id) = self.group_identity(data, group);
         let status = self.group_status(data, group);
-        let summary = group_summary(data, &data.groups.groups[group]);
-        let radius = studio_ui::ds::radius::flush(radii(cx).md);
-        let hover = studio_ui::ds::surface::hover(cx);
-        let head = h_flex()
-            .id(("change-head", group))
-            .min_h(px(studio_ui::ds::size::HEADER))
-            .px(px(space::LG))
-            .gap(px(space::MD))
-            .items_center()
-            .cursor_pointer()
-            .when(first, |head| head.rounded_t(px(radius)))
-            .when(last && !open, |head| head.rounded_b(px(radius)))
-            .when(selected, |head| {
-                head.bg(studio_ui::ds::surface::selected_document(cx))
-            })
-            .when(!selected, |head| head.hover(move |style| style.bg(hover)))
-            .when(reviewed, |head| {
-                head.opacity(studio_ui::ds::opacity::DIMMED)
-            })
-            .child(studio_ui::ds::icon::meta(if open {
-                IconName::ChevronDown
-            } else {
-                IconName::ChevronRight
-            }))
-            .child(
-                studio_ui::ds::text::body(name)
-                    .when(kind == ChangeKind::Removed, |name| name.strikethrough())
-                    .single_line()
-                    .truncate(),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(studio_ui::ds::text::muted(summary).single_line().truncate()),
-            )
-            .children(status.map(|(text, color)| studio_ui::ds::text::meta(text).color(color)))
-            .children(id.map(|id| {
-                studio_ui::ds::text::meta(id)
-                    .buffer_font(cx)
-                    .single_line()
-                    .truncate()
-            }))
-            .on_click(cx.listener(move |this, _, _, cx| this.click_group(group, cx)));
+        let summary = change_cards::entity_summary(&data.folded, &data.groups.groups[group]);
         let body = open.then(|| self.entity_body(data, group, cx));
-        let outline = studio_ui::ds::surface::outline(cx);
-        div()
-            .pl(px(space::XL + studio_ui::ds::size::GUTTER))
-            .pr(px(space::XL))
-            .when(last, |row| row.pb(px(space::LG)))
-            .child(
-                v_flex()
-                    .w_full()
-                    .border_l_1()
-                    .border_r_1()
-                    .border_color(outline)
-                    .when(first, |table| {
-                        table.border_t_1().rounded_t(px(radii(cx).md))
-                    })
-                    .when(last, |table| table.border_b_1().rounded_b(px(radii(cx).md)))
-                    .child(if first {
-                        head.into_any_element()
-                    } else {
-                        studio_ui::ds::dotted(div().border_t_1(), cx)
-                            .child(head)
-                            .into_any_element()
-                    })
-                    .children(body),
-            )
-            .into_any_element()
+        change_cards::entity_row(
+            change_cards::EntityRow {
+                id: ("change-head", group).into(),
+                kind,
+                name,
+                entity_id: id,
+                summary,
+                status,
+                first,
+                last,
+                open,
+                selected,
+                dimmed: reviewed,
+            },
+            body,
+            cx.listener(move |this, _, _, cx| this.click_group(group, cx)),
+            cx,
+        )
     }
 
     /// The split's label for a run of one type: the type with its counts, folding its items.
@@ -3596,17 +3480,6 @@ impl ReviewView {
         let rows = group
             .change
             .map(|own| change_cards::change_rows(&data.folded, own, schema, &data.card_rows));
-        let property_rows: Vec<AnyElement> = rows
-            .iter()
-            .flat_map(|rows| rows.iter())
-            .map(|row| {
-                studio_ui::ds::dotted(div().border_t_1(), cx)
-                    .py(px(space::SM))
-                    .child(studio_ui::property_row(row, kind, Some(&folds), cx))
-                    .into_any_element()
-            })
-            .collect();
-
         // A group of many relationships shows its first few and more as they are asked for,
         // and grows by itself through a relationship selected below them (from a mirror, or
         // a change of a fix). Only the lines it shows are made.
@@ -3696,43 +3569,35 @@ impl ReviewView {
                 line
             })
             .collect();
-        let relationships = (!lines.is_empty()).then(|| {
-            studio_ui::ds::dotted(v_flex().border_t_1(), cx)
-                .py(px(space::SM))
-                .gap(px(space::WITHIN))
-                .child(
-                    h_flex()
-                        .gap(px(space::MD))
-                        .pb(px(space::XXS))
-                        .child(studio_ui::ds::text::meta("Relationships"))
-                        .child(change_counts(added, changed, removed)),
-                )
-                .children(lines)
-                .when(left_out > 0, |block| {
-                    block.child(change_cards::more_lines_button(
-                        ix,
-                        left_out,
-                        cx.listener(move |this, _, _, cx| {
-                            this.card_lines.show_more(card_key.clone(), shown);
-                            cx.notify();
-                        }),
-                    ))
-                })
+        let more = (left_out > 0).then(|| {
+            change_cards::more_lines_button(
+                ix,
+                left_out,
+                cx.listener(move |this, _, _, cx| {
+                    this.card_lines.show_more(card_key.clone(), shown);
+                    cx.notify();
+                }),
+            )
+            .into_any_element()
         });
         let actions = (self.layout == ReviewLayout::Feed).then(|| {
             div()
                 .pt(px(space::MD))
                 .child(self.entity_actions(data, ix, cx))
         });
-        v_flex()
-            .w_full()
-            .min_w_0()
-            .when(self.layout == ReviewLayout::Feed, |body| {
-                body.px(px(space::LG)).pb(px(space::LG))
-            })
-            .children(property_rows)
-            .children(relationships)
-            .children(actions)
+        change_cards::entity_body(
+            rows,
+            kind,
+            Some(&folds),
+            lines,
+            (added, changed, removed),
+            more,
+            cx,
+        )
+        .when(self.layout == ReviewLayout::Feed, |body| {
+            body.px(px(space::LG)).pb(px(space::LG))
+        })
+        .children(actions)
     }
 
     /// What can be done to a group: mark it reviewed, edit its node on the branch, revert
@@ -3846,36 +3711,16 @@ struct RunFacts {
 }
 
 fn run_facts(data: &ReviewData, run: &GroupRun, created: &HashMap<&str, i64>) -> RunFacts {
-    let mut names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     let mut commits: HashSet<&str> = HashSet::new();
     for &g in &run.groups {
         for change in data.groups.groups[g].changes() {
-            let change = &data.folded.changes[change];
-            commits.extend(change.commits.iter().map(String::as_str));
-            if let (Some(before), Some(after)) = (&change.before, &change.after)
-                && !change.is_edge()
-            {
-                names.extend(
-                    after
-                        .properties
-                        .iter()
-                        .filter(|(key, value)| before.properties.get(*key) != Some(value))
-                        .map(|(key, _)| key.as_str()),
-                );
-                names.extend(
-                    before
-                        .properties
-                        .keys()
-                        .filter(|key| !after.properties.contains_key(*key))
-                        .map(String::as_str),
-                );
-            }
+            commits.extend(
+                data.folded.changes[change]
+                    .commits
+                    .iter()
+                    .map(String::as_str),
+            );
         }
-    }
-    let shown: Vec<&str> = names.iter().copied().take(4).collect();
-    let mut properties = shown.join(", ");
-    if names.len() > 4 {
-        properties.push_str(&format!(" and {} more", names.len() - 4));
     }
     let latest = commits
         .iter()
@@ -3883,38 +3728,10 @@ fn run_facts(data: &ReviewData, run: &GroupRun, created: &HashMap<&str, i64>) ->
         .copied()
         .max();
     RunFacts {
-        properties,
+        properties: change_cards::run_properties(run, &data.groups, &data.folded),
         commits: commits.len(),
         latest,
     }
-}
-
-/// A run's counts as the feed says them, and the word to its type: "1 changed" "in" Task,
-/// "2 added" "to" Email, "1 removed" "from" Person; a run of entities standing for their
-/// relationships alone, "3 entities" "with relationships that changed in".
-fn run_sentence(run: &GroupRun) -> (String, &'static str) {
-    let mut parts = Vec::new();
-    if run.changed > 0 {
-        parts.push(format!("{} changed", group_digits(run.changed)));
-    }
-    if run.added > 0 {
-        parts.push(format!("{} added", group_digits(run.added)));
-    }
-    if run.removed > 0 {
-        parts.push(format!("{} removed", group_digits(run.removed)));
-    }
-    if parts.is_empty() {
-        return (
-            studio_ui::plural(run.groups.len(), "entity", "entities"),
-            "with relationships that changed in",
-        );
-    }
-    let joiner = match (run.changed, run.added, run.removed) {
-        (0, _, 0) => "to",
-        (0, 0, _) => "from",
-        _ => "in",
-    };
-    (parts.join(", "), joiner)
 }
 
 /// What the merge banner says the target's history showed of a merge that committed.
@@ -4060,61 +3877,6 @@ fn run_key(run: &GroupRun, data: &ReviewData) -> (GroupSection, bool, String) {
         .first()
         .map_or(GroupSection::Added, |&g| data.groups.groups[g].section);
     (section, run.is_edge, run.type_name.clone())
-}
-
-/// What a group's folded line says: the properties its change touched, or how many an added
-/// or removed record has, then its relationship changes.
-fn group_summary(data: &ReviewData, group: &EntityGroup) -> String {
-    let mut parts = Vec::new();
-    if let Some(own) = group.change {
-        let change = &data.folded.changes[own];
-        match (&change.before, &change.after) {
-            (Some(before), Some(after)) => {
-                let mut names: Vec<&String> = after
-                    .properties
-                    .iter()
-                    .filter(|(key, value)| before.properties.get(*key) != Some(value))
-                    .map(|(key, _)| key)
-                    .chain(
-                        before
-                            .properties
-                            .keys()
-                            .filter(|key| !after.properties.contains_key(*key)),
-                    )
-                    .collect();
-                names.sort();
-                names.dedup();
-                if !names.is_empty() {
-                    let shown: Vec<&str> = names.iter().take(4).map(|s| s.as_str()).collect();
-                    let mut text = shown.join(", ");
-                    if names.len() > 4 {
-                        text.push_str(&format!(" and {} more", names.len() - 4));
-                    }
-                    text.push_str(" changed");
-                    parts.push(text);
-                }
-            }
-            (None, Some(after)) => parts.push(studio_ui::plural(
-                after.properties.len(),
-                "property",
-                "properties",
-            )),
-            (Some(before), None) => parts.push(format!(
-                "{} removed",
-                studio_ui::plural(before.properties.len(), "property", "properties")
-            )),
-            (None, None) => {}
-        }
-    }
-    let relationships = group.relationships.len();
-    if relationships > 0 {
-        parts.push(studio_ui::plural(
-            relationships,
-            "relationship",
-            "relationships",
-        ));
-    }
-    parts.join(" · ")
 }
 
 /// The list's rows: each card the search leaves (`matched`, each change's match; every card

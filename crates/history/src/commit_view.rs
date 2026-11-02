@@ -67,6 +67,13 @@ pub struct CommitView {
     names: NodeNames,
     /// How many relationship lines each card shows.
     card_lines: CardLines,
+    /// The run each row is in, by row: a folded run's entity rows draw nothing.
+    row_runs: Vec<usize>,
+    /// The runs folded to their row, as the review folds them: by section, kind and type.
+    folded_runs: HashSet<(GroupSection, bool, String)>,
+    /// The entities unfolded to their changes, by type and id; each row starts folded, as the
+    /// review's do.
+    open: HashSet<(String, String)>,
     _names_task: Option<Task<()>>,
     counts: Vec<TypeCounts>,
     rows: Vec<Row>,
@@ -169,6 +176,9 @@ impl CommitView {
             runs: Vec::new(),
             names: NodeNames::default(),
             card_lines: CardLines::default(),
+            row_runs: Vec::new(),
+            folded_runs: HashSet::new(),
+            open: HashSet::new(),
             _names_task: None,
             counts: Vec::new(),
             rows: Vec::new(),
@@ -347,6 +357,7 @@ impl CommitView {
                         this.counts = counts;
                         this.rows = rows;
                         this.runs = runs;
+                        this.row_runs = row_runs(&this.rows);
                         this.groups = groups;
                         this.folded = folded;
                         this.schema = made_with;
@@ -434,6 +445,7 @@ impl CommitView {
                 this.groups = groups;
                 this.rows = rows;
                 this.runs = runs;
+                this.row_runs = row_runs(&this.rows);
                 this.schema = made_with;
                 this.card_rows = CardRows::default();
                 this.read_names(cx);
@@ -688,6 +700,53 @@ impl CommitView {
             })
     }
 
+    /// What changed in entity `ix`, in full, as its row unfolds: as the review's
+    /// ([`change_cards::entity_body`]), its relationship lines a few at a time.
+    fn entity_body(&self, ix: usize, kind: studio_ui::ChangeKind, cx: &mut Context<Self>) -> Div {
+        let schema = self.schema.as_deref();
+        let group = &self.groups.groups[ix];
+        let rows = group
+            .change
+            .map(|own| change_cards::change_rows(&self.folded, own, schema, &self.card_rows));
+        let card_key = (group.type_name.clone(), group.id.clone());
+        let total = self.groups.line_count(ix);
+        let shown = self.card_lines.shown(&card_key, total, None);
+        let left_out = total - shown;
+        // Only the lines the row shows are made.
+        let card_lines = self
+            .groups
+            .lines(&self.folded, ix, schema, &self.names, shown);
+        let counts = (card_lines.added, card_lines.changed, card_lines.removed);
+        let lines = card_lines
+            .entries
+            .into_iter()
+            .map(|entry| {
+                // A mirror's other end is the entity it is shown on in full.
+                change_cards::relationship_line(
+                    entry,
+                    &self.folded,
+                    schema,
+                    &self.card_rows,
+                    "shown there",
+                )
+            })
+            .collect();
+        let more = (left_out > 0).then(|| {
+            change_cards::more_lines_button(
+                ix,
+                left_out,
+                cx.listener(move |this, _, _, cx| {
+                    this.card_lines.show_more(card_key.clone(), shown);
+                    cx.notify();
+                }),
+            )
+            .into_any_element()
+        });
+        change_cards::entity_body(rows, kind, None, lines, counts, more, cx)
+            .px(px(studio_ui::ds::space::LG))
+            .pb(px(studio_ui::ds::space::LG))
+    }
+
     fn render_row(
         &mut self,
         row: usize,
@@ -696,69 +755,81 @@ impl CommitView {
     ) -> AnyElement {
         let more = self.next_page_token.is_some();
         match self.rows.get(row).copied() {
-            Some(Row::Header(ix)) => div()
-                .px(px(studio_ui::ds::space::EDGE))
-                .child(change_cards::run_header(
-                    &self.runs[ix],
-                    |section| match section {
-                        GroupSection::Existing => "Changes to existing entities".to_owned(),
-                        GroupSection::Added => "Added".to_owned(),
+            Some(Row::Header(ix)) => {
+                let run = &self.runs[ix];
+                let key = run_key(run, &self.groups);
+                let folded = self.folded_runs.contains(&key);
+                let properties = change_cards::run_properties(run, &self.groups, &self.folded);
+                change_cards::run_row(
+                    ("commit-run", ix),
+                    run,
+                    change_cards::RunWords {
+                        section: run.section.map(|section| {
+                            match section {
+                                GroupSection::Existing => "Changes to existing entities",
+                                GroupSection::Added => "Added",
+                            }
+                            .to_owned()
+                        }),
+                        detail: change_cards::run_detail(run, &properties),
+                        when: None,
                     },
+                    folded,
+                    cx.listener(move |this, _, _, cx| {
+                        if !this.folded_runs.remove(&key) {
+                            this.folded_runs.insert(key.clone());
+                        }
+                        cx.notify();
+                    }),
                     cx,
-                ))
-                .into_any_element(),
+                )
+            }
             Some(Row::Entity(ix)) => {
-                // The schema the groups were made with, which the cards' rows agree with.
+                let run = self.row_runs.get(row).copied().unwrap_or_default();
+                if self
+                    .runs
+                    .get(run)
+                    .is_some_and(|run| self.folded_runs.contains(&run_key(run, &self.groups)))
+                {
+                    return div().into_any_element();
+                }
+                // The schema the groups were made with, which the rows agree with.
                 let schema = self.schema.as_deref();
-                let card = change_cards::entity_card(
-                    &self.groups,
-                    &self.folded,
-                    ix,
-                    schema,
-                    &self.names,
-                    &self.card_rows,
-                    ("commit-change", ix),
-                );
+                let first = row == 0 || matches!(self.rows[row - 1], Row::Header(_));
+                let last = self
+                    .rows
+                    .get(row + 1)
+                    .is_none_or(|next| matches!(next, Row::Header(_)));
                 let group = &self.groups.groups[ix];
                 let card_key = (group.type_name.clone(), group.id.clone());
-                let total = self.groups.line_count(ix);
-                let shown = self.card_lines.shown(&card_key, total, None);
-                let left_out = total - shown;
-                // Only the lines the card shows are made.
-                let card_lines = self
-                    .groups
-                    .lines(&self.folded, ix, schema, &self.names, shown);
-                let counts = (card_lines.added, card_lines.changed, card_lines.removed);
-                let lines = card_lines
-                    .entries
-                    .into_iter()
-                    .map(|entry| {
-                        // A mirror's other end is the card it is shown on in full.
-                        change_cards::relationship_line(
-                            entry,
-                            &self.folded,
-                            schema,
-                            &self.card_rows,
-                            "shown there",
-                        )
-                    })
-                    .collect();
-                let mut card = card.relationships(counts, lines);
-                if left_out > 0 {
-                    card = card.relationships_footer(change_cards::more_lines_button(
-                        ix,
-                        left_out,
-                        cx.listener(move |this, _, _, cx| {
-                            this.card_lines.show_more(card_key.clone(), shown);
-                            cx.notify();
-                        }),
-                    ));
-                }
-                div()
-                    .px(px(studio_ui::ds::space::EDGE))
-                    .py(px(studio_ui::ds::space::XS))
-                    .child(card)
-                    .into_any_element()
+                let open = self.open.contains(&card_key);
+                let (kind, name, id) =
+                    change_cards::identity(&self.groups, &self.folded, ix, schema, &self.names);
+                let summary = change_cards::entity_summary(&self.folded, group);
+                let body = open.then(|| self.entity_body(ix, kind, cx));
+                change_cards::entity_row(
+                    change_cards::EntityRow {
+                        id: ("commit-change", ix).into(),
+                        kind,
+                        name,
+                        entity_id: id,
+                        summary,
+                        status: None,
+                        first,
+                        last,
+                        open,
+                        selected: false,
+                        dimmed: false,
+                    },
+                    body,
+                    cx.listener(move |this, _, _, cx| {
+                        if !this.open.remove(&card_key) {
+                            this.open.insert(card_key.clone());
+                        }
+                        cx.notify();
+                    }),
+                    cx,
+                )
             }
             None if more => h_flex()
                 .px(px(studio_ui::ds::space::XL))
@@ -1018,6 +1089,28 @@ impl Render for CommitView {
             .child(header)
             .child(body)
     }
+}
+
+/// The run each of `rows` is in: an entity's is the header's above it.
+fn row_runs(rows: &[Row]) -> Vec<usize> {
+    let mut run = 0;
+    rows.iter()
+        .map(|row| {
+            if let Row::Header(ix) = row {
+                run = *ix;
+            }
+            run
+        })
+        .collect()
+}
+
+/// What a run is folded by: its section, whether it is of relationships, and its type.
+fn run_key(run: &GroupRun, groups: &EntityGroups) -> (GroupSection, bool, String) {
+    let section = run
+        .groups
+        .first()
+        .map_or(GroupSection::Added, |&g| groups.groups[g].section);
+    (section, run.is_edge, run.type_name.clone())
 }
 
 #[cfg(test)]
