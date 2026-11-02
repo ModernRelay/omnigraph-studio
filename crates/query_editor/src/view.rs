@@ -191,6 +191,64 @@ struct RowsOutput {
     head_seen: Option<String>,
 }
 
+impl RowsOutput {
+    /// The commit the rows were read at when the tab held its query at one; `None` for rows
+    /// read at a branch head, and for a statement, which names its own branches.
+    fn held_at(&self) -> Option<&str> {
+        match &self.read_at {
+            ReadAt::Commit(commit) => Some(commit),
+            ReadAt::Branch(_) | ReadAt::Statement => None,
+        }
+    }
+
+    /// What the views of the result's nodes are opened from, for rows that hold some: their
+    /// title, the nodes, and the commit the views hold. Read at a commit the tab was held at,
+    /// they hold it, and what they open reads there (constitution XIII), whatever the tab is
+    /// pinned to since; read at the branch head, they follow it.
+    fn views(&self) -> Option<ResultViews> {
+        Some(ResultViews {
+            title: format!("{} · result", self.label),
+            graph: self.graph.clone()?,
+            at_commit: self.held_at().map(str::to_owned),
+        })
+    }
+}
+
+/// A result's views as its status bar offers them ([`RowsOutput::views`]). Cheap to make each
+/// frame: the nodes are shared, and copied into an action only when a button is pressed.
+#[derive(Clone)]
+struct ResultViews {
+    title: String,
+    graph: Arc<ResultGraph>,
+    at_commit: Option<String>,
+}
+
+impl ResultViews {
+    /// Its nodes as a tree, each opening to its relationships.
+    fn tree(&self) -> studio_actions::graph::ShowSetInTree {
+        results_set(
+            self.title.clone(),
+            self.graph.0.clone(),
+            self.at_commit.clone(),
+        )
+    }
+
+    /// Whether any of its nodes share a row, which the canvas draws.
+    fn links(&self) -> bool {
+        !self.graph.1.is_empty()
+    }
+
+    /// Its nodes on a canvas of their own, linking those in the same row.
+    fn canvas(&self) -> studio_actions::graph::ShowResultsOnCanvas {
+        studio_actions::graph::ShowResultsOnCanvas {
+            title: self.title.clone(),
+            nodes: self.graph.0.clone(),
+            links: self.graph.1.clone(),
+            at_commit: self.at_commit.clone(),
+        }
+    }
+}
+
 /// A read's rows made ready to show: the table, each column's width from its content, which
 /// columns align right, the graph the node columns make, and a place for each row's cells.
 struct BuiltRows {
@@ -3403,50 +3461,35 @@ impl QueryEditor {
                     &editor_focus,
                 ));
 
-                if let Some(graph) = rows.graph.clone() {
-                    let title = format!("{} · result", rows.label);
-                    // Its nodes as a tree, each opening to its relationships: copied when the
-                    // button is pressed, not each time the status bar is drawn.
-                    let (tree_title, nodes, at_commit) =
-                        (title.clone(), graph.clone(), self.at_commit.clone());
+                if let Some(views) = rows.views() {
+                    let tree = views.clone();
                     end.push(
                         ds::button("result-tree", "Tree")
                             .style(ButtonStyle::Subtle)
                             .start_icon(Icon::new(IconName::ListTree))
                             .tip(studio_ui::ds::tooltip(format!(
                                 "Show the result's {} as a tree",
-                                studio_ui::plural(graph.0.len(), "node", "nodes")
+                                studio_ui::plural(views.graph.0.len(), "node", "nodes")
                             )))
                             .on_click(move |_, window, cx| {
-                                let set = results_set(
-                                    tree_title.clone(),
-                                    nodes.0.clone(),
-                                    at_commit.clone(),
-                                );
-                                window.dispatch_action(Box::new(set), cx)
+                                window.dispatch_action(Box::new(tree.tree()), cx)
                             })
                             .into_any_element(),
                     );
                     // A picture only of what the result links: nodes that share a row. A result
                     // with one node column links nothing, and has none to draw.
-                    if !graph.1.is_empty() {
+                    if views.links() {
+                        let canvas = views.clone();
                         end.push(
                             ds::button("result-graph", "Graph")
                                 .style(ButtonStyle::Subtle)
                                 .start_icon(Icon::new(IconName::GitGraph))
                                 .tip(studio_ui::ds::tooltip(format!(
                                     "Draw the result's {} nodes, linking those in the same row",
-                                    graph.0.len()
+                                    views.graph.0.len()
                                 )))
                                 .on_click(move |_, window, cx| {
-                                    window.dispatch_action(
-                                        Box::new(studio_actions::graph::ShowResultsOnCanvas {
-                                            title: title.clone(),
-                                            nodes: graph.0.clone(),
-                                            links: graph.1.clone(),
-                                        }),
-                                        cx,
-                                    )
+                                    window.dispatch_action(Box::new(canvas.canvas()), cx)
                                 })
                                 .into_any_element(),
                         );
@@ -5126,8 +5169,8 @@ fn confirm_words(prepared: &Prepared, branch: &str) -> (String, String) {
     }
 }
 
-/// A result's nodes as the set a Tree opens to (spec 020): listed, and held at the tab's commit
-/// when the tab is, so a view opened from a held tab stays held.
+/// A result's nodes as the set a Tree opens to (spec 020): listed, and held at the commit the
+/// result was read at when its tab was held at one, so a view opened from a held tab stays held.
 fn results_set(
     title: String,
     nodes: Vec<studio_actions::graph::ResultNode>,
@@ -6032,6 +6075,77 @@ mod tests {
 
         /// A statement read names no branch of the tab's; a diff says the commits it compared
         /// and offers its next page, which reads the same statement with the server's token.
+        /// A result read at the commit the tab is held at opens its tree and its canvas held
+        /// there too, so what they open reads that commit, and still does once the tab lets go
+        /// of the commit; a result read at the branch head opens them following the head.
+        /// Before, the canvas of a held result read the head, and the tree followed whatever
+        /// the tab was pinned to when its button was pressed.
+        #[gpui::test]
+        async fn a_result_read_at_a_commit_opens_its_views_there(cx: &mut TestAppContext) {
+            init(cx);
+            for held in [Some("c1"), None] {
+                let pairs = json!({
+                    "query_name": "pairs",
+                    "target": {"branch": held.is_none().then_some("main"), "snapshot": held},
+                    "row_count": 1,
+                    "columns": ["a", "b"],
+                    "rows": [{
+                        "a": {"@id": "p1", "slug": "p1", "name": "Ada"},
+                        "b": {"@id": "p2", "slug": "p2", "name": "Grace"},
+                    }],
+                    "graph_commit_id": "c1",
+                });
+                let (session, _) = served(
+                    cx,
+                    vec![schema_route(PEOPLE), ("/query", pairs.to_string())],
+                );
+                let (editor, cx) =
+                    cx.add_window_view(|window, cx| QueryEditor::new(1, session, window, cx));
+                cx.run_until_parked();
+                editor.update_in(cx, |editor, window, cx| {
+                    editor.set_text(
+                        "query pairs() { match { $a: Person $b: Person } return { $a, $b } }",
+                        window,
+                        cx,
+                    );
+                    if let Some(commit) = held {
+                        editor.pin_to(commit.into(), cx);
+                    }
+                    editor.run(&Run, window, cx);
+                });
+                cx.run_until_parked();
+                editor.read_with(cx, |editor, _| {
+                    let Output::Rows(rows) = &editor.output else {
+                        panic!("no rows: {held:?}");
+                    };
+                    let views = rows.views().expect("the result holds nodes");
+                    assert_eq!(views.graph.0.len(), 2);
+                    assert!(views.links(), "the two share a row");
+                    assert_eq!(views.tree().at_commit.as_deref(), held, "the tree");
+                    assert_eq!(views.canvas().at_commit.as_deref(), held, "the canvas");
+                });
+                // The tab let go of its commit since: the rows shown are still the commit's,
+                // and so are their views.
+                editor.update(cx, |editor, cx| editor.unpin(cx));
+                editor.read_with(cx, |editor, _| {
+                    let Output::Rows(rows) = &editor.output else {
+                        panic!("the rows stay");
+                    };
+                    let views = rows.views().expect("the result holds nodes");
+                    assert_eq!(
+                        views.tree().at_commit.as_deref(),
+                        held,
+                        "the tree, unpinned"
+                    );
+                    assert_eq!(
+                        views.canvas().at_commit.as_deref(),
+                        held,
+                        "the canvas, unpinned"
+                    );
+                });
+            }
+        }
+
         #[gpui::test]
         async fn a_branch_diff_names_its_sides_and_reads_its_next_page(cx: &mut TestAppContext) {
             init(cx);
