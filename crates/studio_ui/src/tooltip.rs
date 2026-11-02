@@ -30,7 +30,13 @@ pub struct TipContent {
     title: SharedString,
     meta: Option<SharedString>,
     key: Option<Key>,
+    /// A row of detail under a rule, built when the tooltip shows (a commit's counts and
+    /// where it opens).
+    detail: Option<Rc<Detail>>,
 }
+
+/// What builds a tooltip's detail row when it shows.
+type Detail = dyn Fn(&mut App) -> AnyElement;
 
 #[derive(Clone)]
 enum Key {
@@ -44,6 +50,7 @@ pub fn tooltip(title: impl Into<SharedString>) -> TipContent {
         title: title.into(),
         meta: None,
         key: None,
+        detail: None,
     }
 }
 
@@ -113,9 +120,15 @@ impl TipContent {
         self
     }
 
-    /// How many lines it takes: the title, and the detail under it.
+    /// A row of detail under a rule, built when the tooltip shows.
+    pub fn detail(mut self, build: impl Fn(&mut App) -> AnyElement + 'static) -> Self {
+        self.detail = Some(Rc::new(build));
+        self
+    }
+
+    /// How many lines it takes: the title, the line under it, and the detail row.
     fn lines(&self) -> usize {
-        1 + usize::from(self.meta.is_some())
+        1 + usize::from(self.meta.is_some()) + 2 * usize::from(self.detail.is_some())
     }
 
     /// The tooltip as a view at the pointer, for [`Tipped::tip_fn`], which hangs it from the
@@ -168,6 +181,16 @@ impl Render for Tip {
                 )
                 .when_some(self.content.meta.clone(), |tip, meta| {
                     tip.child(ds::text::meta(meta))
+                })
+                .when_some(self.content.detail.clone(), |tip, detail| {
+                    tip.child(
+                        div()
+                            .mt(px(space::XS))
+                            .pt(px(space::XS))
+                            .border_t_1()
+                            .border_color(ds::surface::rule(cx))
+                            .child(detail(cx)),
+                    )
                 }),
         )
     }

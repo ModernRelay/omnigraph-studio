@@ -781,11 +781,12 @@ than styling one-off elements.
   sunken row as tall as the rows, its text on their edge, with no border.
 - **Tabs** fill the 32 px strip (an explicit height: the right-click wrapper lays a tab out at
   its content's height, so `h_full` would shrink it to its label); the active tab joins the
-  document, inactive ones sit on the strip's rule. A tab is laid out as Zed's `Tab`: 4 px
-  padding and gaps, a 12 px slot before its icon and title for its state dot (unsaved, newer
-  data) and a 14 px slot after them for its close or pin button, both kept when empty; the
-  close button shows only under the pointer, the active tab's too (Zed's
-  `show_close_button: hover`), so a title sits evenly between its tab's edges. The
+  document, inactive ones sit on the strip's rule. A tab is laid out after Zed's `Tab`: its
+  icon leads at 8 px from the edge, 6 px gaps, then a 14 px slot after the title for its close
+  or pin button, kept when empty; its state dot (unsaved, newer data) sits in that slot until
+  the pointer rests on the tab, when the close button takes its place (Zed's
+  `show_close_button: hover`), so a title sits evenly between its tab's edges (the slot before
+  the icon went 2026-11-01: it pushed every icon off the edge for a dot few tabs have). The
   strip's Back/Forward and its end buttons sit in Zed's regions: 6 px padding, 4 px gaps, 22 px
   buttons with 14 px icons, as do a dock header's zoom and hide; a dock header's title starts
   16 px in, the edge its panel's toolbar and rows start at.

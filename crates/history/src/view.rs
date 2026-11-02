@@ -1557,12 +1557,9 @@ impl HistoryView {
     ) -> Vec<AnyElement> {
         let selected_bg = studio_ui::ds::surface::selected_document(cx);
         let hover_bg = studio_ui::ds::surface::hover(cx);
-        // One accent for the branch's own lane; merged branches' lanes in a quiet grey, so the
-        // graph reads as structure, not a palette.
-        let accent = studio_ui::ds::surface::accent(cx);
-        let quiet = Color::Muted
-            .color(cx)
-            .opacity(studio_ui::ds::opacity::DIMMED);
+        // The branch's own lane in the accent; each merged branch's lane in a hue of its own,
+        // so where a commit came from reads at a glance.
+        let lane_colors = lane_colors(cx);
         let graph_width = self.graph_width();
         let now = now_micros();
         let more = (self.has_more() && range.contains(&self.commits.len()))
@@ -1571,9 +1568,10 @@ impl HistoryView {
             .filter_map(|ix| {
                 let commit = self.commits.get(ix)?;
                 let row = self.graph.rows.get(ix)?.clone();
-                let color = |index: usize| if index == 0 { accent } else { quiet };
+                let color = |index: usize| lane_colors[index.min(lane_colors.len() - 1)];
                 let lines = RowPaint {
                     commit: (row.lane, color(row.color)),
+                    head: ix == 0,
                     through: row
                         .through
                         .iter()
@@ -1607,7 +1605,10 @@ impl HistoryView {
                 let first = crate::commit_view::is_first_commit(commit);
                 let heads = self.heads.get(&id).cloned().unwrap_or_default();
                 let selected = self.selected == Some(ix);
+                // A commit on a merged branch's lane reads quieter than the branch's own.
+                let aside = row.color != 0;
                 let actor = commit.actor_id.clone();
+                let card = commit_card(commit, counts, partial, &heads, now);
                 let menu_commit = commit.clone();
                 let menu_session = self.session.clone();
                 let menu_focus = self.focus_handle.clone();
@@ -1622,7 +1623,11 @@ impl HistoryView {
                     .rounded(px(studio_ui::ds::radii(cx).sm))
                     .when(selected, |d| d.bg(selected_bg))
                     .when(!selected, |d| d.hover(|d| d.bg(hover_bg)))
+                    .when(aside && !selected, |d| {
+                        d.opacity(studio_ui::ds::opacity::DIMMED)
+                    })
                     .cursor_pointer()
+                    .tip(card)
                     .child(
                         div().w(px(graph_width)).h_full().flex_none().child(
                             canvas(
@@ -1913,9 +1918,72 @@ impl CommitText {
     }
 }
 
+/// The lanes' colors by branch index: the branch's own in the accent, merged branches' in
+/// their own hues, the last of which the rest share.
+fn lane_colors(cx: &App) -> Vec<Hsla> {
+    vec![
+        studio_ui::ds::surface::accent(cx),
+        Color::Warning.color(cx),
+        Color::Error.color(cx),
+        Color::Success.color(cx),
+        Color::Info.color(cx),
+    ]
+}
+
+/// The card a commit's row shows when the pointer rests on it: who and when, what the commit
+/// is, and what it changed; a click opens it.
+fn commit_card(
+    commit: &CommitOutput,
+    counts: Option<(usize, usize, usize)>,
+    partial: bool,
+    heads: &[String],
+    now: i64,
+) -> studio_ui::ds::TipContent {
+    let who = commit.actor_id.clone().unwrap_or_else(|| "—".into());
+    let title = format!("{who} · {}", relative_time(commit.created_at, now));
+    let what = if crate::commit_view::is_first_commit(commit) {
+        "First commit".to_owned()
+    } else if commit.merged_parent_commit_id.is_some() {
+        format!(
+            "Merged into {}",
+            commit.graph_branch.as_deref().unwrap_or("main")
+        )
+    } else {
+        format!("Commit {}", short_commit_id(&commit.graph_commit_id))
+    };
+    let meta = if heads.is_empty() {
+        what
+    } else {
+        format!("{what} · {}", heads.join(", "))
+    };
+    studio_ui::ds::tooltip(title).meta(meta).detail(move |_| {
+        h_flex()
+            .gap(px(studio_ui::ds::space::LG))
+            .justify_between()
+            .child(match counts {
+                Some((added, changed, removed)) if added + changed + removed > 0 => h_flex()
+                    .gap(px(studio_ui::ds::space::XS))
+                    .child(change_counts(added, changed, removed))
+                    .when(partial, |d| d.child(studio_ui::ds::text::meta("+ more")))
+                    .into_any_element(),
+                Some(_) => studio_ui::ds::text::meta("No changes").into_any_element(),
+                None => studio_ui::ds::text::meta("Counting changes…").into_any_element(),
+            })
+            .child(
+                h_flex()
+                    .gap(px(studio_ui::ds::space::XS))
+                    .child(studio_ui::ds::text::meta("Open"))
+                    .child(studio_ui::ds::icon::meta(IconName::ArrowRight)),
+            )
+            .into_any_element()
+    })
+}
+
 /// One row's lines, resolved to colors, painted into the row's graph cell.
 struct RowPaint {
     commit: (usize, Hsla),
+    /// The branch's head: drawn as a ring, as the reference history does.
+    head: bool,
     through: Vec<(usize, Hsla)>,
     incoming: Vec<(usize, Hsla)>,
     outgoing: Vec<(usize, Hsla)>,
@@ -1973,25 +2041,36 @@ impl RowPaint {
         }
         let radius = if self.merge { px(4.5) } else { px(3.5) };
         let center = point(x(lane), mid);
-        let mut circle = PathBuilder::fill();
-        circle.move_to(point(center.x + radius, center.y));
-        circle.arc_to(
-            point(radius, radius),
-            px(0.),
-            false,
-            true,
-            point(center.x - radius, center.y),
-        );
-        circle.arc_to(
-            point(radius, radius),
-            px(0.),
-            false,
-            true,
-            point(center.x + radius, center.y),
-        );
-        circle.close();
-        if let Ok(path) = circle.build() {
-            window.paint_path(path, color);
+        // A soft halo around the dot, then the dot: filled, or a ring for the head.
+        let circle = |radius: Pixels, fill: bool| {
+            let mut circle = if fill {
+                PathBuilder::fill()
+            } else {
+                PathBuilder::stroke(px(1.5))
+            };
+            circle.move_to(point(center.x + radius, center.y));
+            circle.arc_to(
+                point(radius, radius),
+                px(0.),
+                false,
+                true,
+                point(center.x - radius, center.y),
+            );
+            circle.arc_to(
+                point(radius, radius),
+                px(0.),
+                false,
+                true,
+                point(center.x + radius, center.y),
+            );
+            circle.close();
+            circle.build().ok()
+        };
+        if let Some(halo) = circle(radius + px(3.), true) {
+            window.paint_path(halo, color.opacity(studio_ui::ds::opacity::FAINT));
+        }
+        if let Some(dot) = circle(radius, !self.head) {
+            window.paint_path(dot, color);
         }
     }
 }

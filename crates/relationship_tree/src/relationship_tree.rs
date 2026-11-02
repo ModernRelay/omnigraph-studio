@@ -491,7 +491,9 @@ impl RelationshipTree {
             selected: None,
             selected_row_index_hint: None,
             filter: String::new(),
-            hide_empty: false,
+            // Relationships with none are left out until asked for: what a node has is the
+            // tree, not what its type allows.
+            hide_empty: true,
             focus_handle: cx.focus_handle(),
             scroll_handle: UniformListScrollHandle::new(),
             _subscriptions: subscriptions,
@@ -1557,11 +1559,14 @@ impl RelationshipTree {
             return None;
         }
         let field = studio_ui::ds::surface::sunken(cx);
+        // On the toolbar's edge, as the view strip above it, with a gap from the strip and
+        // from the rows under it.
         Some(
             v_flex()
                 .flex_none()
-                .px(px(space::MD))
-                .pb(px(space::XS))
+                .px(px(space::EDGE))
+                .pt(px(space::SM))
+                .pb(px(space::SM))
                 .gap(px(space::XS))
                 .when(newer, |d| {
                     d.child(
@@ -2408,6 +2413,15 @@ mod tests {
             cx.executor()
                 .advance_clock(std::time::Duration::from_millis(10));
         }
+        cx.run_until_parked();
+        // Every relationship of this node is empty, and the tree leaves those out until asked:
+        // show them, so there are more rows than the dock holds.
+        let tree = dock.read_with(cx, |dock, _| dock.tree.clone());
+        cx.update(|window, cx| {
+            tree.update(cx, |tree, cx| {
+                tree.toggle_empty_groups(&ToggleEmptyGroups, window, cx)
+            })
+        });
         cx.run_until_parked();
 
         let dock_bounds = cx.debug_bounds("dock").expect("the dock");

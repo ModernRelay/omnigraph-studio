@@ -41,8 +41,9 @@ Edge properties: the first one shows at the end of the neighbour row when it fit
 ("hours 291"); hover shows the type, key and all of them. Only the root carries a lettered type
 mark: each relationship already names the type it leads to, so its nodes carry a small dot in
 the type's colour. Rows are the sidebar row height (`ds::size::SIDEBAR_ROW`, 26 px). The
-panel's title row holds its actions: hide relationships with none (shown when some are empty)
-and Collapse all. Typed filter text shows as a field above the rows, with `esc` to clear.
+panel's title row holds its actions: show relationships with none (they are left out until
+asked for, since what a node has is the tree, not what its type allows) and Collapse all.
+Typed filter text shows as a field above the rows on the toolbar's edge, with `esc` to clear.
 
 ### Keys (context `Tree`)
 
@@ -165,6 +166,7 @@ on the canvas. Typing filters the visible rows.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-01 | Relationships with none are hidden until asked for; the filter field sits on the toolbar's edge | `relationship_tree` `the_rows_fit_the_dock_and_the_selected_row_shows` (now shows the empty groups first); offscreen snapshot of the Source tree with a node expanded and "tit" typed | An expanded Source shows ChangeEvidence and DesignationEvidence only, the eye toggle slashed; the field's left edge is the view strip's |
 | 2026-11-01 | A relationship's neighbours are filtered by a property wherever it appears, in counts, pages and values | `gq_language` `neighbour_reads_take_filters_on_the_neighbours`; `graph_store` `filters_on_a_relationship_read_its_count_and_page_again`; `relationship_tree` `the_filter_popover_sets_and_removes_a_relationships_filters` | Pass. Offscreen snapshot of a Tree on the dev graph with a filter set on one relationship |
 | 2026-11-01 | A tree holds a set of nodes as well as one | `relationship_tree` `a_set_opens_closed_and_canvas_takes_the_selected_node`; `graph_store` `a_set_is_paged_and_its_rows_open_on_their_own`; an offscreen snapshot | Spec 020. A table's rows open as closed rows, read a page at a time; a closed row reads nothing |
 | 2026-11-01 | The tree is a tab, one per root and commit | `relationship_tree` `a_hidden_tree_makes_no_rows_and_a_walk_is_shared_by_root_and_commit`; `graph_store` `a_held_walk_stays_at_its_commit`; an offscreen snapshot beside a table | Spec 020 moves it from the left dock. Re-rooting opens a tab, and Back replaces the breadcrumb |
@@ -227,7 +229,7 @@ on the canvas. Typing filters the visible rows.
 - **Built since:** Space peeks (`studio_graph::PeekNode`: the inspector only, focus stays in
   the tree); ⌘↵ opens the node's table filtered to its id, or on a relationship group the other
   type's table filtered to "related to" this node (spec 004's relationship filter); the eye
-  toggle (or `h`) hides groups with none, shown when a group is empty; with text typed, a
+  toggle (or `h`) shows groups with none, hidden by default (decided 2026-11-01); with text typed, a
   group not read in full offers "Find “text” among N", which reads that group again on the
   server narrowed to ids starting with or labels containing the text (Esc clears both).
   `OpenNode` from the table, palette or canvas now reaches the tree: the table's handler

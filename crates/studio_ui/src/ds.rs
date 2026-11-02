@@ -330,6 +330,8 @@ pub mod opacity {
     /// A row a filter dims, a card for a side not written yet, a merged branch's lane: one
     /// value, so every quiet thing is equally quiet.
     pub const DIMMED: f32 = 0.5;
+    /// A wash in a mark's own color behind it: the halo around a commit's dot.
+    pub const FAINT: f32 = 0.18;
 }
 
 /// Whether the window is drawn in the glass style (setting `studio.window_style`).

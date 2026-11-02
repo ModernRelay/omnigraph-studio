@@ -409,8 +409,8 @@ const SAVE_DELAY: Duration = Duration::from_millis(500);
 /// columns (after Zed's).
 const HEADER_HEIGHT: f32 = studio_ui::ds::size::HEADER_STRIP;
 const STATUS_BAR_HEIGHT: f32 = studio_ui::ds::size::STATUS_BAR;
-/// A tab's slots before and after its content, as Zed's `Tab`: its state dot, its close button.
-const TAB_START_SLOT: f32 = 12.;
+/// A tab's slot after its content, as Zed's `Tab`: its close or pin button, or its state dot
+/// until the tab is hovered.
 const TAB_END_SLOT: f32 = 14.;
 /// How far a zoomed pane or panel sits inside the document area, as Zed's `zoomed_padding`.
 const ZOOM_INSET: f32 = studio_ui::ds::size::SHEET_GAP;
@@ -3529,15 +3529,16 @@ impl Workspace {
                 let pinned = pane.is_pinned(index);
                 let preview = pane.is_preview(index);
                 let group: SharedString = format!("tab-{pane_id}-{index}").into();
+                let group_name = group.clone();
                 let dirty = item.is_dirty(cx);
                 let stale = item.is_stale(cx);
                 let item_id = item.item_id();
                 // With a split, the active pane's tab reads at full strength and the others'
                 // active tabs are muted, so the focused document is clear.
                 let strong = selected && (!split || focused_pane);
-                // As Zed's `Tab`: a slot before the content for the tab's state (unsaved,
-                // newer data) and one after it for its close or pin button, both kept when
-                // empty so the tabs' contents line up.
+                // The tab's icon leads, on the tab's edge; a slot after the title holds its
+                // close or pin button, and its state (unsaved, newer data) as a dot until the
+                // tab is hovered, so the title sits evenly between the tab's edges.
                 let indicator = if dirty {
                     Some(studio_ui::ds::dot(Color::Warning))
                 } else if stale {
@@ -3577,8 +3578,9 @@ impl Workspace {
                     .debug_selector(move || format!("tab-{pane_id}-{index}"))
                     .group(group)
                     .h(px(HEADER_HEIGHT))
-                    .px(px(studio_ui::ds::space::XS))
-                    .gap(px(studio_ui::ds::space::XS))
+                    .pl(px(studio_ui::ds::space::MD))
+                    .pr(px(studio_ui::ds::space::XS))
+                    .gap(px(studio_ui::ds::space::SM))
                     .items_center()
                     .flex_none()
                     .relative()
@@ -3605,14 +3607,7 @@ impl Workspace {
                     .cursor_pointer()
                     .child(
                         h_flex()
-                            .size(px(TAB_START_SLOT))
-                            .flex_none()
-                            .justify_center()
-                            .children(indicator),
-                    )
-                    .child(
-                        h_flex()
-                            .gap(px(studio_ui::ds::space::XS))
+                            .gap(px(studio_ui::ds::space::SM))
                             .items_center()
                             .children(item.tab_icon(cx).map(studio_ui::ds::icon::meta))
                             .child(
@@ -3626,8 +3621,20 @@ impl Workspace {
                         h_flex()
                             .size(px(TAB_END_SLOT))
                             .flex_none()
+                            .relative()
                             .justify_center()
-                            .child(end_button),
+                            .child(end_button)
+                            // The dot gives way to the close button under the pointer.
+                            .children(indicator.map(|dot| {
+                                div()
+                                    .absolute()
+                                    .inset_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .group_hover(group_name.clone(), |style| style.invisible())
+                                    .child(dot)
+                            })),
                     )
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         // The strip's own double click zooms the window; a tab's keeps it.

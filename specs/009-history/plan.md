@@ -31,7 +31,12 @@ from Zed with notices).
   messages), built from `studio_ui::ds` like every list: the short id (code text), the change
   counts in a fixed column, branch heads as tags with a merge mark, then the actor and the
   relative time, muted and right-aligned. No column header; rows are inset pills at the data
-  row height. The graph draws the branch's own lane in the accent and merged lanes in grey.
+  row height. The graph draws the branch's own lane in the accent and each merged branch's lane
+  in a hue of its own (`lane_colors`: warning, error, success, info; the last shared by the
+  rest), each dot in a faint halo of its colour, the head as a ring; a row on a merged lane
+  reads dimmed. Resting on a row shows a card (`commit_card`, a tooltip with a detail row): who
+  and when, what the commit is (first, merge into which branch, or its id) with its heads, and
+  its change counts with "Open →", as a click does.
   The tab's toolbar is the shared one: title, then branch and commit count as meta, search and
   a refresh icon.
 - Selecting a commit opens its changes (spec 008's entity cards) in a detail split, headed like
@@ -176,6 +181,7 @@ away are dropped.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-01 | Lanes in their own hues, halos, the head ring and the hover card | `history` tests unchanged (12 pass); offscreen snapshot of the law graph's history with the pointer on the first commit | The card shows "act-admin · 35 min ago", "Commit K1GB3NS7 · main", "+100 + more" and "Open →" under the row; the head draws as a ring in a halo. A history with merged lanes was not snapshotted (the law graph has one lane) |
 | 2026-11-01 | A commit previewed from a History tab that is itself the preview keeps History | `history` `commit_view` `a_commit_previewed_from_a_preview_history_keeps_it` (History opened as a preview, a click on a commit) | Pass: History stays as a tab of its own and the commit takes the preview slot, so Back returns to History (spec 020, the source tab is never replaced). Before, the click closed History |
 | 2026-11-01 | History is a tab only | `history` tests; an offscreen snapshot | Spec 020 removes the panel and the detail split: a click previews the commit's own tab, a double click keeps it |
 | 2026-10-29 | A commit tab restored with the workspace reads when it is shown | `history` `a_restored_commit_tab_reads_when_it_is_shown` (made without a window: no request for the commit; drawn: the commit and its changes read) | Pass. Before, every restored commit tab read its commit and its first page of changes at start, shown or not; a commit opened from History or a toast still reads at once, as it is shown |
