@@ -63,7 +63,8 @@ python3 script/test_release_files.py   # a release's version-free copies and lat
 - A debug build run from `target/` is signed ad hoc, so each rebuild is a new app to the
   Keychain and it asks for the login password again. Sign it after every build with
   `script/sign-dev` (once: `script/sign-dev --make-identity`); `script/bundle-mac` uses the same
-  identity when no Developer ID is set.
+  identity when no Developer ID is set. The `omnigraph` CLI keeps its sign-in session in the
+  Keychain too and is signed ad hoc: after a CLI update, `script/sign-dev --cli`.
 - Write files with `studio_settings::write_atomic`, never by truncating in place.
 - A function used on one platform carries the same `cfg` as its caller, so the other platforms
   still build.
