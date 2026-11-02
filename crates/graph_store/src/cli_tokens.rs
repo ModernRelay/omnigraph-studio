@@ -209,6 +209,12 @@ pub trait TokenSource: Send + Sync + 'static {
         None
     }
 
+    /// Whether the CLI would not say this login's organization this time: the one its profile
+    /// named before stands.
+    fn organization_unread(&self) -> bool {
+        false
+    }
+
     /// The server refused the last token this source gave (a 401 that refused it, not one that
     /// found none),
     /// said before the source is asked again: a source that keeps a token it can renew renews it
@@ -945,6 +951,10 @@ impl TokenSource for CliTokenSource {
             CliCredential::Managed { organization, .. } => organization.clone(),
             _ => None,
         }
+    }
+
+    fn organization_unread(&self) -> bool {
+        matches!(self.credential, CliCredential::Managed { unread: true, .. })
     }
 }
 
@@ -1856,6 +1866,7 @@ exit 64
                     CliAuth::Token(CliCredential::Managed {
                         profile: "work".into(),
                         organization: Some("org_work".into()),
+                        unread: false,
                     }),
                     None
                 ),
@@ -2067,8 +2078,8 @@ exit 64
     /// (`append`) or alone (`replace`), and never with an HTTPS proxy. Every bundle a target
     /// names is watched, one that cannot be used too, so putting it right lands its target.
     /// A managed profile the CLI cannot describe still lands its clusters, on the CLI's login
-    /// alone, and says why its sign-ins are checked by the server alone; one in no organization
-    /// names none.
+    /// alone, marked unread, and says how its sign-ins are checked; one in no organization names
+    /// none, and is read.
     #[test]
     fn a_managed_profile_the_cli_cannot_describe_is_said() {
         let cache = probing();
@@ -2097,6 +2108,7 @@ exit 64
                     CliAuth::Token(CliCredential::Managed {
                         profile: "gone".into(),
                         organization: None,
+                        unread: true,
                     })
                 ),
                 (
@@ -2104,6 +2116,7 @@ exit 64
                     CliAuth::Token(CliCredential::Managed {
                         profile: "own".into(),
                         organization: None,
+                        unread: false,
                     })
                 ),
             ]
@@ -2114,7 +2127,7 @@ exit 64
                 .starts_with("Studio could not read which organization CLI profile 'gone' is in (")
                 && listed.errors[0].contains("profile 'gone' is not configured")
                 && listed.errors[0]
-                    .ends_with("so a sign-in to its clusters is checked by the server alone"),
+                    .ends_with("checked against the one read before, else by the server alone"),
             "{}",
             listed.errors[0]
         );
@@ -2330,6 +2343,7 @@ exit 64
             CliCredential::Managed {
                 profile: "work".into(),
                 organization: Some("org_work".into()),
+                unread: false,
             },
         );
         assert_eq!(source.login_profile().as_deref(), Some("work"));

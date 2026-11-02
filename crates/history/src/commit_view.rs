@@ -384,7 +384,7 @@ impl CommitView {
             .session
             .update(cx, |session, cx| session.node_names(ends, commit, cx));
         self._names_task = Some(cx.spawn(async move |this, cx| {
-            let names = names.await;
+            let (names, _) = names.await;
             this.update(cx, |this, cx| {
                 this.names.extend(names);
                 cx.notify();
