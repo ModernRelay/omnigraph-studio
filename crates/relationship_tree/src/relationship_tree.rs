@@ -4,7 +4,7 @@
 //!
 //! Layer 5 (`docs/architecture.md`). Plan: `specs/005-relationship-tree/plan.md`.
 
-mod neighbour_filters;
+mod neighbour_card;
 mod rows;
 
 use std::ops::Range;
@@ -31,11 +31,10 @@ use studio_actions::workspace::Refresh;
 use studio_actions::{ViewKind, ViewLink};
 use studio_ui::ds::Tipped;
 use studio_ui::ds::space;
-use studio_ui::menu::ContextMenu;
 use studio_ui::type_swatch;
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
 use ui::prelude::*;
-use ui::{IndentGuideColors, PopoverMenu, StickyCandidate, Tooltip};
+use ui::{IndentGuideColors, StickyCandidate, Tooltip};
 
 use rows::{RowId, RowTag};
 
@@ -1119,17 +1118,14 @@ impl RelationshipTree {
                     .read(cx)
                     .grouping(&key.group)
                     .map(GroupBy::label);
-                let group_menu = (!empty)
-                    .then(|| self.group_by_menu(entry, &key.group, sticky, selected, cx))
-                    .flatten();
                 let filters: Vec<String> = self
                     .exploration
                     .read(cx)
                     .filters(&key.group)
                     .iter()
-                    .map(neighbour_filters::filter_words)
+                    .map(neighbour_card::filter_words)
                     .collect();
-                let filter_menu = self.filter_menu(row, &key.group, sticky, selected, cx);
+                let card = self.card_menu(row, entry, &key.group, sticky, selected, cx);
                 h_flex()
                     .min_w_0()
                     .flex_1()
@@ -1165,8 +1161,7 @@ impl RelationshipTree {
                         )
                     })
                     .child(div().flex_1())
-                    .children(filter_menu)
-                    .children(group_menu)
+                    .children(card)
                     .child(
                         studio_ui::ds::text::meta(count_label)
                             .color(if matches!(count, Loadable::Failed(_)) {
@@ -1365,48 +1360,11 @@ impl RelationshipTree {
             .into_any_element()
     }
 
-    /// The button on a relationship group that groups its neighbours by a property of the
-    /// other type or of the edge, shown while the row is hovered or selected.
-    /// The group row's filter button (spec 005, "Filtering a relationship's neighbours"): shown
-    /// while the row is hovered or selected, and always while filters are set.
-    fn filter_menu(
+    /// The group row's card button (spec 005, "A relationship's card"): shown while the row is
+    /// hovered or selected, and always while the relationship is grouped, ordered or filtered.
+    fn card_menu(
         &self,
         row: usize,
-        group: &gq_language::RelationshipGroup,
-        sticky: bool,
-        selected: bool,
-        cx: &App,
-    ) -> Option<AnyElement> {
-        let exploration = self.exploration.clone();
-        if !neighbour_filters::can_filter(exploration.read(cx), group) {
-            return None;
-        }
-        let set = !exploration.read(cx).filters(group).is_empty();
-        let always = selected || set;
-        let id = (
-            if sticky {
-                "sticky-filter-neighbours"
-            } else {
-                "filter-neighbours"
-            },
-            row,
-        );
-        Some(
-            div()
-                .flex_none()
-                .when(!always, |d| d.visible_on_hover("tree-row"))
-                .child(neighbour_filters::filter_button(
-                    id,
-                    set,
-                    exploration,
-                    group.clone(),
-                ))
-                .into_any_element(),
-        )
-    }
-
-    fn group_by_menu(
-        &self,
         entry: &Entry,
         group: &gq_language::RelationshipGroup,
         sticky: bool,
@@ -1414,89 +1372,33 @@ impl RelationshipTree {
         cx: &App,
     ) -> Option<AnyElement> {
         let exploration = self.exploration.clone();
-        let schema = exploration.read(cx).schema()?;
-        if !GroupBy::has_choices(&schema, group) {
+        let read = exploration.read(cx);
+        if !neighbour_card::can_open(read, group) {
             return None;
         }
-        let current = exploration.read(cx).grouping(group).cloned();
-        // The trigger shows while the row is hovered or selected, or while grouping is on.
-        let always = selected || current.is_some();
-        let group = group.clone();
-        let path = entry.path.clone();
-        // Keyed by what the row is, not where: a row put above it while the menu is open (a
-        // count or a page landing) would give it another id, and the menu would close.
-        let key = row_key(entry);
+        let set = !read.filters(group).is_empty()
+            || read.sort(group).is_some()
+            || read.grouping(group).is_some();
+        let always = selected || set;
         let id = (
             if sticky {
-                "sticky-group-by"
+                "sticky-neighbour-card"
             } else {
-                "group-by"
+                "neighbour-card"
             },
-            key,
+            row,
         );
-        let tooltip = match &current {
-            Some(by) => format!("Grouped by {}", by.label()),
-            None => "Group by a property or a relationship".to_owned(),
-        };
-        let menu = PopoverMenu::new(SharedString::from(format!("{}-{key}", id.0)))
-            .trigger(
-                studio_ui::ds::row_icon_button(id, IconName::ListTree)
-                    .icon_color(Color::Muted)
-                    .toggle_state(current.is_some())
-                    .tip(studio_ui::ds::tooltip(tooltip)),
-            )
-            .anchor(gpui::Anchor::TopRight)
-            .menu(move |window, cx| {
-                // Built when the menu opens, not for every row drawn.
-                let sections = GroupBy::sections(&schema, &group);
-                let (exploration, group, path, current) = (
-                    exploration.clone(),
-                    group.clone(),
-                    path.clone(),
-                    current.clone(),
-                );
-                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                    // Choosing a property opens the group on its values.
-                    let set = |by: Option<GroupBy>| {
-                        let (exploration, group, path) =
-                            (exploration.clone(), group.clone(), path.clone());
-                        move |_: &mut Window, cx: &mut App| {
-                            exploration.update(cx, |e, cx| {
-                                let open = by.is_some();
-                                e.set_grouping(&group, by.clone(), cx);
-                                if open {
-                                    e.expand(&path, cx);
-                                }
-                            });
-                        }
-                    };
-                    menu = menu.toggleable_entry(
-                        "No grouping",
-                        current.is_none(),
-                        IconPosition::Start,
-                        None,
-                        set(None),
-                    );
-                    for (heading, section) in &sections {
-                        menu = menu.separator().header(heading.clone());
-                        for by in section {
-                            menu = menu.toggleable_entry(
-                                by.label(),
-                                current.as_ref() == Some(by),
-                                IconPosition::Start,
-                                None,
-                                set(Some(by.clone())),
-                            );
-                        }
-                    }
-                    menu
-                }))
-            });
         Some(
             div()
                 .flex_none()
                 .when(!always, |d| d.visible_on_hover("tree-row"))
-                .child(menu)
+                .child(neighbour_card::card_button(
+                    id,
+                    set,
+                    exploration.clone(),
+                    group.clone(),
+                    entry.path.clone(),
+                ))
                 .into_any_element(),
         )
     }
@@ -1930,13 +1832,15 @@ mod tests {
         }
     }
 
-    /// The group row's popover sets a relationship's filters from a property, a test and a
-    /// value, refuses an empty value, and takes a filter off again (spec 005).
+    /// The group row's card sets a relationship's filters from a property, a test and a value,
+    /// refuses an empty value, and takes a filter off again; it orders the neighbours, turns the
+    /// order around and stops; and an answer in words sets the filters and the order, saying
+    /// what it could not use (spec 005).
     #[gpui::test]
     async fn the_filter_popover_sets_and_removes_a_relationships_filters(
         cx: &mut gpui::TestAppContext,
     ) {
-        use crate::neighbour_filters::{NeighbourFilters, can_filter, filter_words};
+        use crate::neighbour_card::{NeighbourCard, can_open, filter_words};
         use gq_language::builder::{Filter, FilterOp};
         cx.update(|cx| {
             studio_theme::init_test(cx);
@@ -1956,9 +1860,9 @@ mod tests {
             direction: gq_language::Direction::Outgoing,
             other_type: "Person".into(),
         };
-        assert!(exploration.read_with(cx, |e, _| can_filter(e, &knows)));
+        assert!(exploration.read_with(cx, |e, _| can_open(e, &knows)));
         let (popover, cx) = cx.add_window_view(|window, cx| {
-            NeighbourFilters::new(exploration.clone(), knows.clone(), window, cx)
+            NeighbourCard::new(exploration.clone(), knows.clone(), None, window, cx)
         });
         cx.run_until_parked();
         popover.update_in(cx, |popover, window, cx| {
@@ -1985,6 +1889,45 @@ mod tests {
         assert_eq!(filter_words(&set[0]), "name is Bob");
         popover.update(cx, |popover, cx| popover.remove(0, cx));
         assert!(exploration.read_with(cx, |e, _| e.filters(&knows).is_empty()));
+        popover.update(cx, |popover, cx| {
+            popover.set_sort(Some("name".into()), cx);
+            popover.flip_sort(cx);
+        });
+        assert_eq!(
+            exploration.read_with(cx, |e, _| e.sort(&knows).cloned()),
+            Some(gq_language::builder::Sort {
+                property: "name".into(),
+                descending: true,
+            })
+        );
+        popover.update(cx, |popover, cx| popover.set_sort(None, cx));
+        assert!(exploration.read_with(cx, |e, _| e.sort(&knows).is_none()));
+        // An answer in words: a filter and an order the card offers, and a key it does not.
+        let answer: filter_words::Answer = serde_json::from_value(serde_json::json!({
+            "filters": [
+                { "property": "name", "op": "eq", "value": ["Ada"] },
+                { "property": "age", "op": "eq", "value": ["3"] }
+            ],
+            "predicate": null,
+            "sort": [{ "property": "name", "descending": false }],
+            "group_by": [],
+            "columns": []
+        }))
+        .unwrap();
+        let note = popover.update(cx, |popover, cx| {
+            let (choices, offered) = (popover.choices(), popover.offered());
+            popover.apply_answer(answer, &choices, &offered, cx)
+        });
+        let (filters, sort) = exploration.read_with(cx, |e, _| {
+            (e.filters(&knows).to_vec(), e.sort(&knows).cloned())
+        });
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filter_words(&filters[0]), "name is Ada");
+        assert_eq!(sort.map(|sort| sort.property), Some("name".into()));
+        assert!(
+            note.is_some_and(|note| note.contains("age")),
+            "the key it lacks is said"
+        );
     }
 
     /// A tab not drawn makes no rows at each answer; what it owes it makes when drawn. Two tabs on

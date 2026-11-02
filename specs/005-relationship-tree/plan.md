@@ -100,6 +100,22 @@ on the canvas. Typing filters the visible rows.
   read with the page's `page_degrees`), and grouped values and the "no value" bucket through the
   same clauses. A condition (`@where`) is not offered, since it names the table's row. Filters
   are not saved with the tab.
+- A relationship's card (since 2026-11-01, replacing the filter popover and the grouping
+  menu): one button on a group row opens a card, the design system's card in a popover, titled
+  with the relationship ("ChangeEvidence from Change"). Its rows are Group (the grouping menu,
+  as before), Sort and Filter (the filter draft and pills, as above); its grey footer is a
+  sentence field, as the type table's toolbar has (spec 019), sent as `table-filter` with the
+  other type's filterable properties, its sortable properties and the groupings offered, through
+  the shared `filter_words` crate. An answer replaces the relationship's filters and sets its
+  order and grouping when it names them; a key or a condition it cannot use is said under the
+  field. The button is lit while any of the three is set.
+- Sorting a relationship's neighbours (since 2026-11-01): by a property of the other type
+  (`Sort::allowed`), either way, wherever the relationship appears. Its pages are read in that
+  order, the neighbours with a value first by (value, id), keyset-paged as the table pages a
+  sort (`builder::neighbours` with `Narrow::sort`, `PageStart`), then those without one by id;
+  a page short in the run with values moves on to the run without, from its start. Sorting
+  again lets go of the pages only: counts and grouped values hold. The order is not saved with
+  the tab, as the filters are not.
 - The whole tree reads one commit; when the session sees the branch's head elsewhere (spec 003:
   Studio's commit, or another writer's at the next poll), "Newer data · Refresh" appears. It is
   read and flattened under one schema too, the one its reads were made under: another writer's
@@ -170,6 +186,7 @@ on the canvas. Typing filters the visible rows.
 | 2026-11-01 | A relationship's neighbours are filtered by a property wherever it appears, in counts, pages and values | `gq_language` `neighbour_reads_take_filters_on_the_neighbours`; `graph_store` `filters_on_a_relationship_read_its_count_and_page_again`; `relationship_tree` `the_filter_popover_sets_and_removes_a_relationships_filters` | Pass. Offscreen snapshot of a Tree on the dev graph with a filter set on one relationship |
 | 2026-11-01 | A tree holds a set of nodes as well as one | `relationship_tree` `a_set_opens_closed_and_canvas_takes_the_selected_node`; `graph_store` `a_set_is_paged_and_its_rows_open_on_their_own`; an offscreen snapshot | Spec 020. A table's rows open as closed rows, read a page at a time; a closed row reads nothing |
 | 2026-11-01 | The tree is a tab, one per root and commit | `relationship_tree` `a_hidden_tree_makes_no_rows_and_a_walk_is_shared_by_root_and_commit`; `graph_store` `a_held_walk_stays_at_its_commit`; an offscreen snapshot beside a table | Spec 020 moves it from the left dock. Re-rooting opens a tab, and Back replaces the breadcrumb |
+| 2026-11-01 | A relationship's card groups, orders and filters its neighbours, and takes a sentence for all three | `gq_language` `neighbour_pages_order_by_a_property`; `graph_store` `a_sorted_relationship_pages_its_values_then_the_rest`; `relationship_tree` `the_filter_popover_sets_and_removes_a_relationships_filters` (sort, flip, an answer with a key the type lacks); offscreen snapshot of the card on the law graph's Source tree | Every sorted page compiles; the card's rows start on one edge and its footer is the grey band. The model call itself was not made: no key in the snapshot run |
 | 2026-10-22 | Reads left by a read ahead take no answer's place in the memo | `graph_store` `memo::a_read_nobody_waits_for_goes_before_any_answer` (spec 015) | Five reads each left as the next started kept a 2-entry memo's answer, one read held at the end. Before, each stayed until the entry cap let it go after every answer |
 | 2026-10-21 | A read out when the pin moved past a commit that changed nothing it reads stands | `graph_store` `an_answer_at_a_commit_the_pin_was_carried_past_stands` (root at c1; another writer changes a Company at c2, so the pin moves to c2; a page and a count answered at c1, sent at c1; a page answered at c9, sent at c1) | The c1 page shows its neighbour and the c1 count 5, with the pin at c2; the c9 answer fails. Before, `pinned_at` refused every answer not at the current pin, so a slow group expanded before another writer's unrelated commit showed "The server answered at commit c1, not at c2" until Retry |
 | 2026-10-21 | A new token reads what the tree shows again | `graph_store` `a_new_token_reads_what_the_exploration_shows_again` (a server answering the root by token: the old one sees Ada, the new one nothing; `Connection::set_token`) | At once the label Ada is gone and the root is not loaded; then one node read goes under the new token and the root reads "No Person with key ada at this commit.", the pin still c1. Before, the exploration had no arm for `SessionEvent::CredentialChanged`: what the old token read stayed beside what the new one read |

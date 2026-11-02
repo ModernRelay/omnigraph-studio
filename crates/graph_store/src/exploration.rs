@@ -23,7 +23,7 @@ use gpui::{
     App, AppContext as _, Context, Entity, EntityId, EventEmitter, Global, Subscription, Task,
     WeakEntity,
 };
-use gq_language::builder::{Filter, GroupBy, GroupOn, Narrow, PageStart};
+use gq_language::builder::{Filter, GroupBy, GroupOn, Narrow, PageStart, Sort};
 use gq_language::{BuiltQuery, Direction, RelationshipGroup, SchemaModel, builder};
 use graph_client::ReadError;
 use graph_client::api::ReadOutput;
@@ -280,6 +280,9 @@ pub struct NeighbourList {
     pub exhausted: bool,
     /// The size of the page last asked for, so a short page is recognised.
     pub page_size: u32,
+    /// Where the next page starts when the relationship is sorted ([`ExploreState::sorts`]):
+    /// none for the first.
+    pub start: Option<PageStart>,
 }
 
 impl NeighbourList {
@@ -435,6 +438,9 @@ pub struct ExploreState {
     /// The filters each relationship's neighbours are read under, wherever it appears (spec
     /// 005, "Filtering a relationship's neighbours"): its counts, pages and values all narrow.
     pub filters: HashMap<RelationshipGroup, Vec<Filter>>,
+    /// The order of each relationship's neighbours, wherever it appears (spec 005, "Sorting a
+    /// relationship's neighbours"); none reads them by id.
+    pub sorts: HashMap<RelationshipGroup, Sort>,
     pub values: HashMap<(GroupKey, GroupBy), Loadable<Buckets>>,
     pub selection: Option<ExplorePath>,
     /// The rows of a tree holding a set; none for a walk from one node.
@@ -453,6 +459,7 @@ impl Default for ExploreState {
             searches: HashMap::new(),
             grouping: HashMap::new(),
             filters: HashMap::new(),
+            sorts: HashMap::new(),
             values: HashMap::new(),
             selection: None,
             set: None,
@@ -587,6 +594,16 @@ impl ExploreState {
     /// The filters a relationship's neighbours are read under.
     pub fn filters_of(&self, group: &RelationshipGroup) -> &[Filter] {
         self.filters.get(group).map_or(&[], Vec::as_slice)
+    }
+
+    /// Orders a relationship's neighbours wherever it appears, or stops: its pages go, to be
+    /// read again in the order; its counts and grouped values hold.
+    pub fn set_sort(&mut self, group: &RelationshipGroup, sort: Option<Sort>) {
+        match sort {
+            Some(sort) => self.sorts.insert(group.clone(), sort),
+            None => self.sorts.remove(group),
+        };
+        self.neighbours.retain(|key, _| key.group != *group);
     }
 
     /// Expands a node or group path. A group known to be empty stays closed.
@@ -1374,8 +1391,35 @@ impl ExploreState {
             self.labels
                 .insert(neighbour.node.clone(), neighbour.label.clone());
         }
+        let sorted = self.sorts.contains_key(&key.group);
+        // The value the last row is ordered by, for where the next page starts.
+        let last_value = rows(output)
+            .last()
+            .map(|row| row.get("sort_value").cloned().unwrap_or(Value::Null));
         let list = self.neighbours.entry(key).or_default();
-        list.exhausted = (page.len() as u32) < page_size;
+        let short = (page.len() as u32) < page_size;
+        if sorted {
+            let in_nulls = matches!(list.start, Some(PageStart::Nulls { .. }));
+            // The run with values ended: the rows without one come next, from their start.
+            list.exhausted = short && in_nulls;
+            list.start = match (short, page.last(), last_value) {
+                (true, _, _) if !in_nulls => Some(PageStart::Nulls {
+                    after: String::new(),
+                }),
+                (false, Some(last), Some(value)) if !in_nulls && !value.is_null() => {
+                    Some(PageStart::After {
+                        id: last.node.id.clone(),
+                        value,
+                    })
+                }
+                (_, Some(last), _) => Some(PageStart::Nulls {
+                    after: last.node.id.clone(),
+                }),
+                (_, None, _) => list.start.take(),
+            };
+        } else {
+            list.exhausted = short;
+        }
         // Parallel edges to one neighbour show as one row, with the first edge's properties,
         // so every path in the tree stays unique.
         let mut shown: HashSet<NodeRef> = list.rows.iter().map(|row| row.node.clone()).collect();
@@ -1750,6 +1794,7 @@ impl Exploration {
         // appears, as Refresh keeps it.
         let grouping = std::mem::take(&mut self.state.grouping);
         let filters = std::mem::take(&mut self.state.filters);
+        let sorts = std::mem::take(&mut self.state.sorts);
         // A set stays the set: its rows are read again, with nothing open.
         *self.state = match self.state.set.take() {
             Some(set) => ExploreState::of_set(set),
@@ -1757,6 +1802,7 @@ impl Exploration {
         };
         self.state.grouping = grouping;
         self.state.filters = filters;
+        self.state.sorts = sorts;
         if self.held.is_none() {
             self.state.forget_set_total();
         }
@@ -1833,6 +1879,30 @@ impl Exploration {
         self.state.set_filters(group, filters);
         self.tasks
             .retain(|target, _| target.group().is_none_or(|g| g != group));
+        self.request_missing(cx);
+        self.changed(cx);
+    }
+
+    /// The order a relationship's neighbours are read in, wherever it appears; none is by id.
+    pub fn sort(&self, group: &RelationshipGroup) -> Option<&Sort> {
+        self.state.sorts.get(group)
+    }
+
+    /// Orders a relationship's neighbours by a property of theirs wherever it appears in this
+    /// exploration, or stops (spec 005, "Sorting a relationship's neighbours"): its pages are
+    /// read again in the order, reads out for them dropped.
+    pub fn set_sort(
+        &mut self,
+        group: &RelationshipGroup,
+        sort: Option<Sort>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.sorts.get(group) == sort.as_ref() {
+            return;
+        }
+        self.state.set_sort(group, sort);
+        self.tasks
+            .retain(|target, _| !matches!(target, LoadTarget::Page(key) if key.group == *group));
         self.request_missing(cx);
         self.changed(cx);
     }
@@ -2254,6 +2324,13 @@ impl Exploration {
                     .get(key)
                     .and_then(NeighbourList::next_after);
                 let value = key.within.as_ref().map(|within| within.value.value());
+                let start = self
+                    .state
+                    .neighbours
+                    .get(key)
+                    .and_then(|list| list.start.clone())
+                    .unwrap_or(PageStart::First);
+                let sort = self.state.sorts.get(&key.group);
                 let narrow = Narrow {
                     search,
                     value: key
@@ -2262,6 +2339,7 @@ impl Exploration {
                         .zip(value.as_ref())
                         .map(|(within, value)| (&within.by, value)),
                     filters: self.state.filters_of(&key.group),
+                    sort: sort.map(|sort| (sort, &start)),
                 };
                 builder::neighbours(
                     &schema,
@@ -2820,6 +2898,71 @@ mod tests {
             state.path_of(&schema, &person("cy")),
             Some(knows_path.child_node(&person("cy")))
         );
+    }
+
+    /// A sorted relationship pages its neighbours with a value after the last value and id,
+    /// moves to those without one when that run ends short, and ends when they do; sorting
+    /// again drops the pages read in the old order and keeps the count (spec 005).
+    #[test]
+    fn a_sorted_relationship_pages_its_values_then_the_rest() {
+        let schema = schema();
+        let mut state = loaded_root(&schema);
+        let knows = group(&schema, "Person", "Knows", Direction::Outgoing);
+        let key = GroupKey::new(person("ada"), knows.clone());
+        state.set_sort(
+            &knows,
+            Some(Sort {
+                property: "name".into(),
+                descending: false,
+            }),
+        );
+        state.apply_count(key.clone(), 5);
+        let columns = ["id", "sort_value"];
+        state.apply_page(
+            key.clone(),
+            &output(
+                &columns,
+                json!([{"id": "p2", "sort_value": "Ada"}, {"id": "p1", "sort_value": "Bea"}]),
+            ),
+            2,
+        );
+        let list = &state.neighbours[&key];
+        assert_eq!(
+            list.start,
+            Some(PageStart::After {
+                id: "p1".into(),
+                value: json!("Bea"),
+            })
+        );
+        assert!(!list.exhausted);
+        // The run with values ends short: the rest come from their start.
+        state.apply_page(
+            key.clone(),
+            &output(&columns, json!([{"id": "p5", "sort_value": "Cy"}])),
+            2,
+        );
+        let list = &state.neighbours[&key];
+        assert_eq!(
+            list.start,
+            Some(PageStart::Nulls {
+                after: String::new()
+            })
+        );
+        assert!(
+            !list.exhausted,
+            "the neighbours without a name are still to come"
+        );
+        state.apply_page(
+            key.clone(),
+            &output(&columns, json!([{"id": "p3", "sort_value": null}])),
+            2,
+        );
+        let list = &state.neighbours[&key];
+        assert!(list.exhausted);
+        assert_eq!(list.rows.len(), 4);
+        state.set_sort(&knows, None);
+        assert!(!state.neighbours.contains_key(&key), "read again by id");
+        assert!(state.counts.contains_key(&key), "the count holds");
     }
 
     #[test]

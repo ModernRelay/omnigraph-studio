@@ -1974,6 +1974,11 @@ pub struct Narrow<'a> {
     /// Filters on the neighbours themselves (spec 005, "Filtering a relationship's
     /// neighbours"): a property of the other type, or one of its relationships.
     pub filters: &'a [Filter],
+    /// An order of the neighbours by a property of the other type, and where its page starts
+    /// (spec 005, "Sorting a relationship's neighbours"): the neighbours with a value in that
+    /// order, then those without one by id, as the table pages a sort ([`PageStart`]). The
+    /// `after` a page is asked with is then not read.
+    pub sort: Option<(&'a Sort, &'a PageStart)>,
 }
 
 /// Where a page of neighbours starts: after a neighbour and every edge to it, as the tree reads
@@ -2022,10 +2027,11 @@ pub fn neighbours_without_properties(
         .edge(&group.edge)
         .ok_or_else(|| BuildError::UnknownEdge(group.edge.clone()))?;
     let other = self::node(schema, &group.other_type)?;
-    // A narrowed list depends on what the neighbours hold too.
+    // A narrowed or ordered list depends on what the neighbours hold too.
     let depends = if narrow.search.is_none_or(str::is_empty)
         && narrow.value.is_none()
         && narrow.filters.is_empty()
+        && narrow.sort.is_none()
     {
         Depends::EdgesAt {
             edge: group.edge.clone(),
@@ -2042,8 +2048,24 @@ pub fn neighbours_without_properties(
     };
     let mut params = Params::new();
     let id = params.add("id", "String", Value::String(id.to_owned()));
+    // A sorted page starts where its keyset says, and orders by the property, then the
+    // neighbour and the edge.
+    let sorted = match narrow.sort {
+        Some((sort, start)) => {
+            let (clauses, order) = keyset(
+                "m",
+                &other.name,
+                &other.properties,
+                Some(sort),
+                start,
+                &mut params,
+            )?;
+            Some((clauses, order, sort.property.clone()))
+        }
+        None => None,
+    };
     // The first page names no neighbour to come after ([`id_after`]).
-    let after = after.map(|after| match after {
+    let after = after.filter(|_| sorted.is_none()).map(|after| match after {
         After::Neighbour(neighbour) => id_after("m", neighbour, &mut params),
         After::Edge { neighbour, edge } => {
             let after = params.add("after", "String", Value::String(neighbour.to_owned()));
@@ -2070,9 +2092,16 @@ pub fn neighbours_without_properties(
             edge_property_column(&property.name)
         ));
     }
+    // A sorted page names the value it is ordered by, so the next page starts after it.
+    if let Some((_, _, property)) = &sorted {
+        columns.push(format!("$m.{property} as sort_value"));
+    }
     let mut extra = after
         .map(|after| format!("\n    {after}"))
         .unwrap_or_default();
+    for clause in sorted.iter().flat_map(|(clauses, _, _)| clauses) {
+        extra.push_str(&format!("\n    {clause}"));
+    }
     // A search narrows the neighbours to ids starting with, or labels containing, the text.
     if let Some(text) = narrow.search.filter(|text| !text.is_empty()) {
         let label = other
@@ -2111,8 +2140,12 @@ pub fn neighbours_without_properties(
     for clause in neighbour_filter_clauses(schema, other, narrow.filters, &mut params)? {
         extra.push_str(&format!("\n    {clause}"));
     }
+    let order = match &sorted {
+        Some((_, order, _)) => format!("{order}, $e.@id asc"),
+        None => "$m.@id asc, $e.@id asc".to_owned(),
+    };
     let text = format!(
-        "query studio_neighbours({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id}\n    {traversal}{extra}\n  }}\n  return {{ {columns} }}\n  order {{ $m.@id asc, $e.@id asc }}\n  limit {limit}\n}}\n",
+        "query studio_neighbours({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id}\n    {traversal}{extra}\n  }}\n  return {{ {columns} }}\n  order {{ {order} }}\n  limit {limit}\n}}\n",
         sig = params.signature(),
         ty = node.name,
         traversal = traversal_clause(group, Some("e")),
@@ -2884,6 +2917,58 @@ mod tests {
     use crate::check::check;
     use crate::schema::tests::dev;
 
+    /// A relationship's neighbours ordered by a property of theirs (spec 005): the first page
+    /// those with a value, by it then by id; a later page after the last value and id; then
+    /// those without one, by id. Each compiles, and names the value it is ordered by.
+    #[test]
+    fn neighbour_pages_order_by_a_property() {
+        let schema = dev();
+        let works_at = schema
+            .relationships_of("Person")
+            .iter()
+            .find(|g| g.edge == "WorksAt" && g.direction == Direction::Outgoing)
+            .cloned()
+            .expect("Person works at a Company");
+        let sort = Sort {
+            property: "city".into(),
+            descending: true,
+        };
+        let page = |start: &PageStart| {
+            let narrow = Narrow {
+                sort: Some((&sort, start)),
+                ..Narrow::default()
+            };
+            neighbours(&schema, "Person", &works_at, "x", None, narrow, 50).unwrap()
+        };
+        let first = page(&PageStart::First);
+        assert!(first.text.contains("$m.city is not null"), "{}", first.text);
+        assert!(
+            first
+                .text
+                .contains("order { $m.city desc, $m.@id asc, $e.@id asc }"),
+            "{}",
+            first.text
+        );
+        assert!(first.text.contains("$m.city as sort_value"));
+        assert_compiles(&first);
+        let next = page(&PageStart::After {
+            id: "c1".into(),
+            value: json!("Paris"),
+        });
+        assert!(
+            next.text.contains("$m.city < $after_value"),
+            "{}",
+            next.text
+        );
+        assert_compiles(&next);
+        let nulls = page(&PageStart::Nulls {
+            after: String::new(),
+        });
+        assert!(nulls.text.contains("$m.city is null"), "{}", nulls.text);
+        assert!(nulls.text.contains("order { $m.@id asc, $e.@id asc }"));
+        assert_compiles(&nulls);
+    }
+
     /// A relationship's neighbours read under filters on the neighbours' own properties: the
     /// page, the count, the grouped values and the "no value" bucket all narrow on `$m`, and a
     /// condition, which names the table's row, is refused (spec 005).
@@ -2905,6 +2990,7 @@ mod tests {
             search: None,
             value: None,
             filters: &filters,
+            sort: None,
         };
         let page = neighbours(&schema, "Person", &works_at, "x", None, narrow, 50).unwrap();
         assert!(page.text.contains("$m.city = $f0"), "{}", page.text);
@@ -4154,6 +4240,7 @@ mod tests {
                 search: Some("ada"),
                 value: None,
                 filters: &[],
+                sort: None,
             };
             assert_compiles(
                 &neighbours(&schema, "Company", group, "company-00000", None, search, 50).unwrap(),
@@ -4182,6 +4269,7 @@ mod tests {
                             search: Some("a"),
                             value: Some((&by, &value)),
                             filters: &[],
+                            sort: None,
                         };
                         let page =
                             neighbours(&schema, node_type, group, "x", None, narrow, 50).unwrap();
