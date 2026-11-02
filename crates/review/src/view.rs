@@ -491,8 +491,8 @@ pub struct ReviewView {
     /// Names of the nodes the review knows only by id, read at the reviewed head after it
     /// loads; until then, and for a node without a name, its id shows.
     names: NodeNames,
-    /// The head whose names `names` hold, once a read of them there landed: a review read at
-    /// another head reads them again.
+    /// The head whose names `names` hold, once a read of them there was answered in full: a
+    /// review read at another head reads them again, and one whose read failed reads it again.
     names_at: Option<String>,
     /// How many relationship lines each card shows.
     card_lines: CardLines,
@@ -1143,12 +1143,16 @@ impl ReviewView {
             session.node_names(missing, head.clone(), cx)
         });
         self._names_task = Some(cx.spawn(async move |this, cx| {
-            let names = names.await;
+            let (names, answered) = names.await;
             this.update(cx, |this, cx| {
                 if let Some(shown) = shown {
                     this.names.retain(|end, _| shown.contains(end));
                 }
-                this.names_at = head;
+                // A read that failed leaves the names it would have replaced shown, and is read
+                // again at the next ask, rather than taken as the head's.
+                if answered {
+                    this.names_at = head;
+                }
                 this.names.extend(names);
                 cx.notify();
             })
@@ -6164,8 +6168,8 @@ pub(crate) mod tests {
 
     /// A name read for a node the review knows only by id is kept while the review is read at
     /// the same head, and read again at another, a merge into the branch having perhaps renamed
-    /// it; the name shown stays until the new one replaces it. Before, a name once read stood for
-    /// the life of the tab.
+    /// it; the name shown stays until the new one replaces it, and a read that failed is read
+    /// again at the next ask. Before, a name once read stood for the life of the tab.
     #[gpui::test]
     async fn names_are_read_again_at_a_new_head(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
@@ -6200,9 +6204,14 @@ pub(crate) mod tests {
             assert!(view._names_task.is_some(), "still read at the new head");
         });
         cx.run_until_parked();
-        view.read_with(cx, |view, _| {
-            assert_eq!(view.names_at.as_deref(), Some("f3"));
+        // The server refuses the read: the names stay shown, those of nodes no longer shown go,
+        // and the head is not taken as read, so the next ask reads again.
+        view.update(cx, |view, cx| {
+            assert_eq!(view.names_at.as_deref(), Some("f2"));
+            assert_eq!(view.names.get(&end).map(String::as_str), Some("Ada"));
             assert!(!view.names.contains_key(&gone), "a node no longer shown");
+            view.read_names(vec![end.clone()], Some("f3".into()), cx);
+            assert!(view._names_task.is_some(), "read again after the failure");
         });
     }
 

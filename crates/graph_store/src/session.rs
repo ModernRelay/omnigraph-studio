@@ -3122,15 +3122,16 @@ impl GraphSession {
     /// `snapshot` (the session's branch when `None`): one read per type of at most
     /// [`NAME_BATCH`] ids, the first [`NAME_LIMIT`] ends only. A node whose label is its key, or
     /// that a read did not find, is left out, and so is every node of a read that failed: a
-    /// name only replaces an id its caller already shows.
+    /// name only replaces an id its caller already shows. With them, whether every read
+    /// answered, so a caller can read the names a failed read left out again.
     pub fn node_names(
         &mut self,
         ends: Vec<(String, String)>,
         snapshot: Option<String>,
         cx: &mut Context<Self>,
-    ) -> Task<crate::NodeNames> {
+    ) -> Task<(crate::NodeNames, bool)> {
         let Some(schema) = self.schema_model() else {
-            return Task::ready(crate::NodeNames::default());
+            return Task::ready((crate::NodeNames::default(), false));
         };
         let mut by_type: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (type_name, id) in ends.into_iter().take(NAME_LIMIT) {
@@ -3146,8 +3147,12 @@ impl GraphSession {
         }
         cx.spawn(async move |_, _| {
             let mut names = crate::NodeNames::default();
+            let mut answered = true;
             for (type_name, read) in reads {
-                let Ok(output) = read.await else { continue };
+                let Ok(output) = read.await else {
+                    answered = false;
+                    continue;
+                };
                 for row in output.rows.as_array().into_iter().flatten() {
                     if let (Some(id), Some(label)) = (
                         row.get("id").and_then(Value::as_str),
@@ -3158,7 +3163,7 @@ impl GraphSession {
                     }
                 }
             }
-            names
+            (names, answered)
         })
     }
 
