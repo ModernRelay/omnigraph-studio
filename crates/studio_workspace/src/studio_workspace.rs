@@ -4122,9 +4122,11 @@ impl Workspace {
         let readout = item.is_some() || performance.is_some();
         // Zed's 4 px between the left side's items, which are chips with padding of their own;
         // the right side's are bare text, so they keep 8 px, and a rule sets the window's
-        // readout apart from the tab's facts.
+        // readout apart from the tab's facts. Bare text also needs more room at the bar's end
+        // than a chip, which pads itself: 4 px more, so the readout ends 8 px in.
         let right = h_flex()
             .flex_none()
+            .pr(px(studio_ui::ds::space::XS))
             .gap(px(studio_ui::ds::space::MD))
             .items_center()
             .children(running.map(|text| {
