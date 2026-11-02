@@ -593,6 +593,10 @@ impl NodePeek {
                 cx.notify();
                 return;
             }
+            if let SessionEvent::CredentialChanged = event {
+                this.credential_changed(cx);
+                return;
+            }
             // A view made before the schema was read (a page restored at start) reads its node
             // once the schema is in.
             if let SessionEvent::SchemaChanged = event
@@ -860,7 +864,31 @@ impl NodePeek {
         self.newer = false;
         self.snapshot = None;
         self.blobs_at = BlobsAt::Pin;
-        // What the table read belongs to the old commit.
+        // What was read, the table's reads of the node included, belongs to the old commit.
+        self.forget_read(cx);
+        // What it showed is let go; what it reads now is told again, under the new schema too.
+        if let Some(scope) = &self.scope {
+            self.session.update(cx, |session, _| {
+                let branch = session.branch.clone();
+                session.reset_scope(scope, &branch);
+            });
+        }
+    }
+
+    /// The connection's token changed ([`SessionEvent::CredentialChanged`]): the new one may
+    /// see less than the old, so nothing the old one read stays shown (the node, its
+    /// relationships, its Blob values and what the table read of it) and the reads still out
+    /// go. The node is read again under the new token at the commit the view shows when it is
+    /// next drawn, and a refusal shows as the view's error. Open fields and drafts are the
+    /// person's, and stay; a write still out goes on.
+    fn credential_changed(&mut self, cx: &mut Context<Self>) {
+        self.forget_read(cx);
+        self.owe_node(cx);
+    }
+
+    /// Lets go of what was read of the node: what the table read, the relationships, and the
+    /// Blob values shown, with the reads still out for them.
+    fn forget_read(&mut self, cx: &mut Context<Self>) {
         self.known.clear();
         self.groups.clear();
         self.absent.clear();
@@ -878,13 +906,6 @@ impl NodePeek {
             slot.head.clear();
             slot.bytes_at = None;
             slot._task = None;
-        }
-        // What it showed is let go; what it reads now is told again, under the new schema too.
-        if let Some(scope) = &self.scope {
-            self.session.update(cx, |session, _| {
-                let branch = session.branch.clone();
-                session.reset_scope(scope, &branch);
-            });
         }
     }
 
@@ -7739,6 +7760,67 @@ mod tests {
             .flatten()
             .and_then(|values| values.get("name").cloned());
         assert_eq!(name, Some(json!("Ada B")), "what the newer read found");
+    }
+
+    /// Another token on the connection: the node the old one read goes, and the page reads it
+    /// again under the new one at the commit it shows. Before, the old token's values stayed.
+    #[gpui::test]
+    async fn a_new_token_reads_the_node_again_at_the_commit_shown(cx: &mut TestAppContext) {
+        let (session, asked) = session_routing(
+            PEOPLE,
+            |request| match request["token"].as_str() {
+                Some("denied") => json!({ "refuse": "not for this credential", "forbidden": true }),
+                token => json!([{ "n": {
+                    "@id": "p1", "slug": "p1",
+                    "name": format!("read with {}", token.unwrap_or_default()),
+                } }]),
+            },
+            cx,
+        );
+        session.update(cx, |session, cx| session.set_shown(true, cx));
+        let (view, cx) = page(session.clone(), cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.value_of("name"), json!("read with t"));
+            assert_eq!(view.snapshot.as_deref(), Some("c1"));
+        });
+        let reads = asked.lock().unwrap().len();
+        let connection = session.read_with(cx, |session, _| session.connection.clone());
+        connection.update(cx, |connection, cx| {
+            connection.set_token(Some("b".into()), cx)
+        });
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.value_of("name"), json!("read with b"));
+            assert_eq!(
+                view.snapshot.as_deref(),
+                Some("c1"),
+                "at the commit it showed"
+            );
+        });
+        assert!(
+            asked.lock().unwrap()[reads..]
+                .iter()
+                .any(|name| name == "studio_node"),
+            "read again"
+        );
+
+        // A token refused the node: the page says so, and shows none of the old one.
+        connection.update(cx, |connection, cx| {
+            connection.set_token(Some("denied".into()), cx)
+        });
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.value_of("name"), Value::Null);
+            assert!(
+                matches!(&view.values, Loadable::Failed(why) if why.contains("not for this credential")),
+                "{:?}",
+                view.values
+            );
+        });
     }
 
     /// ↵ on a field typed back to the value its draft was typed over lets the draft go, and
