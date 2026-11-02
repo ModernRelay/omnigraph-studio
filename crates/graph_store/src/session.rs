@@ -18,7 +18,7 @@ use graph_client::api::{
     AccessAction, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchMergeOutput,
     BranchMergeRequest, ChangeFeedOutput, ChangeOutput, ChangeRequest, CommitKind, CommitOutput,
     DiffOutput, EntityKind, InvokeStoredQueryRequest, MergeBaseOutput, QueryCatalogEntry,
-    QueryRequest, ReadOutput, ReadTargetOutput, SnapshotOutput,
+    QueryRequest, ReadOutput, ReadTargetOutput,
 };
 use graph_client::{
     ApiErrorSummary, BlobAt, BlobCell, BlobMeta, CommitChanges, FeedAt, GraphClient, ReadError,
@@ -642,16 +642,14 @@ pub struct GraphSession {
     server_key: String,
     pub schema: Loadable<Arc<SchemaModel>>,
     pub branches: Loadable<Vec<String>>,
-    /// The branch's storage snapshot the counts were read from: its tables, versions and row
-    /// counts, at `counts_version`. The storage inspector shows it after a branch change.
-    pub snapshot: Loadable<Arc<SnapshotOutput>>,
+    /// Each type's row count at the branch head, by kind and type (a node type and an edge type
+    /// may share a name), from the branch's storage snapshot at `counts_version`: the sidebar
+    /// asks for every type each frame. A refresh keeps them while it reads.
+    pub counts: Loadable<HashMap<(EntityKind, String), i64>>,
     /// Why the last refresh of the counts failed, while the counts held stay the last ones
     /// read ([`Self::counts_stale`]); the next head check reads them again.
     counts_stale: Option<String>,
-    /// Each type's row count from `snapshot`, by kind and type (a node type and an edge type
-    /// may share a name): the sidebar asks for every type each frame.
-    dataset_counts: HashMap<(EntityKind, String), i64>,
-    /// The `__manifest` version of the snapshot `dataset_counts` came from (its
+    /// The `__manifest` version of the snapshot the counts came from (its
     /// `graph_manifest_version`), held and let go with them.
     counts_version: Option<u64>,
     /// The commit the counts are for ([`Self::counts_commit`]): the branch's newest commit, once
@@ -871,9 +869,8 @@ impl GraphSession {
             server_key,
             schema: Loadable::NotLoaded,
             branches: Loadable::NotLoaded,
-            snapshot: Loadable::NotLoaded,
+            counts: Loadable::NotLoaded,
             counts_stale: None,
-            dataset_counts: HashMap::new(),
             counts_version: None,
             counts_commit: None,
             _counts_commit_task: None,
@@ -1141,8 +1138,8 @@ impl GraphSession {
             }
             self.read_branches(None, cx);
         } else {
-            self.snapshot = Loadable::Loading;
             self.clear_counts();
+            self.counts = Loadable::Loading;
             if self.stored_queries_wanted {
                 self.stored_queries = Loadable::Loading;
             }
@@ -1769,15 +1766,15 @@ impl GraphSession {
     }
 
     fn reload_counts(&mut self, cx: &mut Context<Self>) {
-        self.snapshot = Loadable::Loading;
         self.clear_counts();
+        self.counts = Loadable::Loading;
         self.read_counts(cx);
     }
 
     /// Lets go of the type counts, with the snapshot version they came from and their commit,
     /// and of a read of that commit under way: it would name the commit of counts not held.
     fn clear_counts(&mut self) {
-        self.dataset_counts.clear();
+        self.counts = Loadable::NotLoaded;
         self.counts_stale = None;
         self.counts_version = None;
         self.counts_commit = None;
@@ -1793,7 +1790,7 @@ impl GraphSession {
     fn refresh_counts(&mut self, cx: &mut Context<Self>) {
         if self.counts_reading {
             self.counts_again = true;
-        } else if matches!(self.snapshot, Loadable::Loaded(_)) {
+        } else if matches!(self.counts, Loadable::Loaded(_)) {
             self.read_counts(cx);
         } else {
             self.reload_counts(cx);
@@ -1817,31 +1814,32 @@ impl GraphSession {
                 this.counts_reading = false;
                 match read {
                     Ok(output) => {
-                        this.dataset_counts = output
-                            .datasets
-                            .iter()
-                            .map(|dataset| {
-                                let key = (dataset.entity_kind, dataset.type_name.clone());
-                                (key, dataset.entity_count)
-                            })
-                            .collect();
+                        this.counts = Loadable::Loaded(
+                            output
+                                .datasets
+                                .into_iter()
+                                .map(|dataset| {
+                                    let key = (dataset.entity_kind, dataset.type_name);
+                                    (key, dataset.entity_count)
+                                })
+                                .collect(),
+                        );
                         this.counts_stale = None;
                         let version = output.graph_manifest_version;
-                        this.snapshot = Loadable::Loaded(Arc::new(output));
                         this.find_counts_commit(branch, version, cx);
                         cx.emit(SessionEvent::CountsChanged);
                         cx.notify();
                     }
                     // A refresh: the counts held are the branch's last read, and say so until
                     // the next head check reads them again.
-                    Err(error) if matches!(this.snapshot, Loadable::Loaded(_)) => {
+                    Err(error) if matches!(this.counts, Loadable::Loaded(_)) => {
                         this.counts_stale = Some(error.to_string());
                         cx.emit(SessionEvent::CountsChanged);
                         cx.notify();
                     }
                     Err(error) => {
                         this.clear_counts();
-                        this.snapshot = Loadable::Failed(error.to_string());
+                        this.counts = Loadable::Failed(error.to_string());
                         cx.emit(SessionEvent::CountsChanged);
                         cx.notify();
                     }
@@ -1911,7 +1909,8 @@ impl GraphSession {
 
     /// The row count of a node or edge type at the branch head, from the snapshot.
     pub fn count_of(&self, kind: EntityKind, type_name: &str) -> Option<i64> {
-        self.dataset_counts
+        self.counts
+            .loaded()?
             .get(&(kind, type_name.to_owned()))
             .copied()
     }
@@ -2574,7 +2573,7 @@ impl GraphSession {
             self.reload_branches(cx);
         }
         // Counts still shown stay shown while they are read again, as a head move reads them.
-        if matches!(self.snapshot, Loadable::Failed(_)) || self.counts_stale.is_some() {
+        if matches!(self.counts, Loadable::Failed(_)) || self.counts_stale.is_some() {
             self.refresh_counts(cx);
         }
         if self.stored_queries_wanted && matches!(self.stored_queries, Loadable::Failed(_)) {
@@ -4953,10 +4952,7 @@ mod tests {
         });
         cx.run_until_parked();
         session.read_with(cx, |session, _| {
-            assert!(
-                matches!(session.snapshot, Loadable::Loaded(_)),
-                "still shown"
-            );
+            assert!(matches!(session.counts, Loadable::Loaded(_)), "still shown");
         });
         assert_eq!(snapshots.load(Ordering::SeqCst), read + 1);
 
@@ -4996,7 +4992,7 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(snapshots.load(Ordering::SeqCst), before + 3);
         session.read_with(cx, |session, _| {
-            assert!(matches!(session.snapshot, Loadable::Loaded(_)));
+            assert!(matches!(session.counts, Loadable::Loaded(_)));
             assert_eq!(session.count_of(EntityKind::Node, "Person"), Some(3));
             assert!(
                 session.counts_stale().is_some(),

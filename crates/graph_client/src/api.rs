@@ -21,23 +21,6 @@ pub struct HealthOutput {
     pub source_version: Option<String>,
 }
 
-/// `GET /readyz`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ReadinessOutput {
-    pub ready: bool,
-    pub status: String,
-    pub state_revision: i64,
-    pub served_graph_count: i64,
-    pub ready_graph_count: i64,
-    pub loading_graph_count: i64,
-    pub blocked_graph_count: i64,
-    pub shutdown_grace_seconds: i64,
-    #[serde(default)]
-    pub state_cas: Option<String>,
-    #[serde(default)]
-    pub booted_serving_digest: Option<String>,
-}
-
 /// `GET /graphs`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GraphListResponse {
@@ -905,21 +888,6 @@ mod contract_tests {
                 "version",
                 "internal_schema_version",
                 "source_version",
-            ],
-        ),
-        (
-            "ReadinessOutput",
-            &[
-                "ready",
-                "status",
-                "state_revision",
-                "served_graph_count",
-                "ready_graph_count",
-                "loading_graph_count",
-                "blocked_graph_count",
-                "shutdown_grace_seconds",
-                "state_cas",
-                "booted_serving_digest",
             ],
         ),
         ("GraphListOutput", &["graphs"]),
