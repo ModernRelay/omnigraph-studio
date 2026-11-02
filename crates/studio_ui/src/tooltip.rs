@@ -317,18 +317,27 @@ pub trait Tipped: Sized {
 impl Tipped for Stateful<Div> {
     fn tip(self, content: TipContent) -> Self {
         let anchor = Anchor::new();
-        // The recorder is placed against its host, so the host is positioned.
-        self.relative()
+        positioned(self)
             .tooltip(anchor.builder(content))
             .child(anchor.element())
     }
 
     fn tip_fn(self, build: impl Fn(&mut Window, &mut App) -> AnyView + 'static) -> Self {
         let anchor = Anchor::new();
-        self.relative()
+        positioned(self)
             .tooltip(anchor.builder_fn(build))
             .child(anchor.element())
     }
+}
+
+/// `host`, positioned for the recorder, which is placed against it: made relative unless it
+/// is placed already. Made relative over `absolute()`, a control placed in its parent (the
+/// table's select-all box) fell back into the parent's flow.
+fn positioned(mut host: Stateful<Div>) -> Stateful<Div> {
+    if host.style().position.is_none() {
+        host = host.relative();
+    }
+    host
 }
 
 /// Zed's `ButtonLike`, which the graph switcher is built on: it cannot be positioned, so it
@@ -365,6 +374,16 @@ mod tests {
                     .child(self.anchor.element()),
             )
         }
+    }
+
+    /// A control placed already keeps its place when it takes a tooltip; one that is not is
+    /// made relative, for the recorder.
+    #[test]
+    fn a_tooltip_keeps_its_controls_place() {
+        let mut placed = div().id("placed").absolute().tip(tooltip("t"));
+        assert_eq!(placed.style().position, Some(gpui::Position::Absolute));
+        let mut flowing = div().id("flowing").tip(tooltip("t"));
+        assert_eq!(flowing.style().position, Some(gpui::Position::Relative));
     }
 
     /// The recorder takes its control's bounds as the control is laid out.

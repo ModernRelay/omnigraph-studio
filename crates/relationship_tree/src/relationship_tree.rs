@@ -403,7 +403,15 @@ impl Item for RelationshipTree {
                 "id": root.id,
                 "at_commit": self.at_commit,
             }),
-            Subject::Set(set) => serde_json::json!({ "set": set }),
+            // A set at the head is read again when it comes back, so its count, the rows'
+            // number when it opened, is not kept ([`Exploration`] lets it go likewise).
+            Subject::Set(set) => {
+                let mut set = set.clone();
+                if self.at_commit.is_none() {
+                    set.total = None;
+                }
+                serde_json::json!({ "set": set })
+            }
         };
         Some(SavedItem {
             kind: TREE_KIND.into(),
@@ -2273,6 +2281,26 @@ mod tests {
             ..person_set(None)
         };
         assert_ne!(set_key("g", &berlin), set_key("g", &held));
+
+        // A filtered set at the head comes back without the count it opened with, which was
+        // its rows' number then: it is read again. Held at a commit, it keeps it.
+        for (at_commit, kept) in [(None, None), (Some("c1"), Some(40))] {
+            let counted = ShowSetInTree {
+                total: Some(40),
+                at_commit: at_commit.map(str::to_owned),
+                ..person_set(None)
+            };
+            let tree = cx.new(|cx| {
+                let at = counted.at_commit.clone();
+                RelationshipTree::new(session.clone(), Subject::Set(counted.clone()), at, cx)
+            });
+            tree.read_with(cx, |tree, cx| {
+                let saved = Item::serialize(tree, cx).expect("a tree is saved");
+                let back: ShowSetInTree =
+                    serde_json::from_value(saved.data["set"].clone()).expect("it reads back");
+                assert_eq!(back.total, kept, "{at_commit:?}");
+            });
+        }
     }
 
     /// ⌘R where the tree has the keyboard reads it again at the branch head, as its "Newer

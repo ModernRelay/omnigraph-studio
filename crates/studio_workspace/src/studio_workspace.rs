@@ -423,7 +423,7 @@ const TRAFFIC_LIGHTS_TOP: f32 = (HEADER_HEIGHT - 16.) / 2.;
 
 /// Where the traffic lights sit: centered in the top bar. A window opens with them there, so they
 /// do not move on its first draw.
-pub fn traffic_light_position(_glass: bool) -> Point<Pixels> {
+pub fn traffic_light_position() -> Point<Pixels> {
     point(px(TRAFFIC_LIGHTS_LEFT), px(TRAFFIC_LIGHTS_TOP))
 }
 /// What the server at `url` is, as the settings say, kept by address (spec 020).
@@ -5029,7 +5029,7 @@ impl Render for Workspace {
         let gap = px(studio_ui::ds::size::SHEET_GAP);
         self.lights_shown =
             cfg!(target_os = "macos") && !window.is_fullscreen() && !window.is_simple_fullscreen();
-        let lights = traffic_light_position(glass);
+        let lights = traffic_light_position();
         if self.traffic_lights != Some(lights) {
             self.traffic_lights = Some(lights);
             // Only macOS draws traffic lights; GPUI has the call on macOS alone.

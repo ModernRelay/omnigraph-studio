@@ -259,9 +259,7 @@ pub fn window_options(bounds: Option<gpui::Bounds<gpui::Pixels>>, cx: &App) -> W
         titlebar: Some(gpui::TitlebarOptions {
             title: Some("Omnigraph Studio".into()),
             appears_transparent: true,
-            traffic_light_position: Some(studio_workspace::traffic_light_position(
-                studio_ui::ds::is_glass(cx),
-            )),
+            traffic_light_position: Some(studio_workspace::traffic_light_position()),
         }),
         app_id: Some("com.modernrelay.omnigraph-studio".into()),
         // As Zed's windows: the header strips sit where a title bar would be and move the

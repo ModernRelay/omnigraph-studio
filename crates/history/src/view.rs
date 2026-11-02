@@ -50,10 +50,9 @@ const MERGED_AT_ONCE: usize = 8;
 /// the person looks.
 const MERGED_RETRY_AFTER: Duration = Duration::from_secs(5);
 
-/// How long scrolling must pause before the drawn rows' change counts are read, and stepping
-/// through commits before the selected one's changes are.
 /// The search field in the toolbar.
 const SEARCH_WIDTH: f32 = 240.;
+/// How long scrolling must pause before the drawn rows' change counts are read.
 const COUNTS_AFTER: Duration = Duration::from_millis(120);
 /// How long typing in the search pauses before the commits are matched.
 const SEARCH_DELAY: Duration = Duration::from_millis(80);
@@ -330,8 +329,6 @@ fn arrange(mut read: HistoryRead) -> Arranged {
 pub struct HistoryView {
     session: Entity<GraphSession>,
     branch: String,
-    /// The bottom-dock panel: rows only, following the window's branch; a commit opens in its
-    /// own tab.
     /// Finds commits by id prefix or actor.
     search: Entity<Editor>,
     matches: Vec<usize>,
@@ -392,10 +389,9 @@ pub struct HistoryView {
     /// names, or a walk of those alone.
     _task: Option<Task<()>>,
     _search_subscription: Subscription,
-    _session_subscription: Option<Subscription>,
-    /// A tab's own branch asked after while it is open, so another writer's commits to it
-    /// arrive; the panel's is the session's, always asked after.
-    _head_watch: Option<HeadWatch>,
+    _session_subscription: Subscription,
+    /// Its branch asked after while it is open, so another writer's commits to it arrive.
+    _head_watch: HeadWatch,
     /// The other branches whose heads the history shows as tags: a commit to one moves its
     /// tag.
     others: Vec<String>,
@@ -407,7 +403,7 @@ pub struct HistoryView {
     head_asked: HashMap<String, u64>,
     head_reads: HashMap<String, Task<()>>,
     next_head_read: u64,
-    /// The panel's reads owed until it is next drawn, and whether that draw has them due.
+    /// The reads owed until it is next drawn, and whether that draw has them due.
     owed: Owed,
     owed_due: bool,
 }
@@ -476,25 +472,8 @@ pub fn history_key(branch: &str) -> String {
 }
 
 impl HistoryView {
-    pub fn new(
-        session: Entity<GraphSession>,
-        branch: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let mut view = Self::build(session.clone(), branch, window, cx);
-        view._head_watch =
-            Some(session.update(cx, |session, cx| session.watch_head(&view.branch, cx)));
-        // Its own branch's commits, and the other branches whose heads it shows: a tab restored
-        // before the branch list was read draws them once it is.
-        view._session_subscription =
-            Some(cx.subscribe(&session, |this, _, event, cx| this.session_event(event, cx)));
-        view
-    }
-
     /// What the session's events ask of the history, owed until it is next drawn ([`Owed`]):
-    /// a tab or panel behind another, or in a closed dock, asks the server nothing for the
-    /// commits that land meanwhile.
+    /// a tab behind another asks the server nothing for the commits that land meanwhile.
     fn session_event(&mut self, event: &SessionEvent, cx: &mut Context<Self>) {
         match event {
             // The branch left's commits never show under the new one's name meanwhile.
@@ -518,14 +497,14 @@ impl HistoryView {
         }
     }
 
-    /// Notes a read the panel owes, and draws it again: a shown panel reads it at that frame
+    /// Notes a read the view owes, and draws it again: a shown tab reads it at that frame
     /// ([`Self::read_owed`]); a hidden one is not drawn, and reads it when shown again.
     fn owe(&mut self, owe: impl FnOnce(&mut Owed), cx: &mut Context<Self>) {
         owe(&mut self.owed);
         cx.notify();
     }
 
-    /// The reads the panel owes, once for everything that came since it was last drawn: the
+    /// The reads the view owes, once for everything that came since it was last drawn: the
     /// branch's history again (from its first page after a branch change, else keeping the
     /// pages read after commits), the tags for a changed branch list, and the heads of the other
     /// branches commits landed on.
@@ -548,12 +527,17 @@ impl HistoryView {
         }
     }
 
-    fn build(
+    pub fn new(
         session: Entity<GraphSession>,
         branch: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let head_watch = session.update(cx, |session, cx| session.watch_head(&branch, cx));
+        // Its own branch's commits, and the other branches whose heads it shows: a tab restored
+        // before the branch list was read draws them once it is.
+        let session_subscription =
+            cx.subscribe(&session, |this, _, event, cx| this.session_event(event, cx));
         let search = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_placeholder_text("Find a commit by id or actor", window, cx);
@@ -579,8 +563,8 @@ impl HistoryView {
             match_query: String::new(),
             _search_task: None,
             _search_subscription: search_subscription,
-            _session_subscription: None,
-            _head_watch: None,
+            _session_subscription: session_subscription,
+            _head_watch: head_watch,
             others: Vec::new(),
             other_heads: HashMap::new(),
             head_asked: HashMap::new(),
@@ -1355,7 +1339,7 @@ impl HistoryView {
         self.match_commits(cx);
         self.match_at = (!self.matches.is_empty()).then_some(0);
         if let Some(&ix) = self.matches.first() {
-            self.step_to(ix, cx);
+            self.select(ix, cx);
         }
         cx.notify();
     }
@@ -1398,19 +1382,11 @@ impl HistoryView {
             (at + count - 1) % count
         };
         self.match_at = Some(at);
-        self.step_to(self.matches[at], cx);
+        self.select(self.matches[at], cx);
     }
 
     /// Selects a commit; opening it is what shows its changes.
     pub fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
-        self.show(ix, cx);
-    }
-
-    fn step_to(&mut self, ix: usize, cx: &mut Context<Self>) {
-        self.show(ix, cx);
-    }
-
-    fn show(&mut self, ix: usize, cx: &mut Context<Self>) {
         if self.commits.get(ix).is_none() {
             return;
         }
@@ -1422,7 +1398,7 @@ impl HistoryView {
     fn select_next(&mut self, _: &menu::SelectNext, _: &mut Window, cx: &mut Context<Self>) {
         let next = self.selected.map_or(0, |s| s + 1);
         if next < self.commits.len() {
-            self.step_to(next, cx);
+            self.select(next, cx);
         }
     }
 
@@ -1433,7 +1409,7 @@ impl HistoryView {
         cx: &mut Context<Self>,
     ) {
         if let Some(previous) = self.selected.and_then(|s| s.checked_sub(1)) {
-            self.step_to(previous, cx);
+            self.select(previous, cx);
         }
     }
 
@@ -2067,7 +2043,7 @@ impl HistoryView {
 
 impl Render for HistoryView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Drawn, so shown: the panel reads what it owes once the frame is out, not inside it.
+        // Drawn, so shown: the view reads what it owes once the frame is out, not inside it.
         if !self.owed.is_empty() && !std::mem::replace(&mut self.owed_due, true) {
             cx.defer_in(window, |this, _, cx| {
                 this.owed_due = false;
@@ -3589,7 +3565,7 @@ mod tests {
     }
 
     /// A History tab behind another in its pane reads nothing for the commits that land on its
-    /// branch, as the panel reads nothing hidden; shown again, it reads its first page once for
+    /// branch, as the view reads nothing hidden; shown again, it reads its first page once for
     /// all of them. Before, every commit read the tab's 200 commits again, unseen.
     #[gpui::test]
     async fn a_hidden_tab_reads_nothing_until_shown_again(cx: &mut TestAppContext) {

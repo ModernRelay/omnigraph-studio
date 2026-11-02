@@ -31,7 +31,9 @@ pub(crate) struct EditModal {
     /// The change the form edits, by its key.
     key: String,
     title: SharedString,
-    branch: String,
+    /// Where the edit writes, named whole: the server, the graph and the branch, as every write
+    /// confirmation names it, since two windows can both be on `main`.
+    scope: String,
     fields: Vec<Field>,
     /// Why the edit was not sent, shown while the form stays open.
     refused: Option<String>,
@@ -56,7 +58,7 @@ impl EditModal {
         view: WeakEntity<ReviewView>,
         key: String,
         title: String,
-        branch: String,
+        scope: String,
         values: Vec<(Property, Value)>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -82,7 +84,7 @@ impl EditModal {
             view,
             key,
             title: title.into(),
-            branch,
+            scope,
             fields,
             refused: None,
             focus_handle: cx.focus_handle(),
@@ -138,7 +140,7 @@ impl Render for EditModal {
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
             .child(
                 ds::ModalHeader::new(format!("Edit {}", self.title))
-                    .meta(ds::write_target(self.branch.clone(), cx))
+                    .meta(ds::write_target(self.scope.clone(), cx))
                     .on_close(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
             )
             .child(
@@ -167,7 +169,7 @@ impl Render for EditModal {
                         ds::action_button("save-edit", "Save")
                             .tip(studio_ui::ds::tooltip(format!(
                                 "Writes the changed fields to {}, bound to the reviewed head",
-                                self.branch
+                                self.scope
                             )))
                             .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
                     ),
