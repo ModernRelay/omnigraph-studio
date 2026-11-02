@@ -1944,6 +1944,121 @@ pub fn pill_field(id: impl Into<ElementId>, invalid: bool, cx: &App) -> Stateful
         })
 }
 
+/// The filter being written, as the [`filter_pill`] it will become: its segments on the
+/// document's fill, ringed in the focus colour while it is open (red when its value is
+/// refused). The ring is outside it, as a pill's edge is, so its buttons keep a button's
+/// height. The type table's filter bar and a relationship's filters in the tree write with it.
+pub fn filter_draft(id: impl Into<ElementId>, invalid: bool, cx: &App) -> Stateful<Div> {
+    h_flex()
+        .id(id.into())
+        .h(px(size::PILL))
+        .flex_none()
+        .rounded_full()
+        .shadow(vec![gpui::BoxShadow {
+            color: if invalid {
+                surface::error_border(cx)
+            } else {
+                surface::focus(cx)
+            },
+            offset: gpui::point(px(0.), px(0.)),
+            blur_radius: px(0.),
+            spread_radius: px(size::HAIRLINE),
+            inset: false,
+        }])
+        .bg(surface::document(cx))
+        .overflow_hidden()
+}
+
+/// A [`filter_draft`]'s menu segment: the field (with its icon) or the test, and a chevron.
+pub fn filter_draft_choice(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    icon: Option<IconName>,
+) -> Button {
+    Button::new(id, label)
+        .style(ButtonStyle::Subtle)
+        .when_some(icon, |button, icon| button.start_icon(Icon::new(icon)))
+        .when(icon.is_none(), |button| button.color(Color::Muted))
+        .end_icon(icon::meta(IconName::ChevronDown))
+}
+
+/// A [`filter_draft`]'s value segment, which holds the value's editor.
+pub fn filter_draft_value() -> Div {
+    div().relative().w(px(size::FIELD_NARROW)).px(px(space::MD))
+}
+
+/// A [`filter_draft`]'s last segment: add it (↵) and discard it (esc).
+pub fn filter_draft_end(
+    on_apply: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_cancel: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> Div {
+    h_flex()
+        .h_full()
+        .pl(px(space::XS))
+        .pr(px(PILL_BUTTON_GAP))
+        .gap(px(space::XXS))
+        .items_center()
+        .child(
+            pill_button("apply-filter", IconName::Check, Color::Accent, cx)
+                .tip(crate::ds::tooltip("Add this filter (↵)"))
+                .on_click(on_apply),
+        )
+        .child(
+            pill_button("cancel-filter", IconName::Close, Color::Muted, cx)
+                .tip(crate::ds::tooltip("Discard this filter (Esc)"))
+                .on_click(on_cancel),
+        )
+}
+
+/// What a [`sort_menu`] calls with the property chosen and whether it runs descending, or none.
+pub type SetSort = std::rc::Rc<dyn Fn(Option<(String, bool)>, &mut App)>;
+
+/// The Sort menu, as the type table's toolbar and a relationship in the tree offer it: no
+/// order, each property by `choices`' `(name, title)`, then the direction, which a property
+/// chosen keeps. `set` gets the property and whether it runs descending, or none.
+pub fn sort_menu(
+    mut menu: crate::menu::ContextMenu,
+    choices: &[(String, String)],
+    current: Option<(String, bool)>,
+    set: SetSort,
+) -> crate::menu::ContextMenu {
+    let entry = |sort: Option<(String, bool)>| {
+        let set = set.clone();
+        move |_: &mut Window, cx: &mut App| set(sort.clone(), cx)
+    };
+    let descending = current.as_ref().is_some_and(|(_, down)| *down);
+    menu = menu
+        .toggleable_entry(
+            "No order",
+            current.is_none(),
+            IconPosition::Start,
+            None,
+            entry(None),
+        )
+        .separator();
+    for (name, title) in choices {
+        menu = menu.toggleable_entry(
+            title.clone(),
+            current.as_ref().is_some_and(|(at, _)| at == name),
+            IconPosition::Start,
+            None,
+            entry(Some((name.clone(), descending))),
+        );
+    }
+    menu = menu.separator();
+    for (label, down) in [("Ascending", false), ("Descending", true)] {
+        let sort = current.clone().map(|(name, _)| (name, down));
+        menu = menu.item(
+            crate::menu::ContextMenuEntry::new(label)
+                .toggleable(IconPosition::Start, current.is_some() && descending == down)
+                .disabled(current.is_none())
+                .handler(entry(sort)),
+        );
+    }
+    menu
+}
+
 /// The hairline between a pill's segments, the pill's full height: a filter's, a toolbar
 /// chip's, and the filter being written.
 pub fn pill_rule(cx: &App) -> Div {

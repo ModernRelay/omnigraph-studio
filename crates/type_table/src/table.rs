@@ -40,7 +40,6 @@ use studio_actions::table::{
     ShowRowOnCanvas, StageEdit,
 };
 use studio_actions::{ViewKind, ViewLink};
-use studio_ui::ds::Button;
 use studio_ui::ds::Tipped;
 use studio_ui::ds::space;
 use studio_ui::menu::{ContextMenu, ContextMenuEntry};
@@ -3011,42 +3010,18 @@ impl TypeTable {
             )
             .menu(move |window, cx| {
                 let (table, current, choices) = (table.clone(), current.clone(), choices.clone());
-                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                    let set = |sort: Option<Sort>| {
-                        let table = table.clone();
-                        move |_: &mut Window, cx: &mut App| {
-                            table
-                                .update(cx, |table, cx| table.set_sort(sort.clone(), cx))
-                                .ok();
-                        }
-                    };
-                    let descending = current.as_ref().is_some_and(|sort| sort.descending);
-                    for (name, title) in choices.iter() {
-                        menu = menu.toggleable_entry(
-                            title.clone(),
-                            current.as_ref().is_some_and(|sort| sort.property == *name),
-                            IconPosition::Start,
-                            None,
-                            set(Some(Sort {
-                                property: name.clone(),
-                                descending,
-                            })),
-                        );
-                    }
-                    menu = menu.separator();
-                    for (label, down) in [("Ascending", false), ("Descending", true)] {
-                        let sort = current.clone().map(|sort| Sort {
-                            descending: down,
-                            ..sort
-                        });
-                        menu = menu.item(
-                            ContextMenuEntry::new(label)
-                                .toggleable(IconPosition::Start, sorted && descending == down)
-                                .disabled(!sorted)
-                                .handler(set(sort)),
-                        );
-                    }
-                    menu
+                let set: studio_ui::ds::SetSort = Rc::new(move |sort, cx| {
+                    let sort = sort.map(|(property, descending)| Sort {
+                        property,
+                        descending,
+                    });
+                    table.update(cx, |table, cx| table.set_sort(sort, cx)).ok();
+                });
+                let current = current
+                    .as_ref()
+                    .map(|sort| (sort.property.clone(), sort.descending));
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    studio_ui::ds::sort_menu(menu, &choices, current.clone(), set.clone())
                 }))
             });
         studio_ui::ds::control_chip("sort-chip", menu).when(sorted, |chip| {
@@ -8136,7 +8111,6 @@ impl TypeTable {
         if self.filters.is_empty() && self.filter_draft.is_none() && words_note.is_none() {
             return None;
         }
-        let editor_bg = studio_ui::ds::surface::document(cx);
         let mut bar = h_flex()
             .flex_none()
             .flex_wrap()
@@ -8191,35 +8165,17 @@ impl TypeTable {
             let ops = self.ops_for(&draft.property);
             let property_table = table.clone();
             let chosen_icon = self.key_icon(&draft.property);
-            let chevron = || studio_ui::ds::icon::meta(IconName::ChevronDown);
             // The filter being written is the pill it will become, outlined while it is open:
             // a ring outside it as the pill's own edge is, so its buttons keep a button's height.
-            let pill = h_flex()
-                .h(px(studio_ui::ds::size::PILL))
-                .flex_none()
-                .rounded_full()
-                .shadow(vec![gpui::BoxShadow {
-                    color: if draft.error.is_some() {
-                        studio_ui::ds::surface::error_border(cx)
-                    } else {
-                        studio_ui::ds::surface::focus(cx)
-                    },
-                    offset: gpui::point(px(0.), px(0.)),
-                    blur_radius: px(0.),
-                    spread_radius: px(studio_ui::ds::size::HAIRLINE),
-                    inset: false,
-                }])
-                .bg(editor_bg)
-                .overflow_hidden()
+            let pill = studio_ui::ds::filter_draft("filter-draft", draft.error.is_some(), cx)
                 .child(
                     PopoverMenu::new("filter-property")
                         .with_handle(self.filter_menus[0].clone())
-                        .trigger(
-                            Button::new("filter-property-button", chosen)
-                                .style(ButtonStyle::Subtle)
-                                .start_icon(Icon::new(chosen_icon))
-                                .end_icon(chevron()),
-                        )
+                        .trigger(studio_ui::ds::filter_draft_choice(
+                            "filter-property-button",
+                            chosen,
+                            Some(chosen_icon),
+                        ))
                         .menu(move |window, cx| {
                             let table = property_table.clone();
                             let choices = choices.clone();
@@ -8300,12 +8256,11 @@ impl TypeTable {
                 .child(
                     PopoverMenu::new("filter-op")
                         .with_handle(self.filter_menus[1].clone())
-                        .trigger(
-                            Button::new("filter-op-button", draft.op.label())
-                                .style(ButtonStyle::Subtle)
-                                .color(Color::Muted)
-                                .end_icon(chevron()),
-                        )
+                        .trigger(studio_ui::ds::filter_draft_choice(
+                            "filter-op-button",
+                            draft.op.label(),
+                            None,
+                        ))
                         .menu(move |window, cx| {
                             let table = table.clone();
                             let ops = ops.clone();
@@ -8331,7 +8286,7 @@ impl TypeTable {
                         && !draft.offers.is_empty())
                     .then(|| self.render_suggestions(draft, cx));
                     pill.child(studio_ui::ds::pill_rule(cx)).child(
-                        div()
+                        studio_ui::ds::filter_draft_value()
                             .key_context("FilterValue")
                             .on_action(cx.listener(|this, _: &SelectNextSuggestion, _, cx| {
                                 this.move_suggestion(1, cx)
@@ -8339,46 +8294,16 @@ impl TypeTable {
                             .on_action(cx.listener(|this, _: &SelectPreviousSuggestion, _, cx| {
                                 this.move_suggestion(-1, cx)
                             }))
-                            .relative()
-                            .w(px(studio_ui::ds::size::FIELD_NARROW))
-                            .px(px(space::MD))
                             .child(self.filter_editor.clone())
                             .children(offers),
                     )
                 })
                 .child(studio_ui::ds::pill_rule(cx))
-                .child(
-                    h_flex()
-                        .h_full()
-                        .pl(px(space::XS))
-                        .pr(px(studio_ui::ds::PILL_BUTTON_GAP))
-                        .gap(px(space::XXS))
-                        .items_center()
-                        .child(
-                            studio_ui::ds::pill_button(
-                                "apply-filter",
-                                IconName::Check,
-                                Color::Accent,
-                                cx,
-                            )
-                            .tip(studio_ui::ds::tooltip("Add this filter (↵)"))
-                            .on_click(cx.listener(
-                                |this, _, window, cx| this.apply_filter_draft(window, cx),
-                            )),
-                        )
-                        .child(
-                            studio_ui::ds::pill_button(
-                                "cancel-filter",
-                                IconName::Close,
-                                Color::Muted,
-                                cx,
-                            )
-                            .tip(studio_ui::ds::tooltip("Discard this filter (Esc)"))
-                            .on_click(cx.listener(
-                                |this, _, window, cx| this.cancel_filter_draft(window, cx),
-                            )),
-                        ),
-                );
+                .child(studio_ui::ds::filter_draft_end(
+                    cx.listener(|this, _, window, cx| this.apply_filter_draft(window, cx)),
+                    cx.listener(|this, _, window, cx| this.cancel_filter_draft(window, cx)),
+                    cx,
+                ));
             bar = bar
                 .child(pill)
                 .children(draft.error.clone().map(studio_ui::ds::text::error));

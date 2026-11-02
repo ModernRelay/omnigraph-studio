@@ -1,10 +1,11 @@
-//! A relationship's card (spec 005, "A relationship's card"): a popover from the group's row
-//! that groups, orders and filters its neighbours, and takes a sentence for the model to set
-//! all three. Its rows are Group, Sort and Filter; its grey footer is the sentence field, as
-//! the type table's toolbar has one (spec 019). What it sets belongs to the relationship, as a
-//! grouping does, so it holds wherever the relationship appears in the walk: its counts, its
-//! pages and its grouped values.
+//! A relationship's controls (spec 005, "A relationship's controls"): the group row's Sort,
+//! Group and Filter buttons, drawn with the type table's own pieces. Sort and Group open the
+//! table's menus; Filter opens the table's filter pills, the pill a filter is written in, and
+//! the field that sets all three from a sentence (spec 019). What they set belongs to the
+//! relationship, as a grouping does, so it holds wherever the relationship appears in the walk:
+//! its counts, its pages and its grouped values.
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use editor::Editor;
@@ -25,15 +26,15 @@ use studio_workspace::models::{Error as ModelError, Models, Request as ModelRequ
 use ui::prelude::*;
 use ui::{IconName, IconPosition, PopoverMenu, PopoverMenuHandle};
 
-/// Where the card's sentence is: being typed, out with the model, or answered with a note of
-/// what could not be used, or failed with why.
+/// Where the sentence is: being typed, out with the model, or answered with a note of what
+/// could not be used, or failed with why.
 pub(crate) enum Words {
     Typing(Option<String>),
     Running { _call: Task<()> },
     Failed(String),
 }
 
-/// One line of a card's menu: a heading over the choices after it, or a choice.
+/// One line of a menu: a heading over the choices after it, or a choice.
 #[derive(Clone)]
 enum Choice<T> {
     Section(SharedString),
@@ -54,46 +55,44 @@ impl<T> Choice<T> {
     }
 }
 
-/// The card: the relationship's grouping and order, its filters as pills with a draft for the
-/// next, and the sentence field.
-pub(crate) struct NeighbourCard {
-    exploration: Entity<Exploration>,
-    group: RelationshipGroup,
-    /// The group's path where the card was opened: choosing a grouping opens it on its values.
-    path: Option<ExplorePath>,
-    schema: Arc<SchemaModel>,
-    /// The other type, whose properties the rows test, order and group by.
-    other: Arc<NodeType>,
-    /// The draft: a property and a test; its value is the editor's text.
-    property: String,
-    op: FilterOp,
-    pub(crate) value: Entity<Editor>,
-    pub(crate) error: Option<String>,
-    /// The sentence for the model, in the footer.
-    pub(crate) sentence: Entity<Editor>,
-    pub(crate) words: Words,
-    /// The draft's property and test, the grouping and the order: a click on a menu open
-    /// leaves the card open.
-    menus: [PopoverMenuHandle<ContextMenu>; 4],
-    focus_handle: FocusHandle,
-}
+/// What a menu's choice calls with its value.
+type Pick<T> = Rc<dyn Fn(T, &mut App)>;
 
-impl EventEmitter<DismissEvent> for NeighbourCard {}
-
-impl Focusable for NeighbourCard {
-    /// The sentence field: opening the card puts the keyboard there, so what to show is typed
-    /// at once; ↵ asks (or, in the value field, adds the filter) and esc closes, through the
-    /// surface's `menu` context.
-    fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.sentence.focus_handle(cx)
+/// `items` as a menu's entries, the one checked ticked; picking one calls `pick` with its value.
+fn choice_entries<T: Clone + 'static>(
+    mut menu: ContextMenu,
+    items: Vec<Choice<T>>,
+    pick: Pick<T>,
+) -> ContextMenu {
+    for item in items {
+        menu = match item {
+            Choice::Section(heading) => menu.separator().header(heading),
+            Choice::Item {
+                label,
+                value,
+                checked,
+            } => {
+                let pick = pick.clone();
+                menu.toggleable_entry(label, checked, IconPosition::Start, None, move |_, cx| {
+                    pick(value.clone(), cx)
+                })
+            }
+        };
     }
+    menu
 }
 
-/// Whether `group` has a card: its other type is in the schema read.
+/// Whether `group` has controls: its other type is in the schema read.
 pub(crate) fn can_open(exploration: &Exploration, group: &RelationshipGroup) -> bool {
     exploration
         .schema()
         .is_some_and(|schema| schema.node(&group.other_type).is_some())
+}
+
+/// The other type of `group`, as the schema read has it.
+fn other_type(exploration: &Exploration, group: &RelationshipGroup) -> Option<Arc<NodeType>> {
+    let schema = exploration.schema()?;
+    schema.node(&group.other_type).cloned().map(Arc::new)
 }
 
 /// The properties of `other` its neighbours can be ordered by.
@@ -140,8 +139,211 @@ fn property_icon(property: &Property) -> IconName {
     }
 }
 
-impl NeighbourCard {
-    /// The card for `group`'s neighbours in `exploration`, which [`can_open`] says has one;
+/// Every grouping `group` offers, its sections run together.
+fn groupings(schema: &SchemaModel, group: &RelationshipGroup) -> Vec<GroupBy> {
+    GroupBy::sections(schema, group)
+        .into_iter()
+        .flat_map(|(_, section)| section)
+        .collect()
+}
+
+/// Groups `group`'s neighbours by `by`, or stops; a grouping chosen opens `path`, the row it
+/// was asked from, on its values.
+pub(crate) fn set_grouping(
+    exploration: &Entity<Exploration>,
+    group: &RelationshipGroup,
+    path: Option<&ExplorePath>,
+    by: Option<GroupBy>,
+    cx: &mut App,
+) {
+    exploration.update(cx, |exploration, cx| {
+        let open = by.is_some();
+        exploration.set_grouping(group, by, cx);
+        if open && let Some(path) = path {
+            exploration.expand(path, cx);
+        }
+    });
+}
+
+/// Orders `group`'s neighbours by `sort`, or stops.
+pub(crate) fn set_sort(
+    exploration: &Entity<Exploration>,
+    group: &RelationshipGroup,
+    sort: Option<Sort>,
+    cx: &mut App,
+) {
+    exploration.update(cx, |exploration, cx| exploration.set_sort(group, sort, cx));
+}
+
+/// The group row's buttons, each a menu of its own: Sort, Group and Filter, each lit while it
+/// is set. A button the relationship's other type cannot use is left out.
+pub(crate) struct Controls {
+    pub sort: Option<AnyElement>,
+    pub group: Option<AnyElement>,
+    pub filter: Option<AnyElement>,
+}
+
+/// The controls of `group`'s row at `path`; `id` keeps a sticky row's apart from its own.
+pub(crate) fn controls(
+    id: &'static str,
+    row: usize,
+    exploration: &Entity<Exploration>,
+    group: &RelationshipGroup,
+    path: &ExplorePath,
+    cx: &App,
+) -> Option<Controls> {
+    let read = exploration.read(cx);
+    let schema = read.schema()?;
+    let other = other_type(read, group)?;
+    // A set control's icon is the accent, as a set chip's value is in the table; its tip
+    // says what it is set to, and hides while its menu is open.
+    let button = |name: &'static str, icon: IconName, set: bool| {
+        studio_ui::ds::row_icon_button((SharedString::from(format!("{id}-{name}")), row), icon)
+            .icon_color(if set { Color::Accent } else { Color::Muted })
+    };
+    let tip = |tip: String| {
+        move |_: &mut Window, cx: &mut App| studio_ui::ds::tooltip_view(tip.clone(), cx)
+    };
+    let menu_id = |name: &str| SharedString::from(format!("{id}-{name}-{}-{row}", group.edge));
+
+    let sort = (!sortable(&other).is_empty()).then(|| {
+        let current = read.sort(group).cloned();
+        let label = match &current {
+            Some(sort) => format!(
+                "Ordered by {} {}",
+                sort.property,
+                if sort.descending { "↓" } else { "↑" }
+            ),
+            None => "Order these neighbours by a property".to_owned(),
+        };
+        let (exploration, group, other) = (exploration.clone(), group.clone(), other.clone());
+        PopoverMenu::new(menu_id("sort"))
+            .anchor(gpui::Anchor::TopRight)
+            .trigger_with_tooltip(
+                button("sort", IconName::ChevronUpDown, current.is_some()),
+                tip(label),
+            )
+            .menu(move |window, cx| {
+                let choices: Vec<(String, String)> = sortable(&other)
+                    .into_iter()
+                    .map(|property| (property.name.clone(), property.name.clone()))
+                    .collect();
+                let current = exploration
+                    .read(cx)
+                    .sort(&group)
+                    .map(|sort| (sort.property.clone(), sort.descending));
+                let (exploration, group) = (exploration.clone(), group.clone());
+                let set: studio_ui::ds::SetSort = Rc::new(move |sort, cx| {
+                    let sort = sort.map(|(property, descending)| Sort {
+                        property,
+                        descending,
+                    });
+                    set_sort(&exploration, &group, sort, cx);
+                });
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    studio_ui::ds::sort_menu(menu, &choices, current.clone(), set.clone())
+                }))
+            })
+            .into_any_element()
+    });
+
+    let group_menu = (!groupings(&schema, group).is_empty()).then(|| {
+        let current = read.grouping(group).cloned();
+        let label = match &current {
+            Some(by) => format!("Grouped by {}", by.label()),
+            None => "Group these neighbours".to_owned(),
+        };
+        let (exploration, group, path) = (exploration.clone(), group.clone(), path.clone());
+        PopoverMenu::new(menu_id("group"))
+            .anchor(gpui::Anchor::TopRight)
+            .trigger_with_tooltip(
+                button("group", IconName::ListTree, current.is_some()),
+                tip(label),
+            )
+            .menu(move |window, cx| {
+                let current = exploration.read(cx).grouping(&group).cloned();
+                let mut items = vec![Choice::item("No grouping", None, current.is_none())];
+                for (heading, section) in GroupBy::sections(&schema, &group) {
+                    items.push(Choice::Section(heading.into()));
+                    items.extend(section.into_iter().map(|by| {
+                        let checked = current.as_ref() == Some(&by);
+                        Choice::item(by.label(), Some(by), checked)
+                    }));
+                }
+                let (exploration, group, path) = (exploration.clone(), group.clone(), path.clone());
+                let pick: Pick<Option<GroupBy>> =
+                    Rc::new(move |by, cx| set_grouping(&exploration, &group, Some(&path), by, cx));
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    choice_entries(menu, items.clone(), pick.clone())
+                }))
+            })
+            .into_any_element()
+    });
+
+    let filter = (!filterable(&other).is_empty()).then(|| {
+        let count = read.filters(group).len();
+        let label = match count {
+            0 => "Filter these neighbours".to_owned(),
+            1 => "1 filter".to_owned(),
+            n => format!("{n} filters"),
+        };
+        let (exploration, group, path) = (exploration.clone(), group.clone(), path.clone());
+        PopoverMenu::new(menu_id("filter"))
+            .anchor(gpui::Anchor::TopRight)
+            .trigger_with_tooltip(button("filter", IconName::Filter, count > 0), tip(label))
+            .menu(move |window, cx| {
+                if !can_open(exploration.read(cx), &group) {
+                    return None;
+                }
+                let (exploration, group, path) = (exploration.clone(), group.clone(), path.clone());
+                Some(cx.new(|cx| NeighbourFilters::new(exploration, group, Some(path), window, cx)))
+            })
+            .into_any_element()
+    });
+
+    Some(Controls {
+        sort,
+        group: group_menu,
+        filter,
+    })
+}
+
+/// The Filter button's popover: the relationship's filters as the table's pills, the pill the
+/// next is written in, and the field that sets filters, order and grouping from a sentence.
+pub(crate) struct NeighbourFilters {
+    exploration: Entity<Exploration>,
+    group: RelationshipGroup,
+    /// The group's path where it was opened: a grouping a sentence sets opens it on its values.
+    path: Option<ExplorePath>,
+    schema: Arc<SchemaModel>,
+    /// The other type, whose properties the filters test.
+    other: Arc<NodeType>,
+    /// The draft: a property and a test; its value is the editor's text.
+    property: String,
+    op: FilterOp,
+    pub(crate) value: Entity<Editor>,
+    pub(crate) error: Option<String>,
+    /// The sentence for the model.
+    pub(crate) sentence: Entity<Editor>,
+    pub(crate) words: Words,
+    /// The draft's property and test menus: a click on one open leaves the popover open.
+    menus: [PopoverMenuHandle<ContextMenu>; 2],
+    focus_handle: FocusHandle,
+}
+
+impl EventEmitter<DismissEvent> for NeighbourFilters {}
+
+impl Focusable for NeighbourFilters {
+    /// The value field: opening the popover puts the keyboard there, as the table's draft
+    /// does; ↵ adds the filter (or, in the sentence, asks) and esc closes, through the
+    /// surface's `menu` context.
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.value.focus_handle(cx)
+    }
+}
+
+impl NeighbourFilters {
+    /// The popover for `group`'s neighbours in `exploration`, which [`can_open`] says has one;
     /// `path` is the group's row it was opened from.
     pub(crate) fn new(
         exploration: Entity<Exploration>,
@@ -150,18 +352,11 @@ impl NeighbourCard {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let schema: Arc<SchemaModel> = exploration
-            .read(cx)
-            .schema()
-            .expect("a schema, as can_open checked");
-        let other = Arc::new(
-            schema
-                .node(&group.other_type)
-                .expect("the other type, as can_open checked")
-                .clone(),
-        );
+        let read = exploration.read(cx);
+        let schema = read.schema().expect("a schema, as can_open checked");
+        let other = other_type(read, &group).expect("the other type, as can_open checked");
         // The draft starts on the property that names the neighbours, as a filter mostly
-        // does; else the first that takes a test. A type with none has no draft.
+        // does; else the first that takes a test.
         let first = other
             .label_property()
             .and_then(|label| filterable(&other).into_iter().find(|p| p.name == label))
@@ -184,8 +379,7 @@ impl NeighbourCard {
             window,
             cx,
         );
-        // The keyboard goes to the sentence at once: one line says what all three rows can.
-        window.focus(&sentence.focus_handle(cx), cx);
+        window.focus(&value.focus_handle(cx), cx);
         Self {
             exploration,
             group,
@@ -281,6 +475,14 @@ impl NeighbourCard {
         cx.notify();
     }
 
+    /// Empties the draft's value, as the table's discard does.
+    fn discard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.value
+            .update(cx, |editor, cx| editor.set_text("", window, cx));
+        self.error = None;
+        cx.notify();
+    }
+
     pub(crate) fn remove(&mut self, index: usize, cx: &mut Context<Self>) {
         let mut filters = self.filters(cx);
         if index < filters.len() {
@@ -300,62 +502,8 @@ impl NeighbourCard {
         }
     }
 
-    /// Groups the neighbours by `by`, or stops; a grouping chosen opens the row it was asked
-    /// from on its values.
-    pub(crate) fn set_grouping(&mut self, by: Option<GroupBy>, cx: &mut Context<Self>) {
-        let (group, path) = (self.group.clone(), self.path.clone());
-        self.exploration.update(cx, |exploration, cx| {
-            let open = by.is_some();
-            exploration.set_grouping(&group, by, cx);
-            if open && let Some(path) = &path {
-                exploration.expand(path, cx);
-            }
-        });
-        cx.notify();
-    }
-
-    /// Orders the neighbours by `property`, keeping the direction set, or stops.
-    pub(crate) fn set_sort(&mut self, property: Option<String>, cx: &mut Context<Self>) {
-        let descending = self
-            .exploration
-            .read(cx)
-            .sort(&self.group)
-            .is_some_and(|sort| sort.descending);
-        let sort = property.map(|property| Sort {
-            property,
-            descending,
-        });
-        let group = self.group.clone();
-        self.exploration
-            .update(cx, |exploration, cx| exploration.set_sort(&group, sort, cx));
-        cx.notify();
-    }
-
-    /// Turns the order around.
-    pub(crate) fn flip_sort(&mut self, cx: &mut Context<Self>) {
-        let Some(sort) = self.exploration.read(cx).sort(&self.group).cloned() else {
-            return;
-        };
-        let group = self.group.clone();
-        self.exploration.update(cx, |exploration, cx| {
-            exploration.set_sort(
-                &group,
-                Some(Sort {
-                    descending: !sort.descending,
-                    ..sort
-                }),
-                cx,
-            )
-        });
-        cx.notify();
-    }
-
-    /// Every grouping the relationship offers, its sections run together.
-    fn groupings(&self) -> Vec<GroupBy> {
-        GroupBy::sections(&self.schema, &self.group)
-            .into_iter()
-            .flat_map(|(_, section)| section)
-            .collect()
+    fn cancel(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
     }
 
     /// The keys a sentence may filter by: the other type's properties that take a test.
@@ -381,14 +529,17 @@ impl NeighbourCard {
                 .into_iter()
                 .map(|property| property.name.clone())
                 .collect(),
-            groups: self.groupings().iter().map(GroupBy::label).collect(),
+            groups: groupings(&self.schema, &self.group)
+                .iter()
+                .map(GroupBy::label)
+                .collect(),
             columns: Vec::new(),
         }
     }
 
     /// ↵ in the sentence field: the sentence goes to the model, which answers with the
-    /// relationship's filters, order and grouping, each checked against what the card offers;
-    /// what it could not use is said under the field.
+    /// relationship's filters, order and grouping, each checked against what is offered; what
+    /// it could not use is said under the field.
     pub(crate) fn ask(&mut self, cx: &mut Context<Self>) {
         let sentence = self.sentence.read(cx).text(cx).trim().to_owned();
         if sentence.is_empty() || matches!(self.words, Words::Running { .. }) {
@@ -459,27 +610,22 @@ impl NeighbourCard {
             exploration.set_filters(&group, filters, cx)
         });
         if let Some(sort) = view.sort {
-            self.exploration.update(cx, |exploration, cx| {
-                exploration.set_sort(&group, Some(sort), cx)
-            });
+            set_sort(&self.exploration, &group, Some(sort), cx);
         }
         if let Some(label) = view.group_by {
-            let by = self.groupings().into_iter().find(|by| by.label() == label);
+            let by = groupings(&self.schema, &group)
+                .into_iter()
+                .find(|by| by.label() == label);
             if by.is_some() {
-                self.set_grouping(by, cx);
+                set_grouping(&self.exploration, &group, self.path.as_ref(), by, cx);
             }
         }
+        cx.notify();
         (!refused.is_empty()).then(|| format!("Could not use: {}", refused.join("; ")))
     }
 
-    fn cancel(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
-        cx.emit(DismissEvent);
-    }
-
-    /// A menu of the card: `trigger`, opening `items`, the one checked ticked; picking one
-    /// calls `pick` with its value. Menu `handle` of the card's, so a click in it leaves the
-    /// card open.
-    fn choice_menu<T: Clone + 'static>(
+    /// A menu of the draft: `trigger` opening `items`; picking one calls `pick` on the popover.
+    fn draft_menu<T: Clone + 'static>(
         &self,
         id: &'static str,
         handle: usize,
@@ -489,43 +635,24 @@ impl NeighbourCard {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let this = cx.entity().downgrade();
+        let pick: Pick<T> = Rc::new(move |value, cx| {
+            this.update(cx, |this, cx| pick(this, value, cx)).ok();
+        });
         PopoverMenu::new(id)
             .with_handle(self.menus[handle].clone())
-            .trigger(trigger.end_icon(Icon::new(IconName::ChevronDown)))
+            .trigger(trigger)
             .menu(move |window, cx| {
-                let (this, items) = (this.clone(), items.clone());
-                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                    for item in items {
-                        menu = match item {
-                            Choice::Section(heading) => menu.separator().header(heading),
-                            Choice::Item {
-                                label,
-                                value,
-                                checked,
-                            } => {
-                                let this = this.clone();
-                                menu.toggleable_entry(
-                                    label,
-                                    checked,
-                                    IconPosition::Start,
-                                    None,
-                                    move |_, cx| {
-                                        this.update(cx, |this, cx| pick(this, value.clone(), cx))
-                                            .ok();
-                                    },
-                                )
-                            }
-                        };
-                    }
-                    menu
+                let (items, pick) = (items.clone(), pick.clone());
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    choice_entries(menu, items, pick)
                 }))
             })
             .into_any_element()
     }
 
-    /// The draft's property: the other type's properties that take a test.
-    fn render_property_menu(&self, cx: &mut Context<Self>) -> AnyElement {
-        let items = filterable(&self.other)
+    /// The pill the next filter is written in, as the table's: property ▾ | test ▾ | value | ✓ ×.
+    fn render_draft(&self, cx: &mut Context<Self>) -> AnyElement {
+        let properties = filterable(&self.other)
             .into_iter()
             .map(|property| {
                 Choice::item(
@@ -535,67 +662,51 @@ impl NeighbourCard {
                 )
             })
             .collect();
-        let trigger =
-            studio_ui::ds::button("neighbour-filter-property-button", self.property.clone())
-                .start_icon(Icon::new(
-                    self.property().map_or(IconName::Filter, property_icon),
-                ));
-        self.choice_menu(
-            "neighbour-filter-property",
-            0,
-            trigger,
-            items,
-            Self::set_property,
-            cx,
-        )
-    }
-
-    /// The draft's test: the tests its property takes.
-    fn render_op_menu(&self, cx: &mut Context<Self>) -> AnyElement {
-        let items = self
+        let ops = self
             .property()
             .map(FilterOp::for_property)
             .unwrap_or_default()
             .into_iter()
             .map(|op| Choice::item(op.label(), op, op == self.op))
             .collect();
-        let trigger = studio_ui::ds::button("neighbour-filter-op-button", self.op.label());
-        self.choice_menu("neighbour-filter-op", 1, trigger, items, Self::set_op, cx)
-    }
-
-    /// The grouping: none, or one of the other type's, the edge's or the other type's
-    /// relationships, under their headings.
-    fn render_grouping_menu(&self, cx: &mut Context<Self>) -> AnyElement {
-        let current = self.exploration.read(cx).grouping(&self.group).cloned();
-        let mut items = vec![Choice::item("No grouping", None, current.is_none())];
-        for (heading, section) in GroupBy::sections(&self.schema, &self.group) {
-            items.push(Choice::Section(heading.into()));
-            items.extend(section.into_iter().map(|by| {
-                let checked = current.as_ref() == Some(&by);
-                Choice::item(by.label(), Some(by), checked)
-            }));
-        }
-        let label = current.as_ref().map_or("None".to_owned(), GroupBy::label);
-        let trigger = studio_ui::ds::button("neighbour-group-button", label)
-            .start_icon(Icon::new(IconName::ListTree));
-        self.choice_menu("neighbour-group", 2, trigger, items, Self::set_grouping, cx)
-    }
-
-    /// The order: none, by id, or one of the other type's properties that can order rows.
-    fn render_sort_menu(&self, cx: &mut Context<Self>) -> AnyElement {
-        let current = self.exploration.read(cx).sort(&self.group).cloned();
-        let named = current.as_ref().map(|sort| sort.property.clone());
-        let mut items = vec![Choice::item("No order", None, named.is_none())];
-        items.extend(sortable(&self.other).into_iter().map(|property| {
-            let checked = named.as_deref() == Some(property.name.as_str());
-            Choice::item(&property.name, Some(property.name.clone()), checked)
-        }));
-        let trigger = studio_ui::ds::button(
-            "neighbour-sort-button",
-            named.unwrap_or_else(|| "None".to_owned()),
-        )
-        .start_icon(Icon::new(IconName::ChevronUpDown));
-        self.choice_menu("neighbour-sort", 3, trigger, items, Self::set_sort, cx)
+        let icon = self.property().map_or(IconName::Filter, property_icon);
+        studio_ui::ds::filter_draft("neighbour-filter-draft", self.error.is_some(), cx)
+            .child(self.draft_menu(
+                "neighbour-filter-property",
+                0,
+                studio_ui::ds::filter_draft_choice(
+                    "neighbour-filter-property-button",
+                    self.property.clone(),
+                    Some(icon),
+                ),
+                properties,
+                Self::set_property,
+                cx,
+            ))
+            .child(studio_ui::ds::pill_rule(cx))
+            .child(self.draft_menu(
+                "neighbour-filter-op",
+                1,
+                studio_ui::ds::filter_draft_choice(
+                    "neighbour-filter-op-button",
+                    self.op.label(),
+                    None,
+                ),
+                ops,
+                Self::set_op,
+                cx,
+            ))
+            .when(self.op.takes_value(), |pill| {
+                pill.child(studio_ui::ds::pill_rule(cx))
+                    .child(studio_ui::ds::filter_draft_value().child(self.value.clone()))
+            })
+            .child(studio_ui::ds::pill_rule(cx))
+            .child(studio_ui::ds::filter_draft_end(
+                cx.listener(|this, _, window, cx| this.add(window, cx)),
+                cx.listener(|this, _, window, cx| this.discard(window, cx)),
+                cx,
+            ))
+            .into_any_element()
     }
 
     fn render_pills(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -628,99 +739,23 @@ impl NeighbourCard {
     }
 }
 
-/// A row of the card: its name in a short column, then what sets it.
-fn card_row(label: &'static str, control: impl IntoElement) -> Div {
-    h_flex()
-        .gap(px(space::MD))
-        .items_start()
-        .child(
-            div()
-                .w(px(size::SHORT_LABEL))
-                .flex_none()
-                .h(px(size::CONTROL))
-                .flex()
-                .items_center()
-                .child(studio_ui::ds::text::meta(label)),
-        )
-        .child(h_flex().flex_1().min_w_0().child(control))
-}
-
-impl Render for NeighbourCard {
+impl Render for NeighbourFilters {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pills = self.render_pills(cx);
-        let takes_value = self.op.takes_value();
-        let can_filter = !self.property.is_empty();
-        let sort = self.exploration.read(cx).sort(&self.group).cloned();
-        // The row names the relationship; the card names what it shows.
-        let title = match self.group.direction {
-            gq_language::Direction::Outgoing => {
-                format!("{} {}", self.group.edge, self.group.other_type)
-            }
-            gq_language::Direction::Incoming => {
-                format!("{} from {}", self.group.edge, self.group.other_type)
-            }
-        };
-        let field = studio_ui::ds::field_frame(self.error.is_some(), cx)
-            .flex_1()
-            .child(studio_ui::ds::field_input(self.value.clone()));
-        let filter = v_flex()
-            .flex_1()
-            .min_w_0()
-            .gap(px(space::SM))
-            .when(!pills.is_empty(), |rows| {
-                rows.child(h_flex().flex_wrap().gap(px(space::SM)).children(pills))
-            })
-            .child(
-                h_flex()
-                    .gap(px(space::SM))
-                    .items_center()
-                    .flex_wrap()
-                    .child(self.render_property_menu(cx))
-                    .child(self.render_op_menu(cx))
-                    .when(takes_value, |row| row.child(field))
-                    .child(
-                        studio_ui::ds::button("neighbour-filter-add", "Add")
-                            .tip(studio_ui::ds::tooltip("Add this filter (↵)"))
-                            .on_click(cx.listener(|this, _, window, cx| this.add(window, cx))),
-                    ),
-            )
-            .when_some(self.error.clone(), |rows, error| {
-                rows.child(studio_ui::ds::text::error(error))
-            });
-        let order = h_flex()
-            .gap(px(space::SM))
-            .child(self.render_sort_menu(cx))
-            .when_some(sort, |row, sort| {
-                row.child(
-                    studio_ui::ds::row_icon_button(
-                        "neighbour-sort-direction",
-                        if sort.descending {
-                            IconName::ArrowDown
-                        } else {
-                            IconName::ArrowUp
-                        },
-                    )
-                    .tip(studio_ui::ds::tooltip(if sort.descending {
-                        "Descending: turn to ascending"
-                    } else {
-                        "Ascending: turn to descending"
-                    }))
-                    .on_click(cx.listener(|this, _, _, cx| this.flip_sort(cx))),
-                )
-            });
+        let draft = self.render_draft(cx);
         let (running, failed, note) = match &self.words {
             Words::Running { .. } => (true, None, None),
             Words::Failed(why) => (false, Some(why.clone()), None),
             Words::Typing(note) => (false, None, note.clone()),
         };
         let about = format!(
-            "Show in words (↵): {} go to {}",
+            "Filter in words (↵): {} go to {}",
             words::TASK.sends,
             Models::model_for(words::TASK.tier, cx)
         );
-        // The sentence, in the card's grey footer as a card's actions are (`ds::card_footer`).
+        // The sentence, in the grey footer as a card's actions are (`ds::card_footer`).
         let footer = v_flex()
-            .px(px(space::LG))
+            .px(px(space::MD))
             .py(px(space::SM))
             .gap(px(space::XS))
             .rounded_b(px(studio_ui::ds::radius::flush(
@@ -740,7 +775,7 @@ impl Render for NeighbourCard {
             .children(failed.map(studio_ui::ds::text::error))
             .children(note.map(studio_ui::ds::text::meta));
         menu_surface(v_flex(), cx)
-            .id("neighbour-card")
+            .id("neighbour-filters")
             .role(Role::Menu)
             .key_context("menu")
             .track_focus(&self.focus_handle)
@@ -748,59 +783,28 @@ impl Render for NeighbourCard {
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::cancel))
             .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                // A menu of the card open takes the click; the card stays for it.
+                // A menu of the draft open takes the click; the popover stays for it.
                 if !this.menus.iter().any(|menu| menu.is_deployed()) {
                     cx.emit(DismissEvent);
                 }
             }))
-            .w(px(size::POPOVER_MAX))
+            .max_w(px(size::POPOVER_MAX))
             .child(
-                div()
-                    .px(px(space::LG))
-                    .pt(px(space::MD))
-                    .pb(px(space::SM))
-                    .child(studio_ui::ds::text::plain(title)),
-            )
-            .child(
-                v_flex()
-                    .px(px(space::LG))
-                    .pb(px(space::MD))
+                // The filters, then the one being written, wrapping as the table's bar does.
+                h_flex()
+                    .p(px(space::MD))
+                    .flex_wrap()
                     .gap(px(space::SM))
-                    .child(card_row("Group", self.render_grouping_menu(cx)))
-                    .child(card_row("Sort", order))
-                    .when(can_filter, |body| body.child(card_row("Filter", filter))),
+                    .items_center()
+                    .children(pills)
+                    .child(draft),
             )
+            .children(self.error.clone().map(|error| {
+                div()
+                    .px(px(space::MD))
+                    .pb(px(space::SM))
+                    .child(studio_ui::ds::text::error(error))
+            }))
             .child(footer)
     }
-}
-
-/// What opens the card: the group row's button, lit while the relationship is grouped,
-/// ordered or filtered.
-pub(crate) fn card_button(
-    id: impl Into<ElementId>,
-    set: bool,
-    exploration: Entity<Exploration>,
-    group: RelationshipGroup,
-    path: ExplorePath,
-) -> PopoverMenu<NeighbourCard> {
-    let tooltip = if set {
-        "Group, sort and filter these neighbours: some are set"
-    } else {
-        "Group, sort and filter these neighbours"
-    };
-    PopoverMenu::new(SharedString::from(format!("{}-card", group.edge)))
-        .trigger(
-            studio_ui::ds::row_icon_button(id, IconName::Filter)
-                .icon_color(Color::Muted)
-                .toggle_state(set)
-                .tip(studio_ui::ds::tooltip(tooltip)),
-        )
-        .anchor(gpui::Anchor::TopRight)
-        .menu(move |window, cx| {
-            if !can_open(exploration.read(cx), &group) {
-                return None;
-            }
-            let (exploration, group, path) = (exploration.clone(), group.clone(), path.clone());
-            Some(cx.new(|cx| NeighbourCard::new(exploration, group, Some(path), window, cx)))
-        })
 }

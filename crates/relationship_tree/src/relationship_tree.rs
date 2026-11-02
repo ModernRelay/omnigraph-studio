@@ -4,7 +4,7 @@
 //!
 //! Layer 5 (`docs/architecture.md`). Plan: `specs/005-relationship-tree/plan.md`.
 
-mod neighbour_card;
+mod neighbour_controls;
 mod rows;
 
 use std::ops::Range;
@@ -1123,9 +1123,9 @@ impl RelationshipTree {
                     .read(cx)
                     .filters(&key.group)
                     .iter()
-                    .map(neighbour_card::filter_words)
+                    .map(neighbour_controls::filter_words)
                     .collect();
-                let card = self.card_menu(row, entry, &key.group, sticky, selected, cx);
+                let controls = self.controls(row, entry, &key.group, sticky, selected, cx);
                 h_flex()
                     .min_w_0()
                     .flex_1()
@@ -1161,7 +1161,7 @@ impl RelationshipTree {
                         )
                     })
                     .child(div().flex_1())
-                    .children(card)
+                    .children(controls)
                     .child(
                         studio_ui::ds::text::meta(count_label)
                             .color(if matches!(count, Loadable::Failed(_)) {
@@ -1360,9 +1360,9 @@ impl RelationshipTree {
             .into_any_element()
     }
 
-    /// The group row's card button (spec 005, "A relationship's card"): shown while the row is
-    /// hovered or selected, and always while the relationship is grouped, ordered or filtered.
-    fn card_menu(
+    /// The group row's Sort, Group and Filter buttons (spec 005, "A relationship's
+    /// controls"): shown while the row is hovered or selected, and each always while it is set.
+    fn controls(
         &self,
         row: usize,
         entry: &Entry,
@@ -1371,34 +1371,31 @@ impl RelationshipTree {
         selected: bool,
         cx: &App,
     ) -> Option<AnyElement> {
-        let exploration = self.exploration.clone();
-        let read = exploration.read(cx);
-        if !neighbour_card::can_open(read, group) {
-            return None;
-        }
-        let set = !read.filters(group).is_empty()
-            || read.sort(group).is_some()
-            || read.grouping(group).is_some();
-        let always = selected || set;
-        let id = (
-            if sticky {
-                "sticky-neighbour-card"
-            } else {
-                "neighbour-card"
-            },
-            row,
-        );
+        let id = if sticky {
+            "sticky-neighbours"
+        } else {
+            "neighbours"
+        };
+        let controls =
+            neighbour_controls::controls(id, row, &self.exploration, group, &entry.path, cx)?;
+        let read = self.exploration.read(cx);
+        let set = [
+            read.sort(group).is_some(),
+            read.grouping(group).is_some(),
+            !read.filters(group).is_empty(),
+        ];
+        let buttons = [controls.sort, controls.group, controls.filter];
         Some(
-            div()
+            h_flex()
                 .flex_none()
-                .when(!always, |d| d.visible_on_hover("tree-row"))
-                .child(neighbour_card::card_button(
-                    id,
-                    set,
-                    exploration.clone(),
-                    group.clone(),
-                    entry.path.clone(),
-                ))
+                .children(buttons.into_iter().zip(set).filter_map(|(button, set)| {
+                    button.map(|button| {
+                        div()
+                            .flex_none()
+                            .when(!(selected || set), |d| d.visible_on_hover("tree-row"))
+                            .child(button)
+                    })
+                }))
                 .into_any_element(),
         )
     }
@@ -1832,15 +1829,15 @@ mod tests {
         }
     }
 
-    /// The group row's card sets a relationship's filters from a property, a test and a value,
-    /// refuses an empty value, and takes a filter off again; it orders the neighbours, turns the
-    /// order around and stops; and an answer in words sets the filters and the order, saying
-    /// what it could not use (spec 005).
+    /// The Filter popover sets a relationship's filters from a property, a test and a value,
+    /// refuses an empty value, and takes a filter off again; the Sort menu's order holds and
+    /// stops; and an answer in words sets the filters and the order, saying what it could not
+    /// use (spec 005).
     #[gpui::test]
     async fn the_filter_popover_sets_and_removes_a_relationships_filters(
         cx: &mut gpui::TestAppContext,
     ) {
-        use crate::neighbour_card::{NeighbourCard, can_open, filter_words};
+        use crate::neighbour_controls::{NeighbourFilters, can_open, filter_words, set_sort};
         use gq_language::builder::{Filter, FilterOp};
         cx.update(|cx| {
             studio_theme::init_test(cx);
@@ -1862,7 +1859,7 @@ mod tests {
         };
         assert!(exploration.read_with(cx, |e, _| can_open(e, &knows)));
         let (popover, cx) = cx.add_window_view(|window, cx| {
-            NeighbourCard::new(exploration.clone(), knows.clone(), None, window, cx)
+            NeighbourFilters::new(exploration.clone(), knows.clone(), None, window, cx)
         });
         cx.run_until_parked();
         popover.update_in(cx, |popover, window, cx| {
@@ -1889,9 +1886,16 @@ mod tests {
         assert_eq!(filter_words(&set[0]), "name is Bob");
         popover.update(cx, |popover, cx| popover.remove(0, cx));
         assert!(exploration.read_with(cx, |e, _| e.filters(&knows).is_empty()));
-        popover.update(cx, |popover, cx| {
-            popover.set_sort(Some("name".into()), cx);
-            popover.flip_sort(cx);
+        cx.update(|_, cx| {
+            set_sort(
+                &exploration,
+                &knows,
+                Some(gq_language::builder::Sort {
+                    property: "name".into(),
+                    descending: true,
+                }),
+                cx,
+            )
         });
         assert_eq!(
             exploration.read_with(cx, |e, _| e.sort(&knows).cloned()),
@@ -1900,7 +1904,7 @@ mod tests {
                 descending: true,
             })
         );
-        popover.update(cx, |popover, cx| popover.set_sort(None, cx));
+        cx.update(|_, cx| set_sort(&exploration, &knows, None, cx));
         assert!(exploration.read_with(cx, |e, _| e.sort(&knows).is_none()));
         // An answer in words: a filter and an order the card offers, and a key it does not.
         let answer: filter_words::Answer = serde_json::from_value(serde_json::json!({
