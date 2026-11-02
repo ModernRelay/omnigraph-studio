@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Sign a build with the Mac's own development identity, so the Keychain keeps trusting it.
 #
-#   script/sign-dev                                 # target/debug/omnigraph-studio
+#   script/sign-dev                                 # the debug build (CARGO_TARGET_DIR honoured)
 #   script/sign-dev target/release-fast/omnigraph-studio
 #   script/sign-dev "target/bundle/Omnigraph Studio.app"
 #
@@ -60,7 +60,8 @@ EOF
   exit 0
 fi
 
-target=${1:-$ROOT/target/debug/omnigraph-studio}
+# The build lands where cargo puts it: CARGO_TARGET_DIR when set, else the repository's target.
+target=${1:-${CARGO_TARGET_DIR:-$ROOT/target}/debug/omnigraph-studio}
 if ! security find-identity -v -p codesigning | grep -q "\"$identity\""; then
   echo "no identity \"$identity\" in the keychain: run script/sign-dev --make-identity" >&2
   exit 1
