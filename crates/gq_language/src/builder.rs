@@ -1043,25 +1043,27 @@ fn node_page_reading(
     fields_without: Option<&[String]>,
 ) -> Result<BuiltQuery, BuildError> {
     let node = node(schema, type_name)?;
+    // The row variable, bare, as the clause builders take it.
+    let row = &NODE_VAR[1..];
     let (sent, sort, empty) =
         page_without(filters, sort, start, fields_without.unwrap_or_default());
     let limit = if empty { 0 } else { limit };
     let mut params = Params::new();
-    let (keyset, order) = keyset("n", &node.name, &node.properties, sort, start, &mut params)?;
+    let (keyset, order) = keyset(row, &node.name, &node.properties, sort, start, &mut params)?;
     let mut clauses = vec![format!("{NODE_VAR}: {}", node.name)];
     clauses.extend(keyset);
     clauses.extend(filter_clauses(
         schema,
         &node.name,
         &node.properties,
-        "n",
+        row,
         &sent,
         &mut params,
     )?);
     let (name, returned, seeds) = match fields_without {
         None => (
             "studio_page",
-            "$n".to_owned(),
+            NODE_VAR.to_owned(),
             Some(Seeds::Nodes {
                 type_name: node.name.clone(),
             }),
@@ -1096,18 +1098,20 @@ pub fn node_count(
     filters: &[Filter],
 ) -> Result<BuiltQuery, BuildError> {
     let node = node(schema, type_name)?;
+    // The row variable, bare, as the clause builders take it.
+    let row = &NODE_VAR[1..];
     let mut params = Params::new();
     let mut clauses = vec![format!("{NODE_VAR}: {}", node.name)];
     clauses.extend(filter_clauses(
         schema,
         &node.name,
         &node.properties,
-        "n",
+        row,
         filters,
         &mut params,
     )?);
     let text = format!(
-        "query studio_count({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ count($n) as n }}\n}}\n",
+        "query studio_count({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ count({NODE_VAR}) as n }}\n}}\n",
         sig = params.signature(),
         clauses = clauses.join("\n    "),
     );
@@ -1484,10 +1488,12 @@ pub fn neighbour_counts(
     limit: u32,
 ) -> Result<BuiltQuery, BuildError> {
     let node = node(schema, type_name)?;
+    // The row variable, bare, as the clause builders take it.
+    let row = &NODE_VAR[1..];
     let (direction, edge_name) =
         parse_relationship_key(key).ok_or_else(|| BuildError::UnknownEdge(key.to_owned()))?;
     let edge = edge(schema, edge_name)?;
-    let (_, other_type, hop) = hop(edge, direction, "$n", "$g");
+    let (_, other_type, hop) = hop(edge, direction, NODE_VAR, "$g");
     let other = self::node(schema, other_type)?;
     let mut params = Params::new();
     let mut clauses = vec![format!("{NODE_VAR}: {}", node.name)];
@@ -1495,7 +1501,7 @@ pub fn neighbour_counts(
         schema,
         &node.name,
         &node.properties,
-        "n",
+        row,
         filters,
         &mut params,
     )?);
@@ -1512,7 +1518,7 @@ pub fn neighbour_counts(
         None => (String::new(), "value asc".to_owned()),
     };
     let text = format!(
-        "query studio_value_counts({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ $g.@id as value{label_column}, count($n) as n }}\n  order {{ {order} }}\n  limit {limit}\n}}\n",
+        "query studio_value_counts({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ $g.@id as value{label_column}, count({NODE_VAR}) as n }}\n  order {{ {order} }}\n  limit {limit}\n}}\n",
         sig = params.signature(),
         clauses = clauses.join("\n    "),
     );
@@ -1546,8 +1552,10 @@ pub fn neighbour_value_counts(
         return Err(BuildError::UnknownEdge(key.to_owned()));
     };
     let node = node(schema, type_name)?;
+    // The row variable, bare, as the clause builders take it.
+    let row = &NODE_VAR[1..];
     let edge = edge(schema, edge_name)?;
-    let (_, other_type, hop) = hop(edge, direction, "$n", "$g");
+    let (_, other_type, hop) = hop(edge, direction, NODE_VAR, "$g");
     let other = self::node(schema, other_type)?;
     let property = other
         .properties
@@ -1563,7 +1571,7 @@ pub fn neighbour_value_counts(
         schema,
         &node.name,
         &node.properties,
-        "n",
+        row,
         filters,
         &mut params,
     )?);
@@ -1572,7 +1580,7 @@ pub fn neighbour_value_counts(
     clauses.push(hop);
     clauses.push(format!("$g.{prop} is not null"));
     let text = format!(
-        "query studio_value_counts({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ $g.{prop} as value, count(distinct $n) as n }}\n  order {{ value asc }}\n  limit {limit}\n}}\n",
+        "query studio_value_counts({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ $g.{prop} as value, count(distinct {NODE_VAR}) as n }}\n  order {{ value asc }}\n  limit {limit}\n}}\n",
         sig = params.signature(),
         clauses = clauses.join("\n    "),
     );

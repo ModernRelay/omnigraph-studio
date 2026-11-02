@@ -54,7 +54,13 @@ pub(crate) fn can_filter(exploration: &Exploration, group: &RelationshipGroup) -
         .and_then(|schema| {
             schema
                 .node(&group.other_type)
-                .map(|other| !filterable(other).is_empty())
+                // Asked for each relationship row drawn: the first property with a test answers.
+                .map(|other| {
+                    other
+                        .properties
+                        .iter()
+                        .any(|property| !FilterOp::for_property(property).is_empty())
+                })
         })
         .unwrap_or(false)
 }

@@ -511,6 +511,8 @@ impl OpenGraphModal {
         let name = self.new_name.read(cx).text(cx);
         let url = self.new_url.read(cx).text(cx);
         let token = self.new_token.read(cx).text(cx);
+        // What the fields held as the add began, to clear them once it lands.
+        let fields = [name.clone(), url.clone(), token.clone()];
         let token = (!token.trim().is_empty()).then(|| token.trim().to_owned());
         let registry = ConnectionRegistry::global(cx);
         let listed: Vec<_> = registry
@@ -541,10 +543,7 @@ impl OpenGraphModal {
                         this.follow(registry.read(cx).connections.clone(), window, cx);
                         connection.update(cx, |c, cx| c.connect(cx));
                         this.select(connection, window, cx);
-                        // A second server is typed fresh, not added again from these fields.
-                        for editor in [&this.new_name, &this.new_url, &this.new_token] {
-                            editor.update(cx, |editor, cx| editor.set_text("", window, cx));
-                        }
+                        this.clear_added(&fields, window, cx);
                         window.focus(&this.graph_id.focus_handle(cx), cx);
                     }
                     Err(error) => {
@@ -555,6 +554,20 @@ impl OpenGraphModal {
             })
             .ok();
         }));
+    }
+
+    /// Clears the fields a server was added from, so a second server is typed fresh, not
+    /// added again from them: those that still hold what was added (`added`). One typed in
+    /// while the add ran keeps what was typed.
+    fn clear_added(&mut self, added: &[String; 3], window: &mut Window, cx: &mut Context<Self>) {
+        for (editor, added) in [&self.new_name, &self.new_url, &self.new_token]
+            .into_iter()
+            .zip(added)
+        {
+            if editor.read(cx).text(cx) == *added {
+                editor.update(cx, |editor, cx| editor.set_text("", window, cx));
+            }
+        }
     }
 
     fn update_token(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1939,6 +1952,33 @@ mod tests {
                 );
             });
         }
+    }
+
+    /// A server added clears the fields it was added from, so a second is typed fresh; a field
+    /// typed in while the add ran keeps what was typed. Before, every field was cleared.
+    #[gpui::test]
+    fn a_field_typed_in_while_a_server_is_added_keeps_its_text(cx: &mut TestAppContext) {
+        let (modal, cx) = dialog(Vec::new(), cx);
+        modal.update_in(cx, |modal, window, cx| {
+            let typed = |editor: &Entity<Editor>, text: &str, window: &mut Window, cx: &mut App| {
+                editor.update(cx, |editor, cx| editor.set_text(text, window, cx))
+            };
+            typed(&modal.new_name, "work", window, cx);
+            typed(&modal.new_url, "https://graph.test", window, cx);
+            typed(&modal.new_token, "secret", window, cx);
+            let added = [
+                "work".to_owned(),
+                "https://graph.test".into(),
+                "secret".into(),
+            ];
+            // The next server's address, typed while the first is added.
+            typed(&modal.new_url, "https://next.test", window, cx);
+            modal.clear_added(&added, window, cx);
+            let text = |editor: &Entity<Editor>, cx: &App| editor.read(cx).text(cx);
+            assert_eq!(text(&modal.new_name, cx), "");
+            assert_eq!(text(&modal.new_url, cx), "https://next.test");
+            assert_eq!(text(&modal.new_token, cx), "");
+        });
     }
 
     /// Which of Add server's fields has the keyboard.

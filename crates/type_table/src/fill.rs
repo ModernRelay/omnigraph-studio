@@ -29,6 +29,23 @@ pub const AT_ONCE: usize = 8;
 pub const MAX_ROWS: usize = 500;
 /// A source value longer than this is cut, so a row stays under the task's cap.
 const VALUE_CHARS: usize = 400;
+/// And no longer than this in bytes: one character as a reader counts it can be many bytes (an
+/// emoji sequence), which would carry a row past the task's cap all the same.
+const VALUE_BYTES: usize = VALUE_CHARS * 4;
+
+/// A source value as the input shows it: cut as the interface cuts text, to [`VALUE_CHARS`],
+/// and then to [`VALUE_BYTES`] at a character's edge.
+fn shown_value(text: &str) -> String {
+    let cut = studio_ui::text::cut(text, VALUE_CHARS);
+    if cut.len() <= VALUE_BYTES {
+        return cut;
+    }
+    let mut end = VALUE_BYTES - '…'.len_utf8();
+    while !cut.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &cut[..end])
+}
 
 pub fn schema() -> Value {
     json!({
@@ -74,10 +91,7 @@ pub fn input(target: &Property, sources: &[(String, Value)], instruction: &str) 
             Value::String(text) => text.clone(),
             other => other.to_string(),
         };
-        text.push_str(&format!(
-            "- {name}: {}\n",
-            studio_ui::text::cut(&shown, VALUE_CHARS)
-        ));
+        text.push_str(&format!("- {name}: {}\n", shown_value(&shown)));
     }
     text.push_str("\nInstruction: ");
     text.push_str(instruction.trim());
@@ -122,6 +136,11 @@ mod tests {
         let text = input(&target, &[("notes".into(), Value::from(long))], "the city");
         let shown = format!("- notes: {}…\n", "e\u{301}".repeat(VALUE_CHARS - 1));
         assert!(text.contains(&shown), "{text}");
+        // Characters of many bytes each are cut to the byte bound too.
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}".repeat(VALUE_CHARS);
+        let shown = shown_value(&family);
+        assert!(shown.len() <= VALUE_BYTES, "{}", shown.len());
+        assert!(shown.ends_with('…'));
         assert_eq!(
             serde_json::from_str::<Answer>(r#"{"value":"Paris","sure":true}"#).unwrap(),
             Answer {
