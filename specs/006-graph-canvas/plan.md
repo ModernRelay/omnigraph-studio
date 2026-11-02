@@ -32,7 +32,9 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   others set apart, and any type in focus with its relationships either side; a small schema
   drawn whole as one map. Grouped and laid out from the schema alone, with counts from
   `/snapshot` shown beside the types, so a count never moves anything.
-- **Exploring:** expanding a node adds one hub per relationship group with its count; opening a
+- **Exploring:** expanding a node adds one hub per relationship group that has neighbours, once
+  its count is in (since 2026-11-01; before, every group's hub appeared at once and the empty
+  ones went as their counts came in, which read as flicker); opening a
   hub adds 8 neighbours, then "+K more". State lives in `Exploration`, shared with the tree.
 - **Rendering:** one custom element. Nodes as quads with labels shown above a zoom threshold;
   edges batched by color in one paint layer with cached geometry; hit-testing through an
@@ -172,6 +174,7 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 ## Validation log
 
 | Date | Claim | Check | Result |
+| 2026-11-01 | A hub appears only once counted and non-empty | `graph_canvas` `model` tests (`a_single_target_hub_reached_twice_is_open_by_either_path` with counts, `the_cap_counts_relationships_and_each_node_once` counting only drawn hubs) | Pass. Ragnor's call: hubs that appeared and then went as their counts came in empty were noise |
 |---|---|---|---|
 | 2026-11-01 | A canvas walks from one node; a set goes to a tree | `graph_canvas` tests; an offscreen snapshot of a walk opened from a selected tree row | Spec 020 removes drawing a table's rows, which was a grid of unconnected chips. A query's picture is Graph, and only when its result links |
 | 2026-11-01 | One canvas per root and commit; a table's rows draw as a captured set | `graph_canvas` `a_canvas_starts_from_the_graphs_saved_positions`, `a_captured_set_is_known_by_what_it_holds`; offscreen snapshots; a saved root-less canvas restored twice | Spec 020. No blank canvas; a saved one's positions stay for each new canvas of its graph |

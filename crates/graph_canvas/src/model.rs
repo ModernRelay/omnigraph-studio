@@ -277,7 +277,9 @@ pub fn explore_scene(
                     skipped[index] = true;
                     continue;
                 };
-                if *count == Loadable::Loaded(0) {
+                // A hub is drawn once it is counted and has something: the pills do not
+                // appear for every relationship and then go as their counts come in empty.
+                if !matches!(count, Loadable::Loaded(n) if *n > 0) {
                     skipped[index] = true;
                     continue;
                 }
@@ -489,7 +491,7 @@ pub fn explore_scene(
 fn left_out(entry: &Entry, drawn: &HashMap<SceneId, usize>, hidden: &mut HashSet<SceneId>) {
     let id = match &entry.kind {
         EntryKind::Node { node, .. } => SceneId::Node(node.clone()),
-        EntryKind::Group { key, count, .. } if *count != Loadable::Loaded(0) => {
+        EntryKind::Group { key, count, .. } if matches!(count, Loadable::Loaded(n) if *n > 0) => {
             SceneId::Hub(key.clone())
         }
         EntryKind::Field {
@@ -822,15 +824,23 @@ mod tests {
         };
         let mut state = ExploreState::rooted(ada.clone());
         state.root_status = Loadable::Loaded(());
-        state.neighbours.insert(
-            GroupKey::new(ada, knows.clone()),
-            list(vec![bob.clone(), cid.clone()]),
-        );
-        state.neighbours.insert(
-            GroupKey::new(cid.clone(), knows.clone()),
-            list(vec![bob.clone()]),
-        );
+        // A hub is drawn once counted.
+        let ada_knows_key = GroupKey::new(ada, knows.clone());
+        state
+            .counts
+            .insert(ada_knows_key.clone(), Loadable::Loaded(2));
+        state
+            .neighbours
+            .insert(ada_knows_key, list(vec![bob.clone(), cid.clone()]));
+        let cid_knows_key = GroupKey::new(cid.clone(), knows.clone());
+        state
+            .counts
+            .insert(cid_knows_key.clone(), Loadable::Loaded(1));
+        state
+            .neighbours
+            .insert(cid_knows_key, list(vec![bob.clone()]));
         let key = GroupKey::new(bob.clone(), employer.clone());
+        state.counts.insert(key.clone(), Loadable::Loaded(1));
         state
             .neighbours
             .insert(key.clone(), list(vec![acme.clone()]));
@@ -875,13 +885,13 @@ mod tests {
     }
 
     /// At a cap that leaves only Ada drawn, the banner counts what it left out: Ada's three
-    /// relationship chips, the 20 people under one of them (p05 once, though p00 reaches it
-    /// too), and p00's three relationship chips.
+    /// counted relationship chip (the two not counted yet are not drawn, so not left out), the
+    /// 20 people under it (p05 once, though p00 reaches it too), and p00's counted chip.
     #[test]
     fn the_cap_counts_relationships_and_each_node_once() {
         let (schema, state) = exploration();
         let scene = explore_scene(&state.entries(&schema), &state, &HashMap::new(), 1);
         assert_eq!(scene.nodes.len(), 1);
-        assert_eq!(scene.capped, Some((3 + 20 + 3, "Person".into())));
+        assert_eq!(scene.capped, Some((1 + 20 + 1, "Person".into())));
     }
 }
