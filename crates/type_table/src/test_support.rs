@@ -885,9 +885,19 @@ fn serve_blobs(
                 });
                 (200, json!({ "commits": [commit] }))
             } else if path.ends_with("/query") {
+                // The rows see the token the read was sent with as `token`.
+                let token = request
+                    .headers()
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.strip_prefix("Bearer "))
+                    .map(str::to_owned);
                 let mut bytes = Vec::new();
                 request.into_body().read_to_end(&mut bytes).await.ok();
                 let mut asked: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                if let (Some(token), Some(asked)) = (token, asked.as_object_mut()) {
+                    asked.insert("token".into(), Value::String(token));
+                }
                 // A read at a commit is answered there; a read of the branch at the other
                 // writer's newest commit, or c1. The rows see it as `at`.
                 let at_now = |asked: &Value| {
@@ -918,13 +928,19 @@ fn serve_blobs(
                 } else {
                     rows
                 };
-                // An answer `{"refuse": message}` is the server refusing the read.
+                // An answer `{"refuse": message}` is the server refusing the read; with
+                // `"forbidden": true`, the credential's policy refusing it (403).
                 if let Some(message) = rows.get("refuse").and_then(Value::as_str) {
+                    let (status, code) = if rows["forbidden"] == true {
+                        (403, "forbidden")
+                    } else {
+                        (400, "bad_request")
+                    };
                     return Ok(Response::builder()
-                        .status(400)
+                        .status(status)
                         .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
                         .body(AsyncBody::from(
-                            json!({ "error": message, "code": "bad_request", "disposition": { "action": "fix", "effects": "none" } }).to_string(),
+                            json!({ "error": message, "code": code, "disposition": { "action": "fix", "effects": "none" } }).to_string(),
                         ))
                         .unwrap());
                 }
