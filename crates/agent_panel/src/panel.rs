@@ -183,7 +183,7 @@ pub fn open(
         return Some(panel);
     }
     let graph = workspace.session()?.read(cx).overrides_key();
-    let agent = crate::sessions::command_key(&StudioSettings::get(cx).agent.command);
+    let agent = StudioSettings::get(cx).agent.command.clone();
     let sessions = AgentSessions::global(cx);
     let latest = sessions
         .read(cx)
@@ -2609,7 +2609,7 @@ fn agent_for(session_id: Option<&str>, sessions: &Entity<AgentSessions>, cx: &Ap
     agents(cx)
         .into_iter()
         .map(|(_, command)| command)
-        .find(|command| crate::sessions::command_key(command) == held)
+        .find(|command| crate::sessions::is_agent(&held, command))
         .unwrap_or_else(|| crate::sessions::command_of(&held))
 }
 

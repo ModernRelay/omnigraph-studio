@@ -29,6 +29,8 @@ use manifest::{PlatformUpdate, Release};
 pub const FIRST_CHECK: Duration = Duration::from_secs(30);
 /// How often it checks while it runs.
 pub const CHECK_EVERY: Duration = Duration::from_secs(60 * 60);
+/// How many times one version's install may fail in a run before it is refused.
+const INSTALL_TRIES: u32 = 2;
 /// How long a check waits for the manifest.
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long the answer to a check the person asked for stays in the status bar.
@@ -96,7 +98,8 @@ pub enum InstallError {
     /// The file is not a genuine update: never fetched again this run.
     Refused(String),
     /// The download or install did not finish. Said, and tried again at the next check, which
-    /// the person can also ask for (Check for Updates).
+    /// the person can also ask for (Check for Updates); an install that fails
+    /// [`INSTALL_TRIES`] times is not tried again this run.
     Failed(String),
 }
 
@@ -123,6 +126,9 @@ pub struct Updater {
     newest: Option<Version>,
     /// Versions refused or not installed this run, with what was said: never fetched again.
     refused: HashMap<Version, String>,
+    /// Installs that did not finish this run, by version: one is tried again at the next check,
+    /// and one that fails [`INSTALL_TRIES`] times is refused like a bad download.
+    install_failures: HashMap<Version, u32>,
     /// Whether the person asked for the work under way, so its outcome is said.
     asked: bool,
     /// What the item shows once nothing is under way or being said: nothing, or a newer
@@ -147,6 +153,7 @@ impl Updater {
             state: UpdateState::Idle,
             newest: None,
             refused: HashMap::new(),
+            install_failures: HashMap::new(),
             asked: false,
             resting: UpdateState::Idle,
             work: None,
@@ -393,14 +400,22 @@ impl Updater {
                     let reason = format!("Couldn't install {version}: {error}.");
                     this.refuse(version, reason, cx);
                 }
-                // One that may pass (a full disk) is tried again, as a download that did not
-                // finish is.
+                // One that may pass (a full disk) is tried again at the next check, as a
+                // download that did not finish is; one that fails again is refused, rather than
+                // fetched and installed again at every check.
                 Err(InstallError::Failed(error)) => {
                     log::warn!("update {version} install failed: {error}");
-                    let message = format!(
-                        "Couldn't install {version}: {error}. Studio will try again at the next check."
-                    );
-                    this.finish(UpdateState::Failed { message }, cx);
+                    let failures = this.install_failures.entry(version.clone()).or_default();
+                    *failures += 1;
+                    if *failures >= INSTALL_TRIES {
+                        let reason = format!("Couldn't install {version}: {error}.");
+                        this.refuse(version, reason, cx);
+                    } else {
+                        let message = format!(
+                            "Couldn't install {version}: {error}. Studio will try again at the next check."
+                        );
+                        this.finish(UpdateState::Failed { message }, cx);
+                    }
                 }
             })
             .ok();
@@ -904,7 +919,8 @@ mod tests {
     }
 
     /// An install that did not finish (a full disk) is tried again at the next check, as a
-    /// download that did not finish is. Before, it was refused for the rest of the run.
+    /// download that did not finish is; one that fails again is refused for the run, rather
+    /// than fetched and installed again at every check.
     #[gpui::test]
     async fn a_failed_install_waits_for_the_next_check(cx: &mut TestAppContext) {
         let folder = bundle();
@@ -926,6 +942,17 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(installer.downloads.load(Ordering::SeqCst), 2, "tried again");
         assert_eq!(installer.installed.lock().unwrap().len(), 2);
+        // Failed twice, it is refused: not fetched again at every check, and the reason shows.
+        let UpdateState::Available { reason, .. } = state(&updater, cx) else {
+            panic!("{:?}", state(&updater, cx));
+        };
+        assert_eq!(
+            reason.as_deref(),
+            Some("Couldn't install 0.3.0: disk full.")
+        );
+        cx.executor().advance_clock(CHECK_EVERY);
+        cx.run_until_parked();
+        assert_eq!(installer.downloads.load(Ordering::SeqCst), 2);
     }
 
     #[gpui::test]

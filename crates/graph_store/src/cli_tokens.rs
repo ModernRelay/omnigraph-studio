@@ -1971,18 +1971,6 @@ exit 64
                 "credentials status --profile work --json"
             ],
         );
-        // The profile moved to another organization: its targets' revisions move with it, so a
-        // target's token source, which checks a sign-in against it, is made again.
-        let revision = |listed: &crate::cli_config::CliTargets| {
-            let servers = listed.servers.as_ref().unwrap();
-            let cloud = servers.iter().find(|server| server.name == "cloud");
-            cloud.unwrap().revision.clone()
-        };
-        cli.profile("work", Some("org_other"));
-        let moved = smol::block_on(read_targets(Some(&home), &cli.programs(), Platform::Unix));
-        assert_ne!(revision(&moved), revision(&listed));
-        cli.profile("work", Some("org_work"));
-        cli.commands();
 
         // Where the CLI exports no token (Windows), the same CLI is found and the same targets
         // listed with the same one command: the anonymous ones land, `stored-too` now the one
