@@ -2390,6 +2390,8 @@ exit 64
         assert!(!turned.contains("secret-data-token"));
         let stored = cli.source("stored", "https://store.example.com/", CliCredential::Store);
         assert_eq!(stored.login_profile(), None);
+        assert_eq!(stored.organization(), None);
+        assert!(!stored.organization_unread());
     }
 
     /// A refused export says the CLI's reason, without its colours or its note of the target,
