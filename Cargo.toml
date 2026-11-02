@@ -8,6 +8,7 @@ members = [
     "crates/studio_ui",
     "crates/studio_workspace",
     "crates/change_cards",
+    "crates/filter_words",
     "crates/graph_client",
     "crates/graph_store",
     "crates/gq_language",
@@ -51,6 +52,7 @@ studio_theme = { path = "crates/studio_theme" }
 studio_ui = { path = "crates/studio_ui" }
 studio_workspace = { path = "crates/studio_workspace" }
 change_cards = { path = "crates/change_cards" }
+filter_words = { path = "crates/filter_words" }
 graph_client = { path = "crates/graph_client" }
 graph_store = { path = "crates/graph_store" }
 studio_update = { path = "crates/studio_update" }

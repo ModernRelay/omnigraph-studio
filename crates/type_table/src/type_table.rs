@@ -21,7 +21,7 @@ mod table;
 mod test_support;
 mod text_editor;
 mod types_list;
-mod words;
+use filter_words as words;
 mod write;
 
 use gpui::{App, AppContext as _, Context, Entity, Window};

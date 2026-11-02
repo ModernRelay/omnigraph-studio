@@ -3147,6 +3147,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "filter_words"
+version = "0.2.2"
+dependencies = [
+ "gq_language",
+ "model",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8356,7 +8366,9 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 name = "relationship_tree"
 version = "0.2.2"
 dependencies = [
+ "chrono",
  "editor",
+ "filter_words",
  "gpui",
  "gq_language",
  "graph_store",
@@ -10783,6 +10795,7 @@ dependencies = [
  "chrono",
  "collections",
  "editor",
+ "filter_words",
  "futures",
  "gpui",
  "gq_language",

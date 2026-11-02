@@ -1,16 +1,16 @@
-//! A table filter from a sentence (spec 019): what the table sends the model (the type's
+//! A filter from a sentence (spec 019): what the table, or a relationship in the tree, sends the
+//! model (the type's
 //! properties, enums, relationships and operators, and the sentence), the shape it asks the
 //! answer in, and the answer checked against what the table offers. Every filter that comes
 //! back goes through the same keys, operators and value parsing a filter typed by hand does;
 //! one the type cannot take is dropped and named.
 
 use gq_language::builder::{Filter, FilterOp, NODE_VAR, Sort};
+use gq_language::input::parse_scalar;
 use gq_language::schema::Property;
+use model::{Limits, Task as ModelTask, Tier};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use studio_workspace::models::{Limits, ModelTask, Tier};
-
-use crate::model::parse_filter_value;
 
 pub static TASK: ModelTask = ModelTask {
     name: "table-filter",
@@ -445,6 +445,20 @@ fn filter(item: &Item, choices: &[Choice]) -> Result<Filter, String> {
         op,
         value,
     })
+}
+
+/// A filter's value as typed for `property`: one element, parsed as its kind; an empty text is
+/// refused.
+pub fn parse_filter_value(property: &Property, text: &str) -> Result<Value, String> {
+    let element = Property {
+        list: false,
+        nullable: false,
+        ..property.clone()
+    };
+    if text.trim().is_empty() {
+        return Err("Enter a value".into());
+    }
+    parse_scalar(&element, text)
 }
 
 #[cfg(test)]

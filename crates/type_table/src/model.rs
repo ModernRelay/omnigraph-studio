@@ -740,18 +740,7 @@ pub fn edited(property: &Property, old: &Value, text: &str) -> Option<Result<Val
     }
 }
 
-/// Parses a filter's value: one element for a list's membership test.
-pub fn parse_filter_value(property: &Property, text: &str) -> Result<Value, String> {
-    let element = Property {
-        list: false,
-        nullable: false,
-        ..property.clone()
-    };
-    if text.trim().is_empty() {
-        return Err("Enter a value".into());
-    }
-    parse_scalar(&element, text)
-}
+pub use filter_words::parse_filter_value;
 
 /// The values of an "is one of" filter, read as a list cell's items are
 /// ([`gq_language::input::list_texts`]): separated by commas, one holding a comma quoted
