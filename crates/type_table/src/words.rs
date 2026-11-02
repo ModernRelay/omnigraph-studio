@@ -18,10 +18,13 @@ pub static TASK: ModelTask = ModelTask {
     tier: Tier::Fast,
     // A wide type with many relationships describes itself in more than the tier's cap; the
     // call is still one short answer. The personal graph's widest type, Artifact, with its
-    // order, grouping and columns, comes to about 33 KB.
+    // order, grouping and columns, comes to about 33 KB. The answer names the filters, the
+    // order, the grouping and the columns shown, which for a wide type ("every column but the
+    // notes") runs past the tier's 300 tokens: cut off, the whole answer would be lost.
     limits: Limits {
         input_bytes: 48 * 1024,
-        ..Tier::Fast.limits()
+        output_tokens: 1000,
+        time: std::time::Duration::from_secs(20),
     },
 };
 

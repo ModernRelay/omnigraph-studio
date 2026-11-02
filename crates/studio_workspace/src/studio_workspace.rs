@@ -1123,6 +1123,16 @@ impl Workspace {
     fn flush_saves(&mut self, cx: &mut Context<Self>) {
         self.save_open_graphs(cx);
         self.save_now(cx);
+        // A graph parked behind the one shown whose last save failed (a full disk when it was
+        // parked) is written again too: nothing else visits it before the window goes.
+        for parked in &self.parked {
+            if let Some(saved) = &parked.saved {
+                let key = saved_key_of(&parked.session, cx);
+                if persistence::save_failed(&key) {
+                    persistence::save(&key, saved);
+                }
+            }
+        }
         // A move or resize just before the window closes or Studio quits is kept too.
         self._save_bounds = None;
         self.save_bounds(cx);

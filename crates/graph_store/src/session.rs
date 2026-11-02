@@ -1244,10 +1244,6 @@ impl GraphSession {
         }
     }
 
-    /// Asks a graph that answered 503 again, refreshing what is held rather than letting it
-    /// go: the schema, the branch list, the type counts and the stored-query catalog (once
-    /// wanted) held stay shown while they are read, and stay if the graph still cannot answer;
-    /// what was never read is read.
     /// Asks after the graph's availability again once the wait has passed, the next wait twice
     /// as long, up to [`RECHECK_CAP`]: now when a window shows it, else when one does.
     fn recheck_later(&mut self, cx: &mut Context<Self>) {
@@ -1267,6 +1263,10 @@ impl GraphSession {
         }));
     }
 
+    /// Asks a graph that answered 503 again, refreshing what is held rather than letting it
+    /// go: the schema, the branch list, the type counts and the stored-query catalog (once
+    /// wanted) held stay shown while they are read, and stay if the graph still cannot answer;
+    /// what was never read is read.
     fn recheck_available(&mut self, cx: &mut Context<Self>) {
         if matches!(self.schema, Loadable::Loaded(_)) {
             self.recheck_schema(None, cx);
@@ -2494,6 +2494,11 @@ impl GraphSession {
         if cx.active_window().is_some() && std::mem::take(&mut self.head_check_missed) {
             self.check_heads(cx);
         }
+        // What failed while parked is read now: its connection may have come back meanwhile,
+        // its own graph shown elsewhere having taken the change of state.
+        if self.connection.read(cx).state == ConnectionState::Ready {
+            self.read_failed_again(cx);
+        }
     }
 
     /// Sends the first reads of a graph a window shows, once its connection's token is ready
@@ -2568,8 +2573,9 @@ impl GraphSession {
         if matches!(self.branches, Loadable::Failed(_)) {
             self.reload_branches(cx);
         }
+        // Counts still shown stay shown while they are read again, as a head move reads them.
         if matches!(self.snapshot, Loadable::Failed(_)) || self.counts_stale.is_some() {
-            self.reload_counts(cx);
+            self.refresh_counts(cx);
         }
         if self.stored_queries_wanted && matches!(self.stored_queries, Loadable::Failed(_)) {
             self.reload_stored_queries(cx);
@@ -7926,6 +7932,23 @@ mod tests {
         session.read_with(cx, |session, _| {
             assert!(matches!(session.branches, Loadable::Loaded(_)));
         });
+
+        // Parked when a read failed and the connection came back, the graph reads it once it
+        // is shown again: no other change of state comes to read it.
+        session.update(cx, |session, cx| session.set_shown(false, cx));
+        session.update(cx, |session, _| {
+            session.schema = Loadable::Failed("the network".into())
+        });
+        down.store(true, Ordering::SeqCst);
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        cx.run_until_parked();
+        down.store(false, Ordering::SeqCst);
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        cx.run_until_parked();
+        assert!(!schema_loaded(cx), "parked, it reads nothing");
+        session.update(cx, |session, cx| session.set_shown(true, cx));
+        cx.run_until_parked();
+        assert!(schema_loaded(cx), "read once shown");
     }
 
     /// A write refused for its token asks the source again, as a read does (spec 016, 401 and

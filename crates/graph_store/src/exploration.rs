@@ -1856,6 +1856,19 @@ impl Exploration {
             }
             LoadTarget::Root => true,
         });
+        // What those reads marked as being read goes with them, or the grouping switched back
+        // to would wait on reads nobody makes. What came in stays, for a switch back.
+        let state = self.state.unseen();
+        let ours = |key: &GroupKey| key.group == *group;
+        state
+            .values
+            .retain(|(key, _), values| !ours(key) || !values.is_loading());
+        state.counts.retain(|key, count| {
+            !ours(key) || key.within.is_none() || !matches!(count, Loadable::Loading)
+        });
+        state.neighbours.retain(|key, list| {
+            !ours(key) || key.within.is_none() || !matches!(list.status, PageStatus::Loading)
+        });
         self.request_missing(cx);
         self.changed(cx);
         cx.emit(ExplorationEvent::SelectionChanged);
@@ -3287,6 +3300,10 @@ mod tests {
                 !asked(exploration, &by_name),
                 "the first grouping's read let go"
             );
+            // Switched back before it answered, the first grouping is read again: its read let
+            // go leaves no mark that it is being read.
+            exploration.set_grouping(&knows, Some(by_name.clone()), cx);
+            assert!(asked(exploration, &by_name), "read again");
             exploration.set_grouping(&knows, None, cx);
         });
         cx.run_until_parked();

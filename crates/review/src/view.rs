@@ -285,10 +285,6 @@ const MERGE_RUNNING: &str =
     "A merge is running, or may be: a fix now could land on either side of it.";
 const BRANCH_DELETED: &str = "The merge deleted the branch: there is no branch to fix now.";
 
-/// What a reviewed mark is kept by: the entity and what its change does, so the mark holds
-/// until the entity changes again, whichever commits the review reads the change from. A review
-/// since a merge reads every change at the reviewed head, which a fix moves. Made with the fold,
-/// off the main thread: a review holds up to 20,000 changes, and their values can be long.
 /// What an entity group is, whatever its place among the groups: an edge or a node, its type
 /// and its id.
 type GroupId = (bool, String, String);
@@ -297,6 +293,10 @@ fn group_id(group: &EntityGroup) -> GroupId {
     (group.is_edge, group.type_name.clone(), group.id.clone())
 }
 
+/// What a reviewed mark is kept by: the entity and what its change does, so the mark holds
+/// until the entity changes again, whichever commits the review reads the change from. A review
+/// since a merge reads every change at the reviewed head, which a fix moves. Made with the fold,
+/// off the main thread: a review holds up to 20,000 changes, and their values can be long.
 fn mark_of(change: &FoldedChange) -> u64 {
     use std::fmt::Write as _;
     use std::hash::{DefaultHasher, Hash as _, Hasher};
@@ -830,7 +830,13 @@ impl ReviewView {
                 );
                 self.branch_deleted = false;
                 self.merge = MergeState::Idle;
+                // Nothing of the deleted branch's review holds for this one: not a commit it was
+                // scoped to, which this branch may not hold, nor the marks made on its changes.
+                self.scope = None;
                 self.reload(cx);
+                self.reviewed_keys.clear();
+                self.expanded.clear();
+                self.whole_texts.clear();
             }
             _ => return,
         }
@@ -1229,6 +1235,10 @@ impl ReviewView {
                 // hidden, and the keys do not act on it ([`Self::cards_shown`]).
                 if self.row_of_group(group).is_none() && self.unfold_run_of(group) {
                     self.lay_out_in_place();
+                    // Laid out with the card still hidden (a search hides it), the selection
+                    // would move to the first card shown, and the keys act on that one: the
+                    // change asked for stays selected, and they act on nothing.
+                    self.selected = Some(change);
                 }
                 if let Some(row) = self.row_of_group(group) {
                     self.list_state.scroll_to_reveal_item(row);
@@ -5420,9 +5430,19 @@ pub(crate) mod tests {
             assert!(view.row_of_group(group).is_some(), "its run opened");
             assert!(view.cards_shown());
 
-            view.toggle_run(run, cx);
+            view.toggle_run(run.clone(), cx);
             view.selected = Some(change);
             assert!(!view.cards_shown(), "a hidden card is not acted on");
+
+            // Its run folded and a search hiding it, the change asked for stays selected rather
+            // than the first card shown taking its place, and the keys act on nothing.
+            view.searched.matched = Some(vec![false; view.change_count()]);
+            view.lay_out();
+            view.select(change, cx);
+            assert_eq!(view.selected, Some(change));
+            assert!(!view.cards_shown());
+            view.searched = Searched::default();
+            view.lay_out();
 
             // The model's summary is of the review it read: another scope, or another token,
             // lets it go, though the head is the same.
@@ -6351,7 +6371,12 @@ pub(crate) mod tests {
                 });
             }
             // Made again under its name, the branch is another, whose review the tab, reused for
-            // it, reads afresh: its head watched, its fixes not refused, and kept with the window.
+            // it, reads afresh: its head watched, its fixes not refused, and kept with the window;
+            // neither the commit the old review was scoped to nor its marks carry over.
+            view.update(cx, |view, _| {
+                view.scope = Some("f1".into());
+                view.reviewed_keys.insert(42);
+            });
             let session = view.read_with(cx, |view, _| view.session.clone());
             session.update(cx, |session, cx| {
                 session.branches =
@@ -6364,6 +6389,8 @@ pub(crate) mod tests {
                 assert!(view._head_watch.is_some());
                 assert!(view.serialize(cx).is_some());
                 assert!(matches!(view.merge, MergeState::Idle));
+                assert!(view.scope.is_none(), "no commit of the branch deleted");
+                assert!(view.reviewed_keys.is_empty(), "nor its marks");
             });
         }
     }

@@ -655,7 +655,8 @@ enum FilterMenuEntry {
     },
 }
 
-/// A Filter menu entry that sets the filter being written to `key`.
+/// A Filter menu entry that sets the filter being written to `key`: the draft's own key menu,
+/// so a filter opened from its pill is still the one it replaces ([`TypeTable::change_draft_key`]).
 fn filter_key_entry(
     table: &WeakEntity<TypeTable>,
     key: String,
@@ -669,7 +670,7 @@ fn filter_key_entry(
         .handler(move |window, cx| {
             table
                 .update(cx, |this, cx| {
-                    this.set_draft_property(key.clone(), window, cx)
+                    this.change_draft_key(key.clone(), window, cx)
                 })
                 .ok();
         })
@@ -1307,6 +1308,9 @@ impl TypeTable {
                 // A Refresh asked for on the branch left reads nothing here, and a fill under
                 // way ends: its answers are drafts bound to the rows the branch left showed.
                 self._refresh = None;
+                if self.fill_editor.focus_handle(cx).is_focused(window) {
+                    window.focus(&self.focus_handle, cx);
+                }
                 self.fill = None;
                 // A file still being stored goes on to the branch left, and its toast tells how
                 // it ended; the new branch's cells show none of it.
@@ -7311,6 +7315,22 @@ impl TypeTable {
         self.set_draft_property(property.name, window, cx);
     }
 
+    /// The draft tests another key, from its own key menu: opened from a pill, it still replaces
+    /// that pill's filter where it stands. A draft started anew ([`Self::set_draft_property`])
+    /// leaves a filter being edited as it was.
+    fn change_draft_key(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let replacing = self
+            .filter_draft
+            .as_ref()
+            .and_then(|draft| draft.replacing.clone());
+        self.set_draft_property(name, window, cx);
+        if let Some(draft) = &mut self.filter_draft
+            && draft.replacing.is_none()
+        {
+            draft.replacing = replacing;
+        }
+    }
+
     fn set_draft_property(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(&op) = self.ops_for(&name).first() else {
             return;
@@ -7474,8 +7494,9 @@ impl TypeTable {
         }
     }
 
-    /// A click on a pill: the filter comes out of the bar into the draft, its key, test and
-    /// value as they were, to change and apply again or put back with Esc.
+    /// A click on a pill: the pill shows as the draft, its key, test and value as they were, to
+    /// change and apply in its place; Esc leaves it as it was. The filter stays applied the
+    /// while, so the rows and every page read follow it.
     fn edit_filter(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index >= self.filters.len() {
             return;
@@ -7594,7 +7615,6 @@ impl TypeTable {
         cx.notify();
     }
 
-    /// The keys the filter menu offers, with their operators and properties, for the model.
     /// What a sentence may order, group and show the rows by: the properties that can order
     /// the table, what the Group menu offers, and the columns.
     fn view_choices(&self) -> words::ViewChoices {
@@ -7624,10 +7644,12 @@ impl TypeTable {
     /// do, those named shown in the order named and the rest hidden. The caller reads the table
     /// again.
     fn apply_words_view(&mut self, view: words::View, cx: &mut Context<Self>) {
-        if let Some(sort) = view.sort {
+        // Judged again as it lands: the schema can change while the model answers, and an
+        // order or a grouping by a property it no longer has would fail the read.
+        if let Some(sort) = view.sort.filter(|sort| self.can_sort_by(sort)) {
             self.sort = Some(sort);
         }
-        if let Some(key) = view.group_by
+        if let Some(key) = view.group_by.filter(|key| self.can_group_by(key))
             && self.grouping.as_ref().map(|grouping| &grouping.property) != Some(&key)
         {
             self.grouping = Some(Grouping::new(key));
@@ -7652,6 +7674,7 @@ impl TypeTable {
         }
     }
 
+    /// The keys the filter menu offers, with their operators and properties, for the model.
     fn words_choices(&self) -> Vec<words::Choice> {
         self.filter_choices()
             .iter()
@@ -11013,10 +11036,6 @@ mod tests {
         });
     }
 
-    /// The Filter menu lists each relationship once, with its neighbours' properties in a
-    /// submenu of it; a relationship without any is a plain entry. Before, every neighbour
-    /// property followed its relationship in the one menu: 1,122 entries for the personal
-    /// graph's Person, every one drawn at each frame the menu was open.
     /// The condition field's hint names the row the queries bind ([`builder::NODE_VAR`]).
     #[test]
     fn the_condition_hint_names_the_row_variable() {
@@ -11026,6 +11045,10 @@ mod tests {
         );
     }
 
+    /// The Filter menu lists each relationship once, with its neighbours' properties in a
+    /// submenu of it; a relationship without any is a plain entry. Before, every neighbour
+    /// property followed its relationship in the one menu: 1,122 entries for the personal
+    /// graph's Person, every one drawn at each frame the menu was open.
     #[test]
     fn the_filter_menu_nests_each_relationships_neighbour_properties() {
         let choice = |key: &str| (key.to_owned(), key.to_owned(), IconName::CaseSensitive);
@@ -11370,7 +11393,8 @@ mod tests {
     /// rows still showed it.
     #[gpui::test]
     async fn a_filter_being_edited_still_filters_the_rows(cx: &mut TestAppContext) {
-        let session = session(PEOPLE, cx);
+        let schema = PEOPLE.replace("  name: String\n", "  name: String\n  city: String?\n");
+        let session = session(&schema, cx);
         let (table, cx) = people_table(&session, cx);
         let named = |name: &str| Filter {
             property: "name".into(),
@@ -11398,6 +11422,24 @@ mod tests {
             table.apply_filter_draft(window, cx);
             assert_eq!(table.filters, [named("Grace")], "replaced where it stood");
             assert!(table.filter_draft.is_none());
+
+            // Its key changed from the draft's own key menu, it still replaces the filter it
+            // was opened from rather than adding another.
+            table.edit_filter(0, window, cx);
+            table.change_draft_key("city".into(), window, cx);
+            table
+                .filter_editor
+                .update(cx, |editor, cx| editor.set_text("London", window, cx));
+            table.apply_filter_draft(window, cx);
+            assert_eq!(
+                table.filters,
+                [Filter {
+                    property: "city".into(),
+                    op: FilterOp::Eq,
+                    value: serde_json::json!("London"),
+                }],
+                "one filter, on the other key"
+            );
         });
     }
 

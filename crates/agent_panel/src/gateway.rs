@@ -994,8 +994,10 @@ async fn read_request(
             // twice its size.
             rest.reserve_exact(length.saturating_sub(rest.len()));
             while rest.len() < length {
+                // Never past the length: bytes sent beyond it would grow the body over it.
+                let want = (length - rest.len()).min(chunk.len());
                 let read = stream
-                    .read(&mut chunk)
+                    .read(&mut chunk[..want])
                     .await
                     .map_err(|_| ReadFailure::Gone)?;
                 if read == 0 {
@@ -1080,7 +1082,8 @@ async fn read_chunked(
             return Err(too_large());
         }
         // The data goes straight into the body, as it arrives: gathered first, a large chunk
-        // would be held twice.
+        // would be held twice. Room for it is made at once, rather than by doubling.
+        body.reserve(size);
         let buffered = size.min(pending.len());
         body.extend_from_slice(&pending[..buffered]);
         pending.drain(..buffered);
