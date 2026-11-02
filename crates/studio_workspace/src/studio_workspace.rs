@@ -353,6 +353,9 @@ pub struct Workspace {
     toasts: Vec<Toast>,
     next_toast: usize,
     actions: Vec<ActionRegistration>,
+    /// The views the active tab offers, as the frame drawn asked them once ([`Self::offers_view`]):
+    /// each view action's condition reads them, rather than asking the tab again.
+    offered_views: Vec<ViewKind>,
     focus_handle: FocusHandle,
     /// A press on a header strip that becomes a window move if the pointer moves.
     drag_pending: bool,
@@ -637,6 +640,7 @@ impl Workspace {
             toasts: Vec::new(),
             next_toast: 0,
             actions: Vec::new(),
+            offered_views: Vec::new(),
             focus_handle: cx.focus_handle(),
             drag_pending: false,
             traffic_lights: None,
@@ -1752,17 +1756,20 @@ impl Workspace {
     }
 
     /// Whether the active tab offers a view that can open now.
-    fn offers_view(&self, kind: ViewKind, cx: &App) -> bool {
-        self.active_item().is_some_and(|item| {
+    /// The views the active tab offers to open: neither the one it is nor one that cannot open.
+    fn offers_view(&self, cx: &App) -> Vec<ViewKind> {
+        self.active_item().map_or_else(Vec::new, |item| {
             item.views(cx)
                 .iter()
-                .any(|link| link.kind == kind && !link.current && link.disabled.is_none())
+                .filter(|link| !link.current && link.disabled.is_none())
+                .map(|link| link.kind)
+                .collect()
         })
     }
 
     fn register_view_action<A: Action>(&mut self, kind: ViewKind) {
         self.register_action_when(
-            move |workspace, cx| workspace.offers_view(kind, cx),
+            move |workspace, _| workspace.offered_views.contains(&kind),
             move |workspace, _: &A, window, cx| workspace.open_view(kind, false, window, cx),
         );
     }
@@ -4975,6 +4982,8 @@ impl Render for Workspace {
                     }
                 }))
             });
+        // Asked of the tab once for the frame: each view action's condition reads it.
+        self.offered_views = self.offers_view(cx);
         for registration in self.actions.clone() {
             if registration.when.as_ref().is_none_or(|when| when(self, cx)) {
                 root = (registration.register)(root, window, cx);
@@ -6610,8 +6619,13 @@ mod tests {
     #[gpui::test]
     fn a_disabled_view_does_not_open(cx: &mut gpui::TestAppContext) {
         let (workspace, cx, _) = views_workspace(cx, Some("No rows to draw"));
+        // Drawn, the window offers its key no more than its strip does: the frame asked the tab
+        // once for what it offers.
+        cx.run_until_parked();
         workspace.update_in(cx, |workspace, window, cx| {
-            assert!(!workspace.offers_view(ViewKind::Canvas, cx));
+            assert!(!workspace.offers_view(cx).contains(&ViewKind::Canvas));
+            assert!(!workspace.offered_views.contains(&ViewKind::Canvas));
+            assert!(!window.is_action_available(&OpenAsCanvas, cx));
             workspace.open_view(ViewKind::Canvas, false, window, cx);
         });
         cx.run_until_parked();
