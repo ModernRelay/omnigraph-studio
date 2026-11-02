@@ -505,8 +505,26 @@ impl CommitView {
                 .child(studio_ui::ds::meta_code(icon, short, cx))
                 .into_any_element()
         };
+        // An actor is a principal's id, which can be longer than the pane: it truncates, its
+        // whole id in a tooltip.
+        let actor = actor.unwrap_or_else(|| "—".into());
         let mut facts: Vec<AnyElement> = vec![
-            studio_ui::ds::meta(IconName::Person, actor.unwrap_or_else(|| "—".into()))
+            div()
+                .id("commit-actor")
+                .min_w_0()
+                .max_w_full()
+                .tip(studio_ui::ds::tooltip(actor.clone()))
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .gap(px(studio_ui::ds::space::XS))
+                        .child(studio_ui::ds::icon::meta(IconName::Person))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .child(studio_ui::ds::text::meta(actor).single_line().truncate()),
+                        ),
+                )
                 .into_any_element(),
         ];
         if let Some(at) = at {
@@ -869,13 +887,17 @@ pub(crate) fn open_listed(
         return;
     };
     let (session, listed) = (session.clone(), commit.clone());
-    workspace.update(cx, |workspace, cx| {
-        // The click came from History, the active tab: a preview it opens must not take its
-        // place (spec 020, the source tab is never replaced).
-        if preview {
-            workspace.keep_active_tab(cx);
-        }
-        open_in(workspace, session, id, Some(listed), preview, window, cx)
+    // Deferred: History calls this from its own click and ↵ handlers, while it is being
+    // updated, and finding the tab reads every tab's key, History's among them.
+    window.defer(cx, move |window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            // The click came from History, the active tab: a preview it opens must not take
+            // its place (spec 020, the source tab is never replaced).
+            if preview {
+                workspace.keep_active_tab(cx);
+            }
+            open_in(workspace, session, id, Some(listed), preview, window, cx)
+        });
     });
 }
 
@@ -1554,6 +1576,44 @@ mod tests {
                 .collect();
             assert_eq!(ids.len(), 2, "History stayed beside the commit");
             assert_eq!(ids[0], history.entity_id());
+            assert!(
+                workspace
+                    .active_item()
+                    .and_then(|item| item.to_any().downcast::<CommitView>().ok())
+                    .is_some(),
+                "the commit's tab is active"
+            );
+        });
+    }
+
+    /// A commit opened from History's own click or ↵, while History is being updated, opens
+    /// its tab: finding the tab reads History's key, which panicked inside that update.
+    #[gpui::test]
+    async fn a_commit_opened_from_inside_history_opens_its_tab(cx: &mut TestAppContext) {
+        let (session, _asked) = held_commit_session(Duration::from_secs(5), cx);
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let history = workspace
+            .update_in(cx, |workspace, window, cx| {
+                let session = session.clone();
+                workspace.open_item_with::<crate::view::HistoryView>(
+                    crate::view::history_key("main"),
+                    false,
+                    window,
+                    cx,
+                    |window, cx| crate::view::HistoryView::new(session, "main".into(), window, cx),
+                )
+            })
+            .expect("History opened");
+        cx.run_until_parked();
+        let listed: CommitOutput = serde_json::from_value(
+            json!({ "graph_commit_id": "c7", "graph_manifest_version": 1, "kind": "published", "created_at": 0, "parent_commit_id": "c6" }),
+        )
+        .unwrap();
+        history.update_in(cx, |_, window, cx| {
+            open_listed(&session, &listed, true, window, cx)
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
             assert!(
                 workspace
                     .active_item()

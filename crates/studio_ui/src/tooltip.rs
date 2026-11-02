@@ -28,6 +28,9 @@ use crate::ds::{self, size, space};
 #[derive(Clone)]
 pub struct TipContent {
     title: SharedString,
+    /// A muted word after the title that is never cut (a hover card's time); the title
+    /// truncates before it.
+    aside: Option<SharedString>,
     meta: Option<SharedString>,
     key: Option<Key>,
     /// A row of detail under a rule, built when the tooltip shows (a commit's counts and
@@ -48,6 +51,7 @@ enum Key {
 pub fn tooltip(title: impl Into<SharedString>) -> TipContent {
     TipContent {
         title: title.into(),
+        aside: None,
         meta: None,
         key: None,
         detail: None,
@@ -114,6 +118,12 @@ pub fn tooltip_with_meta(
 }
 
 impl TipContent {
+    /// A muted word after the title, kept whole while the title truncates before it.
+    pub fn aside(mut self, aside: impl Into<SharedString>) -> Self {
+        self.aside = Some(aside.into());
+        self
+    }
+
     /// A line of detail under the title.
     pub fn meta(mut self, meta: impl Into<SharedString>) -> Self {
         self.meta = Some(meta.into());
@@ -191,11 +201,34 @@ impl Render for Tip {
                             h_flex()
                                 .gap(px(space::XL))
                                 .justify_between()
-                                .child(ds::text::plain(self.content.title.clone()))
+                                .child(
+                                    h_flex()
+                                        .min_w_0()
+                                        .gap(px(space::SM))
+                                        .child(
+                                            div().min_w_0().child(
+                                                ds::text::plain(self.content.title.clone())
+                                                    .when(card, |l| l.single_line().truncate()),
+                                            ),
+                                        )
+                                        .when_some(self.content.aside.clone(), |row, aside| {
+                                            row.child(
+                                                div().flex_none().child(
+                                                    ds::text::plain(aside)
+                                                        .color(Color::Muted)
+                                                        .single_line(),
+                                                ),
+                                            )
+                                        }),
+                                )
                                 .children(key),
                         )
                         .when_some(self.content.meta.clone(), |tip, meta| {
-                            tip.child(ds::text::meta(meta))
+                            tip.child(
+                                div()
+                                    .min_w_0()
+                                    .child(ds::text::meta(meta).when(card, |l| l.truncate())),
+                            )
                         }),
                 )
                 .when_some(self.content.detail.clone(), |tip, detail| {

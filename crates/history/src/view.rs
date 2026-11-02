@@ -1930,7 +1930,7 @@ fn commit_card(
     now: i64,
 ) -> studio_ui::ds::TipContent {
     let who = commit.actor_id.clone().unwrap_or_else(|| "—".into());
-    let title = format!("{who} · {}", relative_time(commit.created_at, now));
+    let when = relative_time(commit.created_at, now);
     let what = if crate::commit_view::is_first_commit(commit) {
         "First commit".to_owned()
     } else if commit.merged_parent_commit_id.is_some() {
@@ -1946,27 +1946,30 @@ fn commit_card(
     } else {
         format!("{what} · {}", heads.join(", "))
     };
-    studio_ui::ds::tooltip(title).meta(meta).detail(move |_| {
-        h_flex()
-            .gap(px(studio_ui::ds::space::LG))
-            .justify_between()
-            .child(match counts {
-                Some((added, changed, removed)) if added + changed + removed > 0 => h_flex()
-                    .gap(px(studio_ui::ds::space::XS))
-                    .child(change_counts(added, changed, removed))
-                    .when(partial, |d| d.child(studio_ui::ds::text::meta("+ more")))
-                    .into_any_element(),
-                Some(_) => studio_ui::ds::text::meta("No changes").into_any_element(),
-                None => studio_ui::ds::text::meta("Counting changes…").into_any_element(),
-            })
-            .child(
-                h_flex()
-                    .gap(px(studio_ui::ds::space::XS))
-                    .child(studio_ui::ds::text::meta("Open"))
-                    .child(studio_ui::ds::icon::meta(IconName::ArrowRight)),
-            )
-            .into_any_element()
-    })
+    studio_ui::ds::tooltip(who)
+        .aside(when)
+        .meta(meta)
+        .detail(move |_| {
+            h_flex()
+                .gap(px(studio_ui::ds::space::LG))
+                .justify_between()
+                .child(match counts {
+                    Some((added, changed, removed)) if added + changed + removed > 0 => h_flex()
+                        .gap(px(studio_ui::ds::space::XS))
+                        .child(change_counts(added, changed, removed))
+                        .when(partial, |d| d.child(studio_ui::ds::text::meta("+ more")))
+                        .into_any_element(),
+                    Some(_) => studio_ui::ds::text::meta("No changes").into_any_element(),
+                    None => studio_ui::ds::text::meta("Counting changes…").into_any_element(),
+                })
+                .child(
+                    h_flex()
+                        .gap(px(studio_ui::ds::space::XS))
+                        .child(studio_ui::ds::text::meta("Open"))
+                        .child(studio_ui::ds::icon::meta(IconName::ArrowRight)),
+                )
+                .into_any_element()
+        })
 }
 
 /// One row's lines, resolved to colors, painted into the row's graph cell.
