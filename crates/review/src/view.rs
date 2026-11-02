@@ -6204,8 +6204,9 @@ pub(crate) mod tests {
             assert!(view._names_task.is_some(), "still read at the new head");
         });
         cx.run_until_parked();
-        // The server refuses the read: the names stay shown, those of nodes no longer shown go,
-        // and the head is not taken as read, so the next ask reads again.
+        // The read fails (this server answers it with no read's answer): the names stay shown,
+        // those of nodes no longer shown go, and the head is not taken as read, so the next ask
+        // reads again.
         view.update(cx, |view, cx| {
             assert_eq!(view.names_at.as_deref(), Some("f2"));
             assert_eq!(view.names.get(&end).map(String::as_str), Some("Ada"));

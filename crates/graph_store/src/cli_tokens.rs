@@ -2324,7 +2324,8 @@ exit 64
     /// A managed target's token is the data credential the CLI exchanges from its login, asked
     /// for with `credentials export` alone, since `credentials status` takes no managed target,
     /// and kept only while `target inspect` still names that managed target at that endpoint.
-    /// The source says whose login it carries; a server target's says none.
+    /// The source says whose login it carries, its organization, and whether the CLI would not
+    /// say it this time; a server target's says none.
     #[test]
     fn a_managed_targets_token_is_exchanged_from_the_clis_login() {
         let cache = probing();
@@ -2347,6 +2348,18 @@ exit 64
             },
         );
         assert_eq!(source.login_profile().as_deref(), Some("work"));
+        assert_eq!(source.organization().as_deref(), Some("org_work"));
+        assert!(!source.organization_unread());
+        let missed = cli.source(
+            "cloud",
+            endpoint,
+            CliCredential::Managed {
+                profile: "work".into(),
+                organization: None,
+                unread: true,
+            },
+        );
+        assert!(missed.organization_unread(), "the CLI would not say");
         assert_eq!(
             token_of(&source).unwrap().into_string(),
             "secret-data-token"

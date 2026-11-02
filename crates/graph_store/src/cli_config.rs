@@ -303,7 +303,8 @@ pub async fn read_targets(
 /// Names on each managed server of `read` the organization its profile names, as the CLI
 /// reports it (`credentials status --profile NAME --json`, once per profile, in the listing's
 /// turn): a sign-in to the cluster must be in it (spec 016). A profile whose organization the
-/// CLI would not say is a notice, and a sign-in to its clusters is checked by the server alone.
+/// CLI would not say is a notice and marked `unread`: a connection holding its organization
+/// from before keeps it, and one holding none leaves a sign-in to the server to check.
 async fn name_organizations(
     read: &mut CliTargets,
     cli: &cli_tokens::FoundCli,
