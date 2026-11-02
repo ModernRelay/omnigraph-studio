@@ -2543,7 +2543,9 @@ impl GraphSession {
     /// that never arrived, put right and Retried; a refused one given back): what the session
     /// shows is read again, as under a new token ([`Self::read_again_for_credential`]), since
     /// nothing else reads what the 401 refused and each view's failure would stand until its own
-    /// Try again. A new token reads it all again itself ([`Self::sync_access`]).
+    /// Try again. A new token reads it all again itself ([`Self::sync_access`]). A graph that
+    /// answered 503 is asked again at once, its wait started over: each recheck the network did
+    /// not carry while the server was gone made the next wait longer, up to [`RECHECK_CAP`].
     fn connection_state_changed(&mut self, cx: &mut Context<Self>) {
         let ready = self.connection.read(cx).state == ConnectionState::Ready;
         let was_ready = std::mem::replace(&mut self.connection_ready, ready);
@@ -2553,6 +2555,16 @@ impl GraphSession {
         if self.read_refused && self.client(cx).credential_changes() == self.credential {
             self.read_refused = false;
             self.read_again_for_credential(cx);
+        } else if self.unavailable.is_some() {
+            if self.opened {
+                self.recheck_after = RECHECK_FIRST;
+                self._recheck = None;
+                if self.shown {
+                    self.recheck_available(cx);
+                } else {
+                    self.recheck_owed = true;
+                }
+            }
         } else {
             self.read_failed_again(cx);
         }
@@ -2561,9 +2573,11 @@ impl GraphSession {
     /// Reads again, once the connection is ready again, what a read the network did not carry
     /// left failed: the schema, the branch list, the counts, and the stored queries a view
     /// wants. Before, each stood failed until its own Try again or a Refresh, though the
-    /// connection was back. A parked graph reads them when shown.
+    /// connection was back. A parked graph reads them when shown. A graph that answered 503 is
+    /// read again by its recheck alone ([`Self::recheck_available`]): showing it again says
+    /// nothing of the graph's loading.
     fn read_failed_again(&mut self, cx: &mut Context<Self>) {
-        if !self.opened || !self.shown {
+        if !self.opened || !self.shown || self.unavailable.is_some() {
             return;
         }
         if matches!(self.schema, Loadable::Failed(_)) {
@@ -6200,12 +6214,14 @@ mod tests {
 
     /// The wait after a 503 ending while the graph is parked sends nothing; shown again, the
     /// graph is asked again, and what it holds (counts, the catalog, the branch list) stays
-    /// shown while it is, and when the graph still answers 503.
+    /// shown while it is, and when the graph still answers 503. Shown again before the next
+    /// wait has passed, it is asked nothing: before, its tab left and come back to read again
+    /// what the 503 had left failed, at every switch.
     #[gpui::test]
     async fn a_503_recheck_waits_for_the_graph_to_show_and_keeps_what_it_holds(
         cx: &mut TestAppContext,
     ) {
-        let (session, _, asked, failing) = parked_graph(cx);
+        let (session, connection, asked, failing) = parked_graph(cx);
         session.update(cx, |session, cx| {
             session.set_shown(true, cx);
             session.want_stored_queries(cx);
@@ -6249,6 +6265,33 @@ mod tests {
             assert!(sent.iter().any(|sent| sent == read), "{read}: {sent:?}");
         }
         assert_eq!(held(cx), (Some(7), true, true, true), "kept through a 503");
+
+        connection.update(cx, |connection, _| {
+            connection.state = ConnectionState::Ready
+        });
+        asked.lock().unwrap().clear();
+        session.update(cx, |session, cx| {
+            session.set_shown(false, cx);
+            session.set_shown(true, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "shown again within the wait: {:?}",
+            asked.lock()
+        );
+
+        // Its connection back while it waits (the server was gone, each recheck then making the
+        // next wait longer), the graph is asked at once, its wait started over.
+        connection.update(cx, |_, cx| cx.emit(ConnectionEvent::StateChanged));
+        cx.run_until_parked();
+        let sent = std::mem::take(&mut *asked.lock().unwrap());
+        for read in ["schema", "branches", "snapshot", "queries"] {
+            assert!(sent.iter().any(|sent| sent == read), "{read}: {sent:?}");
+        }
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.recheck_after, RECHECK_FIRST * 2, "started over")
+        });
 
         failing.store(false, Ordering::SeqCst);
         cx.executor().advance_clock(RECHECK_FIRST * 2);

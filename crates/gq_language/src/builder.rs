@@ -1331,7 +1331,8 @@ pub fn edge_page_without(
     let (sent, sort, empty) = page_without(filters, sort, start, without);
     let limit = if empty { 0 } else { limit };
     let mut params = Params::new();
-    let (keyset, order) = keyset("e", &edge.name, &edge.properties, sort, start, &mut params)?;
+    let row = &EDGE_VAR[1..];
+    let (keyset, order) = keyset(row, &edge.name, &edge.properties, sort, start, &mut params)?;
     let mut clauses = vec![
         format!("$a: {}", edge.from),
         format!("$a {EDGE_VAR}:{} $b", edge.traversal()),
@@ -1341,12 +1342,12 @@ pub fn edge_page_without(
         schema,
         &edge.name,
         &edge.properties,
-        "e",
+        row,
         &sent,
         &mut params,
     )?);
     let mut columns = vec![
-        "$e.@id as edge_id".to_owned(),
+        format!("{EDGE_VAR}.@id as edge_id"),
         "$a.@id as from_id".to_owned(),
         "$b.@id as to_id".to_owned(),
     ];
@@ -1356,7 +1357,7 @@ pub fn edge_page_without(
         .filter(|p| p.projectable() && !without.contains(&p.name))
     {
         columns.push(format!(
-            "$e.{} as {}",
+            "{EDGE_VAR}.{} as {}",
             property.name,
             edge_property_column(&property.name)
         ));
@@ -1393,12 +1394,12 @@ pub fn edge_count(
         schema,
         &edge.name,
         &edge.properties,
-        "e",
+        &EDGE_VAR[1..],
         filters,
         &mut params,
     )?);
     let text = format!(
-        "query studio_edge_count({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ count($e.@id) as n }}\n}}\n",
+        "query studio_edge_count({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ count({EDGE_VAR}.@id) as n }}\n}}\n",
         sig = params.signature(),
         clauses = clauses.join("\n    "),
     );
@@ -1426,8 +1427,8 @@ pub fn value_counts(
     let (var, counted, mut clauses, properties, owner) = if edge_table {
         let edge = edge(schema, type_name)?;
         (
-            "e",
-            "$e.@id",
+            &EDGE_VAR[1..],
+            format!("{EDGE_VAR}.@id"),
             vec![
                 format!("$a: {}", edge.from),
                 format!("$a {EDGE_VAR}:{} $b", edge.traversal()),
@@ -1438,9 +1439,9 @@ pub fn value_counts(
     } else {
         let node = node(schema, type_name)?;
         (
-            "n",
-            "$n",
-            vec![format!("$n: {}", node.name)],
+            &NODE_VAR[1..],
+            NODE_VAR.to_owned(),
+            vec![format!("{NODE_VAR}: {}", node.name)],
             node.properties.as_slice(),
             node.name.clone(),
         )
@@ -1636,12 +1637,12 @@ pub fn endpoint_value_counts(
         schema,
         &edge.name,
         &edge.properties,
-        "e",
+        &EDGE_VAR[1..],
         filters,
         &mut params,
     )?);
     let text = format!(
-        "query studio_value_counts({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ ${end_var}.{prop} as value, count($e.@id) as n }}\n  order {{ value asc }}\n  limit {limit}\n}}\n",
+        "query studio_value_counts({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ ${end_var}.{prop} as value, count({EDGE_VAR}.@id) as n }}\n  order {{ value asc }}\n  limit {limit}\n}}\n",
         sig = params.signature(),
         clauses = clauses.join("\n    "),
         prop = property.name,
