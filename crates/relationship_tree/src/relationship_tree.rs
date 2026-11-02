@@ -594,6 +594,7 @@ impl RelationshipTree {
                 return;
             }
             self.selected = Some(rows::row_id(entry));
+            self.selected_row_index_hint = Some(row);
             self.scroll_handle
                 .scroll_to_item(row, ScrollStrategy::Nearest);
             cx.notify();
@@ -980,7 +981,7 @@ impl RelationshipTree {
                 } else {
                     "disclosure"
                 },
-                row,
+                row_key(entry),
             ))
             .w(px(DISCLOSURE))
             .flex_none()
@@ -1109,7 +1110,7 @@ impl RelationshipTree {
                     .grouping(&key.group)
                     .map(GroupBy::label);
                 let group_menu = (!empty)
-                    .then(|| self.group_by_menu(row, entry, &key.group, sticky, selected, cx))
+                    .then(|| self.group_by_menu(entry, &key.group, sticky, selected, cx))
                     .flatten();
                 let filters: Vec<String> = self
                     .exploration
@@ -1230,14 +1231,14 @@ impl RelationshipTree {
                     .child(studio_ui::ds::icon::meta(IconName::Warning).color(Color::Error))
                     .child(
                         div()
-                            .id(("error", row))
+                            .id(("error", row_key(entry)))
                             .min_w_0()
                             .flex_shrink(1.)
                             .tip(studio_ui::ds::tooltip(tooltip))
                             .child(studio_ui::ds::text::error_note(message.clone()).truncate()),
                     )
                     .child(
-                        studio_ui::ds::row_button(("retry", row), "Retry")
+                        studio_ui::ds::row_button(("retry", row_key(entry)), "Retry")
                             .style(ButtonStyle::Subtle)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let target = target.clone();
@@ -1396,7 +1397,6 @@ impl RelationshipTree {
 
     fn group_by_menu(
         &self,
-        row: usize,
         entry: &Entry,
         group: &gq_language::RelationshipGroup,
         sticky: bool,
@@ -1413,19 +1413,22 @@ impl RelationshipTree {
         let always = selected || current.is_some();
         let group = group.clone();
         let path = entry.path.clone();
+        // Keyed by what the row is, not where: a row put above it while the menu is open (a
+        // count or a page landing) would give it another id, and the menu would close.
+        let key = row_key(entry);
         let id = (
             if sticky {
                 "sticky-group-by"
             } else {
                 "group-by"
             },
-            row,
+            key,
         );
         let tooltip = match &current {
             Some(by) => format!("Grouped by {}", by.label()),
             None => "Group by a property or a relationship".to_owned(),
         };
-        let menu = PopoverMenu::new(SharedString::from(format!("{}-{row}", id.0)))
+        let menu = PopoverMenu::new(SharedString::from(format!("{}-{key}", id.0)))
             .trigger(
                 studio_ui::ds::row_icon_button(id, IconName::ListTree)
                     .icon_color(Color::Muted)
@@ -2172,6 +2175,25 @@ mod tests {
                 Item::thing(tree, cx),
                 Some(studio_actions::Thing::Type("Person".into()))
             );
+        });
+        // A canvas click on Ada selects her row here, which the next frame finds where it is
+        // rather than by a scan of every row.
+        tree.update(cx, |tree, cx| {
+            let ada = tree
+                .entries
+                .iter()
+                .find(
+                    |entry| matches!(&entry.kind, EntryKind::Node { node, .. } if node.id == "p1"),
+                )
+                .map(|entry| entry.path.clone())
+                .unwrap();
+            tree.exploration
+                .update(cx, |exploration, cx| exploration.select(Some(ada), cx));
+            tree.follow_selection(cx);
+            let selected = tree.selected.clone().unwrap();
+            let row = rows::find(&tree.visible, &tree.entries, &selected);
+            assert!(row.is_some());
+            assert_eq!(tree.selected_row_index_hint, row);
         });
         // With no row selected, Canvas says why it cannot open.
         tree.update(cx, |tree, _| {

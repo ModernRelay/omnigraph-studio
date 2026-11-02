@@ -355,15 +355,25 @@ impl TypeTable {
         if placed.is_empty() {
             return;
         }
-        // The cursor stays on its row, which moves down by the rows put before it.
-        if let Some(cursor) = &mut self.cursor {
-            cursor.row += placed.len();
-        }
         self.placed_here
             .extend(placed.iter().map(|row| row.id.clone()));
+        // The cursor and the selection anchor stay on their rows, which move down by the rows
+        // put before them.
+        self.rows_inserted(0, placed.len());
         self.rows.splice(0..0, placed);
-        self.lines_moved();
         cx.notify();
+    }
+
+    /// Where a row `id` goes among the rows read, in id order: after the rows the branch removed,
+    /// which stand first and out of that order ([`Self::place_removed`]); `None` past the last
+    /// row read of a list a later page goes on.
+    fn read_order_position(&self, id: &str) -> Option<usize> {
+        let removed = self
+            .rows
+            .iter()
+            .take_while(|row| self.is_removed(&row.id))
+            .count();
+        insert_position(&self.rows[removed..], id, self.paging.exhausted).map(|at| at + removed)
     }
 
     /// How the branch changed the row `id`, if it did.
@@ -4835,7 +4845,7 @@ impl TypeTable {
                         None
                     }
                     None if self.sort.is_some() => Some(0),
-                    None => insert_position(&self.rows, &id, self.paging.exhausted),
+                    None => self.read_order_position(&id),
                 };
                 if let (Some(Some(ix)), Some(grouping)) = (section, self.grouping.as_mut()) {
                     grouping.inserted(ix, 1);
@@ -10698,6 +10708,9 @@ mod tests {
         }
         table.read_with(cx, |table, _| {
             assert_eq!(ids(table), ["p3", "p1", "p2"], "the removed row first");
+            // A row inserted here goes among the rows read, after the removed one.
+            assert_eq!(table.read_order_position("p0"), Some(1));
+            assert_eq!(table.read_order_position("p15"), Some(2));
             assert_eq!(table.row_change("p1"), Some(NetChange::Added));
             assert_eq!(table.row_change("p2"), Some(NetChange::Changed));
             assert!(table.cell_changed("p2", "name"));
