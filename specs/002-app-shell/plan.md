@@ -977,8 +977,9 @@ opens a link from inside Studio.
 
 ## Deferred
 
-- `omnigraph-studio://connect?code=…`, the launcher's single-use code (engine change E1): a link
-  of that kind is refused with a note until Omnigraph has `omnigraph studio`.
+- `omnigraph-studio://open?target=…&binding=sha256:…&home=sha256:…[&graph=…]`, what
+  `omnigraph studio` sends (spec 003, "Links from the CLI"): opened once the digests match this
+  Mac's CLI. `omnigraph-studio://connect?code=…`, reserved before that existed, stays refused.
 - Engine changes, [spec 012](../012-omnigraph-engine-changes/plan.md):
   - E9 branch details: the branch menu derives head and fork from `GET /commits?branch=` until then.
   - E15 what may I do (`GET /graphs/{id}/access`, Omnigraph #1073): built 2026-10-20 (Design,

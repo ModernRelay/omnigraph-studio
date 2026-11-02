@@ -582,6 +582,50 @@ async fn inspect_target(cli: &FoundCli, turn: &Held, name: &str) -> Result<Value
     json_answer(cli, turn, &[], &["target", "inspect", name, "--json"]).await
 }
 
+/// The digests `target inspect NAME --json` reports for a server target (`protocols.studio`
+/// 1): `binding`, of what it resolves to, and `home`, of the operator file; and its default
+/// graph. What an `omnigraph-studio://open` link is checked against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetDigests {
+    pub binding: String,
+    pub home: String,
+    pub default_graph: Option<String>,
+}
+
+/// Reads [`TargetDigests`] of the server target `name` with the first CLI of `programs`
+/// Studio can drive, in one turn at the CLI. A target of another kind, or one the CLI does
+/// not know, is a refusal in words.
+pub async fn target_digests(programs: &[PathBuf], name: &str) -> Result<TargetDigests, String> {
+    let asked = format!("`omnigraph target inspect {name} --json`");
+    let turn = take_turn(&Arc::default(), READ_TIMEOUT, &asked).await?;
+    let cli = find_cli(programs, &turn).await?;
+    let inspected = inspect_target(&cli, &turn, name)
+        .await
+        .map_err(|no| no.why)?;
+    let text = |pointer: &str| {
+        inspected
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    };
+    if text("/target/kind").as_deref() != Some("server") {
+        return Err(format!(
+            "Target {name} is not a server target, which is all a link opens."
+        ));
+    }
+    match (text("/binding"), text("/home")) {
+        (Some(binding), Some(home)) => Ok(TargetDigests {
+            binding,
+            home,
+            default_graph: text("/target/default_graph"),
+        }),
+        _ => Err(format!(
+            "{asked} reported no digests for the target: a CLI of 0.14.1 or later reports them."
+        )),
+    }
+}
+
 /// Adds the server target `name` at `endpoint` to the person's operator configuration through
 /// the CLI (`target add NAME`, the target's entry on its standard input): with `token`, kept in
 /// the CLI's secure store (`auth: {provider: token, source: {store: {}}}`, then `credentials set

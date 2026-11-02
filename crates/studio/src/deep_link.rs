@@ -5,8 +5,12 @@
 //! - `omnigraph-studio://graph?server=<url>&graph=<id>[&branch=<name>]`
 //! - `omnigraph-studio://node?server=<url>&graph=<id>&type=<Type>&id=<key>[&branch=<name>]`
 //! - `omnigraph-studio://query?server=<url>&graph=<id>&text=<gq>[&branch=<name>]`
-//! - `omnigraph-studio://connect?code=<code>` is reserved for Omnigraph's `omnigraph studio`
-//!   launcher (engine change E1) and refused until it exists.
+//! - `omnigraph-studio://open?target=<name>&binding=sha256:<hex>&home=sha256:<hex>[&graph=<id>]`
+//!   is what `omnigraph studio` sends (Omnigraph 0.14.1, `protocols.studio` 1): a CLI target
+//!   by name, with digests of what it resolves to and of the operator file it was read from,
+//!   which Studio checks against its own `target inspect` before it opens the target's server.
+//! - `omnigraph-studio://connect?code=<code>` was reserved for that launcher before it existed,
+//!   and is still refused with a note.
 
 use url::Url;
 
@@ -28,6 +32,17 @@ pub struct Target {
     pub branch: Option<String>,
 }
 
+/// What `omnigraph studio` sends: a CLI target by name, the digests the CLI reports for it
+/// (`target inspect NAME --json`: `binding`, of what the target resolves to; `home`, of the
+/// operator file), and the graph asked for, when one was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliLink {
+    pub target: String,
+    pub binding: String,
+    pub home: String,
+    pub graph: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeepLink {
     Graph(Target),
@@ -40,7 +55,9 @@ pub enum DeepLink {
         target: Target,
         text: String,
     },
-    /// A link from the `omnigraph studio` launcher, which no Omnigraph release has yet.
+    /// A link from `omnigraph studio`, opened once its digests match this Mac's.
+    Open(CliLink),
+    /// The launcher's first shape, from before it existed; refused with a note.
     Connect,
 }
 
@@ -50,9 +67,30 @@ impl DeepLink {
             DeepLink::Graph(target)
             | DeepLink::Node { target, .. }
             | DeepLink::Query { target, .. } => Some(target),
-            DeepLink::Connect => None,
+            DeepLink::Open(_) | DeepLink::Connect => None,
         }
     }
+}
+
+/// Whether an `open` link's digests are what the CLI here reports for its target (`binding`
+/// and `home`, from `target inspect`); when not, which differs, and what that means.
+pub fn verify(link: &CliLink, binding: &str, home: &str) -> Result<(), String> {
+    if link.binding != binding {
+        return Err(format!(
+            "The link's target {} is not this Mac's: its binding digest differs, so the name \
+             resolves to another server or credential here. Make the link again with \
+             `omnigraph studio --target {0}` on this Mac.",
+            link.target
+        ));
+    }
+    if link.home != home {
+        return Err(format!(
+            "The link was made from another operator file than this Mac's CLI reads: its home \
+             digest differs. Make the link again with `omnigraph studio --target {}` here.",
+            link.target
+        ));
+    }
+    Ok(())
 }
 
 /// Reads a link, or says what is wrong with it.
@@ -82,6 +120,22 @@ pub fn parse(link: &str) -> Result<DeepLink, String> {
     let need = |key: &str| get(key).ok_or_else(|| format!("The link has no {key}."));
     if route == "connect" {
         return Ok(DeepLink::Connect);
+    }
+    if route == "open" {
+        let digest = |key: &str| -> Result<String, String> {
+            let value = need(key)?;
+            let hex = value.strip_prefix("sha256:").unwrap_or_default();
+            if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(format!("The link's {key} is not a sha256 digest."));
+            }
+            Ok(value)
+        };
+        return Ok(DeepLink::Open(CliLink {
+            target: need("target")?,
+            binding: digest("binding")?,
+            home: digest("home")?,
+            graph: get("graph"),
+        }));
     }
     let target = || -> Result<Target, String> {
         Ok(Target {
@@ -160,6 +214,70 @@ mod tests {
         assert_eq!(
             parse("omnigraph-studio://connect?code=abc"),
             Ok(DeepLink::Connect)
+        );
+    }
+
+    /// `omnigraph studio`'s link names a target and its two digests, and a graph when asked;
+    /// a digest that is not one, or a part missing, is refused with the reason.
+    #[test]
+    fn an_open_link_names_a_target_and_its_digests() {
+        let hex = "a".repeat(64);
+        assert_eq!(
+            parse(&format!(
+                "omnigraph-studio://open?target=law&binding=sha256:{hex}&home=sha256:{hex}&graph=law"
+            )),
+            Ok(DeepLink::Open(CliLink {
+                target: "law".into(),
+                binding: format!("sha256:{hex}"),
+                home: format!("sha256:{hex}"),
+                graph: Some("law".into()),
+            }))
+        );
+        assert!(matches!(
+            parse(&format!(
+                "omnigraph-studio://open?target=law&binding=sha256:{hex}&home=sha256:{hex}"
+            )),
+            Ok(DeepLink::Open(CliLink { graph: None, .. }))
+        ));
+        assert_eq!(
+            parse(&format!(
+                "omnigraph-studio://open?target=law&binding=sha256:{hex}"
+            )),
+            Err("The link has no home.".into())
+        );
+        assert_eq!(
+            parse(&format!(
+                "omnigraph-studio://open?binding=sha256:{hex}&home=sha256:{hex}"
+            )),
+            Err("The link has no target.".into())
+        );
+        assert_eq!(
+            parse(&format!(
+                "omnigraph-studio://open?target=law&binding=md5:abc&home=sha256:{hex}"
+            )),
+            Err("The link's binding is not a sha256 digest.".into())
+        );
+    }
+
+    /// A link's digests must both be the CLI's; the refusal names the one that differs.
+    #[test]
+    fn an_open_link_is_verified_against_the_cli_digests() {
+        let link = CliLink {
+            target: "law".into(),
+            binding: "sha256:b".into(),
+            home: "sha256:h".into(),
+            graph: None,
+        };
+        assert_eq!(verify(&link, "sha256:b", "sha256:h"), Ok(()));
+        assert!(
+            verify(&link, "sha256:x", "sha256:h")
+                .unwrap_err()
+                .contains("binding digest differs")
+        );
+        assert!(
+            verify(&link, "sha256:b", "sha256:x")
+                .unwrap_err()
+                .contains("home digest differs")
         );
     }
 

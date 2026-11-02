@@ -15,12 +15,12 @@ mod update_status;
 
 use std::collections::HashSet;
 
-use deep_link::DeepLink;
+use deep_link::{CliLink, DeepLink};
 use gpui::{
     App, AppContext as _, Context, Entity, Focusable as _, Global, Window, WindowBounds,
     WindowHandle, WindowOptions, px, size,
 };
-use graph_store::{ConnectionRegistry, open_session, open_session_behind};
+use graph_store::{ConnectionRegistry, ServerSource, open_session, open_session_behind};
 use studio_actions::offered;
 use studio_actions::update::{CheckForUpdates, DownloadUpdate, RestartToUpdate, ViewReleaseNotes};
 use studio_actions::workspace::{
@@ -581,16 +581,95 @@ pub fn open_link(link: &str, cx: &mut App) {
         .detach();
         return;
     }
-    let link = match deep_link::parse(link) {
-        Ok(link) => link,
-        Err(message) => return tell(cx, ToastKind::Error, message),
-    };
+    match deep_link::parse(link) {
+        Ok(DeepLink::Open(open)) => open_cli_link(open, cx),
+        Ok(link) => open_parsed(link, cx),
+        Err(message) => tell(cx, ToastKind::Error, message),
+    }
+}
+
+/// Opens a link from `omnigraph studio`, which names a CLI target: the target's server, once
+/// the digests the link carries match what this Mac's CLI reports for the target (its
+/// `binding`, of what the name resolves to, and `home`, of the operator file it was read
+/// from), so a link made elsewhere, or before the target changed, opens nothing. The check
+/// asks the CLI, off the main thread; a start's window waits for it as for any link.
+fn open_cli_link(open: CliLink, cx: &mut App) {
+    let registry = ConnectionRegistry::global(cx);
+    let known = registry.read(cx).connections.iter().any(|connection| {
+        let server = &connection.read(cx).server;
+        server.source == ServerSource::Cli && server.name == open.target
+    });
+    if !known {
+        return tell(
+            cx,
+            ToastKind::Error,
+            format!(
+                "Studio does not know a CLI target named {}. Add it with `omnigraph target add` \
+                 and refresh under “Open a graph”; a link never adds a server.",
+                open.target
+            ),
+        );
+    }
+    cx.default_global::<LinksWaiting>().count += 1;
+    let digests = registry.read(cx).target_digests(&open.target);
+    cx.spawn(async move |cx| {
+        let digests = digests.await;
+        cx.update(|cx| {
+            match digests.and_then(|digests| link_target(&open, digests, cx)) {
+                Ok(target) => open_parsed(DeepLink::Graph(target), cx),
+                Err(message) => tell(cx, ToastKind::Error, message),
+            }
+            link_opened(cx);
+        });
+    })
+    .detach();
+}
+
+/// Where an `open` link points once its digests match `digests`, the CLI's for its target: the
+/// target's server, and the graph the link names, else the target's default graph, else the
+/// first graph known on the server.
+fn link_target(
+    open: &CliLink,
+    digests: graph_store::cli::TargetDigests,
+    cx: &App,
+) -> Result<deep_link::Target, String> {
+    deep_link::verify(open, &digests.binding, &digests.home)?;
+    let connection = ConnectionRegistry::global(cx)
+        .read(cx)
+        .connections
+        .iter()
+        .find(|connection| {
+            let server = &connection.read(cx).server;
+            server.source == ServerSource::Cli && server.name == open.target
+        })
+        .ok_or_else(|| format!("Studio no longer knows the CLI target {}.", open.target))?;
+    let server = &connection.read(cx).server;
+    let graph = open
+        .graph
+        .clone()
+        .or(digests.default_graph)
+        .or_else(|| server.known_graphs.first().cloned())
+        .ok_or_else(|| {
+            format!(
+                "Target {} names no graph; open one on {} from “Open a graph”.",
+                open.target, server.name
+            )
+        })?;
+    Ok(deep_link::Target {
+        server: server.url.clone(),
+        graph,
+        branch: None,
+    })
+}
+
+/// Opens a parsed link ([`open_link`]).
+fn open_parsed(link: DeepLink, cx: &mut App) {
     let Some(target) = link.target().cloned() else {
         return tell(
             cx,
             ToastKind::Info,
-            "This link comes from `omnigraph studio`, which needs a later Omnigraph. Open the graph \
-             from “Open a graph” instead."
+            "This link has a shape no `omnigraph studio` sends. Open the graph from “Open a \
+             graph” instead."
                 .into(),
         );
     };
@@ -655,7 +734,7 @@ pub fn open_link(link: &str, cx: &mut App) {
                 Box::new(studio_actions::graph::NewQueryWithText { text: text.clone() }),
                 cx,
             ),
-            DeepLink::Graph(_) | DeepLink::Connect => {}
+            DeepLink::Graph(_) | DeepLink::Open(_) | DeepLink::Connect => {}
         }
         window.activate_window();
     };
@@ -899,6 +978,7 @@ mod reopen_tests {
 
 #[cfg(test)]
 mod start_tests {
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     use gpui::TestAppContext;
@@ -969,6 +1049,91 @@ mod start_tests {
             assert_eq!(session.graph_id, "g");
             assert_eq!(session.connection, servers[2]);
         });
+    }
+
+    /// Studio with CLI target `law` at `http://law.test`, default graph `law`, whose CLI
+    /// reports digests of all b and all a for it.
+    fn studio_with_a_cli_target(cx: &mut TestAppContext) -> (Entity<Connection>, Asked) {
+        let (registry, _servers, asked) = studio_with_servers(cx);
+        let law = registry.update(cx, |registry, cx| {
+            registry.set_target_digests_for_tests(HashMap::from([(
+                "law".to_owned(),
+                Ok(graph_store::cli::TargetDigests {
+                    binding: format!("sha256:{}", "b".repeat(64)),
+                    home: format!("sha256:{}", "a".repeat(64)),
+                    default_graph: Some("law".into()),
+                }),
+            )]));
+            registry.add_cli_target_for_tests("law", "http://law.test", "law", cx)
+        });
+        (law, asked)
+    }
+
+    fn cli_link(target: &str, binding: char, home: char, graph: Option<&str>) -> String {
+        let graph = graph
+            .map(|graph| format!("&graph={graph}"))
+            .unwrap_or_default();
+        format!(
+            "omnigraph-studio://open?target={target}&binding=sha256:{}&home=sha256:{}{graph}",
+            binding.to_string().repeat(64),
+            home.to_string().repeat(64)
+        )
+    }
+
+    /// A link from `omnigraph studio` names a CLI target; once the digests it carries are what
+    /// this Mac's CLI reports for the target, its server opens, on the graph the link names,
+    /// else the target's default graph. The check runs after the link is parsed, so a start's
+    /// window waits for it as for any link.
+    #[gpui::test]
+    fn a_link_from_the_cli_opens_its_target_once_the_digests_match(cx: &mut TestAppContext) {
+        let (law, asked) = studio_with_a_cli_target(cx);
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        cx.cx
+            .update(|cx| open_link(&cli_link("law", 'b', 'a', None), cx));
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(workspace.toast_messages().is_empty(), "nothing refused");
+            let session = workspace.session().unwrap().read(cx);
+            assert_eq!(session.graph_id, "law", "the target's default graph");
+            assert_eq!(session.connection, law);
+        });
+        let hosts = std::mem::take(&mut *asked.lock().unwrap());
+        assert!(hosts.iter().all(|host| host == "law.test"), "{hosts:?}");
+
+        cx.cx
+            .update(|cx| open_link(&cli_link("law", 'b', 'a', Some("cases")), cx));
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            let session = workspace.session().unwrap().read(cx);
+            assert_eq!(session.graph_id, "cases", "the graph the link names");
+        });
+    }
+
+    /// A link whose digests are not the CLI's here (made on another Mac, or before the target
+    /// changed), or whose target the CLI does not list, opens nothing and says which differs.
+    #[gpui::test]
+    fn a_link_from_the_cli_is_refused_when_its_digests_differ(cx: &mut TestAppContext) {
+        let (_law, _asked) = studio_with_a_cli_target(cx);
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        for (link, said) in [
+            (cli_link("law", 'c', 'a', None), "binding digest differs"),
+            (cli_link("law", 'b', 'c', None), "home digest differs"),
+            (
+                cli_link("tax", 'b', 'a', None),
+                "does not know a CLI target named tax",
+            ),
+        ] {
+            cx.cx.update(|cx| open_link(&link, cx));
+            cx.run_until_parked();
+            workspace.read_with(cx, |workspace, _| {
+                assert!(workspace.session().is_none(), "{link}");
+                let toasts = workspace.toast_messages();
+                assert!(
+                    toasts.last().is_some_and(|toast| toast.contains(said)),
+                    "{link}: {toasts:?}"
+                );
+            });
+        }
     }
 
     /// A reopened window connects its own graphs' servers and no other; the Open dialog,

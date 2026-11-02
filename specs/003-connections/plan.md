@@ -11,8 +11,28 @@ CLI, wait for Studio's own sign-in (Deferred; spec 016).
 ## Problem
 
 Studio has to find Omnigraph servers, authenticate, confirm it speaks the server's contract,
-discover which graphs and routes are there, and show the state of all of that at a glance,
-without the `omnigraph studio` launcher (deferred).
+discover which graphs and routes are there, and show the state of all of that at a glance.
+`omnigraph studio` (Omnigraph 0.14.1) hands a target to Studio by link: see "Links from the
+CLI" below.
+
+## Links from the CLI
+
+`omnigraph studio --target NAME [--graph ID]` opens
+`omnigraph-studio://open?target=NAME&binding=sha256:…&home=sha256:…[&graph=ID]`
+(`protocols.studio` 1): the target by name, a digest of what the name resolves to (`binding`)
+and one of the operator file it was read from (`home`). The link carries no address, token or
+credential. Studio (`studio::deep_link`, `open_cli_link`):
+
+- refuses a link whose target it does not list (a link never adds a server);
+- runs `omnigraph target inspect NAME --json` (`cli_tokens::target_digests`, one turn at the
+  CLI, off the main thread) and refuses the link, naming the digest that differs, when either is
+  not what this Mac's CLI reports: a link made on another Mac, or before the target was changed,
+  opens nothing. A target of another kind, or a CLI older than 0.14.1, is refused in words;
+- on a match opens the target's server on the graph the link names, else the target's default
+  graph, else the first graph known on the server, as a `graph` link does (one that names no
+  branch opens main). A start's window waits for the check as for any link.
+
+`omnigraph-studio://connect?code=…`, reserved for the launcher before it existed, stays refused.
 
 ## Principles
 
@@ -435,6 +455,7 @@ and the tooltip named `omnigraph login`, which is managed sign-in only now).
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-01 | A link from `omnigraph studio` opens its target once the digests match, and is refused naming the one that differs | `studio` `deep_link::tests::an_open_link_names_a_target_and_its_digests` (target, both digests, the graph when named; a part missing or a digest that is not sha256 refused), `an_open_link_is_verified_against_the_cli_digests`, `start_tests::a_link_from_the_cli_opens_its_target_once_the_digests_match` (the default graph, then the named one, only that server asked), `a_link_from_the_cli_is_refused_when_its_digests_differ` (binding, home, a target not listed); live, offscreen (`examples/snapshot.rs` dispatching `studio::OpenLink`) with the link `omnigraph studio --target law --graph law --json` printed (CLI 0.14.1, the law server at `https://localhost:8453`) and the same link with its home digest changed | The real link opened law/law on main, with no toast; the changed one opened nothing, the window asking for a graph with the toast "The link was made from another operator file than this Mac's CLI reads: its home digest differs…". Before, every `open` link was refused as "Studio cannot open “open” links" |
 | 2026-10-28 | A token source that cannot answer now leaves a working token in use | `graph_store` `cli_tokens::tests::a_cli_that_cannot_answer_leaves_its_token_in_use` (Refresh and a connect under a busy CLI), `a_cli_that_cannot_answer_after_a_refusal_is_asked_again` (no token kept after a 401; the next health check asks), `no_credential_sends_nothing` (extended: a missing credential is not asked again by health checks), `connection::tests::a_renewal_that_cannot_be_answered_keeps_the_token_held`, the stand-in CLI tests extended to say which failures may pass (a busy turn and a stopped export do; a refusal, a missing credential, a moved target and a held lock do not) | All pass. Before, every failure dropped the token: Refresh or a reconnect while the CLI was busy with Studio's other commands, or after an upgrade whose first run XProtect stalls, showed the server refused until the person acted |
 | 2026-10-26 | A read refused for its token asks the source again, once per token, and a target's changed transport moves every holder of its client | `graph_store` `connection::tests::a_read_refused_for_its_token_asks_the_source_once` (told first, renewed once, the same token not asked twice, a typed token not asked), `registry::tests::a_renamed_cli_target_keeps_its_connection` (a moved address retires the old connection, which sends nothing; a proxy or certificate authority keeps the connection and makes one client each; an unusable transport retires it); `graph_client` `a_replaced_http_client_reaches_every_clone`; CI on PR #11 (run 40281608899), Check on macOS, Linux and Windows: `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` | All pass: 1014 passed on macOS, 1009 on Linux, 979 on Windows; 0 failed |
 | 2026-10-25 | Choosing a server the CLI gave no token asks the CLI again | `studio` `a_server_sent_no_token_is_said_to_ask_for_one` (a server in "No token from the CLI" chosen in the Open dialog goes to connecting; one whose token the server refused does not), run again with the fix undone | Ragnor signed in after the CLI had told Studio "login required" for `modernrelay-og-cluster`, and the dialog kept that reason: nothing asked again before a Refresh, and choosing the server did not connect it. Now choosing it, or its Retry, asks again; with the fix undone the server stayed `Unauthorized`. The reason now wraps within the pane instead of running past its edge |

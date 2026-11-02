@@ -19,7 +19,7 @@ use http_client::HttpClient;
 use serde::{Deserialize, Serialize};
 
 use crate::cli_config::{self, CliAuth, CliServer, CliTargets, CliTransport, FileStamp, Platform};
-use crate::cli_tokens::{self, CliTokenSource, Token, TokenSource};
+use crate::cli_tokens::{self, CliTokenSource, TargetDigests, Token, TokenSource};
 use crate::connection::{Connection, ServerEntry, ServerSource};
 use crate::sign_in::{self, PlatformKeychain, SignInContext};
 
@@ -36,6 +36,10 @@ type Prepared = Vec<(CliTransport, Result<Arc<dyn HttpClient>, String>)>;
 
 /// Makes the token source of a CLI server whose token the CLI gives; none for an anonymous one.
 type TokenSources = Arc<dyn Fn(&CliServer) -> Option<Arc<dyn TokenSource>> + Send + Sync>;
+
+/// Reads a server target's digests ([`ConnectionRegistry::target_digests`]).
+type Digester =
+    dyn Fn(&[PathBuf], &str) -> BoxFuture<'static, Result<TargetDigests, String>> + Send + Sync;
 
 /// Lists the targets of an operator home with the first CLI Studio can drive of the places
 /// given, as they land on the platform given ([`cli_config::read_targets`]); run off the main
@@ -104,6 +108,9 @@ pub struct ConnectionRegistry {
     /// token again.
     cli_places: Vec<PathBuf>,
     cli_stamp: Vec<Option<FileStamp>>,
+    /// Reads a server target's digests, for an `omnigraph-studio://open` link: the CLI's
+    /// `target inspect`, or a table in tests.
+    digester: Arc<Digester>,
     /// Follows the settings' `omnigraph_cli`, the CLI Studio looks for first
     /// ([`Self::follow_cli_setting`]).
     _cli_setting: Option<gpui::Subscription>,
@@ -282,6 +289,12 @@ fn add_with_the_cli(
 }
 
 impl ConnectionRegistry {
+    /// The digests the CLI reports for its server target `name` (`target inspect`), read off
+    /// the main thread: what an `omnigraph-studio://open` link's are checked against.
+    pub fn target_digests(&self, name: &str) -> BoxFuture<'static, Result<TargetDigests, String>> {
+        (self.digester)(&self.cli_places, name)
+    }
+
     pub fn global(cx: &App) -> Entity<Self> {
         cx.global::<GlobalRegistry>().0.clone()
     }
@@ -369,6 +382,42 @@ impl ConnectionRegistry {
         self.platform = platform;
     }
 
+    /// Adds a server the CLI lists as target `name`, whose default graph is `graph`, for the
+    /// tests of links that name a target.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn add_cli_target_for_tests(
+        &mut self,
+        name: &str,
+        url: &str,
+        graph: &str,
+        cx: &mut Context<Self>,
+    ) -> Entity<Connection> {
+        let entry = ServerEntry {
+            name: name.into(),
+            url: url.into(),
+            source: ServerSource::Cli,
+            known_graphs: vec![graph.to_owned()],
+        };
+        self.add_connection(entry, Some("t".into()), cx)
+            .expect("a usable server address")
+    }
+
+    /// Answers [`Self::target_digests`] from `table` instead of the CLI: a target not in it
+    /// is one the CLI does not know.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_target_digests_for_tests(
+        &mut self,
+        table: HashMap<String, Result<TargetDigests, String>>,
+    ) {
+        self.digester = Arc::new(move |_, name| {
+            let answer = table
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| Err(format!("The CLI has no target named {name}.")));
+            async move { answer }.boxed()
+        });
+    }
+
     /// Whether the CLI gives Studio a token here: the system Studio runs on, but in a test. Add
     /// server's token field follows it.
     pub fn platform(&self) -> Platform {
@@ -451,6 +500,11 @@ impl ConnectionRegistry {
             operator_stamp: Vec::new(),
             cli_places: Vec::new(),
             cli_stamp: Vec::new(),
+            digester: Arc::new(|places, name| {
+                let places = places.to_vec();
+                let name = name.to_owned();
+                async move { cli_tokens::target_digests(&places, &name).await }.boxed()
+            }),
             _cli_setting: None,
             cli_kept: HashMap::new(),
             listed: true,
