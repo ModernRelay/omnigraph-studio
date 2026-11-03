@@ -924,7 +924,7 @@ than styling one-off elements.
   key's header and the others scroll sideways with the rows. Each header ends in its column menu (⋯, the right-click menu) while hovered; the key
   cell ends in the row's Peek while the row is hovered. 28 px rows split by hairlines, every
   cell but the last column's ruled on its right, as every header is, cells 12 px in either
-  side, the cursor as a ring and the selected row
+  side, the cursor as a rounded ring in the accent and the selected row
   on its fill. Dense enough to scan a page at a glance; an 18 px borderless tag or chip still
   sits inside a row. Sidebar rows are 26 px, feed rows 36 px; every list takes its height from
   `ds::size`, never its own constant. Query results keep the grid header of

@@ -242,6 +242,7 @@
     "context": "TypeTable",
     "bindings": {
       "escape": "studio_table::Cancel",
+      "ctrl-shift-enter": "studio_table::ExpandCell",
       "ctrl-s": "studio_table::SaveDrafts",
       "ctrl-r": "studio_table::RefreshTable",
       "ctrl-n": "studio_table::InsertRow",
