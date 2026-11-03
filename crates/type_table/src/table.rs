@@ -54,6 +54,7 @@ use ui::{
 
 use crate::blob_write::{self, Binding, BlobChange, BlobEdit, BlobWritten};
 use crate::branch_diff::{BranchDiff, TARGET};
+use crate::cell_select::{self, CellSelect};
 use crate::dialogs::{
     DeleteRowModal, DeleteTarget, InsertEdgeModal, InsertRowModal, SaveViewModal,
 };
@@ -106,6 +107,16 @@ struct Editing {
     /// what the cell showed.
     old: Value,
     notice: Option<Notice>,
+    /// The select a cell of a few values is edited with in place of the editor
+    /// ([`crate::cell_select`]); the editor still holds the edit's text, which a pick sets.
+    select: Option<SelectEdit>,
+}
+
+/// An open select and the watch on its focus: leaving it ends the edit as leaving the editor
+/// does.
+struct SelectEdit {
+    view: Entity<CellSelect>,
+    _blur: Subscription,
 }
 
 struct FilterDraft {
@@ -847,6 +858,8 @@ pub struct TypeTable {
     /// The open edit's editor, made for it ([`Self::fresh_cell_editor`]), and its events.
     cell_editor: Entity<Editor>,
     _cell_editor_events: Subscription,
+    /// The focus of the open edit's select, the table's so it is known after the select goes.
+    select_focus: FocusHandle,
     /// Cells with a save out, and the session's drafts for this type as of its last change:
     /// a view rebuilt from the session ([`TypeTable::sync_drafts`]), never written on its own.
     cells: HashMap<(String, String), CellState>,
@@ -1218,6 +1231,7 @@ impl TypeTable {
             editing: None,
             cell_editor,
             _cell_editor_events: cell_editor_events,
+            select_focus: cx.focus_handle(),
             cells: HashMap::new(),
             draft_notices: HashMap::new(),
             drafts_due: false,
@@ -5541,15 +5555,95 @@ impl TypeTable {
             Some(CellState::Draft { text, notice }) => (text, notice),
             _ => (edit_text(&old), None),
         };
+        // An enum's values and a boolean's are chosen, not typed.
+        let width = self.layout.width(column);
+        let select = column.property().cloned().and_then(|property| {
+            let choices = cell_select::choices(&property)?;
+            Some(self.open_select(&property, choices, &text, width, notice.clone(), window, cx))
+        });
         self.fresh_cell_editor(text, window, cx);
+        let focus = match &select {
+            Some(_) => self.select_focus.clone(),
+            None => self.cell_editor.focus_handle(cx),
+        };
         self.editing = Some(Editing {
             row_id: key.0,
             column: key.1,
             old,
             notice,
+            select,
         });
-        window.focus(&self.cell_editor.focus_handle(cx), cx);
+        window.focus(&focus, cx);
         cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    /// The select an edit of `property` opens with, on `text`: a click on a value takes it.
+    #[allow(clippy::too_many_arguments)]
+    fn open_select(
+        &mut self,
+        property: &Property,
+        choices: Vec<cell_select::Choice>,
+        text: &str,
+        width: f32,
+        notice: Option<Notice>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> SelectEdit {
+        let table = cx.entity().downgrade();
+        let on_pick: cell_select::OnPick = Rc::new(move |index, window, cx| {
+            table
+                .update(cx, |table, cx| table.pick_choice(index, window, cx))
+                .ok();
+        });
+        let (focus, branch) = (self.select_focus.clone(), self.branch.clone().into());
+        let view = cx.new(|_| {
+            CellSelect::new(
+                property, choices, text, width, notice, branch, focus, on_pick,
+            )
+        });
+        let blur = cx.on_blur(&self.select_focus, window, |this, _, cx| {
+            this.cell_editor_blurred(cx)
+        });
+        SelectEdit { view, _blur: blur }
+    }
+
+    /// A value of the open select clicked: it is taken, as ↵ takes the one highlighted.
+    fn pick_choice(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(select) = self.editing.as_ref().and_then(|e| e.select.as_ref()) {
+            select
+                .view
+                .update(cx, |select, cx| select.highlight(index, cx));
+            self.confirm_edit(window, cx);
+        }
+    }
+
+    /// The open edit's text: what its editor holds, the value highlighted in its select put
+    /// there first, as ↵, ⌥↵ and Tab take it.
+    fn edit_text_taken(&mut self, window: &mut Window, cx: &mut Context<Self>) -> String {
+        let chosen = self
+            .editing
+            .as_ref()
+            .and_then(|editing| editing.select.as_ref())
+            .and_then(|select| select.view.read(cx).highlighted_text());
+        if let Some(text) = chosen {
+            self.cell_editor
+                .update(cx, |editor, cx| editor.set_text(text, window, cx));
+        }
+        self.cell_editor.read(cx).text(cx)
+    }
+
+    /// Says why the open edit cannot be saved, in its callout or its select's list.
+    fn set_edit_notice(&mut self, notice: Notice, cx: &mut Context<Self>) {
+        if let Some(editing) = &mut self.editing {
+            if let Some(select) = &editing.select {
+                let shown = Some(notice.clone());
+                select
+                    .view
+                    .update(cx, |select, cx| select.set_notice(shown, cx));
+            }
+            editing.notice = Some(notice);
+        }
         cx.notify();
     }
 
@@ -5755,15 +5849,12 @@ impl TypeTable {
             self.finish_editing(window, cx);
             return;
         };
-        let text = self.cell_editor.read(cx).text(cx);
+        let text = self.edit_text_taken(window, cx);
         let shown = self.rows[row_ix].value(&column).clone();
         let new = match edited(&property, &old, &text) {
             Some(Ok(value)) => value,
             Some(Err(message)) => {
-                if let Some(editing) = &mut self.editing {
-                    editing.notice = Some(Notice::new(Tone::Invalid, message));
-                }
-                cx.notify();
+                self.set_edit_notice(Notice::new(Tone::Invalid, message), cx);
                 return;
             }
             // Asks for the value the edit is bound to, which the row still shows: nothing to
@@ -5796,10 +5887,7 @@ impl TypeTable {
         ) {
             Ok(write) => write,
             Err(error) => {
-                if let Some(editing) = &mut self.editing {
-                    editing.notice = Some(Notice::new(Tone::Invalid, error));
-                }
-                cx.notify();
+                self.set_edit_notice(Notice::new(Tone::Invalid, error), cx);
                 return;
             }
         };
@@ -5931,16 +6019,13 @@ impl TypeTable {
             self.finish_editing(window, cx);
             return true;
         };
-        let text = self.cell_editor.read(cx).text(cx);
+        let text = self.edit_text_taken(window, cx);
         // Text asking for the value the edit is bound to lets the draft go while the row shows
         // that value; over another, shown since, it stays, so its save finds the change.
         let shows_old = self.row_shows(&key.0, &key.1, &old);
         match edited(&property, &old, &text) {
             Some(Err(message)) => {
-                if let Some(editing) = &mut self.editing {
-                    editing.notice = Some(Notice::new(Tone::Invalid, message));
-                }
-                cx.notify();
+                self.set_edit_notice(Notice::new(Tone::Invalid, message), cx);
                 return false;
             }
             None if shows_old => {
@@ -10070,12 +10155,17 @@ impl TypeTable {
             .when(column.align_right, |d| d.justify_end());
         let removed = self.is_removed(&row.id);
         if let Some(editing) = editing {
-            let hint = column
-                .property()
-                .and_then(|p| p.enum_values.as_ref())
-                .map(|values| format!("One of: {}", values.join(", ")));
             // The editor itself is drawn over this place by the table (`edit_slot`), inside the
-            // cursor's ring on the document's fill.
+            // cursor's ring on the document's fill. A select lists its values, the notice and
+            // the keys itself, where the callout would stand.
+            let callout = editing.select.is_none().then(|| {
+                // An enum list's values, which its text names.
+                let hint = column
+                    .property()
+                    .and_then(|p| p.enum_values.as_ref())
+                    .map(|values| format!("One of: {}", values.join(", ")));
+                self.render_edit_callout(editing.notice.clone(), hint, window, cx)
+            });
             return cell
                 .child(studio_ui::ds::cell_cursor(cx).bg(editor_bg))
                 .child(
@@ -10086,7 +10176,7 @@ impl TypeTable {
                         .child(self.edit_slot.mark()),
                 )
                 .when(expands, |cell| cell.child(self.render_expand(ix, col, cx)))
-                .child(self.render_edit_callout(editing.notice.clone(), hint, window, cx))
+                .children(callout)
                 .into_any_element();
         }
         // Dates read relative; the exact value is the cell's tooltip.
@@ -10557,7 +10647,10 @@ impl Render for TypeTable {
         }
         // An edit taken from the cell (a reload kept it as a draft) leaves the cell editor
         // focused but no longer drawn: the keys come back to the table.
-        if self.editing.is_none() && self.cell_editor.focus_handle(cx).is_focused(window) {
+        if self.editing.is_none()
+            && (self.cell_editor.focus_handle(cx).is_focused(window)
+                || self.select_focus.is_focused(window))
+        {
             window.focus(&self.focus_handle, cx);
         }
         // Keys typed into a field are text, not the table's: the cell editor, the filter
@@ -10657,15 +10750,14 @@ impl Render for TypeTable {
                     .flex_1()
                     .min_h_0()
                     .child(AnyView::from(grid).cached(StyleRefinement::default().size_full()))
-                    .when(self.editing.is_some(), |body| {
+                    .when_some(self.editing.as_ref(), |body, editing| {
+                        let field = match &editing.select {
+                            Some(select) => select.view.clone().into_any_element(),
+                            None => self.cell_editor.clone().into_any_element(),
+                        };
                         body.child(
-                            self.edit_slot.overlay(
-                                div()
-                                    .size_full()
-                                    .flex()
-                                    .items_center()
-                                    .child(self.cell_editor.clone()),
-                            ),
+                            self.edit_slot
+                                .overlay(div().size_full().flex().items_center().child(field)),
                         )
                     })
                     .children(drafts_bar),
@@ -11786,6 +11878,25 @@ mod tests {
             before,
             "the cell editor drew the grid"
         );
+
+        // Moving a select's highlight draws the select, over the grid, and not the grid.
+        table.update_in(cx, |table, window, cx| {
+            let col = table
+                .columns
+                .iter()
+                .position(|c| c.key == "active")
+                .unwrap();
+            table.start_edit(Cursor { row: 1, col }, window, cx);
+        });
+        cx.run_until_parked();
+        let before = grid_renders(&table, cx);
+        table.update(cx, |table, cx| {
+            let editing = table.editing.as_ref().expect("the boolean is edited");
+            let select = editing.select.as_ref().expect("with a select").view.clone();
+            select.update(cx, |select, cx| select.highlight(1, cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(grid_renders(&table, cx), before, "the select drew the grid");
     }
 
     /// A filter opened for editing still filters the rows, and every page read, until it is
@@ -11960,6 +12071,211 @@ mod tests {
                 (editing.row_id.as_str(), editing.column.as_str()),
                 ("p1", "name")
             );
+        });
+    }
+
+    /// The table's keys for an open select, as the keymaps bind them.
+    fn bind_select_keys(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new("up", SelectPreviousSuggestion, Some("CellSelect")),
+                gpui::KeyBinding::new("down", SelectNextSuggestion, Some("CellSelect")),
+                gpui::KeyBinding::new("enter", ConfirmEdit, Some("TypeTable && editing")),
+                gpui::KeyBinding::new("alt-enter", StageEdit, Some("TypeTable && editing")),
+                gpui::KeyBinding::new("escape", Cancel, Some("TypeTable")),
+            ])
+        });
+    }
+
+    /// The people with a `role` from an enum, which no row holds yet, and whether they are
+    /// `active`.
+    const CHOSEN: &str = "node Person {\n  slug: String @key\n  name: String\n  role: enum(admin, member, guest)?\n  active: Bool\n}\n";
+
+    /// The value a write sent sets `property` to, of those its parameters hold.
+    fn sent_values(sent: &Arc<std::sync::Mutex<Vec<Value>>>) -> Vec<Value> {
+        sent.lock()
+            .unwrap()
+            .iter()
+            .flat_map(|write| write["params"].as_object().unwrap().values().cloned())
+            .collect()
+    }
+
+    /// An enum's cell is chosen from its values, not typed (spec 004, Editing): ↵ opens a
+    /// select listing them in the schema's order, None after them for a nullable property, the
+    /// value the cell holds checked and highlighted. ↑/↓ move the highlight around the ends and
+    /// a letter to the next value it begins; ↵ saves the one highlighted.
+    #[gpui::test]
+    async fn an_enum_cell_is_chosen_from_its_values_not_typed(cx: &mut TestAppContext) {
+        let (session, sent) = crate::test_support::session_recording_writes(CHOSEN, cx);
+        let (table, cx) = people_table(&session, cx);
+        bind_select_keys(cx);
+        let col = table.read_with(cx, |table, _| table.column_index("role").unwrap());
+        table.update_in(cx, |table, window, cx| {
+            table.start_edit(Cursor { row: 0, col }, window, cx)
+        });
+        cx.run_until_parked();
+        let highlighted = |cx: &mut VisualTestContext| {
+            table.read_with(cx, |table, cx| {
+                let editing = table.editing.as_ref().expect("the cell is edited");
+                let select = editing.select.as_ref().expect("with a select");
+                select.view.read(cx).highlighted()
+            })
+        };
+        cx.update(|window, cx| {
+            let table = table.read(cx);
+            assert!(
+                table.select_focus.is_focused(window),
+                "the select has the keys"
+            );
+            assert!(
+                !table.cell_editor.focus_handle(cx).is_focused(window),
+                "no text is typed"
+            );
+        });
+        assert_eq!(highlighted(cx), 3, "None, which the cell holds");
+        cx.simulate_keystrokes("down");
+        assert_eq!(highlighted(cx), 0, "around the end, to admin");
+        cx.simulate_keystrokes("up");
+        assert_eq!(highlighted(cx), 3, "and back");
+        // The schema keeps an enum's values sorted: admin, guest, member. Letters typed
+        // without a pause are a word's beginning; after one, a new word's.
+        cx.simulate_keystrokes("m");
+        assert_eq!(highlighted(cx), 2, "member, which m begins");
+        cx.simulate_keystrokes("a");
+        assert_eq!(highlighted(cx), 2, "nothing begins \"ma\"");
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.simulate_keystrokes("g");
+        assert_eq!(highlighted(cx), 1, "guest");
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "nothing saved while choosing"
+        );
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(
+            sent_values(&sent).contains(&Value::from("guest")),
+            "the value highlighted is saved: {:?}",
+            sent.lock().unwrap()
+        );
+        table.read_with(cx, |table, _| {
+            assert!(table.editing.is_none());
+            assert_eq!(table.rows[0].value("role"), &Value::from("guest"));
+        });
+        cx.update(|window, cx| {
+            assert!(
+                table.read(cx).focus_handle.is_focused(window),
+                "the keys are the table's again"
+            );
+        });
+
+        // Opened again, the select checks and highlights what the cell holds now.
+        table.update_in(cx, |table, window, cx| {
+            table.start_edit(Cursor { row: 0, col }, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(highlighted(cx), 1, "guest, which the cell holds");
+    }
+
+    /// A select takes nothing but a value picked: Esc and leaving it end the edit with the
+    /// cell as it was and no draft, whatever was highlighted. A click on a value takes it.
+    #[gpui::test]
+    async fn a_select_takes_only_the_value_picked(cx: &mut TestAppContext) {
+        let (session, sent) = crate::test_support::session_recording_writes(CHOSEN, cx);
+        let (table, cx) = people_table(&session, cx);
+        bind_select_keys(cx);
+        // A window that is not active tells no one of focus leaving.
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let col = table.read_with(cx, |table, _| table.column_index("role").unwrap());
+        let open = |cx: &mut VisualTestContext| {
+            table.update_in(cx, |table, window, cx| {
+                table.start_edit(Cursor { row: 0, col }, window, cx)
+            });
+            cx.run_until_parked();
+        };
+        let unchanged = |cx: &mut VisualTestContext| {
+            table.read_with(cx, |table, cx| {
+                assert!(table.editing.is_none());
+                assert_eq!(table.rows[0].value("role"), &Value::Null);
+                assert_eq!(session.read(cx).drafts().count(), 0, "no draft");
+            });
+            assert!(sent.lock().unwrap().is_empty(), "nothing saved");
+        };
+
+        open(cx);
+        cx.simulate_keystrokes("down escape");
+        cx.run_until_parked();
+        unchanged(cx);
+
+        // Leaving the cell for another: a click on the next row's name.
+        open(cx);
+        cx.simulate_keystrokes("down");
+        let name = table.read_with(cx, |table, _| table.column_index("name").unwrap());
+        let slot = expand_slot(1, name, cx).expect("the name cell ends in its ⤢");
+        click_at(cx, gpui::point(slot.left() - px(24.), slot.center().y), 1);
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.cursor, Some(Cursor { row: 1, col: name }))
+        });
+        unchanged(cx);
+
+        open(cx);
+        let member = cx
+            .debug_bounds("cell-select-choice-2")
+            .expect("the values are listed under the cell");
+        click_at(cx, member.center(), 1);
+        cx.run_until_parked();
+        assert!(
+            sent_values(&sent).contains(&Value::from("member")),
+            "the value clicked is saved"
+        );
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.rows[0].value("role"), &Value::from("member"))
+        });
+    }
+
+    /// A boolean's cell is chosen too, from true and false, with no None for a property every
+    /// row must hold; ⌥↵ keeps the value highlighted as the cell's draft, as it keeps a typed one.
+    #[gpui::test]
+    async fn a_boolean_cell_is_chosen_and_kept_as_a_draft(cx: &mut TestAppContext) {
+        let (session, sent) = crate::test_support::session_recording_writes(CHOSEN, cx);
+        let (table, cx) = people_table(&session, cx);
+        bind_select_keys(cx);
+        let col = table.read_with(cx, |table, _| table.column_index("active").unwrap());
+        table.update_in(cx, |table, window, cx| {
+            table.start_edit(Cursor { row: 0, col }, window, cx)
+        });
+        cx.run_until_parked();
+        table.read_with(cx, |table, cx| {
+            let select = table.editing.as_ref().unwrap().select.as_ref().unwrap();
+            assert_eq!(select.view.read(cx).highlighted(), 0, "true, the first");
+        });
+        cx.simulate_keystrokes("down");
+        cx.simulate_keystrokes("down");
+        table.read_with(cx, |table, cx| {
+            let select = table.editing.as_ref().unwrap().select.as_ref().unwrap();
+            assert_eq!(select.view.read(cx).highlighted(), 0, "two values, no None");
+        });
+        cx.simulate_keystrokes("f alt-enter");
+        cx.run_until_parked();
+        let key = DraftKey {
+            type_name: "Person".into(),
+            id: "p1".into(),
+            property: "active".into(),
+        };
+        session.read_with(cx, |session, _| {
+            assert_eq!(
+                session.draft(&key).map(|draft| draft.text.as_str()),
+                Some("false")
+            );
+        });
+        assert!(sent.lock().unwrap().is_empty(), "a draft, not a save");
+        table.update_in(cx, |table, window, cx| {
+            table.start_edit(Cursor { row: 0, col }, window, cx)
+        });
+        cx.run_until_parked();
+        table.read_with(cx, |table, cx| {
+            let select = table.editing.as_ref().unwrap().select.as_ref().unwrap();
+            assert_eq!(select.view.read(cx).highlighted(), 1, "the draft's false");
         });
     }
 

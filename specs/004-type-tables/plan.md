@@ -400,6 +400,16 @@ its open section.
   registered, only where the cell may be changed, as the inspector offers it. The ⤢ sits over
   the text's end on the row's fill, the design system's hovered row under the pointer, which
   the grid now draws rather than Zed's table.
+- An enum's cell and a boolean's are chosen, not typed (since 2026-11-02): ↵ or a second
+  click opens a select over the cell, its values listed under it in the schema's order (the
+  compiler keeps an enum's values sorted), None after them for a nullable property, the value
+  the cell holds checked and highlighted. ↑/↓ move the highlight around the ends, and letters
+  typed without a pause move it to the value they begin. ↵ saves the value highlighted, ⌥↵
+  keeps it as the cell's draft and Tab saves it and moves on, as they take a typed edit; a
+  click saves the value clicked. Esc and leaving the cell take none. The select is a view of
+  its own drawn over the cell from outside the grid, as the editor is (`cell_select.rs`), and
+  its list carries why the last save did not land and the keys, where a typed edit's callout
+  stands. A list of enum values, a number, a date and free text are still typed.
 - A cell save is bound to the value the cell showed:
 
   ```
@@ -523,6 +533,7 @@ kept answers.
 | Engine-side filter, sort and count | Filtering loaded rows | Correct at any size; grouping and filtering loaded rows is wrong once a type outgrows a page |
 | No row cap | A 1,000-row cap, as a web table needs | GPUI virtualizes; such a cap exists only because a browser renders every row |
 | One offer list (`offers.rs`) for the filter's value field, the edge dialog's endpoints and, since 2026-10-21, the peek's add-relationship search | Zed's editor completion menu (`CompletionProvider`), as the query editor uses | The menu draws code completions in the editor's monospace font and opens on typing; these fields offer names with their ids muted beside them, in the interface's type, and an enum's values as soon as the field has focus. The two hand-built copies became one: the list, ↑/↓ around the ends, the rows and the pick on press |
+| A cell's select is a view of its own (`cell_select.rs`) built from the menu's rows (`MenuRow`, `menu_surface`) | The inspector's `ContextMenu` in a `PopoverMenu` | A menu takes the focus and the keys: ⌥↵ and Tab could not take its highlight, it has no type-ahead, and its list could not carry a save's notice and the keys. Built from the same rows, it reads as the inspector's menu |
 | Fork Zed's CSV preview renderer and selection model | GPUI Kit's table | One GPUI lineage (constitution XI) |
 | Count a row once per value its neighbours hold (`not {}` over earlier neighbours with the value) | `count($n)` over the match | `count($n)` counts matches, not rows: a person at two Berlin companies would count twice, and the section would read fewer rows than its count says |
 
@@ -542,6 +553,7 @@ kept answers.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-02 | An enum's cell and a boolean's are chosen from their values | `type_table` `an_enum_cell_is_chosen_from_its_values_not_typed` (↵ on a nullable enum: the select has the keys and the editor none, None highlighted; ↓ ↑ around the ends; `m` to member, `a` straight after moves nothing, `g` after a pause to guest; ↵ saves guest and gives the keys back; opened again, guest is highlighted), `a_select_takes_only_the_value_picked` (Esc, and a click on another row's name in an active window, end the edit with no write and no draft; a click on member saves it), `a_boolean_cell_is_chosen_and_kept_as_a_draft` (true and false, no None on `Bool`; `f` ⌥↵ keeps the draft `false`, which opens highlighted), `typing_in_a_field_leaves_the_grid_as_it_was` extended (moving a select's highlight draws no grid). Offscreen snapshots on the dev graph's Project (1100×640 at 2×): ↵ on `status`, then ↓ | Pass. The cell keeps its chip with a chevron inside the ring; the list hangs under the cell's edge, the value held checked, then the keys. The first snapshot stretched the chip to the chevron (a block child), now a flex row |
 | 2026-11-02 | A click puts the cursor on a cell and a second edits it; a text cell's ⤢ or ⌘⇧↵ opens it in the editor | `type_table` `one_click_puts_the_cursor_on_a_value_and_a_second_edits_it` (a click on Person's name: the cursor there, nothing edited, ↓ moves it; a double click edits), `a_text_cells_expand_opens_it_in_the_editor_with_what_was_typed` (no ⤢ on the key; the name's ⤢, hovered and clicked, opens `OpenTextEditor` at the table's commit; ⌘⇧↵ in an open edit sends what was typed, kept as the draft; a read-only credential draws no ⤢ and has no key). Both fail on main, where one click edited and no cell had a ⤢. `a_branch_shows_what_it_changed_in_the_rows` also opens removed p3's Knows cell, as ↵ would: no `OpenType` (red without `open_cell`'s removed-row check). Offscreen snapshots on the dev graph (1440×900 at 2×): the cursor on a name, another row's title hovered, the cursor's row hovered, the cursor's cell edited | Pass. A 2 px ring with 6 px corners at the default radius, the ⤢ at the cell's end; the first render put the hovered ⤢ on the resting row's white fill inside the grey hovered row, so the grid draws the design system's hovered row itself and the ⤢ takes that fill |
 | 2026-11-01 | On a branch the rows the branch removed show first, struck and not for picking or editing, and the rows it added or changed are marked, a changed row by its changed cells | `type_table` `a_branch_shows_what_it_changed_in_the_rows` (a table on main, then on fix with p1 added, p2's name changed and p3 removed, then back on main), `branch_diff` `marks_the_types_rows_by_what_the_branch_did`, `a_removed_edge_keeps_its_ends`, `a_row_that_ends_where_it_began_is_not_marked` | Pass. On main nothing is read for it; on fix the rows read p3, p1, p2, select-all picked p1 and p2, Enter on p3 opened nothing; back on main p3 went. Not drawn by a test: the wash, the gutter bar and the strikethrough |
 | 2026-10-31 | A condition filter is spliced in as written and judged by the compiler before a read | `gq_language` `a_condition_is_spliced_in_and_judged_by_the_compiler` (an `or … not exists { }` condition type-checks beside a pill's clause; `$n.nope = 1` is a diagnostic; an empty one is refused by the builder) | Pass. The pill's edit-on-click and the draft's compile error are not drawn by a test |
