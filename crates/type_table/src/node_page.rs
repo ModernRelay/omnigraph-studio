@@ -19,7 +19,8 @@ pub struct NodePage {
     id: String,
     at_commit: Option<String>,
     /// The node's label as the tab last named it, saved with the tab: a page restored behind
-    /// another tab reads nothing until it is shown, and its tab is named by this until then.
+    /// another tab, or one whose branch changed, reads nothing until it is shown, and its tab
+    /// is named by this until then.
     saved_label: Option<String>,
     /// The tab as it was last told: its title, and whether it says newer data.
     tab: (String, bool),
@@ -43,6 +44,11 @@ impl NodePage {
         // the tab is told when either changes, not at each change of the view, which draws
         // itself.
         let subscription = cx.observe(&view, |this, _, cx| {
+            // The label read last names the tab while the view reads the node again, as it
+            // does after a branch switch once the tab is shown.
+            if let Some(label) = this.view.read(cx).label() {
+                this.saved_label = Some(label);
+            }
             let tab = (this.title(cx), this.view.read(cx).is_newer());
             if tab != this.tab {
                 this.tab = tab;

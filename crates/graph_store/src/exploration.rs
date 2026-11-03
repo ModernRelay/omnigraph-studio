@@ -1795,11 +1795,17 @@ impl Exploration {
         let grouping = std::mem::take(&mut self.state.grouping);
         let filters = std::mem::take(&mut self.state.filters);
         let sorts = std::mem::take(&mut self.state.sorts);
+        // The root keeps the name it was read with until it is read again, so a tab behind
+        // another, which reads nothing until it is shown, is not named by the node's id.
+        let label = self.state.labels.get(&node).cloned();
         // A set stays the set: its rows are read again, with nothing open.
         *self.state = match self.state.set.take() {
             Some(set) => ExploreState::of_set(set),
-            None => ExploreState::rooted(node),
+            None => ExploreState::rooted(node.clone()),
         };
+        if let Some(label) = label {
+            self.state.labels.entry(node).or_insert(label);
+        }
         self.state.grouping = grouping;
         self.state.filters = filters;
         self.state.sorts = sorts;
@@ -3491,6 +3497,35 @@ mod tests {
         exploration.read_with(cx, |exploration, _| {
             assert_eq!(exploration.filters(&knows), std::slice::from_ref(&filter));
         });
+    }
+
+    /// A walk started over on another branch keeps its root's name until a view reads it there,
+    /// so a canvas or tree tab behind another is not named by the node's id.
+    #[gpui::test]
+    async fn the_root_keeps_its_name_across_a_branch_switch(cx: &mut gpui::TestAppContext) {
+        use crate::test_server::followed_session;
+        let (session, _served) = followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\n",
+            |_| json!([{ "id": "p1", "label": "Ada" }]),
+            cx,
+        );
+        cx.run_until_parked();
+        let exploration = cx.update(|cx| Exploration::for_session(&session, cx));
+        exploration.update(cx, |exploration, cx| exploration.root_at(person("p1"), cx));
+        cx.run_until_parked();
+        let label = |cx: &mut gpui::TestAppContext| {
+            exploration.read_with(cx, |exploration, _| {
+                exploration.state().label(&person("p1")).map(str::to_owned)
+            })
+        };
+        assert_eq!(label(cx).as_deref(), Some("Ada"), "read at the start");
+
+        session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        cx.run_until_parked();
+        exploration.read_with(cx, |exploration, _| {
+            assert!(exploration.owed, "read again once a view draws it")
+        });
+        assert_eq!(label(cx).as_deref(), Some("Ada"));
     }
 
     /// A root not found at the exploration's commit is not found there again: Retry reads it
