@@ -12,7 +12,8 @@
 //! added and `,right` for the secondary button; `hover:<x>,<y>` moves the pointer there and rests; `key:<keystroke>` presses keys as the keymap sees them (`key:tab`, `key:cmd-4`);
 //! `drag:<x1>,<y1>,<x2>,<y2>` presses at
 //! the first point, moves to the second in steps, and releases (`,shift` or `,cmd` held); `wait:<ms>` lets that long pass
-//! (for a write from outside to land between steps); `measure:<n>[,refresh]` draws n frames
+//! (for a write from outside to land between steps); `shot:<path>` saves the window as it
+//! is to another PNG, so one run can record the frames of a sequence; `measure:<n>[,refresh]` draws n frames
 //! after notifying the workspace (or redrawing everything) and prints their times;
 //! `measure:<n>,scroll=<dy>` first scrolls at the window's centre each frame (a zoom on the
 //! canvas; `scroll=<dx>:<dy>` scrolls sideways too), and `measure:<n>,drag=<dx>:<dy>` drags from the centre by that much a frame (a pan),
@@ -345,6 +346,11 @@ fn main() {
                 at(&cpu_times, 0.95),
                 at(&cpu_times, 0.99),
             );
+            continue;
+        }
+        if let Some(path) = spec.strip_prefix("shot:") {
+            let image = cx.capture_screenshot(handle).expect("render the window");
+            image.save(path).expect("write the PNG");
             continue;
         }
         if let Some(ms) = spec.strip_prefix("wait:") {
