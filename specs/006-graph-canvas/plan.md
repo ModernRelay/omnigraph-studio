@@ -75,13 +75,22 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
     beside the types drawn; it lists every type, by name, to start from instead, as does a
     type's "Explore from here". The page's header holds only the views and the schema's counts.
     - **One step, not two.** A relationship reaches one type, so expanding a type shows the
-      types related to it at once: a pill per related type and direction, named with its
-      relationship ("→ AssignedTo") or counted ("→ 3 relationships"), and the type beyond it.
-      A type's relationships to itself are one pill marked "↻", its line back into the chip.
-      A walk of data takes two steps, a relationship and then its nodes.
-    - **Sides.** The types a type reaches stand on its right and those reaching it on its
-      left (`LayoutNode::side`), at every level: a type with many relationships stands
-      between two columns half as tall as one.
+      types related to it at once: one pill per related type, whichever way its relationships
+      run, and the type beyond it. A pill names its first relationship and how many more
+      ("→ AssignedTo +1"), never a bare count, and its arrow says the way: →, ←, or ⇄ both
+      ways. A type's relationships to itself are one pill marked "↻". A walk of data takes
+      two steps, a relationship and then its nodes. (A pill per direction drew Task–Media
+      twice, on both sides, with a line across the canvas between them.)
+    - **Sides.** At the root, the types it reaches (or reaches and is reached by) stand on
+      its right and those only reaching it on its left (`LayoutNode::side`). Below the root a
+      branch grows outward on one side, as a walk of data does: split to both sides, a type's
+      left column folded back over the root's and crossed its lines.
+    - **Second ways.** A line from a pill to a type drawn elsewhere crosses the canvas where
+      the tree's lines stay beside their chips; it is drawn faintest and lights up with its
+      chips (`line_tone`, for a walk of data too).
+    - **Following an expansion.** Once an expansion is laid out the view moves just enough to
+      show what it opened, zooming out to 0.55 at most, and leaves it be when it is in view
+      (`GraphCanvas::reveal`).
     - **Room.** A schema is laid out with more room than data (`Spacing::SCHEMA`: rows 56
       apart, not 40; 72 and 64 from a type to its pills and a pill to its types, not 44 and
       36), since it holds a few dozen types, not thousands of nodes.
@@ -238,6 +247,7 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 | 2026-11-02 | The map is the clusters as islands on one grid | `graph_canvas` `the_map_is_islands_on_one_grid` (no island's box holds another's chip; every chip on the grid), `the_maps_lines_are_one_per_related_type` (no stretch through a chip); offscreen snapshot of the personal graph's map fitted with Task selected | Nine islands, the four shared types alone at the top left; Task's island with Notification, WorkflowRun, Agent and Repository; its lines along one row gap with an upright per column |
 | 2026-11-02 | The ontology on the canvas | `graph_canvas` `schema_walk` tests (a type expands to its related types at once, its relationship to itself once, marked ↻; a pill and a type drawn once; "+K more" past the step and its limit; closing takes back what only it reached), `a_schema_canvas_walks_types` (opens from its root expanded, a type expands, closing takes back, Explore from another), `layout` `a_roots_children_keep_their_side`; workspace clippy `-D warnings`; offscreen snapshots of the personal graph: opened, Person expanded | Opened from Task: what reaches it on its left, what it reaches on its right, "+13 more"; Person expanded outward on the right, nothing drawn moved, Media linked rather than drawn again. The schema canvas and the small schema's layered map were removed |
 | 2026-11-02 | Room on the ontology canvas | `layout` `a_roots_children_keep_their_side` (a type below the root keeps its sides; the schema's spacing is roomier), `schema_walk` tests (a pill to itself has one line); offscreen snapshots of the personal graph: opened, Person expanded | Rows and columns stand further apart; Person's incoming types stand in their own column on its left, its outgoing on its right; the ↻ pill no longer loops back into Task |
+| 2026-11-02 | The ontology canvas on a large schema | `schema_walk` tests (both ways is one pill, ⇄, on the right; pills name their first relationship and how many more), `layout` (below the root a branch grows outward); graph_canvas tests; offscreen snapshots of the personal graph (100 types, 551 relationships): opened from Task, Agent expanded | One pill per related type, each named; no line across the canvas from a pill per direction; Agent's column grows outward and the view glides to show it; lines to types drawn elsewhere faint |
 
 ## Corrections
 

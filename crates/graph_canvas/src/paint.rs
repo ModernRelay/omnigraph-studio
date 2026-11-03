@@ -482,10 +482,22 @@ fn line_tone(
         (SceneKind::Hub { .. }, SceneKind::Node { .. })
             | (SceneKind::Node { .. }, SceneKind::Hub { .. })
     ) && edge_is_member(scene, from, to);
+    // A line from a hub to a node drawn elsewhere (a second way to it) crosses the canvas
+    // where the tree's own lines stay beside their nodes: it is drawn faintest, and lights up
+    // with its chips.
+    let link = member && {
+        let (hub, node) = match kinds.0 {
+            SceneKind::Hub { .. } => (from, to),
+            _ => (to, from),
+        };
+        scene.nodes[node].parent != Some(hub)
+    };
     let alpha = if touches(hovered) {
         0.45
     } else if touches(selected) {
         0.28
+    } else if link {
+        0.07
     } else if member {
         0.13
     } else if hub_link {

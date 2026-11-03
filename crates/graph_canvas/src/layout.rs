@@ -65,9 +65,10 @@ pub struct LayoutNode {
     pub space: f32,
     /// Where it was drawn before; such a node does not move.
     pub previous: Option<Vec2>,
-    /// The side of its parent it stands on, right (1) or left (-1): a schema's walk puts the
-    /// types a type reaches on its right and those reaching it on its left. None goes outward,
-    /// away from where its parent hangs, and shares a root's two sides by weight.
+    /// The side of its root it stands on, right (1) or left (-1), when it hangs off a root:
+    /// a schema's walk puts the types a type reaches on its right and those reaching it on
+    /// its left. None shares the root's two sides by weight. Below a root, every child goes
+    /// outward, away from where its parent hangs, whatever its side.
     pub side: Option<f32>,
 }
 
@@ -158,10 +159,7 @@ impl Spacing {
     };
 }
 
-/// [`explore_positions`] with its room set by `spacing`. A child with a side of its own
-/// stands on it at every level, not only off a root: a schema's type has what reaches it on
-/// its left and what it reaches on its right, so a type with many relationships stands
-/// between two columns half as tall as one.
+/// [`explore_positions`] with its room set by `spacing`.
 pub fn spaced_positions(nodes: &[LayoutNode], spacing: Spacing) -> Vec<Vec2> {
     let Spacing {
         row,
@@ -244,7 +242,9 @@ pub fn spaced_positions(nodes: &[LayoutNode], spacing: Spacing) -> Vec<Vec2> {
         let mut sides: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
         let mut weight = [0f32; 2];
         for child in new_children {
-            let side = match (nodes[child].side, outward) {
+            // Outward below a root, so a branch never folds back over what it hangs from; a
+            // root's children on their own side, or shared by weight.
+            let side = match (outward, nodes[child].side) {
                 (Some(direction), _) | (None, Some(direction)) => usize::from(direction < 0.),
                 (None, None) => usize::from(weight[1] < weight[0]),
             };
@@ -888,14 +888,15 @@ mod tests {
         let at = explore_positions(&nodes);
         assert!((1..6).all(|i| at[i].x > at[0].x), "reached on the right");
         assert!(at[6].x < at[0].x, "reaching on the left");
-        // Below the root, too: a type on the right has what reaches it on its left.
+        // Below the root a branch grows outward, whatever its children's sides: folded back,
+        // it would cross what it hangs from.
         let child = nodes.len();
         nodes.push(node(Some(1), LayoutKind::Node, None));
         nodes.push(node(Some(child), LayoutKind::Hub, Some(-1.)));
         nodes.push(node(Some(child), LayoutKind::Hub, Some(1.)));
         let at = explore_positions(&nodes);
-        assert!(at[child + 1].x < at[child].x, "reaching it on its left");
-        assert!(at[child + 2].x > at[child].x, "reached on its right");
+        assert!(at[child + 1].x > at[child].x, "outward");
+        assert!(at[child + 2].x > at[child].x, "outward");
         // A schema's walk leaves more room than data's.
         let roomy = spaced_positions(&nodes, Spacing::SCHEMA);
         assert!(roomy[2].y - roomy[1].y > at[2].y - at[1].y);

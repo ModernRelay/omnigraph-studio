@@ -3,9 +3,9 @@
 //! pills and layout. What differs from a walk of data:
 //!
 //! - A relationship reaches one type, so expanding a type shows the types related to it at
-//!   once: a pill per related type and direction, named with its relationship or counted ("→
-//!   3 relationships"), and the type beyond it. A walk of data takes two steps, a relationship
-//!   and then its nodes.
+//!   once: one pill per related type, whichever way its relationships run, named with its
+//!   first relationship and how many more ("→ AssignedTo +1", "⇄ Owns +2" both ways), and the
+//!   type beyond it. A walk of data takes two steps, a relationship and then its nodes.
 //! - Each direction shows [`HUB_STEP`] related types before "+K more", as a relationship shows
 //!   its neighbours.
 //! - A type is drawn once, and a pill between two types once: expanding the second of two
@@ -100,44 +100,80 @@ pub(crate) fn more_key(ty: &str, direction: Direction) -> GroupKey {
     )
 }
 
-/// The types related to `ty` in `direction`, each with the relationships between them, by
-/// name: those it reaches in the order of its first relationship to each, those reaching it
-/// by name.
-fn related(schema: &SchemaModel, ty: &str, direction: Direction) -> Vec<(String, Vec<String>)> {
-    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+/// A type related to another, and the relationships between them each way, by name.
+struct Related {
+    other: String,
+    /// The relationships it is reached by, its relationships to itself among them.
+    out: Vec<String>,
+    /// Those reaching it.
+    into: Vec<String>,
+}
+
+impl Related {
+    /// The side it stands on: what a type reaches, or reaches and is reached by, on its
+    /// right; what only reaches it, on its left.
+    fn direction(&self) -> Direction {
+        if self.out.is_empty() {
+            Direction::Incoming
+        } else {
+            Direction::Outgoing
+        }
+    }
+}
+
+/// The types related to `ty` in `direction` ([`Related::direction`]): those on its right in
+/// the order of their first relationship, by name; those on its left by name.
+fn related(schema: &SchemaModel, ty: &str, direction: Direction) -> Vec<Related> {
     let mut edges: Vec<&gq_language::schema::EdgeType> = schema
         .edges
         .iter()
-        .filter(|edge| match direction {
-            Direction::Outgoing => edge.from == ty,
-            // A type's relationships to itself are drawn once, among those it reaches.
-            Direction::Incoming => edge.to == ty && edge.from != ty,
-        })
+        .filter(|edge| edge.from == ty || edge.to == ty)
         .collect();
     edges.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut groups: Vec<Related> = Vec::new();
     for edge in edges {
-        let other = match direction {
-            Direction::Outgoing => &edge.to,
-            Direction::Incoming => &edge.from,
+        let reached = edge.from == ty;
+        let other = if reached { &edge.to } else { &edge.from };
+        let group = match groups.iter().position(|g| g.other == *other) {
+            Some(at) => &mut groups[at],
+            None => {
+                groups.push(Related {
+                    other: other.clone(),
+                    out: Vec::new(),
+                    into: Vec::new(),
+                });
+                groups.last_mut().expect("just pushed")
+            }
         };
-        match groups.iter_mut().find(|(name, _)| name == other) {
-            Some((_, names)) => names.push(edge.name.clone()),
-            None => groups.push((other.clone(), vec![edge.name.clone()])),
+        if reached {
+            group.out.push(edge.name.clone());
+        } else {
+            group.into.push(edge.name.clone());
         }
     }
+    groups.retain(|group| group.direction() == direction);
     if direction == Direction::Incoming {
-        groups.sort_by(|a, b| a.0.cmp(&b.0));
+        groups.sort_by(|a, b| a.other.cmp(&b.other));
     }
     groups
 }
 
-/// A pill's name: its relationship's, or how many it stands for, after the way it runs; a
-/// type's relationships to itself after "↻", since the line runs back into its own chip.
-fn pill_label(direction: Direction, names: &[String], to_itself: bool) -> String {
-    let arrow = if to_itself { "↻" } else { direction.arrow() };
-    match names {
-        [name] => format!("{arrow} {name}"),
-        _ => format!("{arrow} {} relationships", names.len()),
+/// A pill's name: the way its relationships run ("⇄" both ways; "↻" a type's to itself, since
+/// the pill hangs off its own chip), its first relationship, and how many more.
+fn pill_label(related: &Related, to_itself: bool) -> String {
+    let arrow = if to_itself {
+        "↻"
+    } else if !related.out.is_empty() && !related.into.is_empty() {
+        "⇄"
+    } else {
+        related.direction().arrow()
+    };
+    let first = related.out.first().or(related.into.first());
+    let more = related.out.len() + related.into.len() - 1;
+    match (first, more) {
+        (Some(name), 0) => format!("{arrow} {name}"),
+        (Some(name), more) => format!("{arrow} {name} +{more}"),
+        (None, _) => arrow.to_owned(),
     }
 }
 
@@ -159,8 +195,15 @@ pub(crate) fn schema_scene(
     }
     let mut type_at: HashMap<String, usize> = HashMap::new();
     let mut lines: HashSet<(usize, usize)> = HashSet::new();
-    // Pairs of types a pill joins already, the way they run: drawn once.
+    // Pairs of types a pill joins already, either way: drawn once.
     let mut joined: HashSet<(String, String)> = HashSet::new();
+    let pair = |a: &str, b: &str| {
+        if a <= b {
+            (a.to_owned(), b.to_owned())
+        } else {
+            (b.to_owned(), a.to_owned())
+        }
+    };
     let mut left_out = 0usize;
     let edge = |scene: &mut Scene, lines: &mut HashSet<(usize, usize)>, from: usize, to: usize| {
         if from != to && lines.insert((from, to)) {
@@ -194,19 +237,15 @@ pub(crate) fn schema_scene(
             continue;
         }
         for direction in [Direction::Outgoing, Direction::Incoming] {
-            let groups: Vec<(String, Vec<String>)> = related(schema, &ty, direction)
+            let groups: Vec<Related> = related(schema, &ty, direction)
                 .into_iter()
-                .filter(|(other, _)| {
-                    let pair = match direction {
-                        Direction::Outgoing => (ty.clone(), other.clone()),
-                        Direction::Incoming => (other.clone(), ty.clone()),
-                    };
-                    !joined.contains(&pair)
-                })
+                .filter(|group| !joined.contains(&pair(&ty, &group.other)))
                 .collect();
             let more = more_key(&ty, direction);
             let limit = limits.get(&more).copied().unwrap_or(HUB_STEP);
-            for (shown, (other, names)) in groups.iter().enumerate() {
+            for (shown, group) in groups.iter().enumerate() {
+                let other = &group.other;
+                let names: Vec<String> = group.out.iter().chain(&group.into).cloned().collect();
                 if shown >= limit {
                     break;
                 }
@@ -214,10 +253,7 @@ pub(crate) fn schema_scene(
                     left_out += groups.len() - shown;
                     break;
                 }
-                joined.insert(match direction {
-                    Direction::Outgoing => (ty.clone(), other.clone()),
-                    Direction::Incoming => (other.clone(), ty.clone()),
-                });
+                joined.insert(pair(&ty, other));
                 let key = GroupKey::new(
                     type_ref(&ty),
                     RelationshipGroup {
@@ -234,7 +270,7 @@ pub(crate) fn schema_scene(
                         count: Some(names.len() as u64),
                         open: true,
                     },
-                    label: pill_label(direction, names, *other == ty),
+                    label: pill_label(group, *other == ty),
                     color_key: names[0].clone(),
                     parent: Some(at),
                     path: None,
@@ -302,7 +338,7 @@ edge WorksAt: Person -> Org
         scene.nodes.iter().map(|node| node.label.as_str()).collect()
     }
 
-    /// Expanding a type shows a pill per related type and direction, named or counted, and
+    /// Expanding a type shows a pill per related type, named and counted, and
     /// the type beyond it, at once; its relationship to itself once, among those it reaches.
     #[test]
     fn a_type_expands_to_its_related_types_at_once() {
@@ -311,7 +347,7 @@ edge WorksAt: Person -> Org
             labels(&scene),
             [
                 "Task",
-                "→ 2 relationships",
+                "→ AssignedTo +1",
                 "Person",
                 "↻ BlockedBy",
                 "← HasTask",
@@ -342,7 +378,11 @@ edge WorksAt: Person -> Org
         // relationships to Person are not drawn again from Person's side.
         assert!(names.contains(&"→ Owns"));
         assert!(names.contains(&"→ WorksAt"));
-        assert!(!names.contains(&"← 2 relationships"));
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.starts_with('←') && n.contains("AssignedTo"))
+        );
         let project = names.iter().position(|n| *n == "Project").unwrap();
         let owns = names.iter().position(|n| *n == "→ Owns").unwrap();
         assert!(
@@ -384,6 +424,24 @@ edge WorksAt: Person -> Org
             12
         );
         assert!(!labels(&scene).iter().any(|l| l.ends_with("more")));
+    }
+
+    /// Relationships both ways between two types are one pill, on the side of what the type
+    /// reaches, marked "⇄".
+    #[test]
+    fn both_ways_is_one_pill() {
+        let schema = SchemaModel::parse(
+            "node Task { slug: String @key }\nnode Media { slug: String @key }\n\
+             edge Cites: Task -> Media\nedge MediaForTask: Media -> Task\n",
+        )
+        .unwrap();
+        let scene = schema_scene(&schema, &SchemaWalk::new("Task"), &HashMap::new(), 100);
+        assert_eq!(labels(&scene), ["Task", "⇄ Cites +1", "Media"]);
+        let SceneKind::Hub { key, count, .. } = &scene.nodes[1].kind else {
+            panic!("a pill");
+        };
+        assert_eq!(key.group.direction, Direction::Outgoing);
+        assert_eq!(*count, Some(2));
     }
 
     /// Closing a type takes away what only it reached; what it reached closes with it.

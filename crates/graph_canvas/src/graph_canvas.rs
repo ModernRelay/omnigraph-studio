@@ -57,6 +57,14 @@ use studio_ui::motion::{self, Ease, Lerp, Tween};
 const MAX_ZOOM: f32 = 2.;
 /// How far one Zoom In or Zoom Out goes.
 const ZOOM_STEP: f32 = 1.25;
+/// The furthest a schema canvas zooms out on its own to show what an expansion opened:
+/// further, its names are too small to read.
+const REVEAL_MIN_ZOOM: f32 = 0.55;
+/// The room kept between what an expansion shows and the canvas's edges, in screen pixels:
+/// the floating controls stand there.
+const REVEAL_MARGIN: f32 = 64.;
+/// Half a chip's height, at zoom 1, for what an expansion shows.
+const REVEAL_HALF_HEIGHT: f32 = 16.;
 
 /// Registers the canvas's keys and the actions that open it.
 pub fn init(cx: &mut App) {
@@ -402,6 +410,9 @@ pub(crate) struct GraphCanvas {
     fit_zoom: f32,
     fit_pending: bool,
     center_on: Option<SceneId>,
+    /// A schema canvas's expansion under way: once laid out, the view moves just enough to
+    /// show what it opened.
+    reveal_new: bool,
     selected: Option<SceneId>,
     /// Nodes stepped back from with `[`, most recent last, for `]`.
     walked: Vec<SceneId>,
@@ -687,6 +698,7 @@ impl GraphCanvas {
             fit_zoom: 1.,
             fit_pending: true,
             center_on: None,
+            reveal_new: false,
             selected: None,
             walked: Vec::new(),
             hovered: None,
@@ -1212,7 +1224,72 @@ impl GraphCanvas {
             self.camera_touched = true;
             self.glide_from(from, cx);
         }
+        if std::mem::take(&mut self.reveal_new) {
+            let new: Vec<usize> = (0..self.scene.nodes.len())
+                .filter(|index| !drawn.contains_key(&self.scene.nodes[*index].id))
+                .collect();
+            self.reveal(&new, now, cx);
+        }
         cx.notify();
+    }
+
+    /// Moves the view just enough to show the chips `indices`, and zooms out as far as it
+    /// takes, down to [`REVEAL_MIN_ZOOM`]; past that, their top and leading edge show. Chips
+    /// already in view leave it where it is.
+    fn reveal(&mut self, indices: &[usize], now: Instant, cx: &App) {
+        let Some(viewport) = self.bounds.get() else {
+            return;
+        };
+        let widths = self.half_widths.clone();
+        let mut chips = indices.iter().map(|&index| {
+            let at = self.positions[index];
+            let half = widths.get(index).copied().unwrap_or(60.);
+            (
+                at.x - half,
+                at.x + half,
+                at.y - REVEAL_HALF_HEIGHT,
+                at.y + REVEAL_HALF_HEIGHT,
+            )
+        });
+        let Some(first) = chips.next() else {
+            return;
+        };
+        let (left, right, top, bottom) = chips.fold(first, |a, b| {
+            (a.0.min(b.0), a.1.max(b.1), a.2.min(b.2), a.3.max(b.3))
+        });
+        let from = self.camera_now(now);
+        let (width, height) = (
+            f32::from(viewport.size.width).max(1.),
+            f32::from(viewport.size.height).max(1.),
+        );
+        // Room for the controls floating over the canvas's edges.
+        let room = |screen: f32| (screen - 2. * REVEAL_MARGIN).max(1.);
+        let fits =
+            (room(width) / (right - left).max(1.)).min(room(height) / (bottom - top).max(1.));
+        let zoom = self.zoom.min(fits).max(REVEAL_MIN_ZOOM.min(self.zoom));
+        // Along each axis: unmoved when the span is in view, else moved the least to show it,
+        // or to show its start when it is longer than the view.
+        let axis = |center: f32, low: f32, high: f32, screen: f32| {
+            let half = room(screen) / 2. / zoom;
+            if high - low > 2. * half || low < center - half {
+                low + half
+            } else if high > center + half {
+                high - half
+            } else {
+                center
+            }
+        };
+        let center = Vec2::new(
+            axis(from.center.x, left, right, width),
+            axis(from.center.y, top, bottom, height),
+        );
+        if center == from.center && zoom == from.zoom {
+            return;
+        }
+        self.center = center;
+        self.zoom = zoom;
+        self.camera_touched = true;
+        self.glide_from(from, cx);
     }
 
     /// Where node `index` is drawn at `now`: on its way, or at its place.
@@ -1466,10 +1543,12 @@ impl GraphCanvas {
         let Some(walk) = self.schema_walk.as_mut() else {
             return;
         };
+        self.reveal_new = true;
         match node.kind {
             SceneKind::Node { node, expanded, .. } => {
                 if expanded && !expand_only {
                     walk.collapse(&node.type_name);
+                    self.reveal_new = false;
                 } else {
                     walk.expand(&node.type_name);
                 }
