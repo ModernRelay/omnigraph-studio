@@ -185,7 +185,8 @@
   {
     "bindings": {
       "ctrl-n": "studio_graph::NewQuery",
-      "ctrl-shift-o": "studio_graph::OpenMap"
+      "ctrl-shift-o": "studio_graph::OpenMap",
+      "ctrl-shift-r": "studio_graph::ReviewBranch"
     }
   },
   {

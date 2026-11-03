@@ -30,7 +30,7 @@ const KEYMAPS: [(&str, &str); 3] = [
 
 /// The actions without a default key, as in Zed: rare, or destructive enough that a key would
 /// be reached by accident. Each is in the command palette, and most in a menu as well.
-const PALETTE_ONLY: [&str; 28] = [
+const PALETTE_ONLY: [&str; 27] = [
     "studio_graph::OpenAsReview",
     "studio_graph::OpenAsHistory",
     "studio_graph::OpenAsTable",
@@ -47,7 +47,6 @@ const PALETTE_ONLY: [&str; 28] = [
     "studio::TogglePinTab",
     "studio::KeepPreviewTab",
     "studio::CloseGraph",
-    "studio_graph::ReviewBranch",
     "studio_graph::OpenHistory",
     "studio_graph::CreateBranch",
     "studio_graph::DeleteBranch",
