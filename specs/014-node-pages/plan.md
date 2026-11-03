@@ -185,9 +185,10 @@ Four parts, built in this order; each lands on its own.
   enum values are not parsed. Soft line breaks render as line breaks, so plain text keeps its
   lines. What is stored is always the raw text: rendering never rewrites a value, and an edit
   saves exactly what was typed.
-- **In a table** a value shows its first line, markup removed by the same parse; ↵ or a click
-  edits a one-line value in the cell; a value with a line break or markup opens in the editor
-  (below), read at the table's commit, since a one-line cell editor would flatten it.
+- **In a table** a value shows its first line, markup removed by the same parse; ↵ or a double
+  click edits a one-line value in the cell; a value with a line break or markup opens in the
+  editor (below), read at the table's commit, since a one-line cell editor would flatten it.
+  The cell's ⤢ or ⌘⇧↵ opens any text there (spec 004, Editing).
 - **On the page** a value renders (Zed's `markdown`, as agent replies render). A click on it or
   ↵ edits it in place: Zed's `Editor` in full mode, soft-wrapped, growing with its text,
   highlighted with `tree-sitter-md`; ⌘↵ or leaving it ends the edit into the draft. A segmented

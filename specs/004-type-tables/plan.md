@@ -388,8 +388,18 @@ its open section.
 
 ### Editing
 
-- Click a name to peek, click a value to edit; one overlay editor; a cell cursor moved with
-  arrows; ↵ edits, Esc cancels, Tab moves to the next cell.
+- A cell cursor, as a spreadsheet's: a click puts it on a cell and the arrows move it, ringed
+  in the accent green with the scale's row corners (`ds::cell_cursor`). A click on a name also
+  peeks its row, as one on a value nobody may edit there does; a second click, or ↵, opens the
+  cell: a value's edit, a relationship's related rows. One overlay editor; Esc cancels, Tab
+  moves to the next cell. (Before 2026-11-02 one click edited a value and opened a
+  relationship, so the arrows had no cell to move from.)
+- A text that reads as markdown ends in ⤢ under the pointer, on the cursor's cell and in its
+  open edit: it, or ⌘⇧↵, opens the cell in the editor with its preview (spec 014), read at the
+  table's commit, with what was typed in the cell, which stays its draft. Offered, and the key
+  registered, only where the cell may be changed, as the inspector offers it. The ⤢ sits over
+  the text's end on the row's fill, the design system's hovered row under the pointer, which
+  the grid now draws rather than Zed's table.
 - A cell save is bound to the value the cell showed:
 
   ```
@@ -532,6 +542,7 @@ kept answers.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-02 | A click puts the cursor on a cell and a second edits it; a text cell's ⤢ or ⌘⇧↵ opens it in the editor | `type_table` `one_click_puts_the_cursor_on_a_value_and_a_second_edits_it` (a click on Person's name: the cursor there, nothing edited, ↓ moves it; a double click edits), `a_text_cells_expand_opens_it_in_the_editor_with_what_was_typed` (no ⤢ on the key; the name's ⤢, hovered and clicked, opens `OpenTextEditor` at the table's commit; ⌘⇧↵ in an open edit sends what was typed, kept as the draft; a read-only credential draws no ⤢ and has no key). Both fail on main, where one click edited and no cell had a ⤢. Offscreen snapshots on the dev graph (1440×900 at 2×): the cursor on a name, another row's title hovered, the cursor's row hovered, the cursor's cell edited | Pass. A 2 px ring with 6 px corners at the default radius, the ⤢ at the cell's end; the first render put the hovered ⤢ on the resting row's white fill inside the grey hovered row, so the grid draws the design system's hovered row itself and the ⤢ takes that fill |
 | 2026-11-01 | On a branch the rows the branch removed show first, struck and not for picking or editing, and the rows it added or changed are marked, a changed row by its changed cells | `type_table` `a_branch_shows_what_it_changed_in_the_rows` (a table on main, then on fix with p1 added, p2's name changed and p3 removed, then back on main), `branch_diff` `marks_the_types_rows_by_what_the_branch_did`, `a_removed_edge_keeps_its_ends`, `a_row_that_ends_where_it_began_is_not_marked` | Pass. On main nothing is read for it; on fix the rows read p3, p1, p2, select-all picked p1 and p2, Enter on p3 opened nothing; back on main p3 went. Not drawn by a test: the wash, the gutter bar and the strikethrough |
 | 2026-10-31 | A condition filter is spliced in as written and judged by the compiler before a read | `gq_language` `a_condition_is_spliced_in_and_judged_by_the_compiler` (an `or … not exists { }` condition type-checks beside a pill's clause; `$n.nope = 1` is a diagnostic; an empty one is refused by the builder) | Pass. The pill's edit-on-click and the draft's compile error are not drawn by a test |
 | 2026-10-31 | "Matches words" is offered where the compiler takes `search`, and only there | `gq_language` `every_offered_filter_op_compiles` (extended: edge properties too, and a schema with a composite key, `@index(title)` on the type, `summary: String @index`, a lone key and `note: String @index` on an edge), `text_filters_start_with_search_and_reach_neighbours` (extended: offered on `title`, `summary` and the lone key, not on a composite key's member or an unindexed property). Each fails under the earlier rule (checked) | Fixed. The first rule marked every key member and every property `@index` as searchable, so a composite key's members and an edge's indexed property offered an operator whose query failed to compile, and a one-column index declared on the type was not offered. Each property now asks the compiler's catalog, which Studio already builds |

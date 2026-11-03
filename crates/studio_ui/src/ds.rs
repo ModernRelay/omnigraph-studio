@@ -3560,6 +3560,20 @@ pub fn header_row(cx: &App) -> Div {
     grid_row(cx).bg(header_fill(cx))
 }
 
+/// A grid's cell cursor, as a spreadsheet draws it: a ring in the [`surface::accent`], the
+/// selection's colour as the canvas's marquee is, apart from a field's grey focus ring. Two
+/// pixels wide, with the scale's row corners, over the whole cell so no cell changes size. Draw
+/// it after what the cell holds, which it rings; a cell being edited fills it with the
+/// document's fill and draws it first, under its field.
+pub fn cell_cursor(cx: &App) -> Div {
+    div()
+        .absolute()
+        .inset_0()
+        .rounded(px(radii(cx).sm))
+        .border_2()
+        .border_color(surface::accent(cx))
+}
+
 /// A grid's data cell: [`size::ROW`] high, its value [`space::LG`] in from both sides.
 pub fn data_cell() -> Div {
     h_flex()
@@ -3583,6 +3597,13 @@ pub fn cell_action(id: impl Into<ElementId>, glyph: IconName) -> IconButton {
 /// keeps its place in the layout: a hover that changed layout would change it between a
 /// frame's prepaint and its paint.
 pub fn hover_slot(group: impl Into<SharedString>, fill: Hsla, action: impl IntoElement) -> Div {
+    end_slot(fill, action).visible_on_hover(group)
+}
+
+/// A [`cell_action`] over the end of a cell on the cell's opaque fill (`fill`), shown: a
+/// [`hover_slot`] that does not wait for the pointer, as the cell cursor's cell shows its
+/// action.
+pub fn end_slot(fill: Hsla, action: impl IntoElement) -> Div {
     div()
         .absolute()
         .top_0()
@@ -3593,7 +3614,6 @@ pub fn hover_slot(group: impl Into<SharedString>, fill: Hsla, action: impl IntoE
         .flex()
         .items_center()
         .bg(fill)
-        .visible_on_hover(group)
         .child(action)
 }
 

@@ -573,6 +573,9 @@ pub mod table {
             MoveRight,
             /// Edit the selected cell.
             EditCell,
+            /// Open the selected text cell in an editor of its own beside its markdown
+            /// preview, with what was typed in the cell.
+            ExpandCell,
             /// Save the cell being edited, or apply the filter being typed.
             ConfirmEdit,
             /// Keep the cell being edited as a draft, to save with the others in one commit.

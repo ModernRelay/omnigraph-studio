@@ -34,8 +34,8 @@ use graph_store::{
 use serde_json::Value;
 use studio_actions::blob::{ChooseFile, ClearValue};
 use studio_actions::table::{
-    AddFilter, Cancel, ClearFilters, ConfirmEdit, CopyCell, DeleteRow, EditCell, FillColumn,
-    FilterBySelection, FilterInWords, InsertRow, MoveDown, MoveLeft, MoveRight, MoveUp,
+    AddFilter, Cancel, ClearFilters, ConfirmEdit, CopyCell, DeleteRow, EditCell, ExpandCell,
+    FillColumn, FilterBySelection, FilterInWords, InsertRow, MoveDown, MoveLeft, MoveRight, MoveUp,
     OpenRowPage, PeekRow, RefreshTable, SaveDrafts, SelectNextSuggestion, SelectPreviousSuggestion,
     ShowRowOnCanvas, StageEdit,
 };
@@ -498,6 +498,9 @@ async fn read_branch_diff(
 /// The hover group of a grid row, for the actions its cells show under the pointer.
 const ROW_GROUP: &str = "table-row";
 
+/// The hover group of a grid cell, for the action a text cell shows under the pointer.
+const CELL_GROUP: &str = "table-cell";
+
 /// Where the key column's checkbox sits: the page's gutter, as the toolbar's title does,
 /// since the grid runs to the document's edges. The other cells keep a cell's inset.
 const KEY_INSET: f32 = space::EDGE;
@@ -787,6 +790,9 @@ pub struct TypeTable {
     frame_looks: Rc<RefCell<HashMap<usize, RowLook>>>,
     /// The places this frame's lines draw.
     frame_places: Rc<[GridPlace]>,
+    /// The cells this frame draws may be changed: the table reads the branch, and the
+    /// credential may change it. Found once a frame, not for every cell.
+    frame_writable: bool,
     /// The columns the last drawn rows drew.
     #[cfg(test)]
     frame_drawn: Vec<bool>,
@@ -1181,6 +1187,7 @@ impl TypeTable {
             frame_lines: None,
             frame_looks: Rc::default(),
             frame_places: Rc::from([]),
+            frame_writable: false,
             #[cfg(test)]
             frame_drawn: Vec::new(),
             frame_now: chrono::Local::now(),
@@ -5179,7 +5186,7 @@ impl TypeTable {
             return;
         };
         let (role, editable) = (column.role.clone(), column.editable(self.kind));
-        let relationship = column.relationship().cloned();
+        let relationship = column.relationship().is_some();
         let cursor = Cursor { row, col };
         // A double click on a node's key opens its page (spec 014); the first click peeked it.
         if clicks >= 2 && self.kind == TableKind::Node && matches!(role, ColumnRole::Key) {
@@ -5197,28 +5204,44 @@ impl TypeTable {
             self.clear_selection(cx);
         }
         self.set_cursor(cursor, cx);
-        // A relationship cell opens the related rows: the other type, filtered to those related
-        // to this row through the same relationship seen from the other end.
-        if let (Some(group), Some(id)) = (relationship, self.rows.get(row).map(|r| r.id.clone())) {
-            let back = builder::reversed(&group, &self.type_name);
-            window.dispatch_action(
-                Box::new(studio_actions::graph::OpenType {
-                    type_name: group.other_type.clone(),
-                    at_commit: self.at_commit.clone(),
-                    filter_id: Some(id),
-                    via: Some(builder::relationship_key(&back)),
-                    preview: false,
-                    filters: None,
-                }),
-                cx,
-            );
-            return;
-        }
-        if editable {
-            self.start_edit(cursor, window, cx);
-        } else {
+        // One click puts the cursor on the cell, as a spreadsheet's does, so the arrows go on
+        // from there; a second opens it, as ↵ does. A key, or a value nobody may edit here,
+        // peeks its row at once.
+        if clicks >= 2 {
+            self.open_cell(cursor, window, cx);
+        } else if !relationship && !(editable && self.write_refusal(cx).is_none()) {
             self.show_peek(row, false, cx);
         }
+    }
+
+    /// ↵ or a double click: a value's edit, or a relationship's related rows, the other type
+    /// filtered to those related to this row through the same relationship seen from the other
+    /// end.
+    fn open_cell(&mut self, cursor: Cursor, window: &mut Window, cx: &mut Context<Self>) {
+        let group = self
+            .columns
+            .get(cursor.col)
+            .and_then(ColumnSpec::relationship)
+            .cloned();
+        let Some(group) = group else {
+            self.start_edit(cursor, window, cx);
+            return;
+        };
+        let Some(id) = self.rows.get(cursor.row).map(|row| row.id.clone()) else {
+            return;
+        };
+        let back = builder::reversed(&group, &self.type_name);
+        window.dispatch_action(
+            Box::new(studio_actions::graph::OpenType {
+                type_name: group.other_type.clone(),
+                at_commit: self.at_commit.clone(),
+                filter_id: Some(id),
+                via: Some(builder::relationship_key(&back)),
+                preview: false,
+                filters: None,
+            }),
+            cx,
+        );
     }
 
     // ---- peek ----
@@ -6912,7 +6935,86 @@ impl TypeTable {
             return;
         };
         self.set_cursor(cursor, cx);
-        self.start_edit(cursor, window, cx);
+        self.open_cell(cursor, window, cx);
+    }
+
+    /// Whether a cell opens in the editor with its preview from its ⤢ or ⌘⇧↵ (spec 014): a
+    /// text that reads as markdown, in a node's row the branch has not removed, while no save of
+    /// it is out, as the inspector offers it. `state` is the cell's; whether the table may write
+    /// at all is the caller's.
+    fn cell_expands(&self, row: &Row, column: &ColumnSpec, state: Option<&CellState>) -> bool {
+        column.editable(self.kind)
+            && column.property().is_some_and(reads_as_markdown)
+            && !matches!(state, Some(CellState::Saving { .. }))
+            && !self.is_removed(&row.id)
+    }
+
+    /// The cursor's cell opens in the editor ([`Self::cell_expands`]).
+    fn cursor_expands(&self) -> bool {
+        let Some(cursor) = self.cursor else {
+            return false;
+        };
+        let (Some(row), Some(column)) = (self.rows.get(cursor.row), self.columns.get(cursor.col))
+        else {
+            return false;
+        };
+        let state = if self.cells.is_empty() {
+            None
+        } else {
+            self.cells.get(&(row.id.clone(), column.key.clone()))
+        };
+        self.cell_expands(row, column, state)
+    }
+
+    fn on_expand_cell(&mut self, _: &ExpandCell, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(cursor) = self.cursor {
+            self.expand_cell(cursor, window, cx);
+        }
+    }
+
+    /// ⌘⇧↵ or a text cell's ⤢: the cell in an editor of its own beside its preview (spec 014),
+    /// read at the table's commit so its save stays bound to what the cell shows, with what was
+    /// typed in it. An edit open is first kept as its cell's draft, as leaving the cell keeps
+    /// it: an editor of the property already open only comes forward, and the text stays where
+    /// the table shows it.
+    fn expand_cell(&mut self, cursor: Cursor, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(row), Some(column)) = (self.rows.get(cursor.row), self.columns.get(cursor.col))
+        else {
+            return;
+        };
+        let key = (row.id.clone(), column.key.clone());
+        if self.write_refusal(cx).is_some() || !self.cell_expands(row, column, self.cells.get(&key))
+        {
+            return;
+        }
+        let Some(property) = column.property().map(|property| property.name.clone()) else {
+            return;
+        };
+        let typed = match self.editing.take() {
+            Some(editing) => {
+                let here = editing.row_id == key.0 && editing.column == key.1;
+                let text = self.cell_editor.read(cx).text(cx);
+                self.keep_edit(editing, cx);
+                here.then_some(text)
+            }
+            None => None,
+        }
+        .or_else(|| match self.cells.get(&key) {
+            Some(CellState::Draft { text, .. }) => Some(text.clone()),
+            _ => None,
+        });
+        window.dispatch_action(
+            Box::new(studio_actions::graph::OpenTextEditor {
+                type_name: self.type_name.clone(),
+                id: key.0,
+                property,
+                read_at: self.paging.pinned.clone(),
+                text: typed,
+            }),
+            cx,
+        );
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
     }
 
     /// G: the row's node on the explorer, rooted there (spec 006: from a table into the graph).
@@ -8459,6 +8561,7 @@ impl TypeTable {
             .collect();
         let places: Rc<[GridPlace]> = grid_places(&drawn, &column_widths).into();
         self.frame_places = places.clone();
+        self.frame_writable = self.at_commit.is_none() && self.change_refusal(cx).is_none();
         // The grid ends at its last column: a header and rows no wider than the columns, so no
         // fill or rule runs on past it when they are narrower than the document.
         let content_width = column_widths
@@ -8622,12 +8725,17 @@ impl TypeTable {
             .width_config(ColumnWidthConfig::explicit(widths))
             .disable_base_style()
             .hide_row_borders()
+            // The design system's hovered row, which what a cell draws over its text matches
+            // (`TypeTable::render_cell`), rather than Zed's.
+            .hide_row_hover()
             .pin_cols(1)
             .map_row(move |(ix, row), _window, cx| {
                 let look = looks.borrow().get(&ix).copied().unwrap_or_default();
+                let hover = studio_ui::ds::surface::hover(cx);
                 studio_ui::ds::dotted(row.border_b_1(), cx)
                     .max_w(content_width)
                     .group(ROW_GROUP)
+                    .hover(move |style| style.bg(hover))
                     .when(look.header, |row| row.bg(header_bg))
                     // A changed row is said by its cells, not by a wash.
                     .when_some(
@@ -9915,8 +10023,7 @@ impl TypeTable {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let column = &self.columns[col];
-        let (focus_border, divider, editor_bg) = (
-            studio_ui::ds::surface::focus(cx),
+        let (divider, editor_bg) = (
             studio_ui::ds::surface::rule(cx),
             studio_ui::ds::surface::document(cx),
         );
@@ -9932,6 +10039,9 @@ impl TypeTable {
             self.cells.get(&(row.id.clone(), column.key.clone()))
         };
         let value = row.value(&column.key);
+        // A text opens in the editor with its preview from the ⤢ at its cell's end (spec 014),
+        // shown under the pointer, on the cursor's cell and in the cell's open field.
+        let expands = self.frame_writable && self.cell_expands(row, column, state);
         let mut cell = div()
             .id(ElementId::NamedInteger(
                 "cell".into(),
@@ -9952,22 +10062,15 @@ impl TypeTable {
             })
             .when(column.align_right, |d| d.justify_end());
         let removed = self.is_removed(&row.id);
-        // The cursor and the editor are drawn as a ring over the cell, so no cell changes size.
-        let ring = || {
-            div()
-                .absolute()
-                .inset_0()
-                .border_1()
-                .border_color(focus_border)
-        };
         if let Some(editing) = editing {
             let hint = column
                 .property()
                 .and_then(|p| p.enum_values.as_ref())
                 .map(|values| format!("One of: {}", values.join(", ")));
-            // The editor itself is drawn over this place by the table (`edit_slot`).
+            // The editor itself is drawn over this place by the table (`edit_slot`), inside the
+            // cursor's ring on the document's fill.
             return cell
-                .bg(editor_bg)
+                .child(studio_ui::ds::cell_cursor(cx).bg(editor_bg))
                 .child(
                     div()
                         .flex_1()
@@ -9975,7 +10078,7 @@ impl TypeTable {
                         .h_full()
                         .child(self.edit_slot.mark()),
                 )
-                .child(ring())
+                .when(expands, |cell| cell.child(self.render_expand(ix, col, cx)))
                 .child(self.render_edit_callout(editing.notice.clone(), hint, window, cx))
                 .into_any_element();
         }
@@ -9999,7 +10102,7 @@ impl TypeTable {
             let available = self.layout.width(column) - 2. * space::LG;
             return cell
                 .child(self.render_relation_cell(place, col, row, available, cx))
-                .when(is_cursor, |cell| cell.child(ring()))
+                .when(is_cursor, |cell| cell.child(studio_ui::ds::cell_cursor(cx)))
                 .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                     this.click_cell(ix, col, event.modifiers(), event.click_count(), window, cx)
                 }))
@@ -10162,9 +10265,6 @@ impl TypeTable {
                     this.drop_blob_files(&row_id, &property, paths.paths(), cx)
                 }));
         }
-        if is_cursor {
-            cell = cell.child(ring());
-        }
         if row.dimmed && col == 0 {
             cell = cell.tip(studio_ui::ds::tooltip(
                 "No longer matches the filters or its group. It leaves when the list is read again.",
@@ -10187,13 +10287,80 @@ impl TypeTable {
                     .on_click(cx.listener(move |this, _, window, cx| this.peek_at(ix, window, cx))),
             )
         });
-        cell.children(dot.map(studio_ui::ds::dot))
+        // Over the text's end on the row's fill, as a header's menu sits over its name.
+        let expand = expands.then(|| {
+            let button = self.render_expand(ix, col, cx);
+            // The row's fill under the pointer, which replaces its own (`render_grid`).
+            let hovered =
+                studio_ui::ds::surface::document(cx).blend(studio_ui::ds::surface::hover(cx));
+            let slot = if is_cursor {
+                studio_ui::ds::end_slot(self.row_fill(ix, row, cx), button)
+                    .group_hover(ROW_GROUP, move |style| style.bg(hovered))
+            } else {
+                // Shown only under the pointer, so over a hovered row.
+                studio_ui::ds::hover_slot(CELL_GROUP, hovered, button)
+            };
+            slot.debug_selector(move || format!("expand-cell-{ix}-{col}"))
+        });
+        cell.when(expands, |cell| cell.group(CELL_GROUP))
+            .children(dot.map(studio_ui::ds::dot))
             .child(content)
             .children(peek)
+            .children(expand)
+            // The cursor rings what the cell holds, its action too.
+            .when(is_cursor, |cell| cell.child(studio_ui::ds::cell_cursor(cx)))
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.click_cell(ix, col, event.modifiers(), event.click_count(), window, cx)
             }))
             .into_any_element()
+    }
+
+    /// A text cell's ⤢: the cell in the editor with its preview, from the cursor's cell.
+    fn render_expand(
+        &self,
+        ix: usize,
+        col: usize,
+        cx: &mut Context<Self>,
+    ) -> studio_ui::ds::IconButton {
+        studio_ui::ds::cell_action(
+            ("expand-cell", ix * self.columns.len() + col),
+            IconName::Maximize,
+        )
+        .tip_fn({
+            let focus = self.focus_handle.clone();
+            move |_, cx| {
+                studio_ui::ds::tooltip_for_action_in_view(
+                    "Open in the editor",
+                    &ExpandCell,
+                    &focus,
+                    cx,
+                )
+            }
+        })
+        .on_click(cx.listener(move |this, _, window, cx| {
+            // The cell's own click would open its edit.
+            cx.stop_propagation();
+            let cursor = Cursor { row: ix, col };
+            this.set_cursor(cursor, cx);
+            this.expand_cell(cursor, window, cx);
+        }))
+    }
+
+    /// The opaque fill under row `ix`'s cells away from the pointer, for what is drawn over a
+    /// cell's text: the document's, under the cursor row's, a picked row's or the branch's
+    /// wash, as the row draws them ([`RowLook`]).
+    fn row_fill(&self, ix: usize, row: &Row, cx: &App) -> gpui::Hsla {
+        let document = studio_ui::ds::surface::document(cx);
+        let over = if self.cursor.is_some_and(|cursor| cursor.row == ix) {
+            Some(studio_ui::ds::surface::selected_document(cx))
+        } else if self.selection.contains(&row.id) {
+            Some(studio_ui::ds::surface::picked(cx))
+        } else {
+            self.row_change(&row.id)
+                .filter(|net| *net != NetChange::Changed)
+                .map(|net| studio_ui::ds::surface::wash(change_color(net), cx))
+        };
+        over.map_or(document, |fill| document.blend(fill))
     }
 
     fn render_edit_callout(
@@ -10276,12 +10443,19 @@ impl TypeTable {
         // The keys of actions the credential may not take on the branch are not listed, as
         // they are not registered.
         let refused = self.change_refusal(cx).is_some();
+        let expands = self.at_commit.is_none() && self.cursor_expands();
         let mut keys = match (self.editing.is_some(), self.kind) {
-            (true, _) => vec![
-                key("Save", &ConfirmEdit),
-                key("Keep as draft", &StageEdit),
-                key("Cancel", &Cancel),
-            ],
+            (true, _) => {
+                let mut keys = vec![
+                    key("Save", &ConfirmEdit),
+                    key("Keep as draft", &StageEdit),
+                    key("Cancel", &Cancel),
+                ];
+                if expands {
+                    keys.insert(2, key("Open in the editor", &ExpandCell));
+                }
+                keys
+            }
             // A table pinned to a commit only reads.
             (false, kind) if self.at_commit.is_some() => {
                 let mut keys = vec![key("Peek", &PeekRow), key("Copy", &CopyCell)];
@@ -10307,6 +10481,9 @@ impl TypeTable {
                     keys.insert(1, key("Choose file", &ChooseFile));
                     keys.insert(2, key("Clear value", &ClearValue));
                 }
+                if expands {
+                    keys.insert(1, key("Open in the editor", &ExpandCell));
+                }
                 keys
             }
             (false, TableKind::Edge) => vec![
@@ -10330,8 +10507,9 @@ impl TypeTable {
 
 /// Whether a table key writes to the branch, so goes when the credential may not change it.
 fn writes(action: &dyn gpui::Action) -> bool {
-    let writing: [&dyn gpui::Action; 7] = [
+    let writing: [&dyn gpui::Action; 8] = [
         &EditCell,
+        &ExpandCell,
         &ConfirmEdit,
         &SaveDrafts,
         &InsertRow,
@@ -10430,6 +10608,11 @@ impl Render for TypeTable {
                     .on_action(cx.listener(Self::on_insert))
                     .on_action(cx.listener(Self::on_delete))
             })
+            // Only where the cursor's cell opens in the editor, so the palette offers it there.
+            .when(
+                writable && self.at_commit.is_none() && self.cursor_expands(),
+                |table| table.on_action(cx.listener(Self::on_expand_cell)),
+            )
             .on_action(cx.listener(Self::on_cancel))
             .on_action(cx.listener(Self::on_peek))
             .on_action(cx.listener(Self::on_open_row_page))
@@ -11691,6 +11874,153 @@ mod tests {
             table.start_edit(Cursor { row: 0, col }, window, cx);
             assert!(table.editing.is_some(), "a plain value edits in the cell");
         });
+    }
+
+    /// Clicks a place in the grid `clicks` times over, as the second click of a double click
+    /// arrives.
+    fn click_at(cx: &mut VisualTestContext, at: gpui::Point<Pixels>, clicks: usize) {
+        let modifiers = gpui::Modifiers::none();
+        cx.simulate_event(MouseDownEvent {
+            position: at,
+            modifiers,
+            button: MouseButton::Left,
+            click_count: clicks,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: at,
+            modifiers,
+            button: MouseButton::Left,
+            click_count: clicks,
+        });
+        cx.run_until_parked();
+    }
+
+    /// Where a text cell's ⤢ is drawn, shown or not.
+    fn expand_slot(
+        row: usize,
+        col: usize,
+        cx: &mut VisualTestContext,
+    ) -> Option<gpui::Bounds<Pixels>> {
+        cx.debug_bounds(format!("expand-cell-{row}-{col}").leak())
+    }
+
+    /// One click on a value puts the cursor on it, as a spreadsheet's does, and opens nothing,
+    /// so the arrows go on from there; a second click edits it, as ↵ does (spec 004, Editing).
+    #[gpui::test]
+    async fn one_click_puts_the_cursor_on_a_value_and_a_second_edits_it(cx: &mut TestAppContext) {
+        let session = session(PEOPLE, cx);
+        let (table, cx) = people_table(&session, cx);
+        let col = table.read_with(cx, |table, _| table.column_index("name").unwrap());
+        // The text before the cell's ⤢.
+        let slot = expand_slot(0, col, cx).expect("the name cell ends in its ⤢");
+        let at = gpui::point(slot.left() - px(24.), slot.center().y);
+        click_at(cx, at, 1);
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.cursor, Some(Cursor { row: 0, col }));
+            assert!(table.editing.is_none(), "one click edits nothing");
+        });
+        cx.dispatch_action(MoveDown);
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(
+                table.cursor,
+                Some(Cursor { row: 1, col }),
+                "the click gave the table the keys"
+            );
+        });
+        click_at(cx, at, 2);
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.cursor, Some(Cursor { row: 0, col }));
+            let editing = table.editing.as_ref().expect("a double click edits");
+            assert_eq!(
+                (editing.row_id.as_str(), editing.column.as_str()),
+                ("p1", "name")
+            );
+        });
+    }
+
+    /// A text cell's ⤢, shown under the pointer, opens it in the editor with its preview, read
+    /// at the table's commit (spec 014); ⌘⇧↵ in its open edit does too, with what was typed,
+    /// which stays the cell's draft. A key has none, and a credential that may not change the
+    /// branch is offered neither.
+    #[gpui::test]
+    async fn a_text_cells_expand_opens_it_in_the_editor_with_what_was_typed(
+        cx: &mut TestAppContext,
+    ) {
+        use studio_actions::graph::OpenTextEditor;
+        let session = session(PEOPLE, cx);
+        let (table, cx) = people_table(&session, cx);
+        let opened: Rc<RefCell<Vec<OpenTextEditor>>> = Rc::default();
+        cx.update(|_, cx| {
+            let opened = opened.clone();
+            cx.on_action(move |action: &OpenTextEditor, _| {
+                opened.borrow_mut().push(action.clone())
+            });
+        });
+        let col = table.read_with(cx, |table, _| table.column_index("name").unwrap());
+        assert!(expand_slot(0, 0, cx).is_none(), "a key has no ⤢");
+        let slot = expand_slot(0, col, cx).expect("the name cell ends in its ⤢");
+        // Shown once the pointer is over its cell.
+        cx.simulate_mouse_move(slot.center(), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_click(slot.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let pinned = table.read_with(cx, |table, _| {
+            assert_eq!(table.cursor, Some(Cursor { row: 0, col }));
+            assert!(table.editing.is_none(), "the ⤢ does not edit the cell");
+            table.paging.pinned.clone()
+        });
+        assert!(pinned.is_some(), "the table read at a commit");
+        assert_eq!(
+            opened.borrow().as_slice(),
+            [OpenTextEditor {
+                type_name: "Person".into(),
+                id: "p1".into(),
+                property: "name".into(),
+                read_at: pinned.clone(),
+                text: None,
+            }]
+        );
+        table.update_in(cx, |table, window, cx| {
+            table.start_edit(Cursor { row: 0, col }, window, cx);
+            table
+                .cell_editor
+                .update(cx, |editor, cx| editor.set_text("Adaline", window, cx));
+        });
+        cx.run_until_parked();
+        cx.dispatch_action(ExpandCell);
+        cx.run_until_parked();
+        assert_eq!(
+            opened.borrow().last().map(|action| action.text.clone()),
+            Some(Some("Adaline".to_owned())),
+            "what was typed goes with it"
+        );
+        table.read_with(cx, |table, _| {
+            assert!(table.editing.is_none());
+            assert!(
+                matches!(
+                    table.cells.get(&("p1".to_owned(), "name".to_owned())),
+                    Some(CellState::Draft { text, .. }) if text == "Adaline"
+                ),
+                "and stays the cell's draft"
+            );
+        });
+
+        let (session, _, _) = crate::test_support::session_with_access(
+            PEOPLE,
+            crate::test_support::read_only_access(),
+            &mut cx.cx,
+        );
+        let (table, cx) = people_table(&session, &mut cx.cx);
+        table.update_in(cx, |table, window, cx| {
+            table.set_cursor(Cursor { row: 0, col }, cx);
+            window.focus(&table.focus_handle, cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(expand_slot(0, col, cx).is_none(), "nothing to save it to");
+        assert!(!cx.update(|window, cx| window.is_action_available(&ExpandCell, cx)));
     }
 
     /// A node's page reads the node by id once it is shown and names its tab by the node's
