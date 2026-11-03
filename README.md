@@ -10,7 +10,7 @@ The UI is built on [GPUI](https://github.com/zed-industries/zed/tree/main/crates
 Rust UI framework from Zed, with its editor, UI and theme crates. GPUI draws every frame on the
 GPU, through Metal on macOS and Vulkan (wgpu) on Linux; there is no web view or browser engine.
 
-![Studio walking a person's relationships on the canvas, grouping the Person table by company, catching a typo in a query before it runs, then reviewing a branch's changes before merging it](docs/images/demo.gif)
+![Studio opening a person from the Person table as a page, exploring their relationships on the canvas and in the tree, catching a typo in a query before it runs, then switching to a branch whose table shows the added, changed and removed rows inline and reviewing those changes before the merge](docs/images/demo.gif)
 
 ## Download
 
