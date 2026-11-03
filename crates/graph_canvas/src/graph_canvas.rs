@@ -11,11 +11,11 @@
 //! Layer 5 (`docs/architecture.md`). Plan: `specs/006-graph-canvas/plan.md`.
 
 mod domains;
-mod layered;
 mod layout;
 mod model;
 mod ontology;
 mod paint;
+mod schema_walk;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -49,7 +49,7 @@ use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
 use ui::prelude::*;
 
 use layout::{LayoutKind, LayoutNode, Vec2};
-use model::{HUB_STEP, Scene, SceneId, SceneKind};
+use model::{HUB_STEP, Scene, SceneId, SceneKind, SceneNode};
 use studio_ui::menu::ContextMenu;
 use studio_ui::motion::{self, Ease, Lerp, Tween};
 
@@ -188,6 +188,13 @@ enum Mode {
     Explore,
     /// A query's result nodes (specs 006, 007).
     Results,
+    /// The schema's types, walked from one ([`schema_walk`]).
+    Schema,
+}
+
+/// Asked of the page holding a schema canvas: show a type's description and properties.
+pub(crate) enum TypeEvent {
+    Details(String),
 }
 
 /// What a results canvas draws: a query's nodes, and which ones share a row.
@@ -347,6 +354,8 @@ pub(crate) struct GraphCanvas {
     walk: Option<(NodeRef, Option<String>)>,
     /// Set for a canvas of query results; such a canvas never shows the exploration.
     results: Option<(usize, Arc<ResultsData>)>,
+    /// Set for a canvas of the schema's types; such a canvas never shows the exploration.
+    schema_walk: Option<schema_walk::SchemaWalk>,
     focus_handle: FocusHandle,
     scene: Arc<Scene>,
     positions: Arc<Vec<Vec2>>,
@@ -431,6 +440,7 @@ pub(crate) struct GraphCanvas {
 }
 
 impl EventEmitter<ItemEvent> for GraphCanvas {}
+impl EventEmitter<TypeEvent> for GraphCanvas {}
 
 impl Focusable for GraphCanvas {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -511,7 +521,7 @@ impl Item for GraphCanvas {
     fn tab_icon(&self, _cx: &App) -> Option<IconName> {
         Some(match self.mode() {
             Mode::Explore => IconName::Crosshair,
-            Mode::Results => IconName::GitGraph,
+            Mode::Results | Mode::Schema => IconName::GitGraph,
         })
     }
 
@@ -546,9 +556,9 @@ impl Item for GraphCanvas {
 }
 
 impl GraphCanvas {
-    /// Whether the canvas draws the exploration: not a results canvas.
+    /// Whether the canvas draws the exploration: not a results or a schema canvas.
     fn draws_exploration(&self) -> bool {
-        self.results.is_none()
+        self.results.is_none() && self.schema_walk.is_none()
     }
 
     /// What the canvas draws: a query's result nodes when it was opened with them (whether or
@@ -556,6 +566,8 @@ impl GraphCanvas {
     fn mode(&self) -> Mode {
         if self.results.is_some() {
             Mode::Results
+        } else if self.schema_walk.is_some() {
+            Mode::Schema
         } else {
             Mode::Explore
         }
@@ -649,6 +661,7 @@ impl GraphCanvas {
             exploration,
             walk,
             results,
+            schema_walk: None,
             focus_handle: cx.focus_handle(),
             scene: Arc::default(),
             positions: Arc::default(),
@@ -732,6 +745,57 @@ impl GraphCanvas {
         )
     }
 
+    /// A canvas of the schema's types, walked from `root` expanded, or with every type expanded
+    /// when `whole` (spec 006, "Ontology on the canvas").
+    pub(crate) fn for_schema(
+        session: Entity<GraphSession>,
+        root: &str,
+        whole: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let exploration = Exploration::unrooted(&session, cx);
+        let mut canvas = Self::build(session, exploration, None, None, HashMap::new(), cx);
+        canvas.schema_walk = Some(match canvas.session.read(cx).schema_model() {
+            Some(schema) if whole => schema_walk::SchemaWalk::whole(&schema, root),
+            _ => schema_walk::SchemaWalk::new(root),
+        });
+        canvas.rebuild(cx);
+        canvas
+    }
+
+    /// Walks the schema from `root` instead, expanded; the places of what was drawn go.
+    pub(crate) fn walk_schema_from(&mut self, root: &str, cx: &mut Context<Self>) {
+        if self
+            .schema_walk
+            .as_ref()
+            .is_some_and(|walk| walk.root == root)
+        {
+            return;
+        }
+        self.schema_walk = Some(schema_walk::SchemaWalk::new(root));
+        self.selected = Some(SceneId::Node(schema_walk::type_ref(root)));
+        self.rebuild(cx);
+    }
+
+    /// Selects the type `name` on a schema canvas and glides to it, where it is drawn.
+    pub(crate) fn show_type(&mut self, name: &str, cx: &mut Context<Self>) {
+        let id = SceneId::Node(schema_walk::type_ref(name));
+        if let Some(index) = self.index_of(&id) {
+            let from = self.camera_now(Instant::now());
+            self.center = self.positions[index];
+            self.zoom = self.zoom.max(1.);
+            self.camera_touched = true;
+            self.glide_from(from, cx);
+        }
+        self.selected = Some(id);
+        cx.notify();
+    }
+
+    /// The type a schema canvas starts from.
+    pub(crate) fn schema_root(&self) -> Option<&str> {
+        self.schema_walk.as_ref().map(|walk| walk.root.as_str())
+    }
+
     /// The commit this canvas is held at, which what it opens is held at too (spec 020): a
     /// walk's, or the commit a query's result was read at.
     fn held_at(&self) -> Option<String> {
@@ -813,16 +877,50 @@ impl GraphCanvas {
             self.rebuild_results(&results, cx);
             return;
         }
+        if self.schema_walk.is_some() {
+            self.rebuild_schema(cx);
+            return;
+        }
         if let Some(scene) = self.explore_scene(cx) {
             self.lay_out_explore(scene, cx);
         }
+    }
+
+    /// Lays out the schema's walk: the types it reaches, grown from where they were drawn.
+    fn rebuild_schema(&mut self, cx: &mut Context<Self>) {
+        let Some(schema) = self.session.read(cx).schema_model() else {
+            return;
+        };
+        let cap = self.node_cap(cx);
+        let Some(walk) = self.schema_walk.as_mut() else {
+            return;
+        };
+        // A root the schema no longer has starts from its first type.
+        if !schema.nodes.iter().any(|node| node.name == walk.root)
+            && let Some(first) = schema.nodes.first()
+        {
+            *walk = schema_walk::SchemaWalk::new(first.name.clone());
+        }
+        let scene = schema_walk::schema_scene(&schema, walk, &self.hub_limits, cap);
+        walk.keep_drawn(&scene);
+        let root = Some(schema_walk::type_ref(&walk.root));
+        self.lay_out_scene(scene, (Mode::Schema, root), cx);
     }
 
     /// Lays out `scene`, the exploration's as it stands, off the main thread: drawn chips keep
     /// their places, and what is new grows from beside them.
     fn lay_out_explore(&mut self, scene: Scene, cx: &mut Context<Self>) {
         let root = self.exploration.read(cx).root().cloned();
-        let key = (Mode::Explore, root);
+        self.lay_out_scene(scene, (Mode::Explore, root), cx);
+    }
+
+    /// Lays out `scene` of a walk from the root `key` names, as [`Self::lay_out_explore`].
+    fn lay_out_scene(
+        &mut self,
+        scene: Scene,
+        key: (Mode, Option<NodeRef>),
+        cx: &mut Context<Self>,
+    ) {
         if self.layout_key.as_ref() != Some(&key) {
             // Another root: the chips' places and the hubs widened are the old walk's.
             if self.known_root != key.1 {
@@ -865,6 +963,19 @@ impl GraphCanvas {
                 space: *width,
                 // "+K more" stands for what is not drawn yet: it moves to the end of
                 // its column as neighbours come in, while drawn nodes stay put.
+                // On a schema canvas, a pill or "+K more" of the root stands on the side of
+                // the way it runs: what the root reaches on its right.
+                side: match &node.kind {
+                    SceneKind::Hub { key, .. } | SceneKind::More { key, .. }
+                        if self.schema_walk.is_some() =>
+                    {
+                        Some(match key.group.direction {
+                            gq_language::Direction::Outgoing => 1.,
+                            gq_language::Direction::Incoming => -1.,
+                        })
+                    }
+                    _ => None,
+                },
                 previous: if matches!(node.kind, SceneKind::More { .. }) {
                     None
                 } else {
@@ -877,11 +988,16 @@ impl GraphCanvas {
                 },
             })
             .collect();
+        let spacing = if self.schema_walk.is_some() {
+            layout::Spacing::SCHEMA
+        } else {
+            layout::Spacing::EXPLORE
+        };
         self.lay_out(
             scene,
             texts,
             widths,
-            move || layout::explore_positions(&nodes),
+            move || layout::spaced_positions(&nodes, spacing),
             cx,
         );
     }
@@ -973,6 +1089,7 @@ impl GraphCanvas {
                 previous: pin_key(&node.id)
                     .and_then(|key| self.pinned.get(&key).copied())
                     .or(fixed[i]),
+                side: None,
             })
             .collect();
         if self.layout_key.is_none() {
@@ -1305,6 +1422,10 @@ impl GraphCanvas {
         cx: &mut Context<Self>,
     ) {
         let node = self.scene.nodes[index].clone();
+        if self.schema_walk.is_some() {
+            self.activate_type(node, expand_only, cx);
+            return;
+        }
         match node.kind {
             SceneKind::Node {
                 node: graph_node,
@@ -1339,6 +1460,28 @@ impl GraphCanvas {
         }
     }
 
+    /// On a schema canvas: a type expands, or closes; a pill expands the type it leads to;
+    /// "+K more" shows more.
+    fn activate_type(&mut self, node: SceneNode, expand_only: bool, cx: &mut Context<Self>) {
+        let Some(walk) = self.schema_walk.as_mut() else {
+            return;
+        };
+        match node.kind {
+            SceneKind::Node { node, expanded, .. } => {
+                if expanded && !expand_only {
+                    walk.collapse(&node.type_name);
+                } else {
+                    walk.expand(&node.type_name);
+                }
+            }
+            SceneKind::Hub { key, .. } => walk.expand(&key.group.other_type),
+            SceneKind::More { key, .. } => {
+                *self.hub_limits.entry(key).or_insert(HUB_STEP) += HUB_STEP;
+            }
+        }
+        self.rebuild(cx);
+    }
+
     /// Closes the node or relationship `id` by every path the exploration opened it by.
     fn close(&mut self, id: &SceneId, cx: &mut Context<Self>) {
         self.close_all(std::slice::from_ref(id), cx);
@@ -1347,6 +1490,18 @@ impl GraphCanvas {
     /// Closes every one of `ids` (nodes and relationships; "+K more" closes its relationship),
     /// as one change.
     fn close_all(&mut self, ids: &[SceneId], cx: &mut Context<Self>) {
+        // A schema canvas closes the types; a pill or "+K more" closes the type it hangs off.
+        if let Some(walk) = self.schema_walk.as_mut() {
+            for id in ids {
+                let ty = match id {
+                    SceneId::Node(node) => &node.type_name,
+                    SceneId::Hub(key) | SceneId::More(key) => &key.node.type_name,
+                };
+                walk.collapse(ty);
+            }
+            self.rebuild(cx);
+            return;
+        }
         // A results canvas draws none of the walk, which it does not close.
         if !self.draws_exploration() {
             return;
@@ -1359,6 +1514,11 @@ impl GraphCanvas {
     }
 
     fn show_more(&mut self, key: GroupKey, cx: &mut Context<Self>) {
+        if self.schema_walk.is_some() {
+            *self.hub_limits.entry(key).or_insert(HUB_STEP) += HUB_STEP;
+            self.rebuild(cx);
+            return;
+        }
         let limit = self.hub_limits.entry(key.clone()).or_insert(HUB_STEP);
         *limit += HUB_STEP;
         let wanted = *limit;
@@ -1674,7 +1834,8 @@ impl GraphCanvas {
             // folds away what was walked. A double click closes it, unless its first click
             // opened it.
             SceneKind::Node { expanded, .. }
-                if self.scene.nodes[index].path.is_some() && !expanded =>
+                if (self.scene.nodes[index].path.is_some() || self.schema_walk.is_some())
+                    && !expanded =>
             {
                 if event.click_count < 2 {
                     self.clicked_open = Some(self.scene.nodes[index].id.clone());
@@ -1693,6 +1854,12 @@ impl GraphCanvas {
     /// Shows a chip's node in the inspector without opening anything: a relationship pill
     /// or "+K more" shows the node it belongs to.
     fn peek(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.schema_walk.is_some() {
+            if let SceneKind::Node { node, .. } = &self.scene.nodes[index].kind {
+                cx.emit(TypeEvent::Details(node.type_name.clone()));
+            }
+            return;
+        }
         let node = match &self.scene.nodes[index].kind {
             SceneKind::Node { node, .. } => node.clone(),
             SceneKind::Hub { key, .. } | SceneKind::More { key, .. } => key.node.clone(),
@@ -1779,6 +1946,12 @@ impl GraphCanvas {
             self.marked_menu(window, cx)
         } else {
             match hit {
+                Some(index) if self.schema_walk.is_some() => {
+                    match self.type_menu(index, window, cx) {
+                        Some(menu) => menu,
+                        None => return,
+                    }
+                }
                 Some(index) => self.chip_menu(index, window, cx),
                 None => self.canvas_menu(window, cx),
             }
@@ -1806,6 +1979,69 @@ impl GraphCanvas {
         move |window, cx| {
             this.update(cx, |canvas, cx| f(canvas, window, cx)).ok();
         }
+    }
+
+    /// A type's menu on a schema canvas: expand or close it, walk from it, its table, and its
+    /// description; none for a pill or "+K more".
+    fn type_menu(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<ContextMenu>> {
+        let SceneKind::Node { node, expanded, .. } = self.scene.nodes[index].kind.clone() else {
+            return None;
+        };
+        let this = cx.entity().downgrade();
+        let id = self.scene.nodes[index].id.clone();
+        let name = node.type_name;
+        Some(ContextMenu::build(window, cx, move |menu, _, _| {
+            let (close, from, details) = (id.clone(), name.clone(), name.clone());
+            let menu = if expanded {
+                menu.entry(
+                    "Close",
+                    Some(Box::new(CollapseNode)),
+                    Self::on_menu(&this, move |canvas, _, cx| canvas.close(&close, cx)),
+                )
+            } else {
+                menu.entry(
+                    "Expand",
+                    Some(Box::new(ExpandNode)),
+                    Self::on_menu(&this, move |canvas, window, cx| {
+                        if let Some(index) = canvas.index_of(&close) {
+                            canvas.activate(index, true, window, cx);
+                        }
+                    }),
+                )
+            };
+            menu.entry(
+                "Explore from here",
+                None,
+                Self::on_menu(&this, move |canvas, _, cx| {
+                    canvas.walk_schema_from(&from, cx)
+                }),
+            )
+            .separator()
+            .entry(
+                "Open table",
+                None,
+                open_action(OpenType {
+                    type_name: name.clone(),
+                    at_commit: None,
+                    filter_id: None,
+                    via: None,
+                    preview: true,
+                    filters: None,
+                }),
+            )
+            .entry(
+                "Details",
+                Some(Box::new(PeekSelected)),
+                Self::on_menu(&this, move |_, _, cx| {
+                    cx.emit(TypeEvent::Details(details.clone()))
+                }),
+            )
+        }))
     }
 
     fn chip_menu(
@@ -2268,6 +2504,10 @@ impl GraphCanvas {
         let Some(index) = self.selected_index() else {
             return;
         };
+        if self.schema_walk.is_some() {
+            self.peek(index, window, cx);
+            return;
+        }
         if let SceneKind::Node { node, .. } = &self.scene.nodes[index].kind {
             window.dispatch_action(
                 Box::new(studio_actions::graph::OpenNodePage {
@@ -2382,19 +2622,64 @@ impl GraphCanvas {
     /// The caption, bottom left: what is drawn, and what a click does.
     fn render_caption(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // What a click does; the summary at the top says what is drawn.
-        let text = "click to open · ⇧-click to inspect · ⇧-drag to select";
-        div()
+        let text = if self.schema_walk.is_some() {
+            "click to expand · double-click to close · ⇧-click for details"
+        } else {
+            "click to open · ⇧-click to inspect · ⇧-drag to select"
+        };
+        // A floating bar as the summary and zoom are: one height, surface and corner.
+        studio_ui::ds::float_bar("canvas-caption", cx)
             .absolute()
-            .bottom(px(space::LG))
-            .left(px(space::LG))
+            .bottom(px(space::EDGE))
+            .left(px(space::EDGE))
             // A press on the caption is not one on a chip drawn under it; a drag passes over it.
             .when(self.drag.is_none(), |caption| caption.occlude())
-            .px(px(space::CONTROL_INSET))
-            .py(px(space::XS))
-            .rounded(px(studio_ui::ds::radii(cx).bar()))
-            .bg(studio_ui::ds::surface::solid(cx))
-            .map(|caption| studio_ui::ds::lifted(caption, cx))
-            .child(studio_ui::ds::text::meta(text))
+            .child(
+                div()
+                    .px(px(space::MD))
+                    .child(studio_ui::ds::text::meta(text).single_line()),
+            )
+    }
+
+    /// A schema canvas's root as a menu of every type, by name: picking one walks the schema
+    /// from it. None on any other canvas.
+    fn render_schema_root(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let root = self.schema_root()?.to_owned();
+        let schema = self.session.read(cx).schema_model()?;
+        let mut names: Vec<String> = schema.nodes.iter().map(|n| n.name.clone()).collect();
+        names.sort_by_key(|name| name.to_lowercase());
+        let canvas = cx.entity().downgrade();
+        Some(
+            ui::PopoverMenu::new("canvas-schema-root")
+                .trigger(
+                    studio_ui::ds::bar_button("canvas-schema-root-button", format!("From {root}"))
+                        .end_icon(Icon::new(IconName::ChevronDown))
+                        .tip(studio_ui::ds::tooltip("Explore from another type")),
+                )
+                .menu(move |window, cx| {
+                    let (names, canvas, root) = (names.clone(), canvas.clone(), root.clone());
+                    Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                        for name in names.iter() {
+                            let (canvas, chosen) = (canvas.clone(), name.clone());
+                            menu = menu.toggleable_entry(
+                                name.clone(),
+                                *name == root,
+                                ui::IconPosition::Start,
+                                None,
+                                move |_, cx| {
+                                    canvas
+                                        .update(cx, |canvas, cx| {
+                                            canvas.walk_schema_from(&chosen, cx)
+                                        })
+                                        .ok();
+                                },
+                            );
+                        }
+                        menu
+                    }))
+                })
+                .into_any_element(),
+        )
     }
 
     /// The most nodes this graph's canvas draws (setting `studio.canvas_max_nodes`, or the
@@ -2430,6 +2715,8 @@ impl GraphCanvas {
                 let nodes = studio_ui::plural(self.node_count, "node", "nodes");
                 format!("From {root} · {nodes}")
             }
+            // The root is the picker's label, beside this.
+            Mode::Schema => studio_ui::plural(self.node_count, "type", "types"),
         };
         let root_error = match (&state.root_status, self.mode()) {
             (Loadable::Failed(message), Mode::Explore) => Some(message.clone()),
@@ -2443,26 +2730,30 @@ impl GraphCanvas {
         // A press on one is not one on a chip drawn under it; a drag passes over them, as over
         // the caption.
         let dragging = self.drag.is_some();
+        let schema_root = self.render_schema_root(cx);
         let panel = |id: &'static str| {
             studio_ui::ds::float_bar(id, cx).when(!dragging, |bar| bar.occlude())
         };
         let mode = self.mode();
         v_flex()
             .absolute()
-            .top(px(space::MD))
-            .left(px(space::MD))
-            .right(px(space::MD))
-            .gap(px(space::MD))
+            // The canvas's controls stand in from its edges as a toolbar's do from its column's,
+            // apart as controls are.
+            .top(px(space::EDGE))
+            .left(px(space::EDGE))
+            .right(px(space::EDGE))
+            .gap(px(space::CONTROLS))
             .child(
                 h_flex()
                     .w_full()
-                    .gap(px(space::MD))
+                    .gap(px(space::CONTROLS))
                     // What is drawn, in a floating pill: the walk's root and its nodes, or the
                     // query.
                     .child(
-                        panel("canvas-summary").child(
+                        panel("canvas-summary").children(schema_root).child(
                             div()
                                 .px(px(space::MD))
+                                .when(mode == Mode::Schema, |d| d.pl(px(space::XS)))
                                 .child(studio_ui::ds::text::muted(summary).single_line()),
                         ),
                     )
@@ -2732,7 +3023,7 @@ impl Render for GraphCanvas {
             ),
             Loadable::Loaded(_) if self.scene.nodes.is_empty() => Some(
                 match self.mode() {
-                    Mode::Explore => studio_ui::ds::loading_state("Laying out…"),
+                    Mode::Explore | Mode::Schema => studio_ui::ds::loading_state("Laying out…"),
                     Mode::Results
                         if self
                             .results
@@ -3159,6 +3450,57 @@ mod tests {
 
     /// Leaving a chip stops what was read ahead for it and is still out, as leaving a tree row
     /// does: the read is let go, and nothing says it was asked for.
+    /// A schema canvas walks types: it opens from its root expanded, a type it reaches
+    /// expands to its related types, "+K more" shows more, closing a type takes back what
+    /// only it reached, and walking from another type starts again from it (spec 006,
+    /// "Ontology on the canvas").
+    #[gpui::test]
+    async fn a_schema_canvas_walks_types(cx: &mut gpui::TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let (session, _served) = graph_store::test_server::followed_session(
+            "node Person { slug: String @key }\nnode Task { slug: String @key }\nnode Org { slug: String @key }\nedge AssignedTo: Task -> Person\nedge WorksAt: Person -> Org\n",
+            |_| serde_json::json!([]),
+            cx,
+        );
+        cx.run_until_parked();
+        let canvas = cx.new(|cx| GraphCanvas::for_schema(session, "Task", false, cx));
+        cx.run_until_parked();
+        let labels = |canvas: &Entity<GraphCanvas>, cx: &mut gpui::TestAppContext| {
+            canvas.read_with(cx, |canvas, _| {
+                canvas
+                    .scene
+                    .nodes
+                    .iter()
+                    .map(|node| node.label.clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(labels(&canvas, cx), ["Task", "→ AssignedTo", "Person"]);
+        let person = canvas
+            .read_with(cx, |canvas, _| {
+                canvas.index_of(&SceneId::Node(schema_walk::type_ref("Person")))
+            })
+            .unwrap();
+        canvas.update(cx, |canvas, cx| {
+            let node = canvas.scene.nodes[person].clone();
+            canvas.activate_type(node, true, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            labels(&canvas, cx),
+            ["Task", "→ AssignedTo", "Person", "→ WorksAt", "Org"]
+        );
+        canvas.update(cx, |canvas, cx| {
+            canvas.close(&SceneId::Node(schema_walk::type_ref("Person")), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(labels(&canvas, cx), ["Task", "→ AssignedTo", "Person"]);
+        canvas.update(cx, |canvas, cx| canvas.walk_schema_from("Org", cx));
+        cx.run_until_parked();
+        assert_eq!(labels(&canvas, cx), ["Org", "← WorksAt", "Person"]);
+        canvas.read_with(cx, |canvas, _| assert_eq!(canvas.mode(), Mode::Schema));
+    }
+
     #[gpui::test]
     async fn leaving_a_chip_stops_its_read_ahead(cx: &mut gpui::TestAppContext) {
         cx.update(studio_theme::init_test);

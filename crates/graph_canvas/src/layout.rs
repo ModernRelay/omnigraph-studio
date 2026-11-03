@@ -65,6 +65,10 @@ pub struct LayoutNode {
     pub space: f32,
     /// Where it was drawn before; such a node does not move.
     pub previous: Option<Vec2>,
+    /// The side of its parent it stands on, right (1) or left (-1): a schema's walk puts the
+    /// types a type reaches on its right and those reaching it on its left. None goes outward,
+    /// away from where its parent hangs, and shares a root's two sides by weight.
+    pub side: Option<f32>,
 }
 
 /// Half a chip's height, for overlap removal.
@@ -120,6 +124,51 @@ const GAP: f32 = 6.;
 /// off its members, so subtrees do not interleave. Nodes laid out before keep their places
 /// exactly (constitution V); new ones that would overlap them are relaxed away.
 pub fn explore_positions(nodes: &[LayoutNode]) -> Vec<Vec2> {
+    spaced_positions(nodes, Spacing::EXPLORE)
+}
+
+/// How much room a walk leaves between its chips.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Spacing {
+    /// One row of a column: a chip and the room under it.
+    pub row: f32,
+    /// Between a subtree and the next in a column.
+    pub group_gap: f32,
+    /// From a node to its hubs' near edges.
+    pub hub_gap: f32,
+    /// From a hub to its neighbours' near edges.
+    pub node_gap: f32,
+}
+
+impl Spacing {
+    /// Data: kept close, since a walk can hold thousands of nodes.
+    pub const EXPLORE: Spacing = Spacing {
+        row: EXPLORE_ROW,
+        group_gap: EXPLORE_GROUP_GAP,
+        hub_gap: EXPLORE_HUB_GAP,
+        node_gap: EXPLORE_NODE_GAP,
+    };
+    /// A schema: a few dozen types, each a pill and a chip away, given room so its columns
+    /// and their lines read apart.
+    pub const SCHEMA: Spacing = Spacing {
+        row: 56.,
+        group_gap: 36.,
+        hub_gap: 72.,
+        node_gap: 64.,
+    };
+}
+
+/// [`explore_positions`] with its room set by `spacing`. A child with a side of its own
+/// stands on it at every level, not only off a root: a schema's type has what reaches it on
+/// its left and what it reaches on its right, so a type with many relationships stands
+/// between two columns half as tall as one.
+pub fn spaced_positions(nodes: &[LayoutNode], spacing: Spacing) -> Vec<Vec2> {
+    let Spacing {
+        row,
+        hub_gap,
+        node_gap,
+        ..
+    } = spacing;
     let count = nodes.len();
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); count];
     for (index, node) in nodes.iter().enumerate() {
@@ -128,7 +177,7 @@ pub fn explore_positions(nodes: &[LayoutNode]) -> Vec<Vec2> {
         }
     }
     // How tall each new subtree is: its chip, or its children's subtrees stacked.
-    let mut height = vec![EXPLORE_ROW; count];
+    let mut height = vec![row; count];
     for index in (0..count).rev() {
         let new_children: Vec<usize> = children[index]
             .iter()
@@ -136,7 +185,7 @@ pub fn explore_positions(nodes: &[LayoutNode]) -> Vec<Vec2> {
             .filter(|c| nodes[*c].previous.is_none())
             .collect();
         if !new_children.is_empty() {
-            height[index] = stacked_height(&new_children, &height).max(EXPLORE_ROW);
+            height[index] = spacing.stacked(&new_children, &height).max(row);
         }
     }
     let mut position = vec![Vec2::default(); count];
@@ -193,16 +242,14 @@ pub fn explore_positions(nodes: &[LayoutNode]) -> Vec<Vec2> {
             }
         });
         let mut sides: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
-        match outward {
-            Some(direction) => sides[usize::from(direction < 0.)] = new_children,
-            None => {
-                let mut weight = [0f32; 2];
-                for child in new_children {
-                    let side = usize::from(weight[1] < weight[0]);
-                    weight[side] += height[child] + sibling_gap(height[child]);
-                    sides[side].push(child);
-                }
-            }
+        let mut weight = [0f32; 2];
+        for child in new_children {
+            let side = match (nodes[child].side, outward) {
+                (Some(direction), _) | (None, Some(direction)) => usize::from(direction < 0.),
+                (None, None) => usize::from(weight[1] < weight[0]),
+            };
+            weight[side] += height[child] + spacing.gap_after(height[child]);
+            sides[side].push(child);
         }
         // Where each side's column already ends: new members join it at the bottom, so a drawn
         // column only grows.
@@ -212,7 +259,7 @@ pub fn explore_positions(nodes: &[LayoutNode]) -> Vec<Vec2> {
                 continue;
             }
             let side = usize::from(position[child].x < position[index].x);
-            let bottom = position[child].y + EXPLORE_ROW / 2.;
+            let bottom = position[child].y + row / 2.;
             drawn_bottom[side] = Some(drawn_bottom[side].map_or(bottom, |b: f32| b.max(bottom)));
         }
         for (side, members) in sides.iter().enumerate() {
@@ -220,13 +267,13 @@ pub fn explore_positions(nodes: &[LayoutNode]) -> Vec<Vec2> {
                 continue;
             }
             let direction = if side == 0 { 1. } else { -1. };
-            let total = stacked_height(members, &height);
+            let total = spacing.stacked(members, &height);
             let xs: Vec<f32> = members
                 .iter()
                 .map(|&child| {
                     let gap = match nodes[child].kind {
-                        LayoutKind::Hub => EXPLORE_HUB_GAP,
-                        LayoutKind::Node | LayoutKind::More => EXPLORE_NODE_GAP,
+                        LayoutKind::Hub => hub_gap,
+                        LayoutKind::Node | LayoutKind::More => node_gap,
                     };
                     position[index].x + direction * (nodes[index].space + gap + nodes[child].space)
                 })
@@ -252,7 +299,7 @@ pub fn explore_positions(nodes: &[LayoutNode]) -> Vec<Vec2> {
                 position[child] = Vec2::new(x, top + height[child] / 2.);
                 placed[child] = true;
                 taken.push(chip_box(child, position[child]));
-                top += height[child] + sibling_gap(height[child]);
+                top += height[child] + spacing.gap_after(height[child]);
             }
         }
     }
@@ -309,27 +356,30 @@ pub const EXPLORE_ROW: f32 = 40.;
 /// Between a subtree and the next in a column; single chips already have their row's room.
 const EXPLORE_GROUP_GAP: f32 = 16.;
 
-/// The room after a column member as tall as `height`: none for a single chip, a gap after a
-/// subtree, so groups read as groups.
-fn sibling_gap(height: f32) -> f32 {
-    if height > EXPLORE_ROW {
-        EXPLORE_GROUP_GAP
-    } else {
-        0.
+impl Spacing {
+    /// The room after a column member as tall as `height`: none for a single chip, a gap
+    /// after a subtree, so groups read as groups.
+    fn gap_after(self, height: f32) -> f32 {
+        if height > self.row {
+            self.group_gap
+        } else {
+            0.
+        }
+    }
+
+    /// How tall a column of `members` stands.
+    fn stacked(self, members: &[usize], height: &[f32]) -> f32 {
+        let mut total: f32 = members
+            .iter()
+            .map(|c| height[*c] + self.gap_after(height[*c]))
+            .sum();
+        if let Some(last) = members.last() {
+            total -= self.gap_after(height[*last]);
+        }
+        total
     }
 }
 
-/// How tall a column of `members` stands.
-fn stacked_height(members: &[usize], height: &[f32]) -> f32 {
-    let mut total: f32 = members
-        .iter()
-        .map(|c| height[*c] + sibling_gap(height[*c]))
-        .sum();
-    if let Some(last) = members.last() {
-        total -= sibling_gap(height[*last]);
-    }
-    total
-}
 /// From a node to its hubs' near edges, and from a hub to its neighbours'.
 const EXPLORE_HUB_GAP: f32 = 44.;
 const EXPLORE_NODE_GAP: f32 = 36.;
@@ -494,6 +544,7 @@ mod tests {
                 kind: LayoutKind::Node,
                 space: 40.,
                 previous: fixed[i],
+                side: None,
             })
             .collect()
     }
@@ -615,6 +666,7 @@ mod tests {
             kind: LayoutKind::Node,
             space: 24.,
             previous: None,
+            side: None,
         }];
         for _ in 0..hubs {
             let hub = nodes.len();
@@ -623,6 +675,7 @@ mod tests {
                 kind: LayoutKind::Hub,
                 space: 34.,
                 previous: None,
+                side: None,
             });
             for _ in 0..per_hub {
                 nodes.push(LayoutNode {
@@ -630,6 +683,7 @@ mod tests {
                     kind: LayoutKind::Node,
                     space: 22.,
                     previous: None,
+                    side: None,
                 });
             }
         }
@@ -675,6 +729,7 @@ mod tests {
                 kind,
                 space: 22.,
                 previous: None,
+                side: None,
             });
         }
         let next = explore_positions(&nodes);
@@ -716,6 +771,7 @@ mod tests {
             kind,
             space,
             previous: None,
+            side: None,
         };
         let mut nodes = vec![chip(None, LayoutKind::Node, 70.)];
         for _ in 0..4 {
@@ -811,5 +867,38 @@ mod tests {
         assert!((positions[0].x).abs() < 1e-3 && positions[0].y < 0.);
         let (min, max) = extent(&positions, |_| 10.).unwrap();
         assert!(min.x < 0. && max.x > 0.);
+    }
+
+    /// A root's children with a side stand on it, whatever the weights: a schema's walk puts
+    /// what a type reaches on its right and what reaches it on its left.
+    #[test]
+    fn a_roots_children_keep_their_side() {
+        let node = |parent: Option<usize>, kind: LayoutKind, side: Option<f32>| LayoutNode {
+            parent,
+            kind,
+            space: 40.,
+            previous: None,
+            side,
+        };
+        let mut nodes = vec![node(None, LayoutKind::Node, None)];
+        for _ in 0..5 {
+            nodes.push(node(Some(0), LayoutKind::Hub, Some(1.)));
+        }
+        nodes.push(node(Some(0), LayoutKind::Hub, Some(-1.)));
+        let at = explore_positions(&nodes);
+        assert!((1..6).all(|i| at[i].x > at[0].x), "reached on the right");
+        assert!(at[6].x < at[0].x, "reaching on the left");
+        // Below the root, too: a type on the right has what reaches it on its left.
+        let child = nodes.len();
+        nodes.push(node(Some(1), LayoutKind::Node, None));
+        nodes.push(node(Some(child), LayoutKind::Hub, Some(-1.)));
+        nodes.push(node(Some(child), LayoutKind::Hub, Some(1.)));
+        let at = explore_positions(&nodes);
+        assert!(at[child + 1].x < at[child].x, "reaching it on its left");
+        assert!(at[child + 2].x > at[child].x, "reached on its right");
+        // A schema's walk leaves more room than data's.
+        let roomy = spaced_positions(&nodes, Spacing::SCHEMA);
+        assert!(roomy[2].y - roomy[1].y > at[2].y - at[1].y);
+        assert!(roomy[1].x - roomy[0].x > at[1].x - at[0].x);
     }
 }

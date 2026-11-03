@@ -24,13 +24,11 @@ use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 
 use crate::domains::{self, Domains};
-use crate::layered::{self, Link, Route};
-use crate::layout::Vec2;
 use crate::paint::{self, RING, Tone};
+use crate::{GraphCanvas, TypeEvent};
 
-/// A domain card's width, and the focus view's columns: the related types either side, as wide
-/// as the page allows between the two bounds, the lines between, and the type in focus.
-const CARD_WIDTH: f32 = 240.;
+/// The focus view's columns: the related types either side, as wide as the page allows
+/// between the two bounds, the lines between, and the type in focus.
 const SIDE_MIN: f32 = 240.;
 const SIDE_MAX: f32 = 440.;
 const GUTTER_WIDTH: f32 = 56.;
@@ -44,19 +42,8 @@ const ABOUT_LINES: usize = 5;
 const CENTRE_HEADER: f32 = 44.;
 /// A side groups its lines by domain once it holds more than this many.
 const GROUP_ABOVE: usize = 8;
-/// Up to this many types and relationships, the page draws the whole ontology as one map, its
-/// types laid out in columns ([`crate::layered`]) and every relationship named.
+/// Up to this many types, the canvas opens with every type expanded: the schema whole.
 const MAP_TYPES: usize = domains::SMALL_SCHEMA;
-const MAP_RELATIONSHIPS: usize = 24;
-/// A type's card on the map: as wide as its name and count need between the two bounds, and
-/// its height; and the room around the map.
-const MAP_CARD_MIN: f32 = 140.;
-const MAP_CARD_MAX: f32 = 280.;
-const MAP_CARD_HEIGHT: f32 = 32.;
-const MAP_MARGIN: f32 = 40.;
-/// A relationship label's height, and the widest the map makes room for.
-const LABEL_HEIGHT: f32 = 20.;
-const LABEL_SLOT: f32 = 240.;
 /// The lines' tones, in thousandths: at rest, and of the line pointed at.
 const LINE_ALPHA: u16 = 160;
 const LINE_POINTED_ALPHA: u16 = 450;
@@ -80,6 +67,9 @@ pub(crate) struct OntologyPage {
     sides: Option<Rc<Sides>>,
     /// The type whose whole description is shown, past its first lines.
     about_open: Option<String>,
+    /// The schema's types on the canvas, walked from one (spec 006, "Ontology on the
+    /// canvas"); made with the first schema read, and following the session after.
+    canvas: Option<Entity<GraphCanvas>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -106,93 +96,11 @@ enum Side {
     Out,
 }
 
-/// The schema as the page shows it: its types grouped, each type's related types, and, for a
-/// small schema, its map.
+/// The schema as the page shows it: its types grouped, and each found by name.
 struct View {
     schema: Arc<SchemaModel>,
     domains: Domains,
     index: HashMap<String, usize>,
-    related: Vec<Vec<usize>>,
-    map: Option<Map>,
-}
-
-/// A small ontology laid out whole: each type's card centre and each relationship's route
-/// (empty for a relationship of a type to itself, drawn as a loop over its card), from the
-/// map's top left, and how large the map is.
-struct Map {
-    at: Vec<Vec2>,
-    /// Each type's card's half width.
-    half: Vec<f32>,
-    routes: Vec<Route>,
-    size: Vec2,
-}
-
-impl Map {
-    fn new(schema: &SchemaModel, links: &[(usize, usize)]) -> Self {
-        let half: Vec<f32> = schema
-            .nodes
-            .iter()
-            .map(|node| map_card_width(&node.name) / 2.)
-            .collect();
-        let named: Vec<Link> = links
-            .iter()
-            .zip(&schema.edges)
-            .map(|(&(from, to), edge)| Link {
-                from,
-                to,
-                label_half_width: label_width(&edge.name) / 2.,
-            })
-            .collect();
-        let laid = layered::layered(&half, &named);
-        // The box around every card, route, label and loop.
-        let (mut min, mut max) = (Vec2::new(f32::MAX, f32::MAX), Vec2::new(f32::MIN, f32::MIN));
-        let mut grow = |p: Vec2| {
-            min = Vec2::new(min.x.min(p.x), min.y.min(p.y));
-            max = Vec2::new(max.x.max(p.x), max.y.max(p.y));
-        };
-        for (p, half) in laid.positions.iter().zip(&half) {
-            grow(*p - Vec2::new(*half, MAP_CARD_HEIGHT / 2. + LOOP_ROOM));
-            grow(*p + Vec2::new(*half, MAP_CARD_HEIGHT / 2.));
-        }
-        for (route, edge) in laid.routes.iter().zip(&schema.edges) {
-            route.points.iter().for_each(|p| grow(*p));
-            if let Some(at) = route.label_at {
-                let half = Vec2::new(label_width(&edge.name) / 2., LABEL_HEIGHT / 2.);
-                grow(at - half);
-                grow(at + half);
-            }
-        }
-        let shift = Vec2::new(MAP_MARGIN, MAP_MARGIN) - min;
-        Self {
-            at: laid.positions.iter().map(|p| *p + shift).collect(),
-            half,
-            routes: laid
-                .routes
-                .into_iter()
-                .map(|route| Route {
-                    points: route.points.into_iter().map(|p| p + shift).collect(),
-                    label_at: route.label_at.map(|p| p + shift),
-                })
-                .collect(),
-            size: max - min + Vec2::new(2. * MAP_MARGIN, 2. * MAP_MARGIN),
-        }
-    }
-}
-
-/// Above a card: room for its loops and their labels.
-const LOOP_ROOM: f32 = 44.;
-
-/// About how wide a relationship's label is drawn: its characters at the small text size, and
-/// its padding.
-fn label_width(name: &str) -> f32 {
-    name.chars().count() as f32 * 6.6 + 2. * space::SM
-}
-
-/// About how wide a type's card on the map is drawn: its colour, its name at the body size and
-/// room for its count, inside its padding; the name is cut past the widest card.
-fn map_card_width(name: &str) -> f32 {
-    let name = name.chars().count() as f32 * 7.4;
-    (2. * space::CONTROL_INSET + 8. + 2. * space::SM + name + 36.).clamp(MAP_CARD_MIN, MAP_CARD_MAX)
 }
 
 impl View {
@@ -212,26 +120,24 @@ impl View {
                 _ => (usize::MAX, usize::MAX),
             })
             .collect();
-        let mut related: Vec<Vec<usize>> = vec![Vec::new(); schema.nodes.len()];
-        for &(from, to) in &links {
-            if from != to && from != usize::MAX {
-                related[from].push(to);
-                related[to].push(from);
-            }
-        }
-        for list in related.iter_mut() {
-            list.sort_unstable();
-            list.dedup();
-        }
-        let map = (schema.nodes.len() <= MAP_TYPES && schema.edges.len() <= MAP_RELATIONSHIPS)
-            .then(|| Map::new(&schema, &links));
         Self {
             domains: domains::domains(schema.nodes.len(), &links),
             schema,
             index,
-            related,
-            map,
         }
+    }
+
+    /// The type the canvas starts from: the one related to most others, the shared types
+    /// aside (they are related to everything), by name among equals.
+    fn starting_type(&self) -> Option<usize> {
+        (0..self.schema.nodes.len())
+            .filter(|ty| self.domains.group_of[*ty].is_some() || self.domains.shared.is_empty())
+            .max_by(|&a, &b| {
+                self.domains.degree[a]
+                    .cmp(&self.domains.degree[b])
+                    .then_with(|| self.name(b).cmp(self.name(a)))
+            })
+            .or_else(|| (!self.schema.nodes.is_empty()).then_some(0))
     }
 
     fn name(&self, ty: usize) -> &str {
@@ -347,6 +253,7 @@ impl OntologyPage {
             width: Rc::default(),
             sides: None,
             about_open: None,
+            canvas: None,
             _subscriptions: subscriptions,
         };
         page.read_schema(cx);
@@ -363,6 +270,22 @@ impl OntologyPage {
             self.view = schema.map(|schema| Arc::new(View::new(schema)));
             self.pointed = None;
             self.sides = None;
+            if self.canvas.is_none()
+                && let Some(view) = self.view.clone()
+                && let Some(root) = view.starting_type()
+            {
+                let session = self.session.clone();
+                let whole = view.schema.nodes.len() <= MAP_TYPES;
+                let canvas =
+                    cx.new(|cx| GraphCanvas::for_schema(session, view.name(root), whole, cx));
+                self._subscriptions.push(cx.subscribe(
+                    &canvas,
+                    |this, _, event: &TypeEvent, cx| match event {
+                        TypeEvent::Details(name) => this.focus_on(name, cx),
+                    },
+                ));
+                self.canvas = Some(canvas);
+            }
             // A type the schema no longer has (dropped, or renamed by another writer) leaves
             // the focus and the way back, so the tab and the header say what is shown.
             if let Some(view) = &self.view {
@@ -495,6 +418,10 @@ impl OntologyPage {
     }
 
     fn show_domains(&mut self, cx: &mut Context<Self>) {
+        // Back on the canvas, the type that was in focus is selected where it stands.
+        if let (Some(canvas), Some(focus)) = (self.canvas.clone(), self.focus.clone()) {
+            canvas.update(cx, |canvas, cx| canvas.show_type(&focus, cx));
+        }
         self.focus = None;
         self.back.clear();
         self.pointed = None;
@@ -556,381 +483,6 @@ impl OntologyPage {
             .read(cx)
             .count_of(EntityKind::Node, type_name)
             .map(studio_ui::group_count)
-    }
-
-    // ---- the domain map ----
-
-    fn render_domains(
-        &self,
-        view: &Arc<View>,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let lit: Vec<usize> = match self.pointed {
-            Some(Pointed::Type(ty)) => view.related[ty].clone(),
-            _ => Vec::new(),
-        };
-        let shared = (!view.domains.shared.is_empty()).then(|| {
-            v_flex()
-                .gap(px(space::SM))
-                .child(ds::text::meta(SHARED))
-                .child(
-                    h_flex().flex_wrap().gap(px(space::SM)).children(
-                        view.domains
-                            .shared
-                            .iter()
-                            .map(|&ty| self.render_shared_type(view, ty, &lit, cx))
-                            .collect::<Vec<_>>(),
-                    ),
-                )
-        });
-        // Cards in columns as many as the page holds, each card to the column with least in
-        // it, so a short card does not leave a gap under it as a row would.
-        let width = self.page_width(window);
-        let columns = (((width + space::LG) / (CARD_WIDTH + space::LG)).floor() as usize).max(1);
-        let mut column_of = vec![0usize; view.domains.groups.len()];
-        let mut filled = vec![0usize; columns];
-        for (group, types) in view.domains.groups.iter().enumerate() {
-            let shortest = (0..columns).min_by_key(|&c| (filled[c], c)).unwrap_or(0);
-            column_of[group] = shortest;
-            filled[shortest] += types.len() + 3;
-        }
-        let mut cards: Vec<Vec<AnyElement>> = (0..columns).map(|_| Vec::new()).collect();
-        let built: Vec<AnyElement> =
-            (0..view.domains.groups.len())
-                .map(|group| {
-                    let types = &view.domains.groups[group];
-                    let links = &view.domains.links[group];
-                    let linked = links
-                        .iter()
-                        .take(3)
-                        .map(|&(other, count)| match view.domains.groups[other].first() {
-                            Some(&lead) => format!("{} {count}", view.name(lead)),
-                            None => count.to_string(),
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" · ");
-                    ds::card(cx)
-                        .child(
-                            ds::card_header(cx)
-                                .child(div().flex_1().min_w_0().child(
-                                    ds::text::title(view.title(group)).single_line().truncate(),
-                                ))
-                                .child(ds::text::meta(types.len().to_string())),
-                        )
-                        .child(
-                            v_flex().py(px(space::XS)).children(
-                                types
-                                    .iter()
-                                    .map(|&ty| self.render_type_row(view, ty, &lit, cx))
-                                    .collect::<Vec<_>>(),
-                            ),
-                        )
-                        .when(!linked.is_empty(), |card| {
-                            card.child(
-                                ds::card_footer(cx).px(px(space::LG)).child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .child(ds::text::meta(format!("Linked with {linked}"))),
-                                ),
-                            )
-                        })
-                        .into_any_element()
-                })
-                .collect();
-        for (group, card) in built.into_iter().enumerate() {
-            cards[column_of[group]].push(card);
-        }
-
-        v_flex()
-            .gap(px(space::XL))
-            .children(shared)
-            .child(
-                h_flex()
-                    .items_start()
-                    .gap(px(space::LG))
-                    .children(cards.into_iter().map(|column| {
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap(px(space::LG))
-                            .children(column)
-                    })),
-            )
-            .into_any_element()
-    }
-
-    /// A shared type: a pill, as it stands apart from every domain.
-    fn render_shared_type(
-        &self,
-        view: &Arc<View>,
-        ty: usize,
-        lit: &[usize],
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let name = view.name(ty).to_owned();
-        let count = self.count(&name, cx);
-        let pointed = self.pointed == Some(Pointed::Type(ty));
-        let dimmed = self.dimmed(ty, lit);
-        ds::lifted(
-            h_flex()
-                .id(SharedString::from(format!("shared-{name}")))
-                .h(px(size::PILL))
-                .px(px(space::MD))
-                .gap(px(space::SM))
-                .rounded(px(ds::radii(cx).sm))
-                .bg(ds::surface::document(cx))
-                .cursor_pointer()
-                .when(pointed, |pill| pill.bg(ds::surface::selected_chrome(cx)))
-                .child(ds::type_dot(&name))
-                .child(if dimmed {
-                    ds::text::muted(name.clone())
-                } else {
-                    ds::text::body(name.clone())
-                })
-                .children(count.map(ds::text::meta))
-                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                    this.point_at(Pointed::Type(ty), *hovered, cx)
-                }))
-                .on_click(cx.listener(move |this, _, _, cx| this.focus_on(&name, cx))),
-            cx,
-        )
-        .into_any_element()
-    }
-
-    /// Whether `ty` is dimmed: a type is pointed at, and `ty` is neither it nor related to it.
-    fn dimmed(&self, ty: usize, lit: &[usize]) -> bool {
-        matches!(self.pointed, Some(Pointed::Type(p)) if p != ty && !lit.contains(&ty))
-    }
-
-    /// A type in a domain card: its colour, its name and how many nodes it has. The type
-    /// pointed at is selected, and the types it is not related to are dimmed.
-    fn render_type_row(
-        &self,
-        view: &Arc<View>,
-        ty: usize,
-        lit: &[usize],
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let name = view.name(ty).to_owned();
-        let related = view.related[ty].len();
-        let target = name.clone();
-        div()
-            .id(SharedString::from(format!("type-hover-{ty}")))
-            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                this.point_at(Pointed::Type(ty), *hovered, cx)
-            }))
-            .child(
-                ds::SidebarRow::new(SharedString::from(format!("type-{name}")), name.clone())
-                    .start(ds::type_dot(&name))
-                    .end(ds::sidebar_count(self.count(&name, cx).unwrap_or_default()))
-                    .selected(self.pointed == Some(Pointed::Type(ty)))
-                    .muted(self.dimmed(ty, lit))
-                    .tip(ds::tooltip(format!(
-                        "{name} · related to {}",
-                        studio_ui::plural(related, "type", "types")
-                    )))
-                    .on_click(cx.listener(move |this, _, _, cx| this.focus_on(&target, cx))),
-            )
-            .into_any_element()
-    }
-
-    // ---- a small ontology's map ----
-
-    /// The whole ontology: each type a card where the layout put it, each relationship a
-    /// dashed line between their sides, named on it; the lines of the type pointed at are drawn
-    /// stronger. A click brings a type into focus.
-    fn render_map(&self, view: &Arc<View>, map: &Map, cx: &mut Context<Self>) -> AnyElement {
-        let pointed = match self.pointed {
-            Some(Pointed::Type(ty)) => Some(ty),
-            _ => None,
-        };
-        let edges: Vec<(usize, usize)> = view
-            .schema
-            .edges
-            .iter()
-            .map(|edge| {
-                (
-                    view.index.get(&edge.from).copied().unwrap_or(usize::MAX),
-                    view.index.get(&edge.to).copied().unwrap_or(usize::MAX),
-                )
-            })
-            .collect();
-        // Each loop's rank on its type, inside out.
-        let mut loops: HashMap<usize, usize> = HashMap::new();
-        let loop_rank: Vec<Option<usize>> = edges
-            .iter()
-            .map(|&(from, to)| {
-                (from == to && from != usize::MAX).then(|| {
-                    let rank = loops.entry(from).or_default();
-                    *rank += 1;
-                    *rank - 1
-                })
-            })
-            .collect();
-        let local = |p: Vec2| point(px(p.x), px(p.y));
-        // Where each relationship's label goes, from the map's top left.
-        let labels: Vec<(Vec2, String, bool)> = edges
-            .iter()
-            .enumerate()
-            .filter_map(|(e, &(from, to))| {
-                let name = view.schema.edges[e].name.clone();
-                let strong = pointed.is_some_and(|p| p == from || p == to);
-                let at = match loop_rank[e] {
-                    Some(rank) => {
-                        let points =
-                            paint::loop_points(local(map.at[from]), map.half[from], 1., rank);
-                        let at = paint::loop_label_at(&points);
-                        Vec2::new(f32::from(at.x), f32::from(at.y))
-                    }
-                    None => map.routes.get(e)?.label_at?,
-                };
-                Some((at, name, strong))
-            })
-            .collect();
-        let ink = Color::Default.color(cx);
-        let ground = ds::surface::canvas(cx);
-        let routes: Vec<Vec<Vec2>> = map.routes.iter().map(|r| r.points.clone()).collect();
-        let at = map.at.clone();
-        let half = map.half.clone();
-        let lines = canvas(
-            |_, _, _| {},
-            move |bounds: Bounds<Pixels>, (), window, _cx| {
-                let origin = bounds.origin;
-                let place = |p: Vec2| point(origin.x + px(p.x), origin.y + px(p.y));
-                let tone = |strong: bool| Tone {
-                    alpha: if strong {
-                        LINE_POINTED_ALPHA
-                    } else {
-                        LINE_ALPHA
-                    },
-                    dotted: false,
-                };
-                let mut drawn: Vec<(usize, Vec<Point<Pixels>>, Tone)> = Vec::new();
-                let mut rings: Vec<(Point<Pixels>, bool)> = Vec::new();
-                for (e, &(from, to)) in edges.iter().enumerate() {
-                    if from == usize::MAX {
-                        continue;
-                    }
-                    let strong = pointed.is_some_and(|p| p == from || p == to);
-                    if let Some(rank) = loop_rank[e] {
-                        drawn.push((
-                            e,
-                            paint::loop_points(place(at[from]), half[from], 1., rank),
-                            tone(strong),
-                        ));
-                        continue;
-                    }
-                    let points: Vec<Point<Pixels>> = routes[e].iter().map(|p| place(*p)).collect();
-                    for (end, next) in [
-                        (0, 1),
-                        (
-                            points.len().saturating_sub(1),
-                            points.len().saturating_sub(2),
-                        ),
-                    ] {
-                        if points.len() >= 2 {
-                            let toward = if points[next].x > points[end].x {
-                                1.
-                            } else {
-                                -1.
-                            };
-                            rings.push((
-                                point(points[end].x + px(toward * RING / 2.), points[end].y),
-                                strong,
-                            ));
-                        }
-                    }
-                    drawn.push((e, points, tone(strong)));
-                }
-                paint::paint_runs(&drawn, bounds, origin, ink, window);
-                for (centre, strong) in rings {
-                    let alpha = f32::from(tone(strong).alpha) / 1000.;
-                    paint::paint_ring(centre, ink.opacity(alpha), ground, window);
-                }
-            },
-        )
-        .absolute()
-        .top_0()
-        .left_0()
-        .size_full();
-        let cards: Vec<AnyElement> = (0..view.schema.nodes.len())
-            .map(|ty| {
-                let name = view.name(ty).to_owned();
-                let target = name.clone();
-                let count = self.count(&name, cx);
-                let (centre, half) = (map.at[ty], map.half[ty]);
-                ds::lifted(
-                    h_flex()
-                        .id(SharedString::from(format!("map-{name}")))
-                        .absolute()
-                        .left(px(centre.x - half))
-                        .top(px(centre.y - MAP_CARD_HEIGHT / 2.))
-                        .w(px(2. * half))
-                        .h(px(MAP_CARD_HEIGHT))
-                        .px(px(space::CONTROL_INSET))
-                        .gap(px(space::SM))
-                        .rounded(px(ds::radii(cx).sm))
-                        .bg(ds::surface::document(cx))
-                        .cursor_pointer()
-                        .when(pointed == Some(ty), |card| {
-                            card.shadow(ds::elevation::lift(ds::elevation::Lift::Hover, cx))
-                        })
-                        // At the widest card the name may be cut: the tooltip has it whole.
-                        .when(2. * half >= MAP_CARD_MAX, |card| {
-                            card.tip(studio_ui::ds::tooltip(name.clone()))
-                        })
-                        .child(ds::type_dot(&name))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .child(ds::text::body(name.clone()).single_line().truncate()),
-                        )
-                        .children(count.map(ds::text::meta))
-                        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                            this.point_at(Pointed::Type(ty), *hovered, cx)
-                        }))
-                        .on_click(cx.listener(move |this, _, _, cx| this.focus_on(&target, cx))),
-                    cx,
-                )
-                .into_any_element()
-            })
-            .collect();
-        let labels = labels.into_iter().map(|(at, name, strong)| {
-            // Centred on its place whatever its width: a slot wider than any label, its pill in
-            // the middle.
-            h_flex()
-                .absolute()
-                .left(px(at.x - LABEL_SLOT / 2.))
-                .top(px(at.y - LABEL_HEIGHT / 2.))
-                .w(px(LABEL_SLOT))
-                .h(px(LABEL_HEIGHT))
-                .justify_center()
-                .child(
-                    ds::lifted(div(), cx)
-                        .h(px(LABEL_HEIGHT))
-                        .px(px(space::SM))
-                        .flex()
-                        .items_center()
-                        .rounded(px(ds::radii(cx).xs))
-                        .bg(ds::surface::canvas_label(cx))
-                        .child(if strong {
-                            ds::text::meta(name).color(Color::Default)
-                        } else {
-                            ds::text::meta(name)
-                        }),
-                )
-        });
-        div()
-            .relative()
-            .w(px(map.size.x))
-            .h(px(map.size.y))
-            .child(lines)
-            .children(labels)
-            .children(cards)
-            .into_any_element()
     }
 
     // ---- one type in focus ----
@@ -1258,22 +810,14 @@ impl OntologyPage {
     fn render_header(&self, view: Option<&Arc<View>>, cx: &mut Context<Self>) -> impl IntoElement {
         let focus = self.focus.clone();
         let summary = view.map(|view| {
-            let groups = view.domains.groups.len();
-            let mut summary = format!(
+            format!(
                 "{} types · {} relationships",
                 view.schema.nodes.len(),
                 view.schema.edges.len()
-            );
-            if view.map.is_none() {
-                summary += &format!(" · {}", studio_ui::plural(groups, "domain", "domains"));
-            }
-            summary
+            )
         });
-        h_flex()
-            .h(px(size::TOOLBAR))
-            .px(px(space::PAGE))
-            .gap(px(space::MD))
-            .flex_none()
+        // The toolbar every surface has, so the view strip stands where Source's does.
+        ds::toolbar(cx)
             .children(studio_workspace::view_strip(Item::views(self, cx), cx))
             .map(|bar| match (&focus, view) {
                 (Some(focus), Some(view)) => {
@@ -1284,11 +828,8 @@ impl OntologyPage {
                             .on_click(cx.listener(|this, _, _, cx| this.go_back(cx))),
                     )
                     .child(
-                        ds::button(
-                            "ontology-domains",
-                            if view.map.is_some() { "Map" } else { "Domains" },
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| this.show_domains(cx))),
+                        ds::button("ontology-domains", "Every type")
+                            .on_click(cx.listener(|this, _, _, cx| this.show_domains(cx))),
                     )
                     // A long domain title gives way to the type's name.
                     .children(place.map(|place| {
@@ -1300,13 +841,8 @@ impl OntologyPage {
                     }))
                     .child(div().flex_none().child(ds::text::title(focus.clone())))
                 }
-                // The view strip names the map; a schema too large to draw says what it shows
-                // instead.
-                _ => bar
-                    .when(!view.is_some_and(|view| view.map.is_some()), |bar| {
-                        bar.child(ds::text::title("Domains"))
-                    })
-                    .children(summary.map(ds::text::meta)),
+                // The view strip names the map, and the canvas the type it is walked from.
+                _ => bar.children(summary.map(ds::text::meta)),
             })
     }
 }
@@ -1437,14 +973,20 @@ impl Render for OntologyPage {
             (_, Some(view)) if view.schema.nodes.is_empty() => {
                 ds::empty_state(IconName::GitGraph, "No node types").into_any_element()
             }
-            (_, Some(view)) => match (focus, &view.map) {
-                (Some(focus), _) => {
+            (_, Some(view)) => match focus {
+                Some(focus) => {
                     let sides = self.sides(view, focus);
                     self.render_focus(view, &sides, window, cx)
                 }
-                (None, Some(map)) => self.render_map(view, map, cx),
-                (None, None) => self.render_domains(view, window, cx),
+                // The schema canvas, drawn in place of the body.
+                None => div().into_any_element(),
             },
+        };
+        // A large schema with no type in focus on the canvas: the canvas fills the page and
+        // scrolls itself.
+        let canvas = match (&view, focus) {
+            (Some(view), None) if !view.schema.nodes.is_empty() => self.canvas.clone(),
+            _ => None,
         };
         v_flex()
             .id("ontology")
@@ -1471,24 +1013,29 @@ impl Render for OntologyPage {
             .on_action(cx.listener(|this, _: &SelectPrevious, _, cx| this.step(-1, cx)))
             .on_action(cx.listener(|this, _: &Open, _, cx| this.open_pointed(cx)))
             .child(self.render_header(view.as_ref(), cx))
-            .child(
-                div()
-                    .id("ontology-body")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
-                    // Room above the first row: the scrolling body clips what is drawn outside
-                    // it, and a raised card there (the type in focus, a domain) would lose the
-                    // top of its ring and shadow.
-                    .child(
-                        div()
-                            .px(px(space::PAGE))
-                            .pt(px(space::MD))
-                            .pb(px(space::PAGE))
-                            .child(div().relative().child(self.measure(cx)).child(body)),
-                    ),
-            )
+            .when_some(canvas.clone(), |page, canvas| {
+                page.child(div().flex_1().min_h_0().child(canvas))
+            })
+            .when(canvas.is_none(), |page| {
+                page.child(
+                    div()
+                        .id("ontology-body")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll)
+                        // Room above the first row: the scrolling body clips what is drawn outside
+                        // it, and a raised card there (the type in focus, a domain) would lose the
+                        // top of its ring and shadow.
+                        .child(
+                            div()
+                                .px(px(space::PAGE))
+                                .pt(px(space::MD))
+                                .pb(px(space::PAGE))
+                                .child(div().relative().child(self.measure(cx)).child(body)),
+                        ),
+                )
+            })
     }
 }
 
@@ -1534,8 +1081,7 @@ edge Owns: Person -> Project
             names(view.side(task, Side::Out)),
             vec!["AssignedTo Person", "BlockedBy Task"]
         );
-        // A small schema is one domain, drawn whole as a map, and its sides need no headings.
-        assert!(view.map.is_some());
+        // A small schema is one domain, and its sides need no headings.
         assert_eq!(view.domains.groups.len(), 1);
         assert_eq!(view.title(0), "Types");
         assert!(
@@ -1545,10 +1091,10 @@ edge Owns: Person -> Project
         );
     }
 
-    /// Past twelve types the page shows domains, not a map: a map of more is the web of lines
-    /// it replaces.
+    /// Past twelve types the schema is grouped into domains, which a type in focus groups
+    /// its lines by.
     #[test]
-    fn a_larger_schema_shows_domains() {
+    fn a_larger_schema_has_domains() {
         let mut source = String::new();
         for t in 0..13 {
             source += &format!("node T{t} {{ slug: String @key }}\n");
@@ -1557,7 +1103,6 @@ edge Owns: Person -> Project
             source += &format!("edge L{t}: T0 -> T{t}\n");
         }
         let view = View::new(Arc::new(SchemaModel::parse(&source).unwrap()));
-        assert!(view.map.is_none());
         assert!(!view.domains.groups.is_empty());
     }
 

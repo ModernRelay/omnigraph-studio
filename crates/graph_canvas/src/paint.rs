@@ -1,5 +1,5 @@
 //! How the canvas looks (spec 006): a faint dot grid; dashed grey lines that turn at right
-//! angles, each end in a small ring, as interfaces.dev draws its connectors; every node, type,
+//! angles, each end in a small ring, as interfaces.dev draws its connectors ; every node, type,
 //! hub and "+K more" a chip, a white pill with interfaces.dev's shadow (a 1 px ring and two soft
 //! drops, on its `#fcfcfc` ground), with the type's letter mark and a muted count. Pointing at a
 //! chip lights its lines; the selected chip carries a warm ring. Colour is kept to the small
@@ -80,8 +80,6 @@ pub(crate) const RING: f32 = 6.;
 /// How far from a node an exploration's line turns, at zoom 1: within the narrower of the gaps
 /// the exploration leaves between a node and its hubs and a hub and its neighbours.
 const ELBOW: f32 = 18.;
-/// How much taller each further loop on one type is, and wider, at zoom 1.
-const LOOP_STEP: f32 = 6.;
 
 /// What the lines are drawn from, besides the scene: each node's half width at zoom 1, where
 /// its lines meet its chip, and the world's origin on screen, so a line's dashes keep their
@@ -193,10 +191,10 @@ pub(crate) fn chip_width(text: &ChipText, measure: impl Fn(&str, f32, FontWeight
 }
 
 /// One piece of a chip's text.
-struct Piece {
-    text: SharedString,
-    color: Hsla,
-    weight: FontWeight,
+pub(crate) struct Piece {
+    pub text: SharedString,
+    pub color: Hsla,
+    pub weight: FontWeight,
 }
 
 /// Paints the scene and records each node's chip on screen, for hit testing.
@@ -304,17 +302,12 @@ pub(crate) fn paint(
     let mut drawn: Vec<(usize, Vec<Point<Pixels>>, Tone)> = Vec::new();
     for (index, edge) in scene.edges.iter().enumerate() {
         let tone = line_tone(scene, edge.from, edge.to, hovered, selected);
-        let from_is_parent = scene.nodes[edge.from].parent != Some(edge.to);
-        let (parent, child) = if from_is_parent {
-            (edge.from, edge.to)
-        } else {
-            (edge.to, edge.from)
-        };
-        let points = elbow(
+        let (parent, child) = line_ends(scene, index);
+        let ends = (
             (anchor[parent], reach[parent]),
             (anchor[child], reach[child]),
-            ELBOW * zoom,
         );
+        let points = elbow(ends.0, ends.1, ELBOW * zoom);
         if !crosses(&points, bounds, 40.) {
             continue;
         }
@@ -325,16 +318,10 @@ pub(crate) fn paint(
         // Each line end's ring, once where ends meet, in its strongest tone; none at a mark.
         let mut rings: BTreeMap<(i64, i64), (Point<Pixels>, u16)> = BTreeMap::new();
         for (index, points, tone) in &drawn {
-            let edge = &scene.edges[*index];
             if points.len() < 2 {
                 continue;
             }
-            // Drawn from the node a line hangs from to the other.
-            let (parent, child) = if scene.nodes[edge.from].parent != Some(edge.to) {
-                (edge.from, edge.to)
-            } else {
-                (edge.to, edge.from)
-            };
+            let (parent, child) = line_ends(scene, *index);
             let last = points.len() - 1;
             for (end, next, node) in [(0, 1, parent), (last, last - 1, child)] {
                 if mark_only(node) {
@@ -449,16 +436,15 @@ fn meets(rect: Bounds<Pixels>) -> (Point<Pixels>, f32) {
 
 /// Where the ring at a line's end `at` sits: on the line, half a ring back along its last
 /// piece toward `next`, so the line stops at the ring and the ring touches what the line
-/// reaches. Pieces run at right angles, so the ring moves along one axis only; a piece of no
-/// length leaves it on the end. (`f32::signum` of zero is 1, which moved every ring at a
-/// level line's end half a ring down, off the line.)
+/// reaches, at whatever slant the piece runs; a piece of no length leaves it on the end.
 pub(crate) fn ring_centre(at: Point<Pixels>, next: Point<Pixels>) -> Point<Pixels> {
-    let step = |from: Pixels, to: Pixels| match f32::from(to - from) {
-        d if d > 0. => RING / 2.,
-        d if d < 0. => -RING / 2.,
-        _ => 0.,
-    };
-    point(at.x + px(step(at.x, next.x)), at.y + px(step(at.y, next.y)))
+    let (dx, dy) = (f32::from(next.x - at.x), f32::from(next.y - at.y));
+    let length = (dx * dx + dy * dy).sqrt();
+    if length < 0.01 {
+        return at;
+    }
+    let step = RING / 2. / length;
+    point(at.x + px(dx * step), at.y + px(dy * step))
 }
 
 /// A line end's ring at `centre`: a small circle in `ink`, filled with the ground (`fill`) so
@@ -536,32 +522,13 @@ fn elbow(
     right_angles(vec![start, point(x, parent.y), point(x, child.y), end])
 }
 
-/// A loop over a type's chip, its `rank`th from the inside out: up from the chip's top near its
-/// right end, across, and down again, each further loop wider and taller.
-pub(crate) fn loop_points(
-    at: Point<Pixels>,
-    reach: f32,
-    scale: f32,
-    rank: usize,
-) -> Vec<Point<Pixels>> {
-    let grow = LOOP_STEP * rank as f32 * scale;
-    let top = at.y - px(13. * scale);
-    let right = at.x + px(reach - 12. * scale + grow);
-    let left = right - px(36. * scale + grow * 2.);
-    let height = px(16. * scale + grow);
-    vec![
-        point(left, top),
-        point(left, top - height),
-        point(right, top - height),
-        point(right, top),
-    ]
-}
-
-/// Where a loop's label goes: over its top.
-pub(crate) fn loop_label_at(points: &[Point<Pixels>]) -> Point<Pixels> {
-    match points {
-        [_, a, b, ..] => point((a.x + b.x) / 2., a.y - px(10.)),
-        _ => points.first().copied().unwrap_or_default(),
+/// The two nodes a line is drawn between: from the node it hangs from to the other.
+fn line_ends(scene: &Scene, index: usize) -> (usize, usize) {
+    let edge = &scene.edges[index];
+    if scene.nodes[edge.from].parent != Some(edge.to) {
+        (edge.from, edge.to)
+    } else {
+        (edge.to, edge.from)
     }
 }
 
@@ -775,7 +742,7 @@ pub(crate) fn paint_runs(
 }
 
 /// The dot grid: a dot every [`DOT_STEP`] pixels, fixed to the screen.
-fn paint_dots(bounds: Bounds<Pixels>, palette: &Palette, window: &mut Window) {
+pub(crate) fn paint_dots(bounds: Bounds<Pixels>, palette: &Palette, window: &mut Window) {
     let color = palette.grid_dot;
     let left = f32::from(bounds.left());
     let top = f32::from(bounds.top());
@@ -800,28 +767,38 @@ fn paint_dots(bounds: Bounds<Pixels>, palette: &Palette, window: &mut Window) {
     }
 }
 
-struct PillStyle<'a> {
-    fill: Hsla,
+pub(crate) struct PillStyle<'a> {
+    pub fill: Hsla,
     /// A hairline inside the chip: only where you are; otherwise its shadow's ring outlines it.
-    border: Option<Hsla>,
+    pub border: Option<Hsla>,
     /// Its shadow, the ring first.
-    shadow: &'a [Layer],
+    pub shadow: &'a [Layer],
     /// The focus ring's glow.
-    ring: Option<Hsla>,
+    pub ring: Option<Hsla>,
 }
+
+/// How far the selected chip's ring stands out from it, in screen pixels.
+const RING_SPREAD: f32 = 3.;
 
 /// Paints a chip's glow, shadow and body: the shadow as a browser draws a CSS `box-shadow`
 /// (each layer's corner with its spread), then the fill and, where you are, the hairline.
-fn paint_chip_body(rect: Bounds<Pixels>, radius: f32, style: &PillStyle, window: &mut Window) {
+pub(crate) fn paint_chip_body(
+    rect: Bounds<Pixels>,
+    radius: f32,
+    style: &PillStyle,
+    window: &mut Window,
+) {
     if let Some(ring) = style.ring {
+        // A spread grows the shadow's box but not its corners: the ring's own radius is the
+        // chip's plus the spread, so the two stay concentric.
         window.paint_drop_shadows(
             rect,
-            Corners::all(px(radius)),
+            Corners::all(px(radius + RING_SPREAD)),
             &[BoxShadow {
                 color: ring,
                 offset: point(px(0.), px(0.)),
                 blur_radius: px(0.),
-                spread_radius: px(3.),
+                spread_radius: px(RING_SPREAD),
                 inset: false,
             }],
         );
@@ -885,7 +862,7 @@ fn pill_layout(
 
 /// A chip centred on `at`: an optional letter mark, then the pieces of text. Returns its bounds.
 #[expect(clippy::too_many_arguments)]
-fn paint_pill(
+pub(crate) fn paint_pill(
     at: Point<Pixels>,
     pieces: &[Piece],
     mark: Option<(Hsla, SharedString)>,
@@ -1048,7 +1025,12 @@ fn wrap_width(whole: f32, widest: f32, text_size: f32) -> f32 {
 }
 
 /// A mark's letter, shaped for a mark `size_px` across.
-fn shape_letter(letter: &str, size_px: f32, palette: &Palette, window: &mut Window) -> ShapedLine {
+pub(crate) fn shape_letter(
+    letter: &str,
+    size_px: f32,
+    palette: &Palette,
+    window: &mut Window,
+) -> ShapedLine {
     let font = Font {
         weight: studio_ui::ds::text::weight::HEADING,
         ..palette.font.clone()
@@ -1070,7 +1052,7 @@ fn shape_letter(letter: &str, size_px: f32, palette: &Palette, window: &mut Wind
 
 /// The type mark: the initial in white on the type's tint, a rounded square. A node from afar
 /// is this mark alone.
-fn paint_letter_mark(
+pub(crate) fn paint_letter_mark(
     center: Point<Pixels>,
     tint: Hsla,
     line: &ShapedLine,

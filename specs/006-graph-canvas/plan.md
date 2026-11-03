@@ -52,6 +52,7 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 | Decision | Rejected alternatives | Why |
 |---|---|---|
 | Custom GPUI canvas | WebView with a JS renderer | WebView embedding needs a GPUI fork; not on Zed's lineage |
+| The ontology is walked on the canvas, a type at a time, as data is | A picture of every type: a web of every relationship (2026-10-20), domain cards, and a day of schema maps (copies in frames, connected columns, property cards, a type in focus with chips, chips in columns and in islands; 2026-11-02); a column browser | One canvas for data and schema: the person learns one way to walk, and a schema shows only what is asked for, so it never becomes a web; its relationships are one step each, since each reaches one type |
 | Grow by relationship group | Show the whole neighbourhood | Counts first keep large hubs from flooding the view |
 
 ## Ontology page, canvas and placed nodes
@@ -61,21 +62,49 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   `studio_graph::OpenOntology`, ⌘⇧O, `ontology.rs`) and the **Canvas** (the nodes walked from
   a root, `studio_graph::OpenCanvas`, ⌘⇧E; "Explorer" until 2026-10-19). Both are rows at the
   top of the sidebar's Graph panel, above Types, and items of the Graph menu.
-- **The ontology page** (2026-10-20) is built from Studio's own parts, not painted chips, and
-  draws no web of every relationship: a schema of a hundred types has hundreds, and no layout
-  made that readable (Corrections, "Ontology layout (2026-10-20)").
-  - **Domains.** The types related to more than 30% of the others ("Linked to most types",
-    pills at the top) belong to every group and so to none. The rest are grouped by
-    modularity (Louvain: each type joins the group it has most relationships with beyond
-    chance, then the groups are grouped once more), a type left alone joins the group it is
-    most related to, and the types related only to shared ones, or to none, go last as "Other
-    types" (`domains.rs`). Each domain is a card titled by its most related type ("Account and
-    17 more"), listing its types with their counts, its footer naming the domains it has most
-    relationships with. Cards stand in as many columns as the page holds, each card in the
-    column with least in it; the page's width is read as it is laid out, and a new one draws
-    the page again once that frame is done. Pointing at a type selects it and dims the types
-    it is not related to, in every card. Deterministic: a function of the schema alone.
-    Twelve types or fewer are one group.
+- **The ontology page** (2026-10-20; since 2026-11-02 its overview is the canvas, below).
+  - **Ontology on the canvas** (2026-11-02, `schema_walk.rs`; Ragnor, after a day of schema
+    maps of his own design, none clean enough: "remove everything and let's use our canvas
+    implementation and adapt it to ontology visualization … the similar progressive
+    expansion"). The page's overview is a canvas tab's own view (`GraphCanvas::for_schema`,
+    mode `Schema`): the same chips, pills, layout, glides, drags, keys and caption as a walk
+    of data, the scene made from the schema rather than from reads. It starts from a type,
+    expanded: the one related to most others, the shared types aside (they are related to
+    everything), by name among equals; a schema of twelve types or fewer opens with every type
+    expanded, the whole of it. The canvas's summary pill names the root as a menu, "From Task ▾",
+    beside the types drawn; it lists every type, by name, to start from instead, as does a
+    type's "Explore from here". The page's header holds only the views and the schema's counts.
+    - **One step, not two.** A relationship reaches one type, so expanding a type shows the
+      types related to it at once: a pill per related type and direction, named with its
+      relationship ("→ AssignedTo") or counted ("→ 3 relationships"), and the type beyond it.
+      A type's relationships to itself are one pill marked "↻", its line back into the chip.
+      A walk of data takes two steps, a relationship and then its nodes.
+    - **Sides.** The types a type reaches stand on its right and those reaching it on its
+      left (`LayoutNode::side`), at every level: a type with many relationships stands
+      between two columns half as tall as one.
+    - **Room.** A schema is laid out with more room than data (`Spacing::SCHEMA`: rows 56
+      apart, not 40; 72 and 64 from a type to its pills and a pill to its types, not 44 and
+      36), since it holds a few dozen types, not thousands of nodes.
+    - **To itself.** A pill to the type itself hangs off it alone: its "↻" says where it
+      leads, and no line runs back into the type.
+    - **Caps.** Each direction shows eight related types, then "+K more", which shows eight
+      more a click, as a relationship's neighbours do; the chip cap is the canvas's.
+    - **Drawn once.** A type is one chip, however it is reached: reaching it again draws a
+      line to it. A pill between two types is drawn once: expanding the second of two related
+      types draws no pill for what the first already shows.
+    - **Clicks.** A click expands a closed type (and selects an open one), a double click
+      closes it, taking back what only it reached; a click on a pill expands the type it
+      leads to; ⇧-click, Space or ⌘↵ open the type's page (below, "A type in focus"), its
+      description, properties and every relationship either side. A type's menu: Expand or
+      Close, Explore from here, Open table, Details. From that page, the way back selects the
+      type on the canvas and glides to it.
+  - **Domains** (`domains.rs`, kept for the type page's grouping and the starting type). The
+    types related to more than 30% of the others are shared, belonging to every group and so
+    to none. The rest are grouped by modularity (Louvain: each type joins the group it has
+    most relationships with beyond chance, then the groups are grouped once more), a type left
+    alone joins the group it is most related to, and the types related only to shared ones,
+    or to none, go last. Twelve types or fewer are one group. The domain cards, the small
+    schema's layered map (`layered.rs`) and the schema maps of 2026-11-02 are gone.
   - **A type in focus** (a click on any type): its card in the middle, with its count, what
     the schema says it is (its `@description`, else its `@instruction`; `NodeType::about`;
     five lines, the rest behind More), its properties (an enumeration's values below its
@@ -99,12 +128,6 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   - **Keys** (context `Ontology`): ↑ and ↓ (`SelectPrevious`, `SelectNext`) point at the
     types in the order the page lists them, or at the type in focus's lines, the side
     reaching it first, as the pointer does; ↵ (`Open`) brings the type pointed at into focus.
-  - **A small schema** (12 types or fewer, 24 relationships or fewer) is drawn whole as a map:
-    each type a card in columns (`layered.rs`), as wide as its name and count need between
-    140 and 280 px, each relationship a dashed right-angle line between their sides, named on
-    its own upright, a type's relationships to itself as brackets over its card; a line meets
-    a card's side as near its other end as the side allows, so a line level with it runs
-    straight. Pointing at a type draws its lines stronger, a click brings it into focus.
 - **Opened chips** (2026-10-19). A node's chip shows 32 characters of its name, then "…"
   (`CHIP_LABEL_CHARS`); layout always measures that, so opening a chip never moves another.
   Pointing at a cut chip for a moment opens it: its whole name, wrapped at 320 px at zoom 1
@@ -210,6 +233,11 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 | 2026-10-12 | The ontology and the explorer are found without the menu | offscreen snapshot of `OpenOntology` (⌘⇧O) | The sidebar's Graph panel opens with Ontology (selected) and Explorer above Types; the tab and the mode switch read Ontology / Explorer |
 | 2026-10-12 | Query results as a canvas | `gq_language` `whole_node_columns_carry_their_type`; `query_editor` `node_columns_become_a_graph_of_distinct_nodes_linked_by_row`; snapshot of `return { $p, $c }` | The result offers Canvas; a results canvas draws each node once and links the nodes of a row; it is a tab of its own and is not restored |
 | 2026-10-19 | The canvas is named Canvas; a cut chip opens; a node is named by the property its graph chose | `graph_canvas` `an_opened_name_wraps_into_even_lines`; `gq_language` `reads_types_keys_and_properties` (a chosen text property names a node, a list, a date or a missing one does not); `graph_store` `answers_kept_under_one_schema_are_not_given_under_another` (a choice in the settings renames at once with one `SchemaChanged`, a schema read again keeps it, none goes back to the key); `studio_settings` `views_and_node_names_are_saved_per_graph_and_type`; workspace clippy `-D warnings` and suite; offscreen glass snapshots on a scratch dev server with Person named by `email`: a person explored, a hub opened, a 35-character email at rest and pointed at, the chip menu, the table's Views menu, the settings tab searched for "node" | The sidebar row, mode switch and tab read Canvas. Neighbours with an email showed it, the rest their key. The 35-character email opened on one line over its neighbours from the chip's top left; an earlier wrap at 280 px left "m" alone on a second line, so lines are now of even length and the width 320 px. "Show as ›" in the chip menu, "Name rows by ›" in Views, and "Node names · 1 changed" in settings with Person's dropdown on "email" and Reset. Chips and hubs now take the `sm` corner rather than round ends |
+| 2026-11-02 | A large schema's map: one line per related type in focus, a map of chips | `graph_canvas` `the_map_is_a_chip_per_type`, `focus_draws_one_straight_line_per_related_type` (two relationships to one type are one line, "2 relationships"; every line straight, from a port of its own, ending at its chip; a type both ways on both sides), `the_maps_lines_are_one_per_related_type`, `the_layout_is_a_function_of_the_schema`, `it_opens_in_focus_and_walks_by_chips`; workspace clippy `-D warnings`; offscreen snapshots of the personal graph (100 types, 551 relationships): opened, a count clicked, the map, the map fitted | Opened on Task: CriterionAssessment, Media and Notification on the left, its related types on the right, each line named or counted; "3 relationships" by Person listed TaskForPerson, TaskOutreachToPerson and TaskWaitingOnPerson. A first run drew a line on the right to no chip: a type both ways had only its left chip. The map fitted at 58% with every chip's name readable, Task's related types lit. Earlier slices the same day were replaced |
+| 2026-11-02 | The map's lines merge into a trunk until they part | `graph_canvas` `the_maps_lines_are_one_per_related_type` (one per related type either way, right angles, no stretch through a chip, the trunk along the gap under the row, every line to the right leaving at one point); offscreen snapshot of the personal graph's map fitted with Task selected | Task's 24 related types hang from one trunk under its row, an upright per column and a branch per chip, where before each ran its own lane beside it |
+| 2026-11-02 | The map is the clusters as islands on one grid | `graph_canvas` `the_map_is_islands_on_one_grid` (no island's box holds another's chip; every chip on the grid), `the_maps_lines_are_one_per_related_type` (no stretch through a chip); offscreen snapshot of the personal graph's map fitted with Task selected | Nine islands, the four shared types alone at the top left; Task's island with Notification, WorkflowRun, Agent and Repository; its lines along one row gap with an upright per column |
+| 2026-11-02 | The ontology on the canvas | `graph_canvas` `schema_walk` tests (a type expands to its related types at once, its relationship to itself once, marked ↻; a pill and a type drawn once; "+K more" past the step and its limit; closing takes back what only it reached), `a_schema_canvas_walks_types` (opens from its root expanded, a type expands, closing takes back, Explore from another), `layout` `a_roots_children_keep_their_side`; workspace clippy `-D warnings`; offscreen snapshots of the personal graph: opened, Person expanded | Opened from Task: what reaches it on its left, what it reaches on its right, "+13 more"; Person expanded outward on the right, nothing drawn moved, Media linked rather than drawn again. The schema canvas and the small schema's layered map were removed |
+| 2026-11-02 | Room on the ontology canvas | `layout` `a_roots_children_keep_their_side` (a type below the root keeps its sides; the schema's spacing is roomier), `schema_walk` tests (a pill to itself has one line); offscreen snapshots of the personal graph: opened, Person expanded | Rows and columns stand further apart; Person's incoming types stand in their own column on its left, its outgoing on its right; the ↻ pill no longer loops back into Task |
 
 ## Corrections
 
