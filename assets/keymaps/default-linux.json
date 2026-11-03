@@ -209,6 +209,13 @@
     }
   },
   {
+    "context": "CellSelect",
+    "bindings": {
+      "up": "studio_table::SelectPreviousSuggestion",
+      "down": "studio_table::SelectNextSuggestion"
+    }
+  },
+  {
     "context": "FilterValue > Editor",
     "bindings": {
       "up": "studio_table::SelectPreviousSuggestion",
