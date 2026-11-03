@@ -5216,8 +5216,15 @@ impl TypeTable {
 
     /// ↵ or a double click: a value's edit, or a relationship's related rows, the other type
     /// filtered to those related to this row through the same relationship seen from the other
-    /// end.
+    /// end. A row the branch removed opens neither, as [`Self::start_edit`] refuses it.
     fn open_cell(&mut self, cursor: Cursor, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .rows
+            .get(cursor.row)
+            .is_some_and(|row| self.is_removed(&row.id))
+        {
+            return;
+        }
         let group = self
             .columns
             .get(cursor.col)
@@ -11118,8 +11125,9 @@ mod tests {
             { "kind": "node", "type": person, "id": "p3", "op": "delete",
               "before": { "properties": { "slug": "p3", "name": "Linus" } }, "after": null },
         ]);
+        let schema = format!("{PEOPLE}edge Knows: Person -> Person\n");
         let (session, route) =
-            crate::test_support::session_with_branch_diff(PEOPLE, rows, changes, cx);
+            crate::test_support::session_with_branch_diff(&schema, rows, changes, cx);
         cx.run_until_parked();
         let (table, cx) = cx.add_window_view(|window, cx| {
             TypeTable::new(
@@ -11181,15 +11189,30 @@ mod tests {
             assert_eq!(picked, ["p1", "p2"], "a removed row is not picked");
             assert_eq!(table.all_check_state(), ToggleState::Selected);
         });
+        let opened: Rc<RefCell<Vec<studio_actions::graph::OpenType>>> = Rc::default();
+        cx.update(|_, cx| {
+            let opened = opened.clone();
+            cx.on_action(move |action: &studio_actions::graph::OpenType, _| {
+                opened.borrow_mut().push(action.clone())
+            });
+        });
         table.update_in(cx, |table, window, cx| {
             table.clear_selection(cx);
             let col = table.columns.iter().position(|c| c.key == "name").unwrap();
             table.start_edit(Cursor { row: 0, col }, window, cx);
             assert!(table.editing.is_none(), "a removed row has no cell to edit");
             assert!(table.peek.is_none(), "nor a page to open");
+            let knows = table
+                .columns
+                .iter()
+                .position(|c| c.relationship().is_some())
+                .expect("a relationship column");
+            table.open_cell(Cursor { row: 0, col: knows }, window, cx);
             table.pick_rows(0, false, cx);
             assert!(table.selection.is_empty());
         });
+        cx.run_until_parked();
+        assert!(opened.borrow().is_empty(), "nor its related rows");
 
         session.update(cx, |session, cx| session.set_branch("main".into(), cx));
         cx.run_until_parked();
