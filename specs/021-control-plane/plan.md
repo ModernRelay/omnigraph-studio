@@ -242,10 +242,9 @@ only to the endpoint it names." `docs/architecture.md`'s layer table gains the c
 
 ## Open questions
 
-1. Which `client_id` claim AuthKit gives a token issued to a metadata-document client: the
-   document's URL, or an ID AuthKit assigns (`client_…`, as for a registered application).
-   WorkOS documents only the registered case; Omnigraph's server tests assume the URL. CP1's
-   list must name the one a real sign-in shows.
+1. Settled (2026-11-03): a token issued to Studio's metadata-document client names the
+   document's URL as its `client_id`, `https://www.omnigraph.dev/oauth/studio-client-metadata.json`;
+   that is the value CP1's list accepts.
 2. Settled (2026-11-03): the OAuth server signs with the same key as the control plane's own
    sign-in.
 3. How a person in several organizations signs in to the profile's (spec 016, question 4).
@@ -264,6 +263,7 @@ only to the endpoint it names." `docs/architecture.md`'s layer table gains the c
 | 2026-11-03 | Production signs Studio in without registration, and has no default resource | The identity provider's application and resource listings, read-only; the OAuth server's `/.well-known/oauth-authorization-server` | No registered applications; each resource is a cluster's `…/mcp`, none the default; `client_id_metadata_document_supported: true` |
 | 2026-11-03 | Without `resource`, a token's `aud` is the environment's; an OAuth token's `sid` is a consent | WorkOS docs, `authkit/mcp` ("Set a default Resource Indicator") and `reference/workos-connect/token` | As stated |
 | 2026-11-03 | Clusters are given the OAuth server's issuer | `curl` of production clusters' `/.well-known/oauth-protected-resource/mcp` | Each names `authorization_servers: ["https://login.platform.omnigraph.dev"]` |
+| 2026-11-03 | A token issued to Studio's client names the document's URL as its client | A live sign-in as Studio's client (PKCE S256, loopback redirect, `resource` a production cluster's `…/mcp`); the access token's claims decoded locally, the token neither printed nor kept | `client_id` the metadata document's URL; `aud` the requested resource; `org_id` the profile's organization; `sid` a consent; 300 s; RS256 with no `typ` |
 | 2026-11-03 | The CLI lists a profile's clusters, and needs a current login to | `omnigraph cluster list --profile NAME --json` | `refresh_outcome_unknown`: the login could not be renewed without a terminal |
 
 ## Corrections
