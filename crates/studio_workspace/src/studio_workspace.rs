@@ -602,6 +602,7 @@ impl Workspace {
                 this.pause_performance();
                 return;
             }
+            persistence::window_activated(this.window_slot, cx);
             let sessions: Vec<_> = this
                 .session
                 .iter()

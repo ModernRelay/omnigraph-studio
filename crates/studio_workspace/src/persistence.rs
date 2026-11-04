@@ -254,7 +254,8 @@ impl SavedWindow {
     }
 }
 
-/// `session.json`: the windows open when Studio last quit, in the order they were opened.
+/// `session.json`: the windows open when Studio last quit, in the order they were opened, the one
+/// in front last: they reopen in this order, so that one opens in front again.
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
 struct SessionFile {
@@ -295,6 +296,8 @@ struct SessionWindows {
     /// The last window, closed while no other was open: it comes back at the next start unless
     /// another window opens first.
     last_closed: Option<SavedWindow>,
+    /// The window last made active.
+    front: Option<u64>,
 }
 
 impl SessionWindows {
@@ -312,6 +315,13 @@ impl SessionWindows {
         }
     }
 
+    /// `slot`'s window is the one in front.
+    fn activate(&mut self, slot: u64) {
+        if self.open.contains_key(&slot) {
+            self.front = Some(slot);
+        }
+    }
+
     fn set_bounds(&mut self, slot: u64, bounds: SavedBounds) {
         if let Some(window) = self.open.get_mut(&slot) {
             window.bounds = Some(bounds);
@@ -320,6 +330,9 @@ impl SessionWindows {
 
     /// A closed window is forgotten, unless it was the last one open.
     fn close(&mut self, slot: u64) {
+        if self.front == Some(slot) {
+            self.front = None;
+        }
         if let Some(window) = self.open.remove(&slot)
             && self.open.is_empty()
         {
@@ -327,12 +340,19 @@ impl SessionWindows {
         }
     }
 
-    /// The windows with a graph open, to reopen at the next start.
+    /// The windows with a graph open, to reopen at the next start: in the order they opened, the
+    /// one in front last. Windows that reopen over each other then leave that one on top, not
+    /// the one opened last.
     fn saved(&self) -> Vec<SavedWindow> {
         let windows: Vec<&SavedWindow> = if self.open.is_empty() {
             self.last_closed.iter().collect()
         } else {
-            self.open.values().collect()
+            let (front, mut behind): (Vec<_>, Vec<_>) = self
+                .open
+                .iter()
+                .partition(|(slot, _)| self.front == Some(**slot));
+            behind.extend(front);
+            behind.into_iter().map(|(_, window)| window).collect()
         };
         windows
             .into_iter()
@@ -436,6 +456,10 @@ pub(crate) fn window_opened(window: &Window, cx: &mut App) -> u64 {
 
 pub(crate) fn window_graphs_changed(slot: u64, session: &SavedSession, cx: &mut App) {
     WindowSession::update(cx, |windows| windows.set_session(slot, session));
+}
+
+pub(crate) fn window_activated(slot: u64, cx: &mut App) {
+    WindowSession::update(cx, |windows| windows.activate(slot));
 }
 
 pub(crate) fn window_moved(slot: u64, bounds: Bounds<Pixels>, cx: &mut App) {
@@ -655,6 +679,13 @@ mod tests {
             names(&windows),
             ["crm", "notes"],
             "in the order the windows opened; a window with no graph is not kept"
+        );
+
+        windows.activate(first);
+        assert_eq!(
+            names(&windows),
+            ["notes", "crm"],
+            "the window in front last, so it reopens in front"
         );
 
         windows.close(first);
