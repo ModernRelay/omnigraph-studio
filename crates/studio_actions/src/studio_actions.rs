@@ -153,6 +153,9 @@ pub mod workspace {
             ToggleActivity,
             /// Zoom the active pane over the document area, or end a zoom.
             ToggleZoom,
+            /// Show the active tab alone, full screen, to write without distractions; again
+            /// (or Escape) to bring the window back.
+            ToggleFocusMode,
             /// Connect to a server or open a graph.
             OpenGraph,
             /// Read the open graph's schema, branches and counts again, and the view in

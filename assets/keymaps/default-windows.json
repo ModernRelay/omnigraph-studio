@@ -21,6 +21,12 @@
     }
   },
   {
+    "context": "Workspace && focus_mode",
+    "bindings": {
+      "escape": "studio::ToggleFocusMode"
+    }
+  },
+  {
     "context": "Workspace && !Editor",
     "bindings": {
       "?": "studio::ShowKeyBindings"
@@ -39,6 +45,7 @@
       "ctrl-alt-3": ["studio::OpenViewAt", { "index": 2 }],
       "ctrl-alt-shift-3": ["studio::OpenViewAt", { "index": 2, "beside": true }],
       "shift-escape": "studio::ToggleZoom",
+      "ctrl-alt-enter": "studio::ToggleFocusMode",
       "ctrl-w": "studio::CloseActiveItem",
       "ctrl-tab": "studio::ActivateNextItem",
       "ctrl-shift-tab": "studio::ActivatePreviousItem",
@@ -106,7 +113,14 @@
   {
     "context": "TextEditor",
     "bindings": {
-      "ctrl-s": "studio_node::SaveText"
+      "ctrl-s": "studio_node::SaveText",
+      "ctrl-shift-enter": "studio::ToggleFocusMode"
+    }
+  },
+  {
+    "context": "TextEditor > Editor",
+    "bindings": {
+      "ctrl-shift-enter": "studio::ToggleFocusMode"
     }
   },
   {

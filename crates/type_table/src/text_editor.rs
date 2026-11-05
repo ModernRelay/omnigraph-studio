@@ -77,6 +77,9 @@ pub struct TextEditor {
     preview_behind: bool,
     _preview: Option<Task<()>>,
     mode: Mode,
+    /// Shown alone, full screen (focus mode): no toolbar unless something needs the person,
+    /// and the text in a column of readable width.
+    focus_mode: bool,
     state: State,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -199,6 +202,7 @@ impl TextEditor {
             preview_behind: false,
             _preview: None,
             mode: Mode::Split,
+            focus_mode: false,
             state: State::Idle,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
@@ -463,6 +467,15 @@ impl TextEditor {
         crate::write::change_refusal(&self.session, &self.branch, cx)
     }
 
+    /// The toolbar is drawn: always, but in focus mode only while something needs the person —
+    /// a conflict to settle, a failed save, or a save that goes to another branch than the
+    /// window's.
+    fn toolbar_shown(&self, cx: &App) -> bool {
+        !self.focus_mode
+            || matches!(self.state, State::Conflict | State::Failed(_))
+            || self.session.read(cx).branch != self.branch
+    }
+
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let branch = self.branch.clone();
         let refused = self.change_refusal(cx);
@@ -582,6 +595,13 @@ impl Item for TextEditor {
         Some(Self::key(&self.type_name, &self.id, &self.property).into())
     }
 
+    fn set_focus_mode(&mut self, on: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.focus_mode != on {
+            self.focus_mode = on;
+            cx.notify();
+        }
+    }
+
     /// Unsaved: the text differs from the value saves are bound to.
     fn is_dirty(&self, _cx: &App) -> bool {
         self.unsaved && matches!(self.old, Loadable::Loaded(_))
@@ -641,20 +661,40 @@ impl Render for TextEditor {
             }
             Loadable::Loaded(_) => {
                 // The editor runs to its column's edge, so its scrollbar sits there.
+                let top = if self.focus_mode {
+                    studio_ui::ds::space::XXXL
+                } else {
+                    studio_ui::ds::space::XL
+                };
                 let editor = div()
                     .flex_1()
                     .min_w_0()
                     .h_full()
                     .pl(px(studio_ui::ds::space::PAGE))
-                    .pt(px(studio_ui::ds::space::XL))
+                    .pt(px(top))
                     .child(self.editor.clone());
                 let preview = div().flex_1().min_w_0().h_full().child(
                     AnyView::from(self.preview_view.clone())
                         .cached(StyleRefinement::default().size_full()),
                 );
+                // Alone on a full screen, one pane is a column of readable width in the middle.
+                let column = |pane: Div| {
+                    if self.focus_mode {
+                        h_flex()
+                            .size_full()
+                            .justify_center()
+                            .child(pane.w_full().max_w(px(studio_ui::ds::size::PROSE)))
+                            .into_any_element()
+                    } else {
+                        pane.into_any_element()
+                    }
+                };
                 match self.mode {
-                    Mode::Edit => editor.into_any_element(),
-                    Mode::Preview => preview.into_any_element(),
+                    // Writing alone, the preview beside the text is one more thing to look at:
+                    // Split shows the text only until focus mode ends.
+                    Mode::Edit => column(editor),
+                    Mode::Split if self.focus_mode => column(editor),
+                    Mode::Preview => column(preview),
                     Mode::Split => h_flex()
                         .size_full()
                         .child(editor.border_r_1().border_color(rule))
@@ -671,7 +711,9 @@ impl Render for TextEditor {
             })
             .size_full()
             .bg(studio_ui::ds::surface::document(cx))
-            .child(self.render_toolbar(cx))
+            .when(self.toolbar_shown(cx), |editor| {
+                editor.child(self.render_toolbar(cx))
+            })
             .child(div().flex_1().min_h_0().child(body))
     }
 }
@@ -915,6 +957,32 @@ mod tests {
             ["fix"],
             "read again on fix"
         );
+    }
+
+    /// Shown alone (focus mode), the editor draws no toolbar and keeps the keyboard; a
+    /// conflict brings the toolbar back, since its choice is there, and leaving focus mode
+    /// does too.
+    #[gpui::test]
+    async fn focus_mode_hides_the_toolbar_until_something_needs_the_person(
+        cx: &mut TestAppContext,
+    ) {
+        let mut no_match = committed("c2", "c1");
+        no_match["affected_nodes"] = 0.into();
+        let (view, cx) = editor_answering(200, no_match, cx);
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.toolbar_shown(cx));
+            view.set_focus_mode(true, window, cx);
+            assert!(!view.toolbar_shown(cx), "no toolbar, alone");
+        });
+        save(&view, cx);
+        view.update_in(cx, |view, window, cx| {
+            assert!(matches!(view.state, State::Conflict));
+            assert!(view.toolbar_shown(cx), "a conflict brings it back");
+            view.state = State::Idle;
+            assert!(!view.toolbar_shown(cx));
+            view.set_focus_mode(false, window, cx);
+            assert!(view.toolbar_shown(cx), "out of focus mode, it is back");
+        });
     }
 
     /// A value changed elsewhere meanwhile is not overwritten: the save matches nothing, the

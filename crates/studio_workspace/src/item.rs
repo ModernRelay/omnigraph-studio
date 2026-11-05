@@ -118,6 +118,10 @@ pub trait Item: Render + Focusable + EventEmitter<ItemEvent> {
     fn reads_graph(&self) -> bool {
         true
     }
+
+    /// The tab is shown alone, full screen, in focus mode (spec 002), or no longer is. A tab
+    /// that writes prose gives up its chrome while it is; the rest are drawn as they are.
+    fn set_focus_mode(&mut self, _on: bool, _window: &mut Window, _cx: &mut Context<Self>) {}
 }
 
 pub trait ItemHandle: 'static {
@@ -136,6 +140,7 @@ pub trait ItemHandle: 'static {
     fn status(&self, window: &mut Window, cx: &mut App) -> Option<ItemStatus>;
     fn caches_its_parts(&self, cx: &App) -> bool;
     fn reads_graph(&self, cx: &App) -> bool;
+    fn set_focus_mode(&self, on: bool, window: &mut Window, cx: &mut App);
 }
 
 impl<T: Item> ItemHandle for Entity<T> {
@@ -197,5 +202,9 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn reads_graph(&self, cx: &App) -> bool {
         self.read(cx).reads_graph()
+    }
+
+    fn set_focus_mode(&self, on: bool, window: &mut Window, cx: &mut App) {
+        self.update(cx, |item, cx| item.set_focus_mode(on, window, cx));
     }
 }

@@ -22,8 +22,8 @@ use std::time::Duration;
 
 use gpui::{
     Action, AnyView, App, Bounds, ClickEvent, Context, DismissEvent, Div, DragMoveEvent, ElementId,
-    Entity, EntityId, EventEmitter, FocusHandle, Focusable, MouseButton, Pixels, Point, Render,
-    ScrollHandle, SharedString, Stateful, Subscription, Task, WeakEntity, Window,
+    Entity, EntityId, EventEmitter, FocusHandle, Focusable, KeyContext, MouseButton, Pixels, Point,
+    Render, ScrollHandle, SharedString, Stateful, Subscription, Task, WeakEntity, Window,
     WindowControlArea, WindowHandle, deferred, div, point,
 };
 use graph_store::{
@@ -39,8 +39,8 @@ use studio_actions::workspace::{
     ActivateItem, ActivateLastItem, ActivateNextGraph, ActivateNextItem, ActivateNextPane,
     ActivatePreviousGraph, ActivatePreviousItem, ActivatePreviousPane, CloseActiveItem,
     CloseAllItems, CloseGraph, CloseOtherItems, GoBack, GoForward, KeepPreviewTab, Refresh,
-    SplitDown, SplitLeft, SplitRight, SplitUp, ToggleActivity, ToggleInspector, TogglePinTab,
-    ToggleSidebar, ToggleZoom,
+    SplitDown, SplitLeft, SplitRight, SplitUp, ToggleActivity, ToggleFocusMode, ToggleInspector,
+    TogglePinTab, ToggleSidebar, ToggleZoom,
 };
 use studio_actions::{ViewKind, ViewLink};
 use studio_settings::{BottomDockLayout, ServerEnvironment, StudioSettings};
@@ -299,6 +299,16 @@ enum Zoomed {
     Dock(PanelPosition),
 }
 
+/// Focus mode (spec 002): the active tab alone over the whole window, full screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FocusMode {
+    /// The tab told it is shown alone, which the active tab is kept to.
+    item: EntityId,
+    /// The window went full screen for it, so it leaves full screen when focus mode ends; a
+    /// window already full screen stays so.
+    made_fullscreen: bool,
+}
+
 /// The view at the right of the status bar ([`Workspace::set_status_item`]), and whether it
 /// has anything to say now.
 struct StatusItem {
@@ -331,6 +341,8 @@ pub struct Workspace {
     bottom: Dock,
     /// A pane or a dock drawn over the whole document area, as Zed zooms one (⇧⎋).
     zoomed: Option<Zoomed>,
+    /// The active tab shown alone, full screen, with nothing else drawn.
+    focus_mode: Option<FocusMode>,
     /// Each pane's tab strip scroll, and the tab it was last scrolled to show.
     tab_scrolls: RefCell<HashMap<PaneId, ScrollHandle>>,
     tabs_scrolled_to: RefCell<HashMap<PaneId, EntityId>>,
@@ -628,6 +640,7 @@ impl Workspace {
             right: Dock::new(PanelPosition::Right, true),
             bottom: Dock::new(PanelPosition::Bottom, false),
             zoomed: None,
+            focus_mode: None,
             tab_scrolls: RefCell::default(),
             tabs_scrolled_to: RefCell::default(),
             drop_target: None,
@@ -3220,6 +3233,83 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Shows the active tab alone, full screen, or brings the window back. The tab is told, so
+    /// a tab that writes prose can give up its chrome; the keyboard goes to it, since nothing
+    /// else is drawn.
+    fn toggle_focus_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.focus_mode.is_some() {
+            self.end_focus_mode(window, cx);
+            return;
+        }
+        let Some(item) = self
+            .pane(self.active_pane)
+            .and_then(|pane| pane.active_item())
+        else {
+            return;
+        };
+        let item_id = item.item_id();
+        item.set_focus_mode(true, window, cx);
+        let made_fullscreen = !window.is_fullscreen();
+        if made_fullscreen {
+            window.toggle_fullscreen();
+        }
+        self.focus_mode = Some(FocusMode {
+            item: item_id,
+            made_fullscreen,
+        });
+        self.focus_active_tab(window, cx);
+        cx.notify();
+    }
+
+    /// Ends focus mode: the tab gets its chrome back, and the window leaves full screen if it
+    /// went full screen for it.
+    fn end_focus_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(focus) = self.focus_mode.take() else {
+            return;
+        };
+        if let Some(item) = self.item_by_id(focus.item) {
+            item.set_focus_mode(false, window, cx);
+        }
+        if focus.made_fullscreen && window.is_fullscreen() {
+            window.toggle_fullscreen();
+        }
+        cx.notify();
+    }
+
+    /// In focus mode, the tab shown alone follows the active one: another tab activated is
+    /// told in its place, and with no tab left focus mode ends.
+    fn follow_focus_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(focus) = self.focus_mode else {
+            return;
+        };
+        let active = self
+            .pane(self.active_pane)
+            .and_then(|pane| pane.active_item())
+            .map(|item| item.item_id());
+        match active {
+            Some(id) if id == focus.item => {}
+            Some(id) => {
+                if let Some(item) = self.item_by_id(focus.item) {
+                    item.set_focus_mode(false, window, cx);
+                }
+                if let Some(item) = self.item_by_id(id) {
+                    item.set_focus_mode(true, window, cx);
+                }
+                self.focus_mode = Some(FocusMode { item: id, ..focus });
+            }
+            None => self.end_focus_mode(window, cx),
+        }
+    }
+
+    /// An open tab, in whichever pane holds it.
+    fn item_by_id(&self, id: EntityId) -> Option<&dyn ItemHandle> {
+        self.panes
+            .iter()
+            .flat_map(|pane| pane.items.iter())
+            .map(|item| item.as_ref())
+            .find(|item| item.item_id() == id)
+    }
+
     /// ⇧⎋: zooms the active pane over the document area, or ends any zoom.
     fn toggle_zoom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.toggle_zoom_of(Zoomed::Pane(self.active_pane), window, cx);
@@ -4830,6 +4920,7 @@ impl Render for Workspace {
         if let Some(pane) = focused_pane {
             self.active_pane = pane;
         }
+        self.follow_focus_mode(window, cx);
         // A focused view gone (an inspector replaced, a panel removed, while it held the
         // keyboard) leaves keys dispatched from the window's root, where no tab hears them: the
         // active tab takes them once the frame is out.
@@ -4852,8 +4943,15 @@ impl Render for Workspace {
         let (closes_others, closes_all) = pane.map_or((false, false), |p| {
             (!p.others(p.active).is_empty(), !p.all_unpinned().is_empty())
         });
+        // Escape leaves focus mode once what has the keyboard has nothing of its own to cancel.
+        let mut key_context = KeyContext::new_with_defaults();
+        key_context.add("Workspace");
+        if self.focus_mode.is_some() {
+            key_context.add("focus_mode");
+        }
+        let has_tab = pane.and_then(|p| p.active_item()).is_some();
         let mut root = v_flex()
-            .key_context("Workspace")
+            .key_context(key_context)
             .track_focus(&self.focus_handle)
             .size_full()
             .relative()
@@ -4987,6 +5085,11 @@ impl Render for Workspace {
                 this.set_dock_open(PanelPosition::Bottom, !this.bottom.open, window, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleZoom, window, cx| this.toggle_zoom(window, cx)))
+            .when(has_tab || self.focus_mode.is_some(), |root| {
+                root.on_action(cx.listener(|this, _: &ToggleFocusMode, window, cx| {
+                    this.toggle_focus_mode(window, cx)
+                }))
+            })
             .when(has_graph, |root| {
                 root.on_action(cx.listener(|this, _: &Refresh, _, cx| {
                     if let Some(session) = &this.session {
@@ -5046,6 +5149,45 @@ impl Render for Workspace {
             )
             .with_priority(1)
         });
+        // Focus mode: the active tab alone over the whole window, with no docks, tab strip or
+        // status bar. A window not (yet) full screen keeps a strip it moves by, under the
+        // traffic lights.
+        if self.focus_mode.is_some() {
+            self.lights_shown = cfg!(target_os = "macos")
+                && !window.is_fullscreen()
+                && !window.is_simple_fullscreen();
+            let tab = self
+                .pane(self.active_pane)
+                .and_then(|pane| pane.active_item())
+                .map(|item| {
+                    if item.caches_its_parts(cx) {
+                        item.to_any().into_any_element()
+                    } else {
+                        item.to_any().cached(cached_fill()).into_any_element()
+                    }
+                });
+            return root
+                .bg(studio_ui::ds::surface::document(cx))
+                .when(self.lights_shown, |root| {
+                    root.child(self.strip(
+                        "focus-mode-strip",
+                        studio_ui::ds::size::HEADER_STRIP,
+                        cx,
+                    ))
+                })
+                .child(
+                    div()
+                        .id("focus-mode")
+                        .debug_selector(|| "focus-mode".into())
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .overflow_hidden()
+                        .children(tab),
+                )
+                .child(self.render_toasts(cx))
+                .children(modal);
+        }
         // Columns, each with its own header strip, over one status bar across the window, as
         // Zed lays out its docks over its status bar. Glass: the sidebar, the document and the
         // inspector are three sheets with one gap around and between them, over the bar on the
@@ -6985,6 +7127,137 @@ mod tests {
                     && workspace.dock_has_focus(PanelPosition::Bottom, window, cx),
                 "the dock's button takes it from the tab under it"
             );
+        });
+    }
+
+    /// A tab that records whether it is shown alone.
+    struct Alone {
+        focus_handle: FocusHandle,
+        alone: bool,
+    }
+
+    impl EventEmitter<ItemEvent> for Alone {}
+
+    impl Focusable for Alone {
+        fn focus_handle(&self, _: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    impl Render for Alone {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().track_focus(&self.focus_handle)
+        }
+    }
+
+    impl Item for Alone {
+        fn tab_title(&self, _: &App) -> SharedString {
+            "Alone".into()
+        }
+
+        fn set_focus_mode(&mut self, on: bool, _: &mut Window, _: &mut Context<Self>) {
+            self.alone = on;
+        }
+    }
+
+    /// Focus mode shows the active tab alone, full screen, and tells it so: the docks, the tab
+    /// strip and the status bar are not drawn. Another tab activated meanwhile is shown alone in
+    /// its place; Escape, or the key again, brings the window back out of full screen; a window
+    /// already full screen stays so; closing the last tab ends it.
+    #[gpui::test]
+    fn focus_mode_shows_the_active_tab_alone_full_screen(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+            cx.bind_keys([
+                gpui::KeyBinding::new("ctrl-cmd-enter", ToggleFocusMode, Some("Workspace")),
+                gpui::KeyBinding::new("escape", ToggleFocusMode, Some("Workspace && focus_mode")),
+            ]);
+        });
+        let session = idle_session("http://studio.test", "notes", cx);
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let (first, second) = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.graph_order.push(session.entity_id());
+            workspace.subscribe_session(session.clone(), cx);
+            fn open(
+                key: &str,
+                workspace: &mut Workspace,
+                window: &mut Window,
+                cx: &mut Context<Workspace>,
+            ) -> Entity<Alone> {
+                workspace
+                    .open_item(key.to_owned(), window, cx, |_, cx| Alone {
+                        focus_handle: cx.focus_handle(),
+                        alone: false,
+                    })
+                    .expect("the tab")
+            }
+            let first = open("first", workspace, window, cx);
+            let second = open("second", workspace, window, cx);
+            (first, second)
+        });
+        cx.run_until_parked();
+        let alone = |tab: &Entity<Alone>, cx: &mut gpui::VisualTestContext| {
+            tab.read_with(cx, |tab, _| tab.alone)
+        };
+        let full_screen =
+            |cx: &mut gpui::VisualTestContext| cx.update(|window, _| window.is_fullscreen());
+
+        cx.simulate_keystrokes("ctrl-cmd-enter");
+        cx.run_until_parked();
+        assert!(
+            alone(&second, cx) && !alone(&first, cx),
+            "the active tab is told"
+        );
+        assert!(full_screen(cx), "the window goes full screen");
+        assert!(
+            cx.debug_bounds("focus-mode").is_some(),
+            "the tab is drawn alone"
+        );
+        assert!(
+            cx.debug_bounds("zoomed").is_none(),
+            "and nothing is drawn over it"
+        );
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane);
+        let tabs: &'static str = format!("zoom-pane-{pane}").leak();
+        assert!(cx.debug_bounds(tabs).is_none(), "no tab strip is drawn");
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let index = workspace
+                .pane(pane)
+                .map_or(0, |p| p.position(first.entity_id()).unwrap_or(0));
+            workspace.activate_in(pane, index, true, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            alone(&first, cx) && !alone(&second, cx),
+            "another tab activated is shown alone in its place"
+        );
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!alone(&first, cx), "Escape brings the window back");
+        assert!(!full_screen(cx), "out of full screen");
+        assert!(cx.debug_bounds("focus-mode").is_none());
+
+        // Full screen already: focus mode leaves it so.
+        cx.update(|window, _| window.toggle_fullscreen());
+        cx.simulate_keystrokes("ctrl-cmd-enter");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-cmd-enter");
+        cx.run_until_parked();
+        assert!(full_screen(cx), "a window already full screen stays so");
+
+        // Closing the last tab ends it.
+        cx.simulate_keystrokes("ctrl-cmd-enter");
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.close_item(1, window, cx);
+            workspace.close_item(0, window, cx);
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.focus_mode, None, "no tab left, no focus mode")
         });
     }
 

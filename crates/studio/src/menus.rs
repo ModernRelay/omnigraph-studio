@@ -12,7 +12,7 @@ use studio_actions::workspace::{
     About, ActivateNextPane, ActivatePreviousPane, CloseActiveItem, CloseAllItems, CloseOtherItems,
     GoBack, GoForward, GoTo, NewWindow, OpenGraph, OpenSettings, Quit, Refresh, RevealLog,
     ShowKeyBindings, SplitDown, SplitRight, SwitchBranch, ToggleActivity, ToggleCommandPalette,
-    ToggleInspector, TogglePinTab, ToggleSidebar,
+    ToggleFocusMode, ToggleInspector, TogglePinTab, ToggleSidebar,
 };
 
 pub fn set(cx: &mut App) {
@@ -74,6 +74,7 @@ pub fn set(cx: &mut App) {
             MenuItem::action("Sidebar", ToggleSidebar),
             MenuItem::action("Inspector", ToggleInspector),
             MenuItem::action("Bottom Panel", ToggleActivity),
+            MenuItem::action("Focus Mode", ToggleFocusMode),
             MenuItem::separator(),
             MenuItem::action("Split Right", SplitRight),
             MenuItem::action("Split Down", SplitDown),

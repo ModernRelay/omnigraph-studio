@@ -153,6 +153,17 @@ title bar; Ragnor's choice over a Zed-style title bar) over one status bar acros
   zoom. A zoomed header keeps room for the traffic lights. ⇧⎋ and every zoom button take the
   keyboard from what the zoom covers: a zoomed pane's tab takes it from a dock's panel or
   another pane, a zoomed dock's panel from a tab or another dock.
+- Focus mode (`studio::ToggleFocusMode`, ⌃⌘↵, View › Focus Mode; ⌘⇧↵ in the markdown editor,
+  one step on from the ⌘⇧↵ that opens a field there) shows the active tab alone over the whole
+  window and puts the window in full screen: no docks, tab strip, top bar or status bar. Toasts
+  and dialogs still show. The tab is told (`Item::set_focus_mode`): the markdown editor drops
+  its toolbar unless a conflict, a failed save or a save to another branch needs the person,
+  and runs its text (Edit, and Split, whose preview waits until focus mode ends) or its
+  Preview in a centred column at most `size::PROSE` (720 px) wide.
+  Another tab activated meanwhile is shown alone in its place; closing the last tab ends it.
+  Escape (once what has the keyboard has nothing of its own to cancel) or the key again brings
+  the window back, out of full screen unless it was full screen before. A window not full
+  screen keeps a strip under the traffic lights to move it by. Focus mode is not saved.
 - Each graph keeps its own docks: showing a graph again from the switcher brings back its docks
   as it left them (open, active panel, size), not the shown graph's; before, only a graph
   opened fresh read its saved docks.
@@ -995,6 +1006,7 @@ opens a link from inside Studio.
 ## Validation log
 
 | Date | Claim | Check | Result |
+| 2026-11-05 | Focus mode shows the active tab alone, full screen, and the markdown editor writes in a centred column | `studio_workspace` `focus_mode_shows_the_active_tab_alone_full_screen` (⌃⌘↵ in, the tab told, the window full screen, no tab strip; another tab activated takes its place; Escape out of full screen; a window already full screen stays so; closing the last tab ends it), `type_table` `focus_mode_hides_the_toolbar_until_something_needs_the_person`; offscreen snapshots of Keyset paging's body against the sample graph: ⌘⇧↵, a line typed, Escape | All pass. The first snapshot caught ⌘⇧↵ bound under `TextEditor` alone: Zed's editor took it as Newline Above, so it is bound under `TextEditor > Editor` too. A split editor alone on the screen still showed the preview, so Split shows the text only while in focus mode |
 | 2026-11-01 | Memory and CPU show by default again | `studio_settings` tests (`default.json` against the struct) | Ragnor asked for the readout back; the setting stays under Appearance for turning it off |
 | 2026-11-01 | A tooltip is measured where it draws: it stays inside the window at its real width, and hangs over its control when its lines would run past the bottom; no panel but the inspector docks right | `studio_ui` `tooltip` `a_tooltip_sits_under_its_control_and_flips_at_the_bottom` (one line fits under a control 50 px from the bottom, two flip above); `studio_workspace` `a_panel_goes_where_the_settings_place_it` (a panel saved in the right dock goes home); offscreen snapshots of a strip segment and the Collapse all button at the window's right | The frame hangs from a GPUI `anchored` at the control's corner with `snap_to_window_with_margin`, so a short tooltip at the right edge no longer sits 100–280 px left of its control as the fixed 288 px estimate placed it; the flip still goes by an estimate of the lines (`size::TOOLTIP_HEIGHT` each), since the height is known only once drawn. The panel menu offers Left and Bottom only: the right dock draws no panel buttons, so a panel moved there had no way back |
 | 2026-11-01 | A tooltip sits under its control, a gap below its left edge, kept inside the window and flipped above at the bottom, wherever the pointer is | `studio_ui` `tooltip` `a_tooltip_sits_under_its_control_and_flips_at_the_bottom` (the placement from a control's bounds, the pointer and the window) and `the_recorder_takes_its_controls_bounds` (a drawn control's bounds reach the anchor); `script/check-design-tokens.py` refuses `ui::Tooltip` and `.tooltip(` in a view; offscreen snapshots on `script/dev-server` of a Tree tab's dimmed Canvas segment and its Collapse all button hovered | GPUI puts every tooltip one pixel past the pointer and lays its view out as a root, where a margin moves nothing, so Studio's view is a zero-sized root with the frame set off it absolutely; the control records its bounds with an absolute canvas inside it, which needs the control positioned (`relative`). The segment's tooltip drew at the segment's left edge 6 px under the strip, the button's clamped inside the window's right edge. Zed's `ButtonLike` cannot be positioned, so the graph switcher's tooltip keeps the pointer's place in Studio's look; the tree's hover card keeps Zed's element tooltip (`ds-exempt`) |

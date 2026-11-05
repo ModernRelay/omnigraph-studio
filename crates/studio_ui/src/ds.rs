@@ -281,6 +281,9 @@ pub mod size {
     pub const ABOUT_ICON: f32 = 64.;
     /// The least a code editor shrinks to when results share its column.
     pub const EDITOR_MIN_HEIGHT: f32 = 120.;
+    /// The widest a column of prose runs when the window gives it more (focus mode): about 80
+    /// characters of the buffer font, a comfortable measure.
+    pub const PROSE: f32 = 720.;
     /// A small gauge or spinner beside small text, and its stroke.
     pub const GAUGE: f32 = 14.;
     pub const GAUGE_STROKE: f32 = 2.;
