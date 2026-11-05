@@ -340,6 +340,18 @@ impl Anchor {
         let anchor = self.clone();
         move |window, cx| {
             let inner = build(window, cx);
+            // Studio's own tooltip is given its place: wrapped, it would still draw off the
+            // pointer inside a frame measured empty, which neither flips nor keeps it in the
+            // window.
+            let inner = match inner.downcast::<Tip>() {
+                Ok(tip) => {
+                    let lines = tip.read(cx).content.lines();
+                    let at = anchor.placement(lines, window);
+                    tip.update(cx, |tip, _| tip.at = at);
+                    return tip.into();
+                }
+                Err(inner) => inner,
+            };
             let Some(at) = anchor.placement(1, window) else {
                 return inner;
             };
@@ -472,6 +484,27 @@ mod tests {
         assert_eq!(
             anchor.0.get(),
             Some(Bounds::new(point(px(40.), px(40.)), size(px(60.), px(22.))))
+        );
+    }
+
+    /// A tooltip built from state ([`Tipped::tip_fn`]) of Studio's own hangs from its control
+    /// as one given whole does: over a control at the window's bottom, not off the pointer.
+    #[gpui::test]
+    async fn a_tooltip_built_from_state_hangs_from_its_control(cx: &mut TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let anchor = Anchor::new();
+        let (_, cx) = cx.add_window_view(|_, _| Host {
+            anchor: anchor.clone(),
+        });
+        cx.run_until_parked();
+        let control = anchor.0.get().expect("the control was laid out");
+        let built = anchor.builder_fn(|_, cx| tooltip_view("t", cx));
+        let view = cx.update(|window, cx| built(window, cx));
+        let tip = view.downcast::<Tip>().expect("Studio's own tooltip");
+        let viewport = cx.update(|window, _| window.viewport_size());
+        assert_eq!(
+            tip.read_with(cx, |tip, _| tip.at),
+            Some(place(control, 1, viewport))
         );
     }
 
