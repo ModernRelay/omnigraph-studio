@@ -17,8 +17,8 @@ use editor::{Editor, EditorEvent};
 use gpui::{
     Anchor, AnyView, App, ClickEvent, ClipboardItem, Context, DragMoveEvent, ElementId, Entity,
     EventEmitter, ExternalPaths, FocusHandle, Focusable, KeyContext, MouseButton, MouseDownEvent,
-    Pixels, Render, ScrollStrategy, SharedString, StyleRefinement, Subscription, Task, WeakEntity,
-    Window, anchored, deferred, point,
+    MouseMoveEvent, Pixels, Point, Render, ScrollStrategy, SharedString, StyleRefinement,
+    Subscription, Task, WeakEntity, Window, anchored, deferred, point,
 };
 use gq_language::input::same_value;
 use gq_language::{
@@ -807,6 +807,9 @@ pub struct TypeTable {
     /// The cells this frame draws may be changed: the table reads the branch, and the
     /// credential may change it. Found once a frame, not for every cell.
     frame_writable: bool,
+    /// The row and column under the pointer as this frame draws them ([`Self::cell_at`]): the
+    /// only row that builds its Peek, and the only cell besides the cursor's that builds its ⤢.
+    frame_pointer: Option<(usize, usize)>,
     /// The columns the last drawn rows drew.
     #[cfg(test)]
     frame_drawn: Vec<bool>,
@@ -1205,6 +1208,7 @@ impl TypeTable {
             frame_looks: Rc::default(),
             frame_places: Rc::from([]),
             frame_writable: false,
+            frame_pointer: None,
             #[cfg(test)]
             frame_drawn: Vec::new(),
             frame_now: chrono::Local::now(),
@@ -8801,6 +8805,7 @@ impl TypeTable {
             .as_ref()
             .map(|grouping| Rc::new(grouping.line_map()));
         self.frame_lines = lines.clone();
+        self.frame_pointer = self.row_cell_at(window.mouse_position(), cx);
         // How each drawn line looks (picked, dimmed, the cursor's, a group header) is worked
         // out by the row callback for the lines it draws, not for every loaded row.
         let looks: Rc<RefCell<HashMap<usize, RowLook>>> = Rc::default();
@@ -8915,6 +8920,9 @@ impl TypeTable {
                     // The rows' fills and rules under their text: one layer of the scene, so a
                     // frame orders them without a search per cell (the edit callout floats,
                     // deferred, over them).
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                        this.pointer_moved(event.position, cx)
+                    }))
                     .child(table)
                     .child(wheel),
             )
@@ -9912,6 +9920,92 @@ impl TypeTable {
     }
 
     /// A row's cells at this frame's places; a gap is one empty cell.
+    /// The line and column under `position`, as the grid was last laid out and scrolled as it
+    /// is now; `None` off the rows.
+    fn cell_at(&self, position: Point<Pixels>, cx: &App) -> Option<(usize, usize)> {
+        let state = self.table_state.read(cx);
+        let (rows, offset) = {
+            let list = state.scroll_handle.0.borrow();
+            (list.base_handle.bounds(), list.base_handle.offset())
+        };
+        if !rows.contains(&position) {
+            return None;
+        }
+        let line = (position.y - rows.origin.y - offset.y) / self.line_height(cx);
+        if line < 0. {
+            return None;
+        }
+        // The pinned key column, then a strip of the others that scrolls sideways.
+        let strip = &state.horizontal_scroll_handle;
+        let col = if strip.bounds().size.width <= px(0.) || position.x < strip.bounds().left() {
+            0
+        } else {
+            let mut x = position.x - strip.bounds().left() - strip.offset().x;
+            self.columns
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find_map(|(col, column)| {
+                    let width = px(self.layout.width(column));
+                    if x < width {
+                        Some(col)
+                    } else {
+                        x -= width;
+                        None
+                    }
+                })?
+        };
+        Some((line as usize, col))
+    }
+
+    /// The row and column under `position` ([`Self::cell_at`]), a grouped grid's line taken to
+    /// the row it shows.
+    fn row_cell_at(&self, position: Point<Pixels>, cx: &App) -> Option<(usize, usize)> {
+        let (line, col) = self.cell_at(position, cx)?;
+        let row = match &self.frame_lines {
+            Some(lines) => match lines.get(line)? {
+                Line::Row(row) => row,
+                _ => return None,
+            },
+            None => line,
+        };
+        (row < self.rows.len()).then_some((row, col))
+    }
+
+    /// Whether the cell at `at` builds a ⤢ under the pointer ([`Self::render_cell`]).
+    fn expands_at(&self, at: Option<(usize, usize)>) -> bool {
+        at.is_some_and(|(row, col)| {
+            let (Some(row), Some(column)) = (self.rows.get(row), self.columns.get(col)) else {
+                return false;
+            };
+            let state = if self.cells.is_empty() {
+                None
+            } else {
+                self.cells.get(&(row.id.clone(), column.key.clone()))
+            };
+            self.frame_writable && self.cell_expands(row, column, state)
+        })
+    }
+
+    /// The pointer moved over the rows: the grid draws again when that moves what only the
+    /// pointer's row or cell builds (`docs/drawing.md`). GPUI shows them only while the pointer
+    /// is over them; this decides which row and cell build them at all.
+    fn pointer_moved(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let at = self.row_cell_at(position, cx);
+        if at == self.frame_pointer {
+            return;
+        }
+        let row = |at: Option<(usize, usize)>| at.map(|(row, _)| row);
+        if row(at) != row(self.frame_pointer)
+            || self.expands_at(at)
+            || self.expands_at(self.frame_pointer)
+        {
+            // Once per change: the next frame draws with this one.
+            self.frame_pointer = at;
+            cx.notify();
+        }
+    }
+
     fn render_row(
         &self,
         ix: usize,
@@ -10379,7 +10473,10 @@ impl TypeTable {
         }
         // The key's cell ends in the row's Peek while the row is hovered, as the reference
         // table's cells end in their action.
-        let peek = (col == 0).then(|| {
+        // Peek and ⤢ show only under the pointer, so they are built only in the pointer's row
+        // and cell (and the cursor's cell), not hidden in every row of every frame.
+        let pointer = self.frame_pointer;
+        let peek = (col == 0 && pointer.is_some_and(|(row, _)| row == ix)).then(|| {
             div().ml_auto().flex_none().child(
                 studio_ui::ds::cell_action(("peek-row", ix), IconName::Eye)
                     .visible_on_hover(ROW_GROUP)
@@ -10393,7 +10490,7 @@ impl TypeTable {
             )
         });
         // Over the text's end on the row's fill, as a header's menu sits over its name.
-        let expand = expands.then(|| {
+        let expand = (expands && (is_cursor || pointer == Some((ix, col)))).then(|| {
             let button = self.render_expand(ix, col, cx);
             // The row's fill under the pointer, which replaces its own (`render_grid`).
             let hovered =
@@ -10407,7 +10504,8 @@ impl TypeTable {
             };
             slot.debug_selector(move || format!("expand-cell-{ix}-{col}"))
         });
-        cell.when(expands, |cell| cell.group(CELL_GROUP))
+        cell.when(expand.is_some(), |cell| cell.group(CELL_GROUP))
+            .debug_selector(move || format!("cell-{ix}-{col}"))
             .children(dot.map(studio_ui::ds::dot))
             .child(content)
             .children(peek)
@@ -12038,7 +12136,14 @@ mod tests {
         cx.run_until_parked();
     }
 
-    /// Where a text cell's ⤢ is drawn, shown or not.
+    /// Where a cell is drawn.
+    fn cell_bounds(row: usize, col: usize, cx: &mut VisualTestContext) -> gpui::Bounds<Pixels> {
+        cx.debug_bounds(format!("cell-{row}-{col}").leak())
+            .expect("the cell is drawn")
+    }
+
+    /// Where a text cell's ⤢ is drawn, shown or not: built under the pointer and on the
+    /// cursor's cell.
     fn expand_slot(
         row: usize,
         col: usize,
@@ -12054,9 +12159,9 @@ mod tests {
         let session = session(PEOPLE, cx);
         let (table, cx) = people_table(&session, cx);
         let col = table.read_with(cx, |table, _| table.column_index("name").unwrap());
-        // The text before the cell's ⤢.
-        let slot = expand_slot(0, col, cx).expect("the name cell ends in its ⤢");
-        let at = gpui::point(slot.left() - px(24.), slot.center().y);
+        // The cell's text, at its start.
+        let cell = cell_bounds(0, col, cx);
+        let at = gpui::point(cell.left() + px(24.), cell.center().y);
         click_at(cx, at, 1);
         table.read_with(cx, |table, _| {
             assert_eq!(table.cursor, Some(Cursor { row: 0, col }));
@@ -12219,8 +12324,8 @@ mod tests {
         open(cx);
         cx.simulate_keystrokes("down");
         let name = table.read_with(cx, |table, _| table.column_index("name").unwrap());
-        let slot = expand_slot(1, name, cx).expect("the name cell ends in its ⤢");
-        click_at(cx, gpui::point(slot.left() - px(24.), slot.center().y), 1);
+        let cell = cell_bounds(1, name, cx);
+        click_at(cx, gpui::point(cell.left() + px(24.), cell.center().y), 1);
         table.read_with(cx, |table, _| {
             assert_eq!(table.cursor, Some(Cursor { row: 1, col: name }))
         });
@@ -12306,11 +12411,23 @@ mod tests {
             });
         });
         let col = table.read_with(cx, |table, _| table.column_index("name").unwrap());
-        assert!(expand_slot(0, 0, cx).is_none(), "a key has no ⤢");
-        let slot = expand_slot(0, col, cx).expect("the name cell ends in its ⤢");
-        // Shown once the pointer is over its cell.
-        cx.simulate_mouse_move(slot.center(), None, gpui::Modifiers::none());
+        let key = cell_bounds(0, 0, cx);
+        cx.simulate_mouse_move(key.center(), None, gpui::Modifiers::none());
         cx.run_until_parked();
+        assert!(expand_slot(0, 0, cx).is_none(), "a key has no ⤢");
+        assert!(
+            expand_slot(0, col, cx).is_none(),
+            "a cell away from the pointer builds none"
+        );
+        // Built, and shown, once the pointer is over its cell.
+        let cell = cell_bounds(0, col, cx);
+        cx.simulate_mouse_move(cell.center(), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        let slot = expand_slot(0, col, cx).expect("the name cell ends in its ⤢");
+        assert!(
+            expand_slot(1, col, cx).is_none(),
+            "the next row's name, away from the pointer, builds none"
+        );
         cx.simulate_click(slot.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         let pinned = table.read_with(cx, |table, _| {
