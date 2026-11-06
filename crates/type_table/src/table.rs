@@ -797,6 +797,9 @@ pub struct TypeTable {
     grouping: Option<Grouping>,
     /// The grouped grid's lines as this frame drew them.
     frame_lines: Option<Rc<Lines>>,
+    /// How many lines the last frame's list held, which [`Self::line_height`] divides its
+    /// height by.
+    frame_line_count: usize,
     /// How the lines drawn this frame look, filled by the row callback for the row styling.
     frame_looks: Rc<RefCell<HashMap<usize, RowLook>>>,
     /// The places this frame's lines draw.
@@ -1198,6 +1201,7 @@ impl TypeTable {
             sort: opening.sort,
             grouping: opening.group_by.map(Grouping::new),
             frame_lines: None,
+            frame_line_count: 0,
             frame_looks: Rc::default(),
             frame_places: Rc::from([]),
             frame_writable: false,
@@ -3995,12 +3999,15 @@ impl TypeTable {
         Some((lines.get(first)?, lines.len()))
     }
 
-    /// How tall a grid line is, as the list last laid one out.
+    /// How tall a grid line is, as the list last laid them out. GPUI's `last_item_size` holds
+    /// the list's own size as `item` (`uniform_list.rs`, `ItemSize`) and its lines' as
+    /// `contents`, so a line is the contents' height over the lines it held.
     fn line_height(&self, cx: &App) -> Pixels {
         let state = self.table_state.read(cx).scroll_handle.0.borrow();
         state
             .last_item_size
-            .map(|size| size.item.height)
+            .filter(|_| self.frame_line_count > 0)
+            .map(|size| size.contents.height / self.frame_line_count as f32)
             .filter(|height| *height > px(0.))
             .unwrap_or(px(ROW_HEIGHT))
     }
@@ -8801,6 +8808,7 @@ impl TypeTable {
         let picked_bg = studio_ui::ds::surface::picked(cx);
         let header_bg = studio_ui::ds::surface::well(cx);
         let line_count = lines.as_ref().map_or(self.rows.len(), |lines| lines.len());
+        self.frame_line_count = line_count;
         // Widths fitted to each column's type unless dragged. Not Zed's resizable columns: they
         // draw a full-height rule between every column, which the visual language leaves out
         // (spec 002); the header's edges resize instead.
@@ -16241,6 +16249,21 @@ mod tests {
                 );
             }
         });
+    }
+
+    /// A grid line is as tall as a row is drawn: the list's own height is not a line's. What is
+    /// first in view, and how far a read that puts rows in above the view moves the scroll so the
+    /// lines in view stay where they are, are counted in lines (constitution V).
+    #[gpui::test]
+    async fn a_grid_line_is_as_tall_as_a_drawn_row(cx: &mut TestAppContext) {
+        let session = session(PEOPLE, cx);
+        let (table, cx) = people_table(&session, cx);
+        let first = cx.debug_bounds("row-check-0").expect("row 0 is drawn");
+        let second = cx.debug_bounds("row-check-1").expect("row 1 is drawn");
+        let drawn = second.top() - first.top();
+        assert!(drawn > px(0.));
+        let height = table.read_with(cx, |table, cx| table.line_height(cx));
+        assert_eq!(height, drawn);
     }
 
     /// Grouped, a section's read whose line is more than a screen away is dropped, freeing
