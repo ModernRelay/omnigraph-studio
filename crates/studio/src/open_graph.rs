@@ -19,17 +19,22 @@ use studio_ui::ds::Tipped;
 use studio_ui::ds::{self, MenuRow, size, space};
 use studio_workspace::ModalView;
 use studio_workspace::{Workspace, connection_color};
+
+use crate::organizations;
 use ui::prelude::*;
 
 /// Where the keyboard is in the dialog: a server, one of the chosen server's graphs, or a field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Place {
     Server(EntityId),
-    /// A control plane's line: ↵ signs in, cancels a sign-in under way, or reads its clusters
-    /// again (spec 021).
+    /// A control plane's one row in the sidebar while it lists no organizations: ↵ signs in,
+    /// cancels a sign-in under way, or reads its organizations again (spec 021).
     Plane(EntityId),
-    /// A cluster of a control plane's list that opens for this run: its organization and
-    /// `cluster_id`.
+    /// An organization in the sidebar, under its control plane: moving to it shows its
+    /// clusters, and ↵ goes to the first.
+    Organization(EntityId, String),
+    /// A cluster of an organization's pane that opens for this run, or that chooses the CLI
+    /// target naming it: its organization and `cluster_id`.
     Cluster(EntityId, String, String),
     Graph(String),
     /// The field for a new token, shown when the server refused the token.
@@ -47,6 +52,9 @@ pub struct OpenGraphModal {
     /// keeps its health checked while the dialog shows it ([`Connection::watch`]).
     followed: Vec<(EntityId, Subscription, ConnectionWatch)>,
     selected: Option<Entity<Connection>>,
+    /// The control plane, and its organization, the pane shows in place of the selected
+    /// server's graphs.
+    plane_shown: Option<organizations::Shown>,
     /// The row or field ↑, ↓ and Tab moved to, which ↵ runs.
     cursor: Option<Place>,
     graph_id: Entity<Editor>,
@@ -187,6 +195,7 @@ impl OpenGraphModal {
                 .as_ref()
                 .map(|connection| Place::Server(connection.entity_id())),
             selected,
+            plane_shown: None,
             graph_id,
             adding: connections.is_empty(),
             new_name,
@@ -247,6 +256,11 @@ impl OpenGraphModal {
                 }
             });
         }
+        if let Some((shown, _)) = &self.plane_shown
+            && !planes.iter().any(|plane| plane.entity_id() == *shown)
+        {
+            self.plane_shown = None;
+        }
         self.planes = planes;
         self.managed = managed;
         cx.notify();
@@ -304,10 +318,10 @@ impl OpenGraphModal {
         cx.notify();
     }
 
-    /// Where the keyboard can go, in order: the servers, the field for a new token when the
-    /// server asks for one (not one it signs in to), the chosen server's graphs, then the graph
-    /// id field. None while a
-    /// server is added.
+    /// Where the keyboard can go, in order: the sidebar's servers, then its organizations (or a
+    /// control plane's sign-in), then what the pane shows: an organization's clusters, or the
+    /// selected server's field for a new token when it asks for one (not one it signs in to),
+    /// its graphs and the graph id field. None while a server is added.
     fn places(&self, cx: &App) -> Vec<Place> {
         if self.adding {
             return Vec::new();
@@ -317,20 +331,34 @@ impl OpenGraphModal {
             .iter()
             .map(|connection| Place::Server(connection.entity_id()))
             .collect();
-        places.extend(crate::organizations::places(
-            &self.planes,
-            &self.managed,
-            cx,
-        ));
-        if let Some(selected) = &self.selected {
-            let connection = selected.read(cx);
-            if connection.asks_token() {
-                places.push(Place::Token);
+        places.extend(organizations::nav_places(&self.planes, cx));
+        match self.shown_plane() {
+            Some((plane, Some(organization))) => places.extend(organizations::pane_places(
+                &plane,
+                &organization,
+                &self.managed,
+                cx,
+            )),
+            Some((_, None)) => {}
+            None => {
+                if let Some(selected) = &self.selected {
+                    let connection = selected.read(cx);
+                    if connection.asks_token() {
+                        places.push(Place::Token);
+                    }
+                    places.extend(connection.graph_ids().into_iter().map(Place::Graph));
+                    places.push(Place::GraphId);
+                }
             }
-            places.extend(connection.graph_ids().into_iter().map(Place::Graph));
-            places.push(Place::GraphId);
         }
         places
+    }
+
+    /// The control plane the pane shows, and its organization, when it shows one.
+    fn shown_plane(&self) -> Option<(Entity<ControlPlane>, Option<String>)> {
+        let (id, organization) = self.plane_shown.as_ref()?;
+        let plane = self.planes.iter().find(|p| p.entity_id() == *id)?;
+        Some((plane.clone(), organization.clone()))
     }
 
     /// Why the new server's token field is disabled: where the CLI gives Studio no token
@@ -383,9 +411,10 @@ impl OpenGraphModal {
     /// Puts the keyboard at `place`. Moving to a server chooses it, which shows its graphs and
     /// connects it if it never was; one that could not be reached is tried again with ↵, not
     /// at every key that passes it.
-    fn move_to(&mut self, place: Place, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn move_to(&mut self, place: Place, window: &mut Window, cx: &mut Context<Self>) {
         match &place {
             Place::Server(id) => {
+                self.plane_shown = None;
                 if let Some(connection) = self
                     .connections
                     .iter()
@@ -398,9 +427,15 @@ impl OpenGraphModal {
                 }
                 window.focus(&self.focus_handle, cx);
             }
-            Place::Graph(_) | Place::Plane(_) | Place::Cluster(..) => {
+            Place::Plane(id) => {
+                self.show_plane(*id, None);
                 window.focus(&self.focus_handle, cx)
             }
+            Place::Organization(id, organization) => {
+                self.show_plane(*id, Some(organization.clone()));
+                window.focus(&self.focus_handle, cx)
+            }
+            Place::Graph(_) | Place::Cluster(..) => window.focus(&self.focus_handle, cx),
             Place::Token => window.focus(&self.replacement_token.focus_handle(cx), cx),
             Place::GraphId => window.focus(&self.graph_id.focus_handle(cx), cx),
         }
@@ -412,7 +447,8 @@ impl OpenGraphModal {
                     .iter()
                     .position(|connection| connection.entity_id() == *id)
                 {
-                    self.servers_scroll.scroll_to_item(at);
+                    // After the sidebar's "Servers" label.
+                    self.servers_scroll.scroll_to_item(at + 1);
                 }
             }
             Place::Graph(graph) => {
@@ -427,10 +463,22 @@ impl OpenGraphModal {
                     self.graphs_scroll.scroll_to_item(at);
                 }
             }
-            Place::Token | Place::GraphId | Place::Plane(_) | Place::Cluster(..) => {}
+            Place::Token
+            | Place::GraphId
+            | Place::Plane(_)
+            | Place::Organization(..)
+            | Place::Cluster(..) => {}
         }
         self.cursor = Some(place);
         cx.notify();
+    }
+
+    /// Shows the control plane `id` in the pane, with `organization`'s clusters when it names
+    /// one, in place of a server's graphs or the form to add one.
+    fn show_plane(&mut self, id: EntityId, organization: Option<String>) {
+        self.plane_shown = Some((id, organization));
+        self.adding = false;
+        self.error = None;
     }
 
     /// ↵ on a server: connects it unless it is connected, then goes to its first graph, or to
@@ -476,7 +524,23 @@ impl OpenGraphModal {
                 }
                 Some(Place::Plane(id)) if !self.graph_id.focus_handle(cx).is_focused(window) => {
                     if let Some(plane) = self.planes.iter().find(|p| p.entity_id() == id) {
-                        plane.update(cx, crate::organizations::enter);
+                        plane.update(cx, organizations::enter);
+                    }
+                }
+                Some(Place::Organization(id, organization))
+                    if !self.graph_id.focus_handle(cx).is_focused(window) =>
+                {
+                    let first =
+                        self.planes
+                            .iter()
+                            .find(|p| p.entity_id() == id)
+                            .and_then(|plane| {
+                                organizations::pane_places(plane, &organization, &self.managed, cx)
+                                    .into_iter()
+                                    .next()
+                            });
+                    if let Some(first) = first {
+                        self.move_to(first, window, cx);
                     }
                 }
                 Some(Place::Cluster(id, organization, cluster_id))
@@ -487,13 +551,18 @@ impl OpenGraphModal {
                             .iter()
                             .find(|p| p.entity_id() == id)
                             .and_then(|plane| {
-                                crate::organizations::cluster(plane, &organization, &cluster_id, cx)
+                                organizations::cluster(plane, &organization, &cluster_id, cx)
                                     .map(|cluster| (plane.clone(), cluster))
                             });
                     if let Some((plane, cluster)) = found {
-                        self.open_cluster(&plane, &organization, &cluster, window, cx);
+                        match organizations::cluster_row(&cluster, &self.managed).target {
+                            Some(target) => self.select_target(&target, window, cx),
+                            None => self.open_cluster(&plane, &organization, &cluster, window, cx),
+                        }
                     }
                 }
+                // A control plane's pane has no graph id field.
+                _ if self.plane_shown.is_some() => {}
                 _ => {
                     let graph_id = self.graph_id.read(cx).text(cx);
                     self.open(graph_id, window, cx);
@@ -504,6 +573,9 @@ impl OpenGraphModal {
 
     fn show_add(&mut self, adding: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.adding = adding;
+        if adding {
+            self.plane_shown = None;
+        }
         self.error = None;
         if adding {
             window.focus(&self.new_url.focus_handle(cx), cx);
@@ -543,12 +615,37 @@ impl OpenGraphModal {
         }
     }
 
+    /// Chooses the server of the CLI target `name`, as a cluster that target names was clicked.
+    pub(crate) fn select_target(
+        &mut self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let found = self
+            .connections
+            .iter()
+            .find(|connection| connection.read(cx).server.name == name)
+            .cloned();
+        match found {
+            Some(connection) => {
+                connection.update(cx, |c, cx| c.connect_if_idle(cx));
+                self.select(connection, window, cx);
+            }
+            None => {
+                self.error = Some(format!("Studio lists no CLI target named {name}.").into());
+                cx.notify();
+            }
+        }
+    }
+
     pub(crate) fn select(
         &mut self,
         connection: Entity<Connection>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.plane_shown = None;
         if retries_on_select(connection.read(cx)) {
             connection.update(cx, |c, cx| c.connect(cx));
         }
@@ -726,63 +823,56 @@ impl OpenGraphModal {
         cx.notify();
     }
 
-    fn render_servers(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let connections = self.connections.clone();
-        let organizations =
-            crate::organizations::render(&self.planes, &self.managed, self.cursor.as_ref(), cx);
-        // A third of the wide modal; the graphs take the rest.
+    /// The sidebar: the CLI's servers, Add server…, then each control plane's organizations.
+    /// It scrolls within the dialog.
+    fn render_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let server_shown = self.plane_shown.is_none() && !self.adding;
+        let servers = self
+            .connections
+            .clone()
+            .into_iter()
+            .enumerate()
+            .map(|(index, connection)| {
+                let c = connection.read(cx);
+                let source = source_label(&c.server.source, c.login_profile().as_deref());
+                let tip = format!("{} · {source}", c.server.url);
+                ds::SidebarRow::new(("server", index), c.server.name.clone())
+                    .start(ds::dot(connection_color(&c.state)))
+                    .selected(server_shown && self.selected.as_ref() == Some(&connection))
+                    .tip(ds::tooltip(tip))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.select(connection.clone(), window, cx)
+                    }))
+            })
+            .collect::<Vec<_>>();
         v_flex()
-            .w(px(size::MODAL_WIDE / 3.))
+            .id("server-list")
+            .w(px(size::NAV))
             .flex_none()
-            .min_h_0()
-            .gap(px(space::XXS))
-            .child(pane_label("Servers"))
+            .h_full()
+            .pb(px(space::LG))
+            .gap(px(space::WITHIN))
+            .overflow_y_scroll()
+            .track_scroll(&self.servers_scroll)
+            .border_r_1()
+            .border_color(ds::surface::floating_border(cx))
+            .child(ds::section_label("Servers").pt(px(space::LG)))
+            .children(servers)
             .child(
-                // Scrolls within the dialog, Add server… under it.
-                v_flex()
-                    .id("server-list")
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.servers_scroll)
-                    .children(
-                        connections
-                            .into_iter()
-                            .enumerate()
-                            .map(|(index, connection)| {
-                                let c = connection.read(cx);
-                                let color = connection_color(&c.state);
-                                let selected = self.selected.as_ref() == Some(&connection);
-                                let source =
-                                    source_label(&c.server.source, c.login_profile().as_deref());
-                                MenuRow::new(("server", index))
-                                    .height(size::FEED_ROW)
-                                    .toggle_state(selected)
-                                    .start_slot(studio_ui::ds::dot(color))
-                                    .child(
-                                        v_flex()
-                                            .min_w_0()
-                                            .child(studio_ui::ds::text::body(c.server.name.clone()))
-                                            .child(
-                                                studio_ui::ds::text::meta(format!(
-                                                    "{} · {source}",
-                                                    c.server.url
-                                                ))
-                                                .truncate(),
-                                            ),
-                                    )
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.select(connection.clone(), window, cx)
-                                    }))
-                            }),
-                    )
-                    .children(organizations),
-            )
-            .child(
-                studio_ui::ds::button("add-server", "Add server…")
-                    .style(ButtonStyle::Subtle)
-                    .start_icon(Icon::new(IconName::Plus))
+                ds::SidebarRow::new("add-server", "Add server…")
+                    .icon(IconName::Plus)
+                    .muted(!self.adding)
+                    .selected(self.adding)
+                    .tip(ds::tooltip(
+                        "Adds a server as a target of the Omnigraph CLI",
+                    ))
                     .on_click(cx.listener(|this, _, window, cx| this.show_add(true, window, cx))),
             )
+            .children(organizations::nav(
+                &self.planes,
+                self.plane_shown.as_ref(),
+                cx,
+            ))
     }
 
     fn render_graphs(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -804,6 +894,13 @@ impl OpenGraphModal {
             _ => None,
         };
         let graphs = c.graph_ids();
+        // An empty list says why, rather than leaving a blank pane.
+        let listing_note = listing_note.or_else(|| {
+            graphs.is_empty().then_some(match c.state {
+                ConnectionState::Ready => "This server lists no graphs. Enter a graph id.",
+                _ => "Its graphs show once Studio connects to it.",
+            })
+        });
         // What each id's row says: a listed graph's state, nothing more for one the server
         // named by discovery, and "remembered" for one only typed in before.
         let discovered =
@@ -816,34 +913,44 @@ impl OpenGraphModal {
                 None => None,
             })
             .collect();
+        let (name, address) = {
+            let c = connection.read(cx);
+            let source = source_label(&c.server.source, c.login_profile().as_deref());
+            (
+                c.server.name.clone(),
+                format!("{} · {source}", c.server.url),
+            )
+        };
+        let head = pane_head(
+            name,
+            Some(ds::text::meta(address).truncate().into_any_element()),
+            actions
+                .into_iter()
+                .map(|action| line_button(action, &selected, cx).into_any_element())
+                .collect(),
+        );
         v_flex()
-            .flex_1()
+            .size_full()
             .min_w_0()
             .min_h_0()
-            .gap(px(space::XXS))
+            .gap(px(space::LG))
+            .child(head)
             .child(
+                // Wraps, so the CLI's whole reason shows within the pane.
                 h_flex()
-                    .min_h(px(size::CONTROL))
                     .px(px(space::MD))
                     .gap(px(space::MD))
-                    .child(studio_ui::ds::dot(connection_color(&state)))
-                    // Wraps, so the CLI's whole reason shows within the pane.
+                    .items_start()
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(studio_ui::ds::text::muted(status)),
+                            .pt(px(space::XS))
+                            .child(ds::dot(connection_color(&state))),
                     )
-                    .children(
-                        actions
-                            .into_iter()
-                            .map(|action| line_button(action, &selected, cx)),
-                    ),
+                    .child(div().flex_1().min_w_0().child(ds::text::muted(status))),
             )
             .when(asks_token, |pane| {
                 pane.child(
                     h_flex()
-                        .py(px(space::XS))
                         .gap(px(space::MD))
                         .child(
                             studio_ui::ds::field_frame(false, cx)
@@ -862,50 +969,56 @@ impl OpenGraphModal {
                         ),
                 )
             })
-            .child(pane_label("Graphs"))
-            .children(
-                listing_note.map(|n| div().px(px(space::MD)).child(studio_ui::ds::text::muted(n))),
-            )
             .child(
-                // Scrolls within the dialog: the id field and Open stay under it.
                 v_flex()
-                    .id("graph-list")
+                    .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.graphs_scroll)
-                    .children(graphs.into_iter().zip(infos).enumerate().map(
-                        |(index, (graph, info))| {
-                            let detail = match info {
-                                Some(Some((state, writable))) => format!(
-                                    "{}{}",
-                                    format!("{state:?}").to_lowercase(),
-                                    if writable { "" } else { " · read only" }
-                                ),
-                                Some(None) => String::new(),
-                                None => "remembered".into(),
-                            };
-                            let id = graph.clone();
-                            let at_cursor =
-                                self.cursor.as_ref() == Some(&Place::Graph(graph.clone()));
-                            MenuRow::new(("graph", index))
-                                .height(size::ROW)
-                                .toggle_state(at_cursor)
-                                .start_slot(studio_ui::ds::icon::lead(IconName::Folder))
-                                .child(
-                                    h_flex()
-                                        .gap(px(space::MD))
-                                        .child(studio_ui::ds::text::body(graph))
-                                        .child(studio_ui::ds::text::meta(detail)),
-                                )
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.open(id.clone(), window, cx)
-                                }))
-                        },
-                    )),
+                    .gap(px(space::XXS))
+                    .child(pane_label("Graphs"))
+                    .children(
+                        listing_note
+                            .map(|n| div().px(px(space::MD)).child(studio_ui::ds::text::muted(n))),
+                    )
+                    .child(
+                        // Scrolls within the dialog: the id field and Open stay under it.
+                        v_flex()
+                            .id("graph-list")
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.graphs_scroll)
+                            .children(graphs.into_iter().zip(infos).enumerate().map(
+                                |(index, (graph, info))| {
+                                    let detail = match info {
+                                        Some(Some((state, writable))) => format!(
+                                            "{}{}",
+                                            format!("{state:?}").to_lowercase(),
+                                            if writable { "" } else { " · read only" }
+                                        ),
+                                        Some(None) => String::new(),
+                                        None => "remembered".into(),
+                                    };
+                                    let id = graph.clone();
+                                    let at_cursor =
+                                        self.cursor.as_ref() == Some(&Place::Graph(graph.clone()));
+                                    MenuRow::new(("graph", index))
+                                        .height(size::ROW)
+                                        .toggle_state(at_cursor)
+                                        .start_slot(studio_ui::ds::icon::lead(IconName::Folder))
+                                        .child(
+                                            h_flex()
+                                                .gap(px(space::MD))
+                                                .child(studio_ui::ds::text::body(graph))
+                                                .child(studio_ui::ds::text::meta(detail)),
+                                        )
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.open(id.clone(), window, cx)
+                                        }))
+                                },
+                            )),
+                    ),
             )
             .child(
                 h_flex()
-                    .pt(px(space::SM))
                     .gap(px(space::MD))
                     .debug_selector(|| "open-graph".into())
                     .child(
@@ -1321,8 +1434,30 @@ fn source_label(source: &ServerSource, profile: Option<&str>) -> String {
     }
 }
 
+/// A pane's head: what it shows, named, a line under the name, and its actions on the right;
+/// on its rows' text's edge.
+pub(crate) fn pane_head(
+    title: impl Into<SharedString>,
+    detail: Option<AnyElement>,
+    actions: Vec<AnyElement>,
+) -> Div {
+    h_flex()
+        .px(px(space::MD))
+        .gap(px(space::MD))
+        .items_center()
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap(px(space::XXS))
+                .child(ds::text::title(title).single_line().truncate())
+                .children(detail),
+        )
+        .children(actions)
+}
+
 /// A pane's name, over its rows and on their text's edge.
-fn pane_label(title: &'static str) -> Div {
+pub(crate) fn pane_label(title: &'static str) -> Div {
     div()
         .px(px(space::MD))
         .pb(px(space::XS))
@@ -1340,11 +1475,17 @@ fn first_choice(connections: &[Entity<Connection>], cx: &App) -> Option<Entity<C
 
 impl Render for OpenGraphModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let servers = self.render_servers(cx).into_any_element();
-        let body = if self.adding {
-            self.render_add(cx).into_any_element()
-        } else {
-            self.render_graphs(cx).into_any_element()
+        let nav = self.render_nav(cx).into_any_element();
+        let body = match (self.adding, self.shown_plane()) {
+            (true, _) => self.render_add(cx).into_any_element(),
+            (false, Some((plane, organization))) => organizations::pane(
+                &plane,
+                organization.as_deref(),
+                &self.managed,
+                self.cursor.as_ref(),
+                cx,
+            ),
+            (false, None) => self.render_graphs(cx).into_any_element(),
         };
         ds::modal(cx)
             .key_context("OpenGraphModal")
@@ -1370,38 +1511,36 @@ impl Render for OpenGraphModal {
                 }
             }))
             .w(px(size::MODAL_WIDE))
-            .max_h(px(size::MODAL_MAX_HEIGHT))
+            // One height whatever the pane shows, so choosing in the sidebar moves nothing.
+            .h(px(size::MODAL_MAX_HEIGHT))
             .debug_selector(|| "open-graph-dialog".into())
             .child(
                 ds::ModalHeader::new("Open a graph")
-                    .description(SharedString::from(
-                        "Pick a server, then one of its graphs, or enter a graph's id.",
-                    ))
                     .on_close(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
             )
             .child(
-                ds::modal_body()
+                // The sidebar and the pane stretch to the height the dialog leaves them, which
+                // their lists scroll within (a row centers its children, at their own height,
+                // unless told otherwise).
+                h_flex()
                     .flex_1()
                     .min_h_0()
+                    .items_stretch()
+                    .border_t_1()
+                    .border_color(ds::surface::floating_border(cx))
+                    .child(nav)
                     .child(
-                        // The columns stretch to the height the dialog leaves them, which their
-                        // lists scroll within (a row centers its children, at their own height,
-                        // unless told otherwise).
-                        h_flex()
+                        v_flex()
                             .flex_1()
+                            .min_w_0()
                             .min_h_0()
-                            .items_stretch()
-                            .gap(px(space::XL))
-                            .child(servers)
-                            .child(
-                                div()
-                                    .w(px(size::HAIRLINE))
-                                    .self_stretch()
-                                    .bg(ds::surface::floating_border(cx)),
-                            )
-                            .child(body),
-                    )
-                    .children(self.error.clone().map(studio_ui::ds::text::error)),
+                            .px(px(space::XL))
+                            .pt(px(space::XL))
+                            .pb(px(space::LG))
+                            .gap(px(space::MD))
+                            .child(div().flex_1().min_h_0().child(body))
+                            .children(self.error.clone().map(ds::text::error)),
+                    ),
             )
     }
 }
@@ -2275,6 +2414,120 @@ mod tests {
             plane.sign_in_state(),
             SignIn::Offered { .. }
         )));
+    }
+
+    /// A control plane signed in to, listing `org_1` (Acme) with two clusters: `acme` (`01C`),
+    /// which [`managed`]'s target names, and `beta`, which opens for this run.
+    fn signed_in_plane(cx: &mut VisualTestContext) -> Entity<ControlPlane> {
+        let cluster = |id: &str, name: &str| {
+            serde_json::json!({
+                "cluster_id": id, "name": name, "incarnation": "01I",
+                "canonical_root": "s3://b/c", "binding": {"mode": "github", "repository": "a/g"},
+                "state": "ready", "cell": {"namespace": "ns", "cluster": "cell"},
+                "created_by": "u", "created_at": "2026-11-01T00:00:00Z",
+                "data_endpoint": format!("https://{name}.test"),
+            })
+        };
+        let listed: control_client::Envelope<control_client::ClusterList> =
+            serde_json::from_value(serde_json::json!({
+                "data": {"clusters": [cluster("01C", "acme"), cluster("02C", "beta")]},
+                "meta": {"provenance": "service_db", "assurance": "observed", "stale": false,
+                         "observed_at": "2026-11-05T00:00:00Z"},
+            }))
+            .unwrap();
+        cx.new(|cx| {
+            let mut plane = ControlPlane::new("https://control.test".into(), None, cx);
+            plane.signed_in_for_test(
+                vec![control_client::OrganizationSummary {
+                    organization_id: "org_1".into(),
+                    name: Some("Acme".into()),
+                }],
+                vec![("org_1".into(), graph_store::Listing::Listed(listed))],
+                cx,
+            );
+            plane
+        })
+    }
+
+    fn managed(target: &str) -> Vec<ManagedTarget> {
+        vec![ManagedTarget {
+            name: target.into(),
+            profile: "work".into(),
+            cluster_id: "01C".into(),
+            cluster_incarnation: "01I".into(),
+            endpoint: None,
+            default_graph: None,
+        }]
+    }
+
+    /// Signed in, a control plane's organizations are in the sidebar by name; choosing one shows
+    /// its clusters in the pane, in place of the server's graphs, and ↵ goes to its first
+    /// cluster (spec 021).
+    #[gpui::test]
+    fn an_organization_chosen_in_the_sidebar_shows_its_clusters(cx: &mut TestAppContext) {
+        let alpha = server(&["one"], cx);
+        let (modal, cx) = dialog(vec![alpha.clone()], cx);
+        let target = alpha.read_with(cx, |c, _| c.server.name.clone());
+        let plane = signed_in_plane(cx);
+        modal.update(cx, |modal, cx| {
+            modal.follow_planes(vec![plane.clone()], managed(&target), cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("control-plane-clusters").is_none());
+        let organization = Place::Organization(plane.entity_id(), "org_1".into());
+        let places = modal.read_with(cx, |modal, cx| modal.places(cx));
+        assert_eq!(places[1], organization);
+        cx.dispatch_action(menu::SelectNext);
+        cx.run_until_parked();
+        assert_eq!(
+            modal.read_with(cx, |modal, _| modal.cursor.clone()),
+            Some(organization)
+        );
+        assert!(cx.debug_bounds("control-plane-clusters").is_some());
+        assert!(cx.debug_bounds("open-graph").is_none());
+        // Both clusters are reached: one a target names, one that opens for this run.
+        let places = modal.read_with(cx, |modal, cx| modal.places(cx));
+        let acme = Place::Cluster(plane.entity_id(), "org_1".into(), "01C".into());
+        let beta = Place::Cluster(plane.entity_id(), "org_1".into(), "02C".into());
+        assert_eq!(places[2..], [acme.clone(), beta]);
+        cx.dispatch_action(menu::Confirm);
+        assert_eq!(
+            modal.read_with(cx, |modal, _| modal.cursor.clone()),
+            Some(acme)
+        );
+    }
+
+    /// ↵ on a cluster a CLI target names chooses that target's server, and the pane shows its
+    /// graphs again.
+    #[gpui::test]
+    fn a_cluster_a_target_names_chooses_its_server(cx: &mut TestAppContext) {
+        let alpha = server(&["one"], cx);
+        let beta = server(&["two"], cx);
+        // The test servers share a name: the second is the target's.
+        beta.update(cx, |c, _| c.server.name = "prod".into());
+        let (modal, cx) = dialog(vec![alpha.clone(), beta.clone()], cx);
+        let target = "prod".to_owned();
+        let plane = signed_in_plane(cx);
+        modal.update(cx, |modal, cx| {
+            modal.follow_planes(vec![plane.clone()], managed(&target), cx)
+        });
+        let acme = Place::Cluster(plane.entity_id(), "org_1".into(), "01C".into());
+        modal.update_in(cx, |modal, window, cx| {
+            modal.move_to(
+                Place::Organization(plane.entity_id(), "org_1".into()),
+                window,
+                cx,
+            );
+            modal.move_to(acme, window, cx);
+        });
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        let (selected, shown) = modal.read_with(cx, |modal, _| {
+            (modal.selected.clone(), modal.plane_shown.clone())
+        });
+        assert_eq!(selected.map(|c| c.entity_id()), Some(beta.entity_id()));
+        assert_eq!(shown, None);
+        assert!(cx.debug_bounds("open-graph").is_some());
     }
 
     /// A server with more graphs than the dialog holds scrolls them within it: the id field and

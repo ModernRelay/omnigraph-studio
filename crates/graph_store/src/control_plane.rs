@@ -91,6 +91,24 @@ impl ControlPlane {
         this
     }
 
+    /// Signed in, with `organizations` listed and each one's clusters as `listings` says: what
+    /// a view over a control plane is tested with, without a sign-in service.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn signed_in_for_test(
+        &mut self,
+        organizations: Vec<OrganizationSummary>,
+        listings: Vec<(String, Listing)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.sign_in = SignIn::SignedIn {
+            service: oauth_client::host_of(&self.route),
+            account: "user_test".into(),
+        };
+        self.organizations = Some(Organizations::Listed(organizations));
+        self.listings = listings.into_iter().collect();
+        cx.notify();
+    }
+
     /// What a cluster's data token source reads its sign-in through ([`ControlTokenSource`]):
     /// `None` without a sign-in context, as in tests of other crates.
     ///
