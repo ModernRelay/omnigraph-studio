@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Serve a large graph for measuring Studio at scale on http://127.0.0.1:8788: graph `scale`, a
+# 95-column type of 100,000 rows with 500,000 edges among them (script/dev-seed-big.py), about
+# 340 commits of history and 40 branches with a commit each. Token `dev-token`, as dev-server.
+#
+#   script/dev-big-server            # the first run builds it, which takes a while
+#   script/dev-big-server --reset    # build it again
+#   STUDIO_BIG_ACCOUNTS=20000 script/dev-big-server --reset   # a smaller one
+#
+# Then `script/measure-frames --all` adds its cases. Needs the same CLI and server as dev-server.
+# Data lives in dev/.big.
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+DATA=${STUDIO_BIG_DATA:-$ROOT/dev/.big}
+BIND=${STUDIO_BIG_BIND:-127.0.0.1:8788}
+CLI=${OMNIGRAPH_BIN:-omnigraph}
+SERVER=${OMNIGRAPH_SERVER_BIN:-omnigraph-server}
+ACCOUNTS=${STUDIO_BIG_ACCOUNTS:-100000}
+TOKEN=dev-token
+
+if [[ "${1:-}" == "--reset" ]]; then
+  rm -rf "$DATA"
+fi
+if curl -s -o /dev/null --max-time 2 "http://$BIND/healthz"; then
+  echo "dev-big-server: something already answers at http://$BIND" >&2
+  exit 1
+fi
+
+home=$(mktemp -d)
+work=$(mktemp -d)
+trap 'rm -rf "$home" "$work"' EXIT
+uri=$(python3 -c 'import json, pathlib, sys; print(json.dumps(pathlib.Path(sys.argv[1]).resolve().as_uri()))' "$DATA")
+printf 'version: 1\ntargets:\n  big: {kind: direct, scope: root, uri: %s}\n' "$uri" > "$home/config.yaml"
+og() { OMNIGRAPH_HOME=$home "$CLI" "$@"; }
+
+# A direct apply or load keeps the cluster lock when it ends (see dev-server); nothing else uses
+# this directory, so it is released after each.
+release_lock() {
+  [[ -f "$DATA/__cluster/lock.json" ]] || return 0
+  local lock
+  lock=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["lock_id"])' "$DATA/__cluster/lock.json")
+  og cluster force-unlock "$lock" --target big > /dev/null 2>&1
+}
+
+quietly() {
+  local out
+  if ! out=$(og "$@" 2>&1); then
+    printf '%s\n' "$out" >&2
+    echo "dev-big-server: omnigraph $* failed; its output is above" >&2
+    exit 1
+  fi
+}
+
+pending="$DATA/.seed-pending"
+if [[ ! -d "$DATA/__cluster" ]]; then
+  mkdir -p "$DATA"
+  touch "$pending"
+  python3 "$ROOT/script/dev-seed-big.py" --schema > "$DATA/scale.pg"
+  cp "$ROOT"/dev/cluster/graph.policy.yaml "$ROOT"/dev/cluster/server.policy.yaml "$DATA"/
+  cat > "$DATA/cluster.yaml" <<'EOF'
+version: 1
+metadata:
+  name: studio-scale
+graphs:
+  scale:
+    schema: scale.pg
+policies:
+  graph-access:
+    file: graph.policy.yaml
+    applies_to: [scale]
+  server-access:
+    file: server.policy.yaml
+    applies_to: [cluster]
+EOF
+  quietly cluster apply --config "$DATA" --target big
+  release_lock
+fi
+release_lock
+
+if [[ -f "$pending" ]]; then
+  echo "Writing and loading $ACCOUNTS accounts; each load is one commit."
+  python3 "$ROOT/script/dev-seed-big.py" --accounts "$ACCOUNTS" > "$work/all.jsonl"
+  # A load takes at most 8,192 keyed rows of a type, and 32 MB.
+  grep -v '"edge"' "$work/all.jsonl" | split -l 5000 -d -a 4 - "$work/a-node-"
+  grep '"edge"' "$work/all.jsonl" | split -l 8000 -d -a 4 - "$work/b-edge-"
+  mode=overwrite
+  for chunk in "$work"/a-node-* "$work"/b-edge-*; do
+    quietly load --target big --graph scale --data "$chunk" --mode "$mode"
+    release_lock
+    mode=append
+  done
+fi
+
+OMNIGRAPH_SERVER_BEARER_TOKENS_JSON="{\"act-dev\":\"$TOKEN\"}" "$SERVER" --cluster "$DATA" --bind "$BIND" &
+server=$!
+trap 'kill "$server" 2>/dev/null || true; wait "$server" 2>/dev/null || true; rm -rf "$home" "$work"' EXIT
+for _ in $(seq 1 120); do
+  if curl -fsS "http://$BIND/readyz" > /dev/null 2>&1; then break; fi
+  sleep 0.5
+done
+
+# Branches and history are made through the server, as Studio's own writes are.
+if [[ -f "$pending" ]]; then
+  h=(-H "authorization: Bearer $TOKEN" -H 'omnigraph-http-api: 0.14' -H 'content-type: application/json')
+  edit='query r($s: String, $t: String) { update Account set { c07: $t } where slug = $s }'
+  for i in $(seq 1 40); do
+    curl -sf -o /dev/null -X POST "http://$BIND/graphs/scale/branches" "${h[@]}" -d "{\"name\":\"feature-$i\"}"
+    curl -sf -o /dev/null -X POST "http://$BIND/graphs/scale/mutate" "${h[@]}" \
+      -d "$(python3 -c 'import json,sys; print(json.dumps({"branch": sys.argv[1], "query": sys.argv[2], "params": {"s": "account-%06d" % (int(sys.argv[3]) % 10), "t": "branch " + sys.argv[3]}}))' "feature-$i" "$edit" "$i")"
+  done
+  for i in $(seq 1 200); do
+    curl -sf -o /dev/null -X POST "http://$BIND/graphs/scale/mutate" "${h[@]}" \
+      -d "$(python3 -c 'import json,sys; print(json.dumps({"query": sys.argv[1], "params": {"s": "account-%06d" % (int(sys.argv[2]) * 37 % int(sys.argv[3])), "t": "edit " + sys.argv[2]}}))' "$edit" "$i" "$ACCOUNTS")"
+  done
+  rm -f "$pending"
+fi
+
+echo "Serving http://$BIND · graph scale · token $TOKEN (actor act-dev)"
+wait $server

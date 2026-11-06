@@ -1,17 +1,37 @@
 #!/usr/bin/env bash
-# Measure the frames that matter most against the development graph, on the release-fast
-# profile: a key in each kind of field and a table scroll (docs/drawing.md). Prints the main
-# thread's CPU time per frame, median and p95, which a busy machine moves far less than wall
-# time. An instrument, not a gate: compare runs made in the same session.
+# Measure what the person feels, on the release-fast profile, against the development graph
+# (docs/drawing.md, "Measuring"). An instrument, not a gate: compare runs made in the same session.
 #
-#   script/dev-server &        # once, in another shell
-#   script/measure-frames      # prints one line per case
-#   script/measure-frames 2    # each case twice
+#   script/dev-server &               # once, in another shell
+#   script/measure-frames             # frames: a key in each kind of field, a table scroll
+#   script/measure-frames 2           # each frame case twice
+#   script/measure-frames --scenarios # whole interactions, one line each
+#   script/measure-frames --all       # both
+#   script/measure-frames --memory    # the heap across tabs opened and closed again and again
+#
+# Frames print the main thread's CPU time per frame (median, p95 and the mean over every frame,
+# which a thread clock that ticks in 10 ms, as gVisor's does, still measures), wall time p95 and
+# worst, and two exact counts: allocations per frame and views drawn per frame.
+#
+# Scenarios print, for each step of an interaction: when its last request ended (`settled`, wall
+# time, indicative), its requests and their bytes, the queries Studio built for it, the main
+# thread's allocations, the views drawn (an upper bound: headless, every change draws, where a
+# display draws at most once a frame), and the frame drawn after it. A scenario that writes (the
+# merge) makes its own branch on the development graph first.
+#
+# With the large graph served (script/dev-big-server, STUDIO_BIG_SERVER), both add its cases: a
+# 95-column, 100,000-row type, scrolled down and sideways, and opened.
 #
 # Needs the snapshot tool's build; it builds it first.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+MODE=frames
+case "${1:-}" in
+  --scenarios) MODE=scenarios; shift ;;
+  --all) MODE=all; shift ;;
+  --memory) MODE=memory; shift ;;
+esac
 ROUNDS=${1:-1}
 FRAMES=${STUDIO_MEASURE_FRAMES:-200}
 OUT=$(mktemp -d)
@@ -21,37 +41,163 @@ export OMNIGRAPH_STUDIO_SERVER=${OMNIGRAPH_STUDIO_SERVER:-http://127.0.0.1:8787}
 export OMNIGRAPH_STUDIO_TOKEN=${OMNIGRAPH_STUDIO_TOKEN:-dev-token}
 export OMNIGRAPH_STUDIO_GRAPH=${OMNIGRAPH_STUDIO_GRAPH:-knowledge}
 export SNAPSHOT_WAIT_MS=${SNAPSHOT_WAIT_MS:-2000}
+# The person's CLI targets take no part: Studio would list and check them too.
+export OMNIGRAPH_HOME=${STUDIO_MEASURE_HOME:-$OUT/home}
+mkdir -p "$OMNIGRAPH_HOME"
+BIG=${STUDIO_BIG_SERVER:-http://127.0.0.1:8788}
 
 if ! curl -sf -o /dev/null "$OMNIGRAPH_STUDIO_SERVER/healthz"; then
   echo "no server at $OMNIGRAPH_STUDIO_SERVER; start script/dev-server first" >&2
   exit 1
 fi
+big=0
+if curl -sf -o /dev/null --max-time 2 "$BIG/healthz"; then big=1; fi
 
-cargo build --quiet --profile release-fast -p studio --example snapshot --manifest-path "$ROOT/Cargo.toml"
-SNAPSHOT="$ROOT/target/release-fast/examples/snapshot"
+# STUDIO_SNAPSHOT names a snapshot tool already built (another branch's, to compare); else it is
+# built here.
+if [[ -z "${STUDIO_SNAPSHOT:-}" ]]; then
+  cargo build --quiet --profile release-fast -p studio --example snapshot --manifest-path "$ROOT/Cargo.toml"
+fi
+SNAPSHOT=${STUDIO_SNAPSHOT:-$ROOT/target/release-fast/examples/snapshot}
 
 PERSON='studio_graph::OpenType={"type_name":"Person"}'
+ACCOUNT='studio_graph::OpenType={"type_name":"Account"}'
 QUERY='query people() { match { $p: Person } return { $p.slug, $p.name, $p.title, $p.email, $p.born, $p.tags } }'
 NEW_QUERY="studio_graph::NewQueryWithText={\"text\":\"$QUERY\"}"
+NODE='"type_name":"Person","id":"person-000014"'
 
-# name, then the snapshot steps.
-cases=(
-  "table filter key|$PERSON|studio_table::AddFilter|measure:$FRAMES,type"
-  "table cell key|$PERSON|studio_table::EditCell|key:right|studio_table::EditCell|measure:$FRAMES,type"
-  "table scroll|$PERSON|measure:$FRAMES,scroll=40"
-  "query key (6 columns)|$NEW_QUERY|studio_query::Run|measure:$FRAMES,type"
-  "palette key|$PERSON|studio::GoTo|measure:$FRAMES,type"
-)
+# Runs the snapshot tool with the big graph's server in place of the development one.
+on_big() {
+  OMNIGRAPH_STUDIO_SERVER=$BIG OMNIGRAPH_STUDIO_GRAPH=scale "$@"
+}
 
-printf '%-24s %10s %10s\n' "case" "cpu median" "cpu p95"
-for ((round = 1; round <= ROUNDS; round++)); do
-  for case in "${cases[@]}"; do
-    IFS='|' read -r -a parts <<<"$case"
-    name=${parts[0]}
-    line=$("$SNAPSHOT" "$OUT/frame.png" "${parts[@]:1}" 2>&1 | grep '^measure' || true)
-    median=$(sed -n 's/.*cpu median \([^,]*\),.*/\1/p' <<<"$line")
-    p95=$(sed -n 's/.*cpu median [^,]*, p95 \([^,]*\),.*/\1/p' <<<"$line")
-    printf '%-24s %10s %10s\n' "$name" "${median:-failed}" "${p95:-}"
+# The parsers of the snapshot tool's lines, one table row each.
+cat > "$OUT/frames.py" <<'PY'
+import re, sys
+name = sys.argv[1]
+text = sys.stdin.read()
+times = re.search(r"^measure[^:]*: \d+ frames, median [^,]+, p90 [^,]+, p95 ([^,]+), p99 [^,]+, max ([^ ]+) \| cpu median ([^,]+), p95 ([^,]+),", text, re.M)
+counts = re.search(r"^measure counts[^:]*: cpu mean ([^ ]+) \| allocs median (\d+), p95 (\d+), max \d+ \| views drawn per frame \[([^\]]*)\]", text, re.M)
+if not times or not counts:
+    print(f"{name:<28} failed")
+    sys.exit()
+print(f"{name:<28} {times.group(3):>9} {times.group(4):>9} {counts.group(1):>9} {times.group(1):>9} {times.group(2):>9} {counts.group(2):>9} {counts.group(3):>9}  {counts.group(4)}")
+PY
+cat > "$OUT/steps.py" <<'PY'
+import re, sys
+name = sys.argv[1]
+pattern = re.compile(
+    r"^step\t(?P<step>[^\t]*)\tsettled (?P<settled>[\d.]+) ms\tcpu [\d.]+ ms\tallocs (?P<allocs>\d+) \((?P<mb>[\d.]+) MB\)"
+    r"\trequests (?P<requests>\d+) \((?P<kb>[\d.]+) KB\) \[[^\]]*\]\tqueries \[(?P<queries>[^\]]*)\]\tdraws \[(?P<draws>[^\]]*)\]"
+    r"\tframe (?P<frame>[\d.]+) ms", re.M)
+found = False
+for m in pattern.finditer(sys.stdin.read()):
+    found = True
+    step = m["step"]
+    if step == "start":
+        if name != "table":
+            continue
+        step = "start to first paint"
+    if not step or "=" in step or ":" in step and not step.startswith("big:"):
+        continue
+    detail = " · ".join(part for part in (m["queries"], m["draws"]) if part)
+    print(f"{step:<30} {m['settled']:>7} ms {m['requests']:>9} {m['kb']:>10} {m['allocs']:>9} {m['mb']:>9} {m['frame']:>6} ms  {detail}")
+if not found:
+    print(f"{name:<30} failed")
+PY
+
+frames() {
+  # name, then the snapshot steps; a name starting `big:` runs against the big graph.
+  local cases=(
+    "table filter key|$PERSON|studio_table::AddFilter|measure:$FRAMES,type"
+    "table cell key|$PERSON|studio_table::EditCell|key:right|studio_table::EditCell|measure:$FRAMES,type"
+    "table scroll|$PERSON|measure:$FRAMES,scroll=40"
+    "query key (6 columns)|$NEW_QUERY|studio_query::Run|measure:$FRAMES,type"
+    "palette key|$PERSON|studio::GoTo|measure:$FRAMES,type"
+    "canvas pan|studio_graph::ShowNodeOnCanvas={$NODE}|studio_canvas::ExpandNode|measure:$FRAMES,drag=4:2"
+    "canvas zoom|studio_graph::ShowNodeOnCanvas={$NODE}|studio_canvas::ExpandNode|measure:$FRAMES,scroll=8"
+    "sidebar resize|$PERSON|measure:$FRAMES,drag=2:0,at=262:450"
+  )
+  if [[ $big == 1 ]]; then
+    cases+=(
+      "big: 95-col scroll down|$ACCOUNT|measure:$FRAMES,scroll=40"
+      "big: 95-col scroll sideways|$ACCOUNT|measure:$FRAMES,scroll=60:0"
+      "big: 95-col filter key|$ACCOUNT|studio_table::AddFilter|measure:$FRAMES,type"
+    )
+  fi
+  printf '%-28s %9s %9s %9s %9s %9s %9s %9s  %s\n' "frame" "cpu p50" "cpu p95" "cpu mean" "wall p95" "wall max" "allocs" "alloc p95" "views per frame"
+  for ((round = 1; round <= ROUNDS; round++)); do
+    for case in "${cases[@]}"; do
+      IFS='|' read -r -a parts <<<"$case"
+      local name=${parts[0]} run=()
+      [[ $name == big:* ]] && run=(on_big)
+      local log
+      log=$("${run[@]}" "$SNAPSHOT" "$OUT/frame.png" "${parts[@]:1}" 2>&1 || true)
+      python3 "$OUT/frames.py" "$name" <<<"$log"
+    done
   done
-done
+}
+
+# A branch on the development graph with two edits, for a review and a merge to work on.
+branch_with_edits() {
+  local name=$1 h=(-H "authorization: Bearer $OMNIGRAPH_STUDIO_TOKEN" -H 'omnigraph-http-api: 0.14' -H 'content-type: application/json')
+  curl -sf -o /dev/null -X POST "$OMNIGRAPH_STUDIO_SERVER/graphs/$OMNIGRAPH_STUDIO_GRAPH/branches" "${h[@]}" -d "{\"name\":\"$name\"}"
+  for slug in person-000001 person-000002; do
+    curl -sf -o /dev/null -X POST "$OMNIGRAPH_STUDIO_SERVER/graphs/$OMNIGRAPH_STUDIO_GRAPH/mutate" "${h[@]}" \
+      -d "{\"branch\":\"$name\",\"query\":\"query r(\$s: String, \$t: String) { update Person set { title: \$t } where slug = \$s }\",\"params\":{\"s\":\"$slug\",\"t\":\"Measured\"}}"
+  done
+}
+
+scenarios() {
+  local branch="measure-$(date +%s)"
+  branch_with_edits "$branch"
+  # name, then the snapshot steps, each named by the `report:` before it.
+  local runs=(
+    "table|report:open a type's table|$PERSON|report:sort by a column|click:490,127|report:filter (type, then enter)|studio_table::AddFilter|type:Ada Sammet|key:enter|report:open a row as a page|studio_graph::OpenNodePage={$NODE}"
+    "tree|report:open a node's tree|studio_graph::ShowNodeInTree={$NODE}|report:expand all|studio_tree::ExpandAll"
+    "canvas|report:open a node's canvas|studio_graph::ShowNodeOnCanvas={$NODE}|report:expand on the canvas|studio_canvas::ExpandNode"
+    "query|report:open a query|$NEW_QUERY|report:run it|studio_query::Run"
+    "branch|report:switch branch|studio::SwitchBranch|type:$branch|key:enter|report:open history|studio_graph::OpenBranchHistory={\"branch\":\"main\"}|report:open review|studio_graph::OpenBranch={\"branch\":\"$branch\"}|report:merge|studio_review::Merge|key:enter"
+  )
+  if [[ $big == 1 ]]; then
+    runs+=(
+      "big|report:big: open 95-col table|$ACCOUNT|report:big: open a row's page|studio_graph::OpenNodePage={\"type_name\":\"Account\",\"id\":\"account-000007\"}|report:big: open history|studio_graph::OpenBranchHistory={\"branch\":\"main\"}"
+    )
+  fi
+  printf '%-30s %10s %9s %10s %9s %9s %9s  %s\n' "step" "settled" "requests" "KB" "allocs" "MB" "frame" "queries · views drawn"
+  for ((round = 1; round <= ROUNDS; round++)); do
+    for run in "${runs[@]}"; do
+      IFS='|' read -r -a parts <<<"$run"
+      local name=${parts[0]} cmd=()
+      [[ $name == big ]] && cmd=(on_big)
+      local log
+      log=$("${cmd[@]}" "$SNAPSHOT" "$OUT/scenario.png" "${parts[@]:1}" 2>&1 || true)
+      python3 "$OUT/steps.py" "$name" <<<"$log"
+    done
+  done
+}
+
+# The heap every thread holds after each of ten opens and closes of a table, then five of a query
+# that runs: it should come back to where it was after the first, as caches fill and nothing is
+# held for a closed tab beyond them.
+memory() {
+  local args=() q
+  for i in $(seq 1 10); do
+    args+=("report:table $i" "$PERSON" 'studio::CloseActiveItem')
+  done
+  q="studio_graph::NewQueryWithText={\"text\":\"$QUERY\"}"
+  for i in $(seq 1 5); do
+    args+=("report:query $i" "$q" 'studio_query::Run' 'studio::CloseActiveItem' 'key:enter')
+  done
+  printf '%-12s %10s %9s\n' "step" "heap" "requests"
+  "$SNAPSHOT" "$OUT/memory.png" "${args[@]}" 2>&1 \
+    | awk -F'\t' '/^step/ { for (i = 1; i <= NF; i++) { if ($i ~ /^heap /) heap = substr($i, 6); if ($i ~ /^requests /) { split($i, r, " "); n = r[2] } } printf "%-12s %10s %9s\n", $2, heap, n }'
+}
+
+case $MODE in
+  memory) memory ;;
+  frames) frames ;;
+  scenarios) scenarios ;;
+  all) frames; echo; scenarios ;;
+esac
 uptime
