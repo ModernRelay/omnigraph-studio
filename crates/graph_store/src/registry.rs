@@ -19,7 +19,8 @@ use http_client::HttpClient;
 use serde::{Deserialize, Serialize};
 
 use crate::cli_config::{
-    self, CliAuth, CliServer, CliTargets, CliTransport, FileStamp, Platform, ProfileOwner,
+    self, CliAuth, CliServer, CliTargets, CliTransport, FileStamp, ManagedTarget, Platform,
+    ProfileOwner,
 };
 use crate::cli_tokens::{self, CliTokenSource, TargetDigests, Token, TokenSource};
 use crate::connection::{Connection, ServerEntry, ServerSource};
@@ -88,6 +89,8 @@ pub struct ConnectionRegistry {
     /// The managed control planes the CLI's profiles name, one per route and organization
     /// (spec 021).
     pub control_planes: Vec<Entity<ControlPlane>>,
+    /// The managed targets as the CLI last listed them, landed or not: which cluster each names.
+    pub managed_targets: Vec<ManagedTarget>,
     /// Why the environment's server could not be added at start, which stays one of the
     /// [`Self::notices`] for the run.
     environment_notice: Option<String>,
@@ -558,6 +561,7 @@ impl ConnectionRegistry {
             listing_started: None,
             known: KnownGraphs::default(),
             control_planes: Vec::new(),
+            managed_targets: Vec::new(),
             sign_in: None,
             saving: false,
             _watch: None,
@@ -852,13 +856,17 @@ impl ConnectionRegistry {
             servers,
             mut errors,
             watched: _,
-            managed: _,
+            managed,
             profiles,
         } = targets;
         let Some(servers) = servers else {
             return self.keep_notices(errors);
         };
         let mut changed = self.apply_control_planes(profiles, cx);
+        if self.managed_targets != managed {
+            self.managed_targets = managed;
+            changed = true;
+        }
         // An address still listed keeps its connection, which a changed transport moves to its
         // new client below. One no longer listed is retired: the windows holding it send
         // nothing more, so none keeps a token or a trust its target no longer names.

@@ -1,6 +1,9 @@
 # 021: Studio speaks to the managed control plane
 
-Status: draft; the control plane accepts Studio's sign-in (CP1, live 2026-11-05) · 2026-11-05
+Status: in progress; the control plane accepts Studio's sign-in (CP1, live 2026-11-05).
+Built: `control_client`, a profile's control-plane sign-in and its cluster list in the Open
+dialog. Not yet: opening a cluster that is not a CLI target, a cluster's state in the
+connection chip, and the data token · 2026-11-05
 
 ## Problem
 

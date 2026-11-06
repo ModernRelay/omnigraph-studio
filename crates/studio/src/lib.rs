@@ -10,6 +10,7 @@ mod keymaps;
 pub mod logging;
 mod menus;
 mod open_graph;
+mod organizations;
 mod settings_view;
 mod update_status;
 

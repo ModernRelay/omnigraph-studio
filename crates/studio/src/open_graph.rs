@@ -9,11 +9,11 @@ use gpui::{
     ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window,
 };
 use graph_client::Unauthorized;
-use graph_store::cli_config::{self, Platform};
+use graph_store::cli_config::{self, ManagedTarget, Platform};
 use graph_store::sign_in::{Kept, SignIn, left_in_keychain};
 use graph_store::{
     Connection, ConnectionEvent, ConnectionRegistry, ConnectionState, ConnectionWatch,
-    GraphListing, HeldRefusal, ServerSource,
+    ControlPlane, GraphListing, HeldRefusal, ServerSource,
 };
 use studio_ui::ds::Tipped;
 use studio_ui::ds::{self, MenuRow, size, space};
@@ -60,6 +60,12 @@ pub struct OpenGraphModal {
     /// scrolled into view ([`Self::move_to`]).
     servers_scroll: ScrollHandle,
     graphs_scroll: ScrollHandle,
+    /// The control planes the CLI's profiles name, and the managed targets, as the registry
+    /// last held them (spec 021).
+    planes: Vec<Entity<ControlPlane>>,
+    managed: Vec<ManagedTarget>,
+    /// A subscription to each control plane shown, by its entity.
+    followed_planes: Vec<(EntityId, Subscription)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -97,9 +103,26 @@ impl OpenGraphModal {
         // A reload of the operator's files can add, drop or replace servers: the dialog lists
         // and follows what the registry holds now.
         let observe = cx.observe_in(&registry, window, |this, registry, window, cx| {
-            this.follow(registry.read(cx).connections.clone(), window, cx)
+            this.follow(registry.read(cx).connections.clone(), window, cx);
+            let (planes, managed) = {
+                let registry = registry.read(cx);
+                (
+                    registry.control_planes.clone(),
+                    registry.managed_targets.clone(),
+                )
+            };
+            this.follow_planes(planes, managed, cx);
         });
-        Self::build(workspace, connections, vec![observe], platform, window, cx)
+        let (planes, managed) = {
+            let registry = registry.read(cx);
+            (
+                registry.control_planes.clone(),
+                registry.managed_targets.clone(),
+            )
+        };
+        let mut this = Self::build(workspace, connections, vec![observe], platform, window, cx);
+        this.follow_planes(planes, managed, cx);
+        this
     }
 
     /// The dialog over `connections`, kept in line with the registry by `subscriptions`, on
@@ -169,10 +192,58 @@ impl OpenGraphModal {
             error: None,
             servers_scroll: ScrollHandle::new(),
             graphs_scroll: ScrollHandle::new(),
+            planes: Vec::new(),
+            managed: Vec::new(),
+            followed_planes: Vec::new(),
             _subscriptions: subscriptions,
         };
+        // The clusters are held while the dialog is open, and let go when it closes (spec 021).
+        this._subscriptions.push(cx.on_release(|this, cx| {
+            for plane in &this.planes {
+                plane.update(cx, |plane, cx| plane.forget_clusters(cx));
+            }
+        }));
         this.follow(connections, window, cx);
         this
+    }
+
+    /// Shows `planes`, the control planes the registry holds now, with `managed`, the CLI's
+    /// managed targets. Each signed-in plane's clusters are read once as the dialog shows it, and
+    /// once more when a sign-in lands while it is open; never on a timer (spec 021).
+    fn follow_planes(
+        &mut self,
+        planes: Vec<Entity<ControlPlane>>,
+        managed: Vec<ManagedTarget>,
+        cx: &mut Context<Self>,
+    ) {
+        let listed = |id: EntityId| planes.iter().any(|p| p.entity_id() == id);
+        self.followed_planes.retain(|(id, _)| listed(*id));
+        for plane in &planes {
+            let id = plane.entity_id();
+            if self
+                .followed_planes
+                .iter()
+                .any(|(followed, _)| *followed == id)
+            {
+                continue;
+            }
+            let subscription = cx.observe(plane, |_, plane, cx| {
+                // A sign-in that landed while the dialog shows the plane lists its clusters.
+                if plane.read(cx).holds_sign_in() && plane.read(cx).listing().is_none() {
+                    plane.update(cx, |plane, cx| plane.read_clusters(cx));
+                }
+                cx.notify();
+            });
+            self.followed_planes.push((id, subscription));
+            plane.update(cx, |plane, cx| {
+                if plane.holds_sign_in() && plane.listing().is_none() {
+                    plane.read_clusters(cx);
+                }
+            });
+        }
+        self.planes = planes;
+        self.managed = managed;
+        cx.notify();
     }
 
     /// Lists `connections`, the registry's servers now. Each one's state is followed, its health
@@ -592,6 +663,7 @@ impl OpenGraphModal {
 
     fn render_servers(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let connections = self.connections.clone();
+        let organizations = crate::organizations::render(&self.planes, &self.managed, cx);
         // A third of the wide modal; the graphs take the rest.
         v_flex()
             .w(px(size::MODAL_WIDE / 3.))
@@ -636,7 +708,8 @@ impl OpenGraphModal {
                                         this.select(connection.clone(), window, cx)
                                     }))
                             }),
-                    ),
+                    )
+                    .children(organizations),
             )
             .child(
                 studio_ui::ds::button("add-server", "Add server…")
@@ -2071,6 +2144,29 @@ mod tests {
         );
         assert!(registry.read_with(cx, |registry, _| registry.connections.is_empty()));
         assert!(asked.lock().unwrap().is_empty(), "nothing sent");
+    }
+
+    /// A profile's control plane is shown under the servers with its sign-in, and lists no
+    /// clusters, nor sends anything, before a sign-in is held (spec 021).
+    #[gpui::test]
+    fn a_control_plane_without_a_sign_in_offers_one(cx: &mut TestAppContext) {
+        let (modal, cx) = dialog(vec![server(&["knowledge"], cx)], cx);
+        let plane = cx.new(|cx| {
+            ControlPlane::new(
+                "https://control.test".into(),
+                "org_1".into(),
+                vec!["work".into()],
+                None,
+                cx,
+            )
+        });
+        modal.update(cx, |modal, cx| {
+            modal.follow_planes(vec![plane.clone()], Vec::new(), cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("control-plane-sign-in").is_some());
+        assert!(cx.debug_bounds("control-plane-clusters").is_none());
+        assert!(plane.read_with(cx, |plane, _| plane.listing().is_none()));
     }
 
     /// A server with more graphs than the dialog holds scrolls them within it: the id field and

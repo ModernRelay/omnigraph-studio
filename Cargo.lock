@@ -9699,6 +9699,7 @@ version = "0.4.0"
 dependencies = [
  "agent_panel",
  "command_palette",
+ "control_client",
  "editor",
  "gpui",
  "gpui_platform",

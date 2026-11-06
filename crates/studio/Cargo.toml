@@ -26,6 +26,7 @@ perf = ["gpui/profiler"]
 
 [dependencies]
 serde_json = { workspace = true }
+control_client = { workspace = true }
 log = { workspace = true }
 zlog = { workspace = true }
 gpui = { workspace = true }
