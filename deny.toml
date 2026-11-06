@@ -12,6 +12,7 @@ ignore = [
     { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.37 and 0.39, as RUSTSEC-2026-0194" },
     { id = "RUSTSEC-2023-0071", reason = "rsa in Zed's rpc crate, used for Zed's collaboration-server handshake, which Studio never makes; no fixed rsa release exists" },
     { id = "RUSTSEC-2025-0052", reason = "async-std is unmaintained; reached through Zed's async-tar fork" },
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils is unmaintained, with no release that fixes it; reached only through async-std, as RUSTSEC-2025-0052" },
     { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained; a build-time proc-macro of the metal crate GPUI uses on macOS" },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is unmaintained; reached through Zed's reqwest fork" },
     { id = "RUSTSEC-2026-0206", reason = "rustybuzz is unmaintained; reached through usvg, which GPUI uses for SVG icons" },
