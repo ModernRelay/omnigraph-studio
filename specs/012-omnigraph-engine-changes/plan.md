@@ -376,6 +376,21 @@ commit-ceiling parameter and a work ceiling to the feed. Engine rule: a page
 still ends on a whole commit and its cursor resumes after it. *Waits:* 008. *Today:* the feed is
 read in pages of up to 8,192 changes, each waited for up to five minutes.
 
+**E39. A page of a wide type that reads only what it returns.**
+A sorted page reads every column of every row before it keeps the page's rows, and a filtered
+read does the same for every row it tests. Measured on 2026-11-06 against `omnigraph-server`
+`v0.14.0` on a local cluster (`script/dev-big-server`: `Account`, 95 columns, 100,000 rows; a
+2-core Linux box): `order { $n.@id } limit 100` returning `$n` takes 0.91 s, the same order
+returning `$n.slug` 0.08 s, and `$n` with no order 0.03 s; a point read
+(`$n.@id = $id`, `limit 1`) takes 0.43 s, as does `$n.@id in $ids` for a page of 101 ids. Studio's
+first page of such a type therefore takes about a second, and every node page or tree root read
+that the memo cannot answer about half a second. A Top-K that sorts on the keys alone and then
+reads the page's rows (late materialization), and a filter on `@id` or a key that reads only the
+rows it keeps, would make these cost what they return. Engine rule: the answer is unchanged, and
+the read still sees one snapshot. *Waits:* 004. *Today:* Studio reads a page in one query, and a
+row a page already read is answered from the session's memo (a node page opened from the table
+sends nothing).
+
 ### In 0.14, not in 0.13.0
 
 Studio's minimum server serves these, so it uses them without asking the server's OpenAPI
@@ -425,6 +440,7 @@ Then engine changes still open:
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-06 | A page of a wide, large type costs the server what it holds, not what it returns (E39) | `script/dev-big-server` (`v0.14.0`, `Account`: 95 columns, 100,000 rows), each read sent with curl, then Studio's snapshot tool with `OMNIGRAPH_STUDIO_TRACE` (`docs/perf/20261106-report.md`) | `order { $n.@id } limit 100` returning `$n`: 0.91 s; returning `$n.slug`: 0.08 s; `$n` unordered: 0.03 s; `$n.@id = $id`: 0.43 s; `$n.@id in $ids` (101): 0.46 s. Studio's first page: 947 ms of which 3.5 ms decoding. Filed as E39 |
 | 2026-10-26 | A review's reads of changes take most of a minute on the personal graph, for reasons in the engine (E35 to E38) | The readings of 2026-10-25 in spec 008's validation log; issues #969, #970, #972 and #1157 and the draft RFC #1171 (`gh issue view`, `gh pr view`, all open on 2026-10-27); Omnigraph `7711e4a`: `changes/model.rs:36`, `handlers.rs:4862` and `CHANGE_FEED_PARAMS`, `db/omnigraph.rs` `prepare_diff` and `reopen_diff_continuation` | Filed as E35 (#969), E36 (#970), E37 (#972) and E38 (#1157, filed after: the feed's 128-commit page has no HTTP parameter). Studio waits five minutes for a read of changes and says the server is still working (spec 008) |
 | 2026-10-22 | The first published build whose CLI reads Studio's home is `edge-20261022-7fff9df` | `git ls-remote --tags` of ModernRelay/omnigraph (`edge-20261021-888223b`, then `edge-20261022-7fff9df` at `7fff9dfd`); `git merge-base --is-ancestor ff542202 7fff9dfd`; the installed `0.14.0-edge+7fff9df`'s `version --json` and `config validate --operator-config` on a file with a loopback server target of `auth: {provider: anonymous}`, beside `0.14.0-edge+888223b`'s | `7fff9dfd` contains `ff542202`. `7fff9df` reports protocols `target` 1, `credential` 1, `access` 1 and passes the file; `888223b` reports the same protocols and refuses it (`invalid type: string "anonymous", expected internally tagged enum StrictAuthProfile`) |
 | 2026-10-21 | The CLI reads only the version-1 operator configuration, and no published build reads Studio's home yet | Omnigraph main `97788d37`: `operator_schema.rs` (`target_config_version` refused), the diff `888223b7..ff542202` of `operator_schema.rs` (server `auth` from a map to one provider), `commands/targets/args.rs` (`config validate`); `gh release list` (newest `edge-20261021-888223b`, 2026-10-22 00:21 UTC); `~/.local/bin/omnigraph version --json` and `config validate --operator-config /dev/null` | `0.14.0-edge+50283ce` reports `http_contract` 0.14 and `protocols.target` 1, and answers "unrecognized subcommand 'config'" (exit 2). `888223b` has #1115 without #1126. E34 filed as #1127 |
