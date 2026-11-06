@@ -51,8 +51,10 @@ impl PlaneHandle {
 }
 
 /// A managed cluster's token source: the control plane's data token while it holds a sign-in,
-/// else the CLI's. To the connection it is the managed target's login, as the CLI's is, so the
-/// cluster's own sign-in is still preferred where its 401 offers one (spec 016).
+/// else the CLI's. While the plane holds a sign-in it is preferred over the cluster's own, so one
+/// sign-in serves every organization's clusters (spec 021); without one it is the managed
+/// target's login, as the CLI's is, and the cluster's own sign-in is preferred where its 401
+/// offers one (spec 016).
 pub(crate) struct ControlTokenSource {
     /// The CLI's export for the target, when a CLI target names the cluster.
     cli: Option<Arc<dyn TokenSource>>,
@@ -171,10 +173,11 @@ impl TokenSource for ControlTokenSource {
         .boxed()
     }
 
-    /// Held back as a managed login is, whether or not a profile names it: a cluster whose 401
-    /// offers its own sign-in is signed in to instead (spec 016).
+    /// Held back as a managed login is, whether or not a profile names it, only while the
+    /// control plane holds no sign-in: then a cluster whose 401 offers its own sign-in is signed
+    /// in to instead (spec 016). With one, the plane's data token is taken at once (spec 021).
     fn waits_for_server_sign_in(&self) -> bool {
-        true
+        self.plane.held().is_none()
     }
 
     fn login_profile(&self) -> Option<String> {

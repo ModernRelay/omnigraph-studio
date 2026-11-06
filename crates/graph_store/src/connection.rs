@@ -226,9 +226,11 @@ pub struct Connection {
     /// What Studio needs to sign in to a server that asks; `None` for a connection that never
     /// signs in (the environment's server, tests).
     sign_in_context: Option<SignInContext>,
-    /// A managed target's CLI login, held back until the server's 401 says whether it offers a
+    /// A managed target's login, held back until the server's 401 says whether it offers a
     /// sign-in of its own (spec 016, When Studio signs in): one that does is signed in to, and
-    /// this is dropped; one that offers none takes this as its token source.
+    /// this is kept for a control plane's sign-in to take up later; one that offers none takes
+    /// this as its token source. A control plane's data token is not held back while the plane
+    /// holds a sign-in (spec 021).
     standby: Option<Arc<dyn TokenSource>>,
     /// The server's 401 offered no sign-in while a managed target's CLI login was held back, so
     /// that login is the token source from then on ([`Self::standby`]).
@@ -1327,17 +1329,25 @@ impl Connection {
     /// 401 to a graph's request (a read, a write, the agent's) has its own bound
     /// ([`Self::request_refused`]). One the server did not refuse is not asked about.
     fn refused(&mut self, failed: Failed, token_sent: bool, cx: &mut Context<Self>) {
-        // A managed target's CLI login was held back for this answer: a server that offers a
-        // sign-in is signed in to, and its login dropped; one that offers none, or one Studio
-        // cannot sign in to here, takes the login and connects with it.
+        // A managed target's login was held back for this answer. A control plane's data token
+        // while the plane holds a sign-in connects at once, whatever the server offers (spec
+        // 021, One sign-in, every organization). Otherwise a server that offers a sign-in is
+        // signed in to, the login kept back for a later control-plane sign-in
+        // ([`Self::take_plane_sign_in`]); one that offers none, or one Studio cannot sign in to
+        // here, takes the login and connects with it.
         if failed.state == ConnectionState::Unauthorized && !token_sent && self.standby.is_some() {
+            if self.standby_serves() {
+                let login = self.standby.take();
+                self.take_token_from(login, cx);
+                return;
+            }
             let offers = failed
                 .challenge
                 .as_deref()
                 .and_then(Challenge::resource_metadata)
                 .is_some();
             if offers && self.sign_in_context.is_some() {
-                self.standby = None;
+                // Kept: the sign-in offered below goes ahead.
             } else {
                 self.offers_no_sign_in = true;
                 let login = self.standby.take();
@@ -1767,6 +1777,25 @@ impl Connection {
     /// or a rename ended is kept before anything else is offered.
     pub fn sign_in_under_way(&self) -> bool {
         self.signing_in.is_some()
+    }
+
+    /// Whether the login held back gives a token without the server's own sign-in now: a
+    /// control plane's data token while the plane holds a sign-in.
+    fn standby_serves(&self) -> bool {
+        self.standby
+            .as_ref()
+            .is_some_and(|standby| !standby.waits_for_server_sign_in())
+    }
+
+    /// A control plane signed in: a managed cluster that holds no sign-in of its own takes the
+    /// plane's data token it held back, so one sign-in serves every organization's clusters
+    /// (spec 021). A sign-in the cluster holds already stays.
+    pub(crate) fn take_plane_sign_in(&mut self, cx: &mut Context<Self>) {
+        if self.oauth.is_some() || !self.standby_serves() {
+            return;
+        }
+        let login = self.standby.take();
+        self.take_token_from(login, cx);
     }
 
     /// Whether a sign-in is held, whatever the sign-in state says: one a sign-in as someone else

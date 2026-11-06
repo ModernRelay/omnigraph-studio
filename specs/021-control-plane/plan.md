@@ -142,8 +142,8 @@ typed (Deferred).
 
 ### The data token
 
-For a cluster whose 401 offers no sign-in, Studio asks the control plane for the data token in
-place of `credentials export`:
+While the control plane holds a sign-in, Studio asks it for a managed cluster's data token in
+place of `credentials export`, whether or not the cluster's 401 offers a sign-in of its own:
 
 - `POST /v1/clusters/{id}/tokens` with `{"version": 2, "ttl_seconds": 900}`, 15 s, at most
   64 KiB. The token is kept in memory only and sent only to the returned `endpoint`, which must
@@ -154,8 +154,12 @@ place of `credentials export`:
 - Without a control-plane sign-in, the CLI's export stays the token source (spec 003).
 - This makes managed clusters usable on Windows, where the CLI exports no token.
 
-A cluster that offers its own sign-in keeps it (spec 016): a token from the control plane is
-not preferred over one the cluster's own sign-in gives.
+The control plane's token is preferred over the cluster's own sign-in (spec 016), so one
+sign-in serves every organization's clusters. A cluster's own sign-in binds the person's one
+consent to that cluster's organization (validation log, 2026-11-05), so preferring it asked for
+a sign-in on the web for each organization. Without a control-plane sign-in, a cluster that
+offers its own is signed in to as before. When the plane signs in later, a cluster that asked
+for its own sign-in and holds none takes the plane's token; one that holds a sign-in keeps it.
 
 ### Errors
 
@@ -204,7 +208,7 @@ managed target, sees none. Studio has one control plane of its own:
   profile names is its own plane. One sign-in each, and it lists every organization the person
   is a member of (One sign-in, every organization, below).
 - **Without the CLI.** Every cluster it lists opens for this run, with the control plane's data
-  token, or with the cluster's own sign-in where its 401 offers one. Its command to keep it is
+  token. Its command to keep it is
   `omnigraph target add <name> --cluster <id>`, with a profile when one names the organization.
   This needs no CLI, so managed clusters work on Windows through it.
 - **Tests.** The setting's lifecycle, a profile on the same route sharing the plane, every
@@ -337,7 +341,12 @@ of the client, cluster sign-ins included.
 | 2026-11-05 | The authorize request cannot name an organization | WorkOS Connect reference, `GET /oauth2/authorize` | Parameters: `client_id`, `nonce`, `redirect_uri`, `response_type`, `scope`, `state`, PKCE. No organization, no `prompt`: `prompt=login` asking is undocumented |
 | 2026-11-05 | A person has one organization through Studio's client at a time, and every token of it follows | WorkOS Connect reference, token exchange ("`org_id` reflects the organization currently associated with the user's consent"); a live experiment: a sign-in in A, a second choosing B, then a refresh of each | Both sign-ins shared one consent (`sid`); the refresh of the token issued in A named B. Cluster sign-ins (spec 016) use the same client and consent |
 | 2026-11-05 | The control plane scopes every request to the token's `org_id` | Its source, read with its owners' access | Membership of `org_id` checked; no request names an organization; nothing lists a person's organizations |
+| 2026-11-06 | A control plane's sign-in is preferred over a cluster's own | `cargo test -p graph_store a_control_plane_sign_in_is_preferred`, which fails with the preference removed | The plane's token connects a cluster that offers its own sign-in, made before or after the plane signed in, and one that offered its own already; nothing opens a browser |
 
 ## Corrections
 
-None yet.
+- **2026-11-06, the data token and a cluster's own sign-in.** The plan kept a cluster's own
+  sign-in ahead of the control plane's token. Every production cluster offers one, so each
+  organization's clusters asked for a sign-in on the web of their own, and each moved the one
+  consent. The control plane's token now comes first while the plane holds a sign-in (The data
+  token).

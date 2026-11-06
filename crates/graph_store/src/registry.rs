@@ -135,6 +135,8 @@ pub struct ConnectionRegistry {
     /// Follows the settings' `omnigraph_cli`, the CLI Studio looks for first
     /// ([`Self::follow_cli_setting`]).
     _cli_setting: Option<gpui::Subscription>,
+    /// What watches each control plane for a sign-in ([`Self::watch_plane`]).
+    plane_watches: Vec<(gpui::EntityId, gpui::Subscription)>,
     /// Each CLI server as last listed, by its address.
     cli_kept: HashMap<String, CliKept>,
     /// The CLI's targets have been listed once since Studio started; until then the CLI's
@@ -587,6 +589,7 @@ impl ConnectionRegistry {
                     let context = self.sign_in.clone();
                     let plane = cx.new(|cx| ControlPlane::new(route, context, cx));
                     self.control_planes.push(plane.clone());
+                    self.watch_plane(&plane, cx);
                     plane
                 }
             };
@@ -627,6 +630,7 @@ impl ConnectionRegistry {
                 async move { cli_tokens::target_digests(&places, &name).await }.boxed()
             }),
             _cli_setting: None,
+            plane_watches: Vec::new(),
             cli_kept: HashMap::new(),
             listed: true,
             listing_waiters: Vec::new(),
@@ -1049,9 +1053,28 @@ impl ConnectionRegistry {
                 plane.profiles = names;
                 plane
             });
-            self.control_planes.insert(at, plane);
+            self.control_planes.insert(at, plane.clone());
+            self.watch_plane(&plane, cx);
         }
         changed
+    }
+
+    /// Watches `plane` for a sign-in, which every managed cluster of it that held back the
+    /// plane's data token takes up: one sign-in serves every organization's clusters (spec 021).
+    /// A watch of a plane no longer kept goes.
+    fn watch_plane(&mut self, plane: &Entity<ControlPlane>, cx: &mut Context<Self>) {
+        let planes = &self.control_planes;
+        self.plane_watches
+            .retain(|(id, _)| planes.iter().any(|plane| plane.entity_id() == *id));
+        let watch = cx.observe(plane, |this, plane, cx| {
+            if !plane.read(cx).holds_sign_in() {
+                return;
+            }
+            for connection in this.connections.clone() {
+                connection.update(cx, |connection, cx| connection.take_plane_sign_in(cx));
+            }
+        });
+        self.plane_watches.push((plane.entity_id(), watch));
     }
 
     /// Brings the CLI's servers in line with the targets the CLI lists, and says whether

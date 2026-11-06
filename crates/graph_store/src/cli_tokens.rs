@@ -204,7 +204,8 @@ pub trait TokenSource: Send + Sync + 'static {
     }
 
     /// Whether the connection holds this back until the server's 401 says it offers no
-    /// sign-in of its own (spec 016): a managed target's login, or a control plane's data token.
+    /// sign-in of its own (spec 016): a managed target's login, or a control plane's data token
+    /// while the plane holds no sign-in. Asked again at each 401, so the answer may change.
     fn waits_for_server_sign_in(&self) -> bool {
         self.login_profile().is_some()
     }

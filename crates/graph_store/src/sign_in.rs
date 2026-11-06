@@ -4695,6 +4695,105 @@ mod tests {
         assert_eq!(login.asked(), 0);
     }
 
+    /// A control plane's data token for a managed cluster, as [`ControlTokenSource`] gives it:
+    /// it waits for the server's sign-in only while the plane holds none. Counts its asks.
+    ///
+    /// [`ControlTokenSource`]: crate::control_token::ControlTokenSource
+    #[derive(Default)]
+    struct Plane {
+        held: AtomicBool,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TokenSource for Plane {
+        fn token(&self, _: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, NoToken>> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            futures::future::ready(Ok(Token::typed("from-the-plane".into()))).boxed()
+        }
+
+        fn waits_for_server_sign_in(&self) -> bool {
+            !self.held.load(Ordering::SeqCst)
+        }
+
+        fn organization(&self) -> Option<String> {
+            Some("org_1".into())
+        }
+    }
+
+    /// One sign-in to the control plane serves every organization's clusters (spec 021): while
+    /// the plane holds a sign-in, a cluster that offers its own is reached with the plane's data
+    /// token instead, and a cluster that asked for its own before the plane signed in takes the
+    /// plane's token once it does.
+    #[gpui::test]
+    async fn a_control_plane_sign_in_is_preferred_over_the_clusters_own(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let served = || {
+            Arc::new(Mutex::new(Served {
+                accepted: HashSet::from(["from-the-plane".to_owned()]),
+                ..Served::default()
+            }))
+        };
+        let with_plane =
+            |served: &Arc<Mutex<Served>>, plane: Arc<Plane>, cx: &mut TestAppContext| {
+                let connection = connection(served, Arc::default(), cx);
+                connection.update(cx, |c, _| {
+                    *c = std::mem::replace(
+                        c,
+                        Connection::new(c.server.clone(), None, fake(served.clone())).unwrap(),
+                    )
+                    .with_token_source(Some(plane));
+                });
+                connection
+            };
+
+        // Signed in to the plane first: the plane's token, at once.
+        let first = served();
+        let plane = Arc::new(Plane::default());
+        plane.held.store(true, Ordering::SeqCst);
+        let connection = with_plane(&first, plane.clone(), cx);
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the connect", |cx| {
+            sign_in_state(&connection, cx).0 == ConnectionState::Ready
+        });
+        assert_eq!(plane.asked.load(Ordering::SeqCst), 1);
+        assert_eq!(sign_in_state(&connection, cx).1, SignIn::NotOffered);
+        assert_eq!(cx.opened_url(), None);
+
+        // Signed in to the plane after the connection was made: its 401 takes the plane's token.
+        let second = served();
+        let plane = Arc::new(Plane::default());
+        let connection = with_plane(&second, plane.clone(), cx);
+        plane.held.store(true, Ordering::SeqCst);
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the connect", |cx| {
+            sign_in_state(&connection, cx).0 == ConnectionState::Ready
+        });
+        assert_eq!(sign_in_state(&connection, cx).1, SignIn::NotOffered);
+
+        // Signed in to the plane after the cluster offered its own: the plane's token then.
+        let third = served();
+        let plane = Arc::new(Plane::default());
+        let connection = with_plane(&third, plane.clone(), cx);
+        connection.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the offer", |cx| {
+            matches!(sign_in_state(&connection, cx).1, SignIn::Offered { .. })
+        });
+        assert_eq!(plane.asked.load(Ordering::SeqCst), 0);
+        // Nothing to take up while the plane holds no sign-in.
+        connection.update(cx, |c, cx| c.take_plane_sign_in(cx));
+        assert!(matches!(
+            sign_in_state(&connection, cx).1,
+            SignIn::Offered { .. }
+        ));
+        plane.held.store(true, Ordering::SeqCst);
+        connection.update(cx, |c, cx| c.take_plane_sign_in(cx));
+        until(cx, "the connect", |cx| {
+            sign_in_state(&connection, cx).0 == ConnectionState::Ready
+        });
+        assert_eq!(sign_in_state(&connection, cx).1, SignIn::NotOffered);
+        assert_eq!(cx.opened_url(), None);
+    }
+
     /// A managed cluster whose 401 offers no sign-in is reached with the CLI's login, the interim
     /// before clusters offer one (spec 016): its token is asked for once the server's answer says
     /// so, and from then on at once, without a request that carries none.

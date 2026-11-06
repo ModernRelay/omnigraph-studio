@@ -1184,6 +1184,8 @@ mod tests {
             "02C".into(),
             "https://beta.graphs.test".into(),
         );
+        // Signed in, the plane's token is not held back for the cluster's own sign-in.
+        assert!(!source.waits_for_server_sign_in());
         let token = smol::block_on(source.token(Arc::default())).unwrap();
         assert_eq!(token.lease().unwrap().holder, "user_1");
         assert_eq!(token.into_string(), "data-token");
@@ -1212,6 +1214,7 @@ mod tests {
         cx.run_until_parked();
         let token = smol::block_on(source.token(Arc::default())).unwrap();
         assert_eq!(token.into_string(), "from-the-cli");
+        assert!(source.waits_for_server_sign_in());
     }
 
     #[gpui::test]
