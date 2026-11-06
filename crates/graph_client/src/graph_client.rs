@@ -10,6 +10,7 @@
 
 pub mod api;
 mod client;
+pub mod route;
 
 pub use api::{CommitChanges, ErrorOutput};
 pub use client::{

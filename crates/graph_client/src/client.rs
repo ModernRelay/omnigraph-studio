@@ -575,6 +575,35 @@ impl From<NoAnswer> for String {
     }
 }
 
+/// Counts a request on its route's counters when dropped, sent or not, answered or cancelled,
+/// with the bytes of the answer read, and keeps it among the requests under way meanwhile; a span
+/// of it goes to the trace while one is collected.
+struct Counted {
+    route: &'static crate::route::Route,
+    bytes: u64,
+    _span: studio_perf::Span,
+}
+
+impl Counted {
+    fn begin(base: &Url, method: &Method, url: &Url) -> Self {
+        let route = crate::route::counters(base, method, url);
+        studio_perf::REQUESTS_UNDER_WAY.add(1);
+        Self {
+            route,
+            bytes: 0,
+            _span: studio_perf::span_async("fetch", route.template),
+        }
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.route.requests.add(1);
+        self.route.bytes.add(self.bytes);
+        studio_perf::REQUESTS_UNDER_WAY.add(-1);
+    }
+}
+
 /// The server's transport, which a changed target replaces ([`GraphClient::set_http`]): a client
 /// that sends each request through the one current when it is sent, so everything holding it
 /// moves to a new one together, and a request under way finishes through the one it began with.
@@ -1244,6 +1273,7 @@ impl GraphClient {
         carry: Carry,
     ) -> Result<RawResponse, NoAnswer> {
         let head = method == Method::HEAD;
+        let mut counted = Counted::begin(&self.base, &method, &url);
         let (builder, carried) = self.request(method, &url, carry);
         let mut builder = builder.timeout(timeout);
         // A body is JSON unless the caller names its type: a Blob put's is raw bytes.
@@ -1288,6 +1318,7 @@ impl GraphClient {
         let bytes = read_body(response.into_body(), skip, keep, length)
             .await
             .map_err(|error| NoAnswer::Lost(describe_transport(&error.into())))?;
+        counted.bytes = bytes.len() as u64;
         self.note_answer(&url, &carried, status, contract.as_deref());
         Ok(RawResponse {
             carried,
@@ -1468,6 +1499,7 @@ impl GraphClient {
         if raw.body.len() > cap {
             return Err(ReadError::TooLarge { limit: cap });
         }
+        let _decode = studio_perf::span("decode", std::any::type_name::<T>());
         serde_json::from_slice(&raw.body).map_err(|error| ReadError::Decode(error.to_string()))
     }
 
@@ -1718,6 +1750,7 @@ impl GraphClient {
             )));
         }
         self.fresh_token().await;
+        let _counted = Counted::begin(&self.base, &request.method, &url);
         let (mut builder, carried) = self.request(request.method, &url, Carry::Token);
         for (name, value) in &request.headers {
             builder = builder.header(name.as_str(), value.as_str());
@@ -1790,6 +1823,7 @@ impl GraphClient {
         graph: &str,
         request: &QueryRequest,
     ) -> Result<ReadOutput, ReadError> {
+        crate::route::query_counter(request.name.as_deref()).add(1);
         self.read_capped(
             Method::POST,
             &["graphs", graph, "query"],
