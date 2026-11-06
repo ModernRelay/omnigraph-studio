@@ -199,36 +199,43 @@ managed target, sees none. Studio has one control plane of its own:
 
 - **Where it is.** A setting, `omnigraph_cloud`, defaults to `https://platform.omnigraph.dev`
   and is shown as "Omnigraph Cloud". Empty turns it off. It is one address Studio ships with,
-  not a list Studio keeps: the clusters still come from the control plane (I), and each CLI
-  profile's route still makes its own control plane as today.
-- **No organization before sign-in.** The default has no profile, so it names no organization.
-  It signs in as any control plane does (its metadata, Studio's client, `resource=<route>`),
-  but with no organization pinned. The token's `org_id` names it, and that organization is
-  held from then on. To use another one, sign in again.
-- **The organization is asked for when it is needed.** AuthKit asks which organization only as
-  the person signs in, and skips that while the browser is signed in already, so a second
-  profile's sign-in gets the browser's organization. Asking costs a full sign-in on the web, so
-  a sign-in sends no `prompt` first. After a refused sign-in (another organization's token) or
-  a sign-out, the next sends `prompt=login`, and its button reads "Choose organization".
-  `prompt=consent` and `select_account` do not bring the question back. A cluster's own
-  sign-in (spec 016) sends no `prompt`.
-- **Its keychain item** is `omnigraph-control:<route>`, with no organization: one cloud sign-in
-  at a time, which names its organization when the token is refreshed at launch.
-- **One plane for one pair.** When a CLI profile names the same route and the organization the
-  default's sign-in is in, the two are one control plane. The profile's row is shown, and the
-  sign-in is kept under the default's item.
-- **The Open dialog** shows "Omnigraph Cloud · Sign in to list your organization's clusters"
-  while no profile names a control plane, and below the profiles' when one does. Every cluster
-  there is "Not a CLI target". It opens for this run with the control plane's data token, or
-  with the cluster's own sign-in where its 401 offers one. Its command to keep it is
-  `omnigraph target add <name> --cluster <id>`, with the CLI's default profile.
-- **Windows.** This path needs no CLI, so managed clusters work on Windows through it.
-- **Code.** `ControlPlane.organization` becomes optional (pinned by a profile, or learned
-  from the token). The registry makes the default's plane when the setting names a route,
-  and merges it with a profile's plane once both are known. `studio_settings` gains the
-  setting. No new crate, and no new outside request beyond what this spec allows.
-- **Tests.** A default sign-in learns its organization from the token. A profile on the same
-  pair merges into it. An empty setting makes no plane. Nothing is sent before a sign-in.
+  not a list Studio keeps: the clusters still come from the control plane (I).
+- **It is the plane at that route.** A CLI profile on the same route shares it; another route a
+  profile names is its own plane. One sign-in each, and it lists every organization the person
+  is a member of (One sign-in, every organization, below).
+- **Without the CLI.** Every cluster it lists opens for this run, with the control plane's data
+  token, or with the cluster's own sign-in where its 401 offers one. Its command to keep it is
+  `omnigraph target add <name> --cluster <id>`, with a profile when one names the organization.
+  This needs no CLI, so managed clusters work on Windows through it.
+- **Tests.** The setting's lifecycle, a profile on the same route sharing the plane, every
+  organization listed from one sign-in, and nothing sent before a sign-in.
+
+### One sign-in, every organization
+
+WorkOS keeps one consent per person and app, its organization is chosen at authorization, and
+every token Studio's client holds follows it (validation log, 2026-11-05). So Studio holds one
+sign-in per control plane, never one per organization, and each request names the
+organization it acts in:
+
+- **The control plane takes the organization from the request (CP4).** A request with
+  Studio's token may send one `Omnigraph-Organization: org_…` header; the control plane checks
+  the person's active membership there, reads their permissions there (narrowed by Studio's
+  allowlisted ceiling), and scopes the request to it. Without the header the token's `org_id`
+  applies. `GET /v1/organizations` lists the person's active memberships with their names.
+- **One plane per route.** A CLI profile names a route and an organization; profiles on one
+  route share its plane, and Omnigraph Cloud is the plane at `omnigraph_cloud`'s address,
+  whether or not a profile names it. Its sign-in is kept at `omnigraph-control:<route>`.
+- **Signing in asks nothing about organizations.** No `prompt`, and no organization pinned:
+  any organization the consent names will do. Studio refuses nothing on `org_id`.
+- **Listing.** With a sign-in held, the Open dialog reads `GET /v1/organizations`, then each
+  organization's `GET /v1/clusters` with the header, and shows every organization by name with
+  its clusters. A profile in an organization the person is not a member of says so.
+- **Data tokens and status** name the cluster's organization: a CLI target's profile's, or the
+  organization a cluster was opened from.
+
+The rejected design, one organization at a time chosen by signing in again, needed the
+undocumented `prompt=login` to ask, cost a sign-in on the web each time, and moved every token
+of the client, cluster sign-ins included.
 
 ## Decisions
 
@@ -282,10 +289,13 @@ managed target, sees none. Studio has one control plane of its own:
   procedure: the token issuer follows the provider's custom domain, so a new domain refuses
   every token from the old one at once. The API and each cluster accept both issuers until the
   old one's last access token has expired (300 s), then drop the old one.
-- **CP3, the control plane**: name the organization and the account in what Studio can read
-  (`/v1/auth/session` gains the organization's `name` and the account's `email`, or a route
-  gives them). Today the `Organization` schema is only `{organization_id}`, and the token's
-  `sub` is a user ID, so Studio shows `org_…` and says "Signed in" without saying as whom.
+- **CP3, the control plane**: name the account in what Studio can read (its email). The
+  organization's name now comes with CP4's `GET /v1/organizations`; the token's `sub` is still a
+  user ID, so Studio says "Signed in" without saying as whom.
+- **CP4, the control plane**: requests that name their organization (`Omnigraph-Organization`),
+  authorized by membership in it, and `GET /v1/organizations` with names. Specified and built in
+  the control plane's source; Studio's pinned document has both. Not yet deployed: until it is,
+  Studio's reads without the header still work in the consent's organization.
 - **CP2, the control plane**: say whether its `openapi.json` is a stable contract Studio may pin
   (it is `0.1.0`), and how a breaking change is announced.
 
@@ -299,9 +309,8 @@ managed target, sees none. Studio has one control plane of its own:
 3. How a person in several organizations signs in to the profile's (spec 016, question 4).
 4. Whether the list should show clusters the person may see but not open (no admission): the
    control plane lists them; `POST /tokens` then answers 403.
-5. Settled (2026-11-05): an account in several organizations is asked which one only as it
-   signs in. A signed-in browser gets the organization it is in, so Studio sends
-   `prompt=login` when a sign-in must choose: after a refusal or a sign-out.
+5. Settled (2026-11-05): an account in several organizations does not choose at sign-in;
+   each request names its organization (CP4), so one sign-in serves them all.
 
 ## Validation log
 
@@ -325,6 +334,9 @@ managed target, sees none. Studio has one control plane of its own:
 | 2026-11-05 | A second profile's sign-in gets the organization the browser is signed in to | Live sign-in for profile `omnigraph…` (`org_01M67VZM…`) after one for `managed-og` (`org_01M1V5…`) | AuthKit asked nothing; the token named `org_01M1V5…`, which Studio refused |
 | 2026-11-05 | `prompt=login` makes AuthKit ask the organization; `consent` does not, and `organization_id` is dropped | `curl` of `/oauth2/authorize` with each (AuthKit keeps `prompt`, not `organization_id`); live sign-ins as Studio's client with `prompt=consent`, then `prompt=login` | `consent`: not asked. `login`: asked, and the token named the organization chosen (`org_01M67SX1…`); `GET /v1/clusters` 200 |
 | 2026-11-05 | `prompt=login` asks at the cost of a full web sign-in; `select_account` asks nothing | Live sign-ins as Studio's client with each | `login`: a sign-in on the web every time; `select_account`: signed straight in to the browser's organization |
+| 2026-11-05 | The authorize request cannot name an organization | WorkOS Connect reference, `GET /oauth2/authorize` | Parameters: `client_id`, `nonce`, `redirect_uri`, `response_type`, `scope`, `state`, PKCE. No organization, no `prompt`: `prompt=login` asking is undocumented |
+| 2026-11-05 | A person has one organization through Studio's client at a time, and every token of it follows | WorkOS Connect reference, token exchange ("`org_id` reflects the organization currently associated with the user's consent"); a live experiment: a sign-in in A, a second choosing B, then a refresh of each | Both sign-ins shared one consent (`sid`); the refresh of the token issued in A named B. Cluster sign-ins (spec 016) use the same client and consent |
+| 2026-11-05 | The control plane scopes every request to the token's `org_id` | Its source, read with its owners' access | Membership of `org_id` checked; no request names an organization; nothing lists a person's organizations |
 
 ## Corrections
 

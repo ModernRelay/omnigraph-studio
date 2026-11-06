@@ -1844,6 +1844,34 @@
         ],
         "type": "object"
       },
+      "Envelope_OrganizationList": {
+        "description": "Every successful product API response contains data and its provenance.\nHealth and OAuth protected-resource metadata use their own standard bodies.",
+        "properties": {
+          "data": {
+            "description": "The organizations the signed-in person is an active member of.",
+            "properties": {
+              "organizations": {
+                "items": {
+                  "$ref": "#/components/schemas/OrganizationSummary"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "organizations"
+            ],
+            "type": "object"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "required": [
+          "data",
+          "meta"
+        ],
+        "type": "object"
+      },
       "Envelope_RebuildResult": {
         "description": "Every successful product API response contains data and its provenance.\nHealth and OAuth protected-resource metadata use their own standard bodies.",
         "properties": {
@@ -2699,6 +2727,40 @@
         ],
         "type": "object"
       },
+      "OrganizationList": {
+        "description": "The organizations the signed-in person is an active member of.",
+        "properties": {
+          "organizations": {
+            "items": {
+              "$ref": "#/components/schemas/OrganizationSummary"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "organizations"
+        ],
+        "type": "object"
+      },
+      "OrganizationSummary": {
+        "properties": {
+          "name": {
+            "description": "The organization's name, as the identity provider holds it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "organization_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "organization_id",
+          "name"
+        ],
+        "type": "object"
+      },
       "ProblemDetails": {
         "additionalProperties": {
           "description": "Typed refusals may include further machine-readable context."
@@ -3196,7 +3258,7 @@
     },
     "securitySchemes": {
       "bearerAuth": {
-        "description": "WorkOS mode requires the configured AuthKit human access JWT and current organization membership, a Connect human access token issued to an allowlisted standard client for this API's own resource (its permissions are the person's current permissions narrowed by the client's ceiling), or the explicitly configured organization-owned M2M profile. Machine service authority is current WorkOS application scopes intersected with the signed token ceiling; machines cannot administer organization members. WorkOS service permissions authorize organization-wide service operations; applied Cedar owns native permissions. Login, refresh and client-credentials exchange occur at WorkOS. Development mode accepts its explicitly configured local bearer. Graph identity credentials cannot authenticate control requests.",
+        "description": "WorkOS mode requires the configured AuthKit human access JWT and current organization membership, a Connect human access token issued to an allowlisted standard client for this API's own resource (its permissions are the person's current permissions narrowed by the client's ceiling, in the organization the request names in `Omnigraph-Organization`, else the token's `org_id`), or the explicitly configured organization-owned M2M profile. Machine service authority is current WorkOS application scopes intersected with the signed token ceiling; machines cannot administer organization members. WorkOS service permissions authorize organization-wide service operations; applied Cedar owns native permissions. Login, refresh and client-credentials exchange occur at WorkOS. Development mode accepts its explicitly configured local bearer. Graph identity credentials cannot authenticate control requests.",
         "scheme": "bearer",
         "type": "http"
       }
@@ -7891,6 +7953,108 @@
         "summary": "Replace one active, directly managed membership's complete role assignment\nwith 1 through 256 sorted unique provider organization roles.\nRequires `members_manage`; native Cedar is unchanged.\nUncertain receipts retain the pre-write observation and are never resent.",
         "tags": [
           "Administration"
+        ]
+      }
+    },
+    "/v1/organizations": {
+      "get": {
+        "description": "The organizations the signed-in person is an active member of, read from\n`WorkOS` on each request, with their names. A standard OAuth client names\none of them in `Omnigraph-Organization` to act in it; its consent names only\none organization at a time. People only; machines refuse.",
+        "operationId": "listOrganizations",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_OrganizationList"
+                }
+              }
+            },
+            "description": "Active memberships"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Application refusal or failure. The type field is the stable machine-readable code; additional fields may carry bounded, disclosure-filtered details."
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Application refusal or failure. The type field is the stable machine-readable code; additional fields may carry bounded, disclosure-filtered details."
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Application refusal or failure. The type field is the stable machine-readable code; additional fields may carry bounded, disclosure-filtered details."
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Application refusal or failure. The type field is the stable machine-readable code; additional fields may carry bounded, disclosure-filtered details."
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Application refusal or failure. The type field is the stable machine-readable code; additional fields may carry bounded, disclosure-filtered details."
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Application refusal or failure. The type field is the stable machine-readable code; additional fields may carry bounded, disclosure-filtered details."
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Application refusal or failure. The type field is the stable machine-readable code; additional fields may carry bounded, disclosure-filtered details."
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Application refusal or failure. The type field is the stable machine-readable code; additional fields may carry bounded, disclosure-filtered details."
+          }
+        },
+        "summary": "List the caller's organizations",
+        "tags": [
+          "Authentication"
         ]
       }
     },

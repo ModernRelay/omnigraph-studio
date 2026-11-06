@@ -12,6 +12,7 @@ mod client;
 pub use api::{
     BackupObservation, Binding, ClusterCell, ClusterDetail, ClusterList, ClusterStatus,
     ClusterView, DataCredential, DeploymentView, Envelope, Freshness, IdentityRequest, Meta,
-    OperationKind, Problem, Provenance, RequestedSource, ServiceObservation, ServingHealth,
+    OperationKind, OrganizationList, OrganizationSummary, Problem, Provenance, RequestedSource,
+    ServiceObservation, ServingHealth,
 };
-pub use client::{ControlClient, ControlError, DATA_TOKEN_SECONDS, Limits};
+pub use client::{ControlClient, ControlError, DATA_TOKEN_SECONDS, Limits, ORGANIZATION_HEADER};

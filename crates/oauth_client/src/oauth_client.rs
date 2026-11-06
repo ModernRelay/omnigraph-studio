@@ -29,8 +29,7 @@ pub const SIGN_IN_WAIT: std::time::Duration = std::time::Duration::from_secs(5 *
 pub const MAX_ACCESS_SECONDS: u64 = 300;
 
 /// The address the browser opens to sign in (RFC 6749 §4.1.1, RFC 7636 §4.3, RFC 8707): the
-/// server's authorization endpoint with the sign-in's parameters added to any it has, and
-/// `prompt` (OpenID Connect Core §3.1.2.1) when the sign-in asks for one.
+/// server's authorization endpoint with the sign-in's parameters added to any it has.
 pub fn authorization_url(
     server: &AuthorizationServer,
     client_id: &str,
@@ -38,7 +37,6 @@ pub fn authorization_url(
     pkce: &Pkce,
     state: &str,
     resource: &str,
-    prompt: Option<&str>,
 ) -> Url {
     let mut url = server.authorization_endpoint.clone();
     {
@@ -53,9 +51,6 @@ pub fn authorization_url(
             .append_pair("resource", resource);
         if let Some(scope) = server.scope() {
             query.append_pair("scope", scope);
-        }
-        if let Some(prompt) = prompt {
-            query.append_pair("prompt", prompt);
         }
     }
     url

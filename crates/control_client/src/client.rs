@@ -10,8 +10,13 @@ use serde::de::DeserializeOwned;
 use url::{Host, Url};
 
 use crate::api::{
-    ClusterDetail, ClusterList, ClusterStatus, DataCredential, Envelope, IdentityRequest, Problem,
+    ClusterDetail, ClusterList, ClusterStatus, DataCredential, Envelope, IdentityRequest,
+    OrganizationList, Problem,
 };
+
+/// The header a request names the organization it acts in: the token's consent names one
+/// organization at a time, so a person's other organizations are named here.
+pub const ORGANIZATION_HEADER: &str = "omnigraph-organization";
 
 /// How long a data token Studio asks for lives, in seconds (spec 021, Decisions): removing a
 /// person's admission does not retract a token, so the shorter it lives the sooner it holds.
@@ -110,6 +115,8 @@ pub struct ControlClient {
     http: Arc<dyn HttpClient>,
     route: Url,
     access_token: String,
+    /// The organization its requests act in, when they name one.
+    organization: Option<String>,
 }
 
 impl std::fmt::Debug for ControlClient {
@@ -117,6 +124,7 @@ impl std::fmt::Debug for ControlClient {
         f.debug_struct("ControlClient")
             .field("route", &self.route.as_str())
             .field("access_token", &"<withheld>")
+            .field("organization", &self.organization)
             .finish()
     }
 }
@@ -140,7 +148,22 @@ impl ControlClient {
             http,
             route,
             access_token,
+            organization: None,
         })
+    }
+
+    /// Its requests act in `organization`, one the signed-in person is a member of, rather
+    /// than the one the token's consent names.
+    pub fn in_organization(mut self, organization: impl Into<String>) -> Self {
+        self.organization = Some(organization.into());
+        self
+    }
+
+    /// `GET /v1/organizations`: the organizations the signed-in person is an active member of,
+    /// with their names.
+    pub async fn organizations(&self) -> Result<Envelope<OrganizationList>, ControlError> {
+        self.request(Method::GET, &["v1", "organizations"], None, Limits::READ)
+            .await
     }
 
     pub fn route(&self) -> &Url {
@@ -231,6 +254,9 @@ impl ControlClient {
             .timeout(limits.timeout);
         if body.is_some() {
             builder = builder.header("content-type", "application/json");
+        }
+        if let Some(organization) = &self.organization {
+            builder = builder.header(ORGANIZATION_HEADER, organization.as_str());
         }
         let request = builder
             .body(body.map(AsyncBody::from).unwrap_or_else(AsyncBody::empty))
@@ -395,6 +421,7 @@ mod tests {
         method: String,
         url: String,
         authorization: Option<String>,
+        organization: Option<String>,
         body: Vec<u8>,
     }
 
@@ -413,12 +440,18 @@ mod tests {
                     .get("authorization")
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_owned);
+                let organization = request
+                    .headers()
+                    .get(ORGANIZATION_HEADER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
                 let mut sent = Vec::new();
                 request.into_body().read_to_end(&mut sent).await?;
                 noted.lock().unwrap().push(Seen {
                     method,
                     url,
                     authorization,
+                    organization,
                     body: sent,
                 });
                 Ok(Response::builder()
@@ -483,6 +516,31 @@ mod tests {
         assert_eq!(
             seen[0].authorization.as_deref(),
             Some("Bearer access-token")
+        );
+    }
+
+    #[test]
+    fn a_request_names_its_organization_only_when_told() {
+        let (client, seen) = client(
+            200,
+            json!({"data": {"organizations": [
+                {"organization_id": "org_1", "name": "Acme"},
+                {"organization_id": "org_2", "name": null},
+            ]}, "meta": meta()}),
+        );
+        let listed = smol::block_on(client.organizations()).unwrap();
+        assert_eq!(listed.data.organizations[0].name.as_deref(), Some("Acme"));
+        assert_eq!(listed.data.organizations[1].name, None);
+        assert_eq!(
+            seen.lock().unwrap()[0].url,
+            "https://control.example/v1/organizations"
+        );
+        assert_eq!(seen.lock().unwrap()[0].organization, None);
+        let in_two = client.in_organization("org_2");
+        let _ = smol::block_on(in_two.clusters());
+        assert_eq!(
+            seen.lock().unwrap()[1].organization.as_deref(),
+            Some("org_2")
         );
     }
 

@@ -28,8 +28,9 @@ pub(crate) enum Place {
     /// A control plane's line: ↵ signs in, cancels a sign-in under way, or reads its clusters
     /// again (spec 021).
     Plane(EntityId),
-    /// A cluster of a control plane's list that opens for this run, by its `cluster_id`.
-    Cluster(EntityId, String),
+    /// A cluster of a control plane's list that opens for this run: its organization and
+    /// `cluster_id`.
+    Cluster(EntityId, String, String),
     Graph(String),
     /// The field for a new token, shown when the server refused the token.
     Token,
@@ -234,14 +235,14 @@ impl OpenGraphModal {
             }
             let subscription = cx.observe(plane, |_, plane, cx| {
                 // A sign-in that landed while the dialog shows the plane lists its clusters.
-                if plane.read(cx).holds_sign_in() && plane.read(cx).listing().is_none() {
+                if plane.read(cx).holds_sign_in() && plane.read(cx).organizations().is_none() {
                     plane.update(cx, |plane, cx| plane.read_clusters(cx));
                 }
                 cx.notify();
             });
             self.followed_planes.push((id, subscription));
             plane.update(cx, |plane, cx| {
-                if plane.holds_sign_in() && plane.listing().is_none() {
+                if plane.holds_sign_in() && plane.organizations().is_none() {
                     plane.read_clusters(cx);
                 }
             });
@@ -478,7 +479,7 @@ impl OpenGraphModal {
                         plane.update(cx, crate::organizations::enter);
                     }
                 }
-                Some(Place::Cluster(id, cluster_id))
+                Some(Place::Cluster(id, organization, cluster_id))
                     if !self.graph_id.focus_handle(cx).is_focused(window) =>
                 {
                     let found =
@@ -486,11 +487,11 @@ impl OpenGraphModal {
                             .iter()
                             .find(|p| p.entity_id() == id)
                             .and_then(|plane| {
-                                crate::organizations::cluster(plane, &cluster_id, cx)
+                                crate::organizations::cluster(plane, &organization, &cluster_id, cx)
                                     .map(|cluster| (plane.clone(), cluster))
                             });
                     if let Some((plane, cluster)) = found {
-                        self.open_cluster(&plane, &cluster, window, cx);
+                        self.open_cluster(&plane, &organization, &cluster, window, cx);
                     }
                 }
                 _ => {
@@ -514,12 +515,14 @@ impl OpenGraphModal {
     pub(crate) fn open_cluster(
         &mut self,
         plane: &Entity<ControlPlane>,
+        organization: &str,
         cluster: &control_client::ClusterView,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let opened = ConnectionRegistry::global(cx)
-            .update(cx, |registry, cx| registry.open_cluster(plane, cluster, cx));
+        let opened = ConnectionRegistry::global(cx).update(cx, |registry, cx| {
+            registry.open_cluster(plane, organization, cluster, cx)
+        });
         match opened {
             Some(connection) => {
                 let connections = ConnectionRegistry::global(cx).read(cx).connections.clone();
@@ -2226,13 +2229,9 @@ mod tests {
     fn a_control_plane_without_a_sign_in_offers_one(cx: &mut TestAppContext) {
         let (modal, cx) = dialog(vec![server(&["knowledge"], cx)], cx);
         let plane = cx.new(|cx| {
-            ControlPlane::new(
-                "https://control.test".into(),
-                "org_1".into(),
-                vec!["work".into()],
-                None,
-                cx,
-            )
+            let mut plane = ControlPlane::new("https://control.test".into(), None, cx);
+            plane.profiles = vec![("work".into(), Some("org_1".into()))];
+            plane
         });
         modal.update(cx, |modal, cx| {
             modal.follow_planes(vec![plane.clone()], Vec::new(), cx)
@@ -2240,7 +2239,7 @@ mod tests {
         cx.run_until_parked();
         assert!(cx.debug_bounds("control-plane-sign-in").is_some());
         assert!(cx.debug_bounds("control-plane-clusters").is_none());
-        assert!(plane.read_with(cx, |plane, _| plane.listing().is_none()));
+        assert!(plane.read_with(cx, |plane, _| plane.organizations().is_none()));
     }
 
     /// ↓ from the last server reaches a control plane's line, before the chosen server's
@@ -2250,13 +2249,9 @@ mod tests {
         let alpha = server(&["one"], cx);
         let (modal, cx) = dialog(vec![alpha.clone()], cx);
         let plane = cx.new(|cx| {
-            ControlPlane::new(
-                "https://control.test".into(),
-                "org_1".into(),
-                vec!["work".into()],
-                None,
-                cx,
-            )
+            let mut plane = ControlPlane::new("https://control.test".into(), None, cx);
+            plane.profiles = vec![("work".into(), Some("org_1".into()))];
+            plane
         });
         modal.update(cx, |modal, cx| {
             modal.follow_planes(vec![plane.clone()], Vec::new(), cx)

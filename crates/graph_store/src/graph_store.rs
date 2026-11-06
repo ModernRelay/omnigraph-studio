@@ -40,7 +40,7 @@ pub use connection::{
     Connection, ConnectionEvent, ConnectionState, ConnectionWatch, GraphListing, HeldRefusal,
     PromptAction, ServerEntry, ServerSource, SignInPrompt,
 };
-pub use control_plane::{ControlPlane, Listing};
+pub use control_plane::{ControlPlane, Listing, Organizations};
 pub use degrees::page_counts;
 pub use entity_groups::{
     EntityGroup, EntityGroups, GroupRelationship, GroupRun, GroupSection, NodeNames,

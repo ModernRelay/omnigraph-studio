@@ -1,35 +1,44 @@
-//! The organizations under the Open dialog's servers (spec 021): each control plane a CLI
-//! profile names, its sign-in, and, while the dialog is open, the organization's clusters as the
-//! control plane answered them. Studio keeps no list of its own: the answer is let go when the
-//! dialog closes.
+//! The control planes under the Open dialog's servers (spec 021): Omnigraph Cloud, and any other
+//! a CLI profile names. One sign-in each serves every organization the person is a member of;
+//! while the dialog is open, it lists them by name, each with its clusters as the control plane
+//! answered them. Studio keeps no list of its own: the answers are let go when the dialog closes.
 
 use control_client::{ClusterView, ControlError};
 use gpui::{AnyElement, Context, Entity};
 use graph_store::cli_config::ManagedTarget;
 use graph_store::sign_in::SignIn;
-use graph_store::{ControlPlane, Listing};
+use graph_store::{ControlPlane, Listing, Organizations};
 use studio_ui::ds::Tipped as _;
 use studio_ui::ds::{self, MenuRow, size, space};
 use ui::prelude::*;
 
 use crate::open_graph::{OpenGraphModal, Place};
 
-/// The places the keyboard reaches in the organizations, in order: each control plane's line,
-/// then its clusters that open for this run.
+/// The places the keyboard reaches in the control planes, in order: each plane's sign-in line,
+/// then the clusters that open for this run, organization by organization.
 pub(crate) fn places(
     planes: &[Entity<ControlPlane>],
     managed: &[ManagedTarget],
     cx: &App,
 ) -> Vec<Place> {
     let mut places = Vec::new();
-    for (plane, _) in shown(planes, cx) {
-        let plane = &plane;
+    for plane in planes {
         let id = plane.entity_id();
         places.push(Place::Plane(id));
-        if let Some(Listing::Listed(listed)) = plane.read(cx).listing() {
-            for cluster in &listed.data.clusters {
-                if cluster_row(cluster, managed).opens {
-                    places.push(Place::Cluster(id, cluster.cluster_id.clone()));
+        let p = plane.read(cx);
+        let Some(Organizations::Listed(organizations)) = p.organizations() else {
+            continue;
+        };
+        for organization in organizations {
+            if let Some(Listing::Listed(listed)) = p.listing(&organization.organization_id) {
+                for cluster in &listed.data.clusters {
+                    if cluster_row(cluster, managed).opens {
+                        places.push(Place::Cluster(
+                            id,
+                            organization.organization_id.clone(),
+                            cluster.cluster_id.clone(),
+                        ));
+                    }
                 }
             }
         }
@@ -37,45 +46,7 @@ pub(crate) fn places(
     places
 }
 
-/// The planes shown: each, but a profile's that Omnigraph Cloud's default covers, with its
-/// profiles named under the default instead (spec 021, One plane for one pair).
-pub(crate) fn shown(
-    planes: &[Entity<ControlPlane>],
-    cx: &App,
-) -> Vec<(Entity<ControlPlane>, Vec<String>)> {
-    let cloud = planes.iter().find(|plane| {
-        let plane = plane.read(cx);
-        plane.is_default() && plane.holds_sign_in()
-    });
-    let covers = |plane: &Entity<ControlPlane>| {
-        let Some(cloud) = cloud else { return false };
-        let (cloud, plane) = (cloud.read(cx), plane.read(cx));
-        !plane.is_default()
-            && cloud.route.trim_end_matches('/') == plane.route.trim_end_matches('/')
-            && cloud.organization().is_some()
-            && cloud.organization() == plane.organization()
-    };
-    let covered: Vec<String> = planes
-        .iter()
-        .filter(|plane| covers(plane))
-        .flat_map(|plane| plane.read(cx).profiles.clone())
-        .collect();
-    planes
-        .iter()
-        .filter(|plane| !covers(plane))
-        .map(|plane| {
-            let profiles = if plane.read(cx).is_default() {
-                covered.clone()
-            } else {
-                plane.read(cx).profiles.clone()
-            };
-            (plane.clone(), profiles)
-        })
-        .collect()
-}
-
-/// ↵ on a control plane's line: signs in, cancels a sign-in under way, or reads the clusters
-/// again.
+/// ↵ on a control plane's line: signs in, cancels a sign-in under way, or reads again.
 pub(crate) fn enter(plane: &mut ControlPlane, cx: &mut gpui::Context<ControlPlane>) {
     match plane.sign_in_state() {
         SignIn::SignedIn { .. } => plane.read_clusters(cx),
@@ -85,13 +56,14 @@ pub(crate) fn enter(plane: &mut ControlPlane, cx: &mut gpui::Context<ControlPlan
     }
 }
 
-/// The cluster `cluster_id` of the plane's list, while it is shown.
+/// The cluster `cluster_id` of `organization`'s list on the plane, while it is shown.
 pub(crate) fn cluster(
     plane: &Entity<ControlPlane>,
+    organization: &str,
     cluster_id: &str,
     cx: &App,
 ) -> Option<ClusterView> {
-    match plane.read(cx).listing() {
+    match plane.read(cx).listing(organization) {
         Some(Listing::Listed(listed)) => listed
             .data
             .clusters
@@ -205,7 +177,8 @@ pub(crate) fn failure(error: &ControlError, organization: &str) -> String {
     }
 }
 
-/// The organizations block, or nothing when no profile names a control plane.
+/// The control planes' block, or nothing when there is none (no profile names one, and
+/// `omnigraph_cloud` is empty).
 pub(crate) fn render(
     planes: &[Entity<ControlPlane>],
     managed: &[ManagedTarget],
@@ -215,304 +188,312 @@ pub(crate) fn render(
     if planes.is_empty() {
         return None;
     }
-    let blocks: Vec<AnyElement> = shown(planes, cx)
-        .into_iter()
+    let sections: Vec<AnyElement> = planes
+        .iter()
         .enumerate()
-        .map(|(index, (plane, profiles))| {
-            render_plane(index, &plane, &profiles, managed, cursor, cx)
-        })
+        .map(|(index, plane)| render_plane(index, plane, managed, cursor, cx))
         .collect();
     Some(
         v_flex()
-            .gap(px(space::XS))
+            .gap(px(space::MD))
             .pt(px(space::MD))
-            .child(
-                div()
-                    .px(px(space::MD))
-                    .pb(px(space::XS))
-                    .child(ds::text::meta("Organizations")),
-            )
-            .children(blocks)
+            .children(sections)
             .into_any_element(),
     )
 }
 
+/// One control plane: its heading, its one sign-in, then the person's organizations, each with
+/// its clusters.
 fn render_plane(
     index: usize,
     plane: &Entity<ControlPlane>,
-    profiles: &[String],
     managed: &[ManagedTarget],
     cursor: Option<&Place>,
     cx: &mut Context<OpenGraphModal>,
 ) -> AnyElement {
     let at = cursor == Some(&Place::Plane(plane.entity_id()));
-    let (route, cloud, organization, state) = {
+    let (route, cloud, state, profiles, organizations) = {
         let p = plane.read(cx);
         (
             p.route.clone(),
             p.is_default(),
-            p.organization(),
             p.sign_in_state().clone(),
+            p.profiles.clone(),
+            p.organizations().cloned(),
         )
     };
     let host = oauth_host(&route);
-    let named = match profiles {
-        [] => None,
-        [one] => Some(format!("CLI profile {one}")),
-        many => Some(format!("CLI profiles {}", many.join(", "))),
-    };
-    // Omnigraph Cloud says its organization once a sign-in names one; a profile's names it.
-    let title = if cloud {
-        "Omnigraph Cloud".to_owned()
-    } else {
-        organization.clone().unwrap_or_default()
-    };
-    let meta = [
-        Some(host.clone()),
-        organization.clone().filter(|_| cloud),
-        named,
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join(" · ");
-    let organization = organization.unwrap_or_else(|| "your organization".to_owned());
-    let heading = MenuRow::new(SharedString::from(format!("plane-{index}")))
-        .height(size::FEED_ROW)
-        .toggle_state(at)
-        .child(
-            v_flex()
-                .min_w_0()
-                .child(ds::text::body(title))
-                .child(ds::text::meta(meta).truncate()),
-        );
-    let mut block = v_flex().gap(px(space::XXS)).child(heading);
-    let plane = plane.clone();
-    let id = |what: &str| SharedString::from(format!("plane-{index}-{what}"));
-    match state {
-        // The account is the token's subject, an id that means nothing to the person: the
-        // control plane names no email or name for it yet (spec 021, CP3).
-        SignIn::SignedIn { .. } => {
-            let refresh = plane.clone();
-            let out = plane.clone();
+    let heading = h_flex()
+        .px(px(space::MD))
+        .gap(px(space::XS))
+        .justify_between()
+        .child(ds::text::meta(if cloud {
+            "Omnigraph Cloud".to_owned()
+        } else {
+            host.clone()
+        }))
+        .children(cloud.then(|| ds::text::meta(host.clone()).truncate()));
+    let line = sign_in_line(index, plane, &host, &state, cx);
+    let mut block = v_flex().gap(px(space::XXS)).child(heading).child(
+        MenuRow::new(SharedString::from(format!("plane-{index}")))
+            .height(size::FEED_ROW)
+            .toggle_state(at)
+            .child(line),
+    );
+    if !matches!(state, SignIn::SignedIn { .. }) {
+        // Before a sign-in, the profiles say where they point.
+        if !profiles.is_empty() {
+            let named = profiles
+                .iter()
+                .map(|(profile, _)| profile.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
             block = block.child(
-                h_flex()
+                div()
                     .px(px(space::MD))
-                    .gap(px(space::XS))
-                    .child(fill(ds::text::meta("Signed in")))
-                    .child(
-                        ds::button(id("refresh"), "Refresh")
-                            .style(ButtonStyle::Subtle)
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                refresh.update(cx, |p, cx| p.read_clusters(cx))
-                            })),
-                    )
-                    .child(
-                        ds::button(id("sign-out"), "Sign out")
-                            .style(ButtonStyle::Subtle)
-                            .tip(ds::tooltip(
-                                "Forgets this sign-in, and asks the sign-in service to end it where it can.",
+                    .child(ds::text::meta(format!("CLI profiles {named}")).truncate()),
+            );
+        }
+        return block.into_any_element();
+    }
+    match organizations {
+        None | Some(Organizations::Reading) => {
+            block = block.child(
+                div()
+                    .px(px(space::MD))
+                    .child(ds::text::meta("Reading your organizations…")),
+            );
+        }
+        Some(Organizations::Failed(error)) => {
+            block = block.child(
+                div()
+                    .px(px(space::MD))
+                    .child(ds::text::error_note(failure(&error, "this control plane"))),
+            );
+        }
+        Some(Organizations::Listed(list)) => {
+            for (row, organization) in list.iter().enumerate() {
+                let id = &organization.organization_id;
+                let name = organization.name.clone().unwrap_or_else(|| id.clone());
+                let named: Vec<String> = profiles
+                    .iter()
+                    .filter(|(_, of)| of.as_deref() == Some(id.as_str()))
+                    .map(|(profile, _)| profile.clone())
+                    .collect();
+                let meta = match named.as_slice() {
+                    [] => id.clone(),
+                    [one] => format!("CLI profile {one}"),
+                    many => format!("CLI profiles {}", many.join(", ")),
+                };
+                block = block.child(
+                    v_flex()
+                        .pt(px(space::XS))
+                        .child(
+                            v_flex()
+                                .px(px(space::MD))
+                                .min_w_0()
+                                .child(ds::text::body(name.clone()).truncate())
+                                .child(ds::text::meta(meta).truncate()),
+                        )
+                        .child(render_listing(
+                            index, row, plane, id, &name, &named, managed, cursor, cx,
+                        )),
+                );
+            }
+            // A profile in an organization the person is not a member of.
+            for (profile, of) in &profiles {
+                let Some(of) = of else { continue };
+                if list
+                    .iter()
+                    .any(|organization| &organization.organization_id == of)
+                {
+                    continue;
+                }
+                block = block.child(
+                    v_flex()
+                        .pt(px(space::XS))
+                        .px(px(space::MD))
+                        .child(ds::text::body(of.clone()).truncate())
+                        .child(
+                            ds::text::meta(format!(
+                                "CLI profile {profile} · You are not a member of it"
                             ))
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                out.update(cx, |p, cx| p.sign_out(cx))
-                            })),
-                    ),
-            );
-            block = block.child(render_listing(
-                index,
-                &plane,
-                profiles,
-                managed,
-                &organization,
-                cursor,
-                cx,
-            ));
-        }
-        // Finishing: the service answered, and the keychain is keeping the sign-in; macOS may be
-        // asking whether Studio may. It is not cancelled from here.
-        SignIn::Finishing { .. } => {
-            block = block.child(div().px(px(space::MD)).child(fill(ds::text::meta(
-                "Keeping the sign-in in your keychain…",
-            ))));
-        }
-        SignIn::Waiting { service } => {
-            let cancel = plane.clone();
-            block = block.child(
-                h_flex()
-                    .px(px(space::MD))
-                    .gap(px(space::XS))
-                    .child(fill(ds::text::meta(format!(
-                        "Signing in at {service} in your browser…"
-                    ))))
-                    .child(
-                        ds::button(id("cancel"), "Cancel")
-                            .style(ButtonStyle::Subtle)
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                cancel.update(cx, |p, cx| p.cancel_sign_in(cx))
-                            })),
-                    ),
-            );
-        }
-        SignIn::Reading => {
-            block = block.child(
-                div()
-                    .px(px(space::MD))
-                    .child(ds::text::meta("Reading the control plane's sign-in…")),
-            );
-        }
-        SignIn::Unavailable(refusal) => {
-            block = block.child(
-                div()
-                    .px(px(space::MD))
-                    .child(ds::text::error_note(refusal.why)),
-            );
-        }
-        SignIn::Offered { why, .. } => {
-            block = block.child(sign_in_line(index, &plane, &host, why, cloud, cx));
-        }
-        SignIn::NotOffered => {
-            block = block.child(sign_in_line(index, &plane, &host, None, cloud, cx));
+                            .truncate(),
+                        ),
+                );
+            }
         }
     }
     block.into_any_element()
 }
 
-/// "Sign in to list this organization's clusters", and why a sign-in did not hold.
+/// The plane's one sign-in, and what it is doing.
 fn sign_in_line(
     index: usize,
     plane: &Entity<ControlPlane>,
     host: &str,
-    why: Option<String>,
-    cloud: bool,
+    state: &SignIn,
     cx: &mut Context<OpenGraphModal>,
 ) -> AnyElement {
-    // After a refused sign-in or a sign-out, the next asks which organization, which takes a
-    // sign-in on the web: the button says so.
-    let choose = plane.read(cx).asks_organization();
-    let (label, tip) = if choose {
-        (
-            "Choose organization",
-            format!(
-                "Opens {host} in your browser, where you sign in again and choose the organization."
-            ),
-        )
-    } else {
-        (
-            "Sign in",
-            format!(
-                "Opens {host} in your browser to sign in to this organization's control plane."
-            ),
-        )
-    };
+    let id = |what: &str| SharedString::from(format!("plane-{index}-{what}"));
     let plane = plane.clone();
-    v_flex()
-        .px(px(space::MD))
-        .gap(px(space::XXS))
-        .children(why.map(ds::text::error_note))
-        .child(
-            h_flex()
-                .debug_selector(|| "control-plane-sign-in".into())
-                .gap(px(space::XS))
-                .child(fill(ds::text::meta(if cloud {
-                    "Sign in to list your organization's clusters"
-                } else {
-                    "Sign in to list this organization's clusters"
-                })))
+    let line = h_flex().w_full().gap(px(space::XS));
+    match state.clone() {
+        // The account is the token's subject, an id that means nothing to the person: the
+        // control plane names no email for it yet.
+        SignIn::SignedIn { .. } => {
+            let refresh = plane.clone();
+            line.child(fill(ds::text::meta("Signed in")))
                 .child(
-                    ds::button(SharedString::from(format!("plane-{index}-sign-in")), label)
+                    ds::button(id("refresh"), "Refresh")
                         .style(ButtonStyle::Subtle)
-                        .tip(ds::tooltip(tip))
-                        .on_click(
-                            cx.listener(move |_, _, _, cx| plane.update(cx, |p, cx| p.sign_in(cx))),
-                        ),
-                ),
-        )
-        .into_any_element()
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            refresh.update(cx, |p, cx| p.read_clusters(cx))
+                        })),
+                )
+                .child(
+                    ds::button(id("sign-out"), "Sign out")
+                        .style(ButtonStyle::Subtle)
+                        .tip(ds::tooltip(
+                            "Forgets this sign-in, and asks the sign-in service to end it where it can.",
+                        ))
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            plane.update(cx, |p, cx| p.sign_out(cx))
+                        })),
+                )
+                .into_any_element()
+        }
+        // The service answered, and the keychain is keeping the sign-in; macOS may be asking
+        // whether Studio may. It is not cancelled from here.
+        SignIn::Finishing { .. } => line
+            .child(fill(ds::text::meta("Keeping the sign-in in your keychain…")))
+            .into_any_element(),
+        SignIn::Waiting { service } => line
+            .child(fill(ds::text::meta(format!(
+                "Signing in at {service} in your browser…"
+            ))))
+            .child(
+                ds::button(id("cancel"), "Cancel")
+                    .style(ButtonStyle::Subtle)
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        plane.update(cx, |p, cx| p.cancel_sign_in(cx))
+                    })),
+            )
+            .into_any_element(),
+        SignIn::Reading => line
+            .child(fill(ds::text::meta("Reading the control plane's sign-in…")))
+            .into_any_element(),
+        SignIn::Unavailable(refusal) => line
+            .child(fill(ds::text::error_note(refusal.why)))
+            .into_any_element(),
+        SignIn::Offered { why, .. } => v_flex()
+            .w_full()
+            .gap(px(space::XXS))
+            .children(why.map(ds::text::error_note))
+            .child(
+                line.debug_selector(|| "control-plane-sign-in".into())
+                    .child(fill(ds::text::meta("Sign in to list your organizations")))
+                    .child(
+                        ds::button(id("sign-in"), "Sign in")
+                            .style(ButtonStyle::Subtle)
+                            .tip(ds::tooltip(format!(
+                                "Opens {host} in your browser to sign in. One sign-in lists every organization you are a member of."
+                            )))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                plane.update(cx, |p, cx| p.sign_in(cx))
+                            })),
+                    ),
+            )
+            .into_any_element(),
+        SignIn::NotOffered => line.into_any_element(),
+    }
 }
 
+/// An organization's clusters, set in under it.
+#[allow(clippy::too_many_arguments)]
 fn render_listing(
     index: usize,
+    row: usize,
     plane: &Entity<ControlPlane>,
+    organization: &str,
+    name: &str,
     profiles: &[String],
     managed: &[ManagedTarget],
-    organization: &str,
     cursor: Option<&Place>,
     cx: &mut Context<OpenGraphModal>,
 ) -> AnyElement {
     let plane_id = plane.entity_id();
-    let profiles = profiles.to_vec();
-    let (host, listing) = {
-        let p = plane.read(cx);
-        (oauth_host(&p.route), p.listing().cloned())
-    };
-    match listing.as_ref() {
-        None | Some(Listing::Reading) => div()
-            .px(px(space::MD))
-            .child(ds::text::meta("Reading the organization's clusters…"))
-            .into_any_element(),
-        Some(Listing::Failed(error)) => {
-            let said = failure(error, organization);
-            match error {
-                ControlError::Unauthenticated(_) => sign_in_line(
-                    index,
-                    plane,
-                    &host,
-                    Some(said),
-                    plane.read(cx).is_default(),
-                    cx,
-                ),
-                _ => div()
+    let listing = plane.read(cx).listing(organization).cloned();
+    let body = v_flex()
+        .debug_selector(|| "control-plane-clusters".into())
+        .pl(px(space::LG));
+    match listing {
+        None | Some(Listing::Reading) => body
+            .child(
+                div()
                     .px(px(space::MD))
-                    .child(ds::text::error_note(said))
-                    .into_any_element(),
-            }
-        }
+                    .child(ds::text::meta("Reading its clusters…")),
+            )
+            .into_any_element(),
+        Some(Listing::Failed(error)) => body
+            .child(
+                div()
+                    .px(px(space::MD))
+                    .child(ds::text::error_note(failure(&error, name))),
+            )
+            .into_any_element(),
         Some(Listing::Listed(listed)) => {
             let clusters = &listed.data.clusters;
             // A purged cluster is gone for good: counted, not listed.
             let purged = clusters.iter().filter(|c| is_purged(c)).count();
-            let mut rows: Vec<AnyElement> = clusters
-                .iter()
-                .enumerate()
-                .filter(|(_, cluster)| !is_purged(cluster))
-                .map(|(row, cluster)| {
-                    let shown = cluster_row(cluster, managed);
-                    let mut item =
-                        MenuRow::new(SharedString::from(format!("plane-{index}-cluster-{row}")))
-                            .height(size::FEED_ROW)
-                            .child(
-                                v_flex()
-                                    .min_w_0()
-                                    .child(ds::text::body(shown.name))
-                                    .child(ds::text::meta(shown.meta).truncate()),
-                            );
-                    if shown.opens {
-                        item = item.toggle_state(
-                            cursor == Some(&Place::Cluster(plane_id, cluster.cluster_id.clone())),
-                        );
-                        let plane = plane.clone();
-                        let cluster = cluster.clone();
-                        let command = add_command(&cluster, profiles.first().map(String::as_str));
-                        item = item
-                            .aria_label(format!(
-                                "Open {} for this run. To keep it, add it as a CLI target: {command}",
-                                cluster.name
-                            ))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_cluster(&plane, &cluster, window, cx)
-                            }));
-                    }
-                    if shown.dimmed {
-                        div().opacity(0.5).child(item).into_any_element()
-                    } else {
-                        item.into_any_element()
-                    }
-                })
-                .collect();
-            for target in missing_targets(clusters, managed, &profiles) {
+            let mut rows: Vec<AnyElement> = Vec::new();
+            for (at, cluster) in clusters.iter().enumerate() {
+                if is_purged(cluster) {
+                    continue;
+                }
+                let shown = cluster_row(cluster, managed);
+                let mut item = MenuRow::new(SharedString::from(format!(
+                    "plane-{index}-{row}-cluster-{at}"
+                )))
+                .height(size::FEED_ROW)
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .child(ds::text::body(shown.name))
+                        .child(ds::text::meta(shown.meta).truncate()),
+                );
+                if shown.opens {
+                    item = item.toggle_state(
+                        cursor
+                            == Some(&Place::Cluster(
+                                plane_id,
+                                organization.to_owned(),
+                                cluster.cluster_id.clone(),
+                            )),
+                    );
+                    let plane = plane.clone();
+                    let cluster = cluster.clone();
+                    let organization = organization.to_owned();
+                    let command = add_command(&cluster, profiles.first().map(String::as_str));
+                    item = item
+                        .aria_label(format!(
+                            "Open {} for this run. To keep it, add it as a CLI target: {command}",
+                            cluster.name
+                        ))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_cluster(&plane, &organization, &cluster, window, cx)
+                        }));
+                }
+                rows.push(if shown.dimmed {
+                    div().opacity(0.5).child(item).into_any_element()
+                } else {
+                    item.into_any_element()
+                });
+            }
+            for target in missing_targets(clusters, managed, profiles) {
                 rows.push(
                     MenuRow::new(SharedString::from(format!(
-                        "plane-{index}-missing-{}",
+                        "plane-{index}-{row}-missing-{}",
                         target.name
                     )))
                     .height(size::FEED_ROW)
@@ -521,7 +502,7 @@ fn render_listing(
                             .min_w_0()
                             .child(ds::text::body(target.name.clone()))
                             .child(ds::text::meta(format!(
-                                "Not in {organization} on the control plane"
+                                "Not in {name} on the control plane"
                             ))),
                     )
                     .into_any_element(),
@@ -542,7 +523,7 @@ fn render_listing(
                 rows.push(
                     div()
                         .px(px(space::MD))
-                        .child(ds::text::meta(format!("No clusters in {organization}")))
+                        .child(ds::text::meta("No clusters"))
                         .into_any_element(),
                 );
             }
@@ -551,11 +532,7 @@ fn render_listing(
                     .px(px(space::MD))
                     .child(ds::text::meta(format!("As of {}", listed.meta.observed_at)))
             });
-            v_flex()
-                .debug_selector(|| "control-plane-clusters".into())
-                .children(stale)
-                .children(rows)
-                .into_any_element()
+            body.children(stale).children(rows).into_any_element()
         }
     }
 }

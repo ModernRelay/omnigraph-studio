@@ -346,10 +346,6 @@ pub struct Service {
     /// What names `organization`, as a refusal says it: "this target" for a cluster, "this
     /// profile" for a control plane.
     pub(crate) organization_of: &'static str,
-    /// The `prompt` its sign-in sends: `login` for a control plane, so the sign-in service asks
-    /// which organization each time rather than reusing the one the browser is signed in to
-    /// (spec 021); none for a cluster.
-    pub(crate) prompt: Option<&'static str>,
     pub(crate) clients: Clients,
 }
 
@@ -415,7 +411,6 @@ pub(crate) async fn discover(
         client_id,
         organization,
         organization_of: "this target",
-        prompt: None,
         clients,
     })
 }
@@ -689,7 +684,8 @@ impl OAuthSource {
         self.inner.subject()
     }
 
-    /// The organization its token names (`org_id`), as last issued or refreshed.
+    /// The organization its token names (`org_id`), as last issued or refreshed: the one the
+    /// person's consent for Studio's client is in.
     pub(crate) fn organization(&self) -> Option<String> {
         self.inner
             .account
@@ -868,7 +864,6 @@ pub(crate) fn browser(
         &pkce,
         &state,
         &service.resource.resource,
-        service.prompt,
     );
     let redirect = callback.redirect_uri().to_owned();
     let issuer = service.server.issuer.clone();
@@ -1726,8 +1721,6 @@ mod tests {
         assert_eq!(query["client_id"], CLIENT);
         assert_eq!(query["resource"], RESOURCE);
         assert_eq!(query["code_challenge_method"], "S256");
-        // A cluster's sign-in reuses a consent: only a control plane's asks again.
-        assert!(!query.contains_key("prompt"));
         served.lock().unwrap().codes.insert("c1".into());
         let callback = url::Url::parse(&query["redirect_uri"]).unwrap();
         assert_eq!(callback.host_str(), Some("127.0.0.1"));

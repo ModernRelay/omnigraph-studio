@@ -45,6 +45,9 @@ type TransportHttp =
 type Prepared = Vec<(CliTransport, Result<Arc<dyn HttpClient>, String>)>;
 
 /// Makes the token source of a CLI server whose token the CLI gives; none for an anonymous one.
+/// A CLI profile and the organization it is in.
+type ProfileOrganization = (String, Option<String>);
+
 type TokenSources = Arc<dyn Fn(&CliServer) -> Option<Arc<dyn TokenSource>> + Send + Sync>;
 
 /// Reads a server target's digests ([`ConnectionRegistry::target_digests`]).
@@ -93,8 +96,8 @@ pub struct ConnectionRegistry {
     /// The managed targets as the CLI last listed them, landed or not: which cluster each names.
     pub managed_targets: Vec<ManagedTarget>,
     /// The clusters opened from a control plane's list for this run: each connection, its
-    /// control plane and its `cluster_id`.
-    opened: Vec<(gpui::EntityId, Entity<ControlPlane>, String)>,
+    /// control plane, organization and `cluster_id`.
+    opened: Vec<(gpui::EntityId, Entity<ControlPlane>, String, String)>,
     /// Why the environment's server could not be added at start, which stays one of the
     /// [`Self::notices`] for the run.
     environment_notice: Option<String>,
@@ -542,23 +545,52 @@ impl ConnectionRegistry {
         self.set_cloud(route, cx);
     }
 
-    /// Makes `route` Omnigraph Cloud's control plane, or none when it is empty.
+    /// Makes `route` Omnigraph Cloud's control plane, or none when it is empty: the plane at that
+    /// route, one a profile names or a new one, is marked the default, and a plane only the
+    /// default kept is retired, its sign-in left for a launch.
     pub(crate) fn set_cloud(&mut self, route: String, cx: &mut Context<Self>) {
-        let held = self
-            .control_planes
-            .iter()
-            .position(|plane| plane.read(cx).is_default());
-        if let Some(at) = held {
-            if self.control_planes[at].read(cx).route == route {
-                return;
+        let same = |a: &str, b: &str| a.trim_end_matches('/') == b.trim_end_matches('/');
+        let mut retired = Vec::new();
+        for plane in &self.control_planes {
+            let (default, profiles, at) = {
+                let plane = plane.read(cx);
+                (
+                    plane.is_default(),
+                    !plane.profiles.is_empty(),
+                    plane.route.clone(),
+                )
+            };
+            if default && !same(&at, &route) {
+                plane.update(cx, |plane, cx| plane.set_default(false, cx));
+                if !profiles {
+                    retired.push(plane.clone());
+                }
             }
-            let old = self.control_planes.remove(at);
-            old.update(cx, |plane, cx| plane.retire(cx));
         }
+        for plane in &retired {
+            plane.update(cx, |plane, cx| plane.retire(cx));
+        }
+        self.control_planes.retain(|plane| {
+            !retired
+                .iter()
+                .any(|gone| gone.entity_id() == plane.entity_id())
+        });
         if !route.is_empty() {
-            let context = self.sign_in.clone();
-            self.control_planes
-                .push(cx.new(|cx| ControlPlane::cloud(route, context, cx)));
+            let held = self
+                .control_planes
+                .iter()
+                .find(|plane| same(&plane.read(cx).route, &route))
+                .cloned();
+            let plane = match held {
+                Some(plane) => plane,
+                None => {
+                    let context = self.sign_in.clone();
+                    let plane = cx.new(|cx| ControlPlane::new(route, context, cx));
+                    self.control_planes.push(plane.clone());
+                    plane
+                }
+            };
+            plane.update(cx, |plane, cx| plane.set_default(true, cx));
         }
         cx.notify();
     }
@@ -812,7 +844,7 @@ impl ConnectionRegistry {
         made
     }
 
-    /// The connection to `cluster`, a cluster of `plane`'s organization no CLI target names,
+    /// The connection to `cluster`, a cluster of `organization` on `plane` no CLI target names,
     /// opened for this run (spec 021, Listing clusters): one already reaching its data endpoint
     /// is it. Its data token is the control plane's, and its own sign-in is still preferred where
     /// its 401 offers one. `None` without a data endpoint, or a control plane Studio cannot sign
@@ -820,6 +852,7 @@ impl ConnectionRegistry {
     pub fn open_cluster(
         &mut self,
         plane: &Entity<ControlPlane>,
+        organization: &str,
         cluster: &control_client::ClusterView,
         cx: &mut Context<Self>,
     ) -> Option<Entity<Connection>> {
@@ -832,17 +865,18 @@ impl ConnectionRegistry {
         {
             return Some(open.clone());
         }
-        let (handle, profile, organization) = {
+        let (handle, profile) = {
             let plane = plane.read(cx);
-            (
-                plane.handle()?,
-                plane.profiles.first().cloned(),
-                plane.organization(),
-            )
+            let profile = plane
+                .profiles
+                .iter()
+                .find(|(_, of)| of.as_deref() == Some(organization))
+                .map(|(profile, _)| profile.clone());
+            (plane.handle()?, profile)
         };
         let source: Arc<dyn TokenSource> = Arc::new(ControlTokenSource::of_plane(
             profile,
-            organization,
+            organization.to_owned(),
             handle,
             cluster.cluster_id.clone(),
             endpoint.clone(),
@@ -862,22 +896,25 @@ impl ConnectionRegistry {
         self.opened.push((
             connection.entity_id(),
             plane.clone(),
+            organization.to_owned(),
             cluster.cluster_id.clone(),
         ));
         cx.notify();
         Some(connection)
     }
 
-    /// The control plane and `cluster_id` of `connection`'s cluster, when it is a managed
-    /// cluster: a CLI target's, by the target's profile, or one opened from a list.
+    /// The control plane, organization and `cluster_id` of `connection`'s cluster, when it is a
+    /// managed cluster: a CLI target's, by the target's profile, or one opened from a list.
     pub fn control_cluster(
         &self,
         connection: &Entity<Connection>,
         cx: &App,
-    ) -> Option<(Entity<ControlPlane>, String)> {
+    ) -> Option<(Entity<ControlPlane>, Option<String>, String)> {
         let id = connection.entity_id();
-        if let Some((_, plane, cluster)) = self.opened.iter().find(|(opened, ..)| *opened == id) {
-            return Some((plane.clone(), cluster.clone()));
+        if let Some((_, plane, organization, cluster)) =
+            self.opened.iter().find(|(opened, ..)| *opened == id)
+        {
+            return Some((plane.clone(), Some(organization.clone()), cluster.clone()));
         }
         let server = &connection.read(cx).server;
         if server.source != ServerSource::Cli {
@@ -887,43 +924,25 @@ impl ConnectionRegistry {
             .managed_targets
             .iter()
             .find(|target| target.name == server.name)?;
-        let plane = self
-            .control_planes
-            .iter()
-            .find(|plane| plane.read(cx).profiles.contains(&target.profile))?;
-        // Signed in only through Omnigraph Cloud's default, in the profile's organization: that
-        // sign-in reads the cluster's state.
-        let plane = match plane.read(cx).holds_sign_in() {
-            true => plane,
-            false => self.cloud_covering(plane, cx).unwrap_or(plane),
-        };
-        Some((plane.clone(), target.cluster_id.clone()))
+        let plane = self.plane_of(&target.profile, cx)?;
+        let organization = plane.read(cx).organization_of(&target.profile);
+        Some((plane.clone(), organization, target.cluster_id.clone()))
     }
 
-    /// Omnigraph Cloud's default when it holds a sign-in in `plane`'s route and organization: the
-    /// one control plane the two are (spec 021, One plane for one pair).
-    pub fn cloud_covering(
-        &self,
-        plane: &Entity<ControlPlane>,
-        cx: &App,
-    ) -> Option<&Entity<ControlPlane>> {
-        let (route, organization) = {
-            let plane = plane.read(cx);
-            (plane.route.clone(), plane.organization())
-        };
-        self.control_planes.iter().find(|cloud| {
-            let cloud = cloud.read(cx);
-            cloud.is_default()
-                && cloud.holds_sign_in()
-                && cloud.route.trim_end_matches('/') == route.trim_end_matches('/')
-                && cloud.organization().is_some()
-                && cloud.organization() == organization
+    /// The control plane the CLI profile `profile` names.
+    fn plane_of(&self, profile: &str, cx: &App) -> Option<&Entity<ControlPlane>> {
+        self.control_planes.iter().find(|plane| {
+            plane
+                .read(cx)
+                .profiles
+                .iter()
+                .any(|(name, _)| name == profile)
         })
     }
 
     /// The token source of the CLI server `server`: the CLI's export, which a managed target
     /// whose profile names a control plane takes from that control plane while it holds a
-    /// sign-in (spec 021, The data token).
+    /// sign-in, its requests naming the profile's organization (spec 021, The data token).
     fn token_source_for(&self, server: &CliServer, cx: &App) -> Option<Arc<dyn TokenSource>> {
         let source = (self.token_sources)(server)?;
         let CliAuth::Token(CliCredential::Managed { profile, .. }) = &server.auth else {
@@ -936,52 +955,47 @@ impl ConnectionRegistry {
         else {
             return Some(source);
         };
-        // The profile's control plane, then Omnigraph Cloud's default, whose sign-in gives the
-        // token only in the target's organization.
-        let handles: Vec<_> = self
-            .control_planes
-            .iter()
-            .filter_map(|plane| {
-                let plane = plane.read(cx);
-                (plane.profiles.contains(profile) || plane.is_default())
-                    .then(|| plane.handle())
-                    .flatten()
-            })
-            .collect();
-        if handles.is_empty() {
+        let Some(plane) = self.plane_of(profile, cx) else {
             return Some(source);
-        }
+        };
+        let (handle, organization) = {
+            let plane = plane.read(cx);
+            (plane.handle(), plane.organization_of(profile))
+        };
+        let Some(handle) = handle else {
+            return Some(source);
+        };
         let endpoint = target
             .endpoint
             .clone()
             .unwrap_or_else(|| server.url.clone());
         Some(Arc::new(ControlTokenSource::new(
             source,
-            handles,
+            handle,
+            organization,
             target.cluster_id.clone(),
             endpoint,
         )))
     }
 
-    /// Keeps one control plane for each route and organization the profiles name: a new pair
-    /// gets one, which takes up a sign-in the keychain kept; one no longer named is retired, its
-    /// sign-in left in the keychain for the next launch (spec 021).
+    /// Keeps one control plane for each route the profiles name, with the profiles and their
+    /// organizations: a new route gets one, which takes up a sign-in the keychain kept; one no
+    /// longer named is retired, its sign-in left in the keychain for the next launch, unless it
+    /// is Omnigraph Cloud's default (spec 021).
     fn apply_control_planes(
         &mut self,
         profiles: Vec<ProfileOwner>,
         cx: &mut Context<Self>,
     ) -> bool {
-        let mut named: Vec<(String, String, Vec<String>)> = Vec::new();
+        let same = |a: &str, b: &str| a.trim_end_matches('/') == b.trim_end_matches('/');
+        let mut named: Vec<(String, Vec<ProfileOrganization>)> = Vec::new();
         for owner in profiles {
-            let (Some(route), Some(organization)) = (owner.route, owner.organization) else {
+            let Some(route) = owner.route else {
                 continue;
             };
-            match named
-                .iter_mut()
-                .find(|(r, o, _)| *r == route && *o == organization)
-            {
-                Some((_, _, names)) => names.push(owner.profile),
-                None => named.push((route, organization, vec![owner.profile])),
+            match named.iter_mut().find(|(at, _)| same(at, &route)) {
+                Some((_, names)) => names.push((owner.profile, owner.organization)),
+                None => named.push((route, vec![(owner.profile, owner.organization)])),
             }
         }
         let mut changed = false;
@@ -991,7 +1005,7 @@ impl ConnectionRegistry {
             let stays = plane_read.is_default()
                 || named
                     .iter()
-                    .any(|(r, o, _)| *r == plane_read.route && *o == plane_read.organization);
+                    .any(|(route, _)| same(route, &plane_read.route));
             if !stays {
                 gone.push(plane.clone());
             }
@@ -1001,35 +1015,41 @@ impl ConnectionRegistry {
             changed = true;
             plane.update(cx, |plane, cx| plane.retire(cx));
         }
-        for (route, organization, names) in named {
-            let held = self.control_planes.iter().find(|plane| {
-                let plane = plane.read(cx);
-                !plane.is_default() && plane.route == route && plane.organization == organization
+        for plane in &self.control_planes {
+            let listed = named
+                .iter()
+                .find(|(route, _)| same(route, &plane.read(cx).route))
+                .map(|(_, names)| names.clone())
+                .unwrap_or_default();
+            plane.update(cx, |plane, cx| {
+                if plane.profiles != listed {
+                    plane.profiles = listed;
+                    cx.notify();
+                }
             });
-            match held {
-                Some(plane) => {
-                    plane.update(cx, |plane, cx| {
-                        if plane.profiles != names {
-                            plane.profiles = names;
-                            cx.notify();
-                        }
-                    });
-                }
-                None => {
-                    changed = true;
-                    let context = self.sign_in.clone();
-                    // Before Omnigraph Cloud's default, which stays last.
-                    let at = self
-                        .control_planes
-                        .iter()
-                        .position(|plane| plane.read(cx).is_default())
-                        .unwrap_or(self.control_planes.len());
-                    self.control_planes.insert(
-                        at,
-                        cx.new(|cx| ControlPlane::new(route, organization, names, context, cx)),
-                    );
-                }
+        }
+        for (route, names) in named {
+            if self
+                .control_planes
+                .iter()
+                .any(|plane| same(&plane.read(cx).route, &route))
+            {
+                continue;
             }
+            changed = true;
+            let context = self.sign_in.clone();
+            // Before Omnigraph Cloud's default, which stays last.
+            let at = self
+                .control_planes
+                .iter()
+                .position(|plane| plane.read(cx).is_default())
+                .unwrap_or(self.control_planes.len());
+            let plane = cx.new(|cx| {
+                let mut plane = ControlPlane::new(route, context, cx);
+                plane.profiles = names;
+                plane
+            });
+            self.control_planes.insert(at, plane);
         }
         changed
     }
@@ -1525,6 +1545,149 @@ mod tests {
         })
     }
 
+    fn owner(profile: &str, route: Option<&str>, organization: Option<&str>) -> ProfileOwner {
+        ProfileOwner {
+            profile: profile.into(),
+            route: route.map(str::to_owned),
+            organization: organization.map(str::to_owned),
+        }
+    }
+
+    fn planes(
+        registry: &Entity<ConnectionRegistry>,
+        cx: &mut TestAppContext,
+    ) -> Vec<(String, bool, Vec<ProfileOrganization>)> {
+        registry.read_with(cx, |registry, cx| {
+            registry
+                .control_planes
+                .iter()
+                .map(|plane| {
+                    let plane = plane.read(cx);
+                    (
+                        plane.route.clone(),
+                        plane.is_default(),
+                        plane.profiles.clone(),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    fn listing(profiles: Vec<ProfileOwner>) -> CliTargets {
+        CliTargets {
+            servers: Some(Vec::new()),
+            profiles,
+            ..CliTargets::default()
+        }
+    }
+
+    /// One sign-in serves every organization of a person, so the profiles on one route share
+    /// one control plane, each with its organization; one no longer named is retired.
+    #[gpui::test]
+    async fn profiles_on_one_route_share_a_control_plane(cx: &mut TestAppContext) {
+        let (registry, _) = cx.update(ConnectionRegistry::init_for_tests);
+        let profile = |name: &str, org: &str| (name.to_owned(), Some(org.to_owned()));
+        assert!(apply(
+            &registry,
+            listing(vec![
+                owner("work", Some("https://control.test"), Some("org_1")),
+                owner("ops", Some("https://control.test/"), Some("org_2")),
+                owner("stage", Some("https://stage.test"), Some("org_1")),
+                owner("local", None, Some("org_3")),
+            ]),
+            cx
+        ));
+        assert_eq!(
+            planes(&registry, cx),
+            [
+                (
+                    "https://control.test".to_owned(),
+                    false,
+                    vec![profile("work", "org_1"), profile("ops", "org_2")]
+                ),
+                (
+                    "https://stage.test".to_owned(),
+                    false,
+                    vec![profile("stage", "org_1")]
+                ),
+            ]
+        );
+        let first = registry.read_with(cx, |registry, _| registry.control_planes[0].entity_id());
+        apply(
+            &registry,
+            listing(vec![owner(
+                "work",
+                Some("https://control.test"),
+                Some("org_1"),
+            )]),
+            cx,
+        );
+        assert_eq!(
+            planes(&registry, cx),
+            [(
+                "https://control.test".to_owned(),
+                false,
+                vec![profile("work", "org_1")]
+            )]
+        );
+        assert_eq!(
+            registry.read_with(cx, |registry, _| registry.control_planes[0].entity_id()),
+            first,
+            "the same plane, its sign-in kept"
+        );
+        // A listing that did not happen changes nothing.
+        apply(&registry, CliTargets::default(), cx);
+        assert_eq!(planes(&registry, cx).len(), 1);
+    }
+
+    /// Omnigraph Cloud is the plane at its address: a profile's on the same route is the same
+    /// plane, marked the default. Another address moves the mark; empty removes it, and a plane
+    /// only the default kept goes.
+    #[gpui::test]
+    async fn omnigraph_cloud_follows_its_setting(cx: &mut TestAppContext) {
+        let (registry, _) = cx.update(ConnectionRegistry::init_for_tests);
+        apply(
+            &registry,
+            listing(vec![owner(
+                "work",
+                Some("https://cloud.test/"),
+                Some("org_1"),
+            )]),
+            cx,
+        );
+        registry.update(cx, |r, cx| r.set_cloud("https://cloud.test".into(), cx));
+        assert_eq!(
+            planes(&registry, cx),
+            [(
+                "https://cloud.test/".to_owned(),
+                true,
+                vec![("work".to_owned(), Some("org_1".to_owned()))]
+            )],
+            "one plane: the profile's is Omnigraph Cloud"
+        );
+        registry.update(cx, |r, cx| r.set_cloud("https://other.test".into(), cx));
+        assert_eq!(
+            planes(&registry, cx),
+            [
+                (
+                    "https://cloud.test/".to_owned(),
+                    false,
+                    vec![("work".to_owned(), Some("org_1".to_owned()))]
+                ),
+                ("https://other.test".to_owned(), true, Vec::new()),
+            ]
+        );
+        registry.update(cx, |r, cx| r.set_cloud(String::new(), cx));
+        assert_eq!(
+            planes(&registry, cx),
+            [(
+                "https://cloud.test/".to_owned(),
+                false,
+                vec![("work".to_owned(), Some("org_1".to_owned()))]
+            )]
+        );
+    }
+
     /// A cluster no CLI target names opens for this run, once, reached at its data endpoint
     /// with the control plane's token; one without a data endpoint, or a control plane Studio
     /// cannot sign in to, opens nothing (spec 021).
@@ -1541,18 +1704,8 @@ mod tests {
                 development: None,
             },
         };
-        let plane = |context: Option<crate::sign_in::SignInContext>, cx: &mut TestAppContext| {
-            cx.new(|cx| {
-                ControlPlane::new(
-                    "https://control.test".into(),
-                    "org_1".into(),
-                    vec!["work".into()],
-                    context,
-                    cx,
-                )
-            })
-        };
-        let signed = plane(Some(context), cx);
+        let signed =
+            cx.new(|cx| ControlPlane::new("https://control.test".into(), Some(context), cx));
         let cluster: control_client::ClusterView = serde_json::from_value(serde_json::json!({
             "cluster_id": "01C", "name": "acme", "incarnation": "01I",
             "canonical_root": "s3://b/c", "binding": {"mode": "github", "repository": "a/g"},
@@ -1564,7 +1717,9 @@ mod tests {
         let open = |plane: &Entity<ControlPlane>,
                     cluster: &control_client::ClusterView,
                     cx: &mut TestAppContext| {
-            registry.update(cx, |registry, cx| registry.open_cluster(plane, cluster, cx))
+            registry.update(cx, |registry, cx| {
+                registry.open_cluster(plane, "org_2", cluster, cx)
+            })
         };
         let first = open(&signed, &cluster, cx).expect("opened");
         first.read_with(cx, |connection, _| {
@@ -1575,6 +1730,12 @@ mod tests {
             // it offers a sign-in of its own (spec 016).
             assert_eq!(connection.login_profile(), None);
         });
+        let found = registry.read_with(cx, |registry, cx| registry.control_cluster(&first, cx));
+        let (_, organization, cluster_id) = found.unwrap();
+        assert_eq!(
+            (organization.as_deref(), cluster_id.as_str()),
+            (Some("org_2"), "01C")
+        );
         let again = open(&signed, &cluster, cx).expect("the same");
         assert_eq!(again.entity_id(), first.entity_id());
         assert_eq!(registry.read_with(cx, |r, _| r.connections.len()), 1);
@@ -1582,146 +1743,10 @@ mod tests {
         let mut provisioning = cluster.clone();
         provisioning.data_endpoint = None;
         assert!(open(&signed, &provisioning, cx).is_none());
-        let unsigned = plane(None, cx);
+        let unsigned = cx.new(|cx| ControlPlane::new("https://control.test".into(), None, cx));
         let mut other = cluster.clone();
         other.data_endpoint = Some("https://other.graphs.test".into());
         assert!(open(&unsigned, &other, cx).is_none());
-    }
-
-    /// Omnigraph Cloud's plane follows the setting: one at its address, after the profiles',
-    /// kept across listings, replaced when the address changes and gone when it is empty.
-    #[gpui::test]
-    async fn omnigraph_cloud_follows_its_setting(cx: &mut TestAppContext) {
-        let (registry, _) = cx.update(ConnectionRegistry::init_for_tests);
-        let planes = |cx: &mut TestAppContext| {
-            registry.read_with(cx, |registry, cx| {
-                registry
-                    .control_planes
-                    .iter()
-                    .map(|plane| {
-                        let plane = plane.read(cx);
-                        (plane.route.clone(), plane.is_default())
-                    })
-                    .collect::<Vec<_>>()
-            })
-        };
-        registry.update(cx, |r, cx| r.set_cloud("https://cloud.test".into(), cx));
-        let first = registry.read_with(cx, |r, _| r.control_planes[0].entity_id());
-        apply(
-            &registry,
-            CliTargets {
-                servers: Some(Vec::new()),
-                profiles: vec![crate::cli_config::ProfileOwner {
-                    profile: "work".into(),
-                    route: Some("https://control.test".into()),
-                    organization: Some("org_1".into()),
-                }],
-                ..CliTargets::default()
-            },
-            cx,
-        );
-        assert_eq!(
-            planes(cx),
-            [
-                ("https://control.test".to_owned(), false),
-                ("https://cloud.test".to_owned(), true)
-            ]
-        );
-        registry.update(cx, |r, cx| r.set_cloud("https://cloud.test".into(), cx));
-        assert_eq!(
-            registry.read_with(cx, |r, _| r.control_planes[1].entity_id()),
-            first,
-            "the same address keeps its plane"
-        );
-        registry.update(cx, |r, cx| r.set_cloud("https://other.test".into(), cx));
-        assert_eq!(planes(cx)[1], ("https://other.test".to_owned(), true));
-        registry.update(cx, |r, cx| r.set_cloud(String::new(), cx));
-        assert_eq!(planes(cx), [("https://control.test".to_owned(), false)]);
-    }
-
-    /// Profiles on one control plane and organization share it; one no longer named is retired.
-    /// No sign-in context here, so nothing is read from a keychain or sent.
-    #[gpui::test]
-    async fn profiles_on_one_route_and_organization_share_a_control_plane(cx: &mut TestAppContext) {
-        let (registry, _) = cx.update(ConnectionRegistry::init_for_tests);
-        let owner = |profile: &str, route: Option<&str>, organization: Option<&str>| {
-            crate::cli_config::ProfileOwner {
-                profile: profile.into(),
-                route: route.map(str::to_owned),
-                organization: organization.map(str::to_owned),
-            }
-        };
-        let listing = |profiles| CliTargets {
-            servers: Some(Vec::new()),
-            profiles,
-            ..CliTargets::default()
-        };
-        let planes = |registry: &Entity<ConnectionRegistry>, cx: &mut TestAppContext| {
-            registry.read_with(cx, |registry, cx| {
-                registry
-                    .control_planes
-                    .iter()
-                    .map(|plane| {
-                        let plane = plane.read(cx);
-                        (
-                            plane.route.clone(),
-                            plane.organization.clone(),
-                            plane.profiles.clone(),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            })
-        };
-        assert!(apply(
-            &registry,
-            listing(vec![
-                owner("work", Some("https://control.test"), Some("org_1")),
-                owner("ops", Some("https://control.test"), Some("org_1")),
-                owner("other", Some("https://control.test"), Some("org_2")),
-                owner("local", None, Some("org_3")),
-                owner("anonymous", Some("https://control.test"), None),
-            ]),
-            cx
-        ));
-        assert_eq!(
-            planes(&registry, cx),
-            vec![
-                (
-                    "https://control.test".to_owned(),
-                    "org_1".to_owned(),
-                    vec!["work".to_owned(), "ops".to_owned()]
-                ),
-                (
-                    "https://control.test".to_owned(),
-                    "org_2".to_owned(),
-                    vec!["other".to_owned()]
-                ),
-            ]
-        );
-        let first = registry.read_with(cx, |registry, _| registry.control_planes[0].clone());
-        apply(
-            &registry,
-            listing(vec![owner(
-                "work",
-                Some("https://control.test"),
-                Some("org_1"),
-            )]),
-            cx,
-        );
-        assert_eq!(
-            planes(&registry, cx),
-            vec![(
-                "https://control.test".to_owned(),
-                "org_1".to_owned(),
-                vec!["work".to_owned()]
-            )]
-        );
-        // The same entity, its sign-in kept.
-        let kept = registry.read_with(cx, |registry, _| registry.control_planes[0].clone());
-        assert_eq!(kept.entity_id(), first.entity_id());
-        // A listing that did not happen changes nothing.
-        apply(&registry, CliTargets::default(), cx);
-        assert_eq!(planes(&registry, cx).len(), 1);
     }
 
     /// Two targets naming one transport whose client could not be made off the main thread

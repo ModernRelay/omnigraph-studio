@@ -41,6 +41,19 @@ pub enum Provenance {
     Other,
 }
 
+/// `GET /v1/organizations`: the organizations the signed-in person is an active member of.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct OrganizationList {
+    pub organizations: Vec<OrganizationSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct OrganizationSummary {
+    pub organization_id: String,
+    /// Its name, as the identity provider holds it.
+    pub name: Option<String>,
+}
+
 /// `GET /v1/clusters`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ClusterList {
@@ -266,6 +279,8 @@ mod contract_tests {
             ],
         ),
         ("ClusterList", &["clusters"]),
+        ("OrganizationList", &["organizations"]),
+        ("OrganizationSummary", &["organization_id", "name"]),
         (
             "ClusterView",
             &[
@@ -367,6 +382,12 @@ mod contract_tests {
     /// (route, method, request schema or none, the 2xx envelope's schema). The routes this
     /// crate sends, as the document has them.
     const ROUTES: &[(&str, &str, Option<&str>, &str)] = &[
+        (
+            "/v1/organizations",
+            "get",
+            None,
+            "Envelope_OrganizationList",
+        ),
         ("/v1/clusters", "get", None, "Envelope_ClusterList"),
         (
             "/v1/clusters/{cluster_id}",
