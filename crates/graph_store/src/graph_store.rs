@@ -9,6 +9,7 @@ mod changes;
 pub mod cli_config;
 mod cli_tokens;
 mod connection;
+pub mod control_plane;
 mod degrees;
 pub mod deletes;
 mod entity_groups;
@@ -38,6 +39,7 @@ pub use connection::{
     Connection, ConnectionEvent, ConnectionState, ConnectionWatch, GraphListing, HeldRefusal,
     PromptAction, ServerEntry, ServerSource, SignInPrompt,
 };
+pub use control_plane::{ControlPlane, Listing};
 pub use degrees::page_counts;
 pub use entity_groups::{
     EntityGroup, EntityGroups, GroupRelationship, GroupRun, GroupSection, NodeNames,

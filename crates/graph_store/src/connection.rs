@@ -10,7 +10,6 @@ use gpui::{Context, EventEmitter, Task};
 use graph_client::api::{GraphInfo, HealthOutput};
 use graph_client::{Challenge, GraphClient, ReadError, Unauthorized};
 use http_client::HttpClient;
-use oauth_client::TokenError;
 use studio_settings::StudioSettings;
 
 use crate::cli_tokens::{Lease, NoToken, Token, TokenSource};
@@ -1484,104 +1483,28 @@ impl Connection {
             }
             return;
         };
-        let started = oauth_client::Callback::bind().and_then(|callback| {
-            Ok((
-                callback,
-                oauth_client::Pkce::new()?,
-                oauth_client::random_token()?,
-            ))
-        });
-        let (callback, pkce, state) = match started {
-            Ok(started) => started,
-            Err(error) => {
+        let host = oauth_client::host_of(&self.server.url);
+        let browser = match sign_in::browser(&service, host, cx.background_executor()) {
+            Ok(browser) => browser,
+            Err(why) => {
                 self.sign_in = SignIn::Offered {
                     service: service.host(),
-                    why: Some(format!("Studio could not wait for the sign-in: {error}.")),
+                    why: Some(why),
                 };
                 cx.emit(ConnectionEvent::StateChanged);
                 cx.notify();
                 return;
             }
         };
-        let page = oauth_client::authorization_url(
-            &service.server,
-            &service.client_id,
-            callback.redirect_uri(),
-            &pkce,
-            &state,
-            &service.resource.resource,
-        );
-        cx.open_url(page.as_str());
+        cx.open_url(browser.page.as_str());
         self.sign_in = SignIn::Waiting {
             service: service.host(),
         };
         cx.emit(ConnectionEvent::StateChanged);
         cx.notify();
         let target = self.server.name.clone();
-        let host = oauth_client::host_of(&self.server.url);
         self.signing_in = Some(SigningIn::new(cx.spawn(async move |this, cx| {
-            let redirect = callback.redirect_uri().to_owned();
-            let issuer = service.server.issuer.clone();
-            let exchanged = service.clone();
-            let background = cx.background_executor().clone();
-            let signed_in = cx
-                .background_executor()
-                .spawn(async move {
-                    let code = smol::future::or(
-                        async { Some(callback.code(&state, &issuer, &host).await) },
-                        async {
-                            smol::Timer::after(oauth_client::SIGN_IN_WAIT).await;
-                            None
-                        },
-                    )
-                    .await
-                    .ok_or("The sign-in was not finished within five minutes.".to_owned())?
-                    .map_err(|error| error.to_string())?;
-                    // The exchange runs on its own once the code is sent: the service redeems
-                    // it whether or not the sign-in waits, so a sign-in cancelled meanwhile
-                    // drops the answer, whose guard revokes the token it gives.
-                    let (answer, answered) = oneshot::channel();
-                    background
-                        .spawn(async move {
-                            let service = exchanged;
-                            let tokens = oauth_client::exchange(
-                                service.token_client().as_ref(),
-                                &service.server,
-                                &code,
-                                &redirect,
-                                &pkce.verifier,
-                                service.expected(),
-                            )
-                            .await;
-                            let taken = match tokens {
-                                // Revoked unless a sign-in comes to hold it (the sign-in
-                                // cancelled, or the connection gone before it finishes), made
-                                // here so no moment holds the token unguarded.
-                                Ok(tokens) => {
-                                    let unclaimed = sign_in::Unclaimed::new(
-                                        service,
-                                        tokens.refresh_token.clone(),
-                                    );
-                                    Ok((tokens, unclaimed))
-                                }
-                                // Tokens Studio may not use: nothing will hold their refresh
-                                // token, so it is revoked.
-                                Err(TokenError::Unusable { why, refresh_token }) => {
-                                    if let Some(refresh) = refresh_token {
-                                        service.revoke(refresh);
-                                    }
-                                    Err(why)
-                                }
-                                Err(error) => Err(error.to_string()),
-                            };
-                            answer.send(taken).ok();
-                        })
-                        .detach();
-                    answered.await.unwrap_or_else(|_| {
-                        Err("The sign-in stopped before the service answered.".to_owned())
-                    })
-                })
-                .await;
+            let signed_in = browser.tokens.await;
             // Finishing from here, not to be cancelled: the sign-in this one replaces (another
             // account, after Not admitted) ends in its turn, and the keychain work runs on its own
             // to its end, the connection released meanwhile or not.
@@ -1620,52 +1543,14 @@ impl Connection {
                                 before.await;
                             }
                             let key = current.key(&target);
-                            // One account per target: the one replaced ends, its refresh token
-                            // revoked, and the keychain keeps only the new one's, or none, never
-                            // the old account's.
-                            let previous_holds_item = previous
-                                .as_ref()
-                                .is_some_and(|previous| previous.kept_in_keychain() == Kept::This);
-                            if let Some(previous) = previous {
-                                previous.end(End::Replaced, None).await;
-                            }
-                            let refresh = tokens.refresh_token.clone();
-                            // An earlier item that one does not answer for (left by a sign-in that
-                            // ended, for the next launch) is written over or forgotten below.
-                            let earlier = if previous_holds_item {
-                                None
-                            } else {
-                                keychain
-                                    .read(key.clone())
-                                    .await
-                                    .ok()
-                                    .flatten()
-                                    .and_then(|(_, secret)| String::from_utf8(secret).ok())
-                                    .filter(|earlier| refresh.as_ref() != Some(earlier))
-                            };
-                            // Kept or not, this sign-in leaves the keychain no earlier one: one it
-                            // will not delete is said, as the next launch would read it.
-                            let kept = sign_in::written_or_forgotten(
-                                keychain.as_ref(),
-                                key,
-                                tokens.account.subject.clone(),
-                                refresh.as_deref(),
-                            )
-                            .await;
-                            // The earlier item's token: gone from the keychain, it is held by
-                            // nothing and revoked; still there (the keychain would not let go), the
-                            // sign-in keeps it, to revoke once the item no longer holds it.
-                            let (left, let_go) = match (&kept, earlier) {
-                                (Kept::Left(_), earlier) => (earlier, None),
-                                (_, earlier) => (None, earlier),
-                            };
-                            // The sign-in answers for the token from here, taken by the connection
-                            // or, dropped untaken, ended as told.
-                            unclaimed.claim();
+                            // One account per target ([`sign_in::keep`]); the sign-in answers for
+                            // the token from here, taken by the connection or, dropped untaken,
+                            // ended as told.
+                            let (source, let_go) =
+                                sign_in::keep(keychain, key, previous, current, tokens, unclaimed)
+                                    .await;
                             let finished = Finished {
-                                source: Some(OAuthSource::signed_in(
-                                    current, &target, keychain, tokens, kept, left,
-                                )),
+                                source: Some(source),
                                 let_go,
                                 told,
                                 done: Some(done),

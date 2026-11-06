@@ -561,26 +561,33 @@ pub(crate) async fn list_targets(
     }
 }
 
-/// The organization the managed profile `profile` names, as `credentials status --profile NAME
-/// --json` reports it (`owner.organization_id`), without a service or a secret: `None` when it
-/// names none.
-pub(crate) async fn profile_organization(
+/// The control plane and organization the managed profile `profile` names, as `credentials
+/// status --profile NAME --json` reports them (`owner.route`, `owner.organization_id`), without
+/// a service or a secret: `None` for one it names none of.
+pub(crate) async fn profile_owner(
     cli: &FoundCli,
     turn: &Held,
     profile: &str,
-) -> Result<Option<String>, String> {
+) -> Result<(Option<String>, Option<String>), String> {
     let args = ["credentials", "status", "--profile", profile, "--json"];
     let answer = json_answer(cli, turn, &[], &args)
         .await
         .map_err(|no| no.why)?;
-    match answer.pointer("/owner/organization_id") {
-        Some(Value::String(id)) if !id.is_empty() => Ok(Some(id.clone())),
-        Some(Value::Null) => Ok(None),
-        _ => Err(format!(
-            "`omnigraph {}` did not say the profile's organization",
-            args.join(" ")
-        )),
-    }
+    let organization = match answer.pointer("/owner/organization_id") {
+        Some(Value::String(id)) if !id.is_empty() => Some(id.clone()),
+        Some(Value::Null) => None,
+        _ => {
+            return Err(format!(
+                "`omnigraph {}` did not say the profile's organization",
+                args.join(" ")
+            ));
+        }
+    };
+    let route = match answer.pointer("/owner/route") {
+        Some(Value::String(route)) if !route.is_empty() => Some(route.clone()),
+        _ => None,
+    };
+    Ok((route, organization))
 }
 
 /// What `target inspect NAME --json` says of one target, without a server or a secret.
@@ -1945,6 +1952,15 @@ exit 64
         assert!(said("control").contains("managed cluster registered without a data endpoint"));
         assert!(said("stored-too").contains("so Studio connects as 'stored'"));
         assert_eq!(listed.errors.len(), 4, "{:?}", listed.errors);
+        // Each managed profile's control plane and organization, read once (spec 021).
+        assert_eq!(
+            listed.profiles,
+            [crate::cli_config::ProfileOwner {
+                profile: "work".into(),
+                route: Some("https://api.example.com".into()),
+                organization: Some("org_work".into()),
+            }]
+        );
         let managed: Vec<_> = listed
             .managed
             .iter()
@@ -2033,7 +2049,16 @@ exit 64
         assert_eq!(windows.managed, listed.managed);
         let watched: Vec<&PathBuf> = windows.watched.iter().map(|(path, _)| path).collect();
         assert_eq!(watched, [&home.join("config.yaml"), &ca_file]);
-        assert_eq!(cli.commands(), ["target list --json"]);
+        // No managed target lands on Windows, but its profile's control plane is read: its
+        // clusters, and their data tokens, come from there (spec 021).
+        assert_eq!(
+            cli.commands(),
+            [
+                "target list --json",
+                "credentials status --profile work --json"
+            ]
+        );
+        assert_eq!(windows.profiles, listed.profiles);
 
         // The CLI's own refusal of an old-format file, as it answers `--json`.
         cli.write(

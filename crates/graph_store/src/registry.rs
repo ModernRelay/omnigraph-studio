@@ -18,9 +18,12 @@ use gpui::{App, AppContext as _, Context, Entity, Global, Task};
 use http_client::HttpClient;
 use serde::{Deserialize, Serialize};
 
-use crate::cli_config::{self, CliAuth, CliServer, CliTargets, CliTransport, FileStamp, Platform};
+use crate::cli_config::{
+    self, CliAuth, CliServer, CliTargets, CliTransport, FileStamp, Platform, ProfileOwner,
+};
 use crate::cli_tokens::{self, CliTokenSource, TargetDigests, Token, TokenSource};
 use crate::connection::{Connection, ServerEntry, ServerSource};
+use crate::control_plane::ControlPlane;
 use crate::sign_in::{self, PlatformKeychain, SignInContext};
 
 /// How often the CLI's files are checked for a change, as Studio's settings file is.
@@ -82,6 +85,9 @@ struct CliKept {
 
 pub struct ConnectionRegistry {
     pub connections: Vec<Entity<Connection>>,
+    /// The managed control planes the CLI's profiles name, one per route and organization
+    /// (spec 021).
+    pub control_planes: Vec<Entity<ControlPlane>>,
     /// Why the environment's server could not be added at start, which stays one of the
     /// [`Self::notices`] for the run.
     environment_notice: Option<String>,
@@ -551,6 +557,7 @@ impl ConnectionRegistry {
             listing_waiters: Vec::new(),
             listing_started: None,
             known: KnownGraphs::default(),
+            control_planes: Vec::new(),
             sign_in: None,
             saving: false,
             _watch: None,
@@ -772,6 +779,69 @@ impl ConnectionRegistry {
     /// graph is added. Targets that could not be listed change no server. What could not be
     /// listed or used, a server that cannot be added included, is a change only when it differs
     /// from what was kept.
+    /// Keeps one control plane for each route and organization the profiles name: a new pair
+    /// gets one, which takes up a sign-in the keychain kept; one no longer named is retired, its
+    /// sign-in left in the keychain for the next launch (spec 021).
+    fn apply_control_planes(
+        &mut self,
+        profiles: Vec<ProfileOwner>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut named: Vec<(String, String, Vec<String>)> = Vec::new();
+        for owner in profiles {
+            let (Some(route), Some(organization)) = (owner.route, owner.organization) else {
+                continue;
+            };
+            match named
+                .iter_mut()
+                .find(|(r, o, _)| *r == route && *o == organization)
+            {
+                Some((_, _, names)) => names.push(owner.profile),
+                None => named.push((route, organization, vec![owner.profile])),
+            }
+        }
+        let mut changed = false;
+        let mut gone = Vec::new();
+        self.control_planes.retain(|plane| {
+            let plane_read = plane.read(cx);
+            let stays = named
+                .iter()
+                .any(|(r, o, _)| *r == plane_read.route && *o == plane_read.organization);
+            if !stays {
+                gone.push(plane.clone());
+            }
+            stays
+        });
+        for plane in gone {
+            changed = true;
+            plane.update(cx, |plane, cx| plane.retire(cx));
+        }
+        for (route, organization, names) in named {
+            let held = self.control_planes.iter().find(|plane| {
+                let plane = plane.read(cx);
+                plane.route == route && plane.organization == organization
+            });
+            match held {
+                Some(plane) => {
+                    plane.update(cx, |plane, cx| {
+                        if plane.profiles != names {
+                            plane.profiles = names;
+                            cx.notify();
+                        }
+                    });
+                }
+                None => {
+                    changed = true;
+                    let context = self.sign_in.clone();
+                    self.control_planes.push(
+                        cx.new(|cx| ControlPlane::new(route, organization, names, context, cx)),
+                    );
+                }
+            }
+        }
+        changed
+    }
+
     fn apply_cli_targets(
         &mut self,
         targets: CliTargets,
@@ -783,11 +853,12 @@ impl ConnectionRegistry {
             mut errors,
             watched: _,
             managed: _,
+            profiles,
         } = targets;
         let Some(servers) = servers else {
             return self.keep_notices(errors);
         };
-        let mut changed = false;
+        let mut changed = self.apply_control_planes(profiles, cx);
         // An address still listed keeps its connection, which a changed transport moves to its
         // new client below. One no longer listed is retired: the windows holding it send
         // nothing more, so none keeps a token or a trust its target no longer names.
@@ -1244,6 +1315,91 @@ mod tests {
         registry.update(cx, |registry, cx| {
             registry.apply_cli_targets(files, Vec::new(), cx)
         })
+    }
+
+    /// Profiles on one control plane and organization share it; one no longer named is retired.
+    /// No sign-in context here, so nothing is read from a keychain or sent.
+    #[gpui::test]
+    async fn profiles_on_one_route_and_organization_share_a_control_plane(cx: &mut TestAppContext) {
+        let (registry, _) = cx.update(ConnectionRegistry::init_for_tests);
+        let owner = |profile: &str, route: Option<&str>, organization: Option<&str>| {
+            crate::cli_config::ProfileOwner {
+                profile: profile.into(),
+                route: route.map(str::to_owned),
+                organization: organization.map(str::to_owned),
+            }
+        };
+        let listing = |profiles| CliTargets {
+            servers: Some(Vec::new()),
+            profiles,
+            ..CliTargets::default()
+        };
+        let planes = |registry: &Entity<ConnectionRegistry>, cx: &mut TestAppContext| {
+            registry.read_with(cx, |registry, cx| {
+                registry
+                    .control_planes
+                    .iter()
+                    .map(|plane| {
+                        let plane = plane.read(cx);
+                        (
+                            plane.route.clone(),
+                            plane.organization.clone(),
+                            plane.profiles.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert!(apply(
+            &registry,
+            listing(vec![
+                owner("work", Some("https://control.test"), Some("org_1")),
+                owner("ops", Some("https://control.test"), Some("org_1")),
+                owner("other", Some("https://control.test"), Some("org_2")),
+                owner("local", None, Some("org_3")),
+                owner("anonymous", Some("https://control.test"), None),
+            ]),
+            cx
+        ));
+        assert_eq!(
+            planes(&registry, cx),
+            vec![
+                (
+                    "https://control.test".to_owned(),
+                    "org_1".to_owned(),
+                    vec!["work".to_owned(), "ops".to_owned()]
+                ),
+                (
+                    "https://control.test".to_owned(),
+                    "org_2".to_owned(),
+                    vec!["other".to_owned()]
+                ),
+            ]
+        );
+        let first = registry.read_with(cx, |registry, _| registry.control_planes[0].clone());
+        apply(
+            &registry,
+            listing(vec![owner(
+                "work",
+                Some("https://control.test"),
+                Some("org_1"),
+            )]),
+            cx,
+        );
+        assert_eq!(
+            planes(&registry, cx),
+            vec![(
+                "https://control.test".to_owned(),
+                "org_1".to_owned(),
+                vec!["work".to_owned()]
+            )]
+        );
+        // The same entity, its sign-in kept.
+        let kept = registry.read_with(cx, |registry, _| registry.control_planes[0].clone());
+        assert_eq!(kept.entity_id(), first.entity_id());
+        // A listing that did not happen changes nothing.
+        apply(&registry, CliTargets::default(), cx);
+        assert_eq!(planes(&registry, cx).len(), 1);
     }
 
     /// Two targets naming one transport whose client could not be made off the main thread

@@ -1,0 +1,817 @@
+//! A managed control plane, as a CLI profile names it (spec 021): its sign-in, which Studio makes
+//! as its own OAuth client with the control plane as the resource, and the organization's
+//! clusters, read while something shows them.
+//!
+//! One per distinct route and organization: two profiles on the same pair share it. Nothing is
+//! sent to the route until a sign-in is held; the list is read when asked, never on a timer, and
+//! held only until it is read again.
+
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+use control_client::{ClusterList, ControlClient, ControlError, Envelope};
+use gpui::{Context, Task};
+use http_client::HttpClient;
+use oauth_client::{Clients, Refusal};
+
+use crate::cli_tokens::TokenSource as _;
+use crate::sign_in::{self, End, Kept, OAuthSource, Service, SignIn, SignInContext};
+
+/// What the control plane last answered for the organization's clusters.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Listing {
+    /// Being read.
+    Reading,
+    Listed(Envelope<ClusterList>),
+    Failed(ControlError),
+}
+
+pub struct ControlPlane {
+    /// Its origin, `owner.route` as the CLI says it.
+    pub route: String,
+    pub organization: String,
+    /// The CLI profiles that name it.
+    pub profiles: Vec<String>,
+    context: Option<SignInContext>,
+    service: Option<Service>,
+    sign_in: SignIn,
+    oauth: Option<OAuthSource>,
+    /// The sign-in, or a launch's read of its keychain item, under way.
+    signing_in: Option<Task<()>>,
+    listing: Option<Listing>,
+    reading: Option<Task<()>>,
+}
+
+impl ControlPlane {
+    /// The control plane at `route` for `organization`, signing in with `context`. A sign-in the
+    /// keychain kept is taken up at once; nothing is sent to the route before one is held.
+    pub fn new(
+        route: String,
+        organization: String,
+        profiles: Vec<String>,
+        context: Option<SignInContext>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut this = Self {
+            sign_in: SignIn::Offered {
+                service: oauth_client::host_of(&route),
+                why: None,
+            },
+            route,
+            organization,
+            profiles,
+            context,
+            service: None,
+            oauth: None,
+            signing_in: None,
+            listing: None,
+            reading: None,
+        };
+        this.take_up_kept(cx);
+        this
+    }
+
+    /// The keychain item of its sign-in (spec 021, Signing in).
+    pub fn key(&self) -> String {
+        key(&self.route, &self.organization)
+    }
+
+    pub fn sign_in_state(&self) -> &SignIn {
+        &self.sign_in
+    }
+
+    pub fn holds_sign_in(&self) -> bool {
+        self.oauth.is_some()
+    }
+
+    /// The clusters last read, while something shows them.
+    pub fn listing(&self) -> Option<&Listing> {
+        self.listing.as_ref()
+    }
+
+    /// What the keychain holds for it.
+    pub fn keychain(&self) -> Kept {
+        self.oauth
+            .as_ref()
+            .map_or(Kept::Nothing, OAuthSource::kept_in_keychain)
+    }
+
+    /// Reads the item a sign-in left at launch, in its keychain turn, and holds it: the details
+    /// it needs are read only once there is one.
+    fn take_up_kept(&mut self, cx: &mut Context<Self>) {
+        let Some(context) = self.context.clone() else {
+            return;
+        };
+        let key = self.key();
+        let route = self.route.clone();
+        let organization = self.organization.clone();
+        self.signing_in = Some(cx.spawn(async move |this, cx| {
+            let (before, done) = context.turns.next(&key);
+            if let Some(before) = before {
+                before.await;
+            }
+            let item = context.keychain.read(key.clone()).await.ok().flatten();
+            done.send(()).ok();
+            let Some((subject, secret)) = item else {
+                return;
+            };
+            let Ok(refresh) = String::from_utf8(secret) else {
+                return;
+            };
+            let found = discover(&context, &route, &organization).await;
+            this.update(cx, |this, cx| {
+                this.signing_in = None;
+                match found {
+                    Ok(service) => {
+                        let source = OAuthSource::kept_at(
+                            service.clone(),
+                            key,
+                            context.keychain.clone(),
+                            subject.clone(),
+                            refresh,
+                        );
+                        this.sign_in = SignIn::SignedIn {
+                            service: service.host(),
+                            account: subject,
+                        };
+                        this.service = Some(service);
+                        this.oauth = Some(source);
+                    }
+                    Err(refusal) => {
+                        this.sign_in = SignIn::Offered {
+                            service: oauth_client::host_of(&this.route),
+                            why: Some(refusal.why),
+                        };
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Signs in through the person's browser, as they asked (Sign in on the profile's row):
+    /// reads the control plane's sign-in details first when none are held.
+    pub fn sign_in(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.sign_in,
+            SignIn::Reading | SignIn::Waiting { .. } | SignIn::Finishing { .. }
+        ) {
+            return;
+        }
+        let Some(context) = self.context.clone() else {
+            return;
+        };
+        let Some(service) = self.service.clone() else {
+            self.sign_in = SignIn::Reading;
+            cx.notify();
+            let route = self.route.clone();
+            let organization = self.organization.clone();
+            self.signing_in = Some(cx.spawn(async move |this, cx| {
+                let found = discover(&context, &route, &organization).await;
+                this.update(cx, |this, cx| {
+                    this.signing_in = None;
+                    match found {
+                        Ok(service) => {
+                            this.service = Some(service);
+                            this.sign_in = SignIn::Offered {
+                                service: oauth_client::host_of(&this.route),
+                                why: None,
+                            };
+                            this.sign_in(cx);
+                        }
+                        Err(refusal) => {
+                            this.sign_in = SignIn::Unavailable(refusal);
+                            cx.notify();
+                        }
+                    }
+                })
+                .ok();
+            }));
+            return;
+        };
+        let browser = match sign_in::browser(
+            &service,
+            oauth_client::host_of(&self.route),
+            cx.background_executor(),
+        ) {
+            Ok(browser) => browser,
+            Err(why) => {
+                self.sign_in = SignIn::Offered {
+                    service: service.host(),
+                    why: Some(why),
+                };
+                cx.notify();
+                return;
+            }
+        };
+        cx.open_url(browser.page.as_str());
+        self.sign_in = SignIn::Waiting {
+            service: service.host(),
+        };
+        cx.notify();
+        let key = self.key();
+        self.signing_in = Some(cx.spawn(async move |this, cx| {
+            let tokens = browser.tokens.await;
+            let (tokens, unclaimed) = match tokens {
+                Ok(taken) => taken,
+                Err(why) => {
+                    this.update(cx, |this, cx| {
+                        this.signing_in = None;
+                        // What the details named may be what failed: the next sign-in reads them
+                        // again.
+                        this.service = None;
+                        this.sign_in = SignIn::Offered {
+                            service: service.host(),
+                            why: Some(why),
+                        };
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            // Finishing from here, not to be cancelled: the sign-in it replaces ends, and the
+            // keychain keeps this one, in the item's turn.
+            let Ok((before, done, previous)) = this.update(cx, |this, cx| {
+                this.sign_in = SignIn::Finishing {
+                    service: service.host(),
+                };
+                cx.notify();
+                let (before, done) = context.turns.next(&key);
+                (before, done, this.oauth.take())
+            }) else {
+                return;
+            };
+            if let Some(before) = before {
+                before.await;
+            }
+            let (source, let_go) = sign_in::keep(
+                context.keychain.clone(),
+                key,
+                previous,
+                service.clone(),
+                tokens,
+                unclaimed,
+            )
+            .await;
+            done.send(()).ok();
+            if let Some(token) = let_go {
+                source.revoke(token);
+            }
+            let account = source.account();
+            let taken = this.update(cx, |this, cx| {
+                this.signing_in = None;
+                this.sign_in = SignIn::SignedIn {
+                    service: service.host(),
+                    account,
+                };
+                this.oauth = Some(source.clone());
+                // What was listed was another account's.
+                this.listing = None;
+                cx.notify();
+            });
+            // Gone before it took the sign-in: nothing holds it, so it ends as a drop.
+            if taken.is_err() {
+                drop(source.end(End::Dropped, None));
+            }
+        }));
+    }
+
+    /// Stops a sign-in waiting for the browser; one finishing runs to its end.
+    pub fn cancel_sign_in(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.sign_in, SignIn::Waiting { .. } | SignIn::Reading) {
+            return;
+        }
+        self.signing_in = None;
+        self.sign_in = SignIn::Offered {
+            service: oauth_client::host_of(&self.route),
+            why: None,
+        };
+        cx.notify();
+    }
+
+    /// Signs out: the keychain item is deleted and the refresh token revoked where the service
+    /// publishes a revocation endpoint (spec 016, Custody), in the item's turn.
+    pub fn sign_out(&mut self, cx: &mut Context<Self>) {
+        self.end(End::SignOut, cx);
+    }
+
+    /// The CLI no longer names it: its sign-in stays in the keychain for the next launch.
+    pub(crate) fn retire(&mut self, cx: &mut Context<Self>) {
+        self.end(End::Dropped, cx);
+    }
+
+    fn end(&mut self, how: End, cx: &mut Context<Self>) {
+        self.signing_in = None;
+        self.reading = None;
+        self.listing = None;
+        if let Some(source) = self.oauth.take() {
+            let before = self
+                .context
+                .as_ref()
+                .and_then(|context| context.turns.next(&self.key()).0);
+            drop(source.end(how, before));
+        }
+        self.sign_in = SignIn::Offered {
+            service: oauth_client::host_of(&self.route),
+            why: None,
+        };
+        cx.notify();
+    }
+
+    /// Reads the organization's clusters (the Open dialog opening, or Refresh): once, with one
+    /// silent refresh of the access token after a 401 (spec 021, Errors). Without a sign-in held
+    /// nothing is sent.
+    pub fn read_clusters(&mut self, cx: &mut Context<Self>) {
+        let (Some(source), Some(context)) = (self.oauth.clone(), self.context.clone()) else {
+            return;
+        };
+        self.listing = Some(Listing::Reading);
+        cx.notify();
+        let route = self.route.clone();
+        let http = context.elsewhere.clone();
+        self.reading = Some(cx.spawn(async move |this, cx| {
+            let mut answer = list(&http, &route, &source).await;
+            if matches!(answer, Err(ControlError::Unauthenticated(_))) {
+                source.note_refused();
+                answer = list(&http, &route, &source).await;
+            }
+            this.update(cx, |this, cx| {
+                this.reading = None;
+                this.listing = Some(match answer {
+                    Ok(listed) => Listing::Listed(listed),
+                    Err(error) => Listing::Failed(error),
+                });
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Lets the list go: nothing shows it any more (spec 021, Listing clusters).
+    pub fn forget_clusters(&mut self, cx: &mut Context<Self>) {
+        if self.listing.take().is_some() {
+            self.reading = None;
+            cx.notify();
+        }
+    }
+}
+
+/// The keychain item of the sign-in to the control plane at `route` for `organization`.
+pub fn key(route: &str, organization: &str) -> String {
+    format!("omnigraph-control:{route}#{organization}")
+}
+
+/// The clusters, read with the sign-in's access token.
+async fn list(
+    http: &Arc<dyn HttpClient>,
+    route: &str,
+    source: &OAuthSource,
+) -> Result<Envelope<ClusterList>, ControlError> {
+    let token = source
+        .token(Arc::new(AtomicBool::new(false)))
+        .await
+        .map_err(|no| {
+            if no.passing {
+                ControlError::Unavailable {
+                    status: None,
+                    why: no.why,
+                }
+            } else {
+                ControlError::Unauthenticated(None)
+            }
+        })?;
+    ControlClient::new(http.clone(), route, token.into_string())?
+        .clusters()
+        .await
+}
+
+/// Reads the control plane's sign-in details (CP1.1: its protected-resource metadata, which names
+/// itself as the resource) and its sign-in service's, through Studio's own client: a token from
+/// it must be in `organization`.
+async fn discover(
+    context: &SignInContext,
+    route: &str,
+    organization: &str,
+) -> Result<Service, Refusal> {
+    let at = url::Url::parse(route).map_err(|error| Refusal::lasting(error.to_string()))?;
+    let metadata = format!(
+        "{}/.well-known/oauth-protected-resource",
+        route.trim_end_matches('/')
+    );
+    let clients = Clients::new(at, context.elsewhere.clone(), context.elsewhere.clone());
+    let mut service = sign_in::discover(
+        clients,
+        metadata,
+        context.identities.clone(),
+        Some(organization.to_owned()),
+    )
+    .await?;
+    if service.resource.resource.trim_end_matches('/') != route.trim_end_matches('/') {
+        return Err(Refusal::lasting(format!(
+            "The control plane at {} names another resource ({}), so Studio does not sign in there.",
+            oauth_client::host_of(route),
+            oauth_client::shown(&service.resource.resource)
+        )));
+    }
+    service.organization_of = "this profile";
+    Ok(service)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use futures::AsyncReadExt as _;
+    use gpui::{AppContext as _, Entity, TestAppContext};
+    use http_client::http::Response;
+    use http_client::{AsyncBody, FakeHttpClient};
+    use oauth_client::ClientIdentities;
+    use serde_json::{Value, json};
+
+    use super::*;
+    use crate::sign_in::{KeychainTurns, MemoryKeychain};
+
+    const ROUTE: &str = "https://control.test";
+    const ISSUER: &str = "https://id.test";
+    const CLIENT: &str = "https://studio.test/client.json";
+    const ORG: &str = "org_1";
+
+    /// The control plane and its sign-in service: codes and refresh tokens are single-use, and
+    /// each refresh rotates.
+    #[derive(Default)]
+    struct Served {
+        codes: HashSet<String>,
+        refresh: HashSet<String>,
+        accepted: HashSet<String>,
+        issued: u32,
+        /// The organization the service signs people in to (`ORG` when empty).
+        org: String,
+        /// The resource the control plane's metadata names (`ROUTE` when empty).
+        resource: String,
+        requests: Vec<String>,
+        log: Vec<String>,
+    }
+
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    fn jwt(claims: Value) -> String {
+        format!(
+            "{}.{}.sig",
+            URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256"}"#),
+            URL_SAFE_NO_PAD.encode(claims.to_string())
+        )
+    }
+
+    fn issue(served: &mut Served) -> Value {
+        served.issued += 1;
+        let org = if served.org.is_empty() {
+            ORG
+        } else {
+            &served.org
+        };
+        let access = jwt(json!({
+            "iss": ISSUER, "aud": ROUTE, "client_id": CLIENT, "sub": "user_1",
+            "org_id": org, "iat": now(), "exp": now() + 300, "n": served.issued,
+        }));
+        served.accepted.insert(access.clone());
+        let refresh = format!("r{}", served.issued);
+        served.refresh.insert(refresh.clone());
+        json!({"token_type": "Bearer", "access_token": access, "expires_in": 300, "refresh_token": refresh})
+    }
+
+    fn cluster() -> Value {
+        json!({
+            "cluster_id": "01C", "name": "acme", "incarnation": "01I",
+            "canonical_root": "s3://b/c", "binding": {"mode": "github", "repository": "acme/g"},
+            "state": "ready", "cell": {"namespace": "ns", "cluster": "cell"},
+            "created_by": "user_1", "created_at": "2026-11-01T00:00:00Z",
+            "data_endpoint": "https://acme.graphs.test",
+        })
+    }
+
+    fn answer(
+        served: &mut Served,
+        method: &str,
+        url: &str,
+        bearer: Option<String>,
+        body: String,
+    ) -> (u16, Value) {
+        let form: HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        match (method, url) {
+            ("GET", u) if u == format!("{ROUTE}/.well-known/oauth-protected-resource") => {
+                let resource = if served.resource.is_empty() {
+                    ROUTE.to_owned()
+                } else {
+                    served.resource.clone()
+                };
+                (
+                    200,
+                    json!({"resource": resource, "authorization_servers": [ISSUER], "bearer_methods_supported": ["header"]}),
+                )
+            }
+            ("GET", u) if u == format!("{ISSUER}/.well-known/oauth-authorization-server") => (
+                200,
+                json!({
+                    "issuer": ISSUER, "authorization_endpoint": format!("{ISSUER}/authorize"),
+                    "token_endpoint": format!("{ISSUER}/token"),
+                    "code_challenge_methods_supported": ["S256"], "client_id_metadata_document_supported": true,
+                }),
+            ),
+            ("POST", u) if u == format!("{ISSUER}/token") => {
+                served.log.push(format!(
+                    "token {} resource={}",
+                    form["grant_type"],
+                    form.get("resource").map_or("-", String::as_str)
+                ));
+                let granted = match form["grant_type"].as_str() {
+                    "authorization_code" => served.codes.remove(&form["code"]),
+                    _ => served.refresh.remove(&form["refresh_token"]),
+                };
+                if granted
+                    && form.get("resource").map(String::as_str) == Some(ROUTE)
+                    && form["client_id"] == CLIENT
+                {
+                    (200, issue(served))
+                } else {
+                    (400, json!({"error": "invalid_grant"}))
+                }
+            }
+            ("GET", u) if u == format!("{ROUTE}/v1/clusters") => match bearer {
+                Some(token) if served.accepted.contains(&token) => (
+                    200,
+                    json!({
+                        "data": {"clusters": [cluster()]},
+                        "meta": {"provenance": "service_db", "assurance": "observed", "stale": false, "observed_at": "2026-11-05T00:00:00Z"},
+                    }),
+                ),
+                _ => (
+                    401,
+                    json!({"type": "unauthenticated", "title": "Unauthenticated", "status": 401}),
+                ),
+            },
+            _ => (404, json!({})),
+        }
+    }
+
+    fn fake(served: Arc<Mutex<Served>>) -> Arc<dyn HttpClient> {
+        FakeHttpClient::create(move |request| {
+            let served = served.clone();
+            async move {
+                let method = request.method().to_string();
+                let url = request.uri().to_string();
+                let bearer = request
+                    .headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.strip_prefix("Bearer "))
+                    .map(str::to_owned);
+                let mut body = String::new();
+                request.into_body().read_to_string(&mut body).await?;
+                let (status, page) = {
+                    let mut served = served.lock().unwrap();
+                    served.requests.push(format!("{method} {url}"));
+                    answer(&mut served, &method, &url, bearer, body)
+                };
+                Ok(Response::builder()
+                    .status(status)
+                    .body(AsyncBody::from(page.to_string()))?)
+            }
+        })
+    }
+
+    fn context(served: &Arc<Mutex<Served>>, keychain: Arc<MemoryKeychain>) -> SignInContext {
+        SignInContext {
+            elsewhere: fake(served.clone()),
+            keychain,
+            turns: KeychainTurns::default(),
+            identities: ClientIdentities {
+                metadata_document: Some(CLIENT.into()),
+                registered: Vec::new(),
+                development: None,
+            },
+        }
+    }
+
+    fn plane(context: SignInContext, cx: &mut TestAppContext) -> Entity<ControlPlane> {
+        cx.new(|cx| {
+            ControlPlane::new(
+                ROUTE.into(),
+                ORG.into(),
+                vec!["work".into()],
+                Some(context),
+                cx,
+            )
+        })
+    }
+
+    fn until(cx: &mut TestAppContext, what: &str, done: impl Fn(&mut TestAppContext) -> bool) {
+        for _ in 0..400 {
+            cx.run_until_parked();
+            if done(cx) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// Plays the browser: checks what Studio asked for, and returns to its listener.
+    fn approve(served: &Arc<Mutex<Served>>, opened: &str) -> std::thread::JoinHandle<()> {
+        let opened = url::Url::parse(opened).unwrap();
+        let query: HashMap<String, String> = opened.query_pairs().into_owned().collect();
+        assert_eq!(query["client_id"], CLIENT);
+        assert_eq!(query["resource"], ROUTE);
+        assert_eq!(query["code_challenge_method"], "S256");
+        served.lock().unwrap().codes.insert("c1".into());
+        let callback = url::Url::parse(&query["redirect_uri"]).unwrap();
+        let path = format!("/callback?code=c1&state={}&iss={ISSUER}", query["state"]);
+        let port = callback.port().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            write!(stream, "GET {path} HTTP/1.1\r\nhost: 127.0.0.1\r\n\r\n").unwrap();
+            let mut page = String::new();
+            stream.read_to_string(&mut page).ok();
+        })
+    }
+
+    fn signed_in(plane: &Entity<ControlPlane>, cx: &mut TestAppContext) -> bool {
+        plane.read_with(cx, |p, _| {
+            matches!(p.sign_in_state(), SignIn::SignedIn { .. })
+        })
+    }
+
+    #[gpui::test]
+    fn nothing_is_sent_to_the_control_plane_before_a_sign_in(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served::default()));
+        let plane = plane(context(&served, Arc::new(MemoryKeychain::default())), cx);
+        cx.run_until_parked();
+        plane.update(cx, |p, cx| p.read_clusters(cx));
+        cx.run_until_parked();
+        assert!(served.lock().unwrap().requests.is_empty());
+        plane.read_with(cx, |p, _| {
+            assert!(matches!(
+                p.sign_in_state(),
+                SignIn::Offered { why: None, .. }
+            ));
+            assert_eq!(p.listing(), None);
+        });
+    }
+
+    #[gpui::test]
+    fn a_sign_in_lists_the_organizations_clusters_and_is_kept(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served::default()));
+        let keychain = Arc::new(MemoryKeychain::default());
+        let plane = plane(context(&served, keychain.clone()), cx);
+        plane.update(cx, |p, cx| p.sign_in(cx));
+        until(cx, "the browser", |cx| cx.opened_url().is_some());
+        let browser = approve(&served, &cx.opened_url().unwrap());
+        until(cx, "the sign-in", |cx| signed_in(&plane, cx));
+        browser.join().unwrap();
+        let item = keychain
+            .items
+            .lock()
+            .unwrap()
+            .get(&key(ROUTE, ORG))
+            .cloned();
+        assert_eq!(item, Some(("user_1".into(), b"r1".to_vec())));
+
+        plane.update(cx, |p, cx| p.read_clusters(cx));
+        until(cx, "the list", |cx| {
+            plane.read_with(cx, |p, _| matches!(p.listing(), Some(Listing::Listed(_))))
+        });
+        plane.read_with(cx, |p, _| {
+            let Some(Listing::Listed(listed)) = p.listing() else {
+                unreachable!()
+            };
+            assert_eq!(listed.data.clusters[0].name, "acme");
+        });
+        assert!(
+            served
+                .lock()
+                .unwrap()
+                .log
+                .contains(&format!("token authorization_code resource={ROUTE}"))
+        );
+
+        plane.update(cx, |p, cx| p.forget_clusters(cx));
+        plane.read_with(cx, |p, _| assert_eq!(p.listing(), None));
+    }
+
+    #[gpui::test]
+    fn a_sign_in_to_another_organization_is_refused_in_the_profiles_words(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served {
+            org: "org_2".into(),
+            ..Default::default()
+        }));
+        let keychain = Arc::new(MemoryKeychain::default());
+        let plane = plane(context(&served, keychain.clone()), cx);
+        plane.update(cx, |p, cx| p.sign_in(cx));
+        until(cx, "the browser", |cx| cx.opened_url().is_some());
+        let browser = approve(&served, &cx.opened_url().unwrap());
+        until(cx, "the refusal", |cx| {
+            plane.read_with(cx, |p, _| {
+                matches!(p.sign_in_state(), SignIn::Offered { why: Some(_), .. })
+            })
+        });
+        browser.join().unwrap();
+        plane.read_with(cx, |p, _| {
+            let SignIn::Offered { why: Some(why), .. } = p.sign_in_state() else {
+                unreachable!()
+            };
+            assert_eq!(
+                why,
+                "The sign-in was for org_2, and this profile is in org_1."
+            );
+            assert!(!p.holds_sign_in());
+        });
+        assert!(keychain.items.lock().unwrap().is_empty());
+    }
+
+    #[gpui::test]
+    fn a_control_plane_naming_another_resource_is_not_signed_in_to(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served {
+            resource: "https://elsewhere.test".into(),
+            ..Default::default()
+        }));
+        let plane = plane(context(&served, Arc::new(MemoryKeychain::default())), cx);
+        plane.update(cx, |p, cx| p.sign_in(cx));
+        until(cx, "the refusal", |cx| {
+            plane.read_with(cx, |p, _| {
+                matches!(p.sign_in_state(), SignIn::Unavailable(_))
+            })
+        });
+        assert!(cx.opened_url().is_none());
+    }
+
+    #[gpui::test]
+    fn a_kept_sign_in_lists_after_a_silent_refresh(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served::default()));
+        served.lock().unwrap().refresh.insert("kept".into());
+        let keychain = Arc::new(MemoryKeychain::default());
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key(ROUTE, ORG), ("user_1".into(), b"kept".to_vec()));
+        let plane = plane(context(&served, keychain.clone()), cx);
+        until(cx, "the kept sign-in", |cx| signed_in(&plane, cx));
+        plane.update(cx, |p, cx| p.read_clusters(cx));
+        until(cx, "the list", |cx| {
+            plane.read_with(cx, |p, _| matches!(p.listing(), Some(Listing::Listed(_))))
+        });
+        // The kept token was rotated, and the keychain holds the new one.
+        let item = keychain
+            .items
+            .lock()
+            .unwrap()
+            .get(&key(ROUTE, ORG))
+            .cloned();
+        assert_eq!(item, Some(("user_1".into(), b"r1".to_vec())));
+    }
+
+    #[gpui::test]
+    fn signing_out_forgets_the_sign_in_and_the_list(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served::default()));
+        served.lock().unwrap().refresh.insert("kept".into());
+        let keychain = Arc::new(MemoryKeychain::default());
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key(ROUTE, ORG), ("user_1".into(), b"kept".to_vec()));
+        let plane = plane(context(&served, keychain.clone()), cx);
+        until(cx, "the kept sign-in", |cx| signed_in(&plane, cx));
+        plane.update(cx, |p, cx| p.sign_out(cx));
+        until(cx, "the item deleted", |_| {
+            keychain.items.lock().unwrap().is_empty()
+        });
+        plane.read_with(cx, |p, _| {
+            assert!(!p.holds_sign_in());
+            assert_eq!(p.listing(), None);
+        });
+        let before = served.lock().unwrap().requests.len();
+        plane.update(cx, |p, cx| p.read_clusters(cx));
+        cx.run_until_parked();
+        assert_eq!(served.lock().unwrap().requests.len(), before);
+    }
+}

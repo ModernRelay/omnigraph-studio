@@ -343,6 +343,9 @@ pub struct Service {
     /// The organization the target names, which a token's `org_id` must equal: a managed
     /// target's profile's; `None` for a target that names none, and the server checks it alone.
     pub organization: Option<String>,
+    /// What names `organization`, as a refusal says it: "this target" for a cluster, "this
+    /// profile" for a control plane.
+    pub(crate) organization_of: &'static str,
     pub(crate) clients: Clients,
 }
 
@@ -377,6 +380,7 @@ impl Service {
             resource: &self.resource.resource,
             client_id: &self.client_id,
             organization: self.organization.as_deref(),
+            organization_of: self.organization_of,
         }
     }
 
@@ -406,6 +410,7 @@ pub(crate) async fn discover(
         server,
         client_id,
         organization,
+        organization_of: "this target",
         clients,
     })
 }
@@ -559,6 +564,7 @@ impl Access {
 impl OAuthSource {
     /// A sign-in just made, its tokens and what the keychain holds for its target, with the
     /// token of an earlier item there the keychain would not let go of (`left`).
+    #[cfg(test)]
     pub(crate) fn signed_in(
         service: Service,
         target: &str,
@@ -567,9 +573,23 @@ impl OAuthSource {
         kept: Kept,
         left: Option<String>,
     ) -> Self {
+        let key = service.key(target);
+        Self::signed_in_at(service, key, keychain, tokens, kept, left)
+    }
+
+    /// [`OAuthSource::signed_in`], kept under `key`: a control plane's item rather than a
+    /// target's (spec 021).
+    pub(crate) fn signed_in_at(
+        service: Service,
+        key: String,
+        keychain: Arc<dyn Keychain>,
+        tokens: Tokens,
+        kept: Kept,
+        left: Option<String>,
+    ) -> Self {
         let source = Self::new(
             service,
-            target,
+            key,
             keychain,
             Held {
                 access: Some(Access::new(tokens.access_token, tokens.expires_at)),
@@ -595,9 +615,21 @@ impl OAuthSource {
         subject: String,
         refresh: String,
     ) -> Self {
+        let key = service.key(target);
+        Self::kept_at(service, key, keychain, subject, refresh)
+    }
+
+    /// [`OAuthSource::kept`], at the item `key`: a control plane's rather than a target's.
+    pub(crate) fn kept_at(
+        service: Service,
+        key: String,
+        keychain: Arc<dyn Keychain>,
+        subject: String,
+        refresh: String,
+    ) -> Self {
         Self::new(
             service,
-            target,
+            key,
             keychain,
             Held {
                 access: None,
@@ -614,7 +646,7 @@ impl OAuthSource {
 
     fn new(
         service: Service,
-        target: &str,
+        key: String,
         keychain: Arc<dyn Keychain>,
         held: Held,
         account: Account,
@@ -622,7 +654,7 @@ impl OAuthSource {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                key: service.key(target),
+                key,
                 service,
                 keychain,
                 held: smol::lock::Mutex::new(held),
@@ -785,6 +817,153 @@ impl Drop for Unclaimed {
             self.service.revoke(refresh);
         }
     }
+}
+
+/// A sign-in through the person's browser, under way (spec 016, Signing in): the page to open,
+/// and the tokens the service gives once the person returns through the loopback listener,
+/// which closes after one answer or five minutes, or when this is dropped (Cancel).
+pub(crate) struct Browser {
+    pub page: url::Url,
+    pub tokens: gpui::Task<Result<(Tokens, Unclaimed), String>>,
+}
+
+/// Starts a sign-in to `service` through the browser: Studio listens on a loopback port, and the
+/// page it gives opens the service's sign-in; `host` is the address the person is signing in to,
+/// as the callback page names it. Its tokens are exchanged on their own once the code arrives:
+/// the service redeems the code whether or not the sign-in still waits, so one cancelled
+/// meanwhile drops the answer, whose guard revokes the token it gives.
+pub(crate) fn browser(
+    service: &Service,
+    host: String,
+    background: &gpui::BackgroundExecutor,
+) -> Result<Browser, String> {
+    let (callback, pkce, state) = oauth_client::Callback::bind()
+        .and_then(|callback| {
+            Ok((
+                callback,
+                oauth_client::Pkce::new()?,
+                oauth_client::random_token()?,
+            ))
+        })
+        .map_err(|error| format!("Studio could not wait for the sign-in: {error}."))?;
+    let page = oauth_client::authorization_url(
+        &service.server,
+        &service.client_id,
+        callback.redirect_uri(),
+        &pkce,
+        &state,
+        &service.resource.resource,
+    );
+    let redirect = callback.redirect_uri().to_owned();
+    let issuer = service.server.issuer.clone();
+    let exchanged = service.clone();
+    let spawner = background.clone();
+    let tokens = background.spawn(async move {
+        let code = smol::future::or(
+            async { Some(callback.code(&state, &issuer, &host).await) },
+            async {
+                smol::Timer::after(oauth_client::SIGN_IN_WAIT).await;
+                None
+            },
+        )
+        .await
+        .ok_or("The sign-in was not finished within five minutes.".to_owned())?
+        .map_err(|error| error.to_string())?;
+        let (answer, answered) = oneshot::channel();
+        spawner
+            .spawn(async move {
+                let service = exchanged;
+                let tokens = oauth_client::exchange(
+                    service.token_client().as_ref(),
+                    &service.server,
+                    &code,
+                    &redirect,
+                    &pkce.verifier,
+                    service.expected(),
+                )
+                .await;
+                let taken = match tokens {
+                    // Revoked unless a sign-in comes to hold it (the sign-in cancelled, or its
+                    // holder gone before it finishes), made here so no moment holds the token
+                    // unguarded.
+                    Ok(tokens) => {
+                        let unclaimed = Unclaimed::new(service, tokens.refresh_token.clone());
+                        Ok((tokens, unclaimed))
+                    }
+                    // Tokens Studio may not use: nothing will hold their refresh token, so it
+                    // is revoked.
+                    Err(TokenError::Unusable { why, refresh_token }) => {
+                        if let Some(refresh) = refresh_token {
+                            service.revoke(refresh);
+                        }
+                        Err(why)
+                    }
+                    Err(error) => Err(error.to_string()),
+                };
+                answer.send(taken).ok();
+            })
+            .detach();
+        answered
+            .await
+            .unwrap_or_else(|_| Err("The sign-in stopped before the service answered.".to_owned()))
+    });
+    Ok(Browser { page, tokens })
+}
+
+/// Keeps a sign-in's tokens at the keychain item `key`, in the turn the caller holds there: the
+/// sign-in `previous` it replaces ends (one account per item, its refresh token revoked), and the
+/// keychain keeps only the new one's, or none, never the old account's. Answers the sign-in, which
+/// holds the token from here, and the token of an earlier item gone from the keychain, which
+/// nothing holds and the caller revokes.
+pub(crate) async fn keep(
+    keychain: Arc<dyn Keychain>,
+    key: String,
+    previous: Option<OAuthSource>,
+    current: Service,
+    tokens: Tokens,
+    unclaimed: Unclaimed,
+) -> (OAuthSource, Option<String>) {
+    let previous_holds_item = previous
+        .as_ref()
+        .is_some_and(|previous| previous.kept_in_keychain() == Kept::This);
+    if let Some(previous) = previous {
+        previous.end(End::Replaced, None).await;
+    }
+    let refresh = tokens.refresh_token.clone();
+    // An earlier item that one does not answer for (left by a sign-in that ended, for the next
+    // launch) is written over or forgotten below.
+    let earlier = if previous_holds_item {
+        None
+    } else {
+        keychain
+            .read(key.clone())
+            .await
+            .ok()
+            .flatten()
+            .and_then(|(_, secret)| String::from_utf8(secret).ok())
+            .filter(|earlier| refresh.as_ref() != Some(earlier))
+    };
+    // Kept or not, this sign-in leaves the keychain no earlier one: one it will not delete is
+    // said, as the next launch would read it.
+    let kept = written_or_forgotten(
+        keychain.as_ref(),
+        key.clone(),
+        tokens.account.subject.clone(),
+        refresh.as_deref(),
+    )
+    .await;
+    // The earlier item's token: gone from the keychain, it is held by nothing and revoked; still
+    // there (the keychain would not let go), the sign-in keeps it, to revoke once the item no
+    // longer holds it.
+    let (left, let_go) = match (&kept, earlier) {
+        (Kept::Left(_), earlier) => (earlier, None),
+        (_, earlier) => (None, earlier),
+    };
+    unclaimed.claim();
+    (
+        OAuthSource::signed_in_at(current, key, keychain, tokens, kept, left),
+        let_go,
+    )
 }
 
 impl TokenSource for OAuthSource {

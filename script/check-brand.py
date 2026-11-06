@@ -18,6 +18,7 @@ UPSTREAM = (
     "crates/agent_panel/fixtures/omnigraph-operator-config.schema.json",
     "crates/agent_panel/skill/upstream/",
     "crates/graph_client/openapi/",
+    "crates/control_client/openapi/",
 )
 
 listed = subprocess.run(["git", "ls-files", "-z"], capture_output=True, check=True).stdout

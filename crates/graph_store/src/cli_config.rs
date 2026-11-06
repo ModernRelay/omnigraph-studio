@@ -213,6 +213,18 @@ pub struct CliTargets {
     pub watched: Vec<(PathBuf, Option<FileStamp>)>,
     /// The managed targets, as `target list` describes them, whether they landed or not.
     pub managed: Vec<ManagedTarget>,
+    /// The managed targets' profiles whose control plane and organization the CLI said, each
+    /// once (spec 021).
+    pub profiles: Vec<ProfileOwner>,
+}
+
+/// A CLI profile's control plane and organization, as `credentials status --profile NAME
+/// --json` says them: `owner.route` and `owner.organization_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileOwner {
+    pub profile: String,
+    pub route: Option<String>,
+    pub organization: Option<String>,
 }
 
 impl CliTargets {
@@ -252,6 +264,7 @@ pub async fn read_targets(
             errors: vec![error],
             watched: vec![(config.clone(), stamp)],
             managed: Vec::new(),
+            profiles: Vec::new(),
         }
     };
     let asked = "`omnigraph target list --json`";
@@ -313,8 +326,9 @@ async fn name_organizations(
     let Some(servers) = read.servers.as_mut() else {
         return;
     };
-    // Each profile's organization, or `Err` when the CLI would not say it this time.
-    let mut named: Vec<(String, Result<Option<String>, ()>)> = Vec::new();
+    // Each profile's control plane and organization, or `Err` when the CLI would not say them
+    // this time.
+    let mut named: Vec<(String, Result<Owner, ()>)> = Vec::new();
     for server in servers.iter_mut() {
         let CliAuth::Token(CliCredential::Managed {
             profile,
@@ -327,7 +341,7 @@ async fn name_organizations(
         let found = match named.iter().find(|(read, _)| read == profile) {
             Some((_, known)) => known.clone(),
             None => {
-                let found = cli_tokens::profile_organization(cli, turn, profile)
+                let found = cli_tokens::profile_owner(cli, turn, profile)
                     .await
                     .map_err(|why| {
                         read.errors.push(format!(
@@ -341,9 +355,35 @@ async fn name_organizations(
             }
         };
         *unread = found.is_err();
-        *organization = found.unwrap_or_default();
+        *organization = found
+            .map(|(_, organization)| organization)
+            .unwrap_or_default();
     }
+    // A control-only target's profile names a control plane too, whose clusters Studio lists.
+    for target in &read.managed {
+        if named.iter().any(|(read, _)| *read == target.profile) {
+            continue;
+        }
+        let found = cli_tokens::profile_owner(cli, turn, &target.profile)
+            .await
+            .map_err(|_| ());
+        named.push((target.profile.clone(), found));
+    }
+    read.profiles = named
+        .into_iter()
+        .filter_map(|(profile, found)| {
+            let (route, organization) = found.ok()?;
+            Some(ProfileOwner {
+                profile,
+                route,
+                organization,
+            })
+        })
+        .collect();
 }
+
+/// A profile's control plane and organization, as `credentials status` says them.
+type Owner = (Option<String>, Option<String>);
 
 /// The stamp of the one file at `path` ([`stamp`]).
 fn stamp_of(path: &Path) -> Option<FileStamp> {
@@ -365,6 +405,7 @@ pub(crate) fn unlisted(config: &Path, why: String) -> CliTargets {
         errors: vec![why],
         watched: vec![(config.to_path_buf(), Some(UNLISTED))],
         managed: Vec::new(),
+        profiles: Vec::new(),
     }
 }
 
@@ -506,6 +547,7 @@ pub(crate) fn servers_from(
         errors,
         watched,
         managed,
+        profiles: Vec::new(),
     }
 }
 

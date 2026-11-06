@@ -57,6 +57,8 @@ pub struct Expected<'a> {
     /// The organization the target names, which `org_id` must equal; `None` when it names none,
     /// and the server checks it alone.
     pub organization: Option<&'a str>,
+    /// What names that organization, as the refusal says it: "this target", "this profile".
+    pub organization_of: &'a str,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -308,10 +310,11 @@ fn checked(
         && organization.as_deref() != Some(wanted)
     {
         return Err(format!(
-            "The sign-in was for {}, and this target is in {wanted}.",
+            "The sign-in was for {}, and {} is in {wanted}.",
             organization
                 .as_deref()
-                .map_or("no organization".to_owned(), shown)
+                .map_or("no organization".to_owned(), shown),
+            expected.organization_of
         ));
     }
     // The server checks `exp` against its own clock. Measured against this machine's, a clock
@@ -371,6 +374,7 @@ mod tests {
             resource: RESOURCE,
             client_id: CLIENT,
             organization,
+            organization_of: "this target",
         }
     }
 
